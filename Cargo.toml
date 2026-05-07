@@ -44,7 +44,7 @@ dashmap = "6.1.0"
 clap = { version = "4.6.1", features = ["derive"] }
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 futures = "0.3.32"
-h2 = "0.4.13"
+h2 = "0.4.14"
 http = "1.4.0"
 # Pinned to match Pingora's dependency.
 nix = "0.24.3"
@@ -58,7 +58,6 @@ praxis-proto = { version = "0.1.0", path = "filter/proto", package = "praxis-pro
 prost = "0.14.3"
 prost-build = "0.14.3"
 prost-types = "0.14.3"
-prost-wkt-build = "0.7.1"
 prost-wkt-types = { version = "0.7.1", features = ["vendored-protox"] }
 protox = "0.9.1"
 plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series"] }
@@ -81,10 +80,10 @@ tokio-rustls = "0.26.4"
 tokio-tungstenite = "0.29.0"
 thiserror = "2.0.18"
 tikv-jemallocator = "0.6.1"
-tonic = "0.14.5"
-tonic-prost = "0.14.5"
-tonic-prost-build = { version = "0.14.5", features = ["transport"] }
-tokio = { version = "1.52.1", features = ["macros", "rt"] }
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = { version = "0.14.6", features = ["transport"] }
+tokio = { version = "1.52.2", features = ["macros", "rt"] }
 tokio-util = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
