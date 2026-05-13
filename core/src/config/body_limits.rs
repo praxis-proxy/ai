@@ -68,6 +68,7 @@ impl Default for BodyLimitsConfig {
 }
 
 /// Serde default for body limit fields.
+#[allow(clippy::unnecessary_wraps, reason = "serde default requires matching field type")]
 fn default_max_body_bytes() -> Option<usize> {
     Some(DEFAULT_MAX_BODY_BYTES)
 }
