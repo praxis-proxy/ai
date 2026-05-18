@@ -47,29 +47,43 @@ impl PingoraKvService {
     }
 }
 
+/// Dispatch a KV admin request and return the response.
+///
+/// Routes `GET`, `PUT`, and `DELETE` under `/api/kv/{store}[/{key}]`.
+/// Returns a 404 JSON response for unrecognised paths or methods.
+///
+/// Used by [`PingoraAdminService`] to handle KV requests on the shared
+/// admin port, and by [`PingoraKvService`] for backward compatibility.
+///
+/// [`PingoraAdminService`]: crate::http::pingora::health::PingoraAdminService
+/// [`PingoraKvService`]: PingoraKvService
+pub(crate) async fn dispatch_kv_request(registry: &KvStoreRegistry, session: &mut ServerSession) -> Response<Vec<u8>> {
+    let path = session.req_header().uri.path().to_owned();
+    let method = session.req_header().method.clone();
+
+    let segments: Vec<&str> = path
+        .strip_prefix("/api/kv/")
+        .unwrap_or("")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    match (method.as_str(), segments.as_slice()) {
+        ("GET", [store]) => handle_list(registry, store),
+        ("GET", [store, key]) => handle_get(registry, store, key),
+        ("PUT", [store, key]) => match read_body(session).await {
+            Ok(body) => handle_set(registry, store, key, &body),
+            Err(resp) => resp,
+        },
+        ("DELETE", [store, key]) => handle_delete(registry, store, key),
+        _ => json_response(404, br#"{"error":"not found"}"#),
+    }
+}
+
 #[async_trait]
 impl ServeHttp for PingoraKvService {
     async fn response(&self, http_session: &mut ServerSession) -> Response<Vec<u8>> {
-        let path = http_session.req_header().uri.path().to_owned();
-        let method = http_session.req_header().method.clone();
-
-        let segments: Vec<&str> = path
-            .strip_prefix("/api/kv/")
-            .unwrap_or("")
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        match (method.as_str(), segments.as_slice()) {
-            ("GET", [store]) => handle_list(&self.registry, store),
-            ("GET", [store, key]) => handle_get(&self.registry, store, key),
-            ("PUT", [store, key]) => match read_body(http_session).await {
-                Ok(body) => handle_set(&self.registry, store, key, &body),
-                Err(resp) => resp,
-            },
-            ("DELETE", [store, key]) => handle_delete(&self.registry, store, key),
-            _ => json_response(404, br#"{"error":"not found"}"#),
-        }
+        dispatch_kv_request(&self.registry, http_session).await
     }
 }
 
@@ -165,6 +179,16 @@ fn handle_list(registry: &KvStoreRegistry, store: &str) -> Response<Vec<u8>> {
 /// Register KV admin endpoints on the admin listener.
 ///
 /// Binds to the same admin address as health endpoints.
+///
+/// # Deprecation
+///
+/// Prefer passing `kv_registry` to [`add_admin_endpoints_to_pingora_server`]
+/// instead. This function creates a separate Pingora `Service` that
+/// binds to the same port via `SO_REUSEPORT`, causing non-deterministic
+/// connection routing that breaks health probes.
+///
+/// [`add_admin_endpoints_to_pingora_server`]: crate::http::pingora::health::add_admin_endpoints_to_pingora_server
+#[deprecated(note = "pass KvStoreRegistry to add_admin_endpoints_to_pingora_server instead")]
 pub fn add_kv_endpoint_to_pingora_server(server: &mut Server, admin_addr: &str, registry: KvStoreRegistry) {
     let mut service = Service::new("kv-admin".to_owned(), PingoraKvService::new(registry));
     service.add_tcp(admin_addr);

@@ -89,10 +89,12 @@ pub fn run_server_with_registry(config: Config, registry: FilterRegistry, config
     let _cert_shutdowns = register_protocols(&mut server, &config, &pipelines);
 
     if let Some(ref admin_addr) = config.admin.address {
-        praxis_protocol::http::pingora::kv::add_kv_endpoint_to_pingora_server(
+        praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
             server.server_mut(),
             admin_addr,
-            kv_stores.clone(),
+            Some(Arc::clone(&health_registry)),
+            Some(kv_stores.clone()),
+            config.admin.verbose,
         );
     }
 

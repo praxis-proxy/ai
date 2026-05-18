@@ -8,10 +8,10 @@ use http::Response;
 use pingora_core::{
     apps::http_app::ServeHttp, protocols::http::ServerSession, server::Server, services::listening::Service,
 };
-use praxis_core::health::HealthRegistry;
+use praxis_core::{health::HealthRegistry, kv::KvStoreRegistry};
 use tracing::info;
 
-use crate::http::pingora::{json::json_response, metrics};
+use crate::http::pingora::{json::json_response, kv::dispatch_kv_request, metrics};
 
 // -----------------------------------------------------------------------------
 // JSON Escaping
@@ -132,6 +132,74 @@ impl PingoraHealthService {
     }
 }
 
+// -----------------------------------------------------------------------------
+// PingoraAdminService
+// -----------------------------------------------------------------------------
+
+/// Combined admin service that routes health, metrics, and KV endpoints
+/// through a single Pingora [`Service`].
+///
+/// Eliminates the port contention bug where separate services binding to
+/// the same admin port via `SO_REUSEPORT` caused non-deterministic
+/// connection routing (health probes hitting the KV service and getting 404).
+///
+/// [`Service`]: pingora_core::services::listening::Service
+pub struct PingoraAdminService {
+    /// Shared health registry for per-cluster status reporting.
+    health_registry: Option<HealthRegistry>,
+
+    /// Optional KV store registry for admin CRUD endpoints.
+    kv_registry: Option<KvStoreRegistry>,
+
+    /// When `true`, include per-cluster detail in `/ready` responses.
+    verbose: bool,
+}
+
+impl PingoraAdminService {
+    /// Create a combined admin service.
+    ///
+    /// `kv_registry` enables `/api/kv/*` endpoints when `Some`.
+    pub fn new(health_registry: Option<HealthRegistry>, kv_registry: Option<KvStoreRegistry>, verbose: bool) -> Self {
+        Self {
+            health_registry,
+            kv_registry,
+            verbose,
+        }
+    }
+
+    /// Build the `/ready` response status and body.
+    ///
+    /// Delegates to the same aggregation logic as [`PingoraHealthService`].
+    fn ready_response(&self) -> (u16, String) {
+        let health = PingoraHealthService::new(self.health_registry.clone(), self.verbose);
+        health.ready_response()
+    }
+}
+
+#[async_trait]
+impl ServeHttp for PingoraAdminService {
+    async fn response(&self, http_session: &mut ServerSession) -> Response<Vec<u8>> {
+        let path = http_session.req_header().uri.path().to_owned();
+
+        if path.starts_with("/api/kv/") {
+            if let Some(ref registry) = self.kv_registry {
+                return dispatch_kv_request(registry, http_session).await;
+            }
+            return json_response(404, br#"{"error":"not found"}"#);
+        }
+
+        match path.as_str() {
+            "/healthy" => json_response(200, br#"{"status":"ok"}"#),
+            "/metrics" => prometheus_response(),
+            "/ready" => {
+                let (status, body) = self.ready_response();
+                json_response(status, body.as_bytes())
+            },
+            _ => json_response(404, br#"{"error":"not found"}"#),
+        }
+    }
+}
+
 /// Build an HTTP response containing Prometheus text exposition format.
 ///
 /// Returns 200 with `text/plain; version=0.0.4` content type when the
@@ -152,12 +220,12 @@ fn prometheus_response() -> Response<Vec<u8>> {
     }
 }
 
-/// Add the admin endpoints to a Pingora server.
+/// Add admin endpoints to a Pingora server.
 ///
 /// Installs the global Prometheus metrics recorder and binds a
-/// [`PingoraHealthService`] to `admin_addr`, exposing `/ready`,
-/// `/healthy`, and `/metrics` endpoints.
-/// When `verbose` is `true`, `/ready` includes per-cluster detail.
+/// [`PingoraAdminService`] to `admin_addr`, exposing `/ready`,
+/// `/healthy`, `/metrics`, and (when `kv_registry` is `Some`)
+/// `/api/kv/*` endpoints on a single port.
 ///
 /// ```ignore
 /// use pingora_core::server::Server;
@@ -165,19 +233,21 @@ fn prometheus_response() -> Response<Vec<u8>> {
 ///
 /// let mut server = Server::new(None).unwrap();
 /// server.bootstrap();
-/// add_admin_endpoints_to_pingora_server(&mut server, "127.0.0.1:9090", None, false);
+/// add_admin_endpoints_to_pingora_server(&mut server, "127.0.0.1:9090", None, None, false);
 /// ```
 pub fn add_admin_endpoints_to_pingora_server(
     server: &mut Server,
     admin_addr: &str,
-    registry: Option<HealthRegistry>,
+    health_registry: Option<HealthRegistry>,
+    kv_registry: Option<KvStoreRegistry>,
     verbose: bool,
 ) {
     let _handle = metrics::install_prometheus_recorder();
-    let mut health_service = Service::new("health".to_owned(), PingoraHealthService::new(registry, verbose));
-    health_service.add_tcp(admin_addr);
-    info!(address = %admin_addr, verbose, "admin endpoints enabled (health + metrics)");
-    server.add_service(health_service);
+    let admin = PingoraAdminService::new(health_registry, kv_registry, verbose);
+    let mut service = Service::new("admin".to_owned(), admin);
+    service.add_tcp(admin_addr);
+    info!(address = %admin_addr, verbose, "admin endpoints enabled (health + metrics + kv)");
+    server.add_service(service);
 }
 
 /// Backward-compatible alias for [`add_admin_endpoints_to_pingora_server`].
@@ -187,7 +257,7 @@ pub fn add_health_endpoint_to_pingora_server(
     registry: Option<HealthRegistry>,
     verbose: bool,
 ) {
-    add_admin_endpoints_to_pingora_server(server, admin_addr, registry, verbose);
+    add_admin_endpoints_to_pingora_server(server, admin_addr, registry, None, verbose);
 }
 
 #[async_trait]

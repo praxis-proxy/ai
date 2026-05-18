@@ -11,4 +11,7 @@ pub mod runner;
 mod service;
 
 pub(in crate::http::pingora) use service::escape_json_string;
-pub use service::{PingoraHealthService, add_admin_endpoints_to_pingora_server, add_health_endpoint_to_pingora_server};
+pub use service::{
+    PingoraAdminService, PingoraHealthService, add_admin_endpoints_to_pingora_server,
+    add_health_endpoint_to_pingora_server,
+};

@@ -60,10 +60,6 @@ impl Protocol for PingoraHttp {
             handler::load_http_handler(server.server_mut(), listener, pipeline, &mut cert_watcher_shutdowns)?;
         }
 
-        if let Some(admin_addr) = &config.admin.address {
-            health::add_admin_endpoints_to_pingora_server(server.server_mut(), admin_addr, None, config.admin.verbose);
-        }
-
         Ok(cert_watcher_shutdowns)
     }
 }
