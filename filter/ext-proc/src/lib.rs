@@ -35,9 +35,6 @@
 
 #![deny(unreachable_pub)]
 
-#[cfg(test)]
-mod tests;
-
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -529,3 +526,6 @@ impl HttpFilter for ExtProcFilter {
         Ok(FilterAction::Continue)
     }
 }
+
+#[cfg(test)]
+mod tests;
