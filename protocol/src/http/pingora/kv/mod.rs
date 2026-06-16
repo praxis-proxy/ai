@@ -97,12 +97,21 @@ impl ServeHttp for PingoraKvService {
 /// valid UTF-8.
 async fn read_body(session: &mut ServerSession) -> Result<String, Response<Vec<u8>>> {
     let mut buf = Vec::new();
-    while let Some(chunk) = session.read_request_body().await.ok().flatten() {
-        if buf.len() + chunk.len() > MAX_BODY_BYTES {
-            warn!(limit = MAX_BODY_BYTES, "KV admin request body exceeded size limit");
-            return Err(json_response(413, br#"{"error":"request body too large"}"#));
+    loop {
+        match session.read_request_body().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > MAX_BODY_BYTES {
+                    warn!(limit = MAX_BODY_BYTES, "KV admin request body exceeded size limit");
+                    return Err(json_response(413, br#"{"error":"request body too large"}"#));
+                }
+                buf.extend_from_slice(&chunk);
+            },
+            Ok(None) => break,
+            Err(e) => {
+                warn!(error = %e, "KV admin request body read failed");
+                return Err(json_response(502, br#"{"error":"request body read failed"}"#));
+            },
         }
-        buf.extend_from_slice(&chunk);
     }
     String::from_utf8(buf).map_err(|e| {
         warn!(error = %e, "KV admin request body is not valid UTF-8");
