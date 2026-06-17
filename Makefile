@@ -43,7 +43,7 @@ endif
 	test-schema test-integration test-conformance \
 	test-security test-security-suite test-resilience test-smoke \
 	bench \
-	lint fmt doc audit coverage coverage-check \
+	lint fmt doc audit semver coverage coverage-check \
 	require-container-engine \
 	container container-run \
 	test-container test-container-run \
@@ -188,9 +188,13 @@ bench: $(VEGETA) $(FORTIO_DEP)
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_VERSION) fmt --all -- --check
+	cargo machete
 	cargo xtask lint-deps
 	cargo xtask lint-example-tests
 	cargo xtask sync-example-readme
+
+semver:
+	cargo semver-checks
 
 fmt:
 	cargo +$(NIGHTLY_VERSION) fmt --all
@@ -204,14 +208,18 @@ audit:
 
 coverage:
 	cargo llvm-cov --workspace --html --output-dir target/coverage \
+		--exclude benchmarks \
 		--exclude praxis-tests-conformance \
-		--ignore-filename-regex '(target/|tests/|xtask/|benchmarks/)' \
+		--exclude xtask \
+		--ignore-filename-regex '(target/|tests/)' \
 		--fail-under-lines 95
 
 coverage-check:
 	cargo llvm-cov --workspace --json \
+		--exclude benchmarks \
 		--exclude praxis-tests-conformance \
-		--ignore-filename-regex '(target/|tests/|xtask/|benchmarks/)' \
+		--exclude xtask \
+		--ignore-filename-regex '(target/|tests/)' \
 		--fail-under-lines 95 \
 		--output-path coverage.json
 

@@ -70,10 +70,9 @@ fn rfc9110_host_mismatch_with_absolute_uri() {
          Connection: close\r\n\r\n",
     );
     let status = parse_status(&raw);
-    assert!(
-        status == 200 || status == 400 || status == 404 || status == 0,
-        "expected 200, 400, 404, or connection close for \
-         Host/URI mismatch, got {status}"
+    assert_eq!(
+        status, 400,
+        "Host/URI mismatch must be rejected with 400, got {status}"
     );
 }
 
@@ -101,10 +100,9 @@ fn rfc9110_trace_request_handled() {
          Connection: close\r\n\r\n",
     );
     let status = parse_status(&raw);
-    assert!(
-        status == 200 || status == 405 || status == 0,
-        "expected 200, 405, or connection close for \
-         TRACE, got {status}"
+    assert_eq!(
+        status, 200,
+        "Pingora forwards TRACE to upstream, got {status}"
     );
 }
 
