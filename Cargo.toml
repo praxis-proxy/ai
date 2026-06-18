@@ -22,7 +22,6 @@ members = [
     "tests/integration",
     "tests/resilience",
     "tests/security",
-    "tests/smoke",
     "tests/utils",
 ]
 

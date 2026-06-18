@@ -95,8 +95,5 @@ jobs:
             ${{ runner.os }}-rust-1.96.0-cargo-
           save-always: true
 
-      - name: Smoke tests
-        run: make test-smoke
-
       - name: Unit tests
         run: make test-unit

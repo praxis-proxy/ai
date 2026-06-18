@@ -42,7 +42,6 @@ make test-integration   # end-to-end filter and proxy tests
 make test-conformance   # RFC conformance (h2spec, HTTP semantics)
 make test-security      # request smuggling, header injection
 make test-resilience    # load, failure recovery, throughput
-make test-smoke         # quick startup and round-trip sanity
 ```
 
 See `docs/developing/getting-started.md` for the full
@@ -84,7 +83,6 @@ server -> protocol -> filter -> core -> tls
 - `tests/conformance`: RFC conformance (h2spec)
 - `tests/security`: request smuggling, header injection
 - `tests/resilience`: load, failure recovery
-- `tests/smoke`: quick startup round-trip
 
 ## Conventions
 
