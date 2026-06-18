@@ -1,5 +1,6 @@
 [advisories]
 unmaintained = "all"
+maximum-db-staleness = "P30D"
 ignore = [
     # Pingora transitive dependencies; not under our control.
     # derivative 2.2.0: unmaintained
