@@ -888,7 +888,7 @@ fn has_serde_attr(attrs: &[syn::Attribute], name: &str) -> bool {
 
 /// Parse fields from a config struct.
 fn parse_config_fields(s: &syn::ItemStruct) -> Option<Vec<RawField>> {
-    let syn::Fields::Named(ref fields) = s.fields else {
+    let syn::Fields::Named(fields) = &s.fields else {
         return None;
     };
 
@@ -1374,7 +1374,7 @@ fn render_inner_or(segment: &syn::PathSegment, enums: &BTreeMap<String, EnumInfo
 /// Render `Arc<str>` as `"string"`, other `Arc<T>` by inner type.
 fn render_arc_type(segment: &syn::PathSegment, enums: &BTreeMap<String, EnumInfo>) -> String {
     match extract_angle_bracket_arg(segment) {
-        Some(syn::Type::Path(ref p)) if p.path.segments.last().is_some_and(|s| s.ident == "str") => "string".to_owned(),
+        Some(syn::Type::Path(p)) if p.path.segments.last().is_some_and(|s| s.ident == "str") => "string".to_owned(),
         Some(t) => render_type(&t, enums),
         None => "any".to_owned(),
     }
@@ -1421,7 +1421,7 @@ fn extract_angle_bracket_arg(segment: &syn::PathSegment) -> Option<syn::Type> {
 
 /// Extract type arguments from angle brackets.
 fn extract_angle_bracket_args(segment: &syn::PathSegment) -> Vec<syn::Type> {
-    if let syn::PathArguments::AngleBracketed(ref args) = segment.arguments {
+    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
         return args
             .args
             .iter()

@@ -555,7 +555,7 @@ mod tests {
         let pipeline = FilterPipeline::build(&mut [], &registry).unwrap();
         let mut ctx = PingoraRequestCtx::default();
         ctx.response_phase_done = false;
-        ctx.extensions.insert(42u32);
+        ctx.extensions.insert(42_u32);
         ctx.request_snapshot = Some(praxis_filter::Request {
             method: http::Method::POST,
             uri: "/test".parse().unwrap(),

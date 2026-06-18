@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let mut ext = RequestExtensions::new();
-        ext.insert(42u32);
+        ext.insert(42_u32);
         assert_eq!(ext.get::<u32>(), Some(&42), "should retrieve inserted value");
     }
 
@@ -126,9 +126,9 @@ mod tests {
     #[test]
     fn multiple_types_coexist() {
         let mut ext = RequestExtensions::new();
-        ext.insert(1u32);
+        ext.insert(1_u32);
         ext.insert("text".to_owned());
-        ext.insert(1.5f64);
+        ext.insert(1.5_f64);
         assert_eq!(ext.get::<u32>(), Some(&1), "u32 should be present");
         assert_eq!(
             ext.get::<String>().map(String::as_str),
@@ -141,15 +141,15 @@ mod tests {
     #[test]
     fn insert_same_type_overwrites() {
         let mut ext = RequestExtensions::new();
-        ext.insert(1u32);
-        ext.insert(2u32);
+        ext.insert(1_u32);
+        ext.insert(2_u32);
         assert_eq!(ext.get::<u32>(), Some(&2), "second insert should overwrite first");
     }
 
     #[test]
     fn remove_returns_owned_value() {
         let mut ext = RequestExtensions::new();
-        ext.insert(99u32);
+        ext.insert(99_u32);
         let removed = ext.remove::<u32>();
         assert_eq!(removed, Some(99), "remove should return the stored value");
         assert!(ext.get::<u32>().is_none(), "value should be gone after remove");
@@ -164,22 +164,22 @@ mod tests {
     #[test]
     fn get_or_insert_with_creates_when_absent() {
         let mut ext = RequestExtensions::new();
-        let val = ext.get_or_insert_with(|| 42u32);
+        let val = ext.get_or_insert_with(|| 42_u32);
         assert_eq!(*val, 42, "should create value when absent");
     }
 
     #[test]
     fn get_or_insert_with_returns_existing() {
         let mut ext = RequestExtensions::new();
-        ext.insert(10u32);
-        let val = ext.get_or_insert_with(|| 42u32);
+        ext.insert(10_u32);
+        let val = ext.get_or_insert_with(|| 42_u32);
         assert_eq!(*val, 10, "should return existing value without calling factory");
     }
 
     #[test]
     fn get_wrong_type_returns_none() {
         let mut ext = RequestExtensions::new();
-        ext.insert(42u32);
+        ext.insert(42_u32);
         assert!(ext.get::<String>().is_none(), "wrong type should return None");
     }
 
