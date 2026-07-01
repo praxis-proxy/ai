@@ -198,6 +198,7 @@ impl HttpFilter for A2aFilter {
             a2a_method = a2a_envelope.method.as_str(),
             a2a_family = a2a_envelope.family.as_str(),
             streaming = a2a_envelope.streaming,
+            context_id = ?a2a_envelope.context_id,
             task_id = ?a2a_envelope.task_id,
             version = ?a2a_envelope.version,
             "extracted A2A envelope metadata"
@@ -646,6 +647,7 @@ fn write_metadata(
     set_safe_metadata(ctx, "a2a.original_method", a2a.original_method.as_deref());
     ctx.set_metadata("a2a.family", a2a.family.as_str());
     ctx.set_metadata("a2a.streaming", if a2a.streaming { "true" } else { "false" });
+    set_safe_metadata(ctx, "a2a.context_id", a2a.context_id.as_deref());
     set_safe_metadata(ctx, "a2a.task_id", a2a.task_id.as_deref());
     set_safe_metadata(ctx, "a2a.version", a2a.version.as_deref());
 }
@@ -682,6 +684,7 @@ fn promote_a2a_headers(
         headers.push((Cow::Owned(header_name.clone()), a2a.family.as_str().to_owned()));
     }
 
+    promote_optional_header(&config.headers.context_id, a2a.context_id.as_deref(), headers);
     promote_optional_header(&config.headers.task_id, a2a.task_id.as_deref(), headers);
 
     if let Some(header_name) = &config.headers.kind {
@@ -727,6 +730,7 @@ fn promote_filter_results(
     results.set("streaming", if a2a.streaming { "true" } else { "false" })?;
     results.set("kind", envelope.kind.as_str())?;
 
+    set_optional_result(results, "context_id", a2a.context_id.as_deref())?;
     set_optional_result(results, "task_id", a2a.task_id.as_deref())?;
     set_optional_result(results, "version", a2a.version.as_deref())?;
 

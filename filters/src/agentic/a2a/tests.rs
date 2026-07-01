@@ -149,6 +149,98 @@ fn reject_invalid_header_name() {
     );
 }
 
+#[test]
+fn default_context_id_header_config() {
+    let cfg: A2aConfig = serde_yaml::from_str("{}").unwrap();
+    assert_eq!(
+        cfg.headers.context_id,
+        Some("x-praxis-a2a-context-id".to_owned()),
+        "default context_id header should be x-praxis-a2a-context-id"
+    );
+}
+
+#[test]
+fn custom_context_id_header_config() {
+    let cfg: A2aConfig = serde_yaml::from_str(
+        r#"
+        headers:
+          context_id: x-custom-ctx
+        "#,
+    )
+    .unwrap();
+    let validated = build_config(cfg).unwrap();
+    assert_eq!(
+        validated.headers.context_id,
+        Some("x-custom-ctx".to_owned()),
+        "custom context_id header should be accepted"
+    );
+}
+
+#[test]
+fn null_context_id_header_config_disables_header() {
+    let cfg: A2aConfig = serde_yaml::from_str(
+        r#"
+        headers:
+          context_id: ~
+        "#,
+    )
+    .unwrap();
+    let validated = build_config(cfg).unwrap();
+    assert!(
+        validated.headers.context_id.is_none(),
+        "null context_id header should disable header promotion"
+    );
+}
+
+#[test]
+fn invalid_context_id_header_name_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        headers:
+          context_id: "invalid header with spaces"
+        "#,
+    )
+    .unwrap();
+    let err = A2aFilter::from_config(&yaml).err().expect("should fail");
+    assert!(
+        err.to_string().contains("not a valid HTTP header name"),
+        "invalid context_id header name should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn null_context_id_header_disables_header_but_promotes_metadata_and_results() {
+    let filter = make_filter(r#"{"headers": {"context_id": null}}"#);
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"contextId":"ctx-null-hdr","role":"ROLE_USER","parts":[]}}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release), "should release");
+    assert_eq!(
+        ctx.get_metadata("a2a.context_id"),
+        Some("ctx-null-hdr"),
+        "metadata should still promote context_id when header is null"
+    );
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key("x-praxis-a2a-context-id"),
+        "null header config should suppress header promotion"
+    );
+    let results = ctx.filter_results.get("a2a").unwrap();
+    assert_eq!(
+        results.get("context_id"),
+        Some("ctx-null-hdr"),
+        "filter results should still promote context_id when header is null"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Method Classification Tests
 // -----------------------------------------------------------------------------
@@ -404,6 +496,73 @@ fn version_extraction() {
 }
 
 #[test]
+fn send_message_context_id_extracted_from_message() {
+    let json = serde_json::json!({
+        "jsonrpc": "2.0", "method": "SendMessage",
+        "params": { "message": { "contextId": "ctx-42", "role": "ROLE_USER", "parts": [] } }, "id": 1
+    });
+    let envelope = extract_a2a_envelope(&json, "SendMessage", &BTreeMap::new(), &HeaderMap::new());
+    assert_eq!(
+        envelope.context_id,
+        Some("ctx-42".to_owned()),
+        "SendMessage should extract contextId from params.message.contextId"
+    );
+}
+
+#[test]
+fn send_streaming_message_context_id_extracted_from_message() {
+    let json = serde_json::json!({
+        "jsonrpc": "2.0", "method": "SendStreamingMessage",
+        "params": { "message": { "contextId": "ctx-stream", "role": "ROLE_USER", "parts": [] } }, "id": 1
+    });
+    let envelope = extract_a2a_envelope(&json, "SendStreamingMessage", &BTreeMap::new(), &HeaderMap::new());
+    assert_eq!(
+        envelope.context_id,
+        Some("ctx-stream".to_owned()),
+        "SendStreamingMessage should extract contextId from params.message.contextId"
+    );
+}
+
+#[test]
+fn list_tasks_context_id_extracted_from_params() {
+    let json = serde_json::json!({
+        "jsonrpc": "2.0", "method": "ListTasks",
+        "params": { "contextId": "ctx-list" }, "id": 1
+    });
+    let envelope = extract_a2a_envelope(&json, "ListTasks", &BTreeMap::new(), &HeaderMap::new());
+    assert_eq!(
+        envelope.context_id,
+        Some("ctx-list".to_owned()),
+        "ListTasks should extract contextId from params.contextId"
+    );
+}
+
+#[test]
+fn non_string_context_id_left_unset() {
+    let json = serde_json::json!({
+        "jsonrpc": "2.0", "method": "SendMessage",
+        "params": { "message": { "contextId": 42, "role": "ROLE_USER", "parts": [] } }, "id": 1
+    });
+    let envelope = extract_a2a_envelope(&json, "SendMessage", &BTreeMap::new(), &HeaderMap::new());
+    assert_eq!(
+        envelope.context_id, None,
+        "non-string params.message.contextId should leave context_id unset"
+    );
+}
+
+#[test]
+fn methods_without_context_id_do_not_extract_context() {
+    for method in ["GetTask", "CancelTask", "SubscribeToTask", "GetExtendedAgentCard"] {
+        let json = serde_json::json!({
+            "jsonrpc": "2.0", "method": method,
+            "params": { "id": "task-1", "contextId": "ctx-should-not-extract" }, "id": 1
+        });
+        let envelope = extract_a2a_envelope(&json, method, &BTreeMap::new(), &HeaderMap::new());
+        assert_eq!(envelope.context_id, None, "{method} should not extract contextId");
+    }
+}
+
+#[test]
 fn original_method_tracking() {
     let mut aliases = BTreeMap::new();
     aliases.insert("message/send".to_owned(), "SendMessage".to_owned());
@@ -485,6 +644,42 @@ async fn send_message_extracts_metadata() {
     assert_eq!(ctx.get_metadata("a2a.method"), Some("SendMessage"));
     assert_eq!(ctx.get_metadata("a2a.family"), Some("message"));
     assert_eq!(ctx.get_metadata("a2a.streaming"), Some("false"));
+}
+
+#[tokio::test]
+async fn send_message_context_id_promoted_to_metadata_headers_results() {
+    let filter = make_default_filter();
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"contextId":"ctx-promo","role":"ROLE_USER","parts":[]}}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release), "should release");
+    assert_eq!(
+        ctx.get_metadata("a2a.context_id"),
+        Some("ctx-promo"),
+        "context_id should be in durable metadata"
+    );
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert_eq!(
+        headers.get("x-praxis-a2a-context-id"),
+        Some(&"ctx-promo"),
+        "context_id should be promoted to header"
+    );
+
+    let results = ctx.filter_results.get("a2a").unwrap();
+    assert_eq!(
+        results.get("context_id"),
+        Some("ctx-promo"),
+        "context_id should be in filter results"
+    );
 }
 
 #[tokio::test]
@@ -1006,6 +1201,82 @@ async fn too_long_task_id_not_promoted() {
     assert!(
         !headers.contains_key("x-praxis-a2a-task-id"),
         "too-long task ID should not be promoted to header"
+    );
+}
+
+#[tokio::test]
+async fn context_id_control_chars_not_promoted() {
+    let filter = make_default_filter();
+    let body_str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"contextId\":\"ctx\\n123\",\"role\":\"ROLE_USER\",\"parts\":[]}}}";
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "control char context ID should still release"
+    );
+    assert_eq!(
+        ctx.get_metadata("a2a.context_id"),
+        None,
+        "context ID with control chars should not be promoted to metadata"
+    );
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key("x-praxis-a2a-context-id"),
+        "context ID with control chars should not be promoted to header"
+    );
+    let results = ctx.filter_results.get("a2a").unwrap();
+    assert_eq!(
+        results.get("context_id"),
+        None,
+        "context ID with control chars should not be in filter results"
+    );
+}
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "exhaustive safety assertions")]
+async fn context_id_too_long_not_promoted() {
+    let filter = make_default_filter();
+    let long_ctx = "c".repeat(257);
+    let body_str = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{{"message":{{"contextId":"{long_ctx}","role":"ROLE_USER","parts":[]}}}}}}"#
+    );
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "too-long context ID should still release"
+    );
+    assert_eq!(
+        ctx.get_metadata("a2a.context_id"),
+        None,
+        "context ID exceeding 256 bytes should not be promoted"
+    );
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key("x-praxis-a2a-context-id"),
+        "too-long context ID should not be promoted to header"
+    );
+    let results = ctx.filter_results.get("a2a").unwrap();
+    assert_eq!(
+        results.get("context_id"),
+        None,
+        "too-long context ID should not be in filter results"
     );
 }
 

@@ -713,8 +713,103 @@ fn a2a_subscribe_to_task_sse_captures_task_route() {
 }
 
 // -----------------------------------------------------------------------------
+// Context ID Routing Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn a2a_context_id_routes_to_context_specific_backend() {
+    let context_guard = start_backend_with_shutdown("context-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let yaml = a2a_context_routing_yaml(proxy_port, context_guard.port(), default_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"contextId":"ctx-123","role":"ROLE_USER","parts":[{"text":"hello"}]}}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", body, &[]);
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        "context-backend",
+        "SendMessage with contextId=ctx-123 should route to context-specific backend"
+    );
+
+    let body_no_ctx = r#"{"jsonrpc":"2.0","id":2,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"hello"}]}}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", body_no_ctx, &[]);
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        "default-backend",
+        "SendMessage without contextId should route to default backend"
+    );
+}
+
+#[test]
+fn a2a_spoofed_context_id_header_rejected() {
+    let context_guard = start_backend_with_shutdown("context-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let yaml = a2a_context_routing_yaml(proxy_port, context_guard.port(), default_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[]}}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", body, &[("x-praxis-a2a-context-id", "ctx-123")]);
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "client-supplied x-praxis-a2a-context-id should be rejected by reserved-header guard"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
+
+fn a2a_context_routing_yaml(proxy_port: u16, context_port: u16, default_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: a2a
+        max_body_bytes: 65536
+        on_invalid: continue
+        headers:
+          method: x-praxis-a2a-method
+          context_id: x-praxis-a2a-context-id
+      - filter: router
+        routes:
+          - path_prefix: "/a2a/"
+            headers:
+              x-praxis-a2a-context-id: "ctx-123"
+            cluster: "context"
+          - path_prefix: "/a2a/"
+            cluster: "default"
+      - filter: load_balancer
+        clusters:
+          - name: "context"
+            endpoints:
+              - "127.0.0.1:{context_port}"
+          - name: "default"
+            endpoints:
+              - "127.0.0.1:{default_port}"
+"#,
+    )
+}
 
 fn json_post_with_a2a_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> String {
     let mut extra = String::new();

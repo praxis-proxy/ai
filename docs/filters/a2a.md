@@ -10,6 +10,7 @@ Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method,
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `headers` | A2aHeaders | no | Header names for A2A metadata promotion. |
+| `headers.context_id` | string | no | Header name for the extracted context ID (e.g. `x-praxis-a2a-context-id`). |
 | `headers.family` | string | no | Header name for the A2A family (e.g. `x-praxis-a2a-family`). |
 | `headers.kind` | string | no | Header name for the JSON-RPC kind (e.g. `x-praxis-a2a-kind`). |
 | `headers.method` | string | no | Header name for the canonical A2A method (e.g. `x-praxis-a2a-method`). |
