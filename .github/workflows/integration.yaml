@@ -1,0 +1,126 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PRAXIS_LISTEN_ADDR: "127.0.0.1:8080"
+
+jobs:
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout AI filters
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: ai
+
+      - name: Checkout Praxis
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: praxis-proxy/praxis
+          path: praxis
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # 1.96.0
+        with:
+          toolchain: '1.96.0'
+
+      - uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            praxis/target
+          key: ${{ runner.os }}-rust-1.96.0-integration-${{ hashFiles('praxis/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.96.0-integration-
+          save-always: true
+
+      - name: Patch Praxis to use local AI filters
+        working-directory: praxis
+        run: |
+          AI_CRATES=$(cargo metadata --manifest-path ../ai/Cargo.toml --no-deps --format-version 1 2>/dev/null \
+            | jq -r '.packages[].name' 2>/dev/null || true)
+
+          if [ -z "$AI_CRATES" ]; then
+            echo "::warning::No crates found in AI repo workspace. Skipping."
+            exit 0
+          fi
+
+          for crate in $AI_CRATES; do
+            CRATE_PATH=$(cargo metadata --manifest-path ../ai/Cargo.toml --no-deps --format-version 1 \
+              | jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .manifest_path' \
+              | xargs dirname)
+
+            if grep -rq "\"$crate\"" Cargo.toml Cargo.lock 2>/dev/null; then
+              echo "Patching $crate -> $CRATE_PATH"
+              echo "" >> Cargo.toml
+              echo "[patch.crates-io]" >> Cargo.toml
+              echo "$crate = { path = \"$CRATE_PATH\" }" >> Cargo.toml
+            else
+              echo "Praxis does not depend on $crate, skipping"
+            fi
+          done
+
+      - name: Verify filter registry discovery
+        working-directory: praxis
+        run: |
+          cargo metadata --format-version 1 \
+            | jq '.packages[] | select(.metadata."praxis-filters" != null) | .name' \
+            || echo "::warning::No filter crates with [package.metadata.praxis-filters] found"
+
+      - name: Build Praxis with AI filters
+        working-directory: praxis
+        run: cargo build -p praxis-proxy --all-features
+
+      - name: Start Praxis
+        working-directory: praxis
+        run: |
+          cargo run -p praxis-proxy --all-features -- -c ../ai/tests/configs/praxis-integration.yaml &
+          PRAXIS_PID=$!
+          echo "PRAXIS_PID=$PRAXIS_PID" >> "$GITHUB_ENV"
+
+          # Wait for praxis to be ready
+          for i in $(seq 1 30); do
+            if curl -sf "http://${PRAXIS_LISTEN_ADDR}/health" > /dev/null 2>&1; then
+              echo "Praxis is ready (attempt $i)"
+              break
+            fi
+            if ! kill -0 "$PRAXIS_PID" 2>/dev/null; then
+              echo "::error::Praxis process exited unexpectedly"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if ! curl -sf "http://${PRAXIS_LISTEN_ADDR}/health" > /dev/null 2>&1; then
+            echo "::error::Praxis failed to start within 30 seconds"
+            exit 1
+          fi
+
+      - name: Run integration tests
+        working-directory: ai
+        run: cargo test --workspace --all-features -- --ignored integration
+        env:
+          TEST_MODE: mock
+          PRAXIS_URL: "http://127.0.0.1:8080"
+
+      - name: Stop Praxis
+        if: always()
+        run: |
+          if [ -n "$PRAXIS_PID" ] && kill -0 "$PRAXIS_PID" 2>/dev/null; then
+            kill "$PRAXIS_PID" || true
+            wait "$PRAXIS_PID" 2>/dev/null || true
+          fi
