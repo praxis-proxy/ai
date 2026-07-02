@@ -5,8 +5,6 @@
 
 Validates Anthropic Messages request bodies for proxy-owned JSON envelope requirements.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration
 
 | Field | Type | Required | Description |

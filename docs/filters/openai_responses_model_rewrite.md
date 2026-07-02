@@ -5,8 +5,6 @@
 
 Rewrites the `model` field in Responses API request bodies.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration Notes
 
 Quote wildcard alias keys in YAML, such as `"gpt-4.1-*"`, so `*` is parsed as a literal character rather than YAML alias syntax. The examples quote all alias keys for consistency.

@@ -5,8 +5,6 @@
 
 Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration Notes
 
 Classification formats: `openai_responses`, `openai_chat_completions`, `unknown_json`, `invalid_json`, `non_json`.

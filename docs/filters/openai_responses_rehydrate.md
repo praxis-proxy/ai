@@ -5,8 +5,6 @@
 
 Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input).
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration Notes
 
 The request body is **not** modified; downstream filters read from `ResponsesState.messages` instead.

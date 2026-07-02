@@ -5,8 +5,6 @@
 
 Handles all `/v1/conversations` endpoints locally.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration Notes
 
 All matched requests are served from the local store and never forwarded upstream. Unmatched paths pass through as `Continue`.
