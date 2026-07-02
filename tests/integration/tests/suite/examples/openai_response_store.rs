@@ -34,7 +34,7 @@ async fn response_store_persists_response_to_sqlite() {
     let proxy_port = free_port();
 
     let (db_url, db_path) = temp_sqlite_url("persist");
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
@@ -112,7 +112,7 @@ fn response_store_passes_through_non_responses_traffic() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", "sqlite::memory:"),
@@ -145,7 +145,7 @@ async fn response_store_delete_returns_200_after_post() {
     let proxy_port = free_port();
 
     let (db_url, db_path) = temp_sqlite_url("delete_200");
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
@@ -187,7 +187,7 @@ fn response_store_delete_nonexistent_returns_404() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", "sqlite::memory:"),
@@ -215,7 +215,7 @@ fn response_store_delete_has_json_content_type() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", "sqlite::memory:"),
@@ -246,7 +246,7 @@ fn response_store_delete_has_json_content_type() {
 fn get_missing_response_returns_404() {
     let proxy_port = free_port();
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", "sqlite::memory:"),
@@ -270,7 +270,7 @@ fn get_missing_response_returns_404() {
 fn get_missing_input_items_returns_404() {
     let proxy_port = free_port();
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", "sqlite::memory:"),

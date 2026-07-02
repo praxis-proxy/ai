@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 praxis = { workspace = true }
+praxis-ai-apis = { workspace = true }
+praxis-ai-proxy = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-protocol = { workspace = true }
@@ -33,3 +35,6 @@ tracing = { workspace = true }
 futures = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
+
+[features]
+ai-inference = []

@@ -22,7 +22,7 @@ fn example_config_wildcard_alias_routes_to_llama_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/model-rewrite.yaml",
+        "openai/responses/model-rewrite.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", llama_guard.port()),
@@ -51,7 +51,7 @@ fn example_config_default_model_routes_to_llama_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/model-rewrite.yaml",
+        "openai/responses/model-rewrite.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", llama_guard.port()),
@@ -80,7 +80,7 @@ fn example_config_qwen_alias_routes_to_qwen_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/model-rewrite.yaml",
+        "openai/responses/model-rewrite.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", llama_guard.port()),
@@ -109,7 +109,7 @@ fn example_config_non_responses_routes_to_default() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/model-rewrite.yaml",
+        "openai/responses/model-rewrite.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", llama_guard.port()),

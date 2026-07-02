@@ -20,7 +20,7 @@ fn responses_proxy_example_forwards_to_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/responses-proxy.yaml",
+        "openai/responses/responses-proxy.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -44,7 +44,7 @@ fn responses_proxy_example_preserves_json_response() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/responses-proxy.yaml",
+        "openai/responses/responses-proxy.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -67,7 +67,7 @@ fn responses_proxy_example_forwards_subresource_paths() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/responses-proxy.yaml",
+        "openai/responses/responses-proxy.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );

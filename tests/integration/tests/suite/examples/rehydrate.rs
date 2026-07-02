@@ -29,7 +29,7 @@ async fn rehydrate_validates_previous_response_and_passes_body_through() {
     let proxy_port = free_port();
 
     let (db_url, db_path) = temp_sqlite_url("rehydrate");
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/rehydrate.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/rehydrate.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
@@ -97,7 +97,7 @@ fn rehydrate_passes_through_non_responses_traffic() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/rehydrate.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/rehydrate.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", "sqlite::memory:"),
