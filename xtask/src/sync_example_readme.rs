@@ -25,6 +25,7 @@ const TITLE_OVERRIDES: &[(&str, &str)] = &[("openai", "OpenAI")];
 /// extraction.
 const SKIP_PREFIXES: &[&str] = &[
     "Backend endpoints ",
+    "Build:",
     "Example:",
     "Flow:",
     "Pipeline:",
@@ -38,12 +39,7 @@ const SKIP_PREFIXES: &[&str] = &[
 
 /// Entries that live outside `examples/configs/` but belong in the README.
 /// `(category, filename, link_path, description)`.
-const SPECIAL_ENTRIES: &[(&str, &str, &str, &str)] = &[(
-    "pipeline",
-    "default.yaml",
-    "../core/src/config/default.yaml",
-    "Built-in default config (static JSON on /)",
-)];
+const SPECIAL_ENTRIES: &[(&str, &str, &str, &str)] = &[];
 
 /// Marker line that separates the hand-maintained header from the
 /// auto-generated tables.

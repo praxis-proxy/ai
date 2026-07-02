@@ -1,5 +1,8 @@
 # Prompt Enrichment
 #
+# Build:
+#   cargo build -p praxis-ai-proxy
+#
 # Injects system messages into OpenAI-compatible chat completion
 # requests before forwarding to the upstream provider. The system
 # prompt is defined at the proxy layer and cannot be overridden

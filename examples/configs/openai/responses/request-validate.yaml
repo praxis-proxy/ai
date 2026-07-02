@@ -3,6 +3,9 @@
 # Validates Responses API requests and rejects invalid parameter
 # combinations.
 #
+# Build:
+#   cargo build -p praxis-ai-proxy
+#
 # The openai_responses_format classifier must run before openai_responses_validate.
 # It buffers the body, classifies the request as Responses API, and
 # promotes model/stream/store/background to openai_responses_format.*

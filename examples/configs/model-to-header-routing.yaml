@@ -1,5 +1,8 @@
 # AI Inference Model Routing
 #
+# Build:
+#   cargo build -p praxis-ai-proxy
+#
 # Routes LLM API requests to different backends based on the
 # "model" field in the JSON request body. Uses the model_to_header
 # filter to extract the model name into an X-Model header, then

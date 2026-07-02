@@ -27,6 +27,9 @@
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_abc"}'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
 
 listeners:
   - name: ai-gateway

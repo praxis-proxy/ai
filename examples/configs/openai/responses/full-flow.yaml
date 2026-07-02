@@ -61,6 +61,9 @@
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"test","stream":true,"background":true}'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
 
 listeners:
   - name: ai-gateway
