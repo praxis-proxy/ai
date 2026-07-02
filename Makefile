@@ -13,7 +13,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-integration \
-	lint fmt doc audit \
+	lint fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
 	setup-hooks help
@@ -89,6 +89,13 @@ doc:
 audit:
 	cargo audit
 	cargo deny check
+
+coverage-check:
+	cargo llvm-cov --workspace --json \
+		--exclude xtask \
+		--ignore-filename-regex '(target/|tests/)' \
+		--fail-under-lines 95 \
+		--output-path coverage.json
 
 # -------------------------------------------------------------------
 # Dev Setup
