@@ -99,10 +99,7 @@ pub struct InputItemPage {
 /// Returns [`StoreError::InvalidInput`] if the cursor is malformed
 /// or overflows while calculating the page window.
 pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<InputItemPage, StoreError> {
-    let mut items = match &record.input {
-        serde_json::Value::Array(arr) => arr.clone(),
-        other => vec![other.clone()],
-    };
+    let mut items = normalize_input_items(&record.input);
     if params.order == Order::Descending {
         items.reverse();
     }
@@ -130,6 +127,30 @@ pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<
         next_cursor,
         has_more,
     })
+}
+
+/// Normalize raw stored input into a list of Responses API items.
+///
+/// The stored `input` column preserves the original create-request
+/// value verbatim (`"Hello"`, `null`, or an `ItemResource[]` array).
+/// The `/v1/responses/{id}/input_items` endpoint returns
+/// `ItemResource[]`, so this function applies the same
+/// normalization as [`append_stored_input_items`] in the store
+/// filter: string input becomes a user message item, null input
+/// yields an empty list, and arrays/objects pass through as-is.
+///
+/// [`append_stored_input_items`]: super::filter
+fn normalize_input_items(input: &serde_json::Value) -> Vec<serde_json::Value> {
+    match input {
+        serde_json::Value::Null => vec![],
+        serde_json::Value::String(text) => vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": text
+        })],
+        serde_json::Value::Array(arr) => arr.clone(),
+        other => vec![other.clone()],
+    }
 }
 
 /// Resolve an `after` cursor to the offset where the next page starts.

@@ -3047,20 +3047,25 @@ fn make_record_with_input(input: serde_json::Value) -> ResponseRecord {
 }
 
 #[test]
-fn list_input_items_scalar_input_wrapped_as_single_item() {
+fn list_input_items_scalar_input_normalized_to_message_item() {
     let record = make_record_with_input(json!("Hello"));
     let page = list_input_items(&record, &ListParams::default()).unwrap();
-    assert_eq!(page.data.len(), 1, "scalar input should be wrapped as single item");
-    assert_eq!(page.data[0], json!("Hello"));
+    assert_eq!(page.data.len(), 1, "string input should produce one message item");
+    assert_eq!(
+        page.data[0],
+        json!({"type": "message", "role": "user", "content": "Hello"}),
+        "string input should be normalized to a user message item per the ItemResource schema"
+    );
     assert!(!page.has_more);
 }
 
 #[test]
-fn list_input_items_null_input_returns_single_null_item() {
+fn list_input_items_null_input_returns_empty_page() {
     let record = make_record_with_input(json!(null));
     let page = list_input_items(&record, &ListParams::default()).unwrap();
-    assert_eq!(page.data.len(), 1, "null input should be wrapped as single item");
-    assert_eq!(page.data[0], json!(null));
+    assert!(page.data.is_empty(), "null input should yield no items");
+    assert!(!page.has_more);
+    assert!(page.next_cursor.is_none());
 }
 
 #[test]
@@ -3621,9 +3626,13 @@ async fn get_input_items_with_scalar_input() {
     assert_eq!(
         body["data"].as_array().unwrap().len(),
         1,
-        "scalar input should be wrapped as single item"
+        "string input should produce one message item"
     );
-    assert_eq!(body["data"][0], json!("hello world"));
+    assert_eq!(
+        body["data"][0],
+        json!({"type": "message", "role": "user", "content": "hello world"}),
+        "string input should be normalized to a user message item"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
