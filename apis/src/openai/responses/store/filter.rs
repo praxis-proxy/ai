@@ -15,8 +15,8 @@
 //!   on store init failure for requests that would otherwise persist.
 //!
 //! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
-//!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and
-//!   bail early.
+//!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
+//!   early.
 //!
 //! - **`on_response_body`**: at end-of-stream, extracts the record from the buffered response JSON or accumulated
 //!   streaming [`ResponsesState`] and persists it synchronously via [`block_in_place`] before returning to Pingora.
@@ -640,9 +640,14 @@ pub(super) fn build_record_from_state(
     }
 
     let json = &state.response_object;
-    let id = json.get("id").and_then(Value::as_str)?;
-    let created_at = json.get("created_at").and_then(Value::as_i64)?;
-    let model = json.get("model").and_then(Value::as_str)?;
+    let id = json.get("id").and_then(Value::as_str);
+    let created_at = json.get("created_at").and_then(Value::as_i64);
+    let model = json.get("model").and_then(Value::as_str);
+
+    let (Some(id), Some(created_at), Some(model)) = (id, created_at, model) else {
+        warn!("streaming persistence: missing required field (id, created_at, or model)");
+        return None;
+    };
 
     let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
     let capture = ResponseCapture::from_response_json(json, request_input, state_messages);

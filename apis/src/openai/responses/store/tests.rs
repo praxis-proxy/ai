@@ -757,6 +757,63 @@ async fn on_response_body_skips_streaming_persist_when_no_state() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_streaming_response_at_eos() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
+    assert!(store_opt.is_some(), "store should be initialized for streaming");
+
+    let response_json = json!({
+        "id": "resp_stream_unit",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "Streamed reply"}]
+    });
+    ctx.extensions.insert(ResponsesState {
+        response_object: response_json.clone(),
+        persisted_messages: vec![json!({"role": "user", "content": "Hello"})],
+        ..Default::default()
+    });
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should continue after persisting streaming response"
+    );
+
+    let store = store_opt.as_ref().unwrap();
+    let record = store
+        .get_response("default", "resp_stream_unit")
+        .await
+        .expect("get_response should succeed")
+        .expect("record should exist after streaming persist");
+
+    assert_eq!(record.id, "resp_stream_unit", "persisted ID should match");
+    assert_eq!(record.created_at, 1_719_900_000, "persisted created_at should match");
+    assert_eq!(record.model, "gpt-4.1", "persisted model should match");
+    assert_eq!(record.tenant_id, "default", "persisted tenant_id should be default");
+    assert_eq!(
+        record.response_object, response_json,
+        "persisted response_object should match the accumulated state"
+    );
+    assert_eq!(
+        record.messages,
+        json!([
+            {"role": "user", "content": "Hello"},
+            {"type": "message", "role": "assistant", "content": "Streamed reply"}
+        ]),
+        "persisted messages should combine persisted input history with streamed output"
+    );
+}
+
 #[test]
 fn build_record_from_state_returns_none_for_null_response_object() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
