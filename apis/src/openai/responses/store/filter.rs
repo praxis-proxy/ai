@@ -18,8 +18,8 @@
 //!   non-JSON responses set `responses.skip_persist` and bail early.
 //!
 //! - **`on_response_body`**: at end-of-stream, extracts the record from the buffered response JSON or accumulated
-//!   streaming [`ResponsesState`] and persists it synchronously via [`block_in_place`] before returning to Pingora. This
-//!   guarantees the record is durable before the client observes the completed response, preventing races with
+//!   streaming [`ResponsesState`] and persists it synchronously via [`block_in_place`] before returning to Pingora.
+//!   This guarantees the record is durable before the client observes the completed response, preventing races with
 //!   subsequent operations like `DELETE /v1/responses/{id}`. Non-persistable exchanges release chunks immediately via
 //!   [`FilterAction::Release`] to avoid holding pass-through traffic in the `StreamBuffer`.
 //!
