@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "dashmap 6.2.1",
  "praxis-proxy-tls",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "notify",

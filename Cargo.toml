@@ -49,10 +49,10 @@ wiremock = "0.6.5"
 zeroize = "1.9.0"
 
 # Praxis core dependencies (path for development, version for release)
-praxis-core = { version = "0.3.1", path = "../praxis/core", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.3.1", path = "../praxis/filter", package = "praxis-proxy-filter" }
-praxis-protocol = { version = "0.3.1", path = "../praxis/protocol", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.3.1", path = "../praxis/tls", package = "praxis-proxy-tls" }
+praxis-core = { version = "0.4.0", path = "../praxis/core", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.4.0", path = "../praxis/filter", package = "praxis-proxy-filter" }
+praxis-protocol = { version = "0.4.0", path = "../praxis/protocol", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.4.0", path = "../praxis/tls", package = "praxis-proxy-tls" }
 praxis-test-utils = { path = "../praxis/tests/utils" }
 
 # Praxis AI workspace dependencies

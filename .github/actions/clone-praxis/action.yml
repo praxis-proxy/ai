@@ -1,0 +1,15 @@
+name: Clone Praxis core
+description: >-
+  Temporary: clone praxis core repo as a sibling
+  directory so path dependencies resolve. Remove
+  once praxis crates are published to crates.io.
+
+runs:
+  using: composite
+  steps:
+    - name: Clone praxis core
+      run: >-
+        git clone --depth 1
+        https://github.com/praxis-proxy/praxis.git
+        "$GITHUB_WORKSPACE/../praxis"
+      shell: bash
