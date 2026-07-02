@@ -2963,6 +2963,7 @@ dependencies = [
  "futures",
  "h2",
  "http",
+ "praxis-ai-apis",
  "praxis-ai-proxy",
  "praxis-proxy",
  "praxis-proxy-core",

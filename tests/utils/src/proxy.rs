@@ -50,6 +50,7 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
             config.insecure_options.allow_unbounded_body,
         )
         .unwrap();
+    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
     Arc::new(pipeline)
 }
 
