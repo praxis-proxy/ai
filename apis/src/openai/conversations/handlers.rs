@@ -484,7 +484,7 @@ fn duplicate_item_id(items: &[ConversationItemRecord]) -> Option<&str> {
 
 /// Build store records for normalized conversation item JSON values.
 #[expect(clippy::too_many_arguments, reason = "factoring into struct would add indirection")]
-fn build_item_records(
+pub(super) fn build_item_records(
     ctx: &HttpFilterContext<'_>,
     tenant_id: &str,
     conversation_id: &str,
@@ -511,7 +511,7 @@ fn build_item_records(
 }
 
 /// Ensure an item is an object and has a usable ID.
-fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result<(String, Value), String> {
+pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result<(String, Value), String> {
     let Value::Object(mut map) = item else {
         return Err("each item must be a JSON object".to_owned());
     };
@@ -573,7 +573,7 @@ fn normalize_message_content(role: &str, content: Value) -> Result<Value, String
 }
 
 /// Generate a conversation item ID.
-fn generated_item_id(ctx: &HttpFilterContext<'_>) -> String {
+pub(super) fn generated_item_id(ctx: &HttpFilterContext<'_>) -> String {
     let raw_id = ctx.id_generator.generate(ctx.time_source);
     format!("item_{raw_id}")
 }
@@ -648,7 +648,7 @@ fn decode_query_component(value: &str) -> String {
 }
 
 /// Return the current Unix timestamp as an `i64`.
-fn current_timestamp(ctx: &HttpFilterContext<'_>) -> i64 {
+pub(super) fn current_timestamp(ctx: &HttpFilterContext<'_>) -> i64 {
     i64::try_from(ctx.time_source.now().as_secs()).unwrap_or(i64::MAX)
 }
 
@@ -739,7 +739,7 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
 /// Re-reads all items on every mutation rather than patching the JSON
 /// array incrementally. Acceptable because conversations hold a small
 /// number of items; incremental updates would risk drift.
-async fn sync_conversation_messages(
+pub(super) async fn sync_conversation_messages(
     store: &dyn ConversationItemStore,
     record: ConversationRecord,
 ) -> Result<(), StoreError> {

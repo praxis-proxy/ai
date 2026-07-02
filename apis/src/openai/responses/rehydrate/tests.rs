@@ -648,6 +648,7 @@ async fn deduplicates_mcp_tools_independent_of_tool_order() {
     );
     let store = MockStore {
         records,
+        conversations: std::collections::HashMap::new(),
         should_fail: false,
     };
     let registry = setup_registry(store);
@@ -708,6 +709,7 @@ async fn extracts_mcp_tools_from_stored_history_when_latest_output_has_none() {
     );
     let store = MockStore {
         records,
+        conversations: std::collections::HashMap::new(),
         should_fail: false,
     };
     let registry = setup_registry(store);
@@ -958,6 +960,7 @@ async fn fallback_reconstruction_excludes_mcp_list_tools_but_preserves_outputs()
     );
     let store = MockStore {
         records,
+        conversations: std::collections::HashMap::new(),
         should_fail: false,
     };
     let registry = setup_registry(store);
@@ -1014,11 +1017,253 @@ async fn fallback_reconstruction_excludes_mcp_list_tools_but_preserves_outputs()
 }
 
 // -----------------------------------------------------------------------------
+// Conversation Rehydration
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rehydrates_from_conversation_string_id() {
+    let messages = json!([
+        {"role": "user", "content": "turn one"},
+        {"role": "assistant", "content": "reply one"}
+    ]);
+    let store = MockStore::with_conversation("conv_abc", messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"turn two","conversation":"conv_abc"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "should release after conversation rehydration"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated from conversation");
+    assert_eq!(
+        state.messages.len(),
+        3,
+        "messages should contain 2 stored + 1 current input"
+    );
+    assert_eq!(state.messages[0]["content"], "turn one", "first stored message");
+    assert_eq!(state.messages[1]["content"], "reply one", "second stored message");
+    assert_eq!(state.messages[2]["content"], "turn two", "current input should be last");
+
+    assert_eq!(
+        state.persisted_messages.len(),
+        3,
+        "persisted_messages should mirror messages for conversation rehydration"
+    );
+}
+
+#[tokio::test]
+async fn rehydrates_from_conversation_object_form() {
+    let messages = json!([
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"}
+    ]);
+    let store = MockStore::with_conversation("conv_obj", messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"follow up","conversation":{"id":"conv_obj"}}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "should release after conversation object rehydration"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated from conversation object");
+    assert_eq!(
+        state.messages.len(),
+        3,
+        "messages should contain 2 stored + 1 current input"
+    );
+    assert_eq!(state.messages[0]["content"], "hello", "first stored message");
+    assert_eq!(
+        state.messages[2]["content"], "follow up",
+        "current input should be last"
+    );
+}
+
+#[tokio::test]
+async fn previous_response_id_takes_precedence_over_conversation() {
+    let response_messages = json!([
+        {"role": "user", "content": "from response"},
+        {"role": "assistant", "content": "response reply"}
+    ]);
+    let mut store = MockStore::with_completed_response("resp_win", json!("from response"), response_messages);
+    store.conversations.insert(
+        "conv_lose".to_owned(),
+        ConversationRecord {
+            conversation_id: "conv_lose".to_owned(),
+            tenant_id: "default".to_owned(),
+            created_at: 1000,
+            metadata: json!({}),
+            messages: json!([
+                {"role": "user", "content": "from conversation"},
+                {"role": "assistant", "content": "conversation reply"}
+            ]),
+        },
+    );
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"next","previous_response_id":"resp_win","conversation":"conv_lose"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "should release after rehydration"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated");
+    assert_eq!(
+        state.messages[0]["content"], "from response",
+        "previous_response_id should take precedence over conversation"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.previous_response_id"),
+        Some("resp_win"),
+        "previous_response_id metadata should be set"
+    );
+}
+
+#[tokio::test]
+async fn rejects_when_conversation_not_found() {
+    let store = MockStore::empty();
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_missing"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => assert_eq!(r.status, 400, "missing conversation should reject with 400"),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn empty_conversation_produces_valid_state() {
+    let store = MockStore::with_conversation("conv_empty", json!([]));
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"first message","conversation":"conv_empty"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "empty conversation should release successfully"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated for empty conversation");
+    assert_eq!(
+        state.messages.len(),
+        1,
+        "messages should contain only the current input"
+    );
+    assert_eq!(state.messages[0]["content"], "first message", "current input");
+}
+
+#[tokio::test]
+async fn conversation_rehydration_requires_store_registry() {
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_123"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => assert_eq!(r.status, 500, "missing store registry should reject with 500"),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn conversation_null_messages_treated_as_empty() {
+    let store = MockStore::with_conversation("conv_null_msgs", Value::Null);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"test","conversation":"conv_null_msgs"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "null messages should release successfully"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated");
+    assert_eq!(
+        state.messages.len(),
+        1,
+        "null conversation messages should contribute zero stored items"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
 struct MockStore {
     records: std::collections::HashMap<String, ResponseRecord>,
+    conversations: std::collections::HashMap<String, ConversationRecord>,
     should_fail: bool,
 }
 
@@ -1043,6 +1288,26 @@ impl MockStore {
         );
         Self {
             records,
+            conversations: std::collections::HashMap::new(),
+            should_fail: false,
+        }
+    }
+
+    fn with_conversation(id: &str, messages: Value) -> Self {
+        let mut conversations = std::collections::HashMap::new();
+        conversations.insert(
+            id.to_owned(),
+            ConversationRecord {
+                conversation_id: id.to_owned(),
+                tenant_id: "default".to_owned(),
+                created_at: 1000,
+                metadata: json!({}),
+                messages,
+            },
+        );
+        Self {
+            records: std::collections::HashMap::new(),
+            conversations,
             should_fail: false,
         }
     }
@@ -1077,6 +1342,7 @@ impl MockStore {
         );
         Self {
             records,
+            conversations: std::collections::HashMap::new(),
             should_fail: false,
         }
     }
@@ -1097,6 +1363,7 @@ impl MockStore {
         );
         Self {
             records,
+            conversations: std::collections::HashMap::new(),
             should_fail: false,
         }
     }
@@ -1104,6 +1371,7 @@ impl MockStore {
     fn empty() -> Self {
         Self {
             records: std::collections::HashMap::new(),
+            conversations: std::collections::HashMap::new(),
             should_fail: false,
         }
     }
@@ -1111,6 +1379,7 @@ impl MockStore {
     fn failing() -> Self {
         Self {
             records: std::collections::HashMap::new(),
+            conversations: std::collections::HashMap::new(),
             should_fail: true,
         }
     }
@@ -1136,9 +1405,18 @@ impl ResponseStore for MockStore {
     async fn get_conversation(
         &self,
         _tenant_id: &str,
-        _conversation_id: &str,
+        conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
-        Ok(None)
+        if self.should_fail {
+            return Err(StoreError::Unavailable("mock failure".to_owned()));
+        }
+        Ok(self.conversations.get(conversation_id).map(|c| ConversationRecord {
+            conversation_id: c.conversation_id.clone(),
+            tenant_id: c.tenant_id.clone(),
+            created_at: c.created_at,
+            metadata: c.metadata.clone(),
+            messages: c.messages.clone(),
+        }))
     }
 }
 

@@ -109,14 +109,7 @@ impl ResponsesProxyFilter {
         state: &ResponsesState,
         streaming: bool,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let mut outbound = state.request_body.clone();
-        if let Some(obj) = outbound.as_object_mut() {
-            obj.insert("input".to_owned(), serde_json::Value::Array(state.messages.clone()));
-            if obj.remove("previous_response_id").is_some() {
-                debug!("stripped previous_response_id from outbound body");
-            }
-        }
-
+        let outbound = rebuild_outbound_body(state);
         let serialized =
             serde_json::to_vec(&outbound).map_err(|e| -> FilterError { format!("responses_proxy: {e}").into() })?;
         if serialized.len() > self.config.max_body_bytes {
@@ -195,4 +188,23 @@ impl HttpFilter for ResponsesProxyFilter {
 
         Ok(FilterAction::Continue)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build the outbound JSON body from conversation state.
+fn rebuild_outbound_body(state: &ResponsesState) -> serde_json::Value {
+    let mut outbound = state.request_body.clone();
+    if let Some(obj) = outbound.as_object_mut() {
+        obj.insert("input".to_owned(), serde_json::Value::Array(state.messages.clone()));
+        if obj.remove("previous_response_id").is_some() {
+            debug!("stripped previous_response_id from outbound body");
+        }
+        if obj.remove("conversation").is_some() {
+            debug!("stripped conversation from outbound body");
+        }
+    }
+    outbound
 }

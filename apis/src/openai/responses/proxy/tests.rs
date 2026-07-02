@@ -258,6 +258,66 @@ async fn rejects_oversized_rebuilt_body_with_413() {
     );
 }
 
+#[tokio::test]
+async fn strips_conversation_from_outbound_body() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "conversation": {"id": "conv_abc123"}
+    });
+    let state = ResponsesState::from_request_body(request_body);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"hello","conversation":{"id":"conv_abc123"}}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        rebuilt.get("conversation").is_none(),
+        "conversation should be stripped from outbound body"
+    );
+    assert_eq!(rebuilt["model"], "gpt-4o");
+}
+
+#[tokio::test]
+async fn strips_both_previous_response_id_and_conversation() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "previous_response_id": "resp_abc123",
+        "conversation": "conv_xyz789"
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state
+        .messages
+        .splice(0..0, vec![json!({"role": "user", "content": "stored"})]);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"hello","previous_response_id":"resp_abc123","conversation":"conv_xyz789"}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        rebuilt.get("previous_response_id").is_none(),
+        "previous_response_id should be stripped"
+    );
+    assert!(rebuilt.get("conversation").is_none(), "conversation should be stripped");
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

@@ -489,7 +489,14 @@ fn request_will_persist_response(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Check whether rehydrate needs the store before the request phase.
 fn request_needs_rehydrate_store(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.request.method == http::Method::POST && is_responses_format(ctx) && has_previous_response_id(ctx)
+    ctx.request.method == http::Method::POST
+        && is_responses_format(ctx)
+        && (has_previous_response_id(ctx) || has_conversation(ctx))
+}
+
+/// Return whether the request references a conversation.
+fn has_conversation(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
 }
 
 /// Return whether the request method is not persistable.

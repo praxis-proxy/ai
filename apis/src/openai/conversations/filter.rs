@@ -15,14 +15,18 @@ use praxis_filter::{
     parse_filter_config,
 };
 use secrecy::ExposeSecret as _;
+use serde_json::Value;
 use tokio::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use super::{
     config::{ConversationsConfig, StorageBackend, revalidate_postgres_host, validate_config},
     handlers,
 };
-use crate::store::{ConversationItemStore, PostgresResponseStore, SqliteResponseStore, StoreError};
+use crate::{
+    openai::responses::{DEFAULT_TENANT_ID, TENANT_METADATA_KEY, state::ResponsesState},
+    store::{ConversationItemStore, ConversationRecord, PostgresResponseStore, SqliteResponseStore, StoreError},
+};
 
 // -----------------------------------------------------------------------------
 // OpenaiConversationsFilter
@@ -58,6 +62,13 @@ struct ConversationRequestState {
 
     /// Full body captured by an early pre-read pass.
     deferred_body: Option<Bytes>,
+}
+
+/// Per-request response-phase state that controls whether append-back
+/// should run during `on_response_body`.
+struct ConversationResponseState {
+    /// Whether response body buffering is armed for append-back.
+    armed: bool,
 }
 
 /// Matched POST route variants handled locally.
@@ -244,6 +255,26 @@ impl OpenaiConversationsFilter {
             PostRoute::CreateItems(id) => handlers::handle_create_items(ctx, store, id, body).await,
         }
     }
+
+    /// Persist conversation items synchronously using `block_in_place`.
+    fn append_items_blocking(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        ctx: &HttpFilterContext<'_>,
+        items: Vec<Value>,
+    ) -> Result<(), FilterError> {
+        let store = self
+            .store
+            .get()
+            .and_then(Option::as_ref)
+            .ok_or_else(|| FilterError::from("openai_conversations: store unavailable for append-back"))?;
+
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| {
+            handle.block_on(persist_items(store.as_ref(), tenant_id, conversation_id, ctx, items))
+        })
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -260,10 +291,24 @@ impl HttpFilter for OpenaiConversationsFilter {
         BodyAccess::ReadOnly
     }
 
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        }
+    }
+
+    fn needs_request_context(&self) -> bool {
+        true
     }
 
     #[expect(clippy::too_many_lines, reason = "dispatcher with one arm per endpoint")]
@@ -309,7 +354,12 @@ impl HttpFilter for OpenaiConversationsFilter {
                 };
                 Box::pin(Self::handle_post_route(ctx, store.as_ref(), route, &body)).await
             },
-            _ => Ok(FilterAction::Continue),
+            _ => {
+                if should_append_back(ctx) {
+                    drop(self.get_or_init_store().await);
+                }
+                Ok(FilterAction::Continue)
+            },
         }
     }
 
@@ -342,6 +392,199 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Reject(reject_store_unavailable()));
         };
         Box::pin(Self::handle_post_route(ctx, store.as_ref(), route, bytes)).await
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if !should_append_back(ctx) {
+            ctx.insert_filter_state(ConversationResponseState { armed: false });
+            return Ok(FilterAction::Continue);
+        }
+
+        let resp = ctx.response_header.as_ref();
+        let is_success = resp.is_none_or(|r| r.status.is_success());
+        let is_json = resp
+            .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("application/json")
+            });
+
+        let armed = is_success && is_json;
+        if !armed {
+            trace!("conversation append-back skipped (non-2xx or non-JSON response)");
+        }
+        ctx.insert_filter_state(ConversationResponseState { armed });
+
+        if armed {
+            drop(self.get_or_init_store().await);
+        }
+
+        Ok(FilterAction::Continue)
+    }
+
+    fn on_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let armed = ctx
+            .get_filter_state::<ConversationResponseState>()
+            .is_some_and(|s| s.armed);
+
+        if !armed {
+            return Ok(FilterAction::Release);
+        }
+
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
+        let Some(items) = extract_append_back_items(ctx, body) else {
+            return Ok(FilterAction::Continue);
+        };
+
+        let conv_id = items.conversation_id;
+        if let Err(e) = self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items) {
+            warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed");
+        }
+
+        Ok(FilterAction::Continue)
+    }
+}
+
+/// Whether this request should trigger conversation append-back on
+/// the response path.
+fn should_append_back(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
+        && ctx.get_metadata("responses.conversation_id").is_some()
+        && ctx.get_metadata("openai_responses_format.stream") != Some("true")
+        && ctx.get_metadata("openai_responses_format.background") != Some("true")
+}
+
+// -----------------------------------------------------------------------------
+// Append-Back
+// -----------------------------------------------------------------------------
+
+/// Collected items for append-back persistence.
+struct AppendBackItems {
+    /// Target conversation ID.
+    conversation_id: String,
+    /// Tenant scope for the conversation.
+    tenant_id: String,
+    /// Input + output items to persist.
+    all_items: Vec<Value>,
+}
+
+/// Extract and merge input+output items from the response body for
+/// append-back. Returns `None` when there is nothing to persist.
+fn extract_append_back_items(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> Option<AppendBackItems> {
+    let bytes = body.as_ref().filter(|b| !b.is_empty())?;
+    let conv_id = ctx.get_metadata("responses.conversation_id")?.to_owned();
+    let tenant_id = ctx
+        .get_metadata(TENANT_METADATA_KEY)
+        .unwrap_or(DEFAULT_TENANT_ID)
+        .to_owned();
+
+    let all_items = merge_input_output_items(ctx, bytes)?;
+
+    Some(AppendBackItems {
+        conversation_id: conv_id,
+        tenant_id,
+        all_items,
+    })
+}
+
+/// Parse the response body and combine request input items with
+/// response output items. Returns `None` when both are empty.
+fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<Vec<Value>> {
+    let response_json: Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "conversation append-back: invalid response JSON");
+            return None;
+        },
+    };
+
+    let status = response_json.get("status").and_then(Value::as_str).unwrap_or_default();
+    if status != "completed" {
+        trace!(status, "conversation append-back skipped (response not completed)");
+        return None;
+    }
+
+    let output_items = response_json
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let input_items = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .map(|state| state.input.clone())
+        .unwrap_or_default();
+
+    if input_items.is_empty() && output_items.is_empty() {
+        return None;
+    }
+
+    let mut all_items = input_items;
+    all_items.extend(output_items);
+    Some(all_items)
+}
+
+/// Persist items and refresh the denormalized message cache.
+async fn persist_items(
+    store: &dyn ConversationItemStore,
+    tenant_id: &str,
+    conversation_id: &str,
+    ctx: &HttpFilterContext<'_>,
+    items: Vec<Value>,
+) -> Result<(), FilterError> {
+    let max_pos = store
+        .max_item_position(tenant_id, conversation_id)
+        .await
+        .map_err(|e| -> FilterError { Box::new(e) })?;
+    let start_position = max_pos.saturating_add(1);
+    let created_at = handlers::current_timestamp(ctx);
+
+    let records = handlers::build_item_records(ctx, tenant_id, conversation_id, created_at, start_position, items)
+        .map_err(|e| -> FilterError { e.into() })?;
+
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    let count = records.len();
+    store
+        .create_conversation_items(&records)
+        .await
+        .map_err(|e| -> FilterError { Box::new(e) })?;
+
+    refresh_message_cache(store, tenant_id, conversation_id).await;
+    debug!(
+        conversation_id,
+        tenant_id, count, "conversation items appended from response"
+    );
+
+    Ok(())
+}
+
+/// Refresh the denormalized conversation message cache after item mutation.
+async fn refresh_message_cache(store: &dyn ConversationItemStore, tenant_id: &str, conversation_id: &str) {
+    let record = ConversationRecord {
+        conversation_id: conversation_id.to_owned(),
+        tenant_id: tenant_id.to_owned(),
+        created_at: 0,
+        metadata: Value::Object(serde_json::Map::default()),
+        messages: Value::Null,
+    };
+    if let Err(e) = handlers::sync_conversation_messages(store, record).await {
+        warn!(error = %e, conversation_id, "conversation message sync failed after append-back");
     }
 }
 

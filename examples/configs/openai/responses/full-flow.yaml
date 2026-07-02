@@ -1,33 +1,43 @@
 # Responses API Full Flow
 #
-# Combines format classification, request validation, and backend
-# routing into a single pipeline. This is the unified config that
-# operators would deploy for a Responses API gateway:
+# Combines conversations, format classification, request validation,
+# and backend routing into a single pipeline. This is the unified
+# config that operators would deploy for a Responses API gateway:
 #
-#   1. openai_responses_format classifies the request and rejects
-#      unknown/invalid/non-JSON traffic. It promotes format, model,
-#      stream, and mode to internal routing headers.
+#   1. openai_conversations handles CRUD for the Conversations API
+#      (/v1/conversations) and sets has_conversation metadata when
+#      a Responses request carries a conversation field. On the
+#      response path it appends input+output items back to the
+#      conversation after a successful non-streaming response.
 #
-#   2. openai_responses_validate checks parameter combinations
+#   2. openai_responses_format classifies the request and promotes
+#      format, model, stream, and mode to internal routing headers.
+#      on_invalid is left at the default (passthrough) so that
+#      Conversations API traffic is not rejected before the
+#      conversations filter can handle it in the body phase.
+#
+#   3. openai_responses_validate checks parameter combinations
 #      (stream+background, background+store), generates response
 #      and conversation IDs, and writes responses.* metadata for
 #      downstream filters. Skips non-Responses requests gracefully.
 #
-#   3. openai_response_store persists non-streaming responses to
+#   4. openai_response_store persists non-streaming responses to
 #      SQLite and registers the store backend so downstream filters
 #      (rehydrate, compact) can read from it.
 #
-#   4. openai_responses_rehydrate loads conversation context from
-#      previous_response_id by fetching stored responses and
-#      prepending their message history to the current request.
-#      Passthrough for requests without previous_response_id.
+#   5. openai_responses_rehydrate loads conversation context from
+#      previous_response_id or conversation field by fetching
+#      stored responses/conversations and prepending their message
+#      history to the current request. previous_response_id takes
+#      precedence when both are present.
 #
-#   5. responses_proxy reads the assembled ResponsesState and
+#   6. responses_proxy reads the assembled ResponsesState and
 #      rebuilds the outbound request body with the full conversation
-#      history. Strips previous_response_id (already resolved by
-#      rehydrate). Passthrough when no ResponsesState exists.
+#      history. Strips previous_response_id and conversation
+#      (already resolved by rehydrate). Passthrough when no
+#      ResponsesState exists.
 #
-#   6. The router sends all valid Responses API create requests to
+#   7. The router sends all valid Responses API create requests to
 #      the same inference backend. The promoted mode remains available
 #      as headers/metadata for downstream filters; it does not change
 #      backend selection in this example.
@@ -57,6 +67,11 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_abc"}'
 #
+#   # Multi-turn with conversation
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"What next?","conversation":"conv_abc"}'
+#
 #   # Rejected (stream + background conflict)
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
@@ -73,8 +88,14 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
+
       - filter: openai_responses_format
-        on_invalid: reject
+        on_invalid: continue
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
@@ -110,4 +131,4 @@ filter_chains:
         clusters:
           - name: "inference-backend"
             endpoints:
-              - "127.0.0.1:3001"
+              - "127.0.0.1:8000"
