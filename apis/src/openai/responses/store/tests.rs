@@ -579,6 +579,31 @@ async fn on_response_accepts_mixed_case_json_content_type() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_continues_for_event_stream_200() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should continue for event-stream 200"
+    );
+    assert!(
+        ctx.get_metadata("responses.skip_persist").is_none(),
+        "should not skip persist for event-stream content type"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_does_not_buffer_when_store_unavailable() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -670,6 +695,91 @@ async fn on_response_body_buffers_streaming_chunks_when_error_reformat_is_armed(
     assert!(
         matches!(action, FilterAction::Continue),
         "streaming chunks should buffer when error reformat is armed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_streaming_persist_on_parse_error() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    ctx.set_metadata("responses.stream_parse_error", "true");
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({"id": "resp_err", "created_at": 1, "model": "gpt-4.1"}),
+        ..Default::default()
+    });
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should skip persistence when stream had parse errors"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_streaming_persist_on_incomplete_stream() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    ctx.set_metadata("responses.stream_incomplete", "true");
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should skip persistence when stream was incomplete"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_streaming_persist_when_no_state() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should skip persistence when ResponsesState is absent"
+    );
+}
+
+#[test]
+fn build_record_from_state_returns_none_for_null_response_object() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+
+    let result = super::filter::build_record_from_state(&ctx, "default", None);
+    assert!(result.is_none(), "should return None when response_object is null");
+}
+
+#[test]
+fn build_record_from_state_returns_none_for_missing_fields() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({"id": "resp_1"}),
+        ..Default::default()
+    });
+
+    let result = super::filter::build_record_from_state(&ctx, "default", None);
+    assert!(
+        result.is_none(),
+        "should return None when required fields (created_at, model) are missing"
     );
 }
 

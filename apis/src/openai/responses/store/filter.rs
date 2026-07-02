@@ -14,8 +14,9 @@
 //!   `previous_response_id`). Lazily initializes the store backend when needed. Sets `responses.skip_persist` metadata
 //!   on store init failure for requests that would otherwise persist.
 //!
-//! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx or
-//!   non-JSON responses set `responses.skip_persist` and bail early.
+//! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
+//!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and
+//!   bail early.
 //!
 //! - **`on_response_body`**: at end-of-stream, extracts the record from the buffered response JSON or accumulated
 //!   streaming [`ResponsesState`] and persists it synchronously via [`block_in_place`] before returning to Pingora.
