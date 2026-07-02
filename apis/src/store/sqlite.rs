@@ -630,17 +630,26 @@ mod tests {
 
     #[test]
     fn memory_url_short_form() {
-        assert!(is_memory_database_url("sqlite::memory:"), "short-form memory URL should be detected");
+        assert!(
+            is_memory_database_url("sqlite::memory:"),
+            "short-form memory URL should be detected"
+        );
     }
 
     #[test]
     fn memory_url_slash_form() {
-        assert!(is_memory_database_url("sqlite://:memory:"), "slash-form memory URL should be detected");
+        assert!(
+            is_memory_database_url("sqlite://:memory:"),
+            "slash-form memory URL should be detected"
+        );
     }
 
     #[test]
     fn memory_url_query_param() {
-        assert!(is_memory_database_url("sqlite:///test.db?mode=memory"), "mode=memory query param should be detected");
+        assert!(
+            is_memory_database_url("sqlite:///test.db?mode=memory"),
+            "mode=memory query param should be detected"
+        );
     }
 
     #[test]
@@ -653,21 +662,33 @@ mod tests {
 
     #[test]
     fn memory_url_whitespace_trimmed() {
-        assert!(is_memory_database_url("  sqlite::memory:  "), "leading/trailing whitespace should be trimmed");
+        assert!(
+            is_memory_database_url("  sqlite::memory:  "),
+            "leading/trailing whitespace should be trimmed"
+        );
     }
 
     #[test]
     fn file_url_is_not_memory() {
-        assert!(!is_memory_database_url("sqlite:///path/to/db.sqlite"), "file-backed URL should not be detected as memory");
+        assert!(
+            !is_memory_database_url("sqlite:///path/to/db.sqlite"),
+            "file-backed URL should not be detected as memory"
+        );
     }
 
     #[test]
     fn file_url_with_mode_rwc_is_not_memory() {
-        assert!(!is_memory_database_url("sqlite:///test.db?mode=rwc"), "mode=rwc should not be detected as memory");
+        assert!(
+            !is_memory_database_url("sqlite:///test.db?mode=rwc"),
+            "mode=rwc should not be detected as memory"
+        );
     }
 
     #[test]
     fn empty_url_is_not_memory() {
-        assert!(!is_memory_database_url(""), "empty URL should not be detected as memory");
+        assert!(
+            !is_memory_database_url(""),
+            "empty URL should not be detected as memory"
+        );
     }
 }
