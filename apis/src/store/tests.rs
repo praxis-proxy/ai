@@ -963,6 +963,179 @@ async fn delete_conversation_preserves_items() {
 }
 
 #[tokio::test]
+async fn get_existing_conversation_item_ids_returns_matching() {
+    let store = make_store_with_items().await;
+    let items = [
+        make_conversation_item("item_1", "tenant_a", "conv_1", 1),
+        make_conversation_item("item_2", "tenant_a", "conv_1", 2),
+        make_conversation_item("item_3", "tenant_a", "conv_1", 3),
+    ];
+    store
+        .create_conversation_items(&items)
+        .await
+        .expect("item insert should succeed");
+
+    let existing = store
+        .get_existing_conversation_item_ids("tenant_a", "conv_1", &["item_1", "item_3", "item_99"])
+        .await
+        .expect("get_existing should succeed");
+
+    assert_eq!(existing.len(), 2, "should find 2 of 3 queried IDs");
+    assert!(existing.contains(&"item_1".to_owned()), "item_1 should be found");
+    assert!(existing.contains(&"item_3".to_owned()), "item_3 should be found");
+}
+
+#[tokio::test]
+async fn get_existing_conversation_item_ids_empty_input() {
+    let store = make_store_with_items().await;
+    let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
+    store
+        .create_conversation_items(&[item])
+        .await
+        .expect("item insert should succeed");
+
+    let existing = store
+        .get_existing_conversation_item_ids("tenant_a", "conv_1", &[])
+        .await
+        .expect("get_existing with empty input should succeed");
+
+    assert!(existing.is_empty(), "empty input should return empty result");
+}
+
+#[tokio::test]
+async fn get_existing_conversation_item_ids_tenant_isolation() {
+    let store = make_store_with_items().await;
+    let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
+    store
+        .create_conversation_items(&[item])
+        .await
+        .expect("item insert should succeed");
+
+    let existing = store
+        .get_existing_conversation_item_ids("tenant_b", "conv_1", &["item_1"])
+        .await
+        .expect("get_existing should succeed");
+
+    assert!(existing.is_empty(), "tenant_b should not see tenant_a items");
+}
+
+#[tokio::test]
+async fn delete_conversation_item_returns_true() {
+    let store = make_store_with_items().await;
+    let items = [
+        make_conversation_item("item_1", "tenant_a", "conv_1", 1),
+        make_conversation_item("item_2", "tenant_a", "conv_1", 2),
+    ];
+    store
+        .create_conversation_items(&items)
+        .await
+        .expect("item insert should succeed");
+
+    let deleted = store
+        .delete_conversation_item("tenant_a", "conv_1", "item_1")
+        .await
+        .expect("delete should succeed");
+    assert!(deleted, "delete should return true for existing item");
+
+    let fetched = store
+        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .await
+        .expect("get should succeed");
+    assert!(fetched.is_none(), "deleted item should not be retrievable");
+
+    let remaining = store
+        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&remaining, &["item_2"]);
+}
+
+#[tokio::test]
+async fn delete_nonexistent_conversation_item_returns_false() {
+    let store = make_store_with_items().await;
+
+    let deleted = store
+        .delete_conversation_item("tenant_a", "conv_1", "nonexistent")
+        .await
+        .expect("delete should succeed");
+
+    assert!(!deleted, "delete should return false for nonexistent item");
+}
+
+#[tokio::test]
+async fn conversation_item_position_returns_existing() {
+    let store = make_store_with_items().await;
+    let items = [
+        make_conversation_item("item_1", "tenant_a", "conv_1", 5),
+        make_conversation_item("item_2", "tenant_a", "conv_1", 10),
+    ];
+    store
+        .create_conversation_items(&items)
+        .await
+        .expect("item insert should succeed");
+
+    let position = store
+        .conversation_item_position("tenant_a", "conv_1", "item_2")
+        .await
+        .expect("position lookup should succeed");
+
+    assert_eq!(position, Some(10), "position should be 10");
+}
+
+#[tokio::test]
+async fn conversation_item_position_returns_none_for_missing() {
+    let store = make_store_with_items().await;
+
+    let position = store
+        .conversation_item_position("tenant_a", "conv_1", "nonexistent")
+        .await
+        .expect("position lookup should succeed");
+
+    assert!(position.is_none(), "missing item should return None");
+}
+
+#[tokio::test]
+async fn update_conversation_messages_nonexistent_returns_false() {
+    let store = make_store().await;
+
+    let updated = store
+        .update_conversation_messages("tenant_a", "nonexistent", &json!({"new": "messages"}))
+        .await
+        .expect("update should succeed");
+
+    assert!(!updated, "updating nonexistent conversation should return false");
+}
+
+#[tokio::test]
+async fn update_conversation_messages_tenant_isolation() {
+    let store = make_store().await;
+    let record = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([{"role": "user", "content": "original"}]),
+    };
+    store.upsert_conversation(&record).await.expect("upsert should succeed");
+
+    let updated = store
+        .update_conversation_messages("tenant_b", "conv_1", &json!([{"role": "user", "content": "hijack"}]))
+        .await
+        .expect("cross-tenant update should succeed");
+    assert!(!updated, "tenant_b should not be able to update tenant_a messages");
+
+    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("record should exist");
+    assert_eq!(
+        fetched.messages,
+        json!([{"role": "user", "content": "original"}]),
+        "messages should not have changed"
+    );
+}
+
+#[tokio::test]
 async fn conversation_item_methods_fail_without_items_table() {
     let store = make_store().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
