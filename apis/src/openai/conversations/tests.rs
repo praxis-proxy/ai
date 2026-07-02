@@ -11,7 +11,10 @@ use super::{
     filter::OpenaiConversationsFilter,
     validate::validate_metadata,
 };
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    openai::responses::state::ResponsesState,
+    test_utils::{make_filter_context, make_request, make_response},
+};
 
 fn rejection_body(rejection: &praxis_filter::Rejection) -> Value {
     serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap()
@@ -2772,6 +2775,272 @@ async fn patch_on_conversation_path_continues() {
     let mut ctx = make_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "PATCH should not be handled");
+}
+
+// -----------------------------------------------------------------------------
+// Append-Back: on_response
+// -----------------------------------------------------------------------------
+
+fn set_append_back_metadata(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", "conv_test_123");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_not_armed_without_conversation_metadata() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_not_armed_when_streaming() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_not_armed_when_background() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.set_metadata("openai_responses_format.background", "true");
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_not_armed_for_non_2xx() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+
+    let mut resp = make_response();
+    resp.status = http::StatusCode::INTERNAL_SERVER_ERROR;
+    ctx.response_header = Some(&mut resp);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_not_armed_for_non_json_content_type() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_armed_for_json_200() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+// -----------------------------------------------------------------------------
+// Append-Back: on_response_body
+// -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_releases_when_not_armed() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut body = Some(Bytes::from_static(b"{}"));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Release));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_continues_when_not_end_of_stream() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut body = Some(Bytes::from_static(b"partial"));
+    let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_non_completed_status() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let response_json = serde_json::json!({
+        "status": "failed",
+        "output": [{"type": "message", "role": "assistant", "content": "oops"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_invalid_json() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut body = Some(Bytes::from_static(b"{not-json"));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_empty_items() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": []
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_empty_body() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_appends_completed_response() {
+    let filter = build_test_filter();
+    let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
+
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+
+    let input_items = vec![serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": "hello from append"
+    })];
+    ctx.extensions.insert(ResponsesState {
+        input: input_items,
+        ..ResponsesState::default()
+    });
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "hi from model"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from list items after append-back");
+    };
+    assert_eq!(rejection.status, 200);
+    let resp = rejection_body(&rejection);
+    let items = resp["data"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "append-back should persist both input and output items");
 }
 
 // -----------------------------------------------------------------------------
