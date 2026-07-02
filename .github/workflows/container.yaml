@@ -22,8 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Clone Praxis core (path dependency)
+        uses: ./.github/actions/clone-praxis
+
       - name: Build container image
-        run: docker build -t praxis-ai:ci -f Containerfile .
+        run: docker build -t praxis-ai:ci -f Containerfile ..
 
       - name: Run container
         run: docker run -d --name praxis-ai praxis-ai:ci
