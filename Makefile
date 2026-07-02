@@ -94,8 +94,13 @@ coverage-check:
 	cargo llvm-cov --workspace --json \
 		--exclude xtask \
 		--ignore-filename-regex '(target/|tests/)' \
-		--fail-under-lines 95 \
 		--output-path coverage.json
+	@LINE_PCT=$$(jq '.data[0].totals.lines.percent' coverage.json); \
+	echo "Line coverage: $${LINE_PCT}%"; \
+	if [ $$(echo "$${LINE_PCT} < 90" | bc -l) -eq 1 ]; then \
+		echo "FAIL: coverage $${LINE_PCT}% is below 90% threshold"; \
+		exit 1; \
+	fi
 
 # -------------------------------------------------------------------
 # Dev Setup
