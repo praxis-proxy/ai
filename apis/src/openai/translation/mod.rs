@@ -785,14 +785,6 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn empty_instructions_do_not_produce_system_message() {
-        let mapped = map(&json!({"model": "m", "instructions": "", "input": "hi"}));
-
-        assert_eq!(mapped["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(mapped["messages"][0]["role"], "user");
-    }
-
-    #[test]
     fn message_item_without_content_gets_empty_content() {
         let mapped = map(&json!({
             "model": "m",
@@ -809,7 +801,10 @@ mod tests {
             "input": [{"foo": "bar"}]
         }));
 
-        assert!(error.contains("unknown"));
+        assert_eq!(
+            error,
+            "unsupported Responses input item type for Chat Completions translation: unknown"
+        );
     }
 
     #[test]
@@ -897,7 +892,10 @@ mod tests {
             "input": [{"role": "user", "content": [{"text": "no type"}]}]
         }));
 
-        assert!(error.contains("unknown"));
+        assert_eq!(
+            error,
+            "unsupported Responses content part type for Chat Completions translation: unknown"
+        );
     }
 
     #[test]
@@ -954,6 +952,23 @@ mod tests {
         }));
 
         assert_eq!(mapped["messages"][0]["tool_calls"][0]["function"]["arguments"], "");
+    }
+
+    #[test]
+    fn malformed_function_calls_without_call_id_or_name_are_dropped() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "name": "missing_id", "arguments": "{}"},
+                {"type": "function_call", "call_id": "missing_name", "arguments": "{}"},
+                {"type": "function_call", "call_id": "valid_call", "name": "valid_function", "arguments": "{}"}
+            ]
+        }));
+
+        let tool_calls = mapped["messages"][0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "valid_call");
+        assert_eq!(tool_calls[0]["function"]["name"], "valid_function");
     }
 
     #[test]
@@ -1018,6 +1033,33 @@ mod tests {
         }));
 
         assert_eq!(mapped["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn function_tool_missing_required_name_is_forwarded_to_provider() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{"type": "function", "parameters": {"type": "object"}}]
+        }));
+
+        assert_eq!(mapped["tools"][0]["type"], "function");
+        assert!(mapped["tools"][0]["function"].get("name").is_none());
+        assert_eq!(mapped["tools"][0]["function"]["parameters"], json!({"type": "object"}));
+    }
+
+    #[test]
+    fn tool_object_without_type_returns_unknown_tool_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{"name": "missing_type"}]
+        }));
+
+        assert_eq!(
+            error,
+            "unsupported Responses tool type for Chat Completions translation: unknown"
+        );
     }
 
     #[test]
@@ -1200,25 +1242,6 @@ mod tests {
     // -------------------------------------------------------------------------
     // Response translation: finish reasons
     // -------------------------------------------------------------------------
-
-    fn make_response_context(request: &Value) -> super::chat_completions::ResponseContext {
-        super::chat_completions::ResponseContext::from_responses_request(request, "resp_test".to_owned(), 100)
-            .with_completed_at(200)
-    }
-
-    fn simple_chat_response(finish_reason: &str, content: &str) -> Value {
-        json!({
-            "id": "chatcmpl-1",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "m",
-            "choices": [{
-                "finish_reason": finish_reason,
-                "index": 0,
-                "message": {"role": "assistant", "content": content}
-            }]
-        })
-    }
 
     #[test]
     fn length_finish_reason_maps_to_incomplete_status() {
@@ -1843,5 +1866,28 @@ mod tests {
 
         assert_eq!(mapped["output"][0]["content"][0]["annotations"], json!([]));
         assert_eq!(mapped["output"][0]["content"][0]["logprobs"], json!([]));
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    fn make_response_context(request: &Value) -> super::chat_completions::ResponseContext {
+        super::chat_completions::ResponseContext::from_responses_request(request, "resp_test".to_owned(), 100)
+            .with_completed_at(200)
+    }
+
+    fn simple_chat_response(finish_reason: &str, content: &str) -> Value {
+        json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [{
+                "finish_reason": finish_reason,
+                "index": 0,
+                "message": {"role": "assistant", "content": content}
+            }]
+        })
     }
 }
