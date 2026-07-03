@@ -19,7 +19,7 @@ fn responses_routing_example_forwards_stateless_to_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/responses-routing.yaml",
+        "openai/responses/responses-routing.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -43,7 +43,7 @@ fn responses_routing_example_forwards_stateful_to_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/responses-routing.yaml",
+        "openai/responses/responses-routing.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );

@@ -22,7 +22,7 @@ fn anthropic_validate_forwards_valid_request() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/request-validate.yaml",
+        "anthropic/request-validate.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -41,7 +41,7 @@ fn anthropic_validate_forwards_backend_owned_semantics() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/request-validate.yaml",
+        "anthropic/request-validate.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -64,7 +64,7 @@ fn anthropic_validate_rejects_malformed_json() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/request-validate.yaml",
+        "anthropic/request-validate.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -87,7 +87,7 @@ fn anthropic_messages_protocol_injects_default_version() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/messages-protocol.yaml",
+        "anthropic/messages-protocol.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -115,7 +115,7 @@ fn anthropic_to_openai_transforms_response_body() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/messages-to-openai.yaml",
+        "anthropic/messages-to-openai.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
     );
@@ -147,7 +147,7 @@ fn anthropic_to_openai_transforms_streaming_response_body() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/messages-to-openai.yaml",
+        "anthropic/messages-to-openai.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
     );
@@ -180,7 +180,7 @@ fn unified_gateway_routes_anthropic_to_correct_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/unified-gateway.yaml",
+        "anthropic/unified-gateway.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", anthropic_guard.port()),
@@ -210,7 +210,7 @@ fn unified_gateway_routes_openai_to_correct_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/unified-gateway.yaml",
+        "anthropic/unified-gateway.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", anthropic_guard.port()),
@@ -240,7 +240,7 @@ fn unified_gateway_routes_responses_to_correct_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/unified-gateway.yaml",
+        "anthropic/unified-gateway.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", anthropic_guard.port()),
@@ -270,7 +270,7 @@ fn unified_gateway_routes_unknown_to_default_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/anthropic/unified-gateway.yaml",
+        "anthropic/unified-gateway.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", anthropic_guard.port()),

@@ -5,10 +5,9 @@ members = [
     "filters",
     "apis",
     "xtask",
-    # TODO(migration): re-enable after test crate Cargo.toml is updated
-    # "tests/integration",
-    # "tests/schema",
-    # "tests/utils",
+    "tests/integration",
+    "tests/schema",
+    "tests/utils",
 ]
 
 [workspace.package]
@@ -26,14 +25,18 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dashmap = "6.2.1"
 futures = "0.3.32"
+h2 = "0.4.15"
 http = "1.4.2"
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
 quote = "1.0.46"
 rand = "0.10.1"
+rcgen = "0.14.8"
 regex = "1.12.4"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+rustls = "0.23.41"
+rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
@@ -44,6 +47,8 @@ tempfile = "3.27.0"
 thiserror = "2.0.18"
 tikv-jemallocator = "0.7.0"
 tokio = { version = "1.52.3", features = ["macros", "rt"] }
+tokio-rustls = "0.26.4"
+tokio-tungstenite = "0.29.0"
 tokio-util = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
@@ -55,9 +60,11 @@ praxis-core = { version = "0.4.0", path = "../praxis/core", package = "praxis-pr
 praxis-filter = { version = "0.4.0", path = "../praxis/filter", package = "praxis-proxy-filter" }
 praxis-protocol = { version = "0.4.0", path = "../praxis/protocol", package = "praxis-proxy-protocol" }
 praxis-tls = { version = "0.4.0", path = "../praxis/tls", package = "praxis-proxy-tls" }
-praxis-test-utils = { path = "../praxis/tests/utils" }
+praxis-test-utils = { path = "tests/utils" }
+praxis = { path = "../praxis/server", package = "praxis-proxy" }
 
 # Praxis AI workspace dependencies
+praxis-ai-proxy = { version = "0.1.0", path = "server" }
 praxis-ai-filters = { version = "0.1.0", path = "filters" }
 praxis-ai-apis = { version = "0.1.0", path = "apis" }
 

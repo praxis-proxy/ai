@@ -38,7 +38,7 @@ async fn response_store_persists_response_to_postgres() {
     let responses_table = format!("openai_responses_{suffix}");
     let conversations_table = format!("openai_conversations_{suffix}");
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml
@@ -135,7 +135,7 @@ async fn response_store_postgres_passes_through_non_responses_traffic() {
     let responses_table = format!("openai_responses_{suffix}");
     let conversations_table = format!("openai_conversations_{suffix}");
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/response-store.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml

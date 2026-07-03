@@ -29,7 +29,7 @@ fn json_rpc_routing_routes_mcp_tools() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/json-rpc-routing.yaml",
+        "json-rpc-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", mcp_tools_port),
@@ -73,7 +73,7 @@ fn json_rpc_routing_routes_a2a_send() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/json-rpc-routing.yaml",
+        "json-rpc-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", mcp_tools_port),
@@ -117,7 +117,7 @@ fn json_rpc_routing_falls_through_to_default() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/json-rpc-routing.yaml",
+        "json-rpc-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", mcp_tools_port),
@@ -157,7 +157,7 @@ fn mcp_classifier_routing_routes_by_tool_name() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/mcp-classifier-routing.yaml",
+        "mcp-classifier-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", weather_port),
@@ -194,7 +194,7 @@ fn mcp_classifier_routing_default_fallback() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/mcp-classifier-routing.yaml",
+        "mcp-classifier-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", weather_port),
@@ -231,7 +231,7 @@ fn mcp_classifier_routing_routes_calendar_without_client_mcp_headers() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/mcp-classifier-routing.yaml",
+        "mcp-classifier-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", weather_port),
@@ -386,7 +386,7 @@ fn a2a_task_routing_example_routes_send_message_to_agent_a() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/a2a-task-routing.yaml",
+        "a2a-task-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", agent_a_guard.port()),
@@ -421,7 +421,7 @@ fn a2a_task_routing_example_routes_get_task_to_owning_cluster() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/a2a-task-routing.yaml",
+        "a2a-task-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", agent_a_guard.port()),
@@ -461,7 +461,7 @@ fn a2a_task_routing_example_unknown_task_follows_fallback() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/a2a-task-routing.yaml",
+        "a2a-task-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", agent_a_guard.port()),
@@ -506,7 +506,7 @@ fn load_a2a_example_config(
     default_port: u16,
 ) -> praxis_core::config::Config {
     load_example_config(
-        "ai/a2a-classifier-routing.yaml",
+        "a2a-classifier-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:9001", agent_port),
