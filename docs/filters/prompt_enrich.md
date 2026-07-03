@@ -5,8 +5,6 @@
 
 Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration Notes
 
 Messages are pre-serialized at construction time. At request time, the filter parses the JSON body, splices prepend messages at the beginning and appends messages at the end, then re-serializes the modified body.

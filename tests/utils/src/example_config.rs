@@ -27,9 +27,9 @@ use praxis_core::config::Config;
 /// use std::collections::HashMap;
 ///
 /// let config = praxis_test_utils::load_example_config(
-///     "traffic-management/basic-reverse-proxy.yaml",
+///     "model-to-header-routing.yaml",
 ///     9090,
-///     HashMap::from([("127.0.0.1:3000", 19998_u16)]),
+///     HashMap::from([("10.0.1.1:8080", 19998_u16)]),
 /// );
 /// assert!(!config.listeners.is_empty());
 /// ```
@@ -49,7 +49,7 @@ pub fn load_example_config(filename: &str, listener_port: u16, port_map: HashMap
 ///
 /// ```
 /// let path =
-///     praxis_test_utils::example_config_path("traffic-management/basic-reverse-proxy.yaml");
+///     praxis_test_utils::example_config_path("model-to-header-routing.yaml");
 /// assert!(path.contains("examples/configs/"));
 /// ```
 pub fn example_config_path(filename: &str) -> String {
@@ -127,16 +127,16 @@ mod tests {
 
     #[test]
     fn example_config_path_resolves() {
-        let path = example_config_path("traffic-management/basic-reverse-proxy.yaml");
+        let path = example_config_path("model-to-header-routing.yaml");
         assert!(std::path::Path::new(&path).exists(), "expected {path} to exist");
     }
 
     #[test]
     fn load_example_config_parses() {
         let config = load_example_config(
-            "traffic-management/basic-reverse-proxy.yaml",
+            "model-to-header-routing.yaml",
             19999,
-            HashMap::from([("127.0.0.1:3000", 19998_u16)]),
+            HashMap::from([("10.0.1.1:8080", 19998_u16)]),
         );
         assert_eq!(
             config.listeners[0].address, "127.0.0.1:19999",

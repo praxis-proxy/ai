@@ -1030,3 +1030,23 @@ async fn create_test_conversation(filter: &dyn HttpFilter, metadata: Value) -> S
     let resp = rejection_body(&rejection);
     resp["id"].as_str().unwrap().to_owned()
 }
+
+#[tokio::test]
+async fn create_conversation_response_field_order_matches_openai() {
+    let filter = build_test_filter();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = serde_json::json!({"metadata": {"project": "test"}});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject, got {action:?}");
+    };
+    let resp = rejection_body(&rejection);
+    let keys: Vec<&String> = resp.as_object().unwrap().keys().collect();
+    assert_eq!(keys, &["id", "object", "created_at", "metadata"]);
+}

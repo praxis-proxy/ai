@@ -16,6 +16,8 @@ workspace = true
 [dependencies]
 clap = { workspace = true }
 nix = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
 praxis-ai = { path = "../server", package = "praxis-ai-proxy" }
 praxis-core = { workspace = true }
 serde_json = { workspace = true }

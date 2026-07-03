@@ -1,4 +1,4 @@
-name: MSRV
+name: Tests (Integration)
 
 # ------------------------------------------------------------------------------
 # Workflow Settings
@@ -10,6 +10,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable verbose test output (V=1)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,13 +25,14 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  V: ${{ inputs.debug && '1' || '' }}
 
 jobs:
   # ----------------------------------------------------------------------------
-  # Minimum Supported Rust Version
+  # Integration test suites (tests/ crates)
   # ----------------------------------------------------------------------------
 
-  msrv:
+  test:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -35,7 +42,7 @@ jobs:
       - name: Clone Praxis core (path dependency)
         uses: ./.github/actions/clone-praxis
 
-      - name: Install MSRV Rust (1.96.0)
+      - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
 
       - name: Cache Cargo registry and build artifacts
@@ -46,10 +53,13 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-rust-1.96.0-msrv-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-1.96.0-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-msrv-
+            ${{ runner.os }}-rust-1.96.0-cargo-
           save-always: true
 
-      - name: Check workspace compiles on MSRV
-        run: cargo check --workspace
+      - name: Schema tests
+        run: make test-schema
+
+      - name: Integration tests
+        run: make test-integration

@@ -127,8 +127,7 @@ pub(crate) fn scan_sse_chunk(state: &mut SseScanState, chunk: &[u8], max_scratch
 fn process_line(line: &[u8], data_buf: &mut Vec<u8>, has_data: &mut bool, payloads: &mut Vec<Vec<u8>>) {
     if line.is_empty() {
         if *has_data {
-            payloads.push(data_buf.clone());
-            data_buf.clear();
+            payloads.push(std::mem::take(data_buf));
             *has_data = false;
         }
         return;

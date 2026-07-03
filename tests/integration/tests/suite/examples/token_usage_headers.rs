@@ -21,7 +21,7 @@ fn token_usage_headers_no_metadata_is_noop() {
     let backend_port = backend_port_guard.port();
     let proxy_port = free_port();
     let config = super::load_example_config(
-        "ai/token-usage-headers.yaml",
+        "token-usage-headers.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend_port)]),
     );

@@ -14,7 +14,7 @@ use praxis_test_utils::{free_port, http_send, parse_body, parse_status, start_he
 #[test]
 fn credential_injection_config_parses() {
     let config = super::load_example_config(
-        "ai/credential-injection.yaml",
+        "credential-injection.yaml",
         29900,
         HashMap::from([("127.0.0.1:3000", 29901_u16), ("127.0.0.1:3001", 29902_u16)]),
     );
@@ -30,7 +30,7 @@ fn credential_injection_injects_bearer_token() {
     let proxy_port = free_port();
 
     let config = super::load_example_config(
-        "ai/credential-injection.yaml",
+        "credential-injection.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend_port), ("127.0.0.1:3001", backend_port)]),
     );
@@ -58,7 +58,7 @@ fn credential_injection_strips_client_credential() {
     let proxy_port = free_port();
 
     let config = super::load_example_config(
-        "ai/credential-injection.yaml",
+        "credential-injection.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend_port), ("127.0.0.1:3001", backend_port)]),
     );
@@ -91,7 +91,7 @@ fn credential_injection_internal_cluster() {
     let proxy_port = free_port();
 
     let config = super::load_example_config(
-        "ai/credential-injection.yaml",
+        "credential-injection.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend_port), ("127.0.0.1:3001", backend_port)]),
     );

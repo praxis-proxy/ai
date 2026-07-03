@@ -5,8 +5,6 @@
 
 Normalizes Anthropic Messages protocol headers for native backends.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration
 
 | Field | Type | Required | Description |

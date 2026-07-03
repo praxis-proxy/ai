@@ -258,7 +258,7 @@ fn unmatched_path_passes_through() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/conversations/conversations.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/conversations/conversations.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://conversations.db?mode=rwc", "sqlite::memory:"),
@@ -283,7 +283,7 @@ fn unmatched_path_passes_through() {
 fn start_test_proxy() -> praxis_test_utils::ProxyGuard {
     let proxy_port = free_port();
 
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/conversations/conversations.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/conversations/conversations.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://conversations.db?mode=rwc", "sqlite::memory:"),

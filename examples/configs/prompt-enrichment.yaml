@@ -1,7 +1,7 @@
 # Prompt Enrichment
 #
-# Requires the ai-inference feature:
-#   cargo build -p praxis-proxy --features ai-inference
+# Build:
+#   cargo build -p praxis-ai-proxy
 #
 # Injects system messages into OpenAI-compatible chat completion
 # requests before forwarding to the upstream provider. The system

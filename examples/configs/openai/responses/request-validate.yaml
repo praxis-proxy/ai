@@ -3,8 +3,8 @@
 # Validates Responses API requests and rejects invalid parameter
 # combinations.
 #
-# Requires the ai-inference feature:
-#   cargo build -p praxis-proxy --features ai-inference
+# Build:
+#   cargo build -p praxis-ai-proxy
 #
 # The openai_responses_format classifier must run before openai_responses_validate.
 # It buffers the body, classifies the request as Responses API, and

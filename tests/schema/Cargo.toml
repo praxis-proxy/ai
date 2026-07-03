@@ -9,7 +9,7 @@ publish = false
 
 [features]
 default = ["ai-inference"]
-ai-inference = ["praxis-filter/ai-inference"]
+ai-inference = []
 
 [lints]
 workspace = true

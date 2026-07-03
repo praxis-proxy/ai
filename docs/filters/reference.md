@@ -15,23 +15,23 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`anthropic_messages_format`](http/ai/anthropic_messages_format.md) | Classifies Anthropic Messages API requests and promotes routing facts to headers, metadata, and filter results. |
-| [`anthropic_messages_protocol`](http/ai/anthropic_messages_protocol.md) | Normalizes Anthropic Messages protocol headers for native backends. |
-| [`anthropic_stream_events`](http/ai/anthropic_stream_events.md) | Transforms streaming SSE responses between OpenAI and Anthropic formats, processing each chunk as it arrives. |
-| [`anthropic_to_openai`](http/ai/anthropic_to_openai.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. |
-| [`anthropic_validate`](http/ai/anthropic_validate.md) | Validates Anthropic Messages request bodies for proxy-owned JSON envelope requirements. |
+| [`anthropic_messages_format`](anthropic_messages_format.md) | Classifies Anthropic Messages API requests and promotes routing facts to headers, metadata, and filter results. |
+| [`anthropic_messages_protocol`](anthropic_messages_protocol.md) | Normalizes Anthropic Messages protocol headers for native backends. |
+| [`anthropic_stream_events`](anthropic_stream_events.md) | Transforms streaming SSE responses between `OpenAI` and Anthropic formats, processing each chunk as it arrives. |
+| [`anthropic_to_openai`](anthropic_to_openai.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The filter name refers to the OpenAI Chat Completions wire shape, not the Responses API; non-OpenAI compatible backends are valid targets. |
+| [`anthropic_validate`](anthropic_validate.md) | Validates Anthropic Messages request bodies for proxy-owned JSON envelope requirements. |
 
 ### OpenAI
 
 | Filter | Description |
 |--------|-------------|
-| [`openai_conversations`](http/ai/openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
-| [`openai_response_store`](http/ai/openai_response_store.md) | Persists non-streaming Responses API responses to the configured response store backend. |
-| [`openai_responses_format`](http/ai/openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
-| [`openai_responses_model_rewrite`](http/ai/openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses API request bodies. |
-| [`openai_responses_rehydrate`](http/ai/openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history. |
-| [`openai_responses_validate`](http/ai/openai_responses_validate.md) | Validates and enriches Responses API requests. |
-| [`responses_proxy`](http/ai/responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
+| [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
+| [`openai_response_store`](openai_response_store.md) | Persists non-streaming Responses API responses to the configured response store backend. |
+| [`openai_responses_format`](openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
+| [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses API request bodies. |
+| [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
+| [`openai_responses_validate`](openai_responses_validate.md) | Validates and enriches Responses API requests. |
+| [`responses_proxy`](responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 
 ## Cross-Provider Filters (praxis-ai-filters)
 
@@ -39,30 +39,29 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`a2a`](http/ai/a2a.md) | Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method, family, task ID, streaming detection, and version to request headers, filter results, and durable metadata for routing. |
-| [`json_rpc`](http/ai/json_rpc.md) | Extracts JSON-RPC 2.0 envelope metadata from request bodies and promotes method, id, and kind to request headers and filter results for routing. |
-| [`mcp`](http/ai/mcp.md) | Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata. |
+| [`a2a`](a2a.md) | Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method, family, task ID, streaming detection, and version to request headers, filter results, and durable metadata for routing. |
+| [`mcp`](mcp.md) | Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata. |
 
 ### Guardrails
 
 | Filter | Description |
 |--------|-------------|
-| [`ai_guardrails`](http/ai/ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request (and eventually response) bodies. The provider determines whether content should be passed, blocked, or redacted. |
+| [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request (and eventually response) bodies. The provider determines whether content should be passed, blocked, or redacted. |
 
 ### Inference
 
 | Filter | Description |
 |--------|-------------|
-| [`model_to_header`](http/ai/model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
+| [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
 
-### Prompt Enrichment
+### Prompt Enrich
 
 | Filter | Description |
 |--------|-------------|
-| [`prompt_enrich`](http/ai/prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
+| [`prompt_enrich`](prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
 
 ### Token Usage
 
 | Filter | Description |
 |--------|-------------|
-| [`token_usage_headers`](http/ai/token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. |
+| [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. |
