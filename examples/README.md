@@ -5,18 +5,29 @@ Configuration examples organized by category.
 ## Running an Example
 
 ```console
-cargo run -p praxis-ai-proxy -- -c examples/configs/traffic-management/basic-reverse-proxy.yaml
+cargo run -p praxis-ai-proxy -- -c examples/configs/openai/responses/full-flow.yaml
 curl http://localhost:8080/
 ```
 
 Configs use local ports (`3000`, `3001`, ...) for
-upstreams. For quick experiments without a real backend,
-use `static_response` (see
-[static-response.yaml](configs/traffic-management/static-response.yaml))
-or run Praxis with no config file for a built-in welcome
-page.
+upstreams — start a real backend or stub on those ports
+before sending requests.
 
 ## Configs
+
+### General
+
+| File | Description |
+| ------ | ------------- |
+| [a2a-classifier-routing.yaml](configs/a2a-classifier-routing.yaml) | Routes A2A requests by body-derived method, family, task ID, and streaming detection |
+| [a2a-task-routing.yaml](configs/a2a-task-routing.yaml) | Captures task ownership from SendMessage JSON responses and SendStreamingMessage / SubscribeToTask SSE responses, then routes follow-up task operations back to the backend cluster that created the task |
+| [ai-inference-body-based-routing.yaml](configs/ai-inference-body-based-routing.yaml) | Routes LLM API requests to different backends based on the `model` field in the JSON request body |
+| [credential-injection.yaml](configs/credential-injection.yaml) | Injects per-cluster API credentials into upstream requests and strips client-provided credentials to prevent forwarding |
+| [json-rpc-routing.yaml](configs/json-rpc-routing.yaml) | Routes JSON-RPC 2.0 requests to different backends based on the "method" field in the JSON request body |
+| [mcp-classifier-routing.yaml](configs/mcp-classifier-routing.yaml) | Routes MCP requests by body-derived method and tool name |
+| [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
+| [prompt-enrichment.yaml](configs/prompt-enrichment.yaml) | Injects system messages into OpenAI-compatible chat completion requests before forwarding to the upstream provider |
+| [token-usage-headers.yaml](configs/token-usage-headers.yaml) | Inject Praxis-Token-Input, Praxis-Token-Output, and Praxis-Token-Total headers into downstream responses when token counts are available in filter metadata |
 
 ### Anthropic
 
