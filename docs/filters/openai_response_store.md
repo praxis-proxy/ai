@@ -3,7 +3,7 @@
 
 # `openai_response_store`
 
-Persists non-streaming Responses API responses to the configured response store backend.
+Persists Responses API responses to the configured response store backend. Supports both buffered (non-streaming) and streaming responses. Streaming exchanges are persisted at end-of-stream using accumulated `ResponsesState` from the `openai_stream_events` filter.
 
 ## Configuration
 

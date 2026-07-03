@@ -6,7 +6,5 @@
 mod event;
 mod parser;
 
-#[expect(unused_imports, reason = "used by filter implementations in production")]
 pub(crate) use event::ResponsesEvent;
-#[expect(unused_imports, reason = "used by filter implementations in production")]
 pub(crate) use parser::ResponsesSseParser;
