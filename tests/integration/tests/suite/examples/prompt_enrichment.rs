@@ -14,7 +14,7 @@ use praxis_test_utils::{free_port, http_send, json_post, parse_body, parse_statu
 #[test]
 fn prompt_enrichment_config_parses() {
     let config = super::load_example_config(
-        "ai/prompt-enrichment.yaml",
+        "prompt-enrichment.yaml",
         29910,
         HashMap::from([("127.0.0.1:3000", 29911_u16)]),
     );
@@ -30,7 +30,7 @@ fn prompt_enrichment_prepends_and_appends() {
     let proxy_port = free_port();
 
     let config = super::load_example_config(
-        "ai/prompt-enrichment.yaml",
+        "prompt-enrichment.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend_port)]),
     );
@@ -71,7 +71,7 @@ fn prompt_enrichment_passes_non_chat_traffic() {
     let proxy_port = free_port();
 
     let config = super::load_example_config(
-        "ai/prompt-enrichment.yaml",
+        "prompt-enrichment.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend_port)]),
     );

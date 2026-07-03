@@ -37,7 +37,6 @@
     reason = "test code"
 )]
 
-mod example_utils;
 mod examples;
 mod test_utils;
 

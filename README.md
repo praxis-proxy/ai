@@ -17,6 +17,6 @@ with the following documentation first:
 
 For larger changes, open a [discussion] and follow the [proposal process](docs/proposals.md).
 
-[Issues]:https://github.com/praxis-proxy/praxis/issues/new
-[pull requests]:https://github.com/praxis-proxy/praxis/compare
-[discussion]:https://github.com/praxis-proxy/praxis/discussions
+[Issues]:https://github.com/praxis-proxy/ai/issues/new
+[pull requests]:https://github.com/praxis-proxy/ai/compare
+[discussion]:https://github.com/praxis-proxy/ai/discussions
