@@ -2978,7 +2978,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite",
  "tracing",
  "yaml_serde",
 ]
