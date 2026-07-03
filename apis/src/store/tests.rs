@@ -1145,6 +1145,89 @@ async fn update_conversation_messages_tenant_isolation() {
 }
 
 #[tokio::test]
+async fn delete_conversation_item_tenant_isolation() {
+    let store = make_store_with_items().await;
+    let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
+    store
+        .create_conversation_items(&[item])
+        .await
+        .expect("item insert should succeed");
+
+    let deleted = store
+        .delete_conversation_item("tenant_b", "conv_1", "item_1")
+        .await
+        .expect("cross-tenant delete should succeed");
+    assert!(!deleted, "tenant_b should not be able to delete tenant_a items");
+
+    let still_exists = store
+        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .await
+        .expect("get should succeed");
+    assert!(
+        still_exists.is_some(),
+        "item should still exist after cross-tenant delete attempt"
+    );
+}
+
+#[tokio::test]
+async fn get_existing_conversation_item_ids_conversation_isolation() {
+    let store = make_store_with_items().await;
+    let items = [
+        make_conversation_item("item_1", "tenant_a", "conv_1", 1),
+        make_conversation_item("item_2", "tenant_a", "conv_2", 1),
+    ];
+    store
+        .create_conversation_items(&items)
+        .await
+        .expect("item insert should succeed");
+
+    let existing = store
+        .get_existing_conversation_item_ids("tenant_a", "conv_1", &["item_1", "item_2"])
+        .await
+        .expect("get_existing should succeed");
+
+    assert_eq!(existing.len(), 1, "should find only the item in conv_1");
+    assert!(
+        existing.contains(&"item_1".to_owned()),
+        "item_1 should be found in conv_1"
+    );
+}
+
+#[tokio::test]
+async fn conversation_item_position_tenant_isolation() {
+    let store = make_store_with_items().await;
+    let item = make_conversation_item("item_1", "tenant_a", "conv_1", 5);
+    store
+        .create_conversation_items(&[item])
+        .await
+        .expect("item insert should succeed");
+
+    let position = store
+        .conversation_item_position("tenant_b", "conv_1", "item_1")
+        .await
+        .expect("cross-tenant position lookup should succeed");
+
+    assert!(position.is_none(), "tenant_b should not see tenant_a item position");
+}
+
+#[tokio::test]
+async fn conversation_item_position_conversation_isolation() {
+    let store = make_store_with_items().await;
+    let item = make_conversation_item("item_1", "tenant_a", "conv_1", 5);
+    store
+        .create_conversation_items(&[item])
+        .await
+        .expect("item insert should succeed");
+
+    let position = store
+        .conversation_item_position("tenant_a", "conv_2", "item_1")
+        .await
+        .expect("cross-conversation position lookup should succeed");
+
+    assert!(position.is_none(), "item_1 position should not be visible in conv_2");
+}
+
+#[tokio::test]
 async fn conversation_item_methods_fail_without_items_table() {
     let store = make_store().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
@@ -1196,6 +1279,144 @@ async fn conversation_item_methods_fail_without_items_table() {
         matches!(err, StoreError::Unavailable(_)),
         "max_position should return Unavailable"
     );
+}
+
+// -----------------------------------------------------------------------------
+// File-Backed Store
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn file_backed_store_crud() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("test.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let store = SqliteResponseStore::new(&url, "file_responses", "file_conversations", None)
+        .await
+        .expect("file-backed store creation should succeed");
+
+    let record = make_response_record("resp_1", "tenant_a", 1000);
+    store.upsert_response(&record).await.expect("upsert should succeed");
+
+    let fetched = store
+        .get_response("tenant_a", "resp_1")
+        .await
+        .expect("get should succeed")
+        .expect("record should exist");
+
+    assert_eq!(
+        fetched.id, "resp_1",
+        "file-backed store should persist and retrieve records"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Schema Migration Idempotency
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn schema_migration_is_idempotent() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("idempotent.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let store = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"))
+        .await
+        .expect("first init should succeed");
+
+    let record = make_response_record("resp_1", "tenant_a", 1000);
+    store.upsert_response(&record).await.expect("upsert should succeed");
+
+    drop(store);
+
+    let store2 = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"))
+        .await
+        .expect("second init with same tables should succeed");
+
+    let fetched = store2
+        .get_response("tenant_a", "resp_1")
+        .await
+        .expect("get should succeed")
+        .expect("record should survive re-init");
+
+    assert_eq!(
+        fetched.id, "resp_1",
+        "data should persist across schema re-initialization"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Concurrent Access
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_upserts_do_not_lose_data() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let store = Arc::new(make_file_store(&dir).await);
+    let mut handles = Vec::new();
+
+    for i in 0..20 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let id = format!("resp_{i}");
+            let record = make_response_record(&id, "tenant_a", i64::from(i));
+            store
+                .upsert_response(&record)
+                .await
+                .expect("concurrent upsert should succeed");
+        }));
+    }
+
+    for handle in handles {
+        handle.await.expect("task should not panic");
+    }
+
+    for i in 0..20 {
+        let id = format!("resp_{i}");
+        let fetched = store.get_response("tenant_a", &id).await.expect("get should succeed");
+        assert!(fetched.is_some(), "response {id} should exist after concurrent upsert");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_reads_and_writes() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let store = Arc::new(make_file_store(&dir).await);
+
+    let record = make_response_record("resp_rw", "tenant_a", 1000);
+    store
+        .upsert_response(&record)
+        .await
+        .expect("seed upsert should succeed");
+
+    let mut handles = Vec::new();
+
+    for _ in 0..10 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let fetched = store
+                .get_response("tenant_a", "resp_rw")
+                .await
+                .expect("concurrent read should succeed");
+            assert!(fetched.is_some(), "seeded record should be readable under contention");
+        }));
+    }
+
+    for i in 0..10 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let id = format!("resp_concurrent_{i}");
+            let record = make_response_record(&id, "tenant_a", 2000 + i64::from(i));
+            store
+                .upsert_response(&record)
+                .await
+                .expect("concurrent write should succeed");
+        }));
+    }
+
+    for handle in handles {
+        handle.await.expect("task should not panic");
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2052,6 +2273,14 @@ async fn make_store() -> SqliteResponseStore {
     SqliteResponseStore::new("sqlite::memory:", "test_responses", "test_conversation_messages", None)
         .await
         .expect("store creation should succeed")
+}
+
+async fn make_file_store(dir: &tempfile::TempDir) -> SqliteResponseStore {
+    let db_path = dir.path().join("concurrent.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None)
+        .await
+        .expect("file-backed store creation should succeed")
 }
 
 async fn make_store_with_items() -> SqliteResponseStore {

@@ -82,6 +82,7 @@ AI_PKGS := -p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis -p xtask
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo +nightly fmt $(AI_PKGS) -- --check
+	cargo xtask lint-separators
 
 fmt:
 	cargo +nightly fmt $(AI_PKGS)
@@ -100,8 +101,8 @@ coverage-check:
 		--output-path coverage.json
 	@LINE_PCT=$$(jq '.data[0].totals.lines.percent' coverage.json); \
 	echo "Line coverage: $${LINE_PCT}%"; \
-	if [ $$(echo "$${LINE_PCT} < 90" | bc -l) -eq 1 ]; then \
-		echo "FAIL: coverage $${LINE_PCT}% is below 90% threshold"; \
+	if [ $$(echo "$${LINE_PCT} < 93" | bc -l) -eq 1 ]; then \
+		echo "FAIL: coverage $${LINE_PCT}% is below 93% threshold"; \
 		exit 1; \
 	fi
 
@@ -137,7 +138,7 @@ help:
 	@echo "  test-integration     integration tests"
 	@echo ""
 	@echo "Quality:"
-	@echo "  lint                 clippy + rustfmt check"
+	@echo "  lint                 clippy + rustfmt + separator width check"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"
