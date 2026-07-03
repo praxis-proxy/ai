@@ -54,4 +54,3 @@ mod openai_responses_model_rewrite;
 mod prompt_enrich;
 #[cfg(feature = "ai-inference")]
 mod responses_routing;
-mod routing;
