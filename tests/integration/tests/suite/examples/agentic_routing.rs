@@ -338,6 +338,90 @@ fn a2a_classifier_routing_routes_context_id() {
 }
 
 #[test]
+fn a2a_classifier_routing_routes_streaming_context_id() {
+    let agent_guard = start_backend_with_shutdown("agent-response");
+    let streaming_guard = start_backend_with_shutdown("streaming-response");
+    let task_specific_guard = start_backend_with_shutdown("task-specific-response");
+    let task_guard = start_backend_with_shutdown("task-response");
+    let message_guard = start_backend_with_shutdown("message-response");
+    let notification_guard = start_backend_with_shutdown("notification-response");
+    let agent_info_guard = start_backend_with_shutdown("agent-info-response");
+    let default_guard = start_backend_with_shutdown("default-response");
+    let proxy_port = free_port();
+
+    let config = load_a2a_example_config(
+        proxy_port,
+        agent_guard.port(),
+        streaming_guard.port(),
+        task_specific_guard.port(),
+        task_guard.port(),
+        message_guard.port(),
+        notification_guard.port(),
+        agent_info_guard.port(),
+        default_guard.port(),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &a2a_json_post(
+            "/",
+            r#"{"jsonrpc":"2.0","id":2,"method":"SendStreamingMessage","params":{"message":{"contextId":"ctx-123","role":"ROLE_USER","parts":[{"text":"hello"}]}}}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "SendStreamingMessage with context ID should return 200"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "message-response",
+        "contextId=ctx-123 should route before the broader streaming method route"
+    );
+}
+
+#[test]
+fn a2a_classifier_routing_routes_list_tasks_context_id() {
+    let agent_guard = start_backend_with_shutdown("agent-response");
+    let streaming_guard = start_backend_with_shutdown("streaming-response");
+    let task_specific_guard = start_backend_with_shutdown("task-specific-response");
+    let task_guard = start_backend_with_shutdown("task-response");
+    let message_guard = start_backend_with_shutdown("message-response");
+    let notification_guard = start_backend_with_shutdown("notification-response");
+    let agent_info_guard = start_backend_with_shutdown("agent-info-response");
+    let default_guard = start_backend_with_shutdown("default-response");
+    let proxy_port = free_port();
+
+    let config = load_a2a_example_config(
+        proxy_port,
+        agent_guard.port(),
+        streaming_guard.port(),
+        task_specific_guard.port(),
+        task_guard.port(),
+        message_guard.port(),
+        notification_guard.port(),
+        agent_info_guard.port(),
+        default_guard.port(),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &a2a_json_post(
+            "/",
+            r#"{"jsonrpc":"2.0","id":3,"method":"ListTasks","params":{"contextId":"ctx-123"}}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "ListTasks with context ID should return 200");
+    assert_eq!(
+        parse_body(&raw),
+        "message-response",
+        "contextId=ctx-123 should route before the broader task family route"
+    );
+}
+
+#[test]
 fn a2a_classifier_routing_routes_streaming() {
     let agent_guard = start_backend_with_shutdown("agent-response");
     let streaming_guard = start_backend_with_shutdown("streaming-response");

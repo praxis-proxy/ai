@@ -8,7 +8,7 @@
 # This example demonstrates static A2A routing based on:
 # - Method classification (SendMessage, SendStreamingMessage, GetTask, etc.)
 # - Streaming detection for SendStreamingMessage and SubscribeToTask
-# - Context ID extraction from params.message.contextId
+# - Context ID extraction from params.message.contextId and ListTasks params.contextId
 # - Task ID extraction from params.id and params.taskId
 # - Method alias support for compatibility (slash-delimited → PascalCase)
 #
