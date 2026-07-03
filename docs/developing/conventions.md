@@ -210,8 +210,19 @@ use std::io::Write;
 
 ### Additional Coding Conventions
 
-- Use separator comments to visually separate distinct
-  sections of code.
+- **Separator comments** visually separate distinct
+  sections of code. Each separator line must be exactly
+  80 columns wide (indent + `// ` + dashes). Adjust the
+  dash count for the indentation level:
+  Top-level (77 dashes = 80 cols):
+  ```rust
+  // -----------------------------------------------------------------------------
+  ```
+  Inside `mod tests` with 4-space indent (73 dashes = 80 cols):
+  ```rust
+      // -------------------------------------------------------------------------
+  ```
+  `cargo xtask lint-separators` enforces this.
 - **No re-export-only files.** If a file exists solely
   to `pub use` items from another crate or module,
   inline the import at the call site instead.
