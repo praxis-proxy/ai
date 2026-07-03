@@ -13,8 +13,8 @@
 # `model: "codex-mini-2026-06-24"` and the proxy transparently
 # rewrites it to a locally-hosted model before forwarding.
 #
-# Requires the ai-inference feature:
-#   cargo build -p praxis-proxy --features ai-inference
+# Build:
+#   cargo build -p praxis-ai-proxy
 
 listeners:
   - name: ai-gateway

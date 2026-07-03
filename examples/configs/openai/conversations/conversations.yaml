@@ -10,7 +10,7 @@
 #   DELETE /v1/conversations/{id}   — delete conversation
 #
 # Usage:
-#   cargo run -p praxis-proxy -- -c examples/configs/ai/openai/conversations/conversations.yaml
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/openai/conversations/conversations.yaml
 
 listeners:
   - name: conversations-gateway

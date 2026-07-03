@@ -5,8 +5,6 @@
 
 Persists non-streaming Responses API responses to the configured response store backend.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration
 
 | Field | Type | Required | Description |

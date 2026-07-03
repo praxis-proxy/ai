@@ -30,12 +30,14 @@ http = "1.4.2"
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
+quote = "1.0.46"
 rand = "0.10.1"
 regex = "1.12.4"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.150"
+syn = { version = "2.0.118", features = ["full", "extra-traits", "visit"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres"] }
 tempfile = "3.27.0"

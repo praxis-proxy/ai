@@ -5,8 +5,6 @@
 
 Classifies Anthropic Messages API requests and promotes routing facts to headers, metadata, and filter results.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration
 
 | Field | Type | Required | Description |

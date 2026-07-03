@@ -5,8 +5,6 @@
 
 Calls an external AI guardrail provider to evaluate request (and eventually response) bodies. The provider determines whether content should be passed, blocked, or redacted.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration
 
 | Field | Type | Required | Description |

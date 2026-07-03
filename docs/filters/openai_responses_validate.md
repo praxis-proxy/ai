@@ -5,8 +5,6 @@
 
 Validates and enriches Responses API requests.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration Notes
 
 Reads classifier metadata for parameter-combination checks, then parses the body as [`serde_json::Value`] for targeted field extraction. Does not deserialize the full body into a typed struct.
