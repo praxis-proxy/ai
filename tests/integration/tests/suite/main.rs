@@ -38,7 +38,6 @@
 )]
 
 mod a2a;
-mod adversarial;
 mod agentic_mocks;
 #[cfg(feature = "ai-inference")]
 mod anthropic_messages;
