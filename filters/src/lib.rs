@@ -21,9 +21,9 @@ pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use token_usage_headers::TokenUsageHeadersFilter;
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Test Utilities
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]

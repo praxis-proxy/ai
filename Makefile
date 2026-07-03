@@ -82,6 +82,7 @@ AI_PKGS := -p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis -p xtask
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo +nightly fmt $(AI_PKGS) -- --check
+	cargo xtask lint-separators
 
 fmt:
 	cargo +nightly fmt $(AI_PKGS)
@@ -137,7 +138,7 @@ help:
 	@echo "  test-integration     integration tests"
 	@echo ""
 	@echo "Quality:"
-	@echo "  lint                 clippy + rustfmt check"
+	@echo "  lint                 clippy + rustfmt + separator width check"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"
