@@ -2511,6 +2511,108 @@ async fn update_conversation_with_invalid_json_returns_400() {
 }
 
 // -----------------------------------------------------------------------------
+// Handler Tests — Tenant Isolation
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cross_tenant_get_conversation_returns_404() {
+    let filter = build_test_filter();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.tenant_id", "tenant-a");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = serde_json::json!({"metadata": {"owner": "a"}});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create");
+    };
+    let resp = rejection_body(&rejection);
+    let conv_id = resp["id"].as_str().unwrap();
+
+    let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}"));
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.tenant_id", "tenant-b");
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from cross-tenant GET");
+    };
+    assert_eq!(
+        rejection.status, 404,
+        "cross-tenant GET should return 404, not leak data"
+    );
+}
+
+#[tokio::test]
+async fn cross_tenant_delete_conversation_returns_404() {
+    let filter = build_test_filter();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.tenant_id", "tenant-a");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = serde_json::json!({"metadata": {"owner": "a"}});
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create");
+    };
+    let resp = rejection_body(&rejection);
+    let conv_id = resp["id"].as_str().unwrap();
+
+    let req = make_request(Method::DELETE, &format!("/v1/conversations/{conv_id}"));
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.tenant_id", "tenant-b");
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from cross-tenant DELETE");
+    };
+    assert_eq!(
+        rejection.status, 404,
+        "cross-tenant DELETE should return 404, not delete another tenant's data"
+    );
+}
+
+#[tokio::test]
+async fn cross_tenant_delete_item_returns_404() {
+    let filter = build_test_filter();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.tenant_id", "tenant-a");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = serde_json::json!({
+        "items": [{"id": "item_secret", "type": "message", "role": "user", "content": "private"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create");
+    };
+    let resp = rejection_body(&rejection);
+    let conv_id = resp["id"].as_str().unwrap();
+
+    let req = make_request(
+        Method::DELETE,
+        &format!("/v1/conversations/{conv_id}/items/item_secret"),
+    );
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.tenant_id", "tenant-b");
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from cross-tenant item DELETE");
+    };
+    assert_eq!(rejection.status, 404, "cross-tenant item DELETE should return 404");
+}
+
+// -----------------------------------------------------------------------------
 // Handler Tests — Delete Item Syncs Conversation Messages
 // -----------------------------------------------------------------------------
 
@@ -2550,6 +2652,18 @@ async fn delete_item_returns_updated_conversation() {
         "delete item should return updated conversation"
     );
     assert_eq!(resp["id"], conv_id);
+
+    let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items"));
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from list items");
+    };
+    assert_eq!(rejection.status, 200);
+    let items_resp = rejection_body(&rejection);
+    let items = items_resp["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only the kept item should remain");
+    assert_eq!(items[0]["id"], "item_stay");
 }
 
 // -----------------------------------------------------------------------------
