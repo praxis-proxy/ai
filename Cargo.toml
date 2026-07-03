@@ -36,7 +36,7 @@ regex = "1.12.4"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
-serde_json = "1.0.150"
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 syn = { version = "2.0.118", features = ["full", "extra-traits", "visit"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres"] }
