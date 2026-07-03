@@ -21,7 +21,7 @@ fn openai_responses_validate_example_forwards_valid_responses_request() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/request-validate.yaml",
+        "openai/responses/request-validate.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
     );
@@ -42,7 +42,7 @@ fn openai_responses_validate_example_rejects_stream_and_background() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/request-validate.yaml",
+        "openai/responses/request-validate.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
     );
@@ -94,7 +94,7 @@ fn openai_responses_validate_example_accepts_minimal_request() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/request-validate.yaml",
+        "openai/responses/request-validate.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
     );

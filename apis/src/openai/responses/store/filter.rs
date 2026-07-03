@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! [`ResponseStoreFilter`] persists non-streaming Responses API
-//! responses to the configured store backend and handles
+//! [`ResponseStoreFilter`] persists Responses API responses to the
+//! configured store backend and handles
 //! `DELETE /v1/responses/{id}` locally.
 //!
 //! # Lifecycle design
@@ -14,14 +14,15 @@
 //!   `previous_response_id`). Lazily initializes the store backend when needed. Sets `responses.skip_persist` metadata
 //!   on store init failure for requests that would otherwise persist.
 //!
-//! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx or
-//!   non-JSON responses set `responses.skip_persist` and bail early.
+//! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
+//!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
+//!   early.
 //!
-//! - **`on_response_body`**: at end-of-stream, extracts the record from the buffered response JSON and persists it
-//!   synchronously via [`block_in_place`] before returning to Pingora. This guarantees the record is durable before the
-//!   client observes the completed response, preventing races with subsequent operations like `DELETE
-//!   /v1/responses/{id}`. Non-persistable exchanges release chunks immediately via [`FilterAction::Release`] to avoid
-//!   holding pass-through traffic in the `StreamBuffer`.
+//! - **`on_response_body`**: at end-of-stream, extracts the record from the buffered response JSON or accumulated
+//!   streaming [`ResponsesState`] and persists it synchronously via [`block_in_place`] before returning to Pingora.
+//!   This guarantees the record is durable before the client observes the completed response, preventing races with
+//!   subsequent operations like `DELETE /v1/responses/{id}`. Non-persistable exchanges release chunks immediately via
+//!   [`FilterAction::Release`] to avoid holding pass-through traffic in the `StreamBuffer`.
 //!
 //! [`block_in_place`]: tokio::task::block_in_place
 //!
@@ -68,8 +69,7 @@ use crate::store::{
     PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
 };
 
-/// Persists non-streaming Responses API responses to the
-/// configured response store backend.
+/// Persists Responses API responses to the configured response store backend.
 ///
 /// # YAML
 ///
@@ -248,6 +248,70 @@ impl ResponseStoreFilter {
 
         Some((store, bytes))
     }
+
+    /// Persist a streaming response from accumulated `ResponsesState`.
+    fn persist_from_streaming_state(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if should_skip_persist(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+
+        if ctx.get_metadata("responses.stream_parse_error") == Some("true")
+            || ctx.get_metadata("responses.stream_incomplete") == Some("true")
+        {
+            trace!("skipping streaming persistence: stream had errors or was incomplete");
+            return Ok(FilterAction::Continue);
+        }
+
+        let Some(store) = self.store.get().and_then(Option::as_deref) else {
+            trace!("skipping streaming persistence: store unavailable");
+            return Ok(FilterAction::Continue);
+        };
+
+        let tenant_id = ctx
+            .get_metadata(TENANT_METADATA_KEY)
+            .unwrap_or(DEFAULT_TENANT_ID)
+            .to_owned();
+
+        let request_input = ctx
+            .remove_filter_state::<ResponseStoreRequestState>()
+            .map(|state| state.input);
+
+        let Some(record) = build_record_from_state(ctx, &tenant_id, request_input) else {
+            trace!("skipping streaming persistence: no accumulated state");
+            return Ok(FilterAction::Continue);
+        };
+
+        persist_response_blocking(store, &record)?;
+        Ok(FilterAction::Continue)
+    }
+
+    /// Persist a non-streaming response from the buffered body bytes.
+    fn persist_from_buffered_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
+        let Some((store, bytes)) = self.terminal_store_and_body(ctx, body) else {
+            return Ok(FilterAction::Continue);
+        };
+        let tenant_id = ctx
+            .get_metadata(TENANT_METADATA_KEY)
+            .unwrap_or(DEFAULT_TENANT_ID)
+            .to_owned();
+        let request_input = ctx
+            .remove_filter_state::<ResponseStoreRequestState>()
+            .map(|state| state.input);
+        let state_messages = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .map(|state| state.persisted_messages.clone());
+        let Some(record) = parse_response_record(bytes, &tenant_id, request_input, state_messages) else {
+            return Ok(FilterAction::Continue);
+        };
+
+        persist_response_blocking(store, &record)?;
+        Ok(FilterAction::Continue)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -407,7 +471,7 @@ fn delete_not_found_rejection(id: &str) -> Rejection {
 
 /// Check whether this request should skip persistence entirely.
 fn should_skip(ctx: &HttpFilterContext<'_>) -> bool {
-    is_non_post_request(ctx) || is_non_responses_format(ctx) || is_store_disabled(ctx) || is_streaming_request(ctx)
+    is_non_post_request(ctx) || is_non_responses_format(ctx) || is_store_disabled(ctx)
 }
 
 /// Check whether this request should initialize the store.
@@ -417,10 +481,7 @@ fn should_init_store_for_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Check whether this request can persist the eventual response.
 fn request_will_persist_response(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.request.method == http::Method::POST
-        && is_responses_format(ctx)
-        && !is_store_disabled(ctx)
-        && !is_streaming_request(ctx)
+    ctx.request.method == http::Method::POST && is_responses_format(ctx) && !is_store_disabled(ctx)
 }
 
 /// Check whether rehydrate needs the store before the request phase.
@@ -463,11 +524,7 @@ fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request uses streaming responses.
 fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
-    let skip = ctx.get_metadata("openai_responses_format.stream") == Some("true");
-    if skip {
-        trace!("skipping streaming request (deferred)");
-    }
-    skip
+    ctx.get_metadata("openai_responses_format.stream") == Some("true")
 }
 
 /// Return whether the request references a previous response.
@@ -490,6 +547,16 @@ fn is_json_content_type(content_type: &str) -> bool {
         .eq_ignore_ascii_case("application/json")
 }
 
+/// Return whether a `Content-Type` header is SSE event stream.
+fn is_event_stream_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
+}
+
 /// Check response headers before enabling response body buffering.
 fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
     let Some(resp) = ctx.response_header.as_ref() else {
@@ -502,13 +569,14 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
         return false;
     }
 
-    let is_json = resp
+    let content_type = resp
         .headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(is_json_content_type);
-    if !is_json {
-        trace!("skipping persistence for non-JSON content type");
+        .unwrap_or_default();
+    let is_persistable_content = is_json_content_type(content_type) || is_event_stream_content_type(content_type);
+    if !is_persistable_content {
+        trace!("skipping persistence for non-persistable content type");
         ctx.set_metadata("responses.skip_persist", "true");
         return false;
     }
@@ -549,6 +617,47 @@ fn parse_response_record(
         created_at,
         model: model.to_owned(),
         response_object: json,
+        input: capture.input,
+        messages: capture.messages,
+    })
+}
+
+/// Build a [`ResponseRecord`] from accumulated streaming state.
+///
+/// Reads `ResponsesState` from extensions. Returns `None` if the
+/// state is absent, `response_object` is null, or required fields
+/// are missing.
+pub(super) fn build_record_from_state(
+    ctx: &HttpFilterContext<'_>,
+    tenant_id: &str,
+    request_input: Option<Value>,
+) -> Option<ResponseRecord> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+
+    if state.response_object.is_null() {
+        warn!("streaming persistence: response_object is null (incomplete stream?)");
+        return None;
+    }
+
+    let json = &state.response_object;
+    let id = json.get("id").and_then(Value::as_str);
+    let created_at = json.get("created_at").and_then(Value::as_i64);
+    let model = json.get("model").and_then(Value::as_str);
+
+    let (Some(id), Some(created_at), Some(model)) = (id, created_at, model) else {
+        warn!("streaming persistence: missing required field (id, created_at, or model)");
+        return None;
+    };
+
+    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
+    let capture = ResponseCapture::from_response_json(json, request_input, state_messages);
+
+    Some(ResponseRecord {
+        id: id.to_owned(),
+        tenant_id: tenant_id.to_owned(),
+        created_at,
+        model: model.to_owned(),
+        response_object: json.clone(),
         input: capture.input,
         messages: capture.messages,
     })
@@ -694,37 +803,24 @@ impl HttpFilter for ResponseStoreFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if self.should_release_skipped_response_body(ctx) {
-            // This filter declares StreamBuffer globally. Response storage is
-            // only armed for non-streaming Responses API exchanges with a
-            // usable store and a JSON 2xx response; otherwise release chunks
-            // immediately instead of holding pass-through traffic until EOS.
             return Ok(FilterAction::Release);
+        }
+
+        if is_streaming_request(ctx) {
+            if !end_of_stream {
+                if ctx.get_metadata("responses._reformat_error").is_some() {
+                    return Ok(FilterAction::Continue);
+                }
+                return Ok(FilterAction::Release);
+            }
+            return self.persist_from_streaming_state(ctx);
         }
 
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
 
-        let Some((store, bytes)) = self.terminal_store_and_body(ctx, body) else {
-            return Ok(FilterAction::Continue);
-        };
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
-        let request_input = ctx
-            .remove_filter_state::<ResponseStoreRequestState>()
-            .map(|state| state.input);
-        let state_messages = ctx
-            .extensions
-            .get::<ResponsesState>()
-            .map(|state| state.persisted_messages.clone());
-        let Some(record) = parse_response_record(bytes, &tenant_id, request_input, state_messages) else {
-            return Ok(FilterAction::Continue);
-        };
-
-        persist_response_blocking(store, &record)?;
-        Ok(FilterAction::Continue)
+        self.persist_from_buffered_body(ctx, body)
     }
 }
 

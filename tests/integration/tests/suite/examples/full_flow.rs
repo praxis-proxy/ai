@@ -27,7 +27,7 @@ fn full_flow_stateful_valid_request_reaches_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/full-flow.yaml",
+        "openai/responses/full-flow.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -56,7 +56,7 @@ fn full_flow_stateless_valid_request_reaches_same_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/full-flow.yaml",
+        "openai/responses/full-flow.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -85,7 +85,7 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/full-flow.yaml",
+        "openai/responses/full-flow.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -114,7 +114,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let proxy_port = free_port();
 
     let (db_url, db_path) = temp_sqlite_url("full_flow_prev");
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),

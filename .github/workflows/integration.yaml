@@ -1,4 +1,4 @@
-name: Coverage
+name: Tests (Integration)
 
 # ------------------------------------------------------------------------------
 # Workflow Settings
@@ -9,9 +9,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  merge_group:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable verbose test output (V=1)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,12 +23,16 @@ concurrency:
 
 permissions: {}
 
+env:
+  CARGO_TERM_COLOR: always
+  V: ${{ inputs.debug && '1' || '' }}
+
 jobs:
   # ----------------------------------------------------------------------------
-  # Code Coverage Gate
+  # Integration test suites (tests/ crates)
   # ----------------------------------------------------------------------------
 
-  coverage:
+  test:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -36,20 +44,6 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
-        with:
-          toolchain: stable
-          components: llvm-tools-preview
-
-      - name: Cache cargo-llvm-cov binary
-        id: cache-llvm-cov
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-llvm-cov-${{ runner.os }}
-
-      - name: Install cargo-llvm-cov
-        if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
-        run: cargo install cargo-llvm-cov --locked
 
       - name: Cache Cargo registry and build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -58,11 +52,14 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target/llvm-cov-target
-          key: ${{ runner.os }}-rust-1.96.0-coverage-${{ hashFiles('**/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-rust-1.96.0-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-coverage-
+            ${{ runner.os }}-rust-1.96.0-cargo-
           save-always: true
 
-      - name: Check coverage (≥93% lines)
-        run: make coverage-check
+      - name: Schema tests
+        run: make test-schema
+
+      - name: Integration tests
+        run: make test-integration

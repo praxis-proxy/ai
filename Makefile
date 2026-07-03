@@ -12,7 +12,7 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit test-integration \
+	test test-unit test-schema test-integration \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
@@ -67,8 +67,11 @@ test-unit:
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
 
+test-schema:
+	cargo test -p praxis-tests-schema $(_NOCAPTURE)
+
 test-integration:
-	cargo test -p praxis-ai-tests-integration $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
 # Quality
@@ -79,6 +82,7 @@ AI_PKGS := -p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis -p xtask
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo +nightly fmt $(AI_PKGS) -- --check
+	cargo xtask lint-separators
 
 fmt:
 	cargo +nightly fmt $(AI_PKGS)
@@ -97,8 +101,8 @@ coverage-check:
 		--output-path coverage.json
 	@LINE_PCT=$$(jq '.data[0].totals.lines.percent' coverage.json); \
 	echo "Line coverage: $${LINE_PCT}%"; \
-	if [ $$(echo "$${LINE_PCT} < 90" | bc -l) -eq 1 ]; then \
-		echo "FAIL: coverage $${LINE_PCT}% is below 90% threshold"; \
+	if [ $$(echo "$${LINE_PCT} < 93" | bc -l) -eq 1 ]; then \
+		echo "FAIL: coverage $${LINE_PCT}% is below 93% threshold"; \
 		exit 1; \
 	fi
 
@@ -130,10 +134,11 @@ help:
 	@echo "Test:"
 	@echo "  test                 run all tests"
 	@echo "  test-unit            unit tests (providers, filters, server)"
+	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo ""
 	@echo "Quality:"
-	@echo "  lint                 clippy + rustfmt check"
+	@echo "  lint                 clippy + rustfmt + separator width check"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"
