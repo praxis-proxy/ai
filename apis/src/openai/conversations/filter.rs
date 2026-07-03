@@ -311,7 +311,11 @@ impl HttpFilter for OpenaiConversationsFilter {
         true
     }
 
-    #[expect(clippy::too_many_lines, reason = "dispatcher with one arm per endpoint")]
+    #[expect(
+        clippy::large_stack_frames,
+        clippy::too_many_lines,
+        reason = "dispatcher with one arm per endpoint"
+    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let path = ctx.request.uri.path();
         let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
