@@ -174,15 +174,14 @@ impl SseFrameParser {
     #[expect(clippy::too_many_lines, reason = "linear SSE field processing")]
     fn process_line(&mut self) -> Option<SseFrame> {
         if self.line_buf.is_empty() {
-            let frame = self.has_data.then(|| SseFrame {
-                event_type: self.event_type.take(),
-                data: self.data_buf.clone(),
+            let frame = self.has_data.then(|| {
+                self.has_data = false;
+                SseFrame {
+                    event_type: self.event_type.take(),
+                    data: std::mem::take(&mut self.data_buf),
+                }
             });
 
-            if self.has_data {
-                self.data_buf.clear();
-                self.has_data = false;
-            }
             self.event_type = None;
             return frame;
         }

@@ -50,11 +50,12 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
             config.insecure_options.allow_unbounded_body,
         )
         .unwrap();
+    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
     Arc::new(pipeline)
 }
 
 /// Build the filter pipeline from the config using the
-/// builtin registry (uses first listener). Resolves branch
+/// full AI registry (uses first listener). Resolves branch
 /// chains via [`build_with_chains`].
 ///
 /// # Panics
@@ -63,7 +64,7 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
 ///
 /// [`build_with_chains`]: FilterPipeline::build_with_chains
 pub fn build_pipeline(config: &Config) -> FilterPipeline {
-    let registry = FilterRegistry::with_builtins();
+    let registry = praxis_ai::build_full_registry();
     let listener = config
         .listeners
         .first()
@@ -210,7 +211,7 @@ fn spawn_proxy_server(config: &Config, registry: &FilterRegistry) -> ProxyGuard 
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_proxy(config: &Config) -> ProxyGuard {
-    start_proxy_with_registry(config, &FilterRegistry::with_builtins())
+    start_proxy_with_registry(config, &praxis_ai::build_full_registry())
 }
 
 /// Start the proxy with a custom filter registry.
@@ -230,7 +231,7 @@ pub fn start_proxy_with_registry(config: &Config, registry: &FilterRegistry) -> 
 /// Start a full proxy server (HTTP + TCP protocols) in a background thread.
 pub fn start_full_proxy(config: Config) {
     std::thread::spawn(move || {
-        praxis::run_server(config, None);
+        praxis_ai::run_server(config, None);
     });
 }
 
@@ -313,7 +314,7 @@ pub fn start_reloadable_proxy(yaml: &str) -> ReloadableProxyGuard {
 
     let path_for_server = config_path.clone();
     std::thread::spawn(move || {
-        praxis::run_server(config, Some(path_for_server));
+        praxis_ai::run_server(config, Some(path_for_server));
     });
 
     crate::net::wait::wait_for_http(&addr);
@@ -337,7 +338,7 @@ pub fn start_reloadable_proxy(yaml: &str) -> ReloadableProxyGuard {
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_tls_proxy(config: &Config, client_config: &Arc<rustls::ClientConfig>) -> ProxyGuard {
-    let guard = spawn_proxy_server(config, &FilterRegistry::with_builtins());
+    let guard = spawn_proxy_server(config, &praxis_ai::build_full_registry());
     crate::net::tls::wait_for_https(&guard.addr, client_config);
     guard
 }
@@ -352,7 +353,7 @@ pub fn start_tls_proxy(config: &Config, client_config: &Arc<rustls::ClientConfig
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_tls_proxy_no_wait(config: &Config) -> ProxyGuard {
-    spawn_proxy_server(config, &FilterRegistry::with_builtins())
+    spawn_proxy_server(config, &praxis_ai::build_full_registry())
 }
 
 // -----------------------------------------------------------------------------
@@ -413,8 +414,8 @@ filter_chains:
 // Registry Test Utilities
 // -----------------------------------------------------------------------------
 
-/// Build a [`FilterRegistry`] with builtins plus one custom
-/// test filter.
+/// Build a [`FilterRegistry`] with the full AI registry plus
+/// one custom test filter.
 ///
 /// # Panics
 ///
@@ -422,7 +423,7 @@ filter_chains:
 ///
 /// [`FilterRegistry`]: praxis_filter::FilterRegistry
 pub fn registry_with(name: &str, make: fn() -> Box<dyn HttpFilter>) -> FilterRegistry {
-    let mut registry = FilterRegistry::with_builtins();
+    let mut registry = praxis_ai::build_full_registry();
     registry
         .register(name, FilterFactory::Http(Arc::new(move |_| Ok(make()))))
         .expect("duplicate filter name in test registry");

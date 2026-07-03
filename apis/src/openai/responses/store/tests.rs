@@ -16,8 +16,9 @@ use praxis_filter::{
 use serde_json::json;
 
 use super::{
-    ResponseStoreFilter,
-    config::{ResponseStoreConfig, validate_config},
+    DEFAULT_PAGE_LIMIT, ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
+    config::{ResponseStoreConfig, revalidate_postgres_host, validate_config},
+    list_input_items,
 };
 use crate::store::{ResponseRecord, ResponseStore as _, ResponseStoreRegistry, SqliteResponseStore};
 
@@ -2988,11 +2989,7 @@ fn parse_query_params_empty() {
     let params = super::filter::parse_query_params(None);
     assert!(params.cursor.is_none(), "cursor should be None for empty query");
     assert_eq!(params.limit, 20, "limit should default to 20");
-    assert_eq!(
-        params.order,
-        super::Order::Descending,
-        "order should default to Descending"
-    );
+    assert_eq!(params.order, Order::Descending, "order should default to Descending");
 }
 
 #[test]
@@ -3004,11 +3001,7 @@ fn parse_query_params_all_fields() {
         "cursor should be parsed from after param"
     );
     assert_eq!(params.limit, 10, "limit should be parsed from query");
-    assert_eq!(
-        params.order,
-        super::Order::Ascending,
-        "order should be parsed as Ascending"
-    );
+    assert_eq!(params.order, Order::Ascending, "order should be parsed as Ascending");
 }
 
 #[test]
@@ -3032,8 +3025,963 @@ fn parse_query_params_unknown_order_ignored() {
     let params = super::filter::parse_query_params(Some("order=random"));
     assert_eq!(
         params.order,
-        super::Order::Descending,
+        Order::Descending,
         "unknown order value should keep default"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// list_input_items (direct unit tests)
+// -----------------------------------------------------------------------------
+
+fn make_record_with_input(input: serde_json::Value) -> ResponseRecord {
+    ResponseRecord {
+        id: "resp_test".to_owned(),
+        tenant_id: "default".to_owned(),
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({}),
+        input,
+        messages: json!([]),
+    }
+}
+
+#[test]
+fn list_input_items_scalar_input_normalized_to_message_item() {
+    let record = make_record_with_input(json!("Hello"));
+    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    assert_eq!(page.data.len(), 1, "string input should produce one message item");
+    assert_eq!(
+        page.data[0],
+        json!({
+            "id": "msg_resp_test_input_0",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}]
+        }),
+        "string input should be normalized to a user message resource"
+    );
+    assert!(!page.has_more);
+}
+
+#[test]
+fn list_input_items_null_input_returns_empty_page() {
+    let record = make_record_with_input(json!(null));
+    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    assert!(page.data.is_empty(), "null input should yield no items");
+    assert!(!page.has_more);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn list_input_items_empty_array_returns_empty_page() {
+    let record = make_record_with_input(json!([]));
+    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    assert!(page.data.is_empty(), "empty array input should yield empty page");
+    assert!(!page.has_more);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn list_input_items_ascending_preserves_natural_order() {
+    let record = make_record_with_input(json!([
+        {"id": "a", "val": 1},
+        {"id": "b", "val": 2},
+        {"id": "c", "val": 3}
+    ]));
+    let params = ListParams {
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(page.data[0]["id"], "a");
+    assert_eq!(page.data[1]["id"], "b");
+    assert_eq!(page.data[2]["id"], "c");
+}
+
+#[test]
+fn list_input_items_descending_reverses_order() {
+    let record = make_record_with_input(json!([
+        {"id": "a", "val": 1},
+        {"id": "b", "val": 2},
+        {"id": "c", "val": 3}
+    ]));
+    let params = ListParams {
+        order: Order::Descending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(page.data[0]["id"], "c");
+    assert_eq!(page.data[1]["id"], "b");
+    assert_eq!(page.data[2]["id"], "a");
+}
+
+#[test]
+fn list_input_items_limit_zero_clamped_to_one() {
+    let record = make_record_with_input(json!([
+        {"id": "a"},
+        {"id": "b"},
+        {"id": "c"}
+    ]));
+    let params = ListParams {
+        limit: 0,
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(page.data.len(), 1, "limit=0 should be clamped to 1");
+    assert!(page.has_more);
+}
+
+#[test]
+fn list_input_items_limit_above_max_clamped() {
+    let items: Vec<serde_json::Value> = (0..5).map(|i| json!({"id": format!("item_{i}")})).collect();
+    let record = make_record_with_input(json!(items));
+    let params = ListParams {
+        limit: MAX_PAGE_LIMIT + 50,
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(
+        page.data.len(),
+        5,
+        "should return all items when limit exceeds count after clamping"
+    );
+    assert!(!page.has_more);
+}
+
+#[test]
+fn list_input_items_cursor_after_last_returns_empty_page() {
+    let record = make_record_with_input(json!([
+        {"id": "a"},
+        {"id": "b"}
+    ]));
+    let params = ListParams {
+        cursor: Some("b".to_owned()),
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert!(page.data.is_empty(), "cursor after last item should yield empty page");
+    assert!(!page.has_more);
+}
+
+#[test]
+fn list_input_items_cursor_after_first_skips_it() {
+    let record = make_record_with_input(json!([
+        {"id": "a"},
+        {"id": "b"},
+        {"id": "c"}
+    ]));
+    let params = ListParams {
+        cursor: Some("a".to_owned()),
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(page.data.len(), 2);
+    assert_eq!(page.data[0]["id"], "b");
+    assert_eq!(page.data[1]["id"], "c");
+}
+
+#[test]
+fn list_input_items_numeric_cursor_fallback() {
+    let record = make_record_with_input(json!([
+        {"val": 1},
+        {"val": 2},
+        {"val": 3}
+    ]));
+    let params = ListParams {
+        cursor: Some("1".to_owned()),
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(page.data.len(), 2, "numeric cursor 1 should skip first item");
+    assert_eq!(page.data[0]["val"], 2);
+    assert_eq!(page.data[1]["val"], 3);
+}
+
+#[test]
+fn list_input_items_invalid_cursor_returns_error() {
+    let record = make_record_with_input(json!([
+        {"val": 1},
+        {"val": 2}
+    ]));
+    let params = ListParams {
+        cursor: Some("not_a_cursor".to_owned()),
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let result = list_input_items(&record, &params);
+    assert!(result.is_err(), "non-numeric cursor not matching any ID should error");
+}
+
+#[test]
+fn list_input_items_next_cursor_uses_item_id() {
+    let record = make_record_with_input(json!([
+        {"id": "a"},
+        {"id": "b"},
+        {"id": "c"},
+        {"id": "d"}
+    ]));
+    let params = ListParams {
+        limit: 2,
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert!(page.has_more);
+    assert_eq!(
+        page.next_cursor.as_deref(),
+        Some("b"),
+        "next_cursor should use the last item's ID"
+    );
+}
+
+#[test]
+fn list_input_items_next_cursor_falls_back_to_numeric_offset() {
+    let record = make_record_with_input(json!([
+        {"val": 1},
+        {"val": 2},
+        {"val": 3},
+        {"val": 4}
+    ]));
+    let params = ListParams {
+        limit: 2,
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert!(page.has_more);
+    assert_eq!(
+        page.next_cursor.as_deref(),
+        Some("2"),
+        "next_cursor should fall back to numeric offset when items lack IDs"
+    );
+}
+
+#[test]
+fn list_input_items_no_next_cursor_when_no_more() {
+    let record = make_record_with_input(json!([{"id": "a"}, {"id": "b"}]));
+    let params = ListParams {
+        limit: 10,
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert!(!page.has_more);
+    assert!(
+        page.next_cursor.is_none(),
+        "next_cursor should be None when all items fit"
+    );
+}
+
+#[test]
+fn list_input_items_default_limit_is_default_page_limit() {
+    let params = ListParams::default();
+    assert_eq!(params.limit, DEFAULT_PAGE_LIMIT);
+    assert_eq!(params.order, Order::Descending);
+    assert!(params.cursor.is_none());
+}
+
+#[test]
+fn list_input_items_object_input_wrapped_as_single_item() {
+    let record = make_record_with_input(json!({"type": "message", "role": "user", "content": "hi"}));
+    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    assert_eq!(page.data.len(), 1);
+    assert_eq!(page.data[0]["type"], "message");
+}
+
+#[test]
+fn list_input_items_descending_cursor_operates_on_reversed_order() {
+    let record = make_record_with_input(json!([
+        {"id": "a"},
+        {"id": "b"},
+        {"id": "c"},
+        {"id": "d"}
+    ]));
+    let params = ListParams {
+        cursor: Some("c".to_owned()),
+        limit: 2,
+        order: Order::Descending,
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(page.data.len(), 2, "should return items after cursor in reversed order");
+    assert_eq!(page.data[0]["id"], "b");
+    assert_eq!(page.data[1]["id"], "a");
+    assert!(!page.has_more);
+}
+
+// -----------------------------------------------------------------------------
+// on_request_body edge cases
+// -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_request_body_non_end_of_stream_does_not_process() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "non-EOS request body should just continue"
+    );
+    assert!(
+        filter.store.get().is_none(),
+        "store should not initialize before end of stream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_request_body_non_post_at_eos_does_not_extract_input() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_123");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from_static(b"{}"));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "non-POST request body at EOS should continue"
+    );
+    assert!(filter.store.get().is_none(), "store should not initialize for non-POST");
+}
+
+// -----------------------------------------------------------------------------
+// on_response_body message assembly edge cases
+// -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_response_with_null_output() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = json!({
+        "id": "resp_null_output",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "input": [{"role": "user", "content": "Hello"}],
+        "output": null
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let store = filter.store.get().unwrap().as_ref().unwrap();
+    let record = store
+        .get_response("default", "resp_null_output")
+        .await
+        .unwrap()
+        .expect("record should exist");
+    assert_eq!(
+        record.messages,
+        json!([{"role": "user", "content": "Hello"}]),
+        "null output should not appear in messages"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_response_with_no_output_field() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = json!({
+        "id": "resp_no_output",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "input": [{"role": "user", "content": "Hello"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let store = filter.store.get().unwrap().as_ref().unwrap();
+    let record = store
+        .get_response("default", "resp_no_output")
+        .await
+        .unwrap()
+        .expect("record should exist");
+    assert_eq!(
+        record.messages,
+        json!([{"role": "user", "content": "Hello"}]),
+        "missing output field should not appear in messages"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_response_with_non_array_output() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = json!({
+        "id": "resp_object_output",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "input": "Hello",
+        "output": {"type": "message", "content": "Hi"}
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let store = filter.store.get().unwrap().as_ref().unwrap();
+    let record = store
+        .get_response("default", "resp_object_output")
+        .await
+        .unwrap()
+        .expect("record should exist");
+    assert_eq!(
+        record.messages,
+        json!([
+            {"type": "message", "role": "user", "content": "Hello"},
+            {"type": "message", "content": "Hi"}
+        ]),
+        "non-array output should be pushed as a single item"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_response_with_object_input() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = json!({
+        "id": "resp_object_input",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "input": {"type": "custom_item", "data": "some data"},
+        "output": [{"type": "message", "content": "Result"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let store = filter.store.get().unwrap().as_ref().unwrap();
+    let record = store
+        .get_response("default", "resp_object_input")
+        .await
+        .unwrap()
+        .expect("record should exist");
+    assert_eq!(
+        record.messages,
+        json!([
+            {"type": "custom_item", "data": "some data"},
+            {"type": "message", "content": "Result"}
+        ]),
+        "object input should be pushed as a single item in messages"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_response_with_null_input() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = json!({
+        "id": "resp_null_input",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "input": null,
+        "output": [{"type": "message", "content": "Result"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let store = filter.store.get().unwrap().as_ref().unwrap();
+    let record = store
+        .get_response("default", "resp_null_input")
+        .await
+        .unwrap()
+        .expect("record should exist");
+    assert_eq!(
+        record.messages,
+        json!([{"type": "message", "content": "Result"}]),
+        "null input should not appear in messages"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_response_with_no_input_field() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = json!({
+        "id": "resp_missing_input",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "content": "Result"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let store = filter.store.get().unwrap().as_ref().unwrap();
+    let record = store
+        .get_response("default", "resp_missing_input")
+        .await
+        .unwrap()
+        .expect("record should exist");
+    assert_eq!(record.input, json!(null), "missing input should default to null");
+    assert_eq!(
+        record.messages,
+        json!([{"type": "message", "content": "Result"}]),
+        "missing input should not appear in messages"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_uses_custom_tenant_id() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("responses.tenant_id", "custom_tenant");
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = json!({
+        "id": "resp_tenant_body",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "input": "Hi",
+        "output": []
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let store = filter.store.get().unwrap().as_ref().unwrap();
+    let record = store
+        .get_response("custom_tenant", "resp_tenant_body")
+        .await
+        .unwrap()
+        .expect("record should exist under custom tenant");
+    assert_eq!(record.tenant_id, "custom_tenant");
+
+    let default_record = store.get_response("default", "resp_tenant_body").await.unwrap();
+    assert!(default_record.is_none(), "record should not exist under default tenant");
+}
+
+// -----------------------------------------------------------------------------
+// GET /v1/responses/{id}/input_items edge cases
+// -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_trailing_slash_handled() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_slash_items",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_slash_items/input_items/");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "trailing slash on input_items should be handled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_with_scalar_input() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_scalar", "default", json!("hello world")).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_scalar/input_items");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        body["data"].as_array().unwrap().len(),
+        1,
+        "string input should produce one message item"
+    );
+    assert_eq!(
+        body["data"][0],
+        json!({
+            "id": "msg_resp_scalar_input_0",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello world"}]
+        }),
+        "string input should be normalized to a user message resource"
+    );
+    assert_eq!(
+        body["first_id"], "msg_resp_scalar_input_0",
+        "first_id should use the synthetic message id"
+    );
+    assert_eq!(
+        body["last_id"], "msg_resp_scalar_input_0",
+        "last_id should use the synthetic message id"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_default_descending_order() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_desc",
+        "default",
+        json!([
+            {"id": "item_1", "type": "message"},
+            {"id": "item_2", "type": "message"},
+            {"id": "item_3", "type": "message"}
+        ]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_desc/input_items");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data[0]["id"], "item_3", "default descending order should reverse items");
+    assert_eq!(data[1]["id"], "item_2");
+    assert_eq!(data[2]["id"], "item_1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_with_empty_input() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_empty_input", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_empty_input/input_items");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(body["data"].as_array().unwrap().is_empty());
+    assert_eq!(body["has_more"], false);
+    assert_eq!(body["first_id"], json!(null), "empty data should have null first_id");
+    assert_eq!(body["last_id"], json!(null), "empty data should have null last_id");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_tenant_isolation() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_tenant_items", "tenant_a", json!([{"id": "item_1"}])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_tenant_items/input_items");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(
+        rejection.status, 404,
+        "input_items should return 404 when response belongs to different tenant"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Additional config validation edge cases
+// -----------------------------------------------------------------------------
+
+#[test]
+fn sqlite_colon_memory_variant_accepted() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite://:memory:"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_ok(),
+        "sqlite://:memory: variant should be accepted as in-memory database"
+    );
+}
+
+#[test]
+fn sqlite_database_url_without_double_slash_accepted() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite:test.db?mode=rwc"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_ok(), "sqlite URL without // prefix should be accepted");
+}
+
+#[test]
+fn sqlite_memory_with_extra_query_params_accepted() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite:///tmp/test.db?mode=memory&cache=shared"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_ok(),
+        "sqlite URL with mode=memory among other query params should be accepted"
+    );
+}
+
+#[test]
+fn postgres_config_accepts_public_ipv4_host() {
+    let yaml = postgres_config_yaml("postgres://user:pass@203.0.113.10:5432/praxis", "");
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_ok(), "public IPv4 postgres host should be accepted");
+}
+
+#[test]
+fn postgres_config_rejects_ipv6_unique_local() {
+    let yaml = postgres_config_yaml("postgres://user:pass@[fd12:3456:789a::1]:5432/praxis", "");
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "IPv6 unique-local postgres host should be rejected by default"
+    );
+}
+
+#[test]
+fn postgres_config_rejects_ipv6_unspecified() {
+    let yaml = postgres_config_yaml("postgres://user:pass@[::]:5432/praxis", "");
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "IPv6 unspecified postgres host should be rejected by default"
+    );
+}
+
+#[test]
+fn postgres_config_rejects_ipv4_mapped_loopback_in_authority() {
+    let yaml = postgres_config_yaml("postgres://user:pass@[::ffff:127.0.0.1]:5432/praxis", "");
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "IPv4-mapped loopback in authority should be rejected");
+}
+
+#[test]
+fn postgres_config_url_fragment_not_treated_as_query() {
+    let yaml = postgres_config_yaml(
+        "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full#sslrootcert=/path/to/ca.pem",
+        "ssl_root_cert: /path/to/ca.pem",
+    );
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_ok(), "URL fragment should not be parsed as query parameters");
+}
+
+#[test]
+fn postgres_config_rejects_ssl_cert_path_traversal() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&ssl-cert=../client.pem"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "ssl-cert alias with path traversal should be rejected");
+}
+
+#[test]
+fn postgres_config_rejects_ssl_key_path_traversal() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&ssl-key=../client.key"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "ssl-key alias with path traversal should be rejected");
+}
+
+#[test]
+fn postgres_config_with_ssl_ca_alias_and_verified_sslmode_parses() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@203.0.113.10:5432/praxis?ssl-mode=verify-full&ssl-ca=/path/to/ca.pem"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_ok(),
+        "ssl-ca alias should be recognized as root cert parameter"
+    );
+}
+
+#[test]
+fn revalidate_postgres_host_accepts_non_postgres_url() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let result = revalidate_postgres_host(&cfg);
+    assert!(
+        result.is_ok(),
+        "revalidate_postgres_host should return Ok for non-postgres URLs"
+    );
+}
+
+#[test]
+fn revalidate_postgres_host_rejects_loopback_host() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@127.0.0.1:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let result = revalidate_postgres_host(&cfg);
+    assert!(result.is_err(), "revalidate_postgres_host should reject loopback host");
+}
+
+#[test]
+fn revalidate_postgres_host_rejects_hostaddr_query_param() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=127.0.0.1"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let result = revalidate_postgres_host(&cfg);
+    assert!(
+        result.is_err(),
+        "revalidate_postgres_host should reject loopback hostaddr query param"
+    );
+}
+
+#[test]
+fn revalidate_postgres_host_accepts_public_ip() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let result = revalidate_postgres_host(&cfg);
+    assert!(result.is_ok(), "revalidate_postgres_host should accept public IP");
+}
+
+#[test]
+fn revalidate_postgres_host_rejects_host_query_param_loopback() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=127.0.0.1"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let result = revalidate_postgres_host(&cfg);
+    assert!(
+        result.is_err(),
+        "revalidate_postgres_host should reject loopback host query param"
+    );
+}
+
+#[test]
+fn postgres_config_rejects_hostaddr_with_invalid_ip() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=not-an-ip"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "hostaddr with invalid IP should be rejected");
+}
+
+#[test]
+fn postgres_config_accepts_ipv6_public_host() {
+    let yaml = postgres_config_yaml("postgres://user:pass@[2001:db8::1]:5432/praxis", "");
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_ok(), "public IPv6 postgres host should be accepted");
+}
+
+#[test]
+fn postgres_config_rejects_ipv6_link_local() {
+    let yaml = postgres_config_yaml("postgres://user:pass@[fe80::1]:5432/praxis", "");
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "IPv6 link-local postgres host should be rejected by default"
     );
 }
 

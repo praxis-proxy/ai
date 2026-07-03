@@ -99,10 +99,7 @@ pub struct InputItemPage {
 /// Returns [`StoreError::InvalidInput`] if the cursor is malformed
 /// or overflows while calculating the page window.
 pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<InputItemPage, StoreError> {
-    let mut items = match &record.input {
-        serde_json::Value::Array(arr) => arr.clone(),
-        other => vec![other.clone()],
-    };
+    let mut items = normalize_input_items(record);
     if params.order == Order::Descending {
         items.reverse();
     }
@@ -129,6 +126,39 @@ pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<
         data,
         next_cursor,
         has_more,
+    })
+}
+
+/// Normalize raw stored input into a list of Responses API items.
+///
+/// The stored `input` column preserves the original create-request
+/// value verbatim (`"Hello"`, `null`, or an `ItemResource[]` array).
+/// The `/v1/responses/{id}/input_items` endpoint returns
+/// `ItemResource[]`, so this function applies the same
+/// resource shape as the public API: string input becomes a
+/// synthetic user message resource, null input yields an empty list,
+/// and arrays/objects pass through as-is.
+fn normalize_input_items(record: &ResponseRecord) -> Vec<serde_json::Value> {
+    match &record.input {
+        serde_json::Value::Null => vec![],
+        serde_json::Value::String(text) => vec![scalar_input_item(&record.id, text)],
+        serde_json::Value::Array(arr) => arr.clone(),
+        other => vec![other.clone()],
+    }
+}
+
+/// Build a public input message resource for scalar create input.
+fn scalar_input_item(response_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("msg_{response_id}_input_0"),
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": text
+            }
+        ]
     })
 }
 

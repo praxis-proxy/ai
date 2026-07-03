@@ -22,7 +22,7 @@ fn openai_responses_format_routing_example_routes_responses_input() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/format-routing.yaml",
+        "openai/responses/format-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", responses_guard.port()),
@@ -51,7 +51,7 @@ fn openai_responses_format_routing_example_routes_chat_completions() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/format-routing.yaml",
+        "openai/responses/format-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", responses_guard.port()),
@@ -80,7 +80,7 @@ fn openai_responses_format_routing_example_unknown_falls_to_default() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "ai/openai/responses/format-routing.yaml",
+        "openai/responses/format-routing.yaml",
         proxy_port,
         HashMap::from([
             ("127.0.0.1:3001", responses_guard.port()),

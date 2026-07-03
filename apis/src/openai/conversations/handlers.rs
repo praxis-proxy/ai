@@ -121,12 +121,7 @@ pub(super) async fn handle_create_conversation(
     }
     debug!(conversation_id, tenant_id, "conversation created");
 
-    let body = serde_json::json!({
-        "id": conversation_id,
-        "object": "conversation",
-        "created_at": created_at,
-        "metadata": metadata,
-    });
+    let body = conversation_to_json(&record);
     Ok(FilterAction::Reject(json_response(200, &body)?))
 }
 

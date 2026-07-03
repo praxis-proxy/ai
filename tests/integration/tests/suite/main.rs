@@ -38,44 +38,18 @@
 )]
 
 mod a2a;
-mod adversarial;
 mod agentic_mocks;
+#[cfg(feature = "ai-inference")]
 mod anthropic_messages;
-mod body;
-mod body_pipeline;
-mod compression;
-mod conditions;
-mod cors;
-mod csrf;
-mod downstream_read_timeout;
 mod examples;
 mod failure_mode;
-mod filter_composition;
-mod filter_metadata;
 mod guardrails;
-mod health_check;
-mod hot_reload;
-mod ip_acl;
-mod json_body_field;
-mod json_rpc;
 mod mcp;
-mod mcp_broker;
+#[cfg(feature = "ai-inference")]
 mod openai_responses_format;
+#[cfg(feature = "ai-inference")]
 mod openai_responses_model_rewrite;
-mod path_rewrite;
-mod payload_processing;
-mod per_listener_pipeline;
+#[cfg(feature = "ai-inference")]
 mod prompt_enrich;
-mod rate_limit;
+#[cfg(feature = "ai-inference")]
 mod responses_routing;
-mod retry;
-mod routing;
-mod security;
-mod sni_router;
-mod stream_buffer_adapter;
-mod tcp_access_log;
-mod tcp_load_balancer;
-mod tls;
-mod url_rewrite;
-mod websocket;
-mod wildcard_routing;

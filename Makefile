@@ -12,7 +12,7 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit test-integration \
+	test test-unit test-schema test-integration \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
@@ -67,8 +67,11 @@ test-unit:
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
 
+test-schema:
+	cargo test -p praxis-tests-schema $(_NOCAPTURE)
+
 test-integration:
-	cargo test -p praxis-ai-tests-integration $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
 # Quality
@@ -130,6 +133,7 @@ help:
 	@echo "Test:"
 	@echo "  test                 run all tests"
 	@echo "  test-unit            unit tests (providers, filters, server)"
+	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo ""
 	@echo "Quality:"

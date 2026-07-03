@@ -115,15 +115,15 @@ fn inject_usage_headers(ctx: &mut HttpFilterContext<'_>) {
     ctx.response_headers_modified = true;
 
     let headers = &mut resp.headers;
-    insert_token_header(headers, HEADER_TOKEN_INPUT.clone(), &input);
-    insert_token_header(headers, HEADER_TOKEN_OUTPUT.clone(), &output);
-    insert_token_header(headers, HEADER_TOKEN_TOTAL.clone(), &total);
+    insert_token_header(headers, &HEADER_TOKEN_INPUT, &input);
+    insert_token_header(headers, &HEADER_TOKEN_OUTPUT, &output);
+    insert_token_header(headers, &HEADER_TOKEN_TOTAL, &total);
 
     trace!("injected token usage response headers");
 }
 
 /// Insert a token count as a response header, logging on failure.
-fn insert_token_header(headers: &mut http::HeaderMap, name: HeaderName, value: &str) {
+fn insert_token_header(headers: &mut http::HeaderMap, name: &HeaderName, value: &str) {
     match HeaderValue::from_str(value) {
         Ok(hv) => {
             headers.insert(name, hv);
