@@ -5,8 +5,6 @@
 
 Promotes the JSON `"model"` field from the request body to a request header.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration
 
 | Field | Type | Required | Description |

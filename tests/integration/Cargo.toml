@@ -8,8 +8,6 @@ readme = "../../README.md"
 publish = false
 
 [features]
-default = ["ai-inference"]
-ai-inference = ["praxis-filter/ai-inference", "praxis-test-utils/ai-inference"]
 cpex-policy-engine = ["praxis-filter/cpex-policy-engine"]
 no-mac-cert-rotation-tests = [] # We use this to disable testing cert rotation on macOS
 

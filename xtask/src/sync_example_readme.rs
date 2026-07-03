@@ -18,13 +18,14 @@ use clap::Parser;
 /// Title overrides for category directories whose display name cannot be
 /// derived by simple title-casing. All other directories are converted
 /// automatically (e.g. `"traffic-management"` → `"Traffic Management"`).
-const TITLE_OVERRIDES: &[(&str, &str)] = &[("openai", "OpenAI")];
+const TITLE_OVERRIDES: &[(&str, &str)] = &[("_root", "General"), ("openai", "OpenAI")];
 
 /// Comment-line prefixes that begin a non-description block. Paragraphs
 /// whose first line starts with any of these are skipped during description
 /// extraction.
 const SKIP_PREFIXES: &[&str] = &[
     "Backend endpoints ",
+    "Build:",
     "Example:",
     "Flow:",
     "Pipeline:",
@@ -38,12 +39,7 @@ const SKIP_PREFIXES: &[&str] = &[
 
 /// Entries that live outside `examples/configs/` but belong in the README.
 /// `(category, filename, link_path, description)`.
-const SPECIAL_ENTRIES: &[(&str, &str, &str, &str)] = &[(
-    "pipeline",
-    "default.yaml",
-    "../core/src/config/default.yaml",
-    "Built-in default config (static JSON on /)",
-)];
+const SPECIAL_ENTRIES: &[(&str, &str, &str, &str)] = &[];
 
 /// Marker line that separates the hand-maintained header from the
 /// auto-generated tables.
@@ -118,15 +114,27 @@ fn discover_categories(configs_dir: &Path) -> Vec<(String, String)> {
     let Ok(entries) = std::fs::read_dir(configs_dir) else {
         return Vec::new();
     };
+    let mut has_root_files = false;
     let mut categories: Vec<(String, String)> = entries
         .flatten()
-        .filter(|e| e.path().is_dir())
+        .filter(|e| {
+            if e.path().is_dir() {
+                return true;
+            }
+            if e.path().extension().is_some_and(|ext| ext == "yaml") {
+                has_root_files = true;
+            }
+            false
+        })
         .map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             let title = category_title(&name);
             (name, title)
         })
         .collect();
+    if has_root_files {
+        categories.push(("_root".to_owned(), category_title("_root")));
+    }
     categories.sort();
     categories
 }
@@ -163,13 +171,16 @@ fn collect_entries(configs_dir: &Path) -> BTreeMap<String, Vec<ExampleEntry>> {
 
     for path in &paths {
         let rel = path.strip_prefix(configs_dir).unwrap();
-        let category = rel
-            .components()
-            .next()
-            .unwrap()
-            .as_os_str()
-            .to_string_lossy()
-            .into_owned();
+        let category = match rel.parent().filter(|p| p != &Path::new("")) {
+            Some(parent) => parent
+                .components()
+                .next()
+                .unwrap()
+                .as_os_str()
+                .to_string_lossy()
+                .into_owned(),
+            None => "_root".to_owned(),
+        };
 
         let filename = path.file_name().unwrap().to_string_lossy().into_owned();
         let link_path = format!("configs/{}", rel.to_string_lossy());

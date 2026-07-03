@@ -5,8 +5,6 @@
 
 Transforms streaming SSE responses between `OpenAI` and Anthropic formats, processing each chunk as it arrives.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration Notes
 
 Arms automatically when an upstream classifier or transform filter sets `anthropic_messages_format.stream` or `anthropic_to_openai.streaming` metadata to `"true"` and the backend response has `Content-Type: text/event-stream` (with or without parameters such as `charset=utf-8`). No `response_conditions` configuration is needed.

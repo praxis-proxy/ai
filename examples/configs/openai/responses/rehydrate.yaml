@@ -28,8 +28,8 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_abc"}'
 #
-# Requires the ai-inference feature:
-#   cargo build -p praxis-proxy --features ai-inference
+# Build:
+#   cargo build -p praxis-ai-proxy
 
 listeners:
   - name: ai-gateway

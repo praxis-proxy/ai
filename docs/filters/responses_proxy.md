@@ -5,8 +5,6 @@
 
 Rebuilds the request body from `ResponsesState` when present.
 
-Requires Cargo feature: `ai-inference`.
-
 ## Configuration Notes
 
 Reads the assembled conversation history from `ResponsesState::messages` and replaces the `input` field in the outbound body. Strips `previous_response_id` since Praxis already resolved it locally via the rehydrate filter.
