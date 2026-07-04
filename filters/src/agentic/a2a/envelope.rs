@@ -185,6 +185,8 @@ impl A2aFamily {
 /// Extracted A2A envelope metadata.
 #[derive(Debug, Clone)]
 pub(crate) struct A2aEnvelope {
+    /// Context ID from the request, when present.
+    pub context_id: Option<String>,
     /// Method family classification.
     pub family: A2aFamily,
     /// Classified A2A method (canonical after alias resolution).
@@ -218,9 +220,11 @@ pub(crate) fn extract_a2a_envelope(
     let family = method.family();
     let streaming = method.is_streaming();
     let task_id = extract_task_id(value, &method);
+    let context_id = extract_context_id(value, &method);
     let version = extract_version(request_headers);
 
     A2aEnvelope {
+        context_id,
         family,
         method,
         original_method,
@@ -243,6 +247,22 @@ fn extract_task_id(value: &Value, method: &A2aMethod) -> Option<String> {
     } else {
         // No task ID extraction for other methods
         None
+    }
+}
+
+/// A2A places context IDs at different JSON depths depending on the
+/// method, so extraction must be method-aware.
+fn extract_context_id(value: &Value, method: &A2aMethod) -> Option<String> {
+    let params = value.get("params")?;
+
+    match method {
+        A2aMethod::SendMessage | A2aMethod::SendStreamingMessage => params
+            .get("message")
+            .and_then(|m| m.get("contextId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        A2aMethod::ListTasks => params.get("contextId").and_then(Value::as_str).map(str::to_owned),
+        _ => None,
     }
 }
 

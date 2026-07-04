@@ -136,6 +136,10 @@ fn default_max_response_body_bytes() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct A2aHeaders {
+    /// Header name for the extracted context ID (e.g. `x-praxis-a2a-context-id`).
+    #[serde(default = "default_context_id_header")]
+    pub context_id: Option<String>,
+
     /// Header name for the A2A family (e.g. `x-praxis-a2a-family`).
     #[serde(default = "default_family_header")]
     pub family: Option<String>,
@@ -164,6 +168,7 @@ pub(crate) struct A2aHeaders {
 impl Default for A2aHeaders {
     fn default() -> Self {
         Self {
+            context_id: default_context_id_header(),
             family: default_family_header(),
             kind: default_kind_header(),
             method: default_method_header(),
@@ -172,6 +177,15 @@ impl Default for A2aHeaders {
             version: default_version_header(),
         }
     }
+}
+
+/// Default context ID header name.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default functions require Option return type"
+)]
+fn default_context_id_header() -> Option<String> {
+    Some("x-praxis-a2a-context-id".to_owned())
 }
 
 /// Default method header name.
@@ -270,6 +284,7 @@ fn default_max_body_bytes() -> usize {
 pub(crate) fn build_config(cfg: A2aConfig) -> Result<A2aConfig, FilterError> {
     validate_max_body_bytes("a2a", cfg.max_body_bytes)?;
 
+    validate_header_name("a2a", "context_id", cfg.headers.context_id.as_deref())?;
     validate_header_name("a2a", "method", cfg.headers.method.as_deref())?;
     validate_header_name("a2a", "family", cfg.headers.family.as_deref())?;
     validate_header_name("a2a", "task_id", cfg.headers.task_id.as_deref())?;
