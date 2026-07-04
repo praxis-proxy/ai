@@ -7,6 +7,9 @@
 //! `Bedrock`, Azure) into a common [`TokenUsage`] representation.
 
 mod providers;
+mod streaming;
+
+pub use streaming::extract_streaming_tokens;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -21,6 +24,7 @@ mod tests;
 
 use praxis_filter::HttpFilterContext;
 use providers::{parse_anthropic, parse_bedrock, parse_google, parse_openai};
+use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
 // Public Types
@@ -75,9 +79,11 @@ impl TokenUsage {
 }
 
 /// AI provider identifier for response format selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub enum TokenUsageProvider {
     /// `OpenAI` API (`usage.prompt_tokens`, `usage.completion_tokens`).
+    #[serde(alias = "open_ai")]
     OpenAi,
 
     /// `Anthropic` Claude API (`usage.input_tokens`, `usage.output_tokens`).
