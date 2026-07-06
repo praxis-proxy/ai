@@ -35,7 +35,7 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
     let proxy_port = free_port();
 
     let (db_url, db_path) = temp_sqlite_url("stream_events");
-    let yaml = std::fs::read_to_string(example_config_path("ai/openai/responses/stream-events.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
