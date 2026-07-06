@@ -174,7 +174,13 @@ fn should_reformat_error(ctx: &HttpFilterContext<'_>) -> bool {
             .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("text/event-stream"));
+            .is_some_and(|ct| {
+                ct.split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            });
         is_error && !already_sse
     })
 }
@@ -1224,6 +1230,31 @@ mod tests {
         assert!(
             !ctx.filter_metadata.contains_key("responses._reformat_error"),
             "should not reformat already-SSE responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_response_skips_already_sse_mixed_case() {
+        let filter = make_filter();
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+        let mut resp = crate::test_utils::make_response();
+        resp.status = http::StatusCode::INTERNAL_SERVER_ERROR;
+        resp.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("Text/Event-Stream; charset=utf-8"),
+        );
+        ctx.response_header = Some(&mut resp);
+
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        assert!(
+            !ctx.filter_metadata.contains_key("responses._reformat_error"),
+            "should not reformat already-SSE responses with mixed-case content type"
         );
     }
 
