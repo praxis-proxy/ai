@@ -9,8 +9,6 @@
 mod providers;
 mod streaming;
 
-pub use streaming::extract_streaming_tokens;
-
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -79,7 +77,7 @@ impl TokenUsage {
 }
 
 /// AI provider identifier for response format selection.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum TokenUsageProvider {
     /// `OpenAI` API (`usage.prompt_tokens`, `usage.completion_tokens`).
@@ -119,28 +117,49 @@ pub fn set_token_usage(ctx: &mut HttpFilterContext<'_>, input: u64, output: u64,
     ctx.set_metadata("token.total", total.to_string());
 }
 
-/// Extracts token usage from a provider's JSON response body.
-///
-/// Returns `None` if the response doesn't contain usage information
-/// (e.g., error responses, malformed JSON, or missing fields).
-///
-/// # Example
-///
-/// ```
-/// use praxis_ai_apis::token_usage::{TokenUsageProvider, extract_token_usage};
-///
-/// let openai_response =
-///     br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}"#;
-/// let usage = extract_token_usage(TokenUsageProvider::OpenAi, openai_response).unwrap();
-/// assert_eq!(usage.input_tokens(), 10);
-/// assert_eq!(usage.output_tokens(), 20);
-/// assert_eq!(usage.total_tokens(), 30);
-/// ```
-pub fn extract_token_usage(provider: TokenUsageProvider, body: &[u8]) -> Option<TokenUsage> {
-    match provider {
-        TokenUsageProvider::OpenAi | TokenUsageProvider::Azure => parse_openai(body),
-        TokenUsageProvider::Anthropic => parse_anthropic(body),
-        TokenUsageProvider::Google => parse_google(body),
-        TokenUsageProvider::Bedrock => parse_bedrock(body),
+impl TokenUsageProvider {
+    /// Extracts token usage from a provider's JSON response body.
+    ///
+    /// Returns `None` if the response doesn't contain usage information
+    /// (e.g., error responses, malformed JSON, or missing fields).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use praxis_ai_apis::token_usage::TokenUsageProvider;
+    ///
+    /// let openai_response =
+    ///     br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}"#;
+    /// let usage = TokenUsageProvider::OpenAi
+    ///     .extract_token_usage(openai_response)
+    ///     .unwrap();
+    /// assert_eq!(usage.input_tokens(), 10);
+    /// assert_eq!(usage.output_tokens(), 20);
+    /// assert_eq!(usage.total_tokens(), 30);
+    /// ```
+    pub fn extract_token_usage(&self, body: &[u8]) -> Option<TokenUsage> {
+        match *self {
+            TokenUsageProvider::OpenAi | TokenUsageProvider::Azure => parse_openai(body),
+            TokenUsageProvider::Anthropic => parse_anthropic(body),
+            TokenUsageProvider::Google => parse_google(body),
+            TokenUsageProvider::Bedrock => parse_bedrock(body),
+        }
+    }
+
+    /// Extracts partial token counts from a single SSE event payload.
+    ///
+    /// Returns `(input, output)` where at least one field will be `Some`
+    /// when the event contains token data. Returns `(None, None)` when
+    /// the event contains no token usage data.
+    ///
+    /// Used as a fallback when [`Self::extract_token_usage`] returns `None` for
+    /// providers that distribute token counts across multiple events
+    /// (Anthropic, Bedrock).
+    pub fn extract_streaming_tokens(&self, event_data: &[u8]) -> (Option<u64>, Option<u64>) {
+        match *self {
+            TokenUsageProvider::Anthropic => streaming::parse_anthropic_event(event_data),
+            TokenUsageProvider::Bedrock => streaming::parse_bedrock_event(event_data),
+            TokenUsageProvider::OpenAi | TokenUsageProvider::Azure | TokenUsageProvider::Google => (None, None),
+        }
     }
 }

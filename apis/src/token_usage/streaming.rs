@@ -8,31 +8,6 @@
 
 use serde::Deserialize;
 
-use super::TokenUsageProvider;
-
-// -----------------------------------------------------------------------------
-// Public API
-// -----------------------------------------------------------------------------
-
-/// Extracts partial token counts from a single SSE event payload.
-///
-/// Returns `(input, output)` where at least one field will be `Some`
-/// when the event contains token data. Returns `(None, None)` when
-/// the event contains no token usage data.
-///
-/// Used as a fallback when [`extract_token_usage`] returns `None` for
-/// providers that distribute token counts across multiple events
-/// (Anthropic, Bedrock).
-///
-/// [`extract_token_usage`]: super::extract_token_usage
-pub fn extract_streaming_tokens(provider: TokenUsageProvider, event_data: &[u8]) -> (Option<u64>, Option<u64>) {
-    match provider {
-        TokenUsageProvider::Anthropic => parse_anthropic_event(event_data),
-        TokenUsageProvider::Bedrock => parse_bedrock_event(event_data),
-        TokenUsageProvider::OpenAi | TokenUsageProvider::Azure | TokenUsageProvider::Google => (None, None),
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Anthropic Streaming
 // -----------------------------------------------------------------------------
@@ -87,7 +62,7 @@ struct AnthropicDeltaUsage {
 }
 
 /// Parses Anthropic streaming events for partial token counts.
-fn parse_anthropic_event(data: &[u8]) -> (Option<u64>, Option<u64>) {
+pub(super) fn parse_anthropic_event(data: &[u8]) -> (Option<u64>, Option<u64>) {
     if let Ok(start) = serde_json::from_slice::<AnthropicMessageStart>(data)
         && start.event_type.as_deref() == Some("message_start")
         && let Some(message) = start.message
@@ -142,7 +117,7 @@ struct BedrockStreamUsage {
 }
 
 /// Parses Bedrock `ConverseStream` metadata events for token counts.
-fn parse_bedrock_event(data: &[u8]) -> (Option<u64>, Option<u64>) {
+pub(super) fn parse_bedrock_event(data: &[u8]) -> (Option<u64>, Option<u64>) {
     let Some(meta) = serde_json::from_slice::<BedrockStreamMetadata>(data).ok() else {
         return (None, None);
     };

@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::token_usage::{TokenUsageProvider, extract_streaming_tokens, extract_token_usage, set_token_usage};
+use praxis_ai_apis::token_usage::{TokenUsageProvider, set_token_usage};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -262,8 +262,8 @@ impl HttpFilter for TokenCountFilter {
         let mode = ctx.get_metadata(META_MODE).map(str::to_owned);
 
         match mode.as_deref() {
-            Some("sse") => handle_sse_body(ctx, body, end_of_stream, provider),
-            Some("json") => handle_json_body(ctx, body, end_of_stream, provider),
+            Some("sse") => handle_sse_body(ctx, body, end_of_stream, &provider),
+            Some("json") => handle_json_body(ctx, body, end_of_stream, &provider),
             _ => {},
         }
 
@@ -314,7 +314,7 @@ fn handle_json_body(
     ctx: &mut HttpFilterContext<'_>,
     body: &Option<Bytes>,
     end_of_stream: bool,
-    provider: TokenUsageProvider,
+    provider: &TokenUsageProvider,
 ) {
     if let Some(chunk) = body.as_ref()
         && !accumulate_response_hex(ctx, chunk, DEFAULT_MAX_BODY_BYTES)
@@ -327,7 +327,7 @@ fn handle_json_body(
         let bytes = ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex));
 
         if let Some(data) = bytes
-            && let Some(usage) = extract_token_usage(provider, &data)
+            && let Some(usage) = provider.extract_token_usage(&data)
         {
             set_token_usage(
                 ctx,
@@ -356,7 +356,7 @@ fn handle_sse_body(
     ctx: &mut HttpFilterContext<'_>,
     body: &Option<Bytes>,
     end_of_stream: bool,
-    provider: TokenUsageProvider,
+    provider: &TokenUsageProvider,
 ) {
     if let Some(chunk) = body.as_ref() {
         let mut state = load_sse_scan_state(ctx);
@@ -387,7 +387,7 @@ fn handle_sse_body(
 }
 
 /// Try to extract token usage from a single SSE data payload.
-fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: TokenUsageProvider) {
+fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) {
     if payload == b"[DONE]" {
         return;
     }
@@ -400,8 +400,8 @@ fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider
 }
 
 /// Try complete usage extraction (OpenAI, Google, Azure final events).
-fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: TokenUsageProvider) -> bool {
-    let Some(usage) = extract_token_usage(provider, payload) else {
+fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) -> bool {
+    let Some(usage) = provider.extract_token_usage(payload) else {
         return false;
     };
 
@@ -418,8 +418,8 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
 }
 
 /// Try partial extraction (Anthropic, Bedrock streaming).
-fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: TokenUsageProvider) {
-    let (input, output) = extract_streaming_tokens(provider, payload);
+fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) {
+    let (input, output) = provider.extract_streaming_tokens(payload);
 
     if let Some(inp) = input {
         merge_accumulated_count(ctx, META_INPUT, inp);
