@@ -17,6 +17,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use self::config::{AnthropicStreamEventsConfig, build_config};
+use crate::is_event_stream_content_type;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -398,12 +399,6 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
             .is_some_and(|v| v == "true")
 }
 
-/// Whether a `Content-Type` header value indicates `text/event-stream`.
-fn is_event_stream_content_type(ct: &str) -> bool {
-    ct.split(';')
-        .next()
-        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
-}
 
 /// Process a single SSE event block (lines between double-newlines).
 ///

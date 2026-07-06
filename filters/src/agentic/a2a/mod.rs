@@ -26,6 +26,7 @@ use std::{borrow::Cow, fmt::Write as _, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_ai_apis::is_event_stream_content_type;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     builtins::http::{
@@ -607,12 +608,6 @@ fn clear_sse_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.cluster");
 }
 
-/// Whether a content-type header value indicates `text/event-stream`.
-fn is_event_stream_content_type(ct: &str) -> bool {
-    ct.split(';')
-        .next()
-        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
-}
 
 /// Build a `JsonRpcConfig` for the shared parser with A2A-appropriate defaults.
 fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {

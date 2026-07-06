@@ -16,6 +16,17 @@ pub mod openai;
 pub mod store;
 pub mod token_usage;
 
+/// Whether a `Content-Type` header value indicates `text/event-stream`,
+/// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
+pub fn is_event_stream_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

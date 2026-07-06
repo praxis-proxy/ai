@@ -1,0 +1,48 @@
+# A2A Agent Card Routing
+#
+# Routes agent card discovery requests to dedicated backends.
+# Public discovery uses exact path matching; extended discovery
+# routes by the classifier's promoted x-praxis-a2a-method header.
+#
+# on_invalid: continue allows GET requests without a JSON-RPC body to
+# pass through to path-based routing.
+
+listeners:
+  - name: a2a
+    address: "127.0.0.1:8080"
+    filter_chains: [a2a-agent-card-routing]
+
+filter_chains:
+  - name: a2a-agent-card-routing
+    filters:
+      - filter: a2a
+        max_body_bytes: 65536
+        on_invalid: continue
+        headers:
+          method: x-praxis-a2a-method
+          family: x-praxis-a2a-family
+
+      - filter: router
+        routes:
+          - path: "/.well-known/agent-card.json"
+            cluster: "public-agent-card"
+
+          - path_prefix: "/"
+            headers:
+              x-praxis-a2a-method: "GetExtendedAgentCard"
+            cluster: "extended-agent-card"
+
+          - path_prefix: "/"
+            cluster: "default"
+
+      - filter: load_balancer
+        clusters:
+          - name: "public-agent-card"
+            endpoints:
+              - "127.0.0.1:9001"
+          - name: "extended-agent-card"
+            endpoints:
+              - "127.0.0.1:9002"
+          - name: "default"
+            endpoints:
+              - "127.0.0.1:9000"
