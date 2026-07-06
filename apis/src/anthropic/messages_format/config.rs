@@ -128,3 +128,140 @@ pub(crate) fn build_config(cfg: AnthropicMessagesFormatConfig) -> Result<Anthrop
 
     Ok(cfg)
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::needless_raw_strings,
+    clippy::needless_raw_string_hashes,
+    reason = "tests"
+)]
+mod tests {
+    use super::*;
+
+    // -- Serde defaults -------------------------------------------------------
+
+    #[test]
+    fn serde_defaults_anthropic_messages_format_config() {
+        let cfg: AnthropicMessagesFormatConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(cfg.max_body_bytes, 1_048_576, "default should be 1 MiB");
+        assert_eq!(cfg.on_invalid, OnInvalidBehavior::Continue);
+    }
+
+    #[test]
+    fn default_max_body_bytes_is_1_mib() {
+        assert_eq!(DEFAULT_MAX_BODY_BYTES, 1_048_576);
+    }
+
+    #[test]
+    fn anthropic_messages_format_headers_defaults() {
+        let h = AnthropicMessagesFormatHeaders::default();
+        assert_eq!(h.format.as_deref(), Some("x-praxis-ai-format"));
+        assert_eq!(h.model.as_deref(), Some("x-praxis-ai-model"));
+        assert_eq!(h.stream.as_deref(), Some("x-praxis-ai-stream"));
+    }
+
+    // -- deny_unknown_fields --------------------------------------------------
+
+    #[test]
+    fn deny_unknown_fields_anthropic_messages_format_config() {
+        let res = serde_yaml::from_str::<AnthropicMessagesFormatConfig>(
+            r#"
+bogus: true
+"#,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn deny_unknown_fields_anthropic_messages_format_headers() {
+        let res = serde_yaml::from_str::<AnthropicMessagesFormatHeaders>(
+            r#"
+format: x-test
+extra: true
+"#,
+        );
+        assert!(res.is_err());
+    }
+
+    // -- build_config ---------------------------------------------------------
+
+    #[test]
+    fn build_config_minimal_ok() {
+        let cfg: AnthropicMessagesFormatConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(build_config(cfg).is_ok());
+    }
+
+    #[test]
+    fn build_config_zero_max_body_bytes_rejected() {
+        let cfg = AnthropicMessagesFormatConfig {
+            on_invalid: OnInvalidBehavior::default_continue(),
+            max_body_bytes: 0,
+            headers: AnthropicMessagesFormatHeaders::default(),
+        };
+        let err = build_config(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("must be greater than 0"),
+            "expected 'must be greater than 0' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_config_invalid_header_name_rejected() {
+        let cfg = AnthropicMessagesFormatConfig {
+            on_invalid: OnInvalidBehavior::default_continue(),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            headers: AnthropicMessagesFormatHeaders {
+                format: Some("not a valid header!".into()),
+                model: default_model_header(),
+                stream: default_stream_header(),
+            },
+        };
+        let err = build_config(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid HTTP header name"),
+            "expected invalid header error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_config_valid_custom_headers_ok() {
+        let cfg = AnthropicMessagesFormatConfig {
+            on_invalid: OnInvalidBehavior::default_continue(),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            headers: AnthropicMessagesFormatHeaders {
+                format: Some("x-custom-format".into()),
+                model: Some("x-custom-model".into()),
+                stream: Some("x-custom-stream".into()),
+            },
+        };
+        assert!(build_config(cfg).is_ok());
+    }
+
+    // -- null header disables promotion ---------------------------------------
+
+    #[test]
+    fn null_header_disables_promotion() {
+        let cfg: AnthropicMessagesFormatConfig = serde_yaml::from_str(
+            r#"
+headers:
+  format: null
+  model: null
+  stream: null
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.headers.format.is_none());
+        assert!(cfg.headers.model.is_none());
+        assert!(cfg.headers.stream.is_none());
+        assert!(build_config(cfg).is_ok());
+    }
+}

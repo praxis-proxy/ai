@@ -155,3 +155,229 @@ pub(super) fn message_to_value(msg: &MessageConfig) -> serde_json::Value {
         "content": msg.content,
     })
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::needless_raw_strings,
+    clippy::needless_raw_string_hashes,
+    reason = "tests"
+)]
+mod tests {
+    use super::*;
+
+    // -- Serde defaults -------------------------------------------------------
+
+    #[test]
+    fn serde_defaults_prompt_enrich_config() {
+        let cfg: PromptEnrichConfig = serde_yaml::from_str(
+            r#"
+prepend:
+  - role: system
+    content: hello
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.max_body_bytes, DEFAULT_JSON_BODY_MAX_BYTES);
+        assert_eq!(cfg.on_invalid, InvalidBodyBehavior::Continue);
+        assert!(cfg.append.is_empty());
+    }
+
+    #[test]
+    fn invalid_body_behavior_defaults_to_continue() {
+        let b = InvalidBodyBehavior::default();
+        assert_eq!(b, InvalidBodyBehavior::Continue);
+    }
+
+    // -- MessageRole serde ----------------------------------------------------
+
+    #[test]
+    fn message_role_serde_system() {
+        let r: MessageRole = serde_yaml::from_str("system").unwrap();
+        assert_eq!(r, MessageRole::System);
+    }
+
+    #[test]
+    fn message_role_serde_user() {
+        let r: MessageRole = serde_yaml::from_str("user").unwrap();
+        assert_eq!(r, MessageRole::User);
+    }
+
+    #[test]
+    fn message_role_serde_unknown_rejected() {
+        let res = serde_yaml::from_str::<MessageRole>("admin");
+        assert!(res.is_err());
+    }
+
+    // -- InvalidBodyBehavior serde --------------------------------------------
+
+    #[test]
+    fn invalid_body_behavior_serde_continue() {
+        let b: InvalidBodyBehavior = serde_yaml::from_str("continue").unwrap();
+        assert_eq!(b, InvalidBodyBehavior::Continue);
+    }
+
+    #[test]
+    fn invalid_body_behavior_serde_reject() {
+        let b: InvalidBodyBehavior = serde_yaml::from_str("reject").unwrap();
+        assert_eq!(b, InvalidBodyBehavior::Reject);
+    }
+
+    // -- deny_unknown_fields --------------------------------------------------
+
+    #[test]
+    fn deny_unknown_fields_prompt_enrich_config() {
+        let res = serde_yaml::from_str::<PromptEnrichConfig>(
+            r#"
+prepend:
+  - role: system
+    content: hello
+unknown_field: true
+"#,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn deny_unknown_fields_message_config() {
+        let res = serde_yaml::from_str::<MessageConfig>(
+            r#"
+role: system
+content: hello
+extra: true
+"#,
+        );
+        assert!(res.is_err());
+    }
+
+    // -- validate_config ------------------------------------------------------
+
+    #[test]
+    fn validate_empty_prepend_and_append_rejected() {
+        let cfg = PromptEnrichConfig {
+            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            on_invalid: InvalidBodyBehavior::Continue,
+            prepend: vec![],
+            append: vec![],
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("at least one"),
+            "expected 'at least one' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_prepend_only_ok() {
+        let cfg = PromptEnrichConfig {
+            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            on_invalid: InvalidBodyBehavior::Continue,
+            prepend: vec![MessageConfig {
+                role: MessageRole::System,
+                content: "hello".into(),
+            }],
+            append: vec![],
+        };
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_append_only_ok() {
+        let cfg = PromptEnrichConfig {
+            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            on_invalid: InvalidBodyBehavior::Continue,
+            prepend: vec![],
+            append: vec![MessageConfig {
+                role: MessageRole::User,
+                content: "cite sources".into(),
+            }],
+        };
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_empty_content_rejected() {
+        let cfg = PromptEnrichConfig {
+            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            on_invalid: InvalidBodyBehavior::Continue,
+            prepend: vec![MessageConfig {
+                role: MessageRole::System,
+                content: String::new(),
+            }],
+            append: vec![],
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("content"),
+            "expected 'content' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_prepend_with_user_role_rejected() {
+        let cfg = PromptEnrichConfig {
+            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
+            on_invalid: InvalidBodyBehavior::Continue,
+            prepend: vec![MessageConfig {
+                role: MessageRole::User,
+                content: "not allowed".into(),
+            }],
+            append: vec![],
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("system"),
+            "expected 'system' role error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_zero_max_body_bytes_rejected() {
+        let cfg = PromptEnrichConfig {
+            max_body_bytes: 0,
+            on_invalid: InvalidBodyBehavior::Continue,
+            prepend: vec![MessageConfig {
+                role: MessageRole::System,
+                content: "hello".into(),
+            }],
+            append: vec![],
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("must be greater than 0"),
+            "expected 'must be greater than 0' error, got: {err}"
+        );
+    }
+
+    // -- message_to_value -----------------------------------------------------
+
+    #[test]
+    fn message_to_value_system() {
+        let msg = MessageConfig {
+            role: MessageRole::System,
+            content: "be helpful".into(),
+        };
+        let v = message_to_value(&msg);
+        assert_eq!(v["role"], "system");
+        assert_eq!(v["content"], "be helpful");
+    }
+
+    #[test]
+    fn message_to_value_user() {
+        let msg = MessageConfig {
+            role: MessageRole::User,
+            content: "cite sources".into(),
+        };
+        let v = message_to_value(&msg);
+        assert_eq!(v["role"], "user");
+        assert_eq!(v["content"], "cite sources");
+    }
+}
