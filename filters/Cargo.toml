@@ -20,6 +20,7 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 http = { workspace = true }

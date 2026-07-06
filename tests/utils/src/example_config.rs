@@ -48,8 +48,7 @@ pub fn load_example_config(filename: &str, listener_port: u16, port_map: HashMap
 /// # Examples
 ///
 /// ```
-/// let path =
-///     praxis_test_utils::example_config_path("model-to-header-routing.yaml");
+/// let path = praxis_test_utils::example_config_path("model-to-header-routing.yaml");
 /// assert!(path.contains("examples/configs/"));
 /// ```
 pub fn example_config_path(filename: &str) -> String {

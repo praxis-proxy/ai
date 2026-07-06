@@ -13,6 +13,7 @@ mod anthropic_messages;
 mod credential_injection;
 #[cfg(feature = "ai-inference")]
 mod full_flow;
+mod mcp_broker;
 #[cfg(feature = "ai-inference")]
 mod model_to_header;
 #[cfg(feature = "ai-inference")]

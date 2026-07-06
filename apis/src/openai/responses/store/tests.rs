@@ -20,7 +20,10 @@ use super::{
     config::{ResponseStoreConfig, revalidate_postgres_host, validate_config},
     list_input_items,
 };
-use crate::store::{ResponseRecord, ResponseStore as _, ResponseStoreRegistry, SqliteResponseStore};
+use crate::{
+    openai::responses::state::ResponsesState,
+    store::{ResponseRecord, ResponseStore as _, ResponseStoreRegistry, SqliteResponseStore},
+};
 
 // -----------------------------------------------------------------------------
 // from_config
@@ -294,7 +297,7 @@ async fn on_request_does_not_initialize_store_when_store_is_false() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_does_not_initialize_store_for_streaming_without_previous_response() {
+async fn on_request_initializes_store_for_streaming_requests() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -307,8 +310,8 @@ async fn on_request_does_not_initialize_store_for_streaming_without_previous_res
         "should continue for streaming requests"
     );
     assert!(
-        filter.store.get().is_none(),
-        "store should not initialize for streaming requests unless rehydrate needs it"
+        filter.store.get().is_some(),
+        "store should initialize for streaming requests to enable persistence at EOS"
     );
 }
 
@@ -577,6 +580,31 @@ async fn on_response_accepts_mixed_case_json_content_type() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_continues_for_event_stream_200() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should continue for event-stream 200"
+    );
+    assert!(
+        ctx.get_metadata("responses.skip_persist").is_none(),
+        "should not skip persist for event-stream content type"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_does_not_buffer_when_store_unavailable() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -650,6 +678,166 @@ fn on_response_body_buffers_when_error_reformat_is_armed() {
     assert!(
         matches!(action, FilterAction::Continue),
         "error reformat should keep skipped chunks buffered"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_buffers_streaming_chunks_when_error_reformat_is_armed() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("responses._reformat_error", "502");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let mut body = Some(Bytes::from_static(b"upstream error body"));
+    let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "streaming chunks should buffer when error reformat is armed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_streaming_persist_on_parse_error() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    ctx.set_metadata("responses.stream_parse_error", "true");
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({"id": "resp_err", "created_at": 1, "model": "gpt-4.1"}),
+        ..Default::default()
+    });
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should skip persistence when stream had parse errors"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_streaming_persist_on_incomplete_stream() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    ctx.set_metadata("responses.stream_incomplete", "true");
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should skip persistence when stream was incomplete"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_skips_streaming_persist_when_no_state() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should skip persistence when ResponsesState is absent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_persists_streaming_response_at_eos() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(&filter, &mut ctx).await;
+
+    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
+    assert!(store_opt.is_some(), "store should be initialized for streaming");
+
+    let response_json = json!({
+        "id": "resp_stream_unit",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "Streamed reply"}]
+    });
+    ctx.extensions.insert(ResponsesState {
+        response_object: response_json.clone(),
+        persisted_messages: vec![json!({"role": "user", "content": "Hello"})],
+        ..Default::default()
+    });
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should continue after persisting streaming response"
+    );
+
+    let store = store_opt.as_ref().unwrap();
+    let record = store
+        .get_response("default", "resp_stream_unit")
+        .await
+        .expect("get_response should succeed")
+        .expect("record should exist after streaming persist");
+
+    assert_eq!(record.id, "resp_stream_unit", "persisted ID should match");
+    assert_eq!(record.created_at, 1_719_900_000, "persisted created_at should match");
+    assert_eq!(record.model, "gpt-4.1", "persisted model should match");
+    assert_eq!(record.tenant_id, "default", "persisted tenant_id should be default");
+    assert_eq!(
+        record.response_object, response_json,
+        "persisted response_object should match the accumulated state"
+    );
+    assert_eq!(
+        record.messages,
+        json!([
+            {"role": "user", "content": "Hello"},
+            {"type": "message", "role": "assistant", "content": "Streamed reply"}
+        ]),
+        "persisted messages should combine persisted input history with streamed output"
+    );
+}
+
+#[test]
+fn build_record_from_state_returns_none_for_null_response_object() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+
+    let result = super::filter::build_record_from_state(&ctx, "default", None);
+    assert!(result.is_none(), "should return None when response_object is null");
+}
+
+#[test]
+fn build_record_from_state_returns_none_for_missing_fields() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({"id": "resp_1"}),
+        ..Default::default()
+    });
+
+    let result = super::filter::build_record_from_state(&ctx, "default", None);
+    assert!(
+        result.is_none(),
+        "should return None when required fields (created_at, model) are missing"
     );
 }
 
@@ -999,6 +1187,94 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     );
 }
 
+#[test]
+fn streaming_record_uses_request_input_when_state_messages_are_empty() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let request_input = json!([{"role": "user", "content": "Captured streaming input"}]);
+    let response_json = json!({
+        "id": "resp_stream_no_state_messages",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "content": "Stored streaming output"}]
+    });
+    ctx.extensions.insert(ResponsesState {
+        response_object: response_json.clone(),
+        ..Default::default()
+    });
+
+    let record = super::filter::build_record_from_state(&ctx, "default", Some(request_input.clone()))
+        .expect("streaming state should build a record");
+
+    assert_eq!(
+        record.input, request_input,
+        "stored input should come from the original streaming request"
+    );
+    assert_eq!(
+        record.messages,
+        json!([
+            {"role": "user", "content": "Captured streaming input"},
+            {"type": "message", "content": "Stored streaming output"}
+        ]),
+        "empty default ResponsesState messages should not hide request input"
+    );
+}
+
+#[test]
+fn streaming_record_preserves_mcp_metadata_from_persisted_messages() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mcp_item = json!({
+        "id": "mcpl_1",
+        "type": "mcp_list_tools",
+        "server_label": "weather",
+        "tools": [{"name": "get_weather", "description": "d", "input_schema": {}}]
+    });
+    let response_json = json!({
+        "id": "resp_stream_mcp",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "Next answer"}]
+    });
+
+    ctx.extensions.insert(ResponsesState {
+        response_object: response_json,
+        messages: vec![
+            json!({"role": "user", "content": "Hello"}),
+            json!({"type": "message", "role": "assistant", "content": "Tools loaded"}),
+            json!({"role": "user", "content": "What next?"}),
+        ],
+        persisted_messages: vec![
+            json!({"role": "user", "content": "Hello"}),
+            mcp_item.clone(),
+            json!({"type": "message", "role": "assistant", "content": "Tools loaded"}),
+            json!({"role": "user", "content": "What next?"}),
+        ],
+        ..Default::default()
+    });
+
+    let request_input = json!([{"role": "user", "content": "What next?"}]);
+    let record = super::filter::build_record_from_state(&ctx, "default", Some(request_input))
+        .expect("streaming state should build a record");
+
+    assert_eq!(
+        record.messages,
+        json!([
+            {"role": "user", "content": "Hello"},
+            {"id": "mcpl_1", "type": "mcp_list_tools", "server_label": "weather",
+             "tools": [{"name": "get_weather", "description": "d", "input_schema": {}}]},
+            {"type": "message", "role": "assistant", "content": "Tools loaded"},
+            {"role": "user", "content": "What next?"},
+            {"type": "message", "role": "assistant", "content": "Next answer"}
+        ]),
+        "streaming record should preserve MCP metadata from persisted_messages, not drop it via messages"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_after_format_request_body_classification() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_after_format_request_body_classification");
@@ -1088,6 +1364,122 @@ async fn pipeline_persists_after_format_request_body_classification() {
             {"role": "user", "content": "Hello"},
             {"type": "message", "content": "Hi"}
         ])
+    );
+
+    drop(store);
+    drop(pipeline);
+    cleanup_sqlite_file(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipeline_persists_streaming_response_from_accumulated_state() {
+    let (db_url, db_path) = temp_sqlite_url("pipeline_persists_streaming_response_from_accumulated_state");
+
+    let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
+        r#"
+- filter: openai_responses_format
+- filter: openai_response_store
+  backend: sqlite
+  database_url: "{db_url}"
+  responses_table: test_responses
+  conversations_table: test_conversations
+"#
+    ))
+    .unwrap();
+    let registry = crate::test_utils::make_ai_registry();
+    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let request_json = json!({
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": "Hello"}],
+        "stream": true
+    });
+    let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    let request_body_action = pipeline
+        .execute_http_request_body(&mut ctx, &mut request_body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(request_body_action, FilterAction::Release),
+        "format classifier should release the buffered request body"
+    );
+    assert_eq!(
+        ctx.get_metadata("openai_responses_format.stream"),
+        Some("true"),
+        "format classifier should detect stream=true"
+    );
+
+    let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(request_action, FilterAction::Continue),
+        "request phase should continue and initialize the store for streaming"
+    );
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    let response_action = pipeline.execute_http_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(response_action, FilterAction::Continue),
+        "response phase should continue for event-stream content type"
+    );
+    ctx.response_header = None;
+
+    let mut chunk = Some(Bytes::from_static(b"event: response.output_text.delta\ndata: {}\n\n"));
+    let chunk_action = pipeline
+        .execute_http_response_body(&mut ctx, &mut chunk, false)
+        .unwrap();
+    assert!(
+        matches!(chunk_action, FilterAction::Release),
+        "intermediate streaming chunks should release immediately"
+    );
+
+    let response_json = json!({
+        "id": "resp_stream_pipeline",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "Streamed reply"}]
+    });
+    ctx.extensions.insert(ResponsesState {
+        response_object: response_json.clone(),
+        persisted_messages: vec![json!({"role": "user", "content": "Hello"})],
+        ..Default::default()
+    });
+
+    let mut eos_body: Option<Bytes> = None;
+    let eos_action = pipeline
+        .execute_http_response_body(&mut ctx, &mut eos_body, true)
+        .unwrap();
+    assert!(
+        matches!(eos_action, FilterAction::Continue),
+        "EOS should persist from accumulated state and continue"
+    );
+
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+        .await
+        .unwrap();
+    let record = store
+        .get_response("default", "resp_stream_pipeline")
+        .await
+        .unwrap()
+        .expect("streaming pipeline should persist the response from accumulated ResponsesState");
+    assert_eq!(record.response_object, response_json);
+    assert_eq!(
+        record.input, request_json["input"],
+        "stored input should come from the original streaming request"
+    );
+    assert_eq!(
+        record.messages,
+        json!([
+            {"role": "user", "content": "Hello"},
+            {"type": "message", "role": "assistant", "content": "Streamed reply"}
+        ]),
+        "stored messages should combine persisted input history with streamed output"
     );
 
     drop(store);

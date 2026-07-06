@@ -45,6 +45,7 @@ mod examples;
 mod failure_mode;
 mod guardrails;
 mod mcp;
+mod mcp_broker;
 #[cfg(feature = "ai-inference")]
 mod openai_responses_format;
 #[cfg(feature = "ai-inference")]
