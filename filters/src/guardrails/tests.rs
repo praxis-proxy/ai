@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-use super::filter::AiGuardrailsFilter;
+use super::{
+    config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
+    filter::AiGuardrailsFilter,
+};
 
 // =============================================================================
 // General config
@@ -190,12 +193,12 @@ provider:
     .unwrap();
 
     let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
-    assert!(
-        matches!(
-            filter.request_body_mode(),
-            praxis_filter::body::BodyMode::StreamBuffer { max_bytes: Some(_) }
-        ),
-        "body mode should be StreamBuffer"
+    assert_eq!(
+        filter.request_body_mode(),
+        praxis_filter::body::BodyMode::StreamBuffer {
+            max_bytes: Some(1_048_576)
+        },
+        "body mode should be StreamBuffer with 1 MiB limit"
     );
 }
 
@@ -241,4 +244,117 @@ provider:
         matches!(action, praxis_filter::FilterAction::Continue),
         "stub provider should pass through"
     );
+}
+
+// =============================================================================
+// ProviderType serde
+// =============================================================================
+
+#[test]
+fn provider_type_nemo_parses() {
+    let parsed: ProviderType = serde_yaml::from_str(r#""nemo""#).unwrap();
+    assert_eq!(parsed, ProviderType::Nemo);
+}
+
+#[test]
+fn provider_type_unknown_rejected() {
+    let result: Result<ProviderType, _> = serde_yaml::from_str(r#""openai""#);
+    assert!(result.is_err(), "unknown provider type should fail");
+}
+
+// =============================================================================
+// PhaseConfig
+// =============================================================================
+
+#[test]
+fn phase_config_default() {
+    let phase = PhaseConfig::default();
+    assert!(phase.request, "default request should be true");
+    assert!(!phase.response, "default response should be false");
+}
+
+#[test]
+fn phase_config_custom_values() {
+    let parsed: PhaseConfig = serde_yaml::from_str(
+        "
+request: false
+response: true
+",
+    )
+    .unwrap();
+    assert!(!parsed.request, "request should be false");
+    assert!(parsed.response, "response should be true");
+}
+
+#[test]
+fn phase_config_omitted_uses_defaults() {
+    let parsed: PhaseConfig = serde_yaml::from_str("{}").unwrap();
+    assert!(parsed.request, "omitted request should default to true");
+    assert!(!parsed.response, "omitted response should default to false");
+}
+
+#[test]
+fn phase_config_unknown_field_rejected() {
+    let result: Result<PhaseConfig, _> = serde_yaml::from_str(
+        "
+request: true
+unknown: 42
+",
+    );
+    assert!(result.is_err(), "unknown fields should fail with deny_unknown_fields");
+}
+
+// =============================================================================
+// AiGuardrailsConfig serde
+// =============================================================================
+
+#[test]
+fn guardrails_config_minimal_valid() {
+    let parsed: AiGuardrailsConfig = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/guardrail/checks"
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(parsed.provider.provider_type, ProviderType::Nemo);
+}
+
+#[test]
+fn guardrails_config_missing_provider_rejected() {
+    let result: Result<AiGuardrailsConfig, _> = serde_yaml::from_str("{}");
+    assert!(result.is_err(), "missing provider should fail");
+}
+
+#[test]
+fn guardrails_config_unknown_field_rejected() {
+    let result: Result<AiGuardrailsConfig, _> = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/guardrail/checks"
+bogus: true
+"#,
+    );
+    assert!(result.is_err(), "unknown fields should fail with deny_unknown_fields");
+}
+
+#[test]
+fn guardrails_config_with_phase_overrides() {
+    let parsed: AiGuardrailsConfig = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/guardrail/checks"
+phase:
+  request: false
+  response: true
+"#,
+    )
+    .unwrap();
+
+    assert!(!parsed.phase.request);
+    assert!(parsed.phase.response);
 }
