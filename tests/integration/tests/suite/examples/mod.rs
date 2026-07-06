@@ -11,6 +11,7 @@ mod agentic_routing;
 mod anthropic_messages;
 mod credential_injection;
 mod full_flow;
+mod guardrails;
 mod mcp_broker;
 mod model_to_header;
 mod openai_conversations;

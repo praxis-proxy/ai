@@ -223,13 +223,22 @@ provider:
 
 #[tokio::test]
 async fn on_request_body_passes_through() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "passed"})))
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "{endpoint}"
 "#,
-    )
+    ))
     .unwrap();
 
     let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
@@ -242,7 +251,7 @@ provider:
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(action, praxis_filter::FilterAction::Continue),
-        "stub provider should pass through"
+        "nemo provider should pass through when status is 'passed'"
     );
 }
 

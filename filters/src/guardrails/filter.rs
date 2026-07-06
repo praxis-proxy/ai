@@ -6,12 +6,13 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    parse_filter_config,
 };
 
 use super::{
-    config::{AiGuardrailsConfig, ProviderType},
-    providers::{GuardProvider, nemo::NemoProvider},
+    config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
+    providers::{GuardPhase, GuardProvider, GuardResult, nemo::NemoProvider},
 };
 
 /// Maximum request body size to buffer (1 MiB).
@@ -55,12 +56,10 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// assert_eq!(filter.name(), "ai_guardrails");
 /// ```
 pub struct AiGuardrailsFilter {
-    #[expect(
-        dead_code,
-        reason = "called by on_request_body once provider evaluation is wired (#578)"
-    )]
     /// Guard provider instance.
     provider: Box<dyn GuardProvider>,
+    /// Which phases to evaluate.
+    phase: PhaseConfig,
 }
 
 impl AiGuardrailsFilter {
@@ -79,7 +78,10 @@ impl AiGuardrailsFilter {
             ProviderType::Nemo => Box::new(NemoProvider::from_config(&cfg.provider.config)?),
         };
 
-        Ok(Box::new(Self { provider }))
+        Ok(Box::new(Self {
+            provider,
+            phase: cfg.phase,
+        }))
     }
 }
 
@@ -106,10 +108,71 @@ impl HttpFilter for AiGuardrailsFilter {
     async fn on_request_body(
         &self,
         _ctx: &mut HttpFilterContext<'_>,
-        _body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        // Provider evaluation wired in #578 (NeMo request-side integration).
-        Ok(FilterAction::Continue)
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
+        if !self.phase.request {
+            return Ok(FilterAction::Continue);
+        }
+
+        let Some(bytes) = body.as_ref() else {
+            return Ok(FilterAction::Continue);
+        };
+
+        if bytes.is_empty() {
+            return Ok(FilterAction::Continue);
+        }
+
+        let messages = extract_messages(bytes)?;
+        let result = self.provider.evaluate(messages, GuardPhase::Request).await?;
+
+        // Capture label before consuming `result` in the match.
+        let verdict = result.status_label();
+
+        match result {
+            GuardResult::Pass => {
+                tracing::debug!(verdict, "ai_guardrails: provider verdict");
+                Ok(FilterAction::Continue)
+            },
+            GuardResult::Block { reason } => {
+                tracing::warn!(verdict, %reason, "ai_guardrails: provider verdict");
+                Ok(FilterAction::Reject(Rejection::status(403).with_body(reason)))
+            },
+            GuardResult::Redact { reason, .. } => {
+                // Full body replacement deferred to #579 (NeMo mask/redact action).
+                tracing::warn!(verdict, %reason, "ai_guardrails: provider verdict; forwarding unchanged until #579");
+                Ok(FilterAction::Continue)
+            },
+        }
     }
+}
+
+// --- Private Utilities ---
+
+/// Extract messages from an OpenAI Chat Completion request body.
+///
+/// Supports:
+/// - OpenAI Chat request: `{"messages": [...]}`
+///
+/// Returns an error for unrecognized body formats to prevent
+/// silently skipping guardrail evaluation.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the body is not valid JSON or does not
+/// contain a recognizable messages field.
+fn extract_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError> {
+    let json: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: request body is not valid JSON: {e}").into() })?;
+
+    // OpenAI Chat format: {"messages": [...]}
+    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
+        return Ok(messages.clone());
+    }
+
+    Err("ai_guardrails: request body does not contain recognizable messages".into())
 }
