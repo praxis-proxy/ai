@@ -318,6 +318,7 @@ fn body_passes_through_unchanged() {
     ctx.insert_filter_state(StreamEventsState {
         parser: crate::openai::sse::responses::ResponsesSseParser::new(&crate::openai::sse::SseParserConfig::default()),
         tool_call_args: std::collections::HashMap::new(),
+        max_tool_call_argument_bytes: 1024 * 1024,
     });
 
     let original = Bytes::from("event: response.created\ndata: {\"type\":\"response.created\",\"id\":\"r1\"}\n\n");
@@ -341,6 +342,7 @@ fn parse_error_sets_metadata() {
             timeout: std::time::Duration::from_secs(300),
         }),
         tool_call_args: std::collections::HashMap::new(),
+        max_tool_call_argument_bytes: 1024 * 1024,
     });
 
     let large_chunk =
@@ -540,5 +542,84 @@ async fn error_event_does_not_mutate_state() {
     assert!(
         ctx.extensions.get::<ResponsesState>().is_none(),
         "error event should not create ResponsesState"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_argument_bytes_cap_enforced() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
+    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let item = json!({
+        "item": {
+            "type": "function_call",
+            "id": "fc_big",
+            "call_id": "call_big",
+            "name": "big_fn",
+            "arguments": "",
+            "status": "in_progress"
+        },
+        "output_index": 0
+    });
+    let mut b1 = Some(make_sse_chunk("response.output_item.added", &item));
+    filter.on_response_body(&mut ctx, &mut b1, false).unwrap();
+
+    let delta1 = json!({"item_id": "fc_big", "output_index": 0, "delta": "0123456789"});
+    let mut b2 = Some(make_sse_chunk("response.function_call_arguments.delta", &delta1));
+    filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
+
+    let delta2 = json!({"item_id": "fc_big", "output_index": 0, "delta": "0123456789X"});
+    let mut b3 = Some(make_sse_chunk("response.function_call_arguments.delta", &delta2));
+    filter.on_response_body(&mut ctx, &mut b3, false).unwrap();
+
+    let state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert!(
+        !state.tool_call_args.contains_key("item:fc_big"),
+        "exceeding max_tool_call_argument_bytes should drop the accumulator entry"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_argument_bytes_within_limit() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 50").unwrap();
+    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let item = json!({
+        "item": {
+            "type": "function_call",
+            "id": "fc_ok",
+            "call_id": "call_ok",
+            "name": "small_fn",
+            "arguments": "",
+            "status": "in_progress"
+        },
+        "output_index": 0
+    });
+    let mut b1 = Some(make_sse_chunk("response.output_item.added", &item));
+    filter.on_response_body(&mut ctx, &mut b1, false).unwrap();
+
+    let delta = json!({"item_id": "fc_ok", "output_index": 0, "delta": "{\"k\":\"v\"}"});
+    let mut b2 = Some(make_sse_chunk("response.function_call_arguments.delta", &delta));
+    filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
+
+    let state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    assert_eq!(
+        state.tool_call_args.get("item:fc_ok").unwrap(),
+        "{\"k\":\"v\"}",
+        "within-limit deltas should accumulate normally"
     );
 }

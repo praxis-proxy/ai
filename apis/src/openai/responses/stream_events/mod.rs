@@ -30,6 +30,8 @@ pub(super) struct StreamEventsState {
     parser: ResponsesSseParser,
     /// Accumulated function-call argument deltas, keyed by item id or output index.
     tool_call_args: std::collections::HashMap<String, String>,
+    /// Cap on accumulated bytes per tool-call argument string.
+    max_tool_call_argument_bytes: usize,
 }
 
 /// Accumulates state from native Responses API SSE event streams.
@@ -42,10 +44,13 @@ pub(super) struct StreamEventsState {
 /// # max_buffer_bytes: 10485760
 /// # max_events: 100000
 /// # timeout_secs: 300
+/// # max_tool_call_argument_bytes: 1048576
 /// ```
 pub struct OpenaiStreamEventsFilter {
     /// Configuration for the SSE frame parser.
     parser_config: SseParserConfig,
+    /// Cap on accumulated bytes per tool-call argument string.
+    max_tool_call_argument_bytes: usize,
 }
 
 impl OpenaiStreamEventsFilter {
@@ -58,6 +63,7 @@ impl OpenaiStreamEventsFilter {
         let cfg: StreamEventsConfig = parse_filter_config("openai_stream_events", config)?;
         Ok(Box::new(Self {
             parser_config: cfg.to_parser_config(),
+            max_tool_call_argument_bytes: cfg.max_tool_call_argument_bytes(),
         }))
     }
 
@@ -98,6 +104,7 @@ impl HttpFilter for OpenaiStreamEventsFilter {
             ctx.insert_filter_state(StreamEventsState {
                 parser: ResponsesSseParser::new(&self.parser_config),
                 tool_call_args: std::collections::HashMap::new(),
+                max_tool_call_argument_bytes: self.max_tool_call_argument_bytes,
             });
         }
 

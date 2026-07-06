@@ -134,7 +134,17 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
         return;
     };
 
-    filter_state.tool_call_args.entry(key).or_default().push_str(delta);
+    let buf = filter_state.tool_call_args.entry(key.clone()).or_default();
+    if buf.len().saturating_add(delta.len()) > filter_state.max_tool_call_argument_bytes {
+        warn!(
+            key,
+            limit = filter_state.max_tool_call_argument_bytes,
+            "accumulated tool-call arguments exceed max_tool_call_argument_bytes, dropping"
+        );
+        filter_state.tool_call_args.remove(&key);
+        return;
+    }
+    buf.push_str(delta);
 }
 
 /// Finalize a function call from accumulated deltas and push to `tool_calls`.

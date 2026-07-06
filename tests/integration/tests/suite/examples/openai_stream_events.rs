@@ -119,6 +119,84 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
     cleanup_sqlite_files(&db_path);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_incremental_accumulation_before_terminal() {
+    let sse_body = [
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+        "\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",",
+        "\"name\":\"get_weather\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",",
+        "\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"city\\\":\"}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",",
+        "\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"\\\"NYC\\\"}\"}\n\n",
+        "event: response.function_call_arguments.done\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",",
+        "\"item_id\":\"fc_1\",\"output_index\":0,",
+        "\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}\n\n",
+        &format!(
+            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{RESPONSE_JSON}}}\n\n"
+        ),
+        "event: done\ndata: [DONE]\n\n",
+    ]
+    .concat();
+
+    let backend_guard = Backend::fixed(&sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_incr");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 200);
+
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("function_call_arguments.done"),
+        "response should contain function_call_arguments.done event: {body}"
+    );
+    assert!(
+        body.contains("response.completed"),
+        "response should contain response.completed event: {body}"
+    );
+
+    let pool = sqlx::SqlitePool::connect(&db_url)
+        .await
+        .expect("should connect to test database");
+    let sql = format!("SELECT id FROM {RESPONSES_TABLE} WHERE id = ?");
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind("resp_stream_example")
+        .fetch_one(&pool)
+        .await
+        .expect("terminal response should still be persisted after incremental events");
+    pool.close().await;
+
+    let id: String = row.get("id");
+    assert_eq!(id, "resp_stream_example");
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

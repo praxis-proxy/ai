@@ -57,6 +57,7 @@ filter_chains:
         conversations_table: openai_conversations
 
       - filter: openai_stream_events
+        # max_tool_call_argument_bytes: 1048576
 
       - filter: router
         routes:
