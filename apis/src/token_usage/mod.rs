@@ -75,7 +75,7 @@ impl TokenUsage {
 }
 
 /// AI provider identifier for response format selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum TokenUsageProvider {
     /// `OpenAI` API (`usage.prompt_tokens`, `usage.completion_tokens`).
     OpenAi,
@@ -113,28 +113,32 @@ pub fn set_token_usage(ctx: &mut HttpFilterContext<'_>, input: u64, output: u64,
     ctx.set_metadata("token.total", total.to_string());
 }
 
-/// Extracts token usage from a provider's JSON response body.
-///
-/// Returns `None` if the response doesn't contain usage information
-/// (e.g., error responses, malformed JSON, or missing fields).
-///
-/// # Example
-///
-/// ```
-/// use praxis_ai_apis::token_usage::{TokenUsageProvider, extract_token_usage};
-///
-/// let openai_response =
-///     br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}"#;
-/// let usage = extract_token_usage(TokenUsageProvider::OpenAi, openai_response).unwrap();
-/// assert_eq!(usage.input_tokens(), 10);
-/// assert_eq!(usage.output_tokens(), 20);
-/// assert_eq!(usage.total_tokens(), 30);
-/// ```
-pub fn extract_token_usage(provider: TokenUsageProvider, body: &[u8]) -> Option<TokenUsage> {
-    match provider {
-        TokenUsageProvider::OpenAi | TokenUsageProvider::Azure => parse_openai(body),
-        TokenUsageProvider::Anthropic => parse_anthropic(body),
-        TokenUsageProvider::Google => parse_google(body),
-        TokenUsageProvider::Bedrock => parse_bedrock(body),
+impl TokenUsageProvider {
+    /// Extracts token usage from a provider's JSON response body.
+    ///
+    /// Returns `None` if the response doesn't contain usage information
+    /// (e.g., error responses, malformed JSON, or missing fields).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use praxis_ai_apis::token_usage::TokenUsageProvider;
+    ///
+    /// let openai_response =
+    ///     br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}"#;
+    /// let usage = TokenUsageProvider::OpenAi
+    ///     .extract_token_usage(openai_response)
+    ///     .unwrap();
+    /// assert_eq!(usage.input_tokens(), 10);
+    /// assert_eq!(usage.output_tokens(), 20);
+    /// assert_eq!(usage.total_tokens(), 30);
+    /// ```
+    pub fn extract_token_usage(&self, body: &[u8]) -> Option<TokenUsage> {
+        match *self {
+            TokenUsageProvider::OpenAi | TokenUsageProvider::Azure => parse_openai(body),
+            TokenUsageProvider::Anthropic => parse_anthropic(body),
+            TokenUsageProvider::Google => parse_google(body),
+            TokenUsageProvider::Bedrock => parse_bedrock(body),
+        }
     }
 }

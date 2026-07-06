@@ -3,7 +3,7 @@
 
 //! Unit tests for token usage extraction.
 
-use super::{TokenUsageProvider, extract_token_usage, set_token_usage};
+use super::{TokenUsageProvider, set_token_usage};
 
 // -----------------------------------------------------------------------------
 // set_token_usage Tests
@@ -88,7 +88,7 @@ fn openai_full_response() {
         }
     }"#;
 
-    let usage = extract_token_usage(TokenUsageProvider::OpenAi, json).unwrap();
+    let usage = TokenUsageProvider::OpenAi.extract_token_usage(json).unwrap();
 
     assert_eq!(usage.input_tokens(), 15, "input_tokens should be 15");
     assert_eq!(usage.output_tokens(), 42, "output_tokens should be 42");
@@ -99,7 +99,7 @@ fn openai_full_response() {
 fn azure_same_as_openai() {
     let json = br#"{"usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}}"#;
 
-    let usage = extract_token_usage(TokenUsageProvider::Azure, json).unwrap();
+    let usage = TokenUsageProvider::Azure.extract_token_usage(json).unwrap();
 
     assert_eq!(usage.input_tokens(), 5, "Azure should parse like OpenAI");
     assert_eq!(usage.output_tokens(), 10, "Azure should parse like OpenAI");
@@ -117,7 +117,7 @@ fn anthropic_full_response() {
         }
     }"#;
 
-    let usage = extract_token_usage(TokenUsageProvider::Anthropic, json).unwrap();
+    let usage = TokenUsageProvider::Anthropic.extract_token_usage(json).unwrap();
 
     assert_eq!(usage.input_tokens(), 15, "input_tokens should be 15");
     assert_eq!(usage.output_tokens(), 42, "output_tokens should be 42");
@@ -140,7 +140,7 @@ fn anthropic_with_prompt_caching() {
         }
     }"#;
 
-    let usage = extract_token_usage(TokenUsageProvider::Anthropic, json).unwrap();
+    let usage = TokenUsageProvider::Anthropic.extract_token_usage(json).unwrap();
 
     assert_eq!(
         usage.input_tokens(),
@@ -162,7 +162,7 @@ fn google_full_response() {
         }
     }"#;
 
-    let usage = extract_token_usage(TokenUsageProvider::Google, json).unwrap();
+    let usage = TokenUsageProvider::Google.extract_token_usage(json).unwrap();
 
     assert_eq!(usage.input_tokens(), 15, "promptTokenCount should map to input_tokens");
     assert_eq!(
@@ -177,7 +177,7 @@ fn google_full_response() {
 fn google_without_total() {
     let json = br#"{"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20}}"#;
 
-    let usage = extract_token_usage(TokenUsageProvider::Google, json).unwrap();
+    let usage = TokenUsageProvider::Google.extract_token_usage(json).unwrap();
 
     assert_eq!(usage.input_tokens(), 10, "promptTokenCount should map to input_tokens");
     assert_eq!(
@@ -204,7 +204,7 @@ fn bedrock_claude_invoke_model_response() {
         }
     }"#;
 
-    let usage = extract_token_usage(TokenUsageProvider::Bedrock, json).unwrap();
+    let usage = TokenUsageProvider::Bedrock.extract_token_usage(json).unwrap();
 
     assert_eq!(usage.input_tokens(), 15, "input_tokens should map to input_tokens");
     assert_eq!(usage.output_tokens(), 42, "output_tokens should map to output_tokens");
@@ -222,7 +222,7 @@ fn bedrock_converse_response() {
         }
     }"#;
 
-    let usage = extract_token_usage(TokenUsageProvider::Bedrock, json).unwrap();
+    let usage = TokenUsageProvider::Bedrock.extract_token_usage(json).unwrap();
 
     assert_eq!(usage.input_tokens(), 15, "inputTokens should map to input_tokens");
     assert_eq!(usage.output_tokens(), 42, "outputTokens should map to output_tokens");
@@ -237,7 +237,7 @@ fn bedrock_converse_response() {
 fn missing_usage_returns_none() {
     let json = br#"{"id": "123", "choices": []}"#;
 
-    let result = extract_token_usage(TokenUsageProvider::OpenAi, json);
+    let result = TokenUsageProvider::OpenAi.extract_token_usage(json);
 
     assert!(result.is_none(), "missing usage field should return None");
 }
@@ -246,7 +246,7 @@ fn missing_usage_returns_none() {
 fn google_missing_usage_returns_none() {
     let json = br#"{"candidates": []}"#;
 
-    let result = extract_token_usage(TokenUsageProvider::Google, json);
+    let result = TokenUsageProvider::Google.extract_token_usage(json);
 
     assert!(result.is_none(), "missing usageMetadata field should return None");
 }
@@ -255,14 +255,14 @@ fn google_missing_usage_returns_none() {
 fn invalid_json_returns_none() {
     let json = b"not valid json";
 
-    let result = extract_token_usage(TokenUsageProvider::OpenAi, json);
+    let result = TokenUsageProvider::OpenAi.extract_token_usage(json);
 
     assert!(result.is_none(), "invalid JSON should return None");
 }
 
 #[test]
 fn empty_body_returns_none() {
-    let result = extract_token_usage(TokenUsageProvider::OpenAi, b"");
+    let result = TokenUsageProvider::OpenAi.extract_token_usage(b"");
 
     assert!(result.is_none(), "empty body should return None");
 }
@@ -271,7 +271,7 @@ fn empty_body_returns_none() {
 fn error_response_returns_none() {
     let json = br#"{"error": {"message": "Invalid API key", "type": "invalid_request_error"}}"#;
 
-    let result = extract_token_usage(TokenUsageProvider::OpenAi, json);
+    let result = TokenUsageProvider::OpenAi.extract_token_usage(json);
 
     assert!(result.is_none(), "error response should return None");
 }
