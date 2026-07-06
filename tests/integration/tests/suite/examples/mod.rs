@@ -26,5 +26,6 @@ mod responses_proxy;
 mod responses_routing;
 mod session_replay;
 mod token_count;
+mod token_counting;
 mod token_usage_headers;
 mod tool_parse;

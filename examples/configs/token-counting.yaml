@@ -2,18 +2,29 @@
 #
 # Extracts token usage from AI inference responses (streaming and
 # non-streaming) and makes counts available to downstream filters
-# via filter metadata.
+# via filter metadata as token.input, token.output, and token.total.
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/token-counting.yaml
 #   curl http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
 #
-# The filter reads the response body (streaming SSE or buffered JSON),
-# extracts provider-specific token usage, and writes unified counts
-# to filter_metadata as token.input, token.output, and token.total.
+# token_count reads the response body, extracts provider-specific
+# token usage, and writes the counts to filter_metadata.
 #
-# Counts are available to access logs, metrics, and filters that
-# read metadata during the response body phase.
+# token_usage_headers injects Praxis-Token-Input, Praxis-Token-Output,
+# and Praxis-Token-Total into the downstream response — but only when
+# counts are available during the response-header phase. token_count
+# extracts counts from the response body inside on_response_body,
+# which runs after response headers have already been sent
+# downstream, so for every provider currently supported here the
+# counts remain in filter_metadata for other response-phase filters
+# to read, but the Praxis-Token-* headers are not injected.
+#
+# access_log demonstrates that token_count composes cleanly alongside
+# other response-phase filters in the same pipeline.
+#
+# Supported provider values:
+#   openai | anthropic | google | bedrock | azure
 
 listeners:
   - name: default
@@ -29,8 +40,16 @@ filter_chains:
           - path_prefix: "/"
             cluster: backend
 
+      # token_usage_headers is declared before token_count: response
+      # hooks run in reverse declared order, so token_count's
+      # on_response_body (which sets filter_metadata) runs before
+      # token_usage_headers reads it.
+      - filter: token_usage_headers
+
       - filter: token_count
-        provider: openai
+        provider: openai   # openai | anthropic | google | bedrock | azure
+
+      - filter: access_log
 
       - filter: load_balancer
         clusters:
