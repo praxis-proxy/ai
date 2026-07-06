@@ -201,7 +201,16 @@ async fn rehydrate_from_conversation(
     parsed_body: Value,
     streaming: bool,
 ) -> Result<FilterAction, FilterError> {
+    let has_conversation_field = parsed_body.get("conversation").is_some();
     let Some(conv_id) = extract_conversation_id(&parsed_body) else {
+        if has_conversation_field {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "invalid conversation value: expected a string ID or {\"id\": \"...\"}",
+                streaming,
+            )));
+        }
         return Ok(FilterAction::Release);
     };
 

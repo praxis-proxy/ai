@@ -200,22 +200,29 @@ async fn append_back_persists_items_after_response() {
         "responses request should succeed for append-back"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    let raw = http_send(
-        proxy.addr(),
-        &format!(
-            "GET /v1/conversations/{conv_id}/items?order=asc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        ),
-    );
-    assert_eq!(parse_status(&raw), 200, "list items should return 200");
-    let items: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-    let data = items["data"].as_array().expect("items should have data array");
+    let mut data_len = 0;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let raw = http_send(
+            proxy.addr(),
+            &format!(
+                "GET /v1/conversations/{conv_id}/items?order=asc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        if parse_status(&raw) == 200 {
+            let items: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+            if let Some(arr) = items["data"].as_array() {
+                data_len = arr.len();
+                if data_len >= 2 {
+                    break;
+                }
+            }
+        }
+    }
 
     assert!(
-        data.len() >= 2,
-        "conversation should have at least seed + appended items, got {}",
-        data.len()
+        data_len >= 2,
+        "conversation should have at least seed + appended items, got {data_len}",
     );
 }
 

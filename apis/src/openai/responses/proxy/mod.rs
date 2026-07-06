@@ -168,6 +168,7 @@ impl HttpFilter for ResponsesProxyFilter {
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            strip_conversation_field(body);
             debug!("no ResponsesState in extensions, passthrough");
             return Ok(FilterAction::Continue);
         };
@@ -190,9 +191,29 @@ impl HttpFilter for ResponsesProxyFilter {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+
+/// Defensively strip `conversation` from a passthrough body so it never
+/// leaks to the backend even when no [`ResponsesState`] was produced.
+fn strip_conversation_field(body: &mut Option<Bytes>) {
+    let Some(bytes) = body.as_ref() else {
+        return;
+    };
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    if parsed
+        .as_object_mut()
+        .is_some_and(|obj| obj.remove("conversation").is_some())
+    {
+        debug!("stripped conversation from passthrough body");
+        if let Ok(serialized) = serde_json::to_vec(&parsed) {
+            *body = Some(Bytes::from(serialized));
+        }
+    }
+}
 
 /// Build the outbound JSON body from conversation state.
 fn rebuild_outbound_body(state: &ResponsesState) -> serde_json::Value {

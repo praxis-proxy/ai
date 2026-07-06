@@ -453,9 +453,7 @@ impl HttpFilter for OpenaiConversationsFilter {
         };
 
         let conv_id = items.conversation_id;
-        if let Err(e) = self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items) {
-            warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed");
-        }
+        self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items)?;
 
         Ok(FilterAction::Continue)
     }

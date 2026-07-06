@@ -318,6 +318,24 @@ async fn strips_both_previous_response_id_and_conversation() {
     assert!(rebuilt.get("conversation").is_none(), "conversation should be stripped");
 }
 
+#[tokio::test]
+async fn passthrough_strips_conversation_from_body() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"hello","conversation":42}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        parsed.get("conversation").is_none(),
+        "conversation should be stripped even without ResponsesState"
+    );
+    assert_eq!(parsed["model"], "gpt-4.1", "other fields should be preserved");
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

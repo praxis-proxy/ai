@@ -1178,6 +1178,74 @@ async fn rejects_when_conversation_not_found() {
 }
 
 #[tokio::test]
+async fn tenant_mismatch_rejects_conversation() {
+    let store = MockStore::with_conversation("conv_abc", json!([{"role": "user", "content": "hello"}]));
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata(TENANT_METADATA_KEY, "tenant_b");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_abc"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => assert_eq!(
+            r.status, 400,
+            "conversation stored under different tenant should not be found"
+        ),
+        other => panic!("expected Reject for tenant mismatch, got {other:?}"),
+    }
+
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "no state should be produced for cross-tenant lookup"
+    );
+}
+
+#[tokio::test]
+async fn rejects_malformed_conversation_empty_object() {
+    let store = MockStore::empty();
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"Hi","conversation":{}}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => assert_eq!(r.status, 400, "empty object conversation should be rejected"),
+        other => panic!("expected Reject for malformed conversation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_malformed_conversation_numeric() {
+    let store = MockStore::empty();
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"Hi","conversation":42}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => assert_eq!(r.status, 400, "numeric conversation should be rejected"),
+        other => panic!("expected Reject for malformed conversation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn empty_conversation_produces_valid_state() {
     let store = MockStore::with_conversation("conv_empty", json!([]));
     let registry = setup_registry(store);
@@ -1391,11 +1459,11 @@ impl ResponseStore for MockStore {
         Ok(())
     }
 
-    async fn get_response(&self, _tenant_id: &str, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+    async fn get_response(&self, tenant_id: &str, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
         if self.should_fail {
             return Err(StoreError::Unavailable("mock failure".to_owned()));
         }
-        Ok(self.records.get(id).cloned())
+        Ok(self.records.get(id).filter(|r| r.tenant_id == tenant_id).cloned())
     }
 
     async fn delete_response(&self, _tenant_id: &str, _id: &str) -> Result<bool, StoreError> {
@@ -1404,19 +1472,23 @@ impl ResponseStore for MockStore {
 
     async fn get_conversation(
         &self,
-        _tenant_id: &str,
+        tenant_id: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         if self.should_fail {
             return Err(StoreError::Unavailable("mock failure".to_owned()));
         }
-        Ok(self.conversations.get(conversation_id).map(|c| ConversationRecord {
-            conversation_id: c.conversation_id.clone(),
-            tenant_id: c.tenant_id.clone(),
-            created_at: c.created_at,
-            metadata: c.metadata.clone(),
-            messages: c.messages.clone(),
-        }))
+        Ok(self
+            .conversations
+            .get(conversation_id)
+            .filter(|c| c.tenant_id == tenant_id)
+            .map(|c| ConversationRecord {
+                conversation_id: c.conversation_id.clone(),
+                tenant_id: c.tenant_id.clone(),
+                created_at: c.created_at,
+                metadata: c.metadata.clone(),
+                messages: c.messages.clone(),
+            }))
     }
 }
 
