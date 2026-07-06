@@ -194,7 +194,7 @@ mod tests {
         );
         assert!(
             configs.contains(&"prompt-enrichment.yaml".to_owned()),
-            "basic-reverse-proxy.yaml should be in the config list"
+            "prompt-enrichment.yaml should be in the config list"
         );
     }
 

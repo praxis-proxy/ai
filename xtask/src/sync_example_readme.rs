@@ -412,8 +412,8 @@ listeners:
         let input = "\
 # Title
 #
-# Requires the ai-inference feature:
-#   cargo build --features ai-inference
+# Requires a running Redis instance:
+#   docker run -p 6379:6379 redis
 #
 # Real description here.
 ";

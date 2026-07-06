@@ -63,7 +63,8 @@ write comments that restate what names already convey.
    in `tests/integration/tests/suite/examples/`
 5. Update `examples/README.md` to list any new or
    renamed example configs
-6. Significant changes need to be [benchmarked].
+6. Significant changes need benchmark or load-test evidence
+   appropriate to the affected filter path.
 
 This is not optional. A feature without tests and an
 example is not complete.
@@ -84,8 +85,6 @@ assert_eq!(status, 403);
 assert_eq!(status, 403, "ACL should block loopback");
 ```
 
-[benchmarked]:../benchmarks.md
-
 ### RFC Conformance
 
 When implementing protocol-level behavior (HTTP semantics,
@@ -103,12 +102,12 @@ and verify conformance against them.
   ```
 - When in doubt about an edge case, the RFC is the
   authority, not other proxy implementations.
-- Add dedicated conformance tests when implementing
-  RFC-specified behavior. These live in
-  `tests/conformance/`.
+- Add dedicated integration or schema tests when implementing
+  RFC-specified behavior. Keep protocol-specific coverage near
+  the affected filter or test suite.
 
-See also [HTTP Correctness](../architecture/http-correctness.md)
-for what Praxis enforces vs what Pingora handles.
+When protocol behavior depends on core proxy behavior, document
+the boundary in the relevant architecture doc or PR description.
 
 ### Rules, Practices & Lints
 

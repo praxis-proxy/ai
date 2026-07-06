@@ -8,14 +8,42 @@ use praxis_filter::{
 };
 use serde::Deserialize;
 
-use super::super::protocol::{self, ProtocolProfile};
+use super::super::{
+    config::DEFAULT_MAX_BODY_BYTES,
+    protocol::{self, ProtocolProfile},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Default maximum request body size for `StreamBuffer` mode (64 `KiB`).
-pub(super) const DEFAULT_MAX_BODY_BYTES: usize = 65_536; // 64 KiB
+/// Default cache TTL in milliseconds (5 minutes).
+pub(super) const DEFAULT_CACHE_TTL_MS: u64 = 300_000; // 5 min
+
+// -----------------------------------------------------------------------------
+// CacheScope
+// -----------------------------------------------------------------------------
+
+/// Cache scope for stateless MCP responses.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CacheScope {
+    /// Response may be cached by any intermediary.
+    #[default]
+    Public,
+    /// Response may only be cached by the requesting client.
+    Private,
+}
+
+impl CacheScope {
+    /// String representation for response serialization.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // InvalidToolPolicy
@@ -75,19 +103,23 @@ pub(super) struct McpServerConfig {
 }
 
 // -----------------------------------------------------------------------------
-// McpBrokerConfig
+// McpBrokerConfig (raw deserialized)
 // -----------------------------------------------------------------------------
 
-/// MCP static catalog filter configuration.
+/// MCP broker filter configuration.
+///
+/// Supports two protocol profiles: `current` (session-based, default) and
+/// `stateless` (MCP 2026-07-28, configurable). Version and cache fields are
+/// derived from the selected profile when omitted.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct McpBrokerConfig {
-    /// Fallback MCP protocol version returned in broker `initialize`
-    /// responses when the client's requested version is not supported.
-    /// Must be present in `supported_versions` and implemented by this
-    /// build. Defaults to [`protocol::DEFAULT_VERSION`].
-    #[serde(default = "default_version")]
-    pub default_version: String,
+    /// Cache scope for stateless responses. Requires `protocol_profile: stateless`.
+    pub cache_scope: Option<CacheScope>,
+    /// Cache TTL in milliseconds for stateless responses. Requires `protocol_profile: stateless`.
+    pub cache_ttl_ms: Option<u64>,
+    /// Fallback MCP protocol version. When omitted, derived from the profile.
+    pub default_version: Option<String>,
     /// Behavior when a tool has an invalid schema.
     #[serde(default)]
     pub invalid_tool_policy: InvalidToolPolicy,
@@ -104,11 +136,31 @@ pub(super) struct McpBrokerConfig {
     /// Backend server definitions.
     #[serde(default)]
     pub servers: Vec<McpServerConfig>,
-    /// Protocol versions accepted during `initialize` negotiation.
-    /// Every entry must be implemented by this build (present in
-    /// [`protocol::SUPPORTED_VERSIONS`]). Defaults to the versions
-    /// this build implements.
-    #[serde(default = "default_supported_versions")]
+    /// Protocol versions accepted during negotiation.
+    /// When omitted, derived from the profile.
+    pub supported_versions: Option<Vec<String>>,
+}
+
+// -----------------------------------------------------------------------------
+// ValidatedBrokerConfig (normalized)
+// -----------------------------------------------------------------------------
+
+/// Normalized broker configuration with all defaults resolved.
+#[derive(Debug)]
+pub(super) struct ValidatedBrokerConfig {
+    /// Cache scope for stateless responses.
+    pub cache_scope: CacheScope,
+    /// Cache TTL in milliseconds for stateless responses.
+    pub cache_ttl_ms: u64,
+    /// Fallback MCP protocol version.
+    pub default_version: String,
+    /// Maximum body size in bytes.
+    pub max_body_bytes: usize,
+    /// Public MCP path handled by Praxis.
+    pub path: String,
+    /// Protocol profile for this broker instance.
+    pub protocol_profile: ProtocolProfile,
+    /// Protocol versions accepted during negotiation.
     pub supported_versions: Vec<String>,
 }
 
@@ -152,25 +204,51 @@ fn default_max_body_bytes() -> usize {
     DEFAULT_MAX_BODY_BYTES
 }
 
-/// Default protocol version from the centralized constant.
-fn default_version() -> String {
-    protocol::DEFAULT_VERSION.to_owned()
-}
-
-/// Default supported versions from the centralized constant.
-fn default_supported_versions() -> Vec<String> {
-    protocol::SUPPORTED_VERSIONS.iter().map(|s| (*s).to_owned()).collect()
-}
-
 // -----------------------------------------------------------------------------
 // Validation
 // -----------------------------------------------------------------------------
 
 /// Validate configuration and build the static tool catalog.
-pub(super) fn build_config(cfg: McpBrokerConfig) -> Result<(McpBrokerConfig, Vec<CatalogTool>), FilterError> {
+pub(super) fn build_config(cfg: McpBrokerConfig) -> Result<(ValidatedBrokerConfig, Vec<CatalogTool>), FilterError> {
     validate_max_body_bytes("mcp_broker", cfg.max_body_bytes)?;
 
-    validate_versions(&cfg)?;
+    let profile = cfg.protocol_profile;
+
+    validate_cache_fields_for_profile(profile, &cfg)?;
+
+    let catalog = validate_and_build_catalog(&cfg)?;
+
+    let default_version = cfg
+        .default_version
+        .unwrap_or_else(|| protocol::default_version_for_profile(profile).to_owned());
+
+    let supported_versions = cfg.supported_versions.unwrap_or_else(|| {
+        protocol::supported_versions_for_profile(profile)
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    });
+
+    let cache_scope = cfg.cache_scope.unwrap_or(CacheScope::Public);
+    let cache_ttl_ms = cfg.cache_ttl_ms.unwrap_or(DEFAULT_CACHE_TTL_MS);
+
+    validate_versions(profile, &supported_versions, &default_version)?;
+
+    let validated = ValidatedBrokerConfig {
+        cache_scope,
+        cache_ttl_ms,
+        default_version,
+        max_body_bytes: cfg.max_body_bytes,
+        path: cfg.path,
+        protocol_profile: profile,
+        supported_versions,
+    };
+
+    Ok((validated, catalog))
+}
+
+/// Validate server definitions and build the static tool catalog.
+fn validate_and_build_catalog(cfg: &McpBrokerConfig) -> Result<Vec<CatalogTool>, FilterError> {
     validate_path("mcp", &cfg.path)?;
     validate_unique_server_names(&cfg.servers)?;
     validate_server_clusters(&cfg.servers)?;
@@ -180,29 +258,51 @@ pub(super) fn build_config(cfg: McpBrokerConfig) -> Result<(McpBrokerConfig, Vec
     let catalog = build_catalog(&cfg.servers, cfg.invalid_tool_policy)?;
     validate_unique_exposed_names(&catalog)?;
 
-    Ok((cfg, catalog))
+    Ok(catalog)
 }
 
-/// Validate that every configured version is implemented by this build
-/// and that `default_version` appears in `supported_versions`.
-fn validate_versions(cfg: &McpBrokerConfig) -> Result<(), FilterError> {
-    if cfg.supported_versions.is_empty() {
+/// Reject explicit cache config on profiles that do not use it.
+fn validate_cache_fields_for_profile(profile: ProtocolProfile, cfg: &McpBrokerConfig) -> Result<(), FilterError> {
+    if profile == ProtocolProfile::Current {
+        if cfg.cache_scope.is_some() {
+            return Err("mcp: cache_scope requires protocol_profile 'stateless'".into());
+        }
+        if cfg.cache_ttl_ms.is_some() {
+            return Err("mcp: cache_ttl_ms requires protocol_profile 'stateless'".into());
+        }
+    }
+    Ok(())
+}
+
+/// Rejects versions that the selected profile does not recognize.
+fn validate_versions(
+    profile: ProtocolProfile,
+    supported_versions: &[String],
+    default_version: &str,
+) -> Result<(), FilterError> {
+    if supported_versions.is_empty() {
         return Err("mcp: supported_versions must not be empty".into());
     }
-    for v in &cfg.supported_versions {
+
+    for v in supported_versions {
         if !protocol::is_supported_version(v) {
             return Err(
                 format!("mcp: supported_versions contains '{v}' which is not implemented by this build").into(),
             );
         }
+        if !protocol::is_supported_version_for_profile(profile, v) {
+            return Err(format!(
+                "mcp: version '{v}' is not compatible with protocol_profile '{}'",
+                profile.as_str()
+            )
+            .into());
+        }
     }
-    if !cfg.supported_versions.iter().any(|v| v == &cfg.default_version) {
-        return Err(format!(
-            "mcp: default_version '{}' must appear in supported_versions",
-            cfg.default_version,
-        )
-        .into());
+
+    if !supported_versions.iter().any(|v| v == default_version) {
+        return Err(format!("mcp: default_version '{default_version}' must appear in supported_versions",).into());
     }
+
     Ok(())
 }
 

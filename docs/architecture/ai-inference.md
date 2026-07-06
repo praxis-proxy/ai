@@ -141,8 +141,7 @@ IDs with `resp_` and `conv_` prefixes.
 ### `anthropic_messages_format`
 
 Classifies Anthropic Messages API requests and
-promotes format metadata. Feature-gated behind
-`ai-inference`.
+promotes format metadata.
 
 ### `prompt_enrich`
 
@@ -161,17 +160,6 @@ variable sources.
 
 Persists non-streaming Responses API responses. See
 [Response Store](response-store.md) for details.
-
-## Feature Flags
-
-AI inference filters are gated behind the
-`ai-inference` Cargo feature. The agentic protocol
-filters (JSON-RPC, MCP, A2A) are always compiled.
-
-When `ai-inference` is disabled, the classifier,
-format, validate, store, prompt enrichment, and
-provider-specific filters are excluded from the
-build.
 
 ## Key Files
 
@@ -192,4 +180,4 @@ build.
 
 - [Response Store](response-store.md)
 - [Agentic Protocols](agentic-protocols.md)
-- [Payload Processing](payload-processing.md)
+- [Features](../features.md)

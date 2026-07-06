@@ -12,34 +12,36 @@ use serde_json::Value;
 /// MCP method classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum McpMethod {
+    /// `completion/complete` completion request.
+    CompletionComplete,
     /// `initialize` handshake request.
     Initialize,
+    /// `logging/setLevel` log configuration request.
+    LoggingSetLevel,
     /// `notifications/initialized` post-handshake notification.
     NotificationsInitialized,
-    /// `tools/list` discovery request.
-    ToolsList,
-    /// `tools/call` invocation request.
-    ToolsCall,
-    /// `resources/read` resource access request.
-    ResourcesRead,
-    /// `resources/list` resource discovery request.
-    ResourcesList,
+    /// `notifications/prompts/list_changed` prompt change notification.
+    NotificationsPromptsListChanged,
+    /// `notifications/resources/list_changed` resource change notification.
+    NotificationsResourcesListChanged,
+    /// `notifications/tools/list_changed` tool change notification.
+    NotificationsToolsListChanged,
+    /// `ping` keep-alive request.
+    Ping,
     /// `prompts/get` prompt retrieval request.
     PromptsGet,
     /// `prompts/list` prompt discovery request.
     PromptsList,
-    /// `ping` keep-alive request.
-    Ping,
-    /// `logging/setLevel` log configuration request.
-    LoggingSetLevel,
-    /// `completion/complete` completion request.
-    CompletionComplete,
-    /// `notifications/tools/list_changed` tool change notification.
-    NotificationsToolsListChanged,
-    /// `notifications/resources/list_changed` resource change notification.
-    NotificationsResourcesListChanged,
-    /// `notifications/prompts/list_changed` prompt change notification.
-    NotificationsPromptsListChanged,
+    /// `resources/list` resource discovery request.
+    ResourcesList,
+    /// `resources/read` resource access request.
+    ResourcesRead,
+    /// `server/discover` capability and version discovery (stateless profile).
+    ServerDiscover,
+    /// `tools/call` invocation request.
+    ToolsCall,
+    /// `tools/list` discovery request.
+    ToolsList,
     /// Any other method string not in the known set.
     Other(String),
 }
@@ -48,20 +50,21 @@ impl McpMethod {
     /// Parse an MCP method from the JSON-RPC method string.
     pub(crate) fn from_method_str(s: &str) -> Self {
         match s {
+            "completion/complete" => Self::CompletionComplete,
             "initialize" => Self::Initialize,
+            "logging/setLevel" => Self::LoggingSetLevel,
             "notifications/initialized" => Self::NotificationsInitialized,
-            "tools/list" => Self::ToolsList,
-            "tools/call" => Self::ToolsCall,
-            "resources/read" => Self::ResourcesRead,
-            "resources/list" => Self::ResourcesList,
+            "notifications/prompts/list_changed" => Self::NotificationsPromptsListChanged,
+            "notifications/resources/list_changed" => Self::NotificationsResourcesListChanged,
+            "notifications/tools/list_changed" => Self::NotificationsToolsListChanged,
+            "ping" => Self::Ping,
             "prompts/get" => Self::PromptsGet,
             "prompts/list" => Self::PromptsList,
-            "ping" => Self::Ping,
-            "logging/setLevel" => Self::LoggingSetLevel,
-            "completion/complete" => Self::CompletionComplete,
-            "notifications/tools/list_changed" => Self::NotificationsToolsListChanged,
-            "notifications/resources/list_changed" => Self::NotificationsResourcesListChanged,
-            "notifications/prompts/list_changed" => Self::NotificationsPromptsListChanged,
+            "resources/list" => Self::ResourcesList,
+            "resources/read" => Self::ResourcesRead,
+            "server/discover" => Self::ServerDiscover,
+            "tools/call" => Self::ToolsCall,
+            "tools/list" => Self::ToolsList,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -69,20 +72,21 @@ impl McpMethod {
     /// String representation for headers and metadata.
     pub(crate) fn as_str(&self) -> &str {
         match self {
+            Self::CompletionComplete => "completion/complete",
             Self::Initialize => "initialize",
+            Self::LoggingSetLevel => "logging/setLevel",
             Self::NotificationsInitialized => "notifications/initialized",
-            Self::ToolsList => "tools/list",
-            Self::ToolsCall => "tools/call",
-            Self::ResourcesRead => "resources/read",
-            Self::ResourcesList => "resources/list",
+            Self::NotificationsPromptsListChanged => "notifications/prompts/list_changed",
+            Self::NotificationsResourcesListChanged => "notifications/resources/list_changed",
+            Self::NotificationsToolsListChanged => "notifications/tools/list_changed",
+            Self::Ping => "ping",
             Self::PromptsGet => "prompts/get",
             Self::PromptsList => "prompts/list",
-            Self::Ping => "ping",
-            Self::LoggingSetLevel => "logging/setLevel",
-            Self::CompletionComplete => "completion/complete",
-            Self::NotificationsToolsListChanged => "notifications/tools/list_changed",
-            Self::NotificationsResourcesListChanged => "notifications/resources/list_changed",
-            Self::NotificationsPromptsListChanged => "notifications/prompts/list_changed",
+            Self::ResourcesList => "resources/list",
+            Self::ResourcesRead => "resources/read",
+            Self::ServerDiscover => "server/discover",
+            Self::ToolsCall => "tools/call",
+            Self::ToolsList => "tools/list",
             Self::Other(s) => s,
         }
     }

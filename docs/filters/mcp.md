@@ -15,7 +15,9 @@ Methods requiring a name selector (`tools/call`, `resources/read`, `prompts/get`
 
 Writes `mcp.*` and `json_rpc.*` entries to the filter result set for branch chain conditions.
 
-This first MCP static catalog change short-circuits all methods: no request is forwarded to backends. `tools/call` returns a controlled `-32601` error until backend routing is added.
+The broker serves configured catalog operations locally while backend tool routing is not implemented. It deliberately returns `-32601` for `tools/call` rather than forwarding a request whose target is unresolved.
+
+Supports two protocol profiles: `current` (session-based, default) and `stateless` (MCP 2026-07-28, configurable). Version and cache fields are derived from the selected profile when omitted.
 
 ## Configuration
 
@@ -32,10 +34,12 @@ This first MCP static catalog change short-circuits all methods: no request is f
 | `headers.session_present` | string | no | Header name for MCP session presence (e.g. `x-praxis-mcp-session-present`). |
 | `max_body_bytes` | usize | no | Maximum body size in bytes for `StreamBuffer`. |
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Invalid input handling behavior. |
-| `default_version` | string | no | Fallback MCP protocol version returned in broker `initialize` responses when the client's requested version is not supported. Must be present in `supported_versions` and implemented by this build. Defaults to [`protocol::DEFAULT_VERSION`]. |
+| `cache_scope` | `public` \| `private` | no | Cache scope for stateless responses. Requires `protocol_profile: stateless`. |
+| `cache_ttl_ms` | u64 | no | Cache TTL in milliseconds for stateless responses. Requires `protocol_profile: stateless`. |
+| `default_version` | string | no | Fallback MCP protocol version. When omitted, derived from the profile. |
 | `invalid_tool_policy` | `reject_server` \| `filter_out` | no | Behavior when a tool has an invalid schema. |
 | `path` | string | no | Public MCP path handled by Praxis. |
-| `protocol_profile` | `current` | no | Protocol profile governing session semantics and header requirements for this broker instance. |
+| `protocol_profile` | `current` \| `stateless` | no | Protocol profile governing session semantics and header requirements for this broker instance. |
 | `servers` | McpServerConfig[] | no | Backend server definitions. |
 | `servers[].name` | string | yes | Unique server name. |
 | `servers[].cluster` | string | yes | Backend cluster name. |
@@ -46,7 +50,7 @@ This first MCP static catalog change short-circuits all methods: no request is f
 | `servers[].tools[].description` | string | no | Optional description. |
 | `servers[].tools[].inputSchema` | any | no | Optional input schema. `schema` is accepted as a local shorthand. |
 | `servers[].tools[].annotations` | any | no | Optional tool annotations. |
-| `supported_versions` | string[] | no | Protocol versions accepted during `initialize` negotiation. Every entry must be implemented by this build (present in [`protocol::SUPPORTED_VERSIONS`]). Defaults to the versions this build implements. |
+| `supported_versions` | string[] | no | Protocol versions accepted during negotiation. When omitted, derived from the profile. |
 
 ## Examples
 
@@ -94,4 +98,23 @@ servers:
     tools:
       - name: create_event
         description: Create a calendar event
+```
+
+### Example 4
+
+```yaml
+filter: mcp
+path: /mcp
+max_body_bytes: 65536
+protocol_profile: stateless
+cache_ttl_ms: 300000
+cache_scope: public
+servers:
+  - name: weather
+    cluster: weather-mcp
+    path: /mcp
+    tool_prefix: weather_
+    tools:
+      - name: get_weather
+        description: Get current weather
 ```

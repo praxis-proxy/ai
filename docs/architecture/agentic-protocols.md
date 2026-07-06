@@ -213,5 +213,5 @@ All three filters share these conventions:
 ## Related
 
 - [AI Inference](ai-inference.md)
-- [Payload Processing](payload-processing.md)
-- [Architecture Overview](overview.md)
+- [Response Store](response-store.md)
+- [Features](../features.md)

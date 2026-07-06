@@ -1,6 +1,6 @@
 # A2A Classifier Routing
 #
-# Routes A2A requests by body-derived method, family, task ID, and streaming detection.
+# Routes A2A requests by body-derived method, family, context ID, task ID, and streaming detection.
 # The `a2a` filter parses JSON-RPC bodies and promotes internal routing headers
 # (x-praxis-a2a-*) for router matching. These internal headers are stripped
 # before upstream by header hygiene.
@@ -8,6 +8,7 @@
 # This example demonstrates static A2A routing based on:
 # - Method classification (SendMessage, SendStreamingMessage, GetTask, etc.)
 # - Streaming detection for SendStreamingMessage and SubscribeToTask
+# - Context ID extraction from params.message.contextId and ListTasks params.contextId
 # - Task ID extraction from params.id and params.taskId
 # - Method alias support for compatibility (slash-delimited → PascalCase)
 #
@@ -33,6 +34,7 @@ filter_chains:
         headers:
           method: x-praxis-a2a-method
           family: x-praxis-a2a-family
+          context_id: x-praxis-a2a-context-id
           task_id: x-praxis-a2a-task-id
           kind: x-praxis-a2a-kind
           streaming: x-praxis-a2a-streaming
@@ -40,6 +42,12 @@ filter_chains:
 
       - filter: router
         routes:
+          # First-match routing requires specific context rules before broader method/family rules.
+          - path_prefix: "/"
+            headers:
+              x-praxis-a2a-context-id: "ctx-123"
+            cluster: "message-backend"
+
           # Route SendMessage to agent backend
           - path_prefix: "/"
             headers:

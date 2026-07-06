@@ -46,10 +46,12 @@ produce a warning. All crates enforce
 `#![deny(unsafe_code)]` and Clippy runs with
 `-D warnings` (zero tolerance).
 
-See the [crate layout](../architecture/crate-layout.md) for workspace
-structure and crate dependencies.
-See [security-hardening.md](../operating/security-hardening.md) for
-deployment guidance.
+The workspace is split across `apis`, `filters`, `server`,
+`tests`, and `xtask`; shared dependencies are managed from the
+root `Cargo.toml`.
+
+See [SECURITY.md](../../SECURITY.md) for supported versions and
+vulnerability reporting.
 
 ## Security: Binding Low Ports
 
@@ -148,4 +150,6 @@ options.
 
 ## Performance & Benchmarking
 
-See [benchmarks.md](../benchmarks.md).
+Include benchmark or load-test evidence in PRs that materially
+affect request processing, storage, streaming, or protocol parsing
+costs.
