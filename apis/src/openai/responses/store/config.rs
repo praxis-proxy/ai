@@ -120,7 +120,10 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
     }
 
     let path = sqlite_file_path(database_url).unwrap_or(database_url);
-    if has_dot_dot_traversal(path) {
+    let path = percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|e| format!("openai_response_store: database_url path must be valid UTF-8: {e}"))?;
+    if has_dot_dot_traversal(&path) {
         return Err("openai_response_store: database_url must not contain '..' path traversal".into());
     }
     Ok(())
