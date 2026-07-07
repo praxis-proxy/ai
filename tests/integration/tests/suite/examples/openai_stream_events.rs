@@ -197,6 +197,49 @@ async fn stream_events_incremental_accumulation_before_terminal() {
     cleanup_sqlite_files(&db_path);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_processes_validate_reformatted_error() {
+    let error_body = r#"{"error":{"message":"model not found","type":"invalid_request_error","code":"model_not_found"}}"#;
+    let backend_guard = Backend::status(404, error_body)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_err");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"nonexistent","input":"Hello","stream":true}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "validate filter reformats 404 to 200 SSE for streaming requests"
+    );
+
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("model not found") || body.contains("model_not_found"),
+        "error details should be preserved through validate+stream_events: {body}"
+    );
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

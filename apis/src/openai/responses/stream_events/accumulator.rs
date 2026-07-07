@@ -147,7 +147,7 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
     buf.push_str(delta);
 }
 
-/// Finalize a function call from accumulated deltas and push to `tool_calls`.
+/// Finalize a function call from the done event's payload and push to `tool_calls`.
 fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut StreamEventsState, payload: &Value) {
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
 
@@ -155,10 +155,12 @@ fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut
         return;
     };
 
-    let arguments = filter_state
-        .tool_call_args
-        .remove(&key)
-        .or_else(|| payload.get("arguments").and_then(Value::as_str).map(ToOwned::to_owned))
+    let accumulated = filter_state.tool_call_args.remove(&key);
+    let arguments = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or(accumulated)
         .unwrap_or_default();
 
     let Some(item) = find_output_item_mut(&mut state.output_items, payload) else {

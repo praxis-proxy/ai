@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
 use crate::openai::sse::SseParserConfig;
@@ -40,7 +41,31 @@ pub(crate) struct StreamEventsConfig {
 /// Default cap for accumulated function-call argument bytes (1 MiB).
 const DEFAULT_MAX_TOOL_CALL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
+/// Filter name used in validation error messages.
+const FILTER_NAME: &str = "openai_stream_events";
+
 impl StreamEventsConfig {
+    /// Validate explicitly set values. Omitted fields use safe defaults.
+    pub(crate) fn validate(&self) -> Result<(), FilterError> {
+        if let Some(v) = self.max_buffer_bytes {
+            reject_zero(v, "max_buffer_bytes")?;
+            reject_above_max(v, "max_buffer_bytes")?;
+        }
+        if let Some(v) = self.max_events {
+            reject_zero(v, "max_events")?;
+        }
+        if let Some(v) = self.timeout_secs
+            && v == 0
+        {
+            return Err(format!("{FILTER_NAME}: 'timeout_secs' must be greater than 0").into());
+        }
+        if let Some(v) = self.max_tool_call_argument_bytes {
+            reject_zero(v, "max_tool_call_argument_bytes")?;
+            reject_above_max(v, "max_tool_call_argument_bytes")?;
+        }
+        Ok(())
+    }
+
     /// Convert to the internal parser config, applying defaults for
     /// any omitted fields.
     pub(crate) fn to_parser_config(&self) -> SseParserConfig {
@@ -57,4 +82,20 @@ impl StreamEventsConfig {
         self.max_tool_call_argument_bytes
             .unwrap_or(DEFAULT_MAX_TOOL_CALL_ARGUMENT_BYTES)
     }
+}
+
+/// Reject a zero value for a named configuration field.
+fn reject_zero(value: usize, field: &str) -> Result<(), FilterError> {
+    if value == 0 {
+        return Err(format!("{FILTER_NAME}: '{field}' must be greater than 0").into());
+    }
+    Ok(())
+}
+
+/// Reject a byte-cap value that exceeds `MAX_JSON_BODY_BYTES` (64 MiB).
+fn reject_above_max(value: usize, field: &str) -> Result<(), FilterError> {
+    if value > MAX_JSON_BODY_BYTES {
+        return Err(format!("{FILTER_NAME}: {field} ({value}) exceeds maximum ({MAX_JSON_BODY_BYTES})").into());
+    }
+    Ok(())
 }

@@ -13,9 +13,9 @@ use bytes::Bytes;
 use praxis_filter::{FilterAction, HttpFilter};
 use serde_json::json;
 
-use super::{OpenaiStreamEventsFilter, StreamEventsState};
+use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState};
 use crate::{
-    openai::responses::state::ResponsesState,
+    openai::{responses::state::ResponsesState, sse::SseFrameParser},
     test_utils::{make_filter_context, make_request},
 };
 
@@ -54,6 +54,51 @@ fn unknown_config_field_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("bogus_field: true").unwrap();
     let result = OpenaiStreamEventsFilter::from_config(&yaml);
     assert!(result.is_err(), "unknown fields should be rejected");
+}
+
+#[test]
+fn zero_max_buffer_bytes_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_buffer_bytes: 0").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero max_buffer_bytes should be rejected");
+}
+
+#[test]
+fn zero_max_events_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_events: 0").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero max_events should be rejected");
+}
+
+#[test]
+fn zero_timeout_secs_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 0").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero timeout_secs should be rejected");
+}
+
+#[test]
+fn zero_max_tool_call_argument_bytes_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 0").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero max_tool_call_argument_bytes should be rejected");
+}
+
+#[test]
+fn oversized_max_buffer_bytes_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_buffer_bytes: 100000000").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_buffer_bytes above 64 MiB should be rejected");
+}
+
+#[test]
+fn oversized_max_tool_call_argument_bytes_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 100000000").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "max_tool_call_argument_bytes above 64 MiB should be rejected"
+    );
 }
 
 #[tokio::test]
@@ -316,7 +361,13 @@ async fn eos_without_terminal_sets_incomplete() {
 fn body_passes_through_unchanged() {
     let (filter, mut ctx) = make_armed_context();
     ctx.insert_filter_state(StreamEventsState {
-        parser: crate::openai::sse::responses::ResponsesSseParser::new(&crate::openai::sse::SseParserConfig::default()),
+        frame_parser: SseFrameParser::new(10_485_760),
+        event_count: 0,
+        max_events: 100_000,
+        timeout: std::time::Duration::from_secs(300),
+        started_at: None,
+        completed_at: None,
+        completion_state: CompletionState::Open,
         tool_call_args: std::collections::HashMap::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
     });
@@ -326,9 +377,9 @@ fn body_passes_through_unchanged() {
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
     assert_eq!(
-        body.as_ref().unwrap(),
-        &original,
-        "read-only filter must not modify body bytes"
+        body.as_ref().unwrap().as_ref(),
+        original.as_ref(),
+        "body should pass through unchanged in ReadOnly mode"
     );
 }
 
@@ -336,11 +387,13 @@ fn body_passes_through_unchanged() {
 fn parse_error_sets_metadata() {
     let (filter, mut ctx) = make_armed_context();
     ctx.insert_filter_state(StreamEventsState {
-        parser: crate::openai::sse::responses::ResponsesSseParser::new(&crate::openai::sse::SseParserConfig {
-            max_buffer_bytes: 10,
-            max_events: 100_000,
-            timeout: std::time::Duration::from_secs(300),
-        }),
+        frame_parser: SseFrameParser::new(10),
+        event_count: 0,
+        max_events: 100_000,
+        timeout: std::time::Duration::from_secs(300),
+        started_at: None,
+        completed_at: None,
+        completion_state: CompletionState::Open,
         tool_call_args: std::collections::HashMap::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
     });
@@ -517,6 +570,44 @@ async fn function_call_done_without_prior_deltas() {
 }
 
 #[tokio::test]
+async fn done_payload_wins_over_accumulated_deltas() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let item = json!({
+        "item": {
+            "type": "function_call",
+            "id": "fc_diff",
+            "call_id": "call_diff",
+            "name": "lookup",
+            "arguments": "",
+            "status": "in_progress"
+        },
+        "output_index": 0
+    });
+    let mut b1 = Some(make_sse_chunk("response.output_item.added", &item));
+    filter.on_response_body(&mut ctx, &mut b1, false).unwrap();
+
+    let delta = json!({"item_id": "fc_diff", "output_index": 0, "delta": "{\"from\":\"delta\"}"});
+    let mut b2 = Some(make_sse_chunk("response.function_call_arguments.delta", &delta));
+    filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
+
+    let done = json!({
+        "item_id": "fc_diff",
+        "output_index": 0,
+        "arguments": "{\"from\":\"done_payload\"}"
+    });
+    let mut b3 = Some(make_sse_chunk("response.function_call_arguments.done", &done));
+    filter.on_response_body(&mut ctx, &mut b3, false).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.tool_calls[0]["arguments"], "{\"from\":\"done_payload\"}",
+        "done-event arguments should take precedence over accumulated deltas"
+    );
+}
+
+#[tokio::test]
 async fn unknown_event_type_ignored() {
     let (filter, mut ctx) = make_armed_context();
     filter.on_request(&mut ctx).await.unwrap();
@@ -542,6 +633,55 @@ async fn error_event_does_not_mutate_state() {
     assert!(
         ctx.extensions.get::<ResponsesState>().is_none(),
         "error event should not create ResponsesState"
+    );
+}
+
+#[tokio::test]
+async fn error_after_terminal_lifecycle_is_accepted() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let completed =
+        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
+    let mut b1 = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut b1, false).unwrap();
+
+    let error = json!({"code": "server_error", "message": "late error"});
+    let mut b2 = Some(make_sse_chunk("error", &error));
+    let result = filter.on_response_body(&mut ctx, &mut b2, false);
+
+    assert!(
+        result.is_ok(),
+        "first error after terminal lifecycle should be accepted"
+    );
+    assert!(
+        ctx.get_metadata("responses.stream_parse_error").is_none(),
+        "accepted error should not set parse error"
+    );
+}
+
+#[tokio::test]
+async fn second_error_after_terminal_is_rejected() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let completed =
+        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
+    let mut b1 = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut b1, false).unwrap();
+
+    let error1 = json!({"code": "server_error", "message": "first error"});
+    let mut b2 = Some(make_sse_chunk("error", &error1));
+    filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
+
+    let error2 = json!({"code": "server_error", "message": "second error"});
+    let mut b3 = Some(make_sse_chunk("error", &error2));
+    filter.on_response_body(&mut ctx, &mut b3, false).unwrap();
+
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "second error event should be rejected as EventAfterTerminal"
     );
 }
 
@@ -621,5 +761,117 @@ async fn tool_call_argument_bytes_within_limit() {
         state.tool_call_args.get("item:fc_ok").unwrap(),
         "{\"k\":\"v\"}",
         "within-limit deltas should accumulate normally"
+    );
+}
+
+#[tokio::test]
+async fn on_response_disarms_for_non_2xx_status() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+    assert!(ctx.get_filter_state::<StreamEventsState>().is_some());
+
+    let resp = Box::leak(Box::new(crate::test_utils::make_response()));
+    resp.status = http::StatusCode::BAD_REQUEST;
+    resp.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    ctx.response_header = Some(resp);
+
+    filter.on_response(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>().is_none(),
+        "filter should be disarmed for non-2xx response"
+    );
+}
+
+#[tokio::test]
+async fn on_response_disarms_for_non_sse_content_type() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let resp = Box::leak(Box::new(crate::test_utils::make_response()));
+    resp.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    ctx.response_header = Some(resp);
+
+    filter.on_response(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>().is_none(),
+        "filter should be disarmed for non-SSE content type"
+    );
+}
+
+#[tokio::test]
+async fn on_response_stays_armed_for_sse_with_charset() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let resp = Box::leak(Box::new(crate::test_utils::make_response()));
+    resp.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    ctx.response_header = Some(resp);
+
+    filter.on_response(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>().is_some(),
+        "filter should stay armed for text/event-stream with charset parameter"
+    );
+}
+
+#[tokio::test]
+async fn disarmed_filter_passes_error_body_through() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let resp = Box::leak(Box::new(crate::test_utils::make_response()));
+    resp.status = http::StatusCode::BAD_REQUEST;
+    resp.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    ctx.response_header = Some(resp);
+    filter.on_response(&mut ctx).await.unwrap();
+
+    let error_json = r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#;
+    let mut body = Some(Bytes::from(error_json));
+    filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        error_json.as_bytes(),
+        "error body should pass through unchanged after disarming"
+    );
+}
+
+#[tokio::test]
+async fn on_response_preserves_content_length_when_not_armed() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+
+    let resp = Box::leak(Box::new(crate::test_utils::make_response()));
+    resp.headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("1234"));
+    ctx.response_header = Some(resp);
+
+    filter.on_response(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.response_header
+            .as_ref()
+            .unwrap()
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .is_some(),
+        "Content-Length should be preserved when filter is not armed"
     );
 }

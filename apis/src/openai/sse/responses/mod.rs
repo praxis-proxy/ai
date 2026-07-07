@@ -7,4 +7,3 @@ mod event;
 mod parser;
 
 pub(crate) use event::ResponsesEvent;
-pub(crate) use parser::ResponsesSseParser;
