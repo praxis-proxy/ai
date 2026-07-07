@@ -20,6 +20,7 @@ quote = { workspace = true }
 syn = { workspace = true }
 praxis-ai = { path = "../server", package = "praxis-ai-proxy" }
 praxis-core = { workspace = true }
+praxis-test-utils = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }

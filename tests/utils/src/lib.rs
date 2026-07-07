@@ -37,5 +37,9 @@ pub use proxy::{
     start_tls_proxy_no_wait,
 };
 pub use recording::Recording;
-pub use session_replay::{ReplayProtocol, ReplayTurn, SessionReplay};
+pub use session_replay::{
+    ClaudeCodeSessionImporter, CodexSessionImporter, Detection, ImportError, ImportOptions, ProviderHint,
+    ReplayProtocol, ReplayTurn, SessionInput, SessionProvider, SessionReplay, SessionReplayImporter,
+    import_session_replay,
+};
 pub use sqlite::TempSqlite;

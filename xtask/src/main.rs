@@ -20,6 +20,7 @@ mod filter_docs;
 mod lint_deps;
 mod lint_example_tests;
 mod lint_separators;
+mod make_replay_fixture;
 mod port;
 mod sync_example_readme;
 
@@ -60,6 +61,9 @@ enum Command {
     /// Check that separator comments total exactly 80 columns.
     LintSeparators(lint_separators::Args),
 
+    /// Convert a Claude Code or Codex session log into a replay fixture.
+    MakeReplayFixture(make_replay_fixture::Args),
+
     /// Verify or regenerate the `examples/README.md` table
     /// from YAML config header comments.
     SyncExampleReadme(sync_example_readme::Args),
@@ -84,6 +88,7 @@ fn main() {
         Command::LintDeps(args) => lint_deps::run(args),
         Command::LintExampleTests(args) => lint_example_tests::run(args),
         Command::LintSeparators(args) => lint_separators::run(args),
+        Command::MakeReplayFixture(args) => make_replay_fixture::run(args),
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),

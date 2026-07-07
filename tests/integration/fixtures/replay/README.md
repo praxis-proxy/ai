@@ -107,6 +107,38 @@ Turn fields:
    cargo test -p praxis-tests-integration session_replay -- --nocapture
    ```
 
+## Importing local sessions
+
+Use `cargo xtask make-replay-fixture` to convert a local Claude Code or Codex
+session log into this fixture schema:
+
+```console
+cargo xtask make-replay-fixture ~/.codex/sessions/2026/07/07/session.jsonl \
+  --provider auto \
+  --out tests/integration/fixtures/replay/codex/my-example.json
+```
+
+When `--out` is omitted, the generated fixture is printed to stdout. Provider
+selection defaults to `--provider auto`; use `--provider codex` or
+`--provider claude` when a file is recognizable but auto-detection is not
+specific enough.
+
+Typical local session locations:
+
+- Codex: `~/.codex/sessions/YYYY/MM/DD/*.jsonl`
+- Claude Code project sessions:
+  `~/.claude/projects/<project-slug>/<session-id>.jsonl`
+- Claude Code subagent sessions:
+  `~/.claude/projects/<project-slug>/<session-id>/subagents/*.jsonl`
+- Claude Code prompt history: `~/.claude/history.jsonl`
+
+The importer is intentionally conservative. Codex import currently expects
+JSONL records with `response_item.payload.request` and
+`response_item.payload.response`. Claude Code import pairs a user message with
+the following assistant Messages response and uses a deterministic fallback
+`max_tokens` value in the generated request. Always review and sanitize the
+generated fixture before committing it.
+
 ## Coverage targets
 
 Add fixtures when a real stored Claude or Codex session shows a shape the
