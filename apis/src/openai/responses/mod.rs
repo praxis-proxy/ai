@@ -21,13 +21,9 @@ mod config;
 pub(crate) mod error;
 pub(crate) mod model_rewrite;
 pub(crate) mod proxy;
-#[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on modules")]
-#[allow(
-    dead_code,
-    reason = "state infrastructure for upcoming Responses API filter consumers (#354)"
-)]
 pub(crate) mod state;
 pub(crate) mod store;
+pub(crate) mod stream_events;
 
 pub use model_rewrite::ModelRewriteFilter;
 pub use store::ResponseStoreFilter;

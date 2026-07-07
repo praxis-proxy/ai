@@ -17,6 +17,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use self::config::{AnthropicStreamEventsConfig, build_config};
+use crate::is_event_stream_content_type;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -37,8 +38,14 @@ const OPENAI_DONE_SENTINEL: &str = "[DONE]";
 /// Metadata key tracking whether a text content block is open.
 const TEXT_BLOCK_OPEN_KEY: &str = "anthropic_stream.text_block_open";
 
-/// Metadata key tracking whether a tool content block is open.
-const TOOL_BLOCK_OPEN_KEY: &str = "anthropic_stream.tool_block_open";
+/// Metadata key prefix for per-tool-call content block state.
+const TOOL_BLOCK_KEY_PREFIX: &str = "anthropic_stream.tool_block.";
+
+/// Metadata key suffix for a tool call's Anthropic content block index.
+const TOOL_BLOCK_INDEX_SUFFIX: &str = ".index";
+
+/// Metadata key suffix tracking whether a tool call's content block is open.
+const TOOL_BLOCK_OPEN_SUFFIX: &str = ".open";
 
 /// Metadata key for the finish reason from the upstream provider.
 const FINISH_REASON_KEY: &str = "anthropic_stream.finish_reason";
@@ -392,12 +399,6 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
             .is_some_and(|v| v == "true")
 }
 
-/// Whether a `Content-Type` header value indicates `text/event-stream`.
-fn is_event_stream_content_type(ct: &str) -> bool {
-    ct.split(';')
-        .next()
-        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
-}
 
 /// Process a single SSE event block (lines between double-newlines).
 ///
@@ -545,12 +546,15 @@ fn emit_text_delta(ctx: &mut HttpFilterContext<'_>, content: &str, output: &mut 
 
 /// Transform a tool call delta into Anthropic content block events.
 fn transform_tool_delta(ctx: &mut HttpFilterContext<'_>, tc: &Value, output: &mut Vec<u8>) {
-    if let Some(id) = tc.get("id").and_then(Value::as_str) {
-        close_tool_block_if_open(ctx, output);
-        emit_tool_block_start(ctx, tc, id, output);
+    let tool_call_key = tool_call_key(tc);
+
+    if let Some(id) = tc.get("id").and_then(Value::as_str)
+        && !is_tool_block_open(ctx, &tool_call_key)
+    {
+        emit_tool_block_start(ctx, &tool_call_key, tc, id, output);
     }
 
-    emit_tool_arguments_delta(ctx, tc, output);
+    emit_tool_arguments_delta(ctx, &tool_call_key, tc, output);
 }
 
 /// Close any open text content block and advance the block index.
@@ -569,8 +573,21 @@ fn close_text_block_if_open(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8
     ctx.set_metadata(TEXT_BLOCK_OPEN_KEY, "false".to_owned());
 }
 
+/// Return the stable key used to associate OpenAI tool-call deltas.
+fn tool_call_key(tc: &Value) -> String {
+    tc.get("index")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "legacy".to_owned(), |idx| idx.to_string())
+}
+
 /// Emit a `content_block_start` for a tool-use block.
-fn emit_tool_block_start(ctx: &mut HttpFilterContext<'_>, tc: &Value, id: &str, output: &mut Vec<u8>) {
+fn emit_tool_block_start(
+    ctx: &mut HttpFilterContext<'_>,
+    tool_call_key: &str,
+    tc: &Value,
+    id: &str,
+    output: &mut Vec<u8>,
+) {
     let idx = get_block_index(ctx);
     let name = tc
         .get("function")
@@ -587,11 +604,13 @@ fn emit_tool_block_start(ctx: &mut HttpFilterContext<'_>, tc: &Value, id: &str, 
             "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
         }),
     );
-    ctx.set_metadata(TOOL_BLOCK_OPEN_KEY, "true".to_owned());
+    set_tool_block_index(ctx, tool_call_key, idx);
+    set_tool_block_open(ctx, tool_call_key, true);
+    increment_block_index(ctx);
 }
 
 /// Emit an `input_json_delta` if the tool call has non-empty arguments.
-fn emit_tool_arguments_delta(ctx: &HttpFilterContext<'_>, tc: &Value, output: &mut Vec<u8>) {
+fn emit_tool_arguments_delta(ctx: &HttpFilterContext<'_>, tool_call_key: &str, tc: &Value, output: &mut Vec<u8>) {
     let Some(args) = tc
         .get("function")
         .and_then(|f| f.get("arguments"))
@@ -604,7 +623,7 @@ fn emit_tool_arguments_delta(ctx: &HttpFilterContext<'_>, tc: &Value, output: &m
         return;
     }
 
-    let idx = get_block_index(ctx);
+    let idx = get_tool_block_index(ctx, tool_call_key).unwrap_or_else(|| get_block_index(ctx));
     emit_event(
         output,
         "content_block_delta",
@@ -616,20 +635,22 @@ fn emit_tool_arguments_delta(ctx: &HttpFilterContext<'_>, tc: &Value, output: &m
     );
 }
 
-/// Close any open tool content block and advance the block index.
-fn close_tool_block_if_open(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
-    if !is_tool_block_open(ctx) {
+/// Close a specific open tool content block.
+fn close_tool_block(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, output: &mut Vec<u8>) {
+    if !is_tool_block_open(ctx, tool_call_key) {
         return;
     }
 
-    let idx = get_block_index(ctx);
+    let Some(idx) = get_tool_block_index(ctx, tool_call_key) else {
+        return;
+    };
+
     emit_event(
         output,
         "content_block_stop",
         &serde_json::json!({"type": "content_block_stop", "index": idx}),
     );
-    increment_block_index(ctx);
-    ctx.set_metadata(TOOL_BLOCK_OPEN_KEY, "false".to_owned());
+    set_tool_block_open(ctx, tool_call_key, false);
 }
 
 // -----------------------------------------------------------------------------
@@ -649,8 +670,8 @@ fn emit_final_block_stop(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) 
     if is_text_block_open(ctx) {
         close_text_block_if_open(ctx, output);
     }
-    if is_tool_block_open(ctx) {
-        close_tool_block_if_open(ctx, output);
+    for (_, tool_call_key) in open_tool_blocks(ctx) {
+        close_tool_block(ctx, &tool_call_key, output);
     }
 }
 
@@ -728,13 +749,6 @@ fn is_text_block_open(ctx: &HttpFilterContext<'_>) -> bool {
         .is_some_and(|v| v == "true")
 }
 
-/// Check whether a tool content block is currently open.
-fn is_tool_block_open(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.filter_metadata
-        .get(TOOL_BLOCK_OPEN_KEY)
-        .is_some_and(|v| v == "true")
-}
-
 /// Get the current block index from metadata.
 fn get_block_index(ctx: &HttpFilterContext<'_>) -> u32 {
     ctx.filter_metadata
@@ -747,6 +761,59 @@ fn get_block_index(ctx: &HttpFilterContext<'_>) -> u32 {
 fn increment_block_index(ctx: &mut HttpFilterContext<'_>) {
     let current = get_block_index(ctx);
     ctx.set_metadata(BLOCK_INDEX_KEY, (current + 1).to_string());
+}
+
+/// Build the metadata key for a tool call's Anthropic block index.
+fn tool_block_index_key(tool_call_key: &str) -> String {
+    format!("{TOOL_BLOCK_KEY_PREFIX}{tool_call_key}{TOOL_BLOCK_INDEX_SUFFIX}")
+}
+
+/// Build the metadata key for a tool call's open/closed state.
+fn tool_block_open_key(tool_call_key: &str) -> String {
+    format!("{TOOL_BLOCK_KEY_PREFIX}{tool_call_key}{TOOL_BLOCK_OPEN_SUFFIX}")
+}
+
+/// Record the Anthropic block index assigned to an OpenAI tool-call index.
+fn set_tool_block_index(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, idx: u32) {
+    ctx.set_metadata(tool_block_index_key(tool_call_key), idx.to_string());
+}
+
+/// Return the Anthropic block index assigned to an OpenAI tool-call index.
+fn get_tool_block_index(ctx: &HttpFilterContext<'_>, tool_call_key: &str) -> Option<u32> {
+    ctx.filter_metadata
+        .get(&tool_block_index_key(tool_call_key))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Record whether a tool call's Anthropic content block remains open.
+fn set_tool_block_open(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, open: bool) {
+    ctx.set_metadata(tool_block_open_key(tool_call_key), open.to_string());
+}
+
+/// Check whether a tool call's Anthropic content block is currently open.
+fn is_tool_block_open(ctx: &HttpFilterContext<'_>, tool_call_key: &str) -> bool {
+    ctx.filter_metadata
+        .get(&tool_block_open_key(tool_call_key))
+        .is_some_and(|v| v == "true")
+}
+
+/// Return open tool blocks ordered by their Anthropic content block index.
+fn open_tool_blocks(ctx: &HttpFilterContext<'_>) -> Vec<(u32, String)> {
+    let mut blocks = ctx
+        .filter_metadata
+        .iter()
+        .filter_map(|(key, value)| {
+            if value != "true" {
+                return None;
+            }
+            let tool_call_key = key
+                .strip_prefix(TOOL_BLOCK_KEY_PREFIX)?
+                .strip_suffix(TOOL_BLOCK_OPEN_SUFFIX)?;
+            get_tool_block_index(ctx, tool_call_key).map(|idx| (idx, tool_call_key.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    blocks.sort_by_key(|(idx, _)| *idx);
+    blocks
 }
 
 /// Write a single SSE event to the output buffer.
@@ -1156,6 +1223,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn interleaved_tool_call_argument_delta_uses_matching_tool_block_index() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let call_0_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"function\":{\"name\":\"first\",\"arguments\":\"{\\\"first\\\":\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(call_0_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let call_1_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_1\",\"function\":{\"name\":\"second\",\"arguments\":\"{\\\"second\\\":\"}}]},\"index\":0}]}\n\n";
+        let mut body2 = Some(Bytes::from(call_1_start));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let call_0_args = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"value\\\"}\"}}]},\"index\":0}]}\n\n";
+        let mut body3 = Some(Bytes::from(call_0_args));
+        drop(filter.on_response_body(&mut ctx, &mut body3, false).unwrap());
+
+        let out = String::from_utf8(body3.unwrap().to_vec()).unwrap();
+        let delta = event_data(&out, "content_block_delta");
+        assert_eq!(
+            delta.get("index").and_then(Value::as_u64),
+            Some(0),
+            "id-less argument delta for tool_call index 0 should use call_0's block"
+        );
+    }
+
+    #[test]
+    fn done_closes_all_open_tool_blocks() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let call_0_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"function\":{\"name\":\"first\",\"arguments\":\"{\\\"first\\\":\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(call_0_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let call_1_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_1\",\"function\":{\"name\":\"second\",\"arguments\":\"{\\\"second\\\":\"}}]},\"index\":0}]}\n\n";
+        let mut body2 = Some(Bytes::from(call_1_start));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let done = "data: [DONE]\n\n";
+        let mut body3 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body3, false).unwrap());
+
+        let out = String::from_utf8(body3.unwrap().to_vec()).unwrap();
+        assert_eq!(
+            event_indices(&out, "content_block_stop"),
+            vec![0, 1],
+            "DONE should close every open tool block in block-index order"
+        );
+    }
+
     #[tokio::test]
     async fn error_response_passes_through_unchanged() {
         let filter = make_filter();
@@ -1524,6 +1640,17 @@ mod tests {
         let block = output.split("\n\n").find(|block| block.starts_with(&marker)).unwrap();
         let data = block.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
         serde_json::from_str(data).unwrap()
+    }
+
+    fn event_indices(output: &str, event_type: &str) -> Vec<u64> {
+        let marker = format!("event: {event_type}\n");
+        output
+            .split("\n\n")
+            .filter(|block| block.starts_with(&marker))
+            .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .map(|event| event.get("index").and_then(Value::as_u64).unwrap())
+            .collect()
     }
 
     fn assert_null_fields(value: &Value, fields: &[&str], label: &str) {

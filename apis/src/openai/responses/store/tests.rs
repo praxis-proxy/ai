@@ -97,6 +97,24 @@ conversations_table: conversations
 }
 
 #[test]
+fn database_url_encoded_slash_traversal_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite://..%2F..%2Fetc%2Fresponses.db?mode=rwc"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "database_url with percent-encoded slash traversal should be rejected"
+    );
+}
+
+#[test]
 fn missing_backend_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"

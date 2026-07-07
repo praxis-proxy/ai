@@ -68,9 +68,10 @@ curl http://127.0.0.1:8080/v1/responses \
 
 ## Next steps
 
-- [Configuration](operating/configuration.md): filter
-  chains, routing, load balancing, and all options.
-- [Example configs](../examples/configs/): working YAML
+- [Example configs](../examples/README.md): working YAML
   for every feature.
 - [Filters](filters/README.md): AI filters and how to
   write your own.
+- [Praxis core](https://github.com/praxis-proxy/praxis):
+  listener, filter-chain, routing, and load-balancer
+  configuration.

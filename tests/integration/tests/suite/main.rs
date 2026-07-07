@@ -39,18 +39,13 @@
 
 mod a2a;
 mod agentic_mocks;
-#[cfg(feature = "ai-inference")]
 mod anthropic_messages;
 mod examples;
 mod failure_mode;
 mod guardrails;
 mod mcp;
 mod mcp_broker;
-#[cfg(feature = "ai-inference")]
 mod openai_responses_format;
-#[cfg(feature = "ai-inference")]
 mod openai_responses_model_rewrite;
-#[cfg(feature = "ai-inference")]
 mod prompt_enrich;
-#[cfg(feature = "ai-inference")]
 mod responses_routing;

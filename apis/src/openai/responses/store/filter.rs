@@ -65,8 +65,11 @@ use super::{
     config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
     list_input_items,
 };
-use crate::store::{
-    PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+use crate::{
+    is_event_stream_content_type,
+    store::{
+        PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+    },
 };
 
 /// Persists Responses API responses to the configured response store backend.
@@ -545,16 +548,6 @@ fn is_json_content_type(content_type: &str) -> bool {
         .unwrap_or_default()
         .trim()
         .eq_ignore_ascii_case("application/json")
-}
-
-/// Return whether a `Content-Type` header is SSE event stream.
-fn is_event_stream_content_type(content_type: &str) -> bool {
-    content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .eq_ignore_ascii_case("text/event-stream")
 }
 
 /// Check response headers before enabling response body buffering.
