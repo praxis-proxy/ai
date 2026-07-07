@@ -1,4 +1,4 @@
-<img width="3159" height="540" alt="image" src="https://github.com/user-attachments/assets/0c33e340-a3d4-42e5-93f3-c1e3817b8f35"/>
+<img width="2172" height="724" alt="Praxis AI - Stateful Agentic Server" src="assets/praxis-ai-readme-banner.png"/>
 
 [![Tests](https://github.com/praxis-proxy/ai/actions/workflows/tests.yaml/badge.svg)](https://github.com/praxis-proxy/ai/actions/workflows/tests.yaml)
 [![Coverage: ≥95%](https://img.shields.io/badge/Coverage-≥95%25-brightgreen.svg)](https://github.com/praxis-proxy/ai/actions/workflows/coverage.yaml)
