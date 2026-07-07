@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_send, json_post, parse_body, parse_status, patch_yaml,
+    Backend, TempSqlite, example_config_path, free_port, http_send, json_post, parse_body, parse_status, patch_yaml,
     start_echo_backend, start_proxy,
 };
 
@@ -28,11 +28,11 @@ async fn rehydrate_validates_previous_response_and_passes_body_through() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let (db_url, db_path) = temp_sqlite_url("rehydrate");
+    let db = TempSqlite::new("rehydrate");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/rehydrate.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
         &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
     );
@@ -54,7 +54,7 @@ async fn rehydrate_validates_previous_response_and_passes_body_through() {
 
     let backend_guard2 = start_echo_backend();
     let patched2 = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
         &HashMap::from([("127.0.0.1:8000", backend_guard2.port())]),
     );
@@ -87,7 +87,6 @@ async fn rehydrate_validates_previous_response_and_passes_body_through() {
     );
 
     drop(proxy2);
-    cleanup_sqlite_files(&db_path);
 }
 
 #[test]
@@ -116,26 +115,4 @@ fn rehydrate_passes_through_non_responses_traffic() {
     );
 
     assert_eq!(parse_status(&raw), 200, "non-Responses body should pass through");
-}
-
-// -----------------------------------------------------------------------------
-// Test Utilities
-// -----------------------------------------------------------------------------
-
-/// Generate a unique file-backed SQLite URL for test isolation.
-fn temp_sqlite_url(test_name: &str) -> (String, std::path::PathBuf) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after epoch")
-        .as_nanos();
-    let db_path = std::env::temp_dir().join(format!("praxis_integ_{test_name}_{}_{nanos}.db", std::process::id()));
-    (format!("sqlite://{}?mode=rwc", db_path.display()), db_path)
-}
-
-/// Remove a SQLite database file and its WAL/SHM companions.
-fn cleanup_sqlite_files(db_path: &std::path::Path) {
-    drop(std::fs::remove_file(db_path));
-    drop(std::fs::remove_file(format!("{}-shm", db_path.display())));
-    drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
 }

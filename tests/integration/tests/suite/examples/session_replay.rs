@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, SessionReplay, example_config_path, free_port, http_get, http_send, json_post, parse_body, parse_status,
-    patch_yaml, start_proxy,
+    Backend, SessionReplay, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body,
+    parse_status, patch_yaml, start_proxy,
 };
 
 use super::load_example_config;
@@ -58,7 +58,7 @@ async fn replay_codex_responses_session_through_full_flow_example() {
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", &db.url),
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -91,38 +91,4 @@ async fn replay_codex_responses_session_through_full_flow_example() {
     );
 
     drop(proxy);
-}
-
-// -----------------------------------------------------------------------------
-// Test Utilities
-// -----------------------------------------------------------------------------
-
-/// File-backed SQLite database URL that cleans up its files on drop.
-struct TempSqlite {
-    url: String,
-    path: std::path::PathBuf,
-}
-
-impl TempSqlite {
-    /// Generate a unique file-backed SQLite URL for test isolation.
-    fn new(test_name: &str) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("praxis_integ_{test_name}_{}_{nanos}.db", std::process::id()));
-        Self {
-            url: format!("sqlite://{}?mode=rwc", path.display()),
-            path,
-        }
-    }
-}
-
-impl Drop for TempSqlite {
-    fn drop(&mut self) {
-        drop(std::fs::remove_file(&self.path));
-        drop(std::fs::remove_file(format!("{}-shm", self.path.display())));
-        drop(std::fs::remove_file(format!("{}-wal", self.path.display())));
-    }
 }

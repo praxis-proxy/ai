@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_send, json_post, load_example_config, parse_body, parse_status,
-    patch_yaml, start_backend_with_shutdown, start_echo_backend, start_proxy,
+    Backend, TempSqlite, example_config_path, free_port, http_send, json_post, load_example_config, parse_body,
+    parse_status, patch_yaml, start_backend_with_shutdown, start_echo_backend, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -113,11 +113,11 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let (db_url, db_path) = temp_sqlite_url("full_flow_prev");
+    let db = TempSqlite::new("full_flow_prev");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -134,7 +134,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
 
     let echo_backend = start_echo_backend();
     let patched2 = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", echo_backend.port())]),
     );
@@ -179,27 +179,4 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     );
 
     drop(proxy2);
-    cleanup_sqlite_files(&db_path);
-}
-
-// -----------------------------------------------------------------------------
-// Test Utilities
-// -----------------------------------------------------------------------------
-
-/// Generate a unique file-backed SQLite URL for test isolation.
-fn temp_sqlite_url(test_name: &str) -> (String, std::path::PathBuf) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after epoch")
-        .as_nanos();
-    let db_path = std::env::temp_dir().join(format!("praxis_integ_{test_name}_{}_{nanos}.db", std::process::id()));
-    (format!("sqlite://{}?mode=rwc", db_path.display()), db_path)
-}
-
-/// Remove a SQLite database file and its WAL/SHM companions.
-fn cleanup_sqlite_files(db_path: &std::path::Path) {
-    drop(std::fs::remove_file(db_path));
-    drop(std::fs::remove_file(format!("{}-shm", db_path.display())));
-    drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
 }
