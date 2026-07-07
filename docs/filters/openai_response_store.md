@@ -3,7 +3,7 @@
 
 # `openai_response_store`
 
-Persists non-streaming Responses API responses to the configured response store backend.
+Persists Responses API responses to the configured response store backend.
 
 ## Configuration
 

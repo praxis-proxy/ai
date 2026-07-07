@@ -91,6 +91,9 @@ filter_chains:
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
+
+      - filter: openai_stream_events
+
       - filter: openai_responses_rehydrate
 
       - filter: responses_proxy

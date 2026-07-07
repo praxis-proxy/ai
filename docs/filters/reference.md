@@ -26,11 +26,12 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
-| [`openai_response_store`](openai_response_store.md) | Persists non-streaming Responses API responses to the configured response store backend. |
+| [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
 | [`openai_responses_format`](openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
 | [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses API request bodies. |
 | [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
 | [`openai_responses_validate`](openai_responses_validate.md) | Validates and enriches Responses API requests. |
+| [`openai_stream_events`](openai_stream_events.md) | Accumulates state from native Responses API SSE event streams. |
 | [`responses_proxy`](responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 
 ## Cross-Provider Filters (praxis-ai-filters)

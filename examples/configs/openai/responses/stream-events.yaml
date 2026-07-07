@@ -1,0 +1,73 @@
+# Streaming Event Accumulation
+#
+# Demonstrates the `openai_stream_events` filter, which observes
+# SSE chunks from the backend without modification, accumulates
+# state (response object, output items, tool calls, usage), and
+# writes it to ResponsesState metadata. The `openai_response_store`
+# filter then persists the accumulated state at end-of-stream.
+#
+# This is a minimal pipeline focused on streaming accumulation
+# and persistence. Response body filters run in reverse config
+# order, so the store is listed before stream_events while
+# stream_events still parses final chunks before store persistence.
+# For a complete setup with multi-turn conversation support
+# (rehydrate, responses_proxy), see
+# full-flow.yaml.
+#
+# Example requests:
+#
+#   # Streaming with persistence (store defaults to true)
+#   curl -N http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"Qwen/Qwen3-0.6B","input":"Say hello","stream":true}'
+#
+#   # Non-streaming (still persisted via the buffered path)
+#   curl http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"Qwen/Qwen3-0.6B","input":"Say hello"}'
+#
+#   # Retrieve stored response
+#   curl http://localhost:8080/v1/responses/<response-id>
+#
+# Requires the ai-inference feature:
+#   cargo build -p praxis --features ai-inference
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-pipeline]
+
+filter_chains:
+  - name: responses-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+
+      - filter: openai_responses_validate
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_stream_events
+        # max_tool_call_argument_bytes: 1048576
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:8000"

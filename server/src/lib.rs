@@ -94,7 +94,7 @@ fn register_anthropic_filters(registry: &mut praxis_filter::FilterRegistry) {
     );
 }
 
-/// Register OpenAI-specific filters.
+/// Register OpenAI Responses API request-path filters.
 fn register_openai_filters(registry: &mut praxis_filter::FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
@@ -114,11 +114,20 @@ fn register_openai_filters(registry: &mut praxis_filter::FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "openai_responses_rehydrate" => praxis_ai_apis::openai::RehydrateFilter::from_config
+    );
+    register_openai_response_filters(registry);
+}
+
+/// Register OpenAI Responses API response-path and persistence filters.
+fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
         http "openai_response_store" => praxis_ai_apis::openai::ResponseStoreFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_responses_rehydrate" => praxis_ai_apis::openai::RehydrateFilter::from_config
+        http "openai_stream_events" => praxis_ai_apis::openai::OpenaiStreamEventsFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
