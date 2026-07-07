@@ -465,6 +465,27 @@ async fn rejects_when_store_fetch_fails() {
     }
 }
 
+#[tokio::test]
+async fn rejects_when_conversation_store_fails() {
+    let store = MockStore::failing();
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_abc"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => assert_eq!(r.status, 500, "store failure should reject with 500"),
+        other => panic!("expected Reject for conversation store failure, got {other:?}"),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // MCP Tool Recovery
 // -----------------------------------------------------------------------------
