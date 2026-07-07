@@ -21,6 +21,7 @@ pub mod filters;
 pub mod net;
 pub mod proxy;
 pub mod recording;
+pub mod session_replay;
 
 pub use agentic::{
     A2aMockConfig, A2aMockServerGuard, A2aRecordedRequest, McpMockConfig, McpMockServerGuard, McpRecordedRequest,
@@ -35,3 +36,4 @@ pub use proxy::{
     start_tls_proxy_no_wait,
 };
 pub use recording::Recording;
+pub use session_replay::{ReplayProtocol, ReplayTurn, SessionReplay};

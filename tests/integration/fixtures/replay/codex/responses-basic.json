@@ -1,0 +1,33 @@
+{
+  "source": "Sanitized Codex session replay sample: single Responses turn",
+  "protocol": "openai_responses",
+  "turns": [
+    {
+      "name": "responses-basic",
+      "path": "/v1/responses",
+      "request": {
+        "model": "gpt-4.1",
+        "input": "Name one reason to replay stored Codex sessions through Praxis."
+      },
+      "response": {
+        "id": "resp_replay_codex_basic",
+        "created_at": 1000,
+        "model": "gpt-4.1",
+        "object": "response",
+        "status": "completed",
+        "input": "Name one reason to replay stored Codex sessions through Praxis.",
+        "output": [
+          {
+            "type": "message",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "Stored session replay catches regressions in realistic agent traffic."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
