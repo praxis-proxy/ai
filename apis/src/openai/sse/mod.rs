@@ -4,7 +4,7 @@
 //! SSE parsing for OpenAI streaming APIs.
 //!
 //! - [`frame::SseFrameParser`] — byte-level SSE chunk reassembly
-//! - [`responses::ResponsesSseParser`] — typed Responses API event parser
+//! - [`responses::ResponsesEvent`] — typed Responses API event enum
 
 #![cfg_attr(not(test), allow(dead_code, reason = "used by filter implementations"))]
 

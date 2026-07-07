@@ -19,6 +19,10 @@
 /// callers.
 ///
 /// [`RequestExtensions`]: praxis_filter::RequestExtensions
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "fields used incrementally as more filters are ported")
+)]
 pub(crate) struct ResponsesState {
     /// Truncation strategy for managing context window limits.
     ///
@@ -244,6 +248,7 @@ fn extract_bool_or(body: &serde_json::Value, field: &str, default: bool) -> bool
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,

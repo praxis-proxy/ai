@@ -19,6 +19,7 @@ mod openai_response_store_postgres;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_validate;
+mod openai_stream_events;
 mod prompt_enrichment;
 mod rehydrate;
 mod responses_proxy;

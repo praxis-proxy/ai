@@ -119,6 +119,10 @@ pub(crate) mod test_utils {
             @register registry,
             http "openai_responses_rehydrate" => crate::openai::RehydrateFilter::from_config
         );
+        praxis_filter::register_filters!(
+            @register registry,
+            http "openai_stream_events" => crate::openai::OpenaiStreamEventsFilter::from_config
+        );
         registry
     }
 }
