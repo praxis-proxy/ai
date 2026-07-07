@@ -321,7 +321,7 @@ fn validate_unique_server_names(servers: &[McpServerConfig]) -> Result<(), Filte
 }
 
 /// Validate that all cluster names are non-empty.
-fn validate_server_clusters(servers: &[McpServerConfig]) -> Result<(), FilterError> {
+pub(super) fn validate_server_clusters(servers: &[McpServerConfig]) -> Result<(), FilterError> {
     for server in servers {
         if server.cluster.is_empty() {
             return Err(format!("mcp: server '{}' cluster must not be empty", server.name).into());
@@ -331,7 +331,7 @@ fn validate_server_clusters(servers: &[McpServerConfig]) -> Result<(), FilterErr
 }
 
 /// Validate server backend paths against runtime rewrite constraints.
-fn validate_server_paths(servers: &[McpServerConfig]) -> Result<(), FilterError> {
+pub(super) fn validate_server_paths(servers: &[McpServerConfig]) -> Result<(), FilterError> {
     for server in servers {
         validate_path(&format!("server '{}'", server.name), &server.path)?;
     }
