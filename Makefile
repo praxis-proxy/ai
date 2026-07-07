@@ -83,6 +83,7 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo +nightly fmt $(AI_PKGS) -- --check
 	cargo xtask lint-separators
+	cargo xtask lint-filter-docs
 
 fmt:
 	cargo +nightly fmt $(AI_PKGS)
@@ -138,7 +139,7 @@ help:
 	@echo "  test-integration     integration tests"
 	@echo ""
 	@echo "Quality:"
-	@echo "  lint                 clippy + rustfmt + separator width check"
+	@echo "  lint                 clippy + rustfmt + separator width + filter docs check"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"

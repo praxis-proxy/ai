@@ -99,22 +99,3 @@ servers:
       - name: create_event
         description: Create a calendar event
 ```
-
-### Example 4
-
-```yaml
-filter: mcp
-path: /mcp
-max_body_bytes: 65536
-protocol_profile: stateless
-cache_ttl_ms: 300000
-cache_scope: public
-servers:
-  - name: weather
-    cluster: weather-mcp
-    path: /mcp
-    tool_prefix: weather_
-    tools:
-      - name: get_weather
-        description: Get current weather
-```
