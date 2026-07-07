@@ -53,8 +53,15 @@ impl SessionReplay {
     /// Panics if the file cannot be read or parsed, or if the replay has
     /// no turns.
     pub fn load(relative_path: &str) -> Self {
-        let base = format!("{}/../integration/fixtures/{relative_path}", env!("CARGO_MANIFEST_DIR"),);
-        let content = std::fs::read_to_string(&base).unwrap_or_else(|e| panic!("read fixture {base}: {e}"));
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("..");
+        path.push("integration");
+        path.push("fixtures");
+        for component in relative_path.split('/') {
+            path.push(component);
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
         let replay: Self =
             serde_json::from_str(&content).unwrap_or_else(|e| panic!("parse fixture {relative_path}: {e}"));
         assert!(

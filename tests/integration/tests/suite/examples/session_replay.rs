@@ -40,7 +40,7 @@ fn replay_claude_messages_session_through_protocol_example() {
 
     assert_eq!(status, 200, "Claude replay request should return 200");
     assert_eq!(
-        response, turn.response,
+        &response, &turn.response,
         "client response should match the replayed Claude fixture response"
     );
 }
@@ -72,7 +72,7 @@ async fn replay_codex_responses_session_through_full_flow_example() {
 
     assert_eq!(status, 200, "Codex replay request should return 200");
     assert_eq!(
-        response, turn.response,
+        &response, &turn.response,
         "client response should match the replayed Codex fixture response"
     );
 
