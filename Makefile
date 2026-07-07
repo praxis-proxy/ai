@@ -77,16 +77,14 @@ test-integration:
 # Quality
 # -------------------------------------------------------------------
 
-AI_PKGS := -p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis -p xtask
-
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
-	cargo +nightly fmt $(AI_PKGS) -- --check
+	cargo +nightly fmt --all -- --check
 	cargo xtask lint-separators
 	cargo xtask lint-filter-docs
 
 fmt:
-	cargo +nightly fmt $(AI_PKGS)
+	cargo +nightly fmt --all
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items

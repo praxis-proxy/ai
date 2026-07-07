@@ -199,7 +199,8 @@ async fn stream_events_incremental_accumulation_before_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_events_processes_validate_reformatted_error() {
-    let error_body = r#"{"error":{"message":"model not found","type":"invalid_request_error","code":"model_not_found"}}"#;
+    let error_body =
+        r#"{"error":{"message":"model not found","type":"invalid_request_error","code":"model_not_found"}}"#;
     let backend_guard = Backend::status(404, error_body)
         .header("content-type", "application/json")
         .start_with_shutdown();

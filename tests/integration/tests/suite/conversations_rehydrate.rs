@@ -254,7 +254,11 @@ impl Drop for TempDb {
     }
 }
 
-fn start_test_env() -> (praxis_test_utils::ProxyGuard, praxis_test_utils::net::backend::BackendGuard, TempDb) {
+fn start_test_env() -> (
+    praxis_test_utils::ProxyGuard,
+    praxis_test_utils::net::backend::BackendGuard,
+    TempDb,
+) {
     let echo = start_echo_backend();
     let db = TempDb::new();
     let proxy_port = free_port();
