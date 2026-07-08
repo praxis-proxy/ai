@@ -43,7 +43,8 @@ before it is used.
       "name": "stable-fixture-local-turn-name",
       "path": "/v1/messages",
       "request": {},
-      "response": {}
+      "response": {},
+      "source_records": []
     }
   ]
 }
@@ -62,6 +63,12 @@ Turn fields:
   `/v1/responses`.
 - `request`: JSON request body sent by the agent client.
 - `response`: JSON response body returned by the mocked upstream service.
+- `source_records`: optional original session records used to derive the turn.
+  Importers should preserve records here when the replayable `request` and
+  `response` fields are projections of a richer session log.
+  For OpenAI Responses/Codex sessions, `request` and `response` should be
+  direct copies of the original `response_item.payload.request` and
+  `response_item.payload.response` values, not normalized or filtered shapes.
 
 ## How to add a replay example
 

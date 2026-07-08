@@ -49,6 +49,18 @@ pub struct ReplayTurn {
     pub request: Value,
     /// JSON response body returned by the upstream model service.
     pub response: Value,
+    /// Original session records used to derive this replay turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_records: Option<Vec<Value>>,
+}
+
+/// Pending Claude Code turn state while scanning JSONL records.
+#[derive(Debug)]
+struct PendingClaudeTurn {
+    /// User message selected for the Anthropic Messages request.
+    request_message: Value,
+    /// Original Claude Code records that contributed to this turn.
+    source_records: Vec<Value>,
 }
 
 /// Raw session log content plus optional source metadata.
@@ -246,8 +258,8 @@ impl SessionReplayImporter for CodexSessionImporter {
 
         for (line_index, line) in input.content().lines().enumerate() {
             let line_number = line_index + 1;
-            let mut record = parse_jsonl_line(line, line_number)?;
-            if let Some(turn) = codex_turn_from_record(&mut record, turns.len() + 1) {
+            let record = parse_jsonl_line(line, line_number)?;
+            if let Some(turn) = codex_turn_from_record(&record, turns.len() + 1) {
                 turns.push(turn);
             }
         }
@@ -282,23 +294,28 @@ impl SessionReplayImporter for ClaudeCodeSessionImporter {
 
     fn import(&self, input: &SessionInput<'_>, options: ImportOptions) -> Result<SessionReplay, ImportError> {
         let mut turns = Vec::new();
-        let mut last_user_message = None;
+        let mut pending_turn = None;
 
         for (line_index, line) in input.content().lines().enumerate() {
             let line_number = line_index + 1;
-            let mut record = parse_jsonl_line(line, line_number)?;
-            if let Some(user_message) = claude_user_message_from_record(&mut record) {
-                last_user_message = Some(user_message);
+            let record = parse_jsonl_line(line, line_number)?;
+            if let Some(user_message) = claude_user_message_from_record(&record) {
+                update_pending_claude_turn(&mut pending_turn, user_message, record);
                 continue;
             }
 
             if !is_claude_assistant_record(&record) {
                 continue;
             }
-            let Some(user_message) = last_user_message.take() else {
+            let Some(pending) = pending_turn.as_mut() else {
                 continue;
             };
-            if let Some(turn) = claude_turn_from_record(&mut record, user_message, turns.len() + 1, options) {
+            pending.source_records.push(record.clone());
+            if !is_importable_claude_assistant_record(&record) {
+                continue;
+            }
+            let pending = pending_turn.take().expect("pending turn exists");
+            if let Some(turn) = claude_turn_from_record(&record, pending, turns.len() + 1, options) {
                 turns.push(turn);
             }
         }
@@ -395,32 +412,49 @@ fn is_claude_code_record(value: &Value) -> bool {
 }
 
 /// Extract an importable Codex turn from a JSONL record.
-fn codex_turn_from_record(record: &mut Value, turn_number: usize) -> Option<ReplayTurn> {
-    let record_object = record.as_object_mut()?;
+fn codex_turn_from_record(record: &Value, turn_number: usize) -> Option<ReplayTurn> {
+    let record_object = record.as_object()?;
     if record_object.get("type").and_then(Value::as_str) != Some("response_item") {
         return None;
     }
-    let mut payload = record_object.remove("payload")?;
-    let payload_object = payload.as_object_mut()?;
-    let request = payload_object.remove("request")?;
-    let response = payload_object.remove("response")?;
+    let payload_object = record_object.get("payload")?.as_object()?;
+    let request = payload_object.get("request")?.clone();
+    let response = payload_object.get("response")?.clone();
 
     Some(ReplayTurn {
         name: replay_turn_name("codex-turn", turn_number),
         path: "/v1/responses".to_owned(),
         request,
         response,
+        source_records: Some(vec![record.clone()]),
     })
 }
 
+/// Add a Claude Code user record to the pending turn without dropping earlier
+/// records from the same turn.
+fn update_pending_claude_turn(pending: &mut Option<PendingClaudeTurn>, user_message: Value, record: Value) {
+    let Some(existing) = pending else {
+        *pending = Some(PendingClaudeTurn {
+            request_message: user_message,
+            source_records: vec![record],
+        });
+        return;
+    };
+
+    if should_replace_pending_claude_user(Some(&existing.request_message), &user_message) {
+        existing.request_message = user_message;
+    }
+    existing.source_records.push(record);
+}
+
 /// Extract a Claude Code user message from a JSONL record.
-fn claude_user_message_from_record(record: &mut Value) -> Option<Value> {
-    let record_object = record.as_object_mut()?;
+fn claude_user_message_from_record(record: &Value) -> Option<Value> {
+    let record_object = record.as_object()?;
     if record_object.get("type").and_then(Value::as_str) != Some("user") {
         return None;
     }
-    let message = record_object.remove("message")?;
-    is_claude_user_message(&message).then_some(message)
+    let message = record_object.get("message")?;
+    is_claude_user_message(message).then_some(message.clone())
 }
 
 /// Return true when a record is a Claude Code assistant record.
@@ -430,31 +464,66 @@ fn is_claude_assistant_record(record: &Value) -> bool {
     })
 }
 
+/// Return true when a Claude Code assistant record should become a replay
+/// response rather than an intermediate thinking-only update.
+fn is_importable_claude_assistant_record(record: &Value) -> bool {
+    record.get("message").is_some_and(|message| {
+        is_anthropic_assistant_message(message) && has_replayable_claude_assistant_content(message)
+    })
+}
+
 /// Extract an importable Claude Code turn from a JSONL assistant record.
 fn claude_turn_from_record(
-    record: &mut Value,
-    user_message: Value,
+    record: &Value,
+    pending: PendingClaudeTurn,
     turn_number: usize,
     options: ImportOptions,
 ) -> Option<ReplayTurn> {
-    let record_object = record.as_object_mut()?;
-    let message = record_object.remove("message")?;
-    if !is_anthropic_assistant_message(&message) {
+    let record_object = record.as_object()?;
+    let message = record_object.get("message")?;
+    if !is_anthropic_assistant_message(message) {
         return None;
     }
-    let request = claude_request_from_response(&message, user_message, options)?;
+    let request = claude_request_from_response(message, pending.request_message, options)?;
 
     Some(ReplayTurn {
         name: replay_turn_name("claude-code-turn", turn_number),
         path: "/v1/messages".to_owned(),
         request,
-        response: message,
+        response: message.clone(),
+        source_records: Some(pending.source_records),
     })
 }
 
 /// Return true when a Claude Code message is user-authored.
 fn is_claude_user_message(message: &Value) -> bool {
     message.get("role").and_then(Value::as_str) == Some("user")
+}
+
+/// Return true when a newly observed Claude user message should become the
+/// request paired with the next assistant response.
+fn should_replace_pending_claude_user(pending: Option<&Value>, candidate: &Value) -> bool {
+    pending.is_none()
+        || claude_message_contains_content_type(candidate, "image")
+        || !pending.is_some_and(|message| claude_message_contains_content_type(message, "image"))
+}
+
+/// Return true when a Claude message content array contains a block type.
+fn claude_message_contains_content_type(message: &Value, block_type: &str) -> bool {
+    message.get("content").and_then(Value::as_array).is_some_and(|content| {
+        content
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some(block_type))
+    })
+}
+
+/// Return true when assistant content includes client-visible replay content.
+fn has_replayable_claude_assistant_content(message: &Value) -> bool {
+    message.get("content").and_then(Value::as_array).is_some_and(|content| {
+        content
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) != Some("thinking"))
+    })
 }
 
 /// Return true when a Claude Code assistant message is an Anthropic response.
@@ -585,8 +654,16 @@ mod tests {
     const CODEX_JSONL: &str = r#"{"timestamp":"2026-07-07T00:00:00Z","type":"session_meta","payload":{"id":"session_import_codex"}}
 {"timestamp":"2026-07-07T00:00:01Z","type":"response_item","payload":{"request":{"model":"gpt-4.1","input":"hello"},"response":{"id":"resp_import_codex","object":"response","status":"completed","model":"gpt-4.1","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}}}"#;
 
+    const CODEX_COMPLEX_JSONL: &str = r#"{"timestamp":"2026-07-07T00:00:00Z","type":"session_meta","payload":{"id":"session_import_codex_complex"}}
+{"timestamp":"2026-07-07T00:00:01Z","type":"response_item","payload":{"request":{"model":"gpt-4.1","store":false,"metadata":{"suite":"passthrough"},"input":[{"role":"user","content":[{"type":"input_text","text":"use the tool"}]},{"type":"function_call_output","call_id":"call_1","output":"{\"ok\":true}"}],"tools":[{"type":"function","name":"lookup","description":"Lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}],"previous_response_id":null},"response":{"id":"resp_import_codex_complex","object":"response","created_at":1000,"status":"completed","model":"gpt-4.1","parallel_tool_calls":true,"incomplete_details":null,"usage":{"input_tokens":10,"output_tokens":12,"output_tokens_details":{"reasoning_tokens":3}},"output":[{"type":"reasoning","id":"rs_1","summary":[]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"x\"}","status":"completed"},{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}]}}}"#;
+
     const CLAUDE_CODE_JSONL: &str = r#"{"uuid":"turn_user","sessionId":"session_import_claude","timestamp":"2026-07-07T00:00:00Z","type":"user","message":{"role":"user","content":"hello"}}
 {"uuid":"turn_assistant","sessionId":"session_import_claude","timestamp":"2026-07-07T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#;
+
+    const CLAUDE_CODE_IMAGE_JSONL: &str = r#"{"uuid":"turn_image_user","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"What's in this image?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]}}
+{"uuid":"turn_image_placeholder","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"[Image: source: /tmp/screenshot.png]"}]}}
+{"uuid":"turn_image_thinking","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"thinking","thinking":"Looking at the image.","signature":"sig"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}
+{"uuid":"turn_image_assistant","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:02Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"a terminal screenshot"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#;
 
     #[test]
     fn load_claude_messages_replay() {
@@ -653,6 +730,25 @@ mod tests {
     }
 
     #[test]
+    fn session_replay_import_preserves_codex_responses_payload() {
+        let input = SessionInput::new(CODEX_COMPLEX_JSONL);
+        let source_record: Value = serde_json::from_str(CODEX_COMPLEX_JSONL.lines().nth(1).expect("response item"))
+            .expect("response item should be valid JSON");
+
+        let replay = import_session_replay(&input, ImportOptions::default()).expect("import should succeed");
+        let turn = replay.single_turn();
+
+        assert_eq!(replay.protocol, ReplayProtocol::OpenaiResponses);
+        assert_eq!(turn.path(), "/v1/responses");
+        assert_eq!(turn.request, source_record["payload"]["request"]);
+        assert_eq!(turn.response, source_record["payload"]["response"]);
+        assert_eq!(
+            turn.source_records.as_ref().expect("source record should be preserved")[0],
+            source_record
+        );
+    }
+
+    #[test]
     fn session_replay_import_converts_claude_code_turns() {
         let input = SessionInput::new(CLAUDE_CODE_JSONL);
 
@@ -664,5 +760,36 @@ mod tests {
         assert_eq!(turn.request["model"], "claude-sonnet-4-5");
         assert_eq!(turn.request["messages"][0]["role"], "user");
         assert_eq!(turn.response["id"], "msg_import_claude");
+    }
+
+    #[test]
+    fn session_replay_import_preserves_claude_code_image_turn() {
+        let input = SessionInput::new(CLAUDE_CODE_IMAGE_JSONL);
+
+        let replay = import_session_replay(&input, ImportOptions::default()).expect("import should succeed");
+        let turn = replay.single_turn();
+
+        assert_eq!(turn.request["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(turn.request["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(
+            turn.request["messages"][0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(turn.response["id"], "msg_import_claude_image");
+        assert_eq!(turn.response["content"][0]["type"], "text");
+        assert_eq!(turn.response["content"][0]["text"], "a terminal screenshot");
+
+        let source_records = turn
+            .source_records
+            .as_ref()
+            .expect("source records should be preserved");
+        assert_eq!(source_records.len(), 4);
+        assert_eq!(source_records[0]["message"]["content"][1]["type"], "image");
+        assert_eq!(
+            source_records[1]["message"]["content"][0]["text"],
+            "[Image: source: /tmp/screenshot.png]"
+        );
+        assert_eq!(source_records[2]["message"]["content"][0]["type"], "thinking");
+        assert_eq!(source_records[3]["message"]["content"][0]["type"], "text");
     }
 }

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     Backend, SessionReplay, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body,
-    parse_status, patch_yaml, start_proxy,
+    parse_status, patch_yaml, start_echo_backend, start_proxy,
 };
 
 use super::load_example_config;
@@ -43,6 +43,38 @@ fn replay_claude_messages_session_through_protocol_example() {
         &response, &turn.response,
         "client response should match the replayed Claude fixture response"
     );
+}
+
+#[test]
+fn replay_claude_messages_image_session_through_protocol_example() {
+    let replay = SessionReplay::load("replay/claude/messages-image.json");
+    let turn = replay.single_turn();
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-protocol.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let status = parse_status(&raw);
+    let body = parse_body(&raw);
+    let forwarded: serde_json::Value = serde_json::from_str(&body).expect("echoed request body should be JSON");
+
+    assert_eq!(status, 200, "Claude image replay request should return 200");
+    assert_eq!(
+        forwarded, turn.request,
+        "backend should receive the image-bearing Claude request unchanged"
+    );
+    assert_eq!(
+        forwarded["messages"][0]["content"][1]["source"]["media_type"], "image/png",
+        "forwarded request should preserve the image content block"
+    );
+
+    drop(proxy);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
