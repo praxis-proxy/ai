@@ -422,6 +422,7 @@ async fn filter_results_for_function_tools() {
     let results = &ctx.filter_results["tool_parse"];
 
     assert!(results.matches("has_tools", "true"), "has_tools result");
+    assert!(results.matches("function_count", "1"), "function_count result");
     assert!(results.matches("tool_choice", "required"), "tool_choice result");
 }
 

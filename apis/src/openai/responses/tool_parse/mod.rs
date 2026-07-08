@@ -209,7 +209,7 @@ fn write_tool_presence_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &Parsed
 /// clears results before `tool_parse`'s branches are checked. Metadata
 /// persists across phases, so we rebuild `filter_results` from it.
 fn restore_filter_results(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterError> {
-    let any = restore_presence_flags(ctx)? | restore_tool_choice(ctx)?;
+    let any = restore_presence_flags(ctx)? | restore_function_count(ctx)? | restore_tool_choice(ctx)?;
 
     if any {
         trace!("restored filter_results from metadata");
@@ -242,6 +242,17 @@ fn restore_presence_flags(ctx: &mut HttpFilterContext<'_>) -> Result<bool, Filte
     Ok(any)
 }
 
+/// Restore `function_count` from metadata.
+fn restore_function_count(ctx: &mut HttpFilterContext<'_>) -> Result<bool, FilterError> {
+    if let Some(fc) = ctx.get_metadata("tool_parse.function_count") {
+        let fc = fc.to_owned();
+        let results = ctx.filter_results.entry("tool_parse").or_default();
+        results.set("function_count", fc)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Restore `tool_choice` and `tool_choice_type` from metadata.
 fn restore_tool_choice(ctx: &mut HttpFilterContext<'_>) -> Result<bool, FilterError> {
     let mut any = false;
@@ -269,6 +280,10 @@ fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools)
 
     if parsed.has_tools() {
         results.set("has_tools", "true")?;
+    }
+
+    if parsed.function_count > 0 {
+        results.set("function_count", parsed.function_count.to_string())?;
     }
 
     promote_tool_presence_results(results, parsed)?;
