@@ -310,6 +310,10 @@ fn classify_tools_array(tools_array: &[serde_json::Value], tool_choice: Option<T
 }
 
 /// Classify and accumulate a single tool entry.
+///
+/// Extracts full tool details (names, configs, MCP entries) even though
+/// `tool_parse` only promotes counts and presence flags today.
+/// `tool_dispatch` (#26) will need these fields for routing and invocation.
 fn accumulate_tool(
     acc: &mut ParsedTools,
     entry: &serde_json::Value,
