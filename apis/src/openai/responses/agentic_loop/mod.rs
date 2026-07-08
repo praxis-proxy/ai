@@ -48,10 +48,7 @@
 //!       chains:
 //!         - name: tool-execution
 //!           filters:
-//!             - filter: headers
-//!               request_add:
-//!                 - name: X-Agentic-Loop
-//!                   value: "true"
+//!             - filter: web_search
 //! ```
 //!
 //! # State dependency

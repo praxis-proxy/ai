@@ -85,6 +85,24 @@ async fn no_tool_calls_sets_done() {
     assert_action(&ctx, "done");
 }
 
+#[tokio::test]
+async fn state_survives_done_path() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>();
+    assert!(
+        state.is_some(),
+        "ResponsesState must remain in extensions after done so downstream filters can read it"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Tool Calls Present → Loop
 // -----------------------------------------------------------------------------
@@ -131,8 +149,67 @@ async fn any_tool_type_sets_loop() {
 }
 
 // -----------------------------------------------------------------------------
+// Config Defaults
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn default_config_has_max_infer_iters_ten() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = make_state_with_tool_calls(vec![json!({
+        "type": "function",
+        "call_id": "call_1",
+        "name": "test",
+    })]);
+    state.iteration = 9;
+    ctx.extensions.insert(state);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert_action(&ctx, "loop");
+
+    let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
+    state.tool_calls = vec![json!({"type": "function", "call_id": "call_2", "name": "test"})];
+    ctx.extensions.insert(state);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert_action(&ctx, "done");
+}
+
+// -----------------------------------------------------------------------------
 // Iteration Limit
 // -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn max_infer_iters_one_allows_exactly_one_loop() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 1").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![json!({
+        "type": "function",
+        "call_id": "call_1",
+        "name": "test",
+    })]);
+    ctx.extensions.insert(state);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert_action(&ctx, "loop");
+
+    let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
+    assert_eq!(state.iteration, 1, "should have incremented to 1");
+
+    state.tool_calls = vec![json!({"type": "function", "call_id": "call_2", "name": "test"})];
+    ctx.extensions.insert(state);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert_action(&ctx, "done");
+
+    let status = ctx.get_metadata("responses.status");
+    assert_eq!(status, Some("incomplete"), "should mark as incomplete at limit");
+}
 
 #[tokio::test]
 async fn iteration_limit_exits_as_incomplete() {
