@@ -303,19 +303,8 @@ impl SessionReplayImporter for ClaudeCodeSessionImporter {
                 update_pending_claude_turn(&mut pending_turn, user_message, record);
                 continue;
             }
-
-            if !is_claude_assistant_record(&record) {
-                continue;
-            }
-            let Some(pending) = pending_turn.as_mut() else {
-                continue;
-            };
-            pending.source_records.push(record.clone());
-            if !is_importable_claude_assistant_record(&record) {
-                continue;
-            }
-            let pending = pending_turn.take().expect("pending turn exists");
-            if let Some(turn) = claude_turn_from_record(&record, pending, turns.len() + 1, options) {
+            if let Some(turn) = claude_turn_from_assistant_record(&record, &mut pending_turn, turns.len() + 1, options)
+            {
                 turns.push(turn);
             }
         }
@@ -445,6 +434,26 @@ fn update_pending_claude_turn(pending: &mut Option<PendingClaudeTurn>, user_mess
         existing.request_message = user_message;
     }
     existing.source_records.push(record);
+}
+
+/// Accumulate a Claude assistant record and return a replay turn once the
+/// assistant message contains client-visible content.
+fn claude_turn_from_assistant_record(
+    record: &Value,
+    pending_turn: &mut Option<PendingClaudeTurn>,
+    turn_number: usize,
+    options: ImportOptions,
+) -> Option<ReplayTurn> {
+    if !is_claude_assistant_record(record) {
+        return None;
+    }
+    let pending = pending_turn.as_mut()?;
+    pending.source_records.push(record.clone());
+    if !is_importable_claude_assistant_record(record) {
+        return None;
+    }
+    let pending = pending_turn.take().expect("pending turn exists");
+    claude_turn_from_record(record, pending, turn_number, options)
 }
 
 /// Extract a Claude Code user message from a JSONL record.
