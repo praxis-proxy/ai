@@ -1,0 +1,38 @@
+{
+  "source": "Sanitized Claude session replay sample: single Messages turn",
+  "protocol": "anthropic_messages",
+  "turns": [
+    {
+      "name": "messages-basic",
+      "path": "/v1/messages",
+      "request": {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Summarize the value of replay tests in one sentence."
+          }
+        ]
+      },
+      "response": {
+        "id": "msg_replay_claude_basic",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [
+          {
+            "type": "text",
+            "text": "Replay tests turn real sessions into deterministic coverage for gateway behavior."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 18,
+          "output_tokens": 12
+        }
+      }
+    }
+  ]
+}

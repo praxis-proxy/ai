@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_get, http_send, json_post, parse_body, parse_status, patch_yaml,
-    start_proxy,
+    Backend, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body, parse_status,
+    patch_yaml, start_proxy,
 };
 use sqlx::Row as _;
 
@@ -33,11 +33,11 @@ async fn response_store_persists_response_to_sqlite() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let (db_url, db_path) = temp_sqlite_url("persist");
+    let db = TempSqlite::new("persist");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
         &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
     );
@@ -56,7 +56,7 @@ async fn response_store_persists_response_to_sqlite() {
         "response body should match the backend's JSON"
     );
 
-    let pool = sqlx::SqlitePool::connect(&db_url)
+    let pool = sqlx::SqlitePool::connect(db.url())
         .await
         .expect("should connect to test database");
     let sql = format!("SELECT id, tenant_id, created_at, model, input, messages FROM {RESPONSES_TABLE} WHERE id = ?");
@@ -102,7 +102,6 @@ async fn response_store_persists_response_to_sqlite() {
     assert_eq!(items[1]["type"], "message", "output item should be preserved");
 
     drop(proxy);
-    cleanup_sqlite_files(&db_path);
 }
 
 #[test]
@@ -144,11 +143,11 @@ async fn response_store_delete_returns_200_after_post() {
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let (db_url, db_path) = temp_sqlite_url("delete_200");
+    let db = TempSqlite::new("delete_200");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
         &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
     );
@@ -177,7 +176,6 @@ async fn response_store_delete_returns_200_after_post() {
     assert_eq!(json["deleted"], true, "deleted flag should be true");
 
     drop(proxy);
-    cleanup_sqlite_files(&db_path);
 }
 
 #[test]
@@ -290,26 +288,4 @@ fn get_missing_input_items_returns_404() {
             .contains("resp_nonexistent"),
         "error message should include the missing ID"
     );
-}
-
-// -----------------------------------------------------------------------------
-// Test Utilities
-// -----------------------------------------------------------------------------
-
-/// Generate a unique file-backed SQLite URL for test isolation.
-fn temp_sqlite_url(test_name: &str) -> (String, std::path::PathBuf) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after epoch")
-        .as_nanos();
-    let db_path = std::env::temp_dir().join(format!("praxis_integ_{test_name}_{}_{nanos}.db", std::process::id()));
-    (format!("sqlite://{}?mode=rwc", db_path.display()), db_path)
-}
-
-/// Remove a SQLite database file and its WAL/SHM companions.
-fn cleanup_sqlite_files(db_path: &std::path::Path) {
-    drop(std::fs::remove_file(db_path));
-    drop(std::fs::remove_file(format!("{}-shm", db_path.display())));
-    drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
 }

@@ -6,12 +6,14 @@
 use bytes::Bytes;
 
 use super::{
-    config::{McpBrokerConfig, build_config},
+    config::{McpBrokerConfig, McpServerConfig, build_config, validate_server_clusters, validate_server_paths},
     *,
 };
 use crate::agentic::mcp::{
     config::DEFAULT_MAX_BODY_BYTES,
-    protocol::{PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_STATELESS_2026_07_28, ProtocolProfile},
+    protocol::{
+        PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_STATELESS_2026_07_28, ProtocolProfile, SUPPORTED_VERSIONS_CURRENT,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -504,6 +506,140 @@ servers:
     assert!(
         result.err().unwrap().to_string().contains("empty name"),
         "error should mention empty name"
+    );
+}
+
+#[test]
+fn build_config_minimal() {
+    let yaml = "{}";
+    let cfg: McpBrokerConfig = serde_yaml::from_str(yaml).unwrap();
+    let (validated, catalog) = build_config(cfg).unwrap();
+    assert!(catalog.is_empty(), "empty config should produce no catalog tools");
+    assert_eq!(validated.path, "/mcp", "default public path");
+    assert_eq!(
+        validated.default_version, PROTOCOL_VERSION_CURRENT,
+        "minimal config should default to current protocol version"
+    );
+    assert_eq!(
+        validated.supported_versions,
+        SUPPORTED_VERSIONS_CURRENT
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>(),
+        "minimal config should default to current profile supported versions"
+    );
+}
+
+#[test]
+fn validate_server_paths_rejects_no_leading_slash() {
+    let servers = vec![McpServerConfig {
+        name: "bad".to_owned(),
+        cluster: "c".to_owned(),
+        path: "no-slash".to_owned(),
+        tool_prefix: None,
+        tools: vec![],
+    }];
+    let result = validate_server_paths(&servers);
+    assert!(result.is_err(), "path without leading slash should fail");
+    assert!(
+        result.err().unwrap().to_string().contains("must start with /"),
+        "error should mention leading slash"
+    );
+}
+
+#[test]
+fn validate_server_paths_rejects_second_server_bad_path() {
+    let servers = vec![
+        McpServerConfig {
+            name: "ok".to_owned(),
+            cluster: "c1".to_owned(),
+            path: "/valid".to_owned(),
+            tool_prefix: None,
+            tools: vec![],
+        },
+        McpServerConfig {
+            name: "bad".to_owned(),
+            cluster: "c2".to_owned(),
+            path: "missing-slash".to_owned(),
+            tool_prefix: None,
+            tools: vec![],
+        },
+    ];
+    let result = validate_server_paths(&servers);
+    assert!(
+        result.is_err(),
+        "should reject config when only the second server has an invalid path"
+    );
+    assert!(
+        result.err().unwrap().to_string().contains("must start with /"),
+        "error should mention leading slash"
+    );
+}
+
+#[test]
+fn valid_cluster_name_passes() {
+    let servers = vec![McpServerConfig {
+        name: "s".to_owned(),
+        cluster: "my-cluster".to_owned(),
+        path: "/mcp".to_owned(),
+        tool_prefix: None,
+        tools: vec![],
+    }];
+    assert!(
+        validate_server_clusters(&servers).is_ok(),
+        "valid non-empty cluster name should pass"
+    );
+}
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "comprehensive catalog entry assertions")]
+fn build_config_with_tools_and_prefix() {
+    let yaml = r#"
+servers:
+  - name: weather
+    cluster: weather-mcp
+    path: /backend/mcp
+    tool_prefix: "wx_"
+    tools:
+      - name: get_forecast
+        description: Get the forecast
+        inputSchema:
+          type: object
+          properties:
+            city:
+              type: string
+"#;
+    let cfg: McpBrokerConfig = serde_yaml::from_str(yaml).unwrap();
+    let (_, catalog) = build_config(cfg).unwrap();
+    assert_eq!(catalog.len(), 1, "should produce one catalog tool");
+    assert_eq!(
+        catalog[0].exposed_name, "wx_get_forecast",
+        "exposed name should be prefixed"
+    );
+    assert_eq!(
+        catalog[0].original_name, "get_forecast",
+        "original name should be preserved"
+    );
+    assert_eq!(catalog[0].server_name, "weather", "server_name should match config");
+    assert!(
+        catalog[0].input_schema.get("properties").is_some(),
+        "input_schema should preserve configured schema with properties"
+    );
+    assert_eq!(
+        catalog[0].input_schema["type"], "object",
+        "input_schema type should be object"
+    );
+    assert_eq!(
+        catalog[0].input_schema["properties"]["city"]["type"], "string",
+        "input_schema should preserve property types"
+    );
+    assert_eq!(
+        catalog[0].cluster, "weather-mcp",
+        "cluster should be preserved in catalog entry"
+    );
+    assert_eq!(
+        catalog[0].backend_path, "/backend/mcp",
+        "backend_path should be preserved in catalog entry"
     );
 }
 
