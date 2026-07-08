@@ -86,8 +86,8 @@ async fn replay_codex_responses_session_through_full_flow_example() {
 
     assert_eq!(get_status, 200, "replayed response should be retrievable");
     assert_eq!(
-        stored["id"], response_id,
-        "response store should persist the replayed Codex response"
+        stored, turn.response,
+        "stored response should match the replayed Codex fixture response"
     );
 
     drop(proxy);
