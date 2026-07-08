@@ -4,7 +4,11 @@
 //! Echo backends that reflect request data back in
 //! the response.
 
-use std::{net::TcpStream, time::Duration};
+use std::{
+    net::TcpStream,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use super::specialized::{
     BackendGuard, parse_content_length, read_until_headers_complete, spawn_tcp_server_with_shutdown,
@@ -30,6 +34,63 @@ pub fn start_echo_backend() -> BackendGuard {
         let body = read_request_body(&mut stream);
         let _sent = write_http_response(&mut stream, &body);
     })
+}
+
+/// Backend guard that captures the last non-empty request body.
+pub struct CapturingBackendGuard {
+    /// Inner backend guard that shuts down the listener on drop.
+    guard: BackendGuard,
+    /// Captured request body.
+    body: Arc<Mutex<Option<String>>>,
+}
+
+impl CapturingBackendGuard {
+    /// The allocated port number.
+    pub fn port(&self) -> u16 {
+        self.guard.port()
+    }
+
+    /// Return the captured request body.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no request body has been captured.
+    pub fn body(&self) -> String {
+        self.body
+            .lock()
+            .expect("captured body mutex should not be poisoned")
+            .clone()
+            .expect("backend should capture one request body")
+    }
+}
+
+/// Start a backend that captures request bodies and returns a fixed
+/// JSON response body.
+///
+/// Returns a guard that shuts down the listener thread when dropped.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind or accept connections.
+pub fn start_capturing_backend(response_body: &str) -> CapturingBackendGuard {
+    let body = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&body);
+    let response_body = response_body.to_owned();
+    let guard = spawn_tcp_server_with_shutdown(move |mut stream| {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let request_body = read_request_body(&mut stream);
+        if !request_body.is_empty() {
+            *captured.lock().expect("captured body mutex should not be poisoned") = Some(request_body);
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        let _sent = std::io::Write::write_all(&mut stream, response.as_bytes());
+    });
+
+    CapturingBackendGuard { guard, body }
 }
 
 /// Start a backend that echoes the request URI (path and query)

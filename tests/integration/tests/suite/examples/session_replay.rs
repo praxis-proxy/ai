@@ -3,17 +3,11 @@
 
 //! Functional tests for stored-session replay fixtures.
 
-use std::{
-    collections::HashMap,
-    io::{Read as _, Write as _},
-    net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::collections::HashMap;
 
 use praxis_test_utils::{
     Backend, SessionReplay, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body,
-    parse_status, patch_yaml, start_echo_backend, start_proxy,
+    parse_status, patch_yaml, start_capturing_backend, start_echo_backend, start_proxy,
 };
 use serde_json::json;
 
@@ -102,13 +96,13 @@ fn replay_claude_messages_image_session_through_chat_completions_translation_exa
         }],
         "usage": {"prompt_tokens": 3, "completion_tokens": 202, "total_tokens": 205}
     });
-    let backend = start_capturing_backend(chat_response.to_string());
+    let backend = start_capturing_backend(&chat_response.to_string());
     let proxy_port = free_port();
 
     let config = load_example_config(
         "anthropic/messages-to-openai.yaml",
         proxy_port,
-        HashMap::from([("127.0.0.1:8000", backend.port)]),
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
     );
     let proxy = start_proxy(&config);
 
@@ -190,82 +184,4 @@ async fn replay_codex_responses_session_through_full_flow_example() {
     );
 
     drop(proxy);
-}
-
-struct CapturingBackend {
-    port: u16,
-    body: Arc<Mutex<Option<String>>>,
-}
-
-impl CapturingBackend {
-    fn body(&self) -> String {
-        self.body
-            .lock()
-            .expect("captured body mutex should not be poisoned")
-            .clone()
-            .expect("backend should capture one request body")
-    }
-}
-
-fn start_capturing_backend(response_body: String) -> CapturingBackend {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capturing backend");
-    let port = listener.local_addr().expect("capturing backend address").port();
-    let body = Arc::new(Mutex::new(None));
-    let captured = Arc::clone(&body);
-
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set read timeout");
-            let request_body = read_request_body(&mut stream);
-            if !request_body.is_empty() {
-                *captured.lock().expect("captured body mutex should not be poisoned") = Some(request_body);
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            let _sent = stream.write_all(response.as_bytes());
-        }
-    });
-
-    CapturingBackend { port, body }
-}
-
-fn read_request_body(stream: &mut TcpStream) -> String {
-    let mut data = Vec::new();
-    let mut buf = [0_u8; 4096];
-
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => data.extend_from_slice(&buf[..n]),
-        }
-        if request_body_complete(&data) {
-            break;
-        }
-    }
-
-    String::from_utf8_lossy(&data)
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .to_owned()
-}
-
-fn request_body_complete(data: &[u8]) -> bool {
-    let raw = String::from_utf8_lossy(data);
-    let Some(header_section) = raw.split("\r\n\r\n").next() else {
-        return false;
-    };
-    let content_length = header_section
-        .lines()
-        .find(|line| line.to_lowercase().starts_with("content-length:"))
-        .and_then(|line| line.split_once(':').map(|(_, value)| value))
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-
-    data.len() >= header_section.len() + 4 + content_length
 }

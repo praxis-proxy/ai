@@ -259,7 +259,7 @@ impl SessionReplayImporter for CodexSessionImporter {
         for (line_index, line) in input.content().lines().enumerate() {
             let line_number = line_index + 1;
             let record = parse_jsonl_line(line, line_number)?;
-            if let Some(turn) = codex_turn_from_record(&record, turns.len() + 1) {
+            if let Some(turn) = codex_turn_from_record(record, turns.len() + 1) {
                 turns.push(turn);
             }
         }
@@ -401,7 +401,7 @@ fn is_claude_code_record(value: &Value) -> bool {
 }
 
 /// Extract an importable Codex turn from a JSONL record.
-fn codex_turn_from_record(record: &Value, turn_number: usize) -> Option<ReplayTurn> {
+fn codex_turn_from_record(record: Value, turn_number: usize) -> Option<ReplayTurn> {
     let record_object = record.as_object()?;
     if record_object.get("type").and_then(Value::as_str) != Some("response_item") {
         return None;
@@ -415,7 +415,7 @@ fn codex_turn_from_record(record: &Value, turn_number: usize) -> Option<ReplayTu
         path: "/v1/responses".to_owned(),
         request,
         response,
-        source_records: Some(vec![record.clone()]),
+        source_records: Some(vec![record]),
     })
 }
 
