@@ -96,6 +96,15 @@ fn register_anthropic_filters(registry: &mut praxis_filter::FilterRegistry) {
 
 /// Register OpenAI Responses API request-path filters.
 fn register_openai_filters(registry: &mut praxis_filter::FilterRegistry) {
+    register_openai_responses_filters(registry);
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_conversations" => praxis_ai_apis::openai::OpenaiConversationsFilter::from_config
+    );
+}
+
+/// Register OpenAI Responses API filters.
+fn register_openai_responses_filters(registry: &mut praxis_filter::FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "openai_responses_format" => praxis_ai_apis::openai::ResponsesFormatFilter::from_config
@@ -107,10 +116,6 @@ fn register_openai_filters(registry: &mut praxis_filter::FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "openai_responses_validate" => praxis_ai_apis::openai::OpenaiResponsesValidateFilter::from_config
-    );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "openai_conversations" => praxis_ai_apis::openai::OpenaiConversationsFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -132,5 +137,9 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
     praxis_filter::register_filters!(
         @register registry,
         http "responses_proxy" => praxis_ai_apis::openai::ResponsesProxyFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
     );
 }

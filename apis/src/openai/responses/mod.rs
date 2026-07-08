@@ -24,9 +24,11 @@ pub(crate) mod proxy;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;
+pub(crate) mod tool_parse;
 
 pub use model_rewrite::ModelRewriteFilter;
 pub use store::ResponseStoreFilter;
+pub use tool_parse::ToolParseFilter;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]

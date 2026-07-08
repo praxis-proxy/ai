@@ -25,3 +25,4 @@ mod rehydrate;
 mod responses_proxy;
 mod responses_routing;
 mod token_usage_headers;
+mod tool_parse;

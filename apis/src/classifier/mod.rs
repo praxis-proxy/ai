@@ -59,7 +59,15 @@ pub(crate) struct ClassifiedRequest {
     pub has_previous_response_id: bool,
     /// Whether `prompt.id` is present and non-null.
     pub has_prompt_id: bool,
-    /// Whether `tools` is a non-empty array.
+    /// Whether `tools` is a non-empty array (coarse presence check).
+    ///
+    /// This does NOT validate individual entries: an array like
+    /// `[{"unexpected": true}]` will set this to `true` even though
+    /// no entry carries a recognised `type` discriminator.
+    /// [`tool_parse`] applies stricter per-entry classification and
+    /// may disagree on malformed arrays.
+    ///
+    /// [`tool_parse`]: crate::openai::responses::tool_parse
     pub has_tools: bool,
     /// Extracted `max_output_tokens` field value (Responses API), if present.
     pub max_output_tokens: Option<u64>,

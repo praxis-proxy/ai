@@ -1,0 +1,79 @@
+# Tool Composition Routing
+#
+# Demonstrates using `tool_parse` to route Responses API requests
+# by their tool composition. All requests go to the same inference
+# backend — the branch conditions select different processing
+# chains based on what tools are present in the request body.
+#
+# The `tool_parse` filter parses the `tools` array and `tool_choice`
+# from Responses API create requests and promotes summary facts to
+# metadata and filter results. These promoted facts drive branch
+# conditions and downstream filter decisions.
+#
+# In this example:
+#
+#   - Requests with `web_search` tools branch to a chain that could
+#     apply search-specific policies (rate limiting, cost tracking,
+#     extended timeouts) before forwarding to inference.
+#
+#   - All other requests (with or without tools) fall through to the
+#     default chain.
+#
+# Example requests:
+#
+#   # Function tool — default chain, has_tools=true header set
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"What is 2+2?","tools":[{"type":"function","name":"calc"}]}'
+#
+#   # Web search tool — branches to web-search chain
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Latest news","tools":[{"type":"web_search"}]}'
+#
+#   # No tools — default chain, no tool headers set
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [tool-routing]
+
+filter_chains:
+  - name: tool-routing
+    filters:
+      - filter: tool_parse
+        branch_chains:
+          - name: web-search
+            on_result:
+              filter: tool_parse
+              key: has_web_search
+              result: "true"
+            chains:
+              - name: web-search-chain
+                filters:
+                  # Placeholder: insert search-specific filters here
+                  # (rate limiting, cost tracking, extended timeouts).
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "inference"
+                  - filter: load_balancer
+                    clusters:
+                      - name: "inference"
+                        endpoints:
+                          - "127.0.0.1:3001"
+            rejoin: terminal
+
+      # Default: all other requests (with or without tools)
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "inference"
+      - filter: load_balancer
+        clusters:
+          - name: "inference"
+            endpoints:
+              - "127.0.0.1:3001"
