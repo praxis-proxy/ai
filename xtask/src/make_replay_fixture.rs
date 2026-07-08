@@ -76,8 +76,7 @@ fn render_fixture(content: &str, source_name: &str, provider: ProviderHint) -> R
 fn fixture_source_name(input: &Path) -> String {
     input
         .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .map_or_else(|| input.display().to_string(), ToOwned::to_owned)
+        .map_or_else(|| "session-log".to_owned(), |name| name.to_string_lossy().into_owned())
 }
 
 /// Write fixture content to `path`, creating parent directories as needed.
@@ -117,6 +116,25 @@ mod tests {
         let source = fixture_source_name(Path::new("/Users/example/.codex/sessions/2026/07/07/session.jsonl"));
 
         assert_eq!(source, "session.jsonl");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn make_replay_fixture_source_name_uses_lossy_filename() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+        let source = fixture_source_name(&Path::new("/tmp").join(OsStr::from_bytes(b"session-\xff.jsonl")));
+
+        assert!(source.starts_with("session-"));
+        assert!(source.ends_with(".jsonl"));
+        assert!(!source.contains("/tmp"));
+    }
+
+    #[test]
+    fn make_replay_fixture_source_name_uses_neutral_fallback_without_filename() {
+        let source = fixture_source_name(Path::new(""));
+
+        assert_eq!(source, "session-log");
     }
 
     #[test]
