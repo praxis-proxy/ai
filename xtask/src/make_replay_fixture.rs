@@ -44,7 +44,7 @@ pub(crate) fn run(args: Args) {
 fn run_inner(args: Args) -> Result<(), String> {
     let Args { input, provider, out } = args;
     let content = std::fs::read_to_string(&input).map_err(|err| format!("read {}: {err}", input.display()))?;
-    let source_name = input.to_string_lossy();
+    let source_name = fixture_source_name(&input);
     let output = render_fixture(&content, &source_name, provider)?;
 
     if let Some(path) = out {
@@ -70,6 +70,14 @@ fn render_fixture(content: &str, source_name: &str, provider: ProviderHint) -> R
     let replay = import_session_replay(&input, options).map_err(|err| err.to_string())?;
     let json = serde_json::to_string_pretty(&replay).map_err(|err| format!("serialize replay fixture: {err}"))?;
     Ok(format!("{json}\n"))
+}
+
+/// Return a commit-safe source label for generated fixtures.
+fn fixture_source_name(input: &Path) -> String {
+    input
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map_or_else(|| input.display().to_string(), ToOwned::to_owned)
 }
 
 /// Write fixture content to `path`, creating parent directories as needed.
@@ -102,6 +110,13 @@ mod tests {
         let replay: SessionReplay = serde_json::from_str(&output).expect("output should be a replay fixture");
         assert_eq!(replay.protocol, ReplayProtocol::OpenaiResponses);
         assert!(output.contains("\n  \"source\""), "fixture should be pretty-printed");
+    }
+
+    #[test]
+    fn make_replay_fixture_source_name_uses_input_filename() {
+        let source = fixture_source_name(Path::new("/Users/example/.codex/sessions/2026/07/07/session.jsonl"));
+
+        assert_eq!(source, "session.jsonl");
     }
 
     #[test]

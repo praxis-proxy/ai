@@ -6,7 +6,11 @@
 //! A replay fixture captures one or more sanitized turns from an agent
 //! session and replays those turns through an example configuration.
 
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    path::{Component, PathBuf},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
@@ -513,11 +517,14 @@ impl SessionReplay {
     /// Panics if the file cannot be read or parsed, or if the replay has
     /// no turns.
     pub fn load(relative_path: &str) -> Self {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("..");
         path.push("integration");
         path.push("fixtures");
-        for component in relative_path.split('/') {
+        for component in std::path::Path::new(relative_path).components() {
+            let Component::Normal(component) = component else {
+                panic!("invalid session replay fixture path {relative_path:?}");
+            };
             path.push(component);
         }
 
@@ -597,6 +604,12 @@ mod tests {
         assert_eq!(replay.protocol, ReplayProtocol::OpenaiResponses);
         assert_eq!(replay.turns.len(), 1);
         assert_eq!(replay.single_turn().path(), "/v1/responses");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid session replay fixture path")]
+    fn load_rejects_parent_directory_components() {
+        let _replay = SessionReplay::load("../replay/codex/responses-basic.json");
     }
 
     #[test]
