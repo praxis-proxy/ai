@@ -20,6 +20,7 @@
 //! to validate JSON syntax and extract additional fields without
 //! rejecting provider-owned parameter combinations.
 
+pub(crate) mod agentic_loop;
 mod config;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
@@ -490,6 +491,7 @@ pub(crate) mod rehydrate;
 pub(crate) mod validate;
 pub(crate) mod web_search;
 
+pub use agentic_loop::AgenticLoopFilter;
 pub use rehydrate::RehydrateFilter;
 pub use validate::OpenaiResponsesValidateFilter;
 pub use web_search::WebSearchFilter;
