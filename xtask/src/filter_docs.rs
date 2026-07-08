@@ -14,6 +14,7 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use clap::Parser;
@@ -309,11 +310,12 @@ impl FilterInfo {
 fn parse_shared_config_items(root: &Path) -> ModuleItems {
     let mut items = ModuleItems::new();
     let praxis_root = root.join("../praxis");
-    for dir in &[
-        praxis_root.join("core/src/config"),
-        praxis_root.join("tls/src/config"),
-        praxis_root.join("filter/src/builtins/http/payload_processing"),
-    ] {
+    let dirs = if praxis_root.is_dir() {
+        vec![praxis_root.join("filter/src/builtins/http/payload_processing")]
+    } else {
+        resolve_praxis_source_dirs()
+    };
+    for dir in &dirs {
         for path in collect_rs_files(dir) {
             let Ok(source) = fs::read_to_string(&path) else {
                 continue;
@@ -329,6 +331,31 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
     items.module_docs.clear();
     items.struct_docs.clear();
     items
+}
+
+/// Resolve praxis crate source directories from the cargo registry via
+/// `cargo metadata`. Used in CI where `../praxis` is not checked out.
+fn resolve_praxis_source_dirs() -> Vec<PathBuf> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version", "1"])
+        .output()
+        .expect("failed to run cargo metadata");
+
+    let meta: serde_json::Value = serde_json::from_slice(&output.stdout).expect("failed to parse cargo metadata");
+
+    let Some(packages) = meta.get("packages").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    for pkg in packages {
+        if pkg.get("name").and_then(|v| v.as_str()) == Some("praxis-proxy-filter")
+            && let Some(manifest) = pkg.get("manifest_path").and_then(|v| v.as_str())
+        {
+            let crate_root = Path::new(manifest).parent().unwrap();
+            return vec![crate_root.join("src/builtins/http/payload_processing")];
+        }
+    }
+    Vec::new()
 }
 
 /// Discover all filters across `apis/src/` and `filters/src/`.
