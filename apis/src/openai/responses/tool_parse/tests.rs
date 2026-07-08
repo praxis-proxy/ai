@@ -76,7 +76,8 @@ fn body_mode_is_stream_buffer() {
 
 #[tokio::test]
 async fn no_tools_skips_metadata() {
-    let ctx = run_filter("{}", r#"{"model":"gpt-4.1","input":"test"}"#).await;
+    let (action, ctx) = run_filter("{}", r#"{"model":"gpt-4.1","input":"test"}"#).await;
+    assert!(matches!(action, FilterAction::Continue), "no tools should continue");
     assert!(
         !ctx.filter_metadata.contains_key("tool_parse.has_tools"),
         "no tools => no has_tools metadata"
@@ -132,7 +133,8 @@ async fn anthropic_messages_path_skips_parsing() {
 #[tokio::test]
 async fn function_tools_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"function","name":"calc"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.has_tools").map(String::as_str),
@@ -153,7 +155,8 @@ async fn function_tools_metadata() {
 #[tokio::test]
 async fn nameless_function_tool_still_sets_has_tools() {
     let body = r#"{"input":"test","tools":[{"type":"function"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.has_tools").map(String::as_str),
@@ -170,7 +173,8 @@ async fn nameless_function_tool_still_sets_has_tools() {
 #[tokio::test]
 async fn web_search_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"web_search"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.has_web_search").map(String::as_str),
@@ -187,7 +191,8 @@ async fn web_search_metadata() {
 #[tokio::test]
 async fn file_search_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata
@@ -201,7 +206,8 @@ async fn file_search_metadata() {
 #[tokio::test]
 async fn mcp_tool_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"mcp","server_label":"srv"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.has_mcp").map(String::as_str),
@@ -213,7 +219,8 @@ async fn mcp_tool_metadata() {
 #[tokio::test]
 async fn tool_choice_metadata() {
     let body = r#"{"input":"test","tool_choice":"required","tools":[{"type":"function","name":"f"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.tool_choice").map(String::as_str),
@@ -225,7 +232,8 @@ async fn tool_choice_metadata() {
 #[tokio::test]
 async fn tool_choice_specific_metadata() {
     let body = r#"{"input":"test","tool_choice":{"type":"function","name":"calc"},"tools":[{"type":"function","name":"calc"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.tool_choice").map(String::as_str),
@@ -237,7 +245,8 @@ async fn tool_choice_specific_metadata() {
 #[tokio::test]
 async fn tool_choice_hosted_type_metadata() {
     let body = r#"{"input":"test","tool_choice":{"type":"file_search"},"tools":[{"type":"file_search"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.tool_choice").map(String::as_str),
@@ -257,7 +266,8 @@ async fn tool_choice_allowed_tools_metadata_uses_mode() {
         },
         "tools":[{"type":"function","name":"calc"}]
     }"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.tool_choice").map(String::as_str),
@@ -273,7 +283,8 @@ async fn tool_choice_mcp_metadata() {
         "tool_choice":{"type":"mcp","server_label":"deepwiki","name":"search"},
         "tools":[{"type":"mcp","server_label":"deepwiki","server_url":"http://localhost:8001/mcp"}]
     }"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata.get("tool_parse.tool_choice").map(String::as_str),
@@ -292,7 +303,8 @@ async fn tool_choice_mcp_metadata() {
 #[tokio::test]
 async fn tool_choice_type_metadata_for_function() {
     let body = r#"{"input":"test","tool_choice":{"type":"function","name":"calc"},"tools":[{"type":"function","name":"calc"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata
@@ -306,7 +318,8 @@ async fn tool_choice_type_metadata_for_function() {
 #[tokio::test]
 async fn tool_choice_type_metadata_absent_for_string_choices() {
     let body = r#"{"input":"test","tool_choice":"required","tools":[{"type":"function","name":"f"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert!(
         !ctx.filter_metadata.contains_key("tool_parse.tool_choice_type"),
@@ -321,7 +334,8 @@ async fn tool_choice_mcp_filter_results() {
         "tool_choice":{"type":"mcp","server_label":"deepwiki","name":"search"},
         "tools":[{"type":"mcp","server_label":"deepwiki","server_url":"http://localhost:8001/mcp"}]
     }"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
     let results = &ctx.filter_results["tool_parse"];
 
     assert!(
@@ -337,8 +351,9 @@ async fn tool_choice_mcp_filter_results() {
 #[tokio::test]
 async fn tool_choice_without_tools_not_promoted() {
     let body = r#"{"input":"test","tool_choice":"none"}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
 
+    assert!(matches!(action, FilterAction::Continue), "no tools should continue");
     assert!(
         !ctx.filter_metadata.contains_key("tool_parse.tool_choice"),
         "tool_choice without tools should not be promoted"
@@ -349,7 +364,8 @@ async fn tool_choice_without_tools_not_promoted() {
 async fn oversized_tool_choice_not_promoted() {
     let long_name = "x".repeat(300);
     let body = format!(r#"{{"input":"test","tool_choice":"{long_name}","tools":[{{"type":"function","name":"f"}}]}}"#);
-    let ctx = run_filter("{}", &body).await;
+    let (action, ctx) = run_filter("{}", &body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert!(
         !ctx.filter_metadata.contains_key("tool_parse.tool_choice"),
@@ -360,7 +376,8 @@ async fn oversized_tool_choice_not_promoted() {
 #[tokio::test]
 async fn unsafe_tool_choice_not_promoted() {
     let body = r#"{"input":"test","tool_choice":"bad\nvalue","tools":[{"type":"function","name":"f"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
     let results = &ctx.filter_results["tool_parse"];
 
     assert!(
@@ -380,7 +397,8 @@ async fn oversized_object_tool_choice_type_not_promoted() {
     let body = format!(
         r#"{{"input":"test","tool_choice":{{"type":"{long_type}"}},"tools":[{{"type":"function","name":"f"}}]}}"#
     );
-    let ctx = run_filter("{}", &body).await;
+    let (action, ctx) = run_filter("{}", &body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert!(
         !ctx.filter_metadata.contains_key("tool_parse.tool_choice_type"),
@@ -395,7 +413,8 @@ async fn oversized_object_tool_choice_type_not_promoted() {
 #[tokio::test]
 async fn control_char_object_tool_choice_type_not_promoted() {
     let body = r#"{"input":"test","tool_choice":{"type":"bad\ntype"},"tools":[{"type":"function","name":"f"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert!(
         !ctx.filter_metadata.contains_key("tool_parse.tool_choice_type"),
@@ -418,7 +437,8 @@ async fn control_char_object_tool_choice_type_not_promoted() {
 #[tokio::test]
 async fn filter_results_for_function_tools() {
     let body = r#"{"input":"test","tools":[{"type":"function","name":"calc"}],"tool_choice":"required"}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
     let results = &ctx.filter_results["tool_parse"];
 
     assert!(results.matches("has_tools", "true"), "has_tools result");
@@ -429,7 +449,8 @@ async fn filter_results_for_function_tools() {
 #[tokio::test]
 async fn filter_results_for_web_search() {
     let body = r#"{"input":"test","tools":[{"type":"web_search"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
     let results = &ctx.filter_results["tool_parse"];
 
     assert!(results.matches("has_tools", "true"), "has_tools result");
@@ -439,7 +460,8 @@ async fn filter_results_for_web_search() {
 #[tokio::test]
 async fn filter_results_for_mcp() {
     let body = r#"{"input":"test","tools":[{"type":"mcp","server_label":"s"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
     let results = &ctx.filter_results["tool_parse"];
 
     assert!(results.matches("has_mcp", "true"), "has_mcp result");
@@ -452,7 +474,8 @@ async fn filter_results_for_mcp() {
 #[tokio::test]
 async fn code_interpreter_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"code_interpreter"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata
@@ -471,7 +494,8 @@ async fn code_interpreter_metadata() {
 #[tokio::test]
 async fn computer_use_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"computer_use"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata
@@ -485,7 +509,8 @@ async fn computer_use_metadata() {
 #[tokio::test]
 async fn image_generation_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"image_generation"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata
@@ -499,7 +524,8 @@ async fn image_generation_metadata() {
 #[tokio::test]
 async fn tool_search_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"tool_search"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
         ctx.filter_metadata
@@ -513,7 +539,8 @@ async fn tool_search_metadata() {
 #[tokio::test]
 async fn code_interpreter_filter_results() {
     let body = r#"{"input":"test","tools":[{"type":"code_interpreter"}]}"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
     let results = &ctx.filter_results["tool_parse"];
 
     assert!(
@@ -528,7 +555,8 @@ async fn code_interpreter_filter_results() {
 
 #[tokio::test]
 async fn empty_body_produces_no_metadata() {
-    let ctx = run_filter("{}", "").await;
+    let (action, ctx) = run_filter("{}", "").await;
+    assert!(matches!(action, FilterAction::Continue), "empty body should continue");
     assert!(
         !ctx.filter_metadata.contains_key("tool_parse.has_tools"),
         "empty body should produce no tool metadata"
@@ -537,7 +565,8 @@ async fn empty_body_produces_no_metadata() {
 
 #[tokio::test]
 async fn invalid_json_produces_no_metadata() {
-    let ctx = run_filter("{}", "not json").await;
+    let (action, ctx) = run_filter("{}", "not json").await;
+    assert!(matches!(action, FilterAction::Continue), "invalid JSON should continue");
     assert!(
         !ctx.filter_metadata.contains_key("tool_parse.has_tools"),
         "invalid JSON should produce no tool metadata"
@@ -570,7 +599,8 @@ async fn mixed_tools_all_metadata_set() {
         ],
         "tool_choice": "auto"
     }"#;
-    let ctx = run_filter("{}", body).await;
+    let (action, ctx) = run_filter("{}", body).await;
+    assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(ctx.filter_metadata["tool_parse.has_tools"], "true", "has_tools");
     assert_eq!(ctx.filter_metadata["tool_parse.function_count"], "2", "function_count");
@@ -591,11 +621,120 @@ async fn mixed_tools_all_metadata_set() {
 }
 
 // =============================================================================
+// on_request: Restore Filter Results from Metadata
+// =============================================================================
+
+#[tokio::test]
+async fn restore_presence_flags_from_metadata() {
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    ctx.set_metadata("tool_parse.has_tools", "true");
+    ctx.set_metadata("tool_parse.has_web_search", "true");
+    ctx.set_metadata("tool_parse.has_mcp", "true");
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let results = &ctx.filter_results["tool_parse"];
+    assert!(results.matches("has_tools", "true"), "has_tools restored");
+    assert!(results.matches("has_web_search", "true"), "has_web_search restored");
+    assert!(results.matches("has_mcp", "true"), "has_mcp restored");
+}
+
+#[tokio::test]
+async fn restore_presence_flags_absent_when_no_metadata() {
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        !ctx.filter_results.contains_key("tool_parse"),
+        "no metadata => no filter_results"
+    );
+}
+
+#[tokio::test]
+async fn restore_function_count_from_metadata() {
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    ctx.set_metadata("tool_parse.function_count", "3");
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let results = &ctx.filter_results["tool_parse"];
+    assert!(results.matches("function_count", "3"), "function_count restored");
+}
+
+#[tokio::test]
+async fn restore_function_count_absent_when_no_metadata() {
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.filter_results
+            .get("tool_parse")
+            .and_then(|r| r.get("function_count"))
+            .is_none(),
+        "no metadata => no function_count result"
+    );
+}
+
+#[tokio::test]
+async fn restore_tool_choice_from_metadata() {
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    ctx.set_metadata("tool_parse.tool_choice", "required");
+    ctx.set_metadata("tool_parse.tool_choice_type", "function");
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let results = &ctx.filter_results["tool_parse"];
+    assert!(results.matches("tool_choice", "required"), "tool_choice restored");
+    assert!(
+        results.matches("tool_choice_type", "function"),
+        "tool_choice_type restored"
+    );
+}
+
+#[tokio::test]
+async fn restore_tool_choice_absent_when_no_metadata() {
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.filter_results
+            .get("tool_parse")
+            .and_then(|r| r.get("tool_choice"))
+            .is_none(),
+        "no metadata => no tool_choice result"
+    );
+}
+
+// =============================================================================
 // Test Utilities
 // =============================================================================
 
-/// Run the filter's `on_request_body` and return the resulting context.
-async fn run_filter(config_yaml: &str, body_str: &str) -> praxis_filter::HttpFilterContext<'static> {
+/// Run the filter's `on_request_body` and return the action and context.
+async fn run_filter(config_yaml: &str, body_str: &str) -> (FilterAction, praxis_filter::HttpFilterContext<'static>) {
     let filter = make_filter(config_yaml);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
@@ -606,8 +745,8 @@ async fn run_filter(config_yaml: &str, body_str: &str) -> praxis_filter::HttpFil
         Some(Bytes::from(body_str.to_owned()))
     };
 
-    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
-    ctx
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    (action, ctx)
 }
 
 /// Build a `ToolParseFilter` from a YAML snippet.
