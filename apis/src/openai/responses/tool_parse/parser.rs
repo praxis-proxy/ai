@@ -377,7 +377,10 @@ fn classify_tool_type(obj: &serde_json::Map<String, serde_json::Value>) -> ToolT
 
     match type_str {
         "function" => ToolType::Function,
-        "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" => ToolType::WebSearch,
+        "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" | "web_search_2025_08_26" => {
+            ToolType::WebSearch
+        },
+
         "file_search" => ToolType::FileSearch,
         "code_interpreter" => ToolType::CodeInterpreter,
         "computer" | "computer_use" | "computer_use_preview" => ToolType::ComputerUse,
@@ -579,6 +582,21 @@ mod tests {
         assert!(
             result.has_web_search(),
             "web_search_preview variant should be recognized"
+        );
+    }
+
+    #[test]
+    fn parse_web_search_2025_08_26_variant() {
+        let body = br#"{
+            "input": "test",
+            "tools": [{"type": "web_search_2025_08_26"}]
+        }"#;
+
+        let result = parse_tools(body);
+
+        assert!(
+            result.has_web_search(),
+            "web_search_2025_08_26 variant should be recognized"
         );
     }
 

@@ -77,6 +77,27 @@ fn web_search_tool_routes_to_tools_cluster() {
 }
 
 #[test]
+fn web_search_2025_08_26_routes_to_tools_cluster() {
+    let tools_guard = start_backend_with_shutdown("tools-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let yaml = routing_yaml(proxy_port, tools_guard.port(), default_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"input":"test","tools":[{"type":"web_search_2025_08_26"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 200, "web_search_2025_08_26 should return 200");
+    assert_eq!(
+        parse_body(&raw),
+        "tools-backend",
+        "web_search_2025_08_26 variant should route to tools cluster"
+    );
+}
+
+#[test]
 fn file_search_tool_routes_to_tools_cluster() {
     let tools_guard = start_backend_with_shutdown("tools-backend");
     let default_guard = start_backend_with_shutdown("default-backend");
