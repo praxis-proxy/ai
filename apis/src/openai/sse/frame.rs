@@ -586,4 +586,150 @@ mod tests {
         assert_eq!(frames2.len(), 1, "second data line with blank line should dispatch");
         assert_eq!(frames2[0].data, b"line1\nline2", "split multiline data should match");
     }
+
+    // -------------------------------------------------------------------------
+    // SseParseError Display
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn display_malformed_json() {
+        let err = SseParseError::MalformedJson {
+            event_type: "response.created".to_owned(),
+            err: "expected value at line 1 column 1".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("response.created"), "should mention the event type");
+        assert!(msg.contains("expected value"), "should include the JSON error");
+    }
+
+    #[test]
+    fn display_missing_event_type() {
+        let err = SseParseError::MissingEventType {
+            field: "data.type",
+            event_type: "response.created".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("data.type"), "should mention the missing field");
+        assert!(
+            msg.contains("response.created"),
+            "should mention the observed event type"
+        );
+    }
+
+    #[test]
+    fn display_event_type_mismatch() {
+        let err = SseParseError::EventTypeMismatch {
+            sse_event_type: "response.completed".to_owned(),
+            data_event_type: "response.output_text.delta".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("response.completed"), "should mention the SSE event type");
+        assert!(
+            msg.contains("response.output_text.delta"),
+            "should mention the payload event type"
+        );
+    }
+
+    #[test]
+    fn display_event_limit_exceeded() {
+        let err = SseParseError::EventLimitExceeded { count: 101, limit: 100 };
+        let msg = err.to_string();
+        assert!(msg.contains("101"), "should mention the count");
+        assert!(msg.contains("100"), "should mention the limit");
+    }
+
+    #[test]
+    fn display_timeout() {
+        let err = SseParseError::Timeout {
+            elapsed: Duration::from_secs(35),
+            limit: Duration::from_secs(30),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("35"), "should mention elapsed time");
+        assert!(msg.contains("30"), "should mention the limit");
+    }
+
+    #[test]
+    fn display_missing_terminal_event() {
+        let err = SseParseError::MissingTerminalEvent;
+        let msg = err.to_string();
+        assert!(msg.contains("terminal"), "should mention missing terminal event");
+    }
+
+    #[test]
+    fn display_buffer_overflow() {
+        let err = SseParseError::BufferOverflow {
+            buffered_bytes: 70_000,
+            limit: 65_536,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("70000"), "should mention buffered bytes");
+        assert!(msg.contains("65536"), "should mention the limit");
+    }
+
+    #[test]
+    fn display_event_after_terminal() {
+        let err = SseParseError::EventAfterTerminal {
+            event_type: "response.output_text.delta".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("response.output_text.delta"),
+            "should mention the event type"
+        );
+        assert!(msg.contains("terminal"), "should mention terminal context");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_chunk_with_event_limit
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn event_limit_allows_frames_within_budget() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let chunk = b"data: one\n\ndata: two\n\n";
+        let frames = parser.parse_chunk_with_event_limit(chunk, 0, 5).unwrap();
+        assert_eq!(frames.len(), 2, "both frames should be emitted within budget");
+    }
+
+    #[test]
+    fn event_limit_exact_boundary_succeeds() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let chunk = b"data: one\n\ndata: two\n\n";
+        let frames = parser.parse_chunk_with_event_limit(chunk, 0, 2).unwrap();
+        assert_eq!(frames.len(), 2, "exactly at limit should succeed");
+    }
+
+    #[test]
+    fn event_limit_exceeded_at_boundary() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let chunk = b"data: one\n\ndata: two\n\ndata: three\n\n";
+        let result = parser.parse_chunk_with_event_limit(chunk, 0, 2);
+        assert!(
+            matches!(result, Err(SseParseError::EventLimitExceeded { count: 3, limit: 2 })),
+            "third frame should exceed limit of 2"
+        );
+    }
+
+    #[test]
+    fn event_limit_accounts_for_current_events() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let chunk = b"data: one\n\n";
+        let result = parser.parse_chunk_with_event_limit(chunk, 5, 5);
+        assert!(
+            matches!(result, Err(SseParseError::EventLimitExceeded { count: 6, limit: 5 })),
+            "current_events at limit should reject the next frame"
+        );
+    }
+
+    #[test]
+    fn event_limit_no_frames_always_succeeds() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let chunk = b"data: partial";
+        let frames = parser.parse_chunk_with_event_limit(chunk, 100, 100).unwrap();
+        assert!(
+            frames.is_empty(),
+            "no complete frames should succeed regardless of current count"
+        );
+    }
 }

@@ -618,3 +618,69 @@ fn post_route<'a>(segments: &'a [&'a str]) -> Option<PostRoute<'a>> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_store_unavailable_returns_500_server_error() {
+        let rejection = reject_store_unavailable();
+        assert_eq!(rejection.status, 500);
+        let body: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "Internal server error.");
+    }
+
+    #[test]
+    fn reject_store_unavailable_sets_json_content_type() {
+        let rejection = reject_store_unavailable();
+        let ct = rejection
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ct, Some("application/json"), "should set application/json content-type");
+    }
+
+    #[test]
+    fn post_route_create_conversation() {
+        let segments = ["", "v1", "conversations"];
+        assert!(matches!(post_route(&segments), Some(PostRoute::CreateConversation)));
+    }
+
+    #[test]
+    fn post_route_update_conversation() {
+        let segments = ["", "v1", "conversations", "conv_123"];
+        assert!(matches!(
+            post_route(&segments),
+            Some(PostRoute::UpdateConversation("conv_123"))
+        ));
+    }
+
+    #[test]
+    fn post_route_create_items() {
+        let segments = ["", "v1", "conversations", "conv_123", "items"];
+        assert!(matches!(
+            post_route(&segments),
+            Some(PostRoute::CreateItems("conv_123"))
+        ));
+    }
+
+    #[test]
+    fn post_route_unmatched_returns_none() {
+        let segments = ["", "v1", "models"];
+        assert!(post_route(&segments).is_none());
+    }
+
+    #[test]
+    fn post_route_empty_id_returns_none() {
+        let segments = ["", "v1", "conversations", ""];
+        assert!(
+            post_route(&segments).is_none(),
+            "empty conversation ID should not match"
+        );
+    }
+}

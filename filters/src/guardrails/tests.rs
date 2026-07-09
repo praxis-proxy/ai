@@ -355,6 +355,6 @@ phase:
     )
     .unwrap();
 
-    assert!(!parsed.phase.request);
-    assert!(parsed.phase.response);
+    assert!(!parsed.phase.request, "overridden request should be false");
+    assert!(parsed.phase.response, "overridden response should be true");
 }

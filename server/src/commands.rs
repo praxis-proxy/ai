@@ -161,4 +161,19 @@ filter_chains:
             "error should mention the missing chain name: {err}"
         );
     }
+
+    #[test]
+    fn default_config_source_returns_builtin_when_no_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let source = default_config_source();
+
+        std::env::set_current_dir(original).unwrap();
+        assert_eq!(
+            source, "<built-in default>",
+            "should return built-in default when praxis.yaml is absent"
+        );
+    }
 }

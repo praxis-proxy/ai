@@ -336,6 +336,67 @@ async fn passthrough_strips_conversation_from_body() {
     assert_eq!(parsed["model"], "gpt-4.1", "other fields should be preserved");
 }
 
+#[tokio::test]
+async fn passthrough_none_body() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut body: Option<Bytes> = None;
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "None body should return Continue"
+    );
+    assert!(body.is_none(), "None body should remain None");
+}
+
+#[tokio::test]
+async fn passthrough_invalid_json_body() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original = b"not valid json {{{";
+    let mut body = Some(Bytes::from_static(original));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "invalid JSON body should return Continue"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_slice()),
+        "invalid JSON body should pass through unchanged"
+    );
+}
+
+#[tokio::test]
+async fn rebuild_non_object_request_body_passes_through() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = ResponsesState {
+        request_body: json!(["not", "an", "object"]),
+        ..Default::default()
+    };
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(r#"["not","an","object"]"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "non-object request_body should continue"
+    );
+
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        rebuilt.is_array(),
+        "non-object request_body should pass through without modification"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
