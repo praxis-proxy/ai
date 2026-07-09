@@ -2432,14 +2432,23 @@ mod tests {
     #[test]
     fn numeric_types_render_language_neutral() {
         let enums = BTreeMap::new();
-        let u64_ty: syn::Type = syn::parse_str("u64").unwrap();
-        assert_eq!(render_type(&u64_ty, &enums), "integer", "unsigned integers");
-        let usize_ty: syn::Type = syn::parse_str("usize").unwrap();
-        assert_eq!(render_type(&usize_ty, &enums), "integer", "usize");
-        let i32_ty: syn::Type = syn::parse_str("i32").unwrap();
-        assert_eq!(render_type(&i32_ty, &enums), "integer", "signed integers");
-        let f64_ty: syn::Type = syn::parse_str("f64").unwrap();
-        assert_eq!(render_type(&f64_ty, &enums), "number", "floats");
+        for (rust_ty, expected) in [
+            ("u8", "integer"),
+            ("u16", "integer"),
+            ("u32", "integer"),
+            ("u64", "integer"),
+            ("usize", "integer"),
+            ("i8", "integer"),
+            ("i16", "integer"),
+            ("i32", "integer"),
+            ("i64", "integer"),
+            ("isize", "integer"),
+            ("f32", "number"),
+            ("f64", "number"),
+        ] {
+            let ty: syn::Type = syn::parse_str(rust_ty).unwrap();
+            assert_eq!(render_type(&ty, &enums), expected, "{rust_ty}");
+        }
     }
 
     /// Build a sample [`FilterEntry`] for rendering tests.
