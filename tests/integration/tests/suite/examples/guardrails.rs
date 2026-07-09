@@ -122,7 +122,74 @@ fn nemo_guardrails_provider_down_does_not_forward() {
         r#"{"model":"test","messages":[{"role":"user","content":"hello"}]}"#,
     );
 
-    assert_ne!(status, 200, "provider down should not forward request to upstream");
+    assert_eq!(
+        status, 500,
+        "provider down should abort the pipeline with a 500, not forward to upstream"
+    );
+}
+
+/// A request body that isn't recognized (not valid JSON, missing
+/// `messages`, or `messages` isn't an array) must fail closed - reject
+/// with a pipeline-level error.
+#[test]
+fn nemo_guardrails_invalid_json_body_does_not_forward() {
+    let backend = start_backend_with_shutdown("ok");
+    let dead_port = free_port();
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "nemo-guardrails.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", dead_port)]),
+    );
+    let proxy = start_proxy(&config);
+
+    let (status, _body) = http_post(proxy.addr(), "/v1/guardrail/checks", "not json at all");
+
+    assert_eq!(
+        status, 500,
+        "non-JSON body should fail closed with a 500, not forward to upstream"
+    );
+}
+
+#[test]
+fn nemo_guardrails_missing_messages_key_does_not_forward() {
+    let backend = start_backend_with_shutdown("ok");
+    let dead_port = free_port();
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "nemo-guardrails.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", dead_port)]),
+    );
+    let proxy = start_proxy(&config);
+
+    let (status, _body) = http_post(proxy.addr(), "/v1/guardrail/checks", r#"{"model":"test"}"#);
+
+    assert_eq!(
+        status, 500,
+        "body without a 'messages' field should fail closed with a 500, not forward to upstream"
+    );
+}
+
+/// `messages` present but not an array must also fail closed.
+#[test]
+fn nemo_guardrails_messages_not_array_does_not_forward() {
+    let backend = start_backend_with_shutdown("ok");
+    let dead_port = free_port();
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "nemo-guardrails.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", dead_port)]),
+    );
+    let proxy = start_proxy(&config);
+
+    let (status, _body) = http_post(proxy.addr(), "/v1/guardrail/checks", r#"{"messages":"hello"}"#);
+
+    assert_eq!(
+        status, 500,
+        "non-array 'messages' field should fail closed with a 500, not forward to upstream"
+    );
 }
 
 // -----------------------------------------------------------------------------

@@ -7,6 +7,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt as _;
 use praxis_filter::FilterError;
 use serde::{Deserialize, Serialize};
 
@@ -120,29 +122,63 @@ impl GuardProvider for NemoProvider {
             .send()
             .await
             .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): failed to send request: {e}").into() })?;
-        if let Some(len) = response.content_length()
-            && usize::try_from(len).map_or(true, |l| l > MAX_RESPONSE_SIZE)
-        {
-            return Err(format!(
-                "ai_guardrails (nemo): response Content-Length too large \
-                 ({len} bytes, limit {MAX_RESPONSE_SIZE})"
-            )
-            .into());
-        }
-        let response_status = response.status();
-        if !response_status.is_success() {
-            return Err(format!("ai_guardrails (nemo): provider returned HTTP status code {response_status}").into());
-        }
-        let response_body = response.text().await.map_err(|e| -> FilterError {
-            format!("ai_guardrails (nemo): failed to read response body: {e}").into()
-        })?;
-        let nemo_response: NemoResponse = serde_json::from_str(&response_body)
+        check_content_length(&response)?;
+        ensure_success_status(&response)?;
+        let response_body = read_response_body(response).await?;
+        let nemo_response: NemoResponse = serde_json::from_slice(&response_body)
             .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): failed to parse response: {e}").into() })?;
         map_nemo_response(nemo_response)
     }
 }
 
-// --- Private Utilities ---
+// -----------------------------------------------------------------------------
+// Private Utilities
+// -----------------------------------------------------------------------------
+
+/// Reject responses whose declared `Content-Length` exceeds [`MAX_RESPONSE_SIZE`].
+fn check_content_length(response: &reqwest::Response) -> Result<(), FilterError> {
+    let Some(len) = response.content_length() else {
+        return Ok(());
+    };
+    if usize::try_from(len).map_or(true, |l| l > MAX_RESPONSE_SIZE) {
+        return Err(format!(
+            "ai_guardrails (nemo): response Content-Length too large \
+             ({len} bytes, limit {MAX_RESPONSE_SIZE})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Reject non-2xx HTTP responses from the provider.
+fn ensure_success_status(response: &reqwest::Response) -> Result<(), FilterError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("ai_guardrails (nemo): provider returned HTTP status code {status}").into());
+    }
+    Ok(())
+}
+
+/// Read the response body incrementally, aborting as soon as the running total exceeds [`MAX_RESPONSE_SIZE`],
+///  before any body bytes are read.
+async fn read_response_body(response: reqwest::Response) -> Result<Bytes, FilterError> {
+    let mut stream = response.bytes_stream();
+    let mut body = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| -> FilterError {
+            format!("ai_guardrails (nemo): failed to read response body: {e}").into()
+        })?;
+        if body.len() + chunk.len() > MAX_RESPONSE_SIZE {
+            return Err(format!(
+                "ai_guardrails (nemo): response body too large \
+                 (limit {MAX_RESPONSE_SIZE} bytes)"
+            )
+            .into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
 
 /// Map a deserialized [`NemoResponse`] to a [`GuardResult`].
 fn map_nemo_response(nemo: NemoResponse) -> Result<GuardResult, FilterError> {
@@ -176,4 +212,57 @@ fn blocked_rail_names(rails_status: Option<&serde_json::Value>) -> String {
         .collect();
     names.sort_unstable();
     names.join(", ")
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocked_rail_names_sorts_alphabetically() {
+        let rails = serde_json::json!({
+            "toxicity": {"status": "blocked"},
+            "jailbreak": {"status": "blocked"},
+            "pii masking": {"status": "blocked"},
+        });
+        assert_eq!(blocked_rail_names(Some(&rails)), "jailbreak, pii masking, toxicity");
+    }
+
+    #[test]
+    fn blocked_rail_names_filters_out_non_blocked_rails() {
+        let rails = serde_json::json!({
+            "toxicity": {"status": "blocked"},
+            "jailbreak": {"status": "passed"},
+        });
+        assert_eq!(
+            blocked_rail_names(Some(&rails)),
+            "toxicity",
+            "only rails with status 'blocked' should be included in the reason string"
+        );
+    }
+
+    #[test]
+    fn blocked_rail_names_empty_rails_status_returns_empty_string() {
+        let rails = serde_json::json!({});
+        assert_eq!(blocked_rail_names(Some(&rails)), "");
+    }
+
+    #[test]
+    fn blocked_rail_names_absent_map_returns_empty_string() {
+        assert_eq!(
+            blocked_rail_names(None),
+            "",
+            "missing rails_status should not panic or error"
+        );
+    }
+
+    #[test]
+    fn blocked_rail_names_non_object_rails_status_returns_empty_string() {
+        let rails = serde_json::json!("not an object");
+        assert_eq!(blocked_rail_names(Some(&rails)), "");
+    }
 }

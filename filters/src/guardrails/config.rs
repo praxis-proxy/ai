@@ -57,16 +57,6 @@ pub(super) struct ProviderConfig {
 #[serde(deny_unknown_fields)]
 pub(super) struct PhaseConfig {
     /// Evaluate client requests before forwarding to the upstream.
-<<<<<<< HEAD
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by on_request_body once provider evaluation is wired (#578)"
-        )
-    )]
-=======
->>>>>>> 1f9563d (feat(guardrails): add NeMo Provider)
     #[serde(default = "default_true")]
     pub request: bool,
 
