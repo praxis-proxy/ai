@@ -1,5 +1,5 @@
 {
-  "source": "Converted Claude Code session log: be1aac05-652c-4442-8c61-a86b86311a09.jsonl",
+  "source": "Converted sanitized Claude Code image session log",
   "protocol": "anthropic_messages",
   "turns": [
     {
@@ -30,7 +30,7 @@
       },
       "response": {
         "model": "claude-opus-4-6",
-        "id": "msg_vrtx_01X7TrVqAogyQDyEhNdQPSrT",
+        "id": "msg_replay_claude_image",
         "type": "message",
         "role": "assistant",
         "content": [
@@ -63,9 +63,9 @@
       },
       "source_records": [
         {
-          "parentUuid": "ae8d1e86-8470-4b38-8379-09b2dbb41ead",
+          "parentUuid": "turn_parent_replay_claude_image",
           "isSidechain": false,
-          "promptId": "a8741fd6-2a9a-43b1-ac0f-071aefd0471a",
+          "promptId": "prompt_replay_claude_image",
           "type": "user",
           "message": {
             "role": "user",
@@ -84,7 +84,7 @@
               }
             ]
           },
-          "uuid": "1636d9f1-791e-4fd5-929a-b480393a1a91",
+          "uuid": "turn_user_replay_claude_image",
           "timestamp": "2026-07-08T17:52:01.280Z",
           "imagePasteIds": [
             1
@@ -96,41 +96,41 @@
           "promptSource": "typed",
           "userType": "external",
           "entrypoint": "cli",
-          "cwd": "/Users/farceo/dev/vllm",
-          "sessionId": "be1aac05-652c-4442-8c61-a86b86311a09",
+          "cwd": "fixture-cwd",
+          "sessionId": "session_replay_claude_image",
           "version": "2.1.204",
-          "gitBranch": "responses-tokens-endpoint"
+          "gitBranch": "fixture-branch"
         },
         {
-          "parentUuid": "68fad836-7bf8-49eb-b251-53de442e0018",
+          "parentUuid": "turn_user_replay_claude_image",
           "isSidechain": false,
-          "promptId": "a8741fd6-2a9a-43b1-ac0f-071aefd0471a",
+          "promptId": "prompt_replay_claude_image",
           "type": "user",
           "message": {
             "role": "user",
             "content": [
               {
                 "type": "text",
-                "text": "[Image: source: /var/folders/s4/_p0njf691459fq5fkk2yd1sc0000gn/T/TemporaryItems/NSIRD_screencaptureui_xK6zEK/Screenshot 2026-07-08 at 1.51.50 PM.png]"
+                "text": "[Image: source: fixture-screenshot.png]"
               }
             ]
           },
           "isMeta": true,
-          "uuid": "8371b7d8-7d38-4e5f-96ca-76dd03c4b186",
+          "uuid": "turn_user_replay_claude_image_placeholder",
           "timestamp": "2026-07-08T17:52:01.280Z",
           "userType": "external",
           "entrypoint": "cli",
-          "cwd": "/Users/farceo/dev/vllm",
-          "sessionId": "be1aac05-652c-4442-8c61-a86b86311a09",
+          "cwd": "fixture-cwd",
+          "sessionId": "session_replay_claude_image",
           "version": "2.1.204",
-          "gitBranch": "responses-tokens-endpoint"
+          "gitBranch": "fixture-branch"
         },
         {
-          "parentUuid": "8371b7d8-7d38-4e5f-96ca-76dd03c4b186",
+          "parentUuid": "turn_user_replay_claude_image_placeholder",
           "isSidechain": false,
           "message": {
             "model": "claude-opus-4-6",
-            "id": "msg_vrtx_01X7TrVqAogyQDyEhNdQPSrT",
+            "id": "msg_replay_claude_image",
             "type": "message",
             "role": "assistant",
             "content": [
@@ -162,23 +162,23 @@
               "speed": "standard"
             }
           },
-          "requestId": "req_vrtx_011Ccq1sjAZiV6Hydov6V1DZ",
+          "requestId": "req_replay_claude_image",
           "type": "assistant",
-          "uuid": "b0d1fd68-e4fe-4d18-b1dc-0a2eb9f92887",
+          "uuid": "turn_assistant_replay_claude_image_thinking",
           "timestamp": "2026-07-08T17:52:05.102Z",
           "userType": "external",
           "entrypoint": "cli",
-          "cwd": "/Users/farceo/dev/vllm",
-          "sessionId": "be1aac05-652c-4442-8c61-a86b86311a09",
+          "cwd": "fixture-cwd",
+          "sessionId": "session_replay_claude_image",
           "version": "2.1.204",
-          "gitBranch": "responses-tokens-endpoint"
+          "gitBranch": "fixture-branch"
         },
         {
-          "parentUuid": "b0d1fd68-e4fe-4d18-b1dc-0a2eb9f92887",
+          "parentUuid": "turn_assistant_replay_claude_image_thinking",
           "isSidechain": false,
           "message": {
             "model": "claude-opus-4-6",
-            "id": "msg_vrtx_01X7TrVqAogyQDyEhNdQPSrT",
+            "id": "msg_replay_claude_image",
             "type": "message",
             "role": "assistant",
             "content": [
@@ -209,16 +209,16 @@
               "speed": "standard"
             }
           },
-          "requestId": "req_vrtx_011Ccq1sjAZiV6Hydov6V1DZ",
+          "requestId": "req_replay_claude_image",
           "type": "assistant",
-          "uuid": "e20be114-bcd2-4e94-bc74-890282a657d2",
+          "uuid": "turn_assistant_replay_claude_image_final",
           "timestamp": "2026-07-08T17:52:09.611Z",
           "userType": "external",
           "entrypoint": "cli",
-          "cwd": "/Users/farceo/dev/vllm",
-          "sessionId": "be1aac05-652c-4442-8c61-a86b86311a09",
+          "cwd": "fixture-cwd",
+          "sessionId": "session_replay_claude_image",
           "version": "2.1.204",
-          "gitBranch": "responses-tokens-endpoint"
+          "gitBranch": "fixture-branch"
         }
       ]
     }

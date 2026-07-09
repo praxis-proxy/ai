@@ -708,6 +708,34 @@ mod tests {
     }
 
     #[test]
+    fn committed_replay_source_records_do_not_include_local_paths() {
+        let mut fixture_paths = Vec::new();
+        collect_replay_fixture_paths(&replay_fixture_root(), &mut fixture_paths);
+        assert!(!fixture_paths.is_empty(), "expected replay fixtures to be present");
+
+        for path in fixture_paths {
+            let content =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+            let replay: SessionReplay =
+                serde_json::from_str(&content).unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
+
+            for (turn_index, turn) in replay.turns.iter().enumerate() {
+                let Some(source_records) = &turn.source_records else {
+                    continue;
+                };
+
+                for (record_index, record) in source_records.iter().enumerate() {
+                    assert_value_has_no_local_path(
+                        record,
+                        &path,
+                        &format!("turns[{turn_index}].source_records[{record_index}]"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn session_replay_import_detects_codex_jsonl() {
         let input = SessionInput::new(CODEX_JSONL);
 
@@ -800,5 +828,63 @@ mod tests {
         );
         assert_eq!(source_records[2]["message"]["content"][0]["type"], "thinking");
         assert_eq!(source_records[3]["message"]["content"][0]["type"], "text");
+    }
+
+    fn replay_fixture_root() -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("..");
+        path.push("integration");
+        path.push("fixtures");
+        path.push("replay");
+        path
+    }
+
+    fn collect_replay_fixture_paths(dir: &std::path::Path, fixture_paths: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read fixture dir {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| panic!("read fixture dir entry {}: {e}", dir.display()));
+            let path = entry.path();
+            if path.is_dir() {
+                collect_replay_fixture_paths(&path, fixture_paths);
+            } else if path.extension().is_some_and(|extension| extension == "json") {
+                fixture_paths.push(path);
+            }
+        }
+    }
+
+    fn assert_value_has_no_local_path(value: &Value, fixture_path: &std::path::Path, json_path: &str) {
+        match value {
+            Value::String(text) => {
+                const LOCAL_PATH_PATTERNS: &[&str] = &[
+                    "/Users/",
+                    "/var/folders/",
+                    "/private/var/",
+                    "/tmp/",
+                    "TemporaryItems",
+                    "C:\\Users\\",
+                    "\\Users\\",
+                    "\\AppData\\",
+                ];
+
+                for pattern in LOCAL_PATH_PATTERNS {
+                    assert!(
+                        !text.contains(pattern),
+                        "fixture {} contains local path pattern {pattern:?} at {json_path}: {text:?}",
+                        fixture_path.display()
+                    );
+                }
+            },
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    assert_value_has_no_local_path(item, fixture_path, &format!("{json_path}[{index}]"));
+                }
+            },
+            Value::Object(object) => {
+                for (key, item) in object {
+                    assert_value_has_no_local_path(item, fixture_path, &format!("{json_path}.{key}"));
+                }
+            },
+            Value::Null | Value::Bool(_) | Value::Number(_) => {},
+        }
     }
 }
