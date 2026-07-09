@@ -527,14 +527,16 @@ fn claude_message_contains_content_type(message: &Value, block_type: &str) -> bo
 
 /// Return true when assistant content includes client-visible replay content.
 fn has_replayable_claude_assistant_content(message: &Value) -> bool {
-    message.get("content").and_then(Value::as_array).is_some_and(|content| {
-        content.iter().any(|block| {
+    match message.get("content") {
+        Some(Value::String(content)) => !content.is_empty(),
+        Some(Value::Array(content)) => content.iter().any(|block| {
             !matches!(
                 block.get("type").and_then(Value::as_str),
                 Some("thinking" | "redacted_thinking")
             )
-        })
-    })
+        }),
+        _ => false,
+    }
 }
 
 /// Return true when a Claude Code assistant message is an Anthropic response.
@@ -671,6 +673,9 @@ mod tests {
     const CLAUDE_CODE_JSONL: &str = r#"{"uuid":"turn_user","sessionId":"session_import_claude","timestamp":"2026-07-07T00:00:00Z","type":"user","message":{"role":"user","content":"hello"}}
 {"uuid":"turn_assistant","sessionId":"session_import_claude","timestamp":"2026-07-07T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#;
 
+    const CLAUDE_CODE_STRING_ASSISTANT_JSONL: &str = r#"{"uuid":"turn_user","sessionId":"session_import_claude_string","timestamp":"2026-07-07T00:00:00Z","type":"user","message":{"role":"user","content":"hello"}}
+{"uuid":"turn_assistant","sessionId":"session_import_claude_string","timestamp":"2026-07-07T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_string","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":"hi","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#;
+
     const CLAUDE_CODE_IMAGE_JSONL: &str = r#"{"uuid":"turn_image_user","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"What's in this image?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]}}
 {"uuid":"turn_image_placeholder","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"[Image: source: /tmp/screenshot.png]"}]}}
 {"uuid":"turn_image_thinking","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"thinking","thinking":"Looking at the image.","signature":"sig"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}
@@ -800,6 +805,24 @@ mod tests {
         assert_eq!(turn.request["model"], "claude-sonnet-4-5");
         assert_eq!(turn.request["messages"][0]["role"], "user");
         assert_eq!(turn.response["id"], "msg_import_claude");
+    }
+
+    #[test]
+    fn session_replay_import_accepts_claude_code_string_assistant_content() {
+        let input = SessionInput::new(CLAUDE_CODE_STRING_ASSISTANT_JSONL);
+
+        let replay = import_session_replay(&input, ImportOptions::default()).expect("import should succeed");
+        let turn = replay.single_turn();
+
+        assert_eq!(replay.protocol, ReplayProtocol::AnthropicMessages);
+        assert_eq!(turn.response["id"], "msg_import_claude_string");
+        assert_eq!(turn.response["content"], "hi");
+        assert_eq!(
+            turn.source_records
+                .as_ref()
+                .expect("source records should be preserved")[1]["message"]["content"],
+            "hi"
+        );
     }
 
     #[test]
