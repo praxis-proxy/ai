@@ -26,6 +26,10 @@ use std::collections::HashMap;
     expect(dead_code, reason = "fields used incrementally as more filters are ported")
 )]
 pub(crate) struct ResponsesState {
+    /// Maps `file_id` to filename for citation markers injected by
+    /// the file-search filter and consumed by response annotation extraction.
+    pub citation_files: HashMap<String, String>,
+
     /// Truncation strategy for managing context window limits.
     ///
     /// Preserves the full object from the request so filters can
@@ -139,6 +143,7 @@ pub(crate) struct ResponsesState {
 impl Default for ResponsesState {
     fn default() -> Self {
         Self {
+            citation_files: HashMap::new(),
             context_management: None,
             conversation: None,
             include: Vec::new(),
@@ -563,6 +568,15 @@ mod tests {
     }
 
     #[test]
+    fn default_has_empty_citation_files() {
+        let state = ResponsesState::default();
+        assert!(
+            state.citation_files.is_empty(),
+            "initial citation_files should be empty"
+        );
+    }
+
+    #[test]
     fn default_has_empty_mcp_tool_map() {
         let state = ResponsesState::default();
         assert!(state.mcp_tool_map.is_empty(), "default mcp_tool_map should be empty");
@@ -573,5 +587,14 @@ mod tests {
         let body = json!({"model": "gpt-4o", "input": "test"});
         let state = ResponsesState::from_request_body(body);
         assert!(state.mcp_tool_map.is_empty(), "initial mcp_tool_map should be empty");
+
+    #[test]
+    fn from_request_body_has_empty_citation_files() {
+        let body = json!({"model": "gpt-4o", "input": "test"});
+        let state = ResponsesState::from_request_body(body);
+        assert!(
+            state.citation_files.is_empty(),
+            "citation_files should be empty on construction"
+        );
     }
 }
