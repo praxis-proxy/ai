@@ -7,17 +7,17 @@ Extracts token usage from AI inference responses and writes unified counts to [`
 
 ## Configuration Notes
 
-Supports both streaming (SSE) and non-streaming (JSON) responses across all five providers (OpenAI, Anthropic, Google, Bedrock, Azure).
+Supports both streaming (SSE) and non-streaming (JSON) responses across five providers (OpenAI, Anthropic, Google, Bedrock Converse, Azure), plus a header-only extraction path for Bedrock `InvokeModel`.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `provider` | TokenUsageProvider | yes | AI provider whose response format to parse. |
+| `provider` | `openai` \| `anthropic` \| `google` \| `bedrock` \| `bedrock_invoke_model` \| `azure` | yes | AI provider whose response format to parse. |
 
 ## Example
 
 ```yaml
 filter: token_count
-provider: openai
+provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure
 ```
