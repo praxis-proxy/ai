@@ -91,7 +91,9 @@ Turn fields:
    Remove secrets, hostnames, account identifiers, user text that should not be
    committed, local file paths, and unstable timestamps. Replace real IDs with
    deterministic fixture IDs like `msg_replay_tool_call` or
-   `resp_replay_structured_output`.
+   `resp_replay_structured_output`. When redacting linked IDs such as `uuid`,
+   `parentUuid`, `promptId`, or `sessionId`, preserve equality and parent-child
+   relationships instead of inventing new links.
 
 4. Add or extend an integration test in
    `tests/integration/tests/suite/examples/session_replay.rs`.

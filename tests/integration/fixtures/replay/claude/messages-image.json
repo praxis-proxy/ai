@@ -63,9 +63,9 @@
       },
       "source_records": [
         {
-          "parentUuid": "turn_parent_replay_claude_image",
+          "parentUuid": "00000000-0000-4000-8000-000000000001",
           "isSidechain": false,
-          "promptId": "prompt_replay_claude_image",
+          "promptId": "00000000-0000-4000-8000-000000000010",
           "type": "user",
           "message": {
             "role": "user",
@@ -84,7 +84,7 @@
               }
             ]
           },
-          "uuid": "turn_user_replay_claude_image",
+          "uuid": "00000000-0000-4000-8000-000000000002",
           "timestamp": "2026-07-08T17:52:01.280Z",
           "imagePasteIds": [
             1
@@ -97,14 +97,14 @@
           "userType": "external",
           "entrypoint": "cli",
           "cwd": "fixture-cwd",
-          "sessionId": "session_replay_claude_image",
+          "sessionId": "00000000-0000-4000-8000-000000000020",
           "version": "2.1.204",
           "gitBranch": "fixture-branch"
         },
         {
-          "parentUuid": "turn_user_replay_claude_image",
+          "parentUuid": "00000000-0000-4000-8000-000000000003",
           "isSidechain": false,
-          "promptId": "prompt_replay_claude_image",
+          "promptId": "00000000-0000-4000-8000-000000000010",
           "type": "user",
           "message": {
             "role": "user",
@@ -116,17 +116,17 @@
             ]
           },
           "isMeta": true,
-          "uuid": "turn_user_replay_claude_image_placeholder",
+          "uuid": "00000000-0000-4000-8000-000000000004",
           "timestamp": "2026-07-08T17:52:01.280Z",
           "userType": "external",
           "entrypoint": "cli",
           "cwd": "fixture-cwd",
-          "sessionId": "session_replay_claude_image",
+          "sessionId": "00000000-0000-4000-8000-000000000020",
           "version": "2.1.204",
           "gitBranch": "fixture-branch"
         },
         {
-          "parentUuid": "turn_user_replay_claude_image_placeholder",
+          "parentUuid": "00000000-0000-4000-8000-000000000004",
           "isSidechain": false,
           "message": {
             "model": "claude-opus-4-6",
@@ -164,17 +164,17 @@
           },
           "requestId": "req_replay_claude_image",
           "type": "assistant",
-          "uuid": "turn_assistant_replay_claude_image_thinking",
+          "uuid": "00000000-0000-4000-8000-000000000005",
           "timestamp": "2026-07-08T17:52:05.102Z",
           "userType": "external",
           "entrypoint": "cli",
           "cwd": "fixture-cwd",
-          "sessionId": "session_replay_claude_image",
+          "sessionId": "00000000-0000-4000-8000-000000000020",
           "version": "2.1.204",
           "gitBranch": "fixture-branch"
         },
         {
-          "parentUuid": "turn_assistant_replay_claude_image_thinking",
+          "parentUuid": "00000000-0000-4000-8000-000000000005",
           "isSidechain": false,
           "message": {
             "model": "claude-opus-4-6",
@@ -211,12 +211,12 @@
           },
           "requestId": "req_replay_claude_image",
           "type": "assistant",
-          "uuid": "turn_assistant_replay_claude_image_final",
+          "uuid": "00000000-0000-4000-8000-000000000006",
           "timestamp": "2026-07-08T17:52:09.611Z",
           "userType": "external",
           "entrypoint": "cli",
           "cwd": "fixture-cwd",
-          "sessionId": "session_replay_claude_image",
+          "sessionId": "00000000-0000-4000-8000-000000000020",
           "version": "2.1.204",
           "gitBranch": "fixture-branch"
         }
