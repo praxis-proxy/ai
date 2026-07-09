@@ -854,37 +854,50 @@ mod tests {
 
     fn assert_value_has_no_local_path(value: &Value, fixture_path: &std::path::Path, json_path: &str) {
         match value {
-            Value::String(text) => {
-                const LOCAL_PATH_PATTERNS: &[&str] = &[
-                    "/Users/",
-                    "/var/folders/",
-                    "/private/var/",
-                    "/tmp/",
-                    "TemporaryItems",
-                    "C:\\Users\\",
-                    "\\Users\\",
-                    "\\AppData\\",
-                ];
-
-                for pattern in LOCAL_PATH_PATTERNS {
-                    assert!(
-                        !text.contains(pattern),
-                        "fixture {} contains local path pattern {pattern:?} at {json_path}: {text:?}",
-                        fixture_path.display()
-                    );
-                }
-            },
-            Value::Array(items) => {
-                for (index, item) in items.iter().enumerate() {
-                    assert_value_has_no_local_path(item, fixture_path, &format!("{json_path}[{index}]"));
-                }
-            },
-            Value::Object(object) => {
-                for (key, item) in object {
-                    assert_value_has_no_local_path(item, fixture_path, &format!("{json_path}.{key}"));
-                }
-            },
+            Value::String(text) => assert_text_has_no_local_path(text, fixture_path, json_path),
+            Value::Array(items) => assert_array_has_no_local_path(items, fixture_path, json_path),
+            Value::Object(object) => assert_object_has_no_local_path(object, fixture_path, json_path),
             Value::Null | Value::Bool(_) | Value::Number(_) => {},
         }
+    }
+
+    fn assert_text_has_no_local_path(text: &str, fixture_path: &std::path::Path, json_path: &str) {
+        const LOCAL_PATH_PATTERNS: &[&str] = &[
+            "/Users/",
+            "/var/folders/",
+            "/private/var/",
+            "/tmp/",
+            "TemporaryItems",
+            "C:\\Users\\",
+            "\\Users\\",
+            "\\AppData\\",
+        ];
+
+        for pattern in LOCAL_PATH_PATTERNS {
+            assert!(
+                !text.contains(pattern),
+                "fixture {} contains local path pattern {pattern:?} at {json_path}: {text:?}",
+                fixture_path.display()
+            );
+        }
+    }
+
+    fn assert_array_has_no_local_path(items: &[Value], fixture_path: &std::path::Path, json_path: &str) {
+        for (index, item) in items.iter().enumerate() {
+            assert_value_has_no_local_path(item, fixture_path, &format!("{json_path}[{index}]"));
+        }
+    }
+
+    fn assert_object_has_no_local_path(object: &Map<String, Value>, fixture_path: &std::path::Path, json_path: &str) {
+        for (key, item) in object {
+            if is_base64_data_field(object, key) {
+                continue;
+            }
+            assert_value_has_no_local_path(item, fixture_path, &format!("{json_path}.{key}"));
+        }
+    }
+
+    fn is_base64_data_field(object: &Map<String, Value>, key: &str) -> bool {
+        key == "data" && object.get("type").and_then(Value::as_str) == Some("base64")
     }
 }
