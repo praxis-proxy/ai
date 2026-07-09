@@ -512,8 +512,7 @@ fn is_claude_user_message(message: &Value) -> bool {
 /// Return true when a newly observed Claude user message should become the
 /// request paired with the next assistant response.
 fn should_replace_pending_claude_user(pending: Option<&Value>, candidate: &Value) -> bool {
-    pending.is_none()
-        || claude_message_contains_content_type(candidate, "image")
+    claude_message_contains_content_type(candidate, "image")
         || !pending.is_some_and(|message| claude_message_contains_content_type(message, "image"))
 }
 
@@ -529,9 +528,12 @@ fn claude_message_contains_content_type(message: &Value, block_type: &str) -> bo
 /// Return true when assistant content includes client-visible replay content.
 fn has_replayable_claude_assistant_content(message: &Value) -> bool {
     message.get("content").and_then(Value::as_array).is_some_and(|content| {
-        content
-            .iter()
-            .any(|block| block.get("type").and_then(Value::as_str) != Some("thinking"))
+        content.iter().any(|block| {
+            !matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            )
+        })
     })
 }
 
@@ -672,6 +674,7 @@ mod tests {
     const CLAUDE_CODE_IMAGE_JSONL: &str = r#"{"uuid":"turn_image_user","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"What's in this image?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]}}
 {"uuid":"turn_image_placeholder","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"[Image: source: /tmp/screenshot.png]"}]}}
 {"uuid":"turn_image_thinking","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"thinking","thinking":"Looking at the image.","signature":"sig"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}
+{"uuid":"turn_image_redacted_thinking","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"redacted_thinking","data":"encrypted-reasoning"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}
 {"uuid":"turn_image_assistant","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:02Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"a terminal screenshot"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#;
 
     #[test]
@@ -820,14 +823,15 @@ mod tests {
             .source_records
             .as_ref()
             .expect("source records should be preserved");
-        assert_eq!(source_records.len(), 4);
+        assert_eq!(source_records.len(), 5);
         assert_eq!(source_records[0]["message"]["content"][1]["type"], "image");
         assert_eq!(
             source_records[1]["message"]["content"][0]["text"],
             "[Image: source: /tmp/screenshot.png]"
         );
         assert_eq!(source_records[2]["message"]["content"][0]["type"], "thinking");
-        assert_eq!(source_records[3]["message"]["content"][0]["type"], "text");
+        assert_eq!(source_records[3]["message"]["content"][0]["type"], "redacted_thinking");
+        assert_eq!(source_records[4]["message"]["content"][0]["type"], "text");
     }
 
     fn replay_fixture_root() -> PathBuf {
