@@ -17,17 +17,17 @@ Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method,
 | `headers.streaming` | string | no | Header name for streaming detection (e.g. `x-praxis-a2a-streaming`). |
 | `headers.task_id` | string | no | Header name for the extracted task ID (e.g. `x-praxis-a2a-task-id`). |
 | `headers.version` | string | no | Header name for A2A version (e.g. `x-praxis-a2a-version`). |
-| `max_body_bytes` | usize | no | Maximum body size in bytes for `StreamBuffer`. |
+| `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer`. |
 | `method_aliases` | object<string, string> | no | Method aliases for compatibility (slash-delimited → `PascalCase`). |
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Invalid input handling behavior. |
 | `task_routing` | TaskRoutingConfig | no | Task-ownership routing configuration. |
 | `task_routing.enabled` | bool | no | Whether task routing is enabled. |
-| `task_routing.max_response_body_bytes` | usize | no | Maximum response body bytes to buffer for task route capture. |
+| `task_routing.max_response_body_bytes` | integer | no | Maximum response body bytes to buffer for task route capture. |
 | `task_routing.on_lookup_miss` | `continue` | no | Behavior when a task route lookup misses. |
 | `task_routing.route_cluster_header` | string | no | Internal header name injected on task route hit. |
 | `task_routing.store` | `local` | no | Storage backend for task routes. |
-| `task_routing.terminal_ttl_seconds` | u64 | no | TTL in seconds for terminal task routes (0 = remove immediately). |
-| `task_routing.ttl_seconds` | u64 | no | TTL in seconds for non-terminal task routes. |
+| `task_routing.terminal_ttl_seconds` | integer | no | TTL in seconds for terminal task routes (0 = remove immediately). |
+| `task_routing.ttl_seconds` | integer | no | TTL in seconds for non-terminal task routes. |
 
 ## Examples
 

@@ -32,10 +32,10 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 | `headers.name` | string | no | Header name for the tool/resource/prompt name (e.g. `x-praxis-mcp-name`). |
 | `headers.protocol_version` | string | no | Header name for the MCP protocol version (e.g. `x-praxis-mcp-protocol-version`). |
 | `headers.session_present` | string | no | Header name for MCP session presence (e.g. `x-praxis-mcp-session-present`). |
-| `max_body_bytes` | usize | no | Maximum body size in bytes for `StreamBuffer`. |
+| `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer`. |
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Invalid input handling behavior. |
 | `cache_scope` | `public` \| `private` | no | Cache scope for stateless responses. Requires `protocol_profile: stateless`. |
-| `cache_ttl_ms` | u64 | no | Cache TTL in milliseconds for stateless responses. Requires `protocol_profile: stateless`. |
+| `cache_ttl_ms` | integer | no | Cache TTL in milliseconds for stateless responses. Requires `protocol_profile: stateless`. |
 | `default_version` | string | no | Fallback MCP protocol version. When omitted, derived from the profile. |
 | `invalid_tool_policy` | `reject_server` \| `filter_out` | no | Behavior when a tool has an invalid schema. |
 | `path` | string | no | Public MCP path handled by Praxis. |

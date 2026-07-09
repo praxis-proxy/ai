@@ -10,7 +10,7 @@ Classifies Anthropic Messages API requests and promotes routing facts to headers
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Behavior when the body cannot be classified. |
-| `max_body_bytes` | usize | no | Maximum body size in bytes for `StreamBuffer` mode. |
+| `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 | `headers` | AnthropicMessagesFormatHeaders | no | Header names for promoted classification facts. |
 | `headers.format` | string | no | Header name for the detected format. |
 | `headers.model` | string | no | Header name for the extracted model value. |

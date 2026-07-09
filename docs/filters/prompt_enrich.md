@@ -17,7 +17,7 @@ In chains that also use `json_body_field` or `model_to_header`, place `prompt_en
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_body_bytes` | usize | no | Maximum request body size to buffer before parsing. |
+| `max_body_bytes` | integer | no | Maximum request body size to buffer before parsing. |
 | `on_invalid` | `continue` \| `reject` | no | Behavior when the body is not valid JSON or lacks a `messages` array. |
 | `prepend` | MessageConfig[] | no | Messages to prepend at the beginning of the `messages` array. |
 | `prepend[].role` | `system` \| `user` | yes | Role for the injected message. |

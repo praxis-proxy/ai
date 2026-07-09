@@ -13,10 +13,10 @@ All fields are optional; omitted values fall back to [`SseParserConfig`] default
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_buffer_bytes` | usize | no | Maximum bytes buffered for incomplete SSE lines/data across chunk boundaries. Default: 10 MiB. |
-| `max_events` | usize | no | Maximum number of SSE events before the parser errors. Default: 100,000. |
-| `timeout_secs` | u64 | no | Maximum seconds from first chunk to stream completion. Default: 300 (5 minutes). |
-| `max_tool_call_argument_bytes` | usize | no | Maximum bytes accumulated per function-call argument string from `function_call_arguments.delta` events. Default: 1 MiB. |
+| `max_buffer_bytes` | integer | no | Maximum bytes buffered for incomplete SSE lines/data across chunk boundaries. Default: 10 MiB. |
+| `max_events` | integer | no | Maximum number of SSE events before the parser errors. Default: 100,000. |
+| `timeout_secs` | integer | no | Maximum seconds from first chunk to stream completion. Default: 300 (5 minutes). |
+| `max_tool_call_argument_bytes` | integer | no | Maximum bytes accumulated per function-call argument string from `function_call_arguments.delta` events. Default: 1 MiB. |
 
 ## Example
 
