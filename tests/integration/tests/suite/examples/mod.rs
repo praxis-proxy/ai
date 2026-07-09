@@ -12,6 +12,7 @@ mod anthropic_messages;
 mod credential_injection;
 mod full_flow;
 mod mcp_broker;
+mod mcp_tool_resolve;
 mod model_to_header;
 mod openai_conversations;
 mod openai_response_store;

@@ -19,6 +19,7 @@
 
 mod config;
 pub(crate) mod error;
+pub(crate) mod mcp_tool_resolve;
 pub(crate) mod model_rewrite;
 pub(crate) mod proxy;
 pub(crate) mod state;
@@ -26,6 +27,7 @@ pub(crate) mod store;
 pub(crate) mod stream_events;
 pub(crate) mod tool_parse;
 
+pub use mcp_tool_resolve::McpToolResolveFilter;
 pub use model_rewrite::ModelRewriteFilter;
 pub use store::ResponseStoreFilter;
 pub use tool_parse::ToolParseFilter;

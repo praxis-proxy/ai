@@ -491,10 +491,13 @@ fn collect_mcp_tool_listings_from_items(
             return None;
         }
 
-        Some(serde_json::json!({
-            "server_label": label,
-            "tools": tools,
-        }))
+        let mut map = serde_json::Map::new();
+        map.insert("server_label".to_owned(), Value::String(label.to_owned()));
+        map.insert("tools".to_owned(), Value::Array(tools.clone()));
+        if let Some(url) = item.get("server_url").and_then(Value::as_str) {
+            map.insert("server_url".to_owned(), Value::String(url.to_owned()));
+        }
+        Some(Value::Object(map))
     }));
 }
 

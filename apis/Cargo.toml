@@ -13,7 +13,7 @@ name = "praxis_ai_apis"
 
 [features]
 default = ["store"]
-store = ["dep:sqlx", "dep:dashmap", "dep:tokio"]
+store = ["dep:sqlx", "dep:dashmap"]
 
 [lints]
 workspace = true
@@ -27,13 +27,15 @@ percent-encoding = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["rt", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "time", "net"] }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 

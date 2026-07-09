@@ -144,6 +144,10 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "mcp_tool_resolve" => praxis_ai_apis::openai::McpToolResolveFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
     );
 }

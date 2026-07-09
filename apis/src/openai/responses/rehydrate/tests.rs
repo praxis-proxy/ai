@@ -498,6 +498,7 @@ async fn extracts_mcp_tools_from_previous_response() {
             "id": "mcpl_abc",
             "type": "mcp_list_tools",
             "server_label": "my-server",
+            "server_url": "http://10.0.0.5:8080/mcp",
             "tools": [
                 {"name": "get_weather", "description": "Get weather", "input_schema": {}},
                 {"name": "search", "description": "Search docs", "input_schema": {}}
@@ -540,6 +541,10 @@ async fn extracts_mcp_tools_from_previous_response() {
     assert_eq!(
         state.previous_tools[0]["tools"][0]["description"], "Get weather",
         "ResponsesState should preserve full tool definitions"
+    );
+    assert_eq!(
+        state.previous_tools[0]["server_url"], "http://10.0.0.5:8080/mcp",
+        "server_url should be preserved for cache matching"
     );
 }
 
