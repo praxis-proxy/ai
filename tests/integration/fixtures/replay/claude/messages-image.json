@@ -3,7 +3,7 @@
   "protocol": "anthropic_messages",
   "turns": [
     {
-      "name": "claude-code-turn-1",
+      "name": "messages-image",
       "path": "/v1/messages",
       "request": {
         "model": "claude-opus-4-6",

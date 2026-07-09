@@ -52,7 +52,9 @@ before it is used.
 
 Top-level fields:
 
-- `source`: describes the origin and sanitization level of the sample.
+- `source`: describes the origin and sanitization level of the sample, such as
+  `Sanitized Claude Code session log`. Keep scenario names in the turn `name`
+  and fixture filename, not in `source`.
 - `protocol`: currently `anthropic_messages` or `openai_responses`.
 - `turns`: ordered request/response pairs from the session.
 

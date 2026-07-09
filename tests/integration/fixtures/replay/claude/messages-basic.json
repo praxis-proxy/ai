@@ -1,5 +1,5 @@
 {
-  "source": "Sanitized Claude session replay sample: single Messages turn",
+  "source": "Sanitized Claude Code session log",
   "protocol": "anthropic_messages",
   "turns": [
     {

@@ -1,5 +1,5 @@
 {
-  "source": "Sanitized Codex session replay sample: single Responses turn",
+  "source": "Sanitized Codex session log",
   "protocol": "openai_responses",
   "turns": [
     {
