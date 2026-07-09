@@ -303,8 +303,7 @@ impl SessionReplayImporter for ClaudeCodeSessionImporter {
                 update_pending_claude_turn(&mut pending_turn, user_message, record);
                 continue;
             }
-            if let Some(turn) = claude_turn_from_assistant_record(&record, &mut pending_turn, turns.len() + 1, options)
-            {
+            if let Some(turn) = claude_turn_from_assistant_record(record, &mut pending_turn, turns.len() + 1, options) {
                 turns.push(turn);
             }
         }
@@ -439,21 +438,24 @@ fn update_pending_claude_turn(pending: &mut Option<PendingClaudeTurn>, user_mess
 /// Accumulate a Claude assistant record and return a replay turn once the
 /// assistant message contains client-visible content.
 fn claude_turn_from_assistant_record(
-    record: &Value,
+    record: Value,
     pending_turn: &mut Option<PendingClaudeTurn>,
     turn_number: usize,
     options: ImportOptions,
 ) -> Option<ReplayTurn> {
-    if !is_claude_assistant_record(record) {
+    if !is_claude_assistant_record(&record) {
         return None;
     }
     let pending = pending_turn.as_mut()?;
-    pending.source_records.push(record.clone());
-    if !is_importable_claude_assistant_record(record) {
-        return None;
-    }
+    let response = if is_importable_claude_assistant_record(&record) {
+        Some(record.get("message")?.clone())
+    } else {
+        None
+    };
+    pending.source_records.push(record);
+    let response = response?;
     let pending = pending_turn.take().expect("pending turn exists");
-    claude_turn_from_record(record, pending, turn_number, options)
+    claude_turn_from_response(response, pending, turn_number, options)
 }
 
 /// Extract a Claude Code user message from a JSONL record.
@@ -481,25 +483,23 @@ fn is_importable_claude_assistant_record(record: &Value) -> bool {
     })
 }
 
-/// Extract an importable Claude Code turn from a JSONL assistant record.
-fn claude_turn_from_record(
-    record: &Value,
+/// Build a replay turn from an importable Claude Code assistant response.
+fn claude_turn_from_response(
+    response: Value,
     pending: PendingClaudeTurn,
     turn_number: usize,
     options: ImportOptions,
 ) -> Option<ReplayTurn> {
-    let record_object = record.as_object()?;
-    let message = record_object.get("message")?;
-    if !is_anthropic_assistant_message(message) {
+    if !is_anthropic_assistant_message(&response) {
         return None;
     }
-    let request = claude_request_from_response(message, pending.request_message, options)?;
+    let request = claude_request_from_response(&response, pending.request_message, options)?;
 
     Some(ReplayTurn {
         name: replay_turn_name("claude-code-turn", turn_number),
         path: "/v1/messages".to_owned(),
         request,
-        response: message.clone(),
+        response,
         source_records: Some(pending.source_records),
     })
 }
