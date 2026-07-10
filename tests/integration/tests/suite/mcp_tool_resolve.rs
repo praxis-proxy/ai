@@ -5,8 +5,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    free_port, http_send, json_post, parse_body, parse_status, start_backend_with_shutdown, start_echo_backend,
-    start_proxy,
+    McpMockConfig, McpToolFixture, free_port, http_send, json_post, parse_body, parse_status,
+    start_backend_with_shutdown, start_echo_backend, start_mcp_mock_server_with_config, start_proxy,
 };
 
 // =============================================================================
@@ -298,6 +298,147 @@ fn mcp_tool_names_filter_object_accepted() {
 }
 
 // =============================================================================
+// Mock MCP Server: tools/list and mcp_tool_map populated
+// =============================================================================
+
+#[test]
+fn mcp_tools_list_succeeds_against_mock_server() {
+    let mcp_config = McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather").with_description("Get weather"),
+            McpToolFixture::new("create_event"),
+        ],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["get_weather"]}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 200, "MCP resolution should succeed");
+
+    assert!(
+        mcp_server.method_count("initialize") >= 1,
+        "should have called initialize on MCP server"
+    );
+    assert!(
+        mcp_server.method_count("tools/list") >= 1,
+        "should have called tools/list on MCP server"
+    );
+}
+
+#[test]
+fn mcp_too_many_tools_rejected() {
+    let tools: Vec<McpToolFixture> = (0..5).map(|i| McpToolFixture::new(format!("tool_{i}"))).collect();
+    let mcp_config = McpMockConfig {
+        tools,
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback_with_max_tools(proxy_port, backend_guard.port(), 2);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"many","server_url":"{mcp_url}","allowed_tools":["tool_0"]}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 502, "too many tools should produce 502");
+    let response_body = parse_body(&raw);
+    assert!(
+        response_body.contains("too many tools"),
+        "rejection should mention too many tools: {response_body}"
+    );
+}
+
+#[test]
+fn mcp_mock_server_echoes_resolved_body() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("calc")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback_with_proxy(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"math","server_url":"{mcp_url}","allowed_tools":["calc"]}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 200, "should return 200");
+    let echoed = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    assert_eq!(parsed["model"], "gpt-4.1", "model should be preserved");
+    let input = &parsed["input"];
+    let has_test_content = if input.is_string() {
+        input.as_str() == Some("test")
+    } else if let Some(arr) = input.as_array() {
+        arr.iter()
+            .any(|item| item.get("content").and_then(|c| c.as_str()) == Some("test"))
+    } else {
+        false
+    };
+    assert!(has_test_content, "input should contain 'test': {input}");
+
+    assert!(
+        mcp_server.method_count("tools/list") >= 1,
+        "should have called tools/list"
+    );
+}
+
+#[test]
+fn mcp_invalid_authorization_rejected() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"{mcp_url}","authorization":"tok\nbad","allowed_tools":["tool_a"]}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "invalid authorization chars should produce 502"
+    );
+    let response_body = parse_body(&raw);
+    assert!(
+        response_body.contains("invalid HTTP header"),
+        "rejection should mention invalid header: {response_body}"
+    );
+}
+
+// =============================================================================
 // YAML Helpers
 // =============================================================================
 
@@ -347,6 +488,93 @@ filter_chains:
         on_invalid: continue
       - filter: tool_parse
       - filter: mcp_tool_resolve
+      - filter: responses_proxy
+        name: inference
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "backend"
+      - filter: load_balancer
+        clusters:
+          - name: "backend"
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+"#
+    )
+}
+
+fn resolve_yaml_loopback(proxy_port: u16, backend_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+      - filter: tool_parse
+      - filter: mcp_tool_resolve
+        allow_loopback: true
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "backend"
+      - filter: load_balancer
+        clusters:
+          - name: "backend"
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+"#
+    )
+}
+
+fn resolve_yaml_loopback_with_max_tools(proxy_port: u16, backend_port: u16, max_tools: usize) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+      - filter: tool_parse
+      - filter: mcp_tool_resolve
+        allow_loopback: true
+        max_tools: {max_tools}
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "backend"
+      - filter: load_balancer
+        clusters:
+          - name: "backend"
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+"#
+    )
+}
+
+fn resolve_yaml_loopback_with_proxy(proxy_port: u16, backend_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+      - filter: tool_parse
+      - filter: mcp_tool_resolve
+        allow_loopback: true
       - filter: responses_proxy
         name: inference
       - filter: router

@@ -98,6 +98,10 @@ pub(crate) enum McpClientError {
         /// The blocked URL.
         String,
     ),
+
+    /// Authorization token contains invalid header characters.
+    #[error("authorization token contains invalid HTTP header characters")]
+    InvalidAuthorization,
 }
 
 // -----------------------------------------------------------------------------
@@ -115,17 +119,19 @@ pub(crate) enum McpClientError {
 ///
 /// Returns [`McpClientError`] on connection failure, timeout, or
 /// invalid server response.
+#[expect(clippy::too_many_arguments, reason = "allow_loopback extends the existing param set")]
 pub(crate) async fn list_tools(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
     timeout: Duration,
     max_tools: usize,
+    allow_loopback: bool,
 ) -> Result<Vec<serde_json::Value>, McpClientError> {
-    let resolved = resolve_and_validate(server_url, timeout).await?;
+    let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
     let transport = StreamableHttpClientTransport::with_client(
         build_pinned_client(&resolved)?,
-        build_transport_config(server_url, headers, authorization),
+        build_transport_config(server_url, headers, authorization)?,
     );
     let url = server_url.to_owned();
     let client = tokio::time::timeout(timeout, Box::pin(().serve(transport)))
@@ -187,11 +193,16 @@ async fn paginate_tools(
 
 /// Build transport config from server URL, optional headers, and
 /// optional `OAuth` authorization token.
+///
+/// # Errors
+///
+/// Returns [`McpClientError::InvalidAuthorization`] if the token
+/// contains characters invalid in HTTP header values.
 fn build_transport_config(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
-) -> StreamableHttpClientTransportConfig {
+) -> Result<StreamableHttpClientTransportConfig, McpClientError> {
     let mut config = StreamableHttpClientTransportConfig::with_uri(server_url);
     let mut header_map = HashMap::new();
 
@@ -207,13 +218,13 @@ fn build_transport_config(
         }
     }
 
-    inject_authorization(&mut header_map, authorization);
+    inject_authorization(&mut header_map, authorization)?;
 
     if !header_map.is_empty() {
         config = config.custom_headers(header_map);
     }
 
-    config
+    Ok(config)
 }
 
 /// Inject `authorization` as a Bearer token.
@@ -221,14 +232,22 @@ fn build_transport_config(
 /// `Authorization` headers in the `headers` field are stripped
 /// upstream so the dedicated `authorization` field is the only
 /// auth source.
-fn inject_authorization(header_map: &mut HashMap<http::HeaderName, http::HeaderValue>, authorization: Option<&str>) {
+///
+/// # Errors
+///
+/// Returns [`McpClientError::InvalidAuthorization`] if the token
+/// contains characters invalid in HTTP header values.
+fn inject_authorization(
+    header_map: &mut HashMap<http::HeaderName, http::HeaderValue>,
+    authorization: Option<&str>,
+) -> Result<(), McpClientError> {
     let Some(token) = authorization else {
-        return;
+        return Ok(());
     };
     let bearer = format!("Bearer {token}");
-    if let Ok(val) = http::HeaderValue::from_str(&bearer) {
-        header_map.insert(http::header::AUTHORIZATION, val);
-    }
+    let val = http::HeaderValue::from_str(&bearer).map_err(|_invalid| McpClientError::InvalidAuthorization)?;
+    header_map.insert(http::header::AUTHORIZATION, val);
+    Ok(())
 }
 
 /// Reject MCP server URLs that point at SSRF-sensitive addresses.
@@ -236,8 +255,10 @@ fn inject_authorization(header_map: &mut HashMap<http::HeaderName, http::HeaderV
 /// Lightweight validation for use on the cache-hit path where no
 /// connection is made. For the connect path, use
 /// [`resolve_and_validate`] to also pin resolved addresses.
-pub(crate) async fn validate_mcp_url(url: &str, timeout: Duration) -> Result<(), McpClientError> {
-    resolve_and_validate(url, timeout).await.map(|_resolved| ())
+pub(crate) async fn validate_mcp_url(url: &str, timeout: Duration, allow_loopback: bool) -> Result<(), McpClientError> {
+    resolve_and_validate(url, timeout, allow_loopback)
+        .await
+        .map(|_resolved| ())
 }
 
 /// Resolved MCP URL with validated addresses pinned for
@@ -257,7 +278,11 @@ struct ResolvedMcpUrl {
 /// Returns the validated resolved addresses so the caller can
 /// pin them on the HTTP client, closing the DNS-rebinding
 /// TOCTOU window between validation and connect.
-async fn resolve_and_validate(url: &str, timeout: Duration) -> Result<ResolvedMcpUrl, McpClientError> {
+async fn resolve_and_validate(
+    url: &str,
+    timeout: Duration,
+    allow_loopback: bool,
+) -> Result<ResolvedMcpUrl, McpClientError> {
     let uri: http::Uri = url
         .parse()
         .map_err(|_parse_err| McpClientError::SsrfBlocked(url.to_owned()))?;
@@ -274,23 +299,26 @@ async fn resolve_and_validate(url: &str, timeout: Duration) -> Result<ResolvedMc
         return Err(McpClientError::SsrfBlocked(url.to_owned()));
     };
     let host = host.trim_matches(|c| c == '[' || c == ']');
-    if is_blocked_hostname(host) {
+    if !allow_loopback && is_blocked_hostname(host) {
         return Err(McpClientError::SsrfBlocked(url.to_owned()));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        check_ip(ip, url)?;
+        check_ip(ip, url, allow_loopback)?;
         return Ok(ResolvedMcpUrl {
             hostname: None,
             addrs: Vec::new(),
         });
     }
     let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
-    resolve_hostname_ssrf(host, port, url, timeout).await
+    resolve_hostname_ssrf(host, port, url, timeout, allow_loopback).await
 }
 
 /// Check a literal IP address against the SSRF block list.
-fn check_ip(ip: IpAddr, url: &str) -> Result<(), McpClientError> {
+fn check_ip(ip: IpAddr, url: &str, allow_loopback: bool) -> Result<(), McpClientError> {
     let ip = praxis_core::connectivity::normalize_mapped_ipv4(ip);
+    if allow_loopback && ip.is_loopback() {
+        return Ok(());
+    }
     if is_ssrf_sensitive(&ip) {
         return Err(McpClientError::SsrfBlocked(url.to_owned()));
     }
@@ -305,6 +333,7 @@ async fn resolve_hostname_ssrf(
     port: u16,
     url: &str,
     timeout: Duration,
+    allow_loopback: bool,
 ) -> Result<ResolvedMcpUrl, McpClientError> {
     let addrs: Vec<SocketAddr> = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
         .await
@@ -316,6 +345,9 @@ async fn resolve_hostname_ssrf(
         .collect();
     for addr in &addrs {
         let ip = praxis_core::connectivity::normalize_mapped_ipv4(addr.ip());
+        if allow_loopback && ip.is_loopback() {
+            continue;
+        }
         if is_ssrf_sensitive(&ip) {
             return Err(McpClientError::SsrfBlocked(url.to_owned()));
         }

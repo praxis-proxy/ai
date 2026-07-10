@@ -10,7 +10,7 @@ use super::*;
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn validate_url(url: &str) -> Result<(), McpClientError> {
-    validate_mcp_url(url, TEST_TIMEOUT).await
+    validate_mcp_url(url, TEST_TIMEOUT, false).await
 }
 
 // =========================================================================
@@ -19,7 +19,7 @@ async fn validate_url(url: &str) -> Result<(), McpClientError> {
 
 #[test]
 fn build_config_with_no_headers() {
-    let config = build_transport_config("http://localhost:8001/mcp", None, None);
+    let config = build_transport_config("http://localhost:8001/mcp", None, None).unwrap();
     assert_eq!(&*config.uri, "http://localhost:8001/mcp", "URI should match");
     assert!(config.custom_headers.is_empty(), "no custom headers expected");
 }
@@ -27,7 +27,7 @@ fn build_config_with_no_headers() {
 #[test]
 fn build_config_with_headers() {
     let headers = serde_json::json!({"x-custom": "value", "x-other": "val2"});
-    let config = build_transport_config("http://localhost:8001/mcp", Some(&headers), None);
+    let config = build_transport_config("http://localhost:8001/mcp", Some(&headers), None).unwrap();
 
     assert_eq!(config.custom_headers.len(), 2, "should have 2 custom headers");
 }
@@ -35,7 +35,7 @@ fn build_config_with_headers() {
 #[test]
 fn build_config_ignores_non_string_header_values() {
     let headers = serde_json::json!({"x-good": "ok", "x-bad": 123});
-    let config = build_transport_config("http://localhost:8001/mcp", Some(&headers), None);
+    let config = build_transport_config("http://localhost:8001/mcp", Some(&headers), None).unwrap();
 
     assert_eq!(
         config.custom_headers.len(),
@@ -47,7 +47,7 @@ fn build_config_ignores_non_string_header_values() {
 #[test]
 fn build_config_ignores_non_object_headers() {
     let headers = serde_json::json!("not-an-object");
-    let config = build_transport_config("http://localhost:8001/mcp", Some(&headers), None);
+    let config = build_transport_config("http://localhost:8001/mcp", Some(&headers), None).unwrap();
 
     assert!(config.custom_headers.is_empty(), "non-object headers should be ignored");
 }
@@ -69,7 +69,7 @@ fn hop_by_hop_headers_stripped_from_mcp_headers() {
         "proxy-authorization": "Basic creds",
         "x-custom": "safe"
     });
-    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None);
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
 
     assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
     assert!(
@@ -88,7 +88,7 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
         "x-a2a-method": "task/send",
         "x-custom": "safe"
     });
-    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None);
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
 
     assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
     assert!(
@@ -105,7 +105,7 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
 
 #[test]
 fn authorization_injects_bearer_header() {
-    let config = build_transport_config("http://api.example.com/mcp", None, Some("tok_abc"));
+    let config = build_transport_config("http://api.example.com/mcp", None, Some("tok_abc")).unwrap();
     let auth = config.custom_headers.get(&http::header::AUTHORIZATION).unwrap();
     assert_eq!(auth, "Bearer tok_abc", "should inject Bearer token");
 }
@@ -113,7 +113,7 @@ fn authorization_injects_bearer_header() {
 #[test]
 fn authorization_with_custom_headers() {
     let headers = serde_json::json!({"x-custom": "val"});
-    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), Some("tok_xyz"));
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), Some("tok_xyz")).unwrap();
 
     assert_eq!(config.custom_headers.len(), 2, "should have both headers");
     assert_eq!(
@@ -126,7 +126,7 @@ fn authorization_with_custom_headers() {
 #[test]
 fn authorization_field_overrides_headers_authorization() {
     let headers = serde_json::json!({"authorization": "Basic creds"});
-    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), Some("tok_real"));
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), Some("tok_real")).unwrap();
 
     let auth = config.custom_headers.get(&http::header::AUTHORIZATION).unwrap();
     assert_eq!(
@@ -138,7 +138,7 @@ fn authorization_field_overrides_headers_authorization() {
 #[test]
 fn authorization_in_headers_stripped_when_no_field() {
     let headers = serde_json::json!({"authorization": "Basic creds", "x-custom": "val"});
-    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None);
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
 
     assert!(
         !config.custom_headers.contains_key(&http::header::AUTHORIZATION),
@@ -149,8 +149,19 @@ fn authorization_in_headers_stripped_when_no_field() {
 
 #[test]
 fn no_authorization_no_header() {
-    let config = build_transport_config("http://api.example.com/mcp", None, None);
+    let config = build_transport_config("http://api.example.com/mcp", None, None).unwrap();
     assert!(config.custom_headers.is_empty(), "no headers expected");
+}
+
+#[test]
+fn authorization_with_invalid_chars_returns_error() {
+    let result = build_transport_config("http://api.example.com/mcp", None, Some("tok\x00bad"));
+    assert!(result.is_err(), "invalid header chars should return error");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("invalid HTTP header"),
+        "error should describe invalid header: {msg}"
+    );
 }
 
 // =========================================================================
@@ -200,6 +211,16 @@ fn list_tools_error_display() {
     let msg = err.to_string();
     assert!(msg.contains("tools/list failed"), "should describe failure");
     assert!(msg.contains("example.com"), "should include URL");
+}
+
+#[test]
+fn invalid_authorization_error_display() {
+    let err = McpClientError::InvalidAuthorization;
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid HTTP header"),
+        "should describe invalid header: {msg}"
+    );
 }
 
 // =========================================================================
@@ -321,7 +342,7 @@ fn unspecified_ip_detected_by_is_ssrf_sensitive() {
 #[test]
 fn no_authorization_field_injects_no_auth_header() {
     let headers = serde_json::json!({"x-custom": "val"});
-    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None);
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
     assert!(
         !config.custom_headers.contains_key(&http::header::AUTHORIZATION),
         "should not inject Authorization when authorization field is absent"
@@ -336,4 +357,44 @@ fn ipv6_link_local_detected_by_is_ssrf_sensitive() {
     assert!(is_ssrf_sensitive(&febf), "febf::1 should be SSRF-sensitive");
     let fe00 = "fe00::1".parse::<IpAddr>().unwrap();
     assert!(!is_ssrf_sensitive(&fe00), "fe00::1 is not link-local");
+}
+
+// =========================================================================
+// allow_loopback
+// =========================================================================
+
+#[tokio::test]
+async fn allow_loopback_permits_ipv4_loopback() {
+    assert!(
+        validate_mcp_url("http://127.0.0.1/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn allow_loopback_permits_localhost_hostname() {
+    assert!(
+        validate_mcp_url("http://localhost/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn allow_loopback_still_blocks_link_local() {
+    assert!(
+        validate_mcp_url("http://169.254.169.254/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn allow_loopback_still_blocks_unspecified() {
+    assert!(
+        validate_mcp_url("http://0.0.0.0/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_err()
+    );
 }

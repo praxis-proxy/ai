@@ -39,13 +39,19 @@
 #      history to the current request. previous_response_id takes
 #      precedence when both are present.
 #
-#   8. responses_proxy reads the assembled ResponsesState and
+#   8. mcp_tool_resolve resolves MCP tool entries from the tools
+#      array by calling tools/list on each upstream MCP server.
+#      Runs after rehydrate so previous_tools is available for
+#      cross-request caching. Writes mcp_tool_map to
+#      ResponsesState for downstream tool dispatch.
+#
+#   9. responses_proxy reads the assembled ResponsesState and
 #      rebuilds the outbound request body with the full conversation
 #      history. Strips previous_response_id and conversation
 #      (already resolved by rehydrate). Passthrough when no
 #      ResponsesState exists.
 #
-#   9. The router sends all valid Responses API create requests to
+#   10. The router sends all valid Responses API create requests to
 #      the same inference backend. The promoted mode remains available
 #      as headers/metadata for downstream filters; it does not change
 #      backend selection in this example.
@@ -126,6 +132,8 @@ filter_chains:
       - filter: openai_stream_events
 
       - filter: openai_responses_rehydrate
+
+      - filter: mcp_tool_resolve
 
       - filter: responses_proxy
         name: inference

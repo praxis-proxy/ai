@@ -45,6 +45,13 @@ pub(crate) struct McpToolResolveConfig {
     /// Maximum number of tools returned by a single MCP server.
     #[serde(default = "default_max_tools")]
     pub max_tools: usize,
+
+    /// Allow connections to loopback addresses (`127.0.0.0/8`,
+    /// `::1`, `localhost`). Disabled by default for SSRF
+    /// protection; enable for development environments where MCP
+    /// servers run locally.
+    #[serde(default)]
+    pub allow_loopback: bool,
 }
 
 /// Default max body bytes.

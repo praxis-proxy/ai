@@ -61,6 +61,9 @@ use crate::mcp_client;
 /// max_tools: 128
 /// ```
 pub struct McpToolResolveFilter {
+    /// Allow connections to loopback addresses.
+    allow_loopback: bool,
+
     /// Maximum request body bytes for `StreamBuffer`.
     max_body_bytes: usize,
 
@@ -84,6 +87,7 @@ impl McpToolResolveFilter {
         let cfg: McpToolResolveConfig = parse_filter_config("mcp_tool_resolve", config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self {
+            allow_loopback: validated.allow_loopback,
             max_body_bytes: validated.max_body_bytes,
             max_servers: validated.max_servers,
             max_tools: validated.max_tools,
@@ -161,7 +165,7 @@ impl McpToolResolveFilter {
         if !has_credentials && let Some(cached) = fetched.get(&(label, server_url)) {
             return Ok(Some(cached.clone()));
         }
-        mcp_client::validate_mcp_url(server_url, self.timeout)
+        mcp_client::validate_mcp_url(server_url, self.timeout, self.allow_loopback)
             .await
             .map_err(ResolveError::Client)?;
         let allowed = extract_allowed_tools(entry);
@@ -171,7 +175,7 @@ impl McpToolResolveFilter {
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
-        let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools).await?;
+        let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools, self.allow_loopback).await?;
         if !has_credentials {
             fetched.insert((label, server_url), tools.clone());
         }
@@ -309,12 +313,20 @@ async fn fetch_tools(
     server_url: &str,
     timeout: Duration,
     max_tools: usize,
+    allow_loopback: bool,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
     debug!(server_url, "calling MCP tools/list");
     let auth = entry.get("authorization").and_then(serde_json::Value::as_str);
-    mcp_client::list_tools(server_url, entry.get("headers"), auth, timeout, max_tools)
-        .await
-        .map_err(ResolveError::Client)
+    mcp_client::list_tools(
+        server_url,
+        entry.get("headers"),
+        auth,
+        timeout,
+        max_tools,
+        allow_loopback,
+    )
+    .await
+    .map_err(ResolveError::Client)
 }
 
 /// Write the resolved tool map to `ResponsesState`, creating

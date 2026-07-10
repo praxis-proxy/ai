@@ -13,6 +13,7 @@ Resolves MCP tool entries from the Responses API `tools` array into concrete too
 | `timeout_ms` | integer | no | Per-server timeout in milliseconds for `tools/list` calls. |
 | `max_servers` | integer | no | Maximum number of distinct MCP servers per request. |
 | `max_tools` | integer | no | Maximum number of tools returned by a single MCP server. |
+| `allow_loopback` | bool | no | Allow connections to loopback addresses (`127.0.0.0/8`, `::1`, `localhost`). Disabled by default for SSRF protection; enable for development environments where MCP servers run locally. |
 
 ## Examples
 
