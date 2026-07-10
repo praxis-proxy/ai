@@ -100,8 +100,8 @@ coverage-check:
 		--output-path coverage.json
 	@LINE_PCT=$$(jq '.data[0].totals.lines.percent' coverage.json); \
 	echo "Line coverage: $${LINE_PCT}%"; \
-	if [ $$(echo "$${LINE_PCT} < 94" | bc -l) -eq 1 ]; then \
-		echo "FAIL: coverage $${LINE_PCT}% is below 94% threshold"; \
+	if [ $$(echo "$${LINE_PCT} < 95" | bc -l) -eq 1 ]; then \
+		echo "FAIL: coverage $${LINE_PCT}% is below 95% threshold"; \
 		exit 1; \
 	fi
 
