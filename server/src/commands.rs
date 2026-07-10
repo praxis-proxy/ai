@@ -162,15 +162,32 @@ filter_chains:
         );
     }
 
+    static CWD_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    struct CwdGuard(std::path::PathBuf);
+
+    impl CwdGuard {
+        fn new(path: &std::path::Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self(original)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("failed to restore working directory");
+        }
+    }
+
     #[test]
     fn default_config_source_returns_builtin_when_no_yaml() {
+        let _lock = CWD_MUTEX.get_or_init(Default::default).lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
+        let _guard = CwdGuard::new(dir.path());
 
         let source = default_config_source();
 
-        std::env::set_current_dir(original).unwrap();
         assert_eq!(
             source, "<built-in default>",
             "should return built-in default when praxis.yaml is absent"
