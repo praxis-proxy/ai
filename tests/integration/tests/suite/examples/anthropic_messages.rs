@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     Backend, Recording, free_port, http_send, json_post, parse_body, parse_status, start_backend_with_shutdown,
-    start_header_echo_backend, start_proxy,
+    start_capturing_backend, start_header_echo_backend, start_proxy,
 };
 
 use super::load_example_config;
@@ -134,6 +134,69 @@ fn anthropic_to_openai_transforms_response_body() {
         transformed["usage"]["input_tokens"], 11,
         "prompt tokens should map to input tokens"
     );
+}
+
+#[test]
+fn anthropic_to_openai_transforms_tool_cycle_request_body() {
+    let recording = Recording::load("anthropic/messages/tool_result.json");
+    let request_body = recording.request_body();
+    let chat_response = serde_json::json!({
+        "id": "chatcmpl_tool_cycle",
+        "object": "chat.completion",
+        "model": recording.request["model"],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "15 times 7 equals 105."},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
+    });
+    let backend = start_capturing_backend(&chat_response.to_string());
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-to-openai.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request_body));
+    let transformed: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response body should be JSON");
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&backend.body()).expect("captured backend body should be JSON");
+    let messages = forwarded["messages"]
+        .as_array()
+        .expect("backend request should include Chat Completions messages");
+
+    assert_eq!(parse_status(&raw), 200, "tool-cycle translation should return 200");
+    assert_eq!(
+        forwarded["tools"][0]["function"]["name"], "calculator",
+        "Anthropic tool definitions should become Chat Completions function tools"
+    );
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["name"], "calculator",
+        "assistant tool_use should become an OpenAI tool call"
+    );
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["arguments"], r#"{"expression":"15 * 7"}"#,
+        "tool_use input should become JSON string arguments"
+    );
+    assert_eq!(messages[2]["role"], "tool", "tool_result should become a tool message");
+    assert_eq!(
+        messages[2]["tool_call_id"], "toolu_test01",
+        "tool_result should preserve the tool call id"
+    );
+    assert_eq!(
+        messages[2]["content"], "105",
+        "tool_result content should be visible to the backend"
+    );
+    assert_eq!(
+        transformed["content"][0]["text"], "15 times 7 equals 105.",
+        "Chat Completions response should still map back to Anthropic"
+    );
+
+    drop(proxy);
 }
 
 #[test]

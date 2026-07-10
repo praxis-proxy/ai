@@ -24,6 +24,9 @@ configuration.
 
 - `claude/messages-basic.json` replays one Anthropic Messages turn through
   `examples/configs/anthropic/messages-protocol.yaml`.
+- `claude/messages-tool-cycle.json` replays a sanitized Claude Code client-tool
+  cycle with preserved source records for the assistant `tool_use` and user
+  `tool_result` records.
 - `codex/responses-basic.json` replays one OpenAI Responses turn through
   `examples/configs/openai/responses/full-flow.yaml` and verifies the response
   can be read back from the response store.

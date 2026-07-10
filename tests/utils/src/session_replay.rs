@@ -61,6 +61,19 @@ struct PendingClaudeTurn {
     request_message: Value,
     /// Original Claude Code records that contributed to this turn.
     source_records: Vec<Value>,
+    /// Text-only assistant response that may be followed by a split
+    /// `tool_use` record with the same message id.
+    deferred_response: Option<Value>,
+}
+
+/// How to transfer a pending request message into a generated replay turn.
+#[derive(Clone, Copy, Debug)]
+enum ClaudeRequestMessageMode {
+    /// Clone the request message because more assistant responses may still use
+    /// the same pending user request.
+    Clone,
+    /// Move the request message because the pending turn is being consumed.
+    Take,
 }
 
 /// Raw session log content plus optional source metadata.
@@ -300,12 +313,21 @@ impl SessionReplayImporter for ClaudeCodeSessionImporter {
             let line_number = line_index + 1;
             let record = parse_jsonl_line(line, line_number)?;
             if let Some(user_message) = claude_user_message_from_record(&record) {
+                if let Some(turn) = flush_deferred_claude_turn(&mut pending_turn, turns.len() + 1, options) {
+                    turns.push(turn);
+                }
                 update_pending_claude_turn(&mut pending_turn, user_message, record);
                 continue;
             }
-            if let Some(turn) = claude_turn_from_assistant_record(record, &mut pending_turn, turns.len() + 1, options) {
-                turns.push(turn);
-            }
+            turns.extend(claude_turns_from_assistant_record(
+                record,
+                &mut pending_turn,
+                turns.len() + 1,
+                options,
+            ));
+        }
+        if let Some(turn) = flush_deferred_claude_turn(&mut pending_turn, turns.len() + 1, options) {
+            turns.push(turn);
         }
 
         replay_from_turns(
@@ -425,6 +447,7 @@ fn update_pending_claude_turn(pending: &mut Option<PendingClaudeTurn>, user_mess
         *pending = Some(PendingClaudeTurn {
             request_message: user_message,
             source_records: vec![record],
+            deferred_response: None,
         });
         return;
     };
@@ -437,25 +460,143 @@ fn update_pending_claude_turn(pending: &mut Option<PendingClaudeTurn>, user_mess
 
 /// Accumulate a Claude assistant record and return a replay turn once the
 /// assistant message contains client-visible content.
-fn claude_turn_from_assistant_record(
+fn claude_turns_from_assistant_record(
     record: Value,
     pending_turn: &mut Option<PendingClaudeTurn>,
     turn_number: usize,
     options: ImportOptions,
-) -> Option<ReplayTurn> {
+) -> Vec<ReplayTurn> {
     if !is_claude_assistant_record(&record) {
-        return None;
+        return Vec::new();
     }
-    let pending = pending_turn.as_mut()?;
-    let response = if is_importable_claude_assistant_record(&record) {
-        Some(record.get("message")?.clone())
-    } else {
-        None
+    let Some(mut pending) = pending_turn.take() else {
+        return Vec::new();
     };
+
+    if !is_importable_claude_assistant_record(&record) {
+        return defer_non_importable_claude_assistant_record(record, pending, pending_turn, turn_number, options);
+    }
+
+    emit_importable_claude_assistant_record(record, &mut pending, turn_number, options)
+}
+
+/// Keep non-importable split text records pending until a matching `tool_use`,
+/// new assistant id, user boundary, or EOF determines how to emit them.
+fn defer_non_importable_claude_assistant_record(
+    record: Value,
+    mut pending: PendingClaudeTurn,
+    pending_turn: &mut Option<PendingClaudeTurn>,
+    turn_number: usize,
+    options: ImportOptions,
+) -> Vec<ReplayTurn> {
+    let mut turns = Vec::new();
+    if let Some(message) = record.get("message")
+        && is_anthropic_assistant_message(message)
+        && is_split_tool_use_text_prelude(message)
+    {
+        flush_deferred_if_assistant_id_differs(&mut pending, message, &mut turns, turn_number, options);
+        pending.deferred_response = Some(message.clone());
+    }
     pending.source_records.push(record);
-    let response = response?;
-    let pending = pending_turn.take().expect("pending turn exists");
-    claude_turn_from_response(response, pending, turn_number, options)
+    *pending_turn = Some(pending);
+    turns
+}
+
+/// Emit an importable assistant record, flushing a previously deferred response
+/// first when the ids prove they are separate assistant messages.
+fn emit_importable_claude_assistant_record(
+    record: Value,
+    pending: &mut PendingClaudeTurn,
+    turn_number: usize,
+    options: ImportOptions,
+) -> Vec<ReplayTurn> {
+    let mut turns = Vec::new();
+    let Some(response) = record.get("message").cloned() else {
+        return turns;
+    };
+    flush_deferred_if_assistant_id_differs(pending, &response, &mut turns, turn_number, options);
+    pending.source_records.push(record);
+    if let Some(turn) = build_claude_replay_turn(
+        response,
+        pending,
+        ClaudeRequestMessageMode::Take,
+        turn_number + turns.len(),
+        options,
+    ) {
+        turns.push(turn);
+    }
+    turns
+}
+
+/// Flush the currently deferred response when a later assistant message has a
+/// known different id.
+fn flush_deferred_if_assistant_id_differs(
+    pending: &mut PendingClaudeTurn,
+    message: &Value,
+    turns: &mut Vec<ReplayTurn>,
+    turn_number: usize,
+    options: ImportOptions,
+) {
+    if pending
+        .deferred_response
+        .as_ref()
+        .is_some_and(|deferred| claude_message_ids_differ(deferred, message))
+        && let Some(turn) = take_deferred_claude_turn(pending, turn_number, options)
+    {
+        turns.push(turn);
+    }
+}
+
+/// Emit a deferred text-only Claude response when no matching split `tool_use`
+/// record arrived before the turn boundary.
+fn flush_deferred_claude_turn(
+    pending_turn: &mut Option<PendingClaudeTurn>,
+    turn_number: usize,
+    options: ImportOptions,
+) -> Option<ReplayTurn> {
+    pending_turn.as_ref()?.deferred_response.as_ref()?;
+    let turn = {
+        let pending = pending_turn.as_mut().expect("pending turn exists");
+        take_deferred_claude_turn(pending, turn_number, options)
+    };
+    let _pending = pending_turn.take();
+    turn
+}
+
+/// Emit and clear a deferred Claude response from a pending turn without
+/// consuming the pending request. This is used when the next assistant record
+/// proves the deferred text belongs to a different response id.
+fn take_deferred_claude_turn(
+    pending: &mut PendingClaudeTurn,
+    turn_number: usize,
+    options: ImportOptions,
+) -> Option<ReplayTurn> {
+    let response = pending.deferred_response.take()?;
+    build_claude_replay_turn(response, pending, ClaudeRequestMessageMode::Clone, turn_number, options)
+}
+
+/// Build a replay turn from a Claude assistant response and the pending user
+/// request state.
+fn build_claude_replay_turn(
+    response: Value,
+    pending: &mut PendingClaudeTurn,
+    request_message_mode: ClaudeRequestMessageMode,
+    turn_number: usize,
+    options: ImportOptions,
+) -> Option<ReplayTurn> {
+    let source_records = source_records_for_claude_response(&pending.source_records, &response);
+    let response =
+        normalize_claude_replay_response(accumulate_split_claude_assistant_content(response, &source_records));
+    let request_message = match request_message_mode {
+        ClaudeRequestMessageMode::Clone => pending.request_message.clone(),
+        ClaudeRequestMessageMode::Take => std::mem::take(&mut pending.request_message),
+    };
+    let response_pending = PendingClaudeTurn {
+        request_message,
+        source_records,
+        deferred_response: None,
+    };
+    claude_turn_from_response(response, response_pending, turn_number, options)
 }
 
 /// Extract a Claude Code user message from a JSONL record.
@@ -527,16 +668,141 @@ fn claude_message_contains_content_type(message: &Value, block_type: &str) -> bo
 
 /// Return true when assistant content includes client-visible replay content.
 fn has_replayable_claude_assistant_content(message: &Value) -> bool {
+    if is_split_tool_use_text_prelude(message) {
+        return false;
+    }
+
     match message.get("content") {
         Some(Value::String(content)) => !content.is_empty(),
-        Some(Value::Array(content)) => content.iter().any(|block| {
-            !matches!(
-                block.get("type").and_then(Value::as_str),
-                Some("thinking" | "redacted_thinking")
-            )
-        }),
+        Some(Value::Array(content)) => content.iter().any(is_replayable_claude_assistant_block),
         _ => false,
     }
+}
+
+/// Return true when Claude Code split the assistant text prelude from a
+/// following `tool_use` record for the same assistant response.
+fn is_split_tool_use_text_prelude(message: &Value) -> bool {
+    if message
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|stop_reason| stop_reason != "tool_use")
+    {
+        return false;
+    }
+
+    let Some(Value::Array(content)) = message.get("content") else {
+        return false;
+    };
+
+    !content.is_empty()
+        && content
+            .iter()
+            .all(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+}
+
+/// Return true for assistant blocks that should appear in generated replay
+/// responses rather than only in `source_records`.
+fn is_replayable_claude_assistant_block(block: &Value) -> bool {
+    !matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
+/// Return the Anthropic message id from a Claude Code message.
+fn claude_message_id(message: &Value) -> Option<&str> {
+    message.get("id").and_then(Value::as_str)
+}
+
+/// Return true when two Claude assistant messages have different known ids.
+fn claude_message_ids_differ(left: &Value, right: &Value) -> bool {
+    match (claude_message_id(left), claude_message_id(right)) {
+        (Some(left), Some(right)) => left != right,
+        _ => false,
+    }
+}
+
+/// Return source records that belong to the given response id, while retaining
+/// user records needed to reconstruct the request.
+fn source_records_for_claude_response(source_records: &[Value], response: &Value) -> Vec<Value> {
+    let Some(response_id) = claude_message_id(response) else {
+        return source_records.to_vec();
+    };
+
+    source_records
+        .iter()
+        .filter(|record| match record.get("type").and_then(Value::as_str) {
+            Some("user") => true,
+            Some("assistant") => record
+                .get("message")
+                .and_then(claude_message_id)
+                .is_some_and(|message_id| message_id == response_id),
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Reconstruct assistant content when Claude Code stored one model response as
+/// multiple assistant records with the same message id.
+fn accumulate_split_claude_assistant_content(mut response: Value, source_records: &[Value]) -> Value {
+    let Some(response_id) = response.get("id").and_then(Value::as_str) else {
+        return response;
+    };
+
+    if !response.get("content").is_some_and(Value::is_array) {
+        return response;
+    }
+
+    let mut content = Vec::new();
+    for record in source_records {
+        let Some(message) = record.get("message") else {
+            continue;
+        };
+        if message.get("id").and_then(Value::as_str) != Some(response_id) {
+            continue;
+        }
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        content.extend(
+            blocks
+                .iter()
+                .filter(|block| is_replayable_claude_assistant_block(block))
+                .cloned(),
+        );
+    }
+
+    if let Some(obj) = response.as_object_mut()
+        && !content.is_empty()
+    {
+        obj.insert("content".to_owned(), Value::Array(content));
+    }
+
+    response
+}
+
+/// Normalize Claude Code's incremental assistant log records into replayable
+/// Anthropic Messages responses.
+fn normalize_claude_replay_response(mut response: Value) -> Value {
+    if response
+        .get("stop_reason")
+        .is_some_and(|stop_reason| !stop_reason.is_null())
+    {
+        return response;
+    }
+
+    let has_tool_use = response.get("content").and_then(Value::as_array).is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+    });
+
+    if has_tool_use && let Some(obj) = response.as_object_mut() {
+        obj.insert("stop_reason".to_owned(), Value::String("tool_use".to_owned()));
+    }
+
+    response
 }
 
 /// Return true when a Claude Code assistant message is an Anthropic response.
@@ -681,6 +947,22 @@ mod tests {
 {"uuid":"turn_image_thinking","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"thinking","thinking":"Looking at the image.","signature":"sig"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}
 {"uuid":"turn_image_redacted_thinking","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"redacted_thinking","data":"encrypted-reasoning"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}
 {"uuid":"turn_image_assistant","sessionId":"session_import_claude_image","timestamp":"2026-07-08T00:00:02Z","type":"assistant","message":{"id":"msg_import_claude_image","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"a terminal screenshot"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#;
+
+    const CLAUDE_CODE_SPLIT_TEXT_TOOL_USE_JSONL: &str = r#"{"uuid":"turn_split_user","sessionId":"session_import_claude_split_tool","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":"inspect the fixture"}}
+{"uuid":"turn_split_text","sessionId":"session_import_claude_split_tool","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_split_tool","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"I will inspect it."}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":5}}}
+{"uuid":"turn_split_tool","sessionId":"session_import_claude_split_tool","timestamp":"2026-07-08T00:00:02Z","type":"assistant","message":{"id":"msg_import_claude_split_tool","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"tool_use","id":"toolu_import_split_01","name":"Read","input":{"file_path":"fixture-file"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":12}}}"#;
+
+    const CLAUDE_CODE_TEXT_NULL_STOP_EOF_JSONL: &str = r#"{"uuid":"turn_null_text_user","sessionId":"session_import_claude_null_text","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":"summarize the fixture"}}
+{"uuid":"turn_null_text_assistant","sessionId":"session_import_claude_null_text","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_null_text","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"fixture summary"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":5}}}"#;
+
+    const CLAUDE_CODE_TEXT_NULL_STOP_BEFORE_NEXT_USER_JSONL: &str = r#"{"uuid":"turn_null_text_user_a","sessionId":"session_import_claude_null_text_boundary","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":"first request"}}
+{"uuid":"turn_null_text_assistant_a","sessionId":"session_import_claude_null_text_boundary","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_null_text_a","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"first response"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":5}}}
+{"uuid":"turn_null_text_user_b","sessionId":"session_import_claude_null_text_boundary","timestamp":"2026-07-08T00:00:02Z","type":"user","message":{"role":"user","content":"second request"}}
+{"uuid":"turn_null_text_assistant_b","sessionId":"session_import_claude_null_text_boundary","timestamp":"2026-07-08T00:00:03Z","type":"assistant","message":{"id":"msg_import_claude_null_text_b","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"second response"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":5}}}"#;
+
+    const CLAUDE_CODE_TEXT_NULL_STOP_BEFORE_DIFFERENT_ASSISTANT_JSONL: &str = r#"{"uuid":"turn_null_text_same_user","sessionId":"session_import_claude_null_text_assistant_boundary","timestamp":"2026-07-08T00:00:00Z","type":"user","message":{"role":"user","content":"same user request"}}
+{"uuid":"turn_null_text_assistant_a","sessionId":"session_import_claude_null_text_assistant_boundary","timestamp":"2026-07-08T00:00:01Z","type":"assistant","message":{"id":"msg_import_claude_null_text_a","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"first response"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":5}}}
+{"uuid":"turn_null_text_assistant_b","sessionId":"session_import_claude_null_text_assistant_boundary","timestamp":"2026-07-08T00:00:02Z","type":"assistant","message":{"id":"msg_import_claude_null_text_b","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"second response"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":5}}}"#;
 
     #[test]
     fn load_claude_messages_replay() {
@@ -855,6 +1137,82 @@ mod tests {
         assert_eq!(source_records[2]["message"]["content"][0]["type"], "thinking");
         assert_eq!(source_records[3]["message"]["content"][0]["type"], "redacted_thinking");
         assert_eq!(source_records[4]["message"]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn session_replay_import_preserves_split_text_before_tool_use() {
+        let input = SessionInput::new(CLAUDE_CODE_SPLIT_TEXT_TOOL_USE_JSONL);
+
+        let replay = import_session_replay(&input, ImportOptions::default()).expect("import should succeed");
+        let turn = replay.single_turn();
+
+        assert_eq!(turn.response["id"], "msg_import_claude_split_tool");
+        assert_eq!(turn.response["stop_reason"], "tool_use");
+        assert_eq!(turn.response["content"][0]["type"], "text");
+        assert_eq!(turn.response["content"][1]["type"], "tool_use");
+        assert_eq!(turn.response["content"][1]["id"], "toolu_import_split_01");
+        assert_eq!(
+            turn.source_records
+                .as_ref()
+                .expect("source records should be preserved")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn session_replay_import_flushes_text_null_stop_at_eof() {
+        let input = SessionInput::new(CLAUDE_CODE_TEXT_NULL_STOP_EOF_JSONL);
+
+        let replay = import_session_replay(&input, ImportOptions::default()).expect("import should succeed");
+        let turn = replay.single_turn();
+
+        assert_eq!(turn.response["id"], "msg_import_claude_null_text");
+        assert_eq!(turn.response["stop_reason"], Value::Null);
+        assert_eq!(turn.response["content"][0]["type"], "text");
+        assert_eq!(turn.response["content"][0]["text"], "fixture summary");
+    }
+
+    #[test]
+    fn session_replay_import_flushes_text_null_stop_before_next_user() {
+        let input = SessionInput::new(CLAUDE_CODE_TEXT_NULL_STOP_BEFORE_NEXT_USER_JSONL);
+
+        let replay = import_session_replay(&input, ImportOptions::default()).expect("import should succeed");
+
+        assert_eq!(replay.turns.len(), 2);
+        assert_eq!(replay.turns[0].request["messages"][0]["content"], "first request");
+        assert_eq!(replay.turns[0].response["id"], "msg_import_claude_null_text_a");
+        assert_eq!(replay.turns[0].response["content"][0]["text"], "first response");
+        assert_eq!(replay.turns[1].request["messages"][0]["content"], "second request");
+        assert_eq!(replay.turns[1].response["id"], "msg_import_claude_null_text_b");
+        assert_eq!(replay.turns[1].response["content"][0]["text"], "second response");
+    }
+
+    #[test]
+    fn session_replay_import_flushes_text_null_stop_before_different_assistant_id() {
+        let input = SessionInput::new(CLAUDE_CODE_TEXT_NULL_STOP_BEFORE_DIFFERENT_ASSISTANT_JSONL);
+
+        let replay = import_session_replay(&input, ImportOptions::default()).expect("import should succeed");
+
+        assert_eq!(replay.turns.len(), 2);
+        assert_eq!(replay.turns[0].request["messages"][0]["content"], "same user request");
+        assert_eq!(replay.turns[0].response["id"], "msg_import_claude_null_text_a");
+        assert_eq!(replay.turns[0].response["content"][0]["text"], "first response");
+        let first_sources = replay.turns[0]
+            .source_records
+            .as_ref()
+            .expect("first turn source records");
+        assert_eq!(first_sources[1]["message"]["id"], "msg_import_claude_null_text_a");
+        assert_eq!(first_sources.len(), 2);
+        assert_eq!(replay.turns[1].request["messages"][0]["content"], "same user request");
+        assert_eq!(replay.turns[1].response["id"], "msg_import_claude_null_text_b");
+        assert_eq!(replay.turns[1].response["content"][0]["text"], "second response");
+        let second_sources = replay.turns[1]
+            .source_records
+            .as_ref()
+            .expect("second turn source records");
+        assert_eq!(second_sources[1]["message"]["id"], "msg_import_claude_null_text_b");
+        assert_eq!(second_sources.len(), 2);
     }
 
     fn replay_fixture_root() -> PathBuf {
