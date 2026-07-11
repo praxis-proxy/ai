@@ -30,14 +30,22 @@ COPY server/Cargo.toml ./server/Cargo.toml
 # crates via cargo metadata for build-time auto-registration.
 COPY server/build.rs ./server/build.rs
 
-# Strip workspace members not needed for the binary.
+# Strip workspace members not needed for the default binary.
 RUN sed -i '/xtask/d; /tests\//d' Cargo.toml
+
+# Copy the llmd-ext-proc manifest for workspace resolution.
+# The crate is optional and not enabled in the default image.
+COPY integrations/llmd/ext-proc/Cargo.toml ./integrations/llmd/ext-proc/Cargo.toml
+COPY integrations/llmd/ext-proc/build.rs ./integrations/llmd/ext-proc/build.rs
+COPY integrations/llmd/ext-proc/proto ./integrations/llmd/ext-proc/proto
 
 # Create stub source files for all crates.
 RUN mkdir -p apis/src filters/src server/src \
+    integrations/llmd/ext-proc/src \
     && echo '//! stub' > apis/src/lib.rs \
     && echo '//! stub' > filters/src/lib.rs \
     && echo '//! stub' > server/src/lib.rs \
+    && echo '//! stub' > integrations/llmd/ext-proc/src/lib.rs \
     && printf '//! stub\nfn main() {}\n' > server/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -53,8 +61,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY apis/src ./apis/src
 COPY filters/src ./filters/src
 COPY server/src ./server/src
+COPY integrations/llmd/ext-proc/src ./integrations/llmd/ext-proc/src
 
-RUN find apis/src filters/src server/src \
+RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
     -name '*.rs' -exec touch {} +
 
 # ------------------------------------------------------------------------------

@@ -18,6 +18,8 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
+default = []
+llmd-ext-proc = ["dep:praxis-ai-llmd-ext-proc"]
 praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
 
 [lints]
@@ -28,6 +30,7 @@ clap = { workspace = true }
 notify = { workspace = true }
 praxis-ai-filters = { workspace = true }
 praxis-ai-apis = { workspace = true }
+praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-protocol = { workspace = true }

@@ -18,17 +18,39 @@ pub use server::{check_root_privilege, fatal, resolve_config_path, run_server, r
 // Provides: fn register_external_filters(&mut FilterRegistry)
 include!(concat!(env!("OUT_DIR"), "/external_filters.rs"));
 
-/// Build a [`FilterRegistry`] with core builtins, AI filters, and
-/// auto-discovered external filters.
+/// Build a [`FilterRegistry`] with core builtins, AI filters,
+/// optional `llm-d` `ext_proc`, and auto-discovered external filters.
+///
+/// When the `llmd-ext-proc` feature is enabled, the
+/// `ext_proc` filter is registered for `llm-d` integration.
 ///
 /// [`FilterRegistry`]: praxis_filter::FilterRegistry
 #[must_use]
 pub fn build_full_registry() -> praxis_filter::FilterRegistry {
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
     register_ai_filters(&mut registry);
+    register_llmd_ext_proc(&mut registry);
     register_external_filters(&mut registry);
     registry
 }
+
+/// Register the `llm-d` `ext_proc` compatibility filter.
+///
+/// Only available when the `llmd-ext-proc` feature is enabled.
+/// This is a compatibility layer for `llm-d`'s current EPP
+/// protocol, not a general-purpose `ext_proc` extension point.
+/// Native Praxis filters are preferred for general extension work.
+#[cfg(feature = "llmd-ext-proc")]
+fn register_llmd_ext_proc(registry: &mut praxis_filter::FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "ext_proc" => praxis_ai_llmd_ext_proc::ExtProcFilter::from_config
+    );
+}
+
+/// No-op when `llmd-ext-proc` is disabled.
+#[cfg(not(feature = "llmd-ext-proc"))]
+fn register_llmd_ext_proc(_registry: &mut praxis_filter::FilterRegistry) {}
 
 /// Register all AI filters into the registry.
 fn register_ai_filters(registry: &mut praxis_filter::FilterRegistry) {
