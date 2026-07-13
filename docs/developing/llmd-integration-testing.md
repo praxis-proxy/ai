@@ -27,13 +27,13 @@ The integration test request path is:
 
 ```text
 OpenAI-compatible request
-    → Praxis AI runtime
-    → ext_proc filter (gRPC full-duplex)
-    → deterministic mock ExternalProcessor
-    → trusted x-gateway-destination-endpoint mutation
-    → endpoint_selector
-    → llm-d-inference-sim container
-    → Chat Completions response
+    -> Praxis AI runtime
+    -> ext_proc filter (gRPC full-duplex)
+    -> deterministic mock ExternalProcessor
+    -> trusted x-gateway-destination-endpoint mutation
+    -> endpoint_selector
+    -> llm-d-inference-sim container
+    -> Chat Completions response
 ```
 
 The mock processor is **not** the real `llm-d` Go EPP. These
