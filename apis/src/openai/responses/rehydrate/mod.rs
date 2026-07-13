@@ -58,32 +58,57 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// ```yaml
 /// filter: openai_responses_rehydrate
 /// ```
-pub struct RehydrateFilter;
+pub struct RehydrateFilter {
+    /// Maximum serialized byte size of stored conversation history.
+    max_history_bytes: usize,
+    /// Optional cap on the number of stored history items.
+    max_history_items: Option<usize>,
+}
 
 impl RehydrateFilter {
     /// Create a filter from YAML config.
     ///
-    /// This filter has no configuration fields.
-    ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the YAML config contains unknown fields.
+    /// Returns [`FilterError`] if the YAML config contains unknown
+    /// fields, or `max_history_bytes` / `max_history_items` is zero.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let empty = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
         let cfg = if config.is_null() { &empty } else { config };
-        let _validated: RehydrateConfig = parse_filter_config("openai_responses_rehydrate", cfg)?;
-        Ok(Box::new(Self))
+        let validated: RehydrateConfig = parse_filter_config("openai_responses_rehydrate", cfg)?;
+        if validated.max_history_bytes == 0 {
+            return Err(FilterError::from(
+                "openai_responses_rehydrate: max_history_bytes must be greater than 0",
+            ));
+        }
+        if validated.max_history_items == Some(0) {
+            return Err(FilterError::from(
+                "openai_responses_rehydrate: max_history_items must be greater than 0",
+            ));
+        }
+        Ok(Box::new(Self {
+            max_history_bytes: validated.max_history_bytes,
+            max_history_items: validated.max_history_items,
+        }))
     }
 }
 
-/// Empty YAML configuration for [`RehydrateFilter`].
+/// YAML configuration for [`RehydrateFilter`].
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    clippy::empty_structs_with_brackets,
-    reason = "serde cannot deserialize a map into a unit struct"
-)]
-struct RehydrateConfig {}
+struct RehydrateConfig {
+    /// Maximum serialized byte size of stored conversation history.
+    #[serde(default = "default_max_history_bytes")]
+    max_history_bytes: usize,
+    /// Optional cap on the number of stored history items.
+    #[serde(default)]
+    max_history_items: Option<usize>,
+}
+
+/// Default maximum byte size for stored conversation history (2 MiB).
+fn default_max_history_bytes() -> usize {
+    2_097_152 // 2 MiB
+}
 
 #[async_trait]
 impl HttpFilter for RehydrateFilter {
@@ -133,7 +158,7 @@ impl HttpFilter for RehydrateFilter {
             .get_metadata("openai_responses_format.stream")
             .is_some_and(|v| v == "true");
 
-        rehydrate(ctx, body, streaming).await
+        rehydrate(ctx, body, streaming, self.max_history_bytes, self.max_history_items).await
     }
 }
 
@@ -151,6 +176,42 @@ fn is_responses_cancel_path(path: &str) -> bool {
     !response_id.is_empty() && !response_id.contains('/')
 }
 
+/// Reject the request when stored conversation history exceeds configured limits.
+fn enforce_history_limits(
+    stored: &[Value],
+    max_history_bytes: usize,
+    max_history_items: Option<usize>,
+    streaming: bool,
+) -> Result<(), FilterAction> {
+    if let Some(max) = max_history_items {
+        let count = stored.len();
+        if count > max {
+            return Err(reject_too_large(
+                &format!(
+                    "stored conversation history contains {count} items, \
+                   exceeding the {max} item limit; \
+                   compact or shorten the conversation before continuing"
+                ),
+                streaming,
+            ));
+        }
+    }
+
+    let byte_size = serde_json::to_string(stored).map_or(0, |s| s.len());
+    if byte_size > max_history_bytes {
+        return Err(reject_too_large(
+            &format!(
+                "stored conversation history is {byte_size} bytes, \
+               exceeding the {max_history_bytes} byte limit; \
+               compact or shorten the conversation before continuing"
+            ),
+            streaming,
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parse body, resolve rehydration source (`previous_response_id` or
 /// `conversation`), and populate [`ResponsesState`] with the full
 /// conversation history.
@@ -161,37 +222,46 @@ async fn rehydrate(
     ctx: &mut HttpFilterContext<'_>,
     body: &Option<Bytes>,
     streaming: bool,
+    max_history_bytes: usize,
+    max_history_items: Option<usize>,
 ) -> Result<FilterAction, FilterError> {
     let Some(bytes) = body.as_ref() else {
         return Ok(FilterAction::Release);
     };
-
     let (parsed_body, prev_id) = match parse_body_and_extract_id(bytes, streaming) {
         Ok((body, Some(id))) => (body, id),
         Ok((body, None)) => return rehydrate_from_conversation(ctx, body, streaming).await,
         Err(action) => return Ok(action),
     };
-
     let tenant_id = ctx
         .get_metadata(TENANT_METADATA_KEY)
         .unwrap_or(DEFAULT_TENANT_ID)
         .to_owned();
-
-    let record = match fetch_previous_response(ctx, &tenant_id, &prev_id, streaming).await {
+    let record = match fetch_and_validate_previous(ctx, &tenant_id, &prev_id, streaming).await {
         Ok(r) => r,
         Err(action) => return Ok(action),
     };
-
-    if let Err(action) = validate_response_status(&record, streaming) {
-        return Ok(action);
-    }
-
-    populate_state_and_usage_metadata(ctx, parsed_body, &record);
-
+    let state = match build_state(parsed_body, &record, max_history_bytes, max_history_items, streaming) {
+        Ok(s) => s,
+        Err(action) => return Ok(action),
+    };
+    write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
+    ctx.extensions.insert(state);
     debug!(previous_response_id = %prev_id, "previous response validated, state populated");
     ctx.set_metadata("responses.previous_response_id", prev_id);
-
     Ok(FilterAction::Release)
+}
+
+/// Fetch the previous response and validate its status in one step.
+async fn fetch_and_validate_previous(
+    ctx: &HttpFilterContext<'_>,
+    tenant_id: &str,
+    prev_id: &str,
+    streaming: bool,
+) -> Result<ResponseRecord, FilterAction> {
+    let record = fetch_previous_response(ctx, tenant_id, prev_id, streaming).await?;
+    validate_response_status(&record, streaming)?;
+    Ok(record)
 }
 
 /// Rehydrate from a stored conversation when no `previous_response_id`
@@ -282,37 +352,27 @@ fn conversation_messages_for_rehydrate(record: &ConversationRecord) -> Vec<Value
     record.messages.as_array().cloned().unwrap_or_default()
 }
 
-/// Insert rehydrated request state and promote previous usage metadata.
-fn populate_state_and_usage_metadata(ctx: &mut HttpFilterContext<'_>, parsed_body: Value, record: &ResponseRecord) {
-    let previous_tools = collect_mcp_tool_listings(record);
-
-    let previous_usage = record.response_object.get("usage").filter(|usage| !usage.is_null());
-    write_previous_usage_metadata(ctx, previous_usage);
-
-    ctx.extensions.insert(build_state(
-        parsed_body,
-        record,
-        previous_tools,
-        previous_usage.cloned(),
-    ));
-}
-
-/// Build [`ResponsesState`] by prepending stored messages before the current input.
-// TODO(#697): enforce a max rehydrated history size.
+/// Build [`ResponsesState`] by resolving stored messages, enforcing
+/// history limits, and prepending conversation history before
+/// current input.
 fn build_state(
     parsed_body: Value,
     record: &ResponseRecord,
-    previous_tools: Vec<Value>,
-    previous_usage: Option<Value>,
-) -> ResponsesState {
-    let mut state = ResponsesState::from_request_body(parsed_body);
+    max_history_bytes: usize,
+    max_history_items: Option<usize>,
+    streaming: bool,
+) -> Result<ResponsesState, FilterAction> {
     let stored = stored_messages_for_rehydrate(record);
+    enforce_history_limits(&stored, max_history_bytes, max_history_items, streaming)?;
+    let previous_tools = collect_mcp_tool_listings(record);
+    let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
     let replay = replay_messages_from_stored(&stored);
+    let mut state = ResponsesState::from_request_body(parsed_body);
     state.messages.splice(0..0, replay);
     state.persisted_messages.splice(0..0, stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
-    state
+    Ok(state)
 }
 
 /// Return stored history, reconstructing from public fields for
@@ -551,6 +611,16 @@ fn reject_invalid(message: &str, streaming: bool) -> FilterAction {
 /// Build a 500 rejection with a Responses API error body.
 fn reject_server_error(message: &str, streaming: bool) -> FilterAction {
     FilterAction::Reject(responses_error_rejection(500, "server_error", message, streaming))
+}
+
+/// Build a 413 rejection with a Responses API error body.
+fn reject_too_large(message: &str, streaming: bool) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        message,
+        streaming,
+    ))
 }
 
 // -----------------------------------------------------------------------------

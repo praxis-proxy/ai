@@ -38,7 +38,10 @@ fn unknown_field_rejected() {
 
 #[test]
 fn body_access_is_read_only() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     assert_eq!(
         filter.request_body_access(),
         BodyAccess::ReadOnly,
@@ -52,7 +55,10 @@ fn body_access_is_read_only() {
 
 #[tokio::test]
 async fn skips_non_post_request() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(Bytes::from(r#"{"input":"test"}"#));
@@ -63,7 +69,10 @@ async fn skips_non_post_request() {
 
 #[tokio::test]
 async fn skips_non_responses_format() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_chat_completions");
@@ -78,7 +87,10 @@ async fn skips_non_responses_format() {
 
 #[tokio::test]
 async fn continues_on_non_end_of_stream() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(Bytes::from(r#"{"input":"partial"}"#));
@@ -92,7 +104,10 @@ async fn continues_on_non_end_of_stream() {
 
 #[tokio::test]
 async fn skips_cancel_request_without_parsing_empty_body() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_123/cancel");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
@@ -116,7 +131,10 @@ async fn skips_cancel_request_without_parsing_empty_body() {
 
 #[tokio::test]
 async fn passthrough_when_no_previous_response_id() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
@@ -141,7 +159,10 @@ async fn passthrough_when_no_previous_response_id() {
 
 #[tokio::test]
 async fn passthrough_when_previous_response_id_is_null() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
@@ -169,7 +190,10 @@ async fn validates_previous_response_and_sets_metadata() {
     let store = MockStore::with_completed_response("resp_prev", json!("Hello"), messages);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -312,7 +336,10 @@ async fn rejects_when_previous_response_not_found() {
     let store = MockStore::empty();
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -331,7 +358,10 @@ async fn rejects_when_status_not_completed() {
     let store = MockStore::with_status("resp_123", "in_progress");
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -350,7 +380,10 @@ async fn rejects_when_status_incomplete() {
     let store = MockStore::with_status("resp_123", "incomplete");
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -369,7 +402,10 @@ async fn rejects_when_status_failed() {
     let store = MockStore::with_status("resp_123", "failed");
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -385,7 +421,10 @@ async fn rejects_when_status_failed() {
 
 #[tokio::test]
 async fn rejects_when_store_unavailable() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
@@ -402,7 +441,10 @@ async fn rejects_when_store_unavailable() {
 async fn rejects_when_store_not_registered() {
     let registry = ResponseStoreRegistry::new();
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -418,7 +460,10 @@ async fn rejects_when_store_not_registered() {
 
 #[tokio::test]
 async fn rejects_invalid_json_body() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
@@ -433,7 +478,10 @@ async fn rejects_invalid_json_body() {
 
 #[tokio::test]
 async fn rejects_non_string_previous_response_id() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
@@ -451,7 +499,10 @@ async fn rejects_when_store_fetch_fails() {
     let store = MockStore::failing();
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -470,7 +521,10 @@ async fn rejects_when_conversation_store_fails() {
     let store = MockStore::failing();
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -509,7 +563,10 @@ async fn extracts_mcp_tools_from_previous_response() {
     let store = MockStore::with_output_and_usage("resp_mcp", output, usage);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -557,7 +614,10 @@ async fn no_previous_tools_when_output_has_no_mcp_items() {
     let store = MockStore::with_output_and_usage("resp_no_mcp", output, usage);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -602,7 +662,10 @@ async fn extracts_mcp_tools_from_multiple_servers() {
     let store = MockStore::with_output_and_usage("resp_multi", output, Value::Null);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -679,7 +742,10 @@ async fn deduplicates_mcp_tools_independent_of_tool_order() {
     };
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -740,7 +806,10 @@ async fn extracts_mcp_tools_from_stored_history_when_latest_output_has_none() {
     };
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -799,7 +868,10 @@ async fn large_mcp_tool_listing_is_preserved_in_state() {
     let store = MockStore::with_output_and_usage("resp_big", output, Value::Null);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -838,7 +910,10 @@ async fn extracts_usage_from_previous_response() {
     let store = MockStore::with_output_and_usage("resp_usage", output, usage.clone());
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -883,7 +958,10 @@ async fn no_usage_metadata_when_usage_missing() {
     let store = MockStore::with_output_and_usage("resp_no_usage", output, Value::Null);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -925,7 +1003,10 @@ async fn extracts_partial_usage_fields() {
     let store = MockStore::with_output_and_usage("resp_partial", output, usage);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -991,7 +1072,10 @@ async fn fallback_reconstruction_excludes_mcp_list_tools_but_preserves_outputs()
     };
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1043,6 +1127,239 @@ async fn fallback_reconstruction_excludes_mcp_list_tools_but_preserves_outputs()
 }
 
 // -----------------------------------------------------------------------------
+// History Limits
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rejects_stored_history_exceeding_byte_limit() {
+    let user_content = "A".repeat(500);
+    let assistant_content = "B".repeat(500);
+    let messages = json!([
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": assistant_content}
+    ]);
+    let store = MockStore::with_completed_response("resp_big", json!("Hello"), messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: 64,
+        max_history_items: None,
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_big"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => {
+            assert_eq!(r.status, 413, "should reject with 413 for oversized history");
+            let body_bytes = r.body.unwrap();
+            let body_str = std::str::from_utf8(&body_bytes).unwrap();
+            assert!(
+                body_str.contains("byte limit"),
+                "rejection body should mention byte limit: {body_str}"
+            );
+        },
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_stored_history_exceeding_item_limit() {
+    let messages = json!([
+        {"role": "user", "content": "Turn 1"},
+        {"role": "assistant", "content": "Reply 1"},
+        {"role": "user", "content": "Turn 2"},
+        {"role": "assistant", "content": "Reply 2"},
+        {"role": "user", "content": "Turn 3"}
+    ]);
+    let store = MockStore::with_completed_response("resp_many", json!("Hello"), messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: Some(3),
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_many"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => {
+            assert_eq!(r.status, 413, "should reject with 413 for too many items");
+            let body_bytes = r.body.unwrap();
+            let body_str = std::str::from_utf8(&body_bytes).unwrap();
+            assert!(
+                body_str.contains("item limit"),
+                "rejection body should mention item limit: {body_str}"
+            );
+        },
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn allows_history_within_limits() {
+    let messages = json!([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"}
+    ]);
+    let store = MockStore::with_completed_response("resp_ok", json!("Hello"), messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: Some(10),
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(r#"{"input":"Next","previous_response_id":"resp_ok"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "should release when history is within limits"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated");
+    assert_eq!(
+        state.messages.len(),
+        3,
+        "messages should contain 2 stored + 1 current input"
+    );
+}
+
+#[test]
+fn from_config_with_custom_limits() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_history_bytes: 1048576\nmax_history_items: 200").unwrap();
+    let filter = RehydrateFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_responses_rehydrate");
+}
+
+#[test]
+fn from_config_rejects_zero_max_history_bytes() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_history_bytes: 0").unwrap();
+    let result = RehydrateFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_history_bytes: 0 should be rejected");
+}
+
+#[test]
+fn from_config_rejects_zero_max_history_items() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_history_items: 0").unwrap();
+    let result = RehydrateFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_history_items: 0 should be rejected");
+}
+
+#[tokio::test]
+async fn rejects_stored_history_exceeding_byte_limit_streaming() {
+    let user_content = "A".repeat(500);
+    let assistant_content = "B".repeat(500);
+    let messages = json!([
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": assistant_content}
+    ]);
+    let store = MockStore::with_completed_response("resp_big_stream", json!("Hello"), messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: 64,
+        max_history_items: None,
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    let mut body = Some(Bytes::from(
+        r#"{"input":"Hi","previous_response_id":"resp_big_stream","stream":true}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => {
+            assert_eq!(r.status, 413, "should reject with 413 for oversized history");
+            let ct = r.headers.iter().find(|(k, _)| k == "content-type");
+            assert_eq!(
+                ct.map(|(_, v)| v.as_str()),
+                Some("text/event-stream"),
+                "streaming rejection should use SSE content type"
+            );
+            let body_bytes = r.body.unwrap();
+            let body_str = std::str::from_utf8(&body_bytes).unwrap();
+            assert!(
+                body_str.starts_with("event: error\n"),
+                "streaming rejection should be an SSE error event: {body_str}"
+            );
+        },
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn allows_history_at_exact_byte_limit() {
+    let messages = json!([
+        {"role": "user", "content": "Hi"}
+    ]);
+    let serialized_size = serde_json::to_string(messages.as_array().unwrap()).unwrap().len();
+    let store = MockStore::with_completed_response("resp_exact", json!("Hi"), messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: serialized_size,
+        max_history_items: None,
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(r#"{"input":"Next","previous_response_id":"resp_exact"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "history at exact byte limit should pass, not reject"
+    );
+}
+
+#[tokio::test]
+async fn allows_history_at_exact_item_limit() {
+    let messages = json!([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"}
+    ]);
+    let store = MockStore::with_completed_response("resp_exact_items", json!("Hello"), messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: Some(2),
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"input":"Next","previous_response_id":"resp_exact_items"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "history at exact item limit should pass, not reject"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Conversation Rehydration
 // -----------------------------------------------------------------------------
 
@@ -1055,7 +1372,10 @@ async fn rehydrates_from_conversation_string_id() {
     let store = MockStore::with_conversation("conv_abc", messages);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1099,7 +1419,10 @@ async fn rehydrates_from_conversation_object_form() {
     let store = MockStore::with_conversation("conv_obj", messages);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1152,7 +1475,10 @@ async fn previous_response_id_takes_precedence_over_conversation() {
     );
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1187,7 +1513,10 @@ async fn rejects_when_conversation_not_found() {
     let store = MockStore::empty();
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1208,7 +1537,10 @@ async fn tenant_mismatch_rejects_conversation() {
     let store = MockStore::with_conversation("conv_abc", json!([{"role": "user", "content": "hello"}]));
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1238,7 +1570,10 @@ async fn rejects_malformed_conversation_empty_object() {
     let store = MockStore::empty();
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1257,7 +1592,10 @@ async fn rejects_malformed_conversation_numeric() {
     let store = MockStore::empty();
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1276,7 +1614,10 @@ async fn empty_conversation_produces_valid_state() {
     let store = MockStore::with_conversation("conv_empty", json!([]));
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
@@ -1305,7 +1646,10 @@ async fn empty_conversation_produces_valid_state() {
 
 #[tokio::test]
 async fn conversation_rehydration_requires_store_registry() {
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
@@ -1325,7 +1669,10 @@ async fn conversation_null_messages_treated_as_empty() {
     let store = MockStore::with_conversation("conv_null_msgs", Value::Null);
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter;
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: None,
+    };
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
