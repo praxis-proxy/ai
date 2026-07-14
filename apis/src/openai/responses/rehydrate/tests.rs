@@ -1699,6 +1699,128 @@ async fn conversation_null_messages_treated_as_empty() {
 }
 
 // -----------------------------------------------------------------------------
+// Conversation History Limits
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rejects_conversation_history_exceeding_byte_limit() {
+    let user_content = "A".repeat(500);
+    let assistant_content = "B".repeat(500);
+    let messages = json!([
+        {"role": "user", "content": user_content},
+        {"role": "assistant", "content": assistant_content}
+    ]);
+    let store = MockStore::with_conversation("conv_big", messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: 64,
+        max_history_items: None,
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_big"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => {
+            assert_eq!(
+                r.status, 413,
+                "should reject with 413 for oversized conversation history"
+            );
+            let body_bytes = r.body.unwrap();
+            let body_str = std::str::from_utf8(&body_bytes).unwrap();
+            assert!(
+                body_str.contains("byte limit"),
+                "rejection body should mention byte limit: {body_str}"
+            );
+        },
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_conversation_history_exceeding_item_limit() {
+    let messages = json!([
+        {"role": "user", "content": "Turn 1"},
+        {"role": "assistant", "content": "Reply 1"},
+        {"role": "user", "content": "Turn 2"},
+        {"role": "assistant", "content": "Reply 2"},
+        {"role": "user", "content": "Turn 3"}
+    ]);
+    let store = MockStore::with_conversation("conv_many", messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: Some(3),
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_many"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(r) => {
+            assert_eq!(r.status, 413, "should reject with 413 for too many conversation items");
+            let body_bytes = r.body.unwrap();
+            let body_str = std::str::from_utf8(&body_bytes).unwrap();
+            assert!(
+                body_str.contains("item limit"),
+                "rejection body should mention item limit: {body_str}"
+            );
+        },
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn allows_conversation_history_within_limits() {
+    let messages = json!([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"}
+    ]);
+    let store = MockStore::with_conversation("conv_ok", messages);
+    let registry = setup_registry(store);
+
+    let filter = RehydrateFilter {
+        max_history_bytes: default_max_history_bytes(),
+        max_history_items: Some(10),
+    };
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Next","conversation":"conv_ok"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "should release when conversation history is within limits"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated");
+    assert_eq!(
+        state.messages.len(),
+        3,
+        "messages should contain 2 stored + 1 current input"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 

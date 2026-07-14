@@ -91,6 +91,97 @@ impl RehydrateFilter {
             max_history_items: validated.max_history_items,
         }))
     }
+
+    /// Parse body, resolve rehydration source (`previous_response_id` or
+    /// `conversation`), and populate [`ResponsesState`] with the full
+    /// conversation history.
+    ///
+    /// `previous_response_id` takes precedence when both fields are
+    /// present.
+    async fn rehydrate(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+        streaming: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let Some(bytes) = body.as_ref() else {
+            return Ok(FilterAction::Release);
+        };
+        match parse_body_and_extract_id(bytes, streaming) {
+            Ok((body, Some(id))) => self.rehydrate_from_response(ctx, body, id, streaming).await,
+            Ok((body, None)) => self.rehydrate_from_conversation(ctx, body, streaming).await,
+            Err(action) => Ok(action),
+        }
+    }
+
+    /// Rehydrate from a stored response via `previous_response_id`.
+    async fn rehydrate_from_response(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        parsed_body: Value,
+        prev_id: String,
+        streaming: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let tenant_id = ctx
+            .get_metadata(TENANT_METADATA_KEY)
+            .unwrap_or(DEFAULT_TENANT_ID)
+            .to_owned();
+        let record = match fetch_and_validate_previous(ctx, &tenant_id, &prev_id, streaming).await {
+            Ok(r) => r,
+            Err(action) => return Ok(action),
+        };
+        let state = match build_state(
+            parsed_body,
+            &record,
+            self.max_history_bytes,
+            self.max_history_items,
+            streaming,
+        ) {
+            Ok(s) => s,
+            Err(action) => return Ok(action),
+        };
+        write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
+        ctx.extensions.insert(state);
+        debug!(previous_response_id = %prev_id, "previous response validated, state populated");
+        ctx.set_metadata("responses.previous_response_id", prev_id);
+        Ok(FilterAction::Release)
+    }
+
+    /// Rehydrate from a stored conversation when no `previous_response_id`
+    /// is present.
+    async fn rehydrate_from_conversation(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        parsed_body: Value,
+        streaming: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let conv_id = match resolve_conversation_id(&parsed_body, streaming) {
+            Ok(id) => id,
+            Err(action) => return Ok(action),
+        };
+        let tenant_id = ctx
+            .get_metadata(TENANT_METADATA_KEY)
+            .unwrap_or(DEFAULT_TENANT_ID)
+            .to_owned();
+        let record = match fetch_conversation(ctx, &tenant_id, &conv_id, streaming).await {
+            Ok(r) => r,
+            Err(action) => return Ok(action),
+        };
+        let state = match build_state(
+            parsed_body,
+            &record,
+            self.max_history_bytes,
+            self.max_history_items,
+            streaming,
+        ) {
+            Ok(s) => s,
+            Err(action) => return Ok(action),
+        };
+        write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
+        ctx.extensions.insert(state);
+        debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
+        Ok(FilterAction::Release)
+    }
 }
 
 /// YAML configuration for [`RehydrateFilter`].
@@ -158,7 +249,7 @@ impl HttpFilter for RehydrateFilter {
             .get_metadata("openai_responses_format.stream")
             .is_some_and(|v| v == "true");
 
-        rehydrate(ctx, body, streaming, self.max_history_bytes, self.max_history_items).await
+        self.rehydrate(ctx, body, streaming).await
     }
 }
 
@@ -197,7 +288,7 @@ fn enforce_history_limits(
         }
     }
 
-    let byte_size = serde_json::to_string(stored).map_or(0, |s| s.len());
+    let byte_size = serde_json::to_string(stored).map_or(usize::MAX, |s| s.len());
     if byte_size > max_history_bytes {
         return Err(reject_too_large(
             &format!(
@@ -212,44 +303,42 @@ fn enforce_history_limits(
     Ok(())
 }
 
-/// Parse body, resolve rehydration source (`previous_response_id` or
-/// `conversation`), and populate [`ResponsesState`] with the full
-/// conversation history.
-///
-/// `previous_response_id` takes precedence when both fields are
-/// present.
-async fn rehydrate(
-    ctx: &mut HttpFilterContext<'_>,
-    body: &Option<Bytes>,
-    streaming: bool,
-    max_history_bytes: usize,
-    max_history_items: Option<usize>,
-) -> Result<FilterAction, FilterError> {
-    let Some(bytes) = body.as_ref() else {
-        return Ok(FilterAction::Release);
-    };
-    let (parsed_body, prev_id) = match parse_body_and_extract_id(bytes, streaming) {
-        Ok((body, Some(id))) => (body, id),
-        Ok((body, None)) => return rehydrate_from_conversation(ctx, body, streaming).await,
-        Err(action) => return Ok(action),
-    };
-    let tenant_id = ctx
-        .get_metadata(TENANT_METADATA_KEY)
-        .unwrap_or(DEFAULT_TENANT_ID)
-        .to_owned();
-    let record = match fetch_and_validate_previous(ctx, &tenant_id, &prev_id, streaming).await {
-        Ok(r) => r,
-        Err(action) => return Ok(action),
-    };
-    let state = match build_state(parsed_body, &record, max_history_bytes, max_history_items, streaming) {
-        Ok(s) => s,
-        Err(action) => return Ok(action),
-    };
-    write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
-    ctx.extensions.insert(state);
-    debug!(previous_response_id = %prev_id, "previous response validated, state populated");
-    ctx.set_metadata("responses.previous_response_id", prev_id);
-    Ok(FilterAction::Release)
+// -----------------------------------------------------------------------------
+// RehydrationSource
+// -----------------------------------------------------------------------------
+
+/// Common interface for records that supply stored conversation history.
+trait RehydrationSource {
+    /// Extract stored messages for rehydration.
+    fn stored_messages(&self) -> Vec<Value>;
+    /// Recover MCP tool listings from stored history.
+    fn mcp_tool_listings(&self) -> Vec<Value> {
+        vec![]
+    }
+    /// Extract token usage from the previous response.
+    fn previous_usage(&self) -> Option<Value> {
+        None
+    }
+}
+
+impl RehydrationSource for ResponseRecord {
+    fn stored_messages(&self) -> Vec<Value> {
+        stored_messages_for_rehydrate(self)
+    }
+
+    fn mcp_tool_listings(&self) -> Vec<Value> {
+        collect_mcp_tool_listings(self)
+    }
+
+    fn previous_usage(&self) -> Option<Value> {
+        self.response_object.get("usage").filter(|u| !u.is_null()).cloned()
+    }
+}
+
+impl RehydrationSource for ConversationRecord {
+    fn stored_messages(&self) -> Vec<Value> {
+        conversation_messages_for_rehydrate(self)
+    }
 }
 
 /// Fetch the previous response and validate its status in one step.
@@ -264,46 +353,23 @@ async fn fetch_and_validate_previous(
     Ok(record)
 }
 
-/// Rehydrate from a stored conversation when no `previous_response_id`
-/// is present.
-async fn rehydrate_from_conversation(
-    ctx: &mut HttpFilterContext<'_>,
-    parsed_body: Value,
-    streaming: bool,
-) -> Result<FilterAction, FilterError> {
-    let has_conversation_field = parsed_body.get("conversation").is_some();
-    let Some(conv_id) = extract_conversation_id(&parsed_body) else {
-        if has_conversation_field {
-            return Ok(FilterAction::Reject(responses_error_rejection(
+/// Resolve the conversation ID from the request body, returning a
+/// `Release` when no conversation field is present or a `Reject`
+/// when the field is malformed.
+fn resolve_conversation_id(body: &Value, streaming: bool) -> Result<String, FilterAction> {
+    let has_field = body.get("conversation").is_some();
+    extract_conversation_id(body).ok_or_else(|| {
+        if has_field {
+            FilterAction::Reject(responses_error_rejection(
                 400,
                 "invalid_request_error",
                 "invalid conversation value: expected a string ID or {\"id\": \"...\"}",
                 streaming,
-            )));
+            ))
+        } else {
+            FilterAction::Release
         }
-        return Ok(FilterAction::Release);
-    };
-
-    let tenant_id = ctx
-        .get_metadata(TENANT_METADATA_KEY)
-        .unwrap_or(DEFAULT_TENANT_ID)
-        .to_owned();
-
-    let record = match fetch_conversation(ctx, &tenant_id, &conv_id, streaming).await {
-        Ok(r) => r,
-        Err(action) => return Ok(action),
-    };
-
-    let stored = conversation_messages_for_rehydrate(&record);
-    let replay = replay_messages_from_stored(&stored);
-    let mut state = ResponsesState::from_request_body(parsed_body);
-    state.messages.splice(0..0, replay);
-    state.persisted_messages.splice(0..0, stored);
-    ctx.extensions.insert(state);
-
-    debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
-
-    Ok(FilterAction::Release)
+    })
 }
 
 /// Extract a conversation ID from the request body.
@@ -357,15 +423,15 @@ fn conversation_messages_for_rehydrate(record: &ConversationRecord) -> Vec<Value
 /// current input.
 fn build_state(
     parsed_body: Value,
-    record: &ResponseRecord,
+    source: &impl RehydrationSource,
     max_history_bytes: usize,
     max_history_items: Option<usize>,
     streaming: bool,
 ) -> Result<ResponsesState, FilterAction> {
-    let stored = stored_messages_for_rehydrate(record);
+    let stored = source.stored_messages();
     enforce_history_limits(&stored, max_history_bytes, max_history_items, streaming)?;
-    let previous_tools = collect_mcp_tool_listings(record);
-    let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
+    let previous_tools = source.mcp_tool_listings();
+    let previous_usage = source.previous_usage();
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.messages.splice(0..0, replay);
