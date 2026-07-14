@@ -15,6 +15,13 @@ before sending requests.
 
 ## Configs
 
+### Grid Routing
+
+| File | Description |
+| ------ | ------------- |
+| [grid-route-inference.yaml](configs/grid-route-inference.yaml) | Routes requests to different upstream clusters based on the inference model name extracted from a configured request header |
+| [grid-route-mcp.yaml](configs/grid-route-mcp.yaml) | Routes MCP `tools/call` requests to the cluster that owns the requested tool using `mcp.name` metadata |
+
 ### General
 
 | File | Description |
