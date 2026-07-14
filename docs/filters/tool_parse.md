@@ -9,7 +9,7 @@ Parses tool definitions and `tool_choice` from Responses API request bodies and 
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_body_bytes` | usize | no | Maximum body size in bytes for `StreamBuffer` mode. |
+| `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 
 ## Examples
 

@@ -631,4 +631,225 @@ mod tests {
 
         assert_eq!(parsed["top_k"], 40, "top_k should be preserved as extra body parameter");
     }
+
+    #[test]
+    fn transform_request_non_json_body() {
+        let body = b"not json at all";
+        let result = transform_request(body);
+        assert!(result.is_err(), "non-JSON body should return Err");
+        assert!(
+            result.unwrap_err().contains("invalid JSON"),
+            "error should mention invalid JSON"
+        );
+    }
+
+    #[test]
+    fn transform_request_json_array_body() {
+        let body = b"[1,2,3]";
+        let result = transform_request(body);
+        assert!(result.is_err(), "JSON array body should return Err");
+        assert!(
+            result.unwrap_err().contains("not a JSON object"),
+            "error should mention not a JSON object"
+        );
+    }
+
+    #[test]
+    fn hoist_system_non_string_non_array_skipped() {
+        let body =
+            br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":42,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["messages"].as_array().unwrap().len(),
+            1,
+            "non-string/non-array system should be skipped"
+        );
+        assert_eq!(parsed["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn hoist_system_array_empty_text_skipped() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["messages"].as_array().unwrap().len(),
+            1,
+            "system with single empty text block should be skipped"
+        );
+        assert_eq!(parsed["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn convert_messages_missing_role_skipped() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(
+            parsed["messages"].as_array().unwrap().is_empty(),
+            "message without role should be skipped"
+        );
+    }
+
+    #[test]
+    fn convert_messages_content_not_string_or_array() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":42}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "user");
+        assert_eq!(
+            parsed["messages"][0]["content"], "",
+            "non-string/non-array content should become empty string"
+        );
+    }
+
+    #[test]
+    fn thinking_block_dropped() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think..."}]}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(
+            parsed["messages"].as_array().unwrap().is_empty(),
+            "thinking blocks should be dropped entirely"
+        );
+    }
+
+    #[test]
+    fn unknown_block_type_dropped() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"custom_xyz","data":"something"}]}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(
+            parsed["messages"].as_array().unwrap().is_empty(),
+            "unknown block types should be dropped"
+        );
+    }
+
+    #[test]
+    fn tool_choice_string_none() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"none","messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["tool_choice"], "none", "string none maps to none");
+    }
+
+    #[test]
+    fn tool_choice_string_unknown_maps_to_auto() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"foo","messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["tool_choice"], "auto", "unknown string tool_choice maps to auto");
+    }
+
+    #[test]
+    fn tool_choice_object_none() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"f","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"none"},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["tool_choice"], "none", "object-form none maps to none");
+    }
+
+    #[test]
+    fn tool_choice_object_tool_with_name() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"fn","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"tool","name":"fn"},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["tool_choice"]["type"], "function",
+            "tool type should map to function"
+        );
+        assert_eq!(
+            parsed["tool_choice"]["function"]["name"], "fn",
+            "tool name should be preserved"
+        );
+    }
+
+    #[test]
+    fn tool_choice_object_tool_without_name_maps_to_auto() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"f","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"tool"},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["tool_choice"], "auto",
+            "tool without name should fallback to auto"
+        );
+    }
+
+    #[test]
+    fn tool_choice_non_string_non_object_skipped() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":true,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(
+            parsed.get("tool_choice").is_none(),
+            "non-string/non-object tool_choice should be skipped"
+        );
+    }
+
+    #[test]
+    fn multipart_image_and_text_produces_array_content() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"Describe this"},{"type":"image","source":{"type":"url","url":"https://example.com/img.png"}}]}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let content = &parsed["messages"][0]["content"];
+        assert!(content.is_array(), "multipart content should be an array");
+        assert_eq!(content.as_array().unwrap().len(), 2, "two content parts");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn only_tool_result_blocks_produce_tool_messages() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"result1"},{"type":"tool_result","tool_use_id":"call_2","content":"result2"}]}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let messages = parsed["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "two tool messages, no wrapper");
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call_1");
+        assert_eq!(messages[0]["content"], "result1");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_2");
+        assert_eq!(messages[1]["content"], "result2");
+    }
+
+    #[test]
+    fn extract_tool_result_content_null() {
+        let block = json!({"type": "tool_result", "tool_use_id": "call_1", "content": null});
+        let result = extract_tool_result_content(&block);
+        assert!(result.is_empty(), "null content should return empty string");
+    }
+
+    #[test]
+    fn extract_tool_result_content_missing() {
+        let block = json!({"type": "tool_result", "tool_use_id": "call_1"});
+        let result = extract_tool_result_content(&block);
+        assert!(result.is_empty(), "missing content should return empty string");
+    }
+
+    #[test]
+    fn bash_and_text_editor_tools_filtered() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"bash_20241022","name":"bash"},{"type":"text_editor_20241022","name":"text_editor"},{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let tools = parsed["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "only non-filtered tools should remain");
+        assert_eq!(tools[0]["function"]["name"], "get_weather");
+    }
 }

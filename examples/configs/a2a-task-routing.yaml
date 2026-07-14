@@ -1,25 +1,30 @@
-# A2A Task Routing
+# A2A Task and Context-Owner Routing
 #
-# Captures task ownership from SendMessage JSON responses and
+# Captures task and context ownership from SendMessage JSON responses and
 # SendStreamingMessage / SubscribeToTask SSE responses, then routes
-# follow-up task operations back to the backend cluster that created
-# the task.
+# follow-up requests back to the backend cluster that created the task or
+# owns the context.
 #
 # This example uses `local` storage mode. This is useful for development and
-# testing or single-instance deployments of Praxis, but multi-replica task routing
+# testing or single-instance deployments of Praxis, but multi-replica routing
 # requires an external state store (e.g. Valkey).
 #
 # Flow:
 # 1. SendMessage and SendStreamingMessage are routed to agent-a by
 #    static router rules.
-# 2. The a2a filter captures task IDs from JSON response bodies
-#    (SendMessage) and SSE data frames (SendStreamingMessage,
-#    SubscribeToTask), recording task_id -> cluster_name in a
-#    local in-process store.
+# 2. The a2a filter captures task IDs and context IDs from JSON response
+#    bodies (SendMessage) and SSE data frames (SendStreamingMessage,
+#    SubscribeToTask), recording:
+#      - task_id -> cluster_name
+#      - context_id -> cluster_name
+#    in local in-process stores.
 # 3. Follow-up GetTask, CancelTask, SubscribeToTask, or push-notification
 #    config calls with a known task ID inject x-praxis-a2a-route-cluster,
 #    which the router matches to select the owning cluster.
-# 4. Unknown task IDs follow the static fallback route.
+# 4. ListTasks, SendMessage, or SendStreamingMessage carrying a known
+#    contextId are also routed to the owning cluster via context-owner
+#    routing. Task ID routes take precedence over context ID routes.
+# 5. Unknown task IDs and context IDs follow the static fallback route.
 
 listeners:
   - name: a2a
@@ -35,6 +40,7 @@ filter_chains:
         headers:
           method: x-praxis-a2a-method
           family: x-praxis-a2a-family
+          context_id: x-praxis-a2a-context-id
           task_id: x-praxis-a2a-task-id
           streaming: x-praxis-a2a-streaming
         task_routing:

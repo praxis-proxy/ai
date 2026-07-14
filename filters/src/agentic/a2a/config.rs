@@ -73,16 +73,22 @@ pub(crate) struct TaskRoutingConfig {
 
     /// Behavior when a task route lookup misses.
     #[serde(default)]
-    #[expect(dead_code, reason = "validated at parse time, used in follow-up PRs")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "validated at parse time, used in follow-up PRs")
+    )]
     pub on_lookup_miss: OnLookupMiss,
 
-    /// Internal header name injected on task route hit.
+    /// Internal header name injected on task or context route hit.
     #[serde(default = "default_route_cluster_header")]
     pub route_cluster_header: String,
 
     /// Storage backend for task routes.
     #[serde(default)]
-    #[expect(dead_code, reason = "validated at parse time, only local supported in this PR")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "validated at parse time, only local supported in this PR")
+    )]
     pub store: TaskRouteStore,
 
     /// TTL in seconds for terminal task routes (0 = remove immediately).
@@ -355,4 +361,444 @@ fn is_known_a2a_method(method: &str) -> bool {
             | "DeleteTaskPushNotificationConfig"
             | "GetExtendedAgentCard"
     )
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::needless_raw_strings,
+    clippy::needless_raw_string_hashes,
+    reason = "tests"
+)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Serde Defaults
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn on_lookup_miss_defaults_to_continue() {
+        let parsed: OnLookupMiss = serde_yaml::from_str("continue").unwrap();
+        assert_eq!(parsed, OnLookupMiss::Continue, "explicit 'continue' should parse");
+        assert_eq!(
+            OnLookupMiss::default(),
+            OnLookupMiss::Continue,
+            "default should be Continue"
+        );
+    }
+
+    #[test]
+    fn task_route_store_defaults_to_local() {
+        let parsed: TaskRouteStore = serde_yaml::from_str("local").unwrap();
+        assert_eq!(parsed, TaskRouteStore::Local, "explicit 'local' should parse");
+        assert_eq!(
+            TaskRouteStore::default(),
+            TaskRouteStore::Local,
+            "default should be Local"
+        );
+    }
+
+    #[test]
+    fn task_routing_config_deserializes_with_defaults() {
+        let cfg: TaskRoutingConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert!(!cfg.enabled, "enabled should default to false");
+        assert_eq!(
+            cfg.max_response_body_bytes, DEFAULT_MAX_RESPONSE_BODY_BYTES,
+            "max_response_body_bytes should use default constant"
+        );
+        assert_eq!(
+            cfg.on_lookup_miss,
+            OnLookupMiss::Continue,
+            "on_lookup_miss should default to Continue"
+        );
+        assert_eq!(
+            cfg.route_cluster_header, DEFAULT_ROUTE_CLUSTER_HEADER,
+            "route_cluster_header should use default constant"
+        );
+        assert_eq!(cfg.store, TaskRouteStore::Local, "store should default to Local");
+        assert_eq!(
+            cfg.terminal_ttl_seconds, DEFAULT_TERMINAL_TTL_SECONDS,
+            "terminal_ttl_seconds should use default constant"
+        );
+        assert_eq!(
+            cfg.ttl_seconds, DEFAULT_TTL_SECONDS,
+            "ttl_seconds should use default constant"
+        );
+    }
+
+    /// Assert all seven header defaults match the expected `x-praxis-a2a-*` values.
+    fn assert_all_header_defaults(h: &A2aHeaders) {
+        assert_eq!(h.context_id.as_deref(), Some("x-praxis-a2a-context-id"));
+        assert_eq!(h.method.as_deref(), Some("x-praxis-a2a-method"));
+        assert_eq!(h.family.as_deref(), Some("x-praxis-a2a-family"));
+        assert_eq!(h.task_id.as_deref(), Some("x-praxis-a2a-task-id"));
+        assert_eq!(h.kind.as_deref(), Some("x-praxis-a2a-kind"));
+        assert_eq!(h.streaming.as_deref(), Some("x-praxis-a2a-streaming"));
+        assert_eq!(h.version.as_deref(), Some("x-praxis-a2a-version"));
+    }
+
+    #[test]
+    fn a2a_headers_deserializes_with_defaults() {
+        let headers: A2aHeaders = serde_yaml::from_str("{}").unwrap();
+        assert_all_header_defaults(&headers);
+    }
+
+    #[test]
+    fn a2a_config_deserializes_with_defaults() {
+        let cfg: A2aConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(
+            cfg.max_body_bytes, DEFAULT_MAX_BODY_BYTES,
+            "max_body_bytes should use default constant"
+        );
+        assert!(cfg.method_aliases.is_empty(), "method_aliases should default to empty");
+        assert_eq!(
+            cfg.on_invalid,
+            OnInvalidBehavior::Reject,
+            "on_invalid should default to Reject"
+        );
+        assert!(
+            !cfg.task_routing.enabled,
+            "task_routing.enabled should default to false"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Serde deny_unknown_fields
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn task_routing_config_rejects_unknown_fields() {
+        let result = serde_yaml::from_str::<TaskRoutingConfig>("bogus_field: true");
+        assert!(result.is_err(), "unknown field should be rejected");
+    }
+
+    #[test]
+    fn a2a_headers_rejects_unknown_fields() {
+        let result = serde_yaml::from_str::<A2aHeaders>("bogus_field: x-foo");
+        assert!(result.is_err(), "unknown field should be rejected");
+    }
+
+    #[test]
+    fn a2a_config_rejects_unknown_fields() {
+        let result = serde_yaml::from_str::<A2aConfig>("bogus_field: true");
+        assert!(result.is_err(), "unknown field should be rejected");
+    }
+
+    // -------------------------------------------------------------------------
+    // A2aHeaders with null (disabled) headers
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn null_header_produces_none() {
+        let headers: A2aHeaders = serde_yaml::from_str(
+            r"
+context_id: ~
+method: ~
+family: ~
+task_id: ~
+kind: ~
+streaming: ~
+version: ~
+",
+        )
+        .unwrap();
+
+        assert!(headers.context_id.is_none(), "null context_id should be None");
+        assert!(headers.method.is_none(), "null method should be None");
+        assert!(headers.family.is_none(), "null family should be None");
+        assert!(headers.task_id.is_none(), "null task_id should be None");
+        assert!(headers.kind.is_none(), "null kind should be None");
+        assert!(headers.streaming.is_none(), "null streaming should be None");
+        assert!(headers.version.is_none(), "null version should be None");
+    }
+
+    // -------------------------------------------------------------------------
+    // A2aHeaders Default trait
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn a2a_headers_default_trait_matches_serde_defaults() {
+        let from_default = A2aHeaders::default();
+        let from_serde: A2aHeaders = serde_yaml::from_str("{}").unwrap();
+
+        // Both paths should produce the same canonical header names.
+        assert_all_header_defaults(&from_default);
+        assert_all_header_defaults(&from_serde);
+    }
+
+    // -------------------------------------------------------------------------
+    // build_config — valid
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn build_config_minimal_valid() {
+        let cfg: A2aConfig = serde_yaml::from_str("{}").unwrap();
+        let result = build_config(cfg);
+        assert!(result.is_ok(), "minimal config should be valid");
+    }
+
+    // -------------------------------------------------------------------------
+    // build_config — max_body_bytes
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn build_config_rejects_zero_max_body_bytes() {
+        let cfg: A2aConfig = serde_yaml::from_str("max_body_bytes: 0").unwrap();
+        let result = build_config(cfg);
+        assert!(result.is_err(), "zero max_body_bytes should be rejected");
+    }
+
+    // -------------------------------------------------------------------------
+    // build_config — header validation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn build_config_rejects_invalid_header_name() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+headers:
+  context_id: 'invalid header name'
+",
+        )
+        .unwrap();
+        let result = build_config(cfg);
+        assert!(result.is_err(), "header name with spaces should be rejected");
+    }
+
+    #[test]
+    fn build_config_accepts_null_headers() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+headers:
+  context_id: ~
+  method: ~
+  family: ~
+  task_id: ~
+  kind: ~
+  streaming: ~
+  version: ~
+",
+        )
+        .unwrap();
+        let result = build_config(cfg);
+        assert!(result.is_ok(), "null (disabled) headers should be accepted");
+    }
+
+    // -------------------------------------------------------------------------
+    // build_config — alias validation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn build_config_rejects_empty_alias_key() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r#"
+method_aliases:
+  "": SendMessage
+"#,
+        )
+        .unwrap();
+        let result = build_config(cfg);
+        assert!(result.is_err(), "empty alias key should be rejected");
+    }
+
+    #[test]
+    fn build_config_rejects_empty_alias_value() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r#"
+method_aliases:
+  send: ""
+"#,
+        )
+        .unwrap();
+        let result = build_config(cfg);
+        assert!(result.is_err(), "empty alias value should be rejected");
+    }
+
+    #[test]
+    fn build_config_rejects_unknown_canonical_method() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+method_aliases:
+  send: NotARealMethod
+",
+        )
+        .unwrap();
+        let result = build_config(cfg);
+        assert!(
+            result.is_err(),
+            "alias target that is not a known A2A method should be rejected"
+        );
+    }
+
+    #[test]
+    fn build_config_accepts_valid_alias() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+method_aliases:
+  message/send: SendMessage
+  tasks/get: GetTask
+",
+        )
+        .unwrap();
+        let result = build_config(cfg);
+        assert!(
+            result.is_ok(),
+            "valid aliases mapping to known methods should be accepted"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // is_known_a2a_method
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn all_known_methods_recognized() {
+        let known = [
+            "SendMessage",
+            "SendStreamingMessage",
+            "GetTask",
+            "ListTasks",
+            "CancelTask",
+            "SubscribeToTask",
+            "CreateTaskPushNotificationConfig",
+            "GetTaskPushNotificationConfig",
+            "ListTaskPushNotificationConfigs",
+            "DeleteTaskPushNotificationConfig",
+            "GetExtendedAgentCard",
+        ];
+        for method in &known {
+            assert!(
+                is_known_a2a_method(method),
+                "{method} should be recognized as a known A2A method"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_method_not_recognized() {
+        assert!(
+            !is_known_a2a_method("NotARealMethod"),
+            "unknown method should not be recognized"
+        );
+        assert!(
+            !is_known_a2a_method("sendmessage"),
+            "lowercase variant should not be recognized"
+        );
+        assert!(!is_known_a2a_method(""), "empty string should not be recognized");
+    }
+
+    // -------------------------------------------------------------------------
+    // validate_task_routing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn validate_task_routing_rejects_zero_ttl() {
+        let tr = TaskRoutingConfig {
+            enabled: true,
+            ttl_seconds: 0,
+            ..TaskRoutingConfig::default()
+        };
+        let result = validate_task_routing(&tr);
+        assert!(result.is_err(), "ttl_seconds=0 should be rejected");
+    }
+
+    #[test]
+    fn validate_task_routing_rejects_zero_max_response_body_bytes() {
+        let tr = TaskRoutingConfig {
+            enabled: true,
+            max_response_body_bytes: 0,
+            ..TaskRoutingConfig::default()
+        };
+        let result = validate_task_routing(&tr);
+        assert!(result.is_err(), "max_response_body_bytes=0 should be rejected");
+    }
+
+    #[test]
+    fn validate_task_routing_rejects_bad_route_cluster_header_prefix() {
+        let tr = TaskRoutingConfig {
+            enabled: true,
+            route_cluster_header: "x-custom-header".to_owned(),
+            ..TaskRoutingConfig::default()
+        };
+        let result = validate_task_routing(&tr);
+        assert!(
+            result.is_err(),
+            "route_cluster_header without x-praxis-a2a- prefix should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_task_routing_valid_config() {
+        let tr = TaskRoutingConfig::default();
+        // Default has ttl_seconds > 0, valid header prefix, valid body bytes.
+        let result = validate_task_routing(&tr);
+        assert!(result.is_ok(), "default TaskRoutingConfig should be valid");
+    }
+
+    #[test]
+    fn build_config_validates_task_routing_when_enabled() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+task_routing:
+  enabled: true
+  ttl_seconds: 0
+",
+        )
+        .unwrap();
+        let result = build_config(cfg);
+        assert!(
+            result.is_err(),
+            "enabled task_routing with ttl_seconds=0 should be rejected"
+        );
+    }
+
+    #[test]
+    fn build_config_skips_task_routing_validation_when_disabled() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+task_routing:
+  enabled: false
+  ttl_seconds: 0
+",
+        )
+        .unwrap();
+        let result = build_config(cfg);
+        assert!(
+            result.is_ok(),
+            "disabled task_routing should skip validation even with invalid ttl"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // TaskRoutingConfig defaults match constants
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn task_routing_config_default_matches_constants() {
+        let cfg = TaskRoutingConfig::default();
+
+        assert_eq!(cfg.ttl_seconds, 3_600, "default ttl_seconds should be 3600");
+        assert_eq!(
+            cfg.terminal_ttl_seconds, 300,
+            "default terminal_ttl_seconds should be 300"
+        );
+        assert_eq!(
+            cfg.max_response_body_bytes, 65_536,
+            "default max_response_body_bytes should be 65536"
+        );
+        assert_eq!(
+            cfg.route_cluster_header, "x-praxis-a2a-route-cluster",
+            "default route_cluster_header should be x-praxis-a2a-route-cluster"
+        );
+    }
 }

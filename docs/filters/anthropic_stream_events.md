@@ -13,7 +13,7 @@ Arms automatically when an upstream classifier or transform filter sets `anthrop
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_partial_event_bytes` | usize | no | Maximum incomplete SSE event bytes retained between chunks. |
+| `max_partial_event_bytes` | integer | no | Maximum incomplete SSE event bytes retained between chunks. |
 
 ## Examples
 

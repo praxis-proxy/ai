@@ -1,5 +1,5 @@
 {
-  "source": "Sanitized Claude session replay sample: single Messages turn",
+  "source": "Sanitized Claude Code session log",
   "protocol": "anthropic_messages",
   "turns": [
     {
@@ -32,7 +32,43 @@
           "input_tokens": 18,
           "output_tokens": 12
         }
-      }
+      },
+      "source_records": [
+        {
+          "uuid": "turn_user_replay_claude_basic",
+          "sessionId": "session_replay_claude_basic",
+          "timestamp": "2026-07-07T00:00:00Z",
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "Summarize the value of replay tests in one sentence."
+          }
+        },
+        {
+          "uuid": "turn_assistant_replay_claude_basic",
+          "sessionId": "session_replay_claude_basic",
+          "timestamp": "2026-07-07T00:00:01Z",
+          "type": "assistant",
+          "message": {
+            "id": "msg_replay_claude_basic",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+              {
+                "type": "text",
+                "text": "Replay tests turn real sessions into deterministic coverage for gateway behavior."
+              }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 18,
+              "output_tokens": 12
+            }
+          }
+        }
+      ]
     }
   ]
 }

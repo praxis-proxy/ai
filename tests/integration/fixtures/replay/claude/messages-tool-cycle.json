@@ -1,0 +1,267 @@
+{
+  "source": "Sanitized Claude Code session log",
+  "protocol": "anthropic_messages",
+  "turns": [
+    {
+      "name": "messages-tool-use",
+      "path": "/v1/messages",
+      "request": {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "List the files in the fixture directory."
+          }
+        ],
+        "tools": [
+          {
+            "name": "Bash",
+            "description": "Run a shell command.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        ]
+      },
+      "response": {
+        "id": "msg_replay_tool_cycle_01",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [
+          {
+            "type": "text",
+            "text": "I will inspect the fixture directory."
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_replay_bash_01",
+            "name": "Bash",
+            "input": {
+              "command": "ls fixtures"
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 18,
+          "output_tokens": 11
+        }
+      },
+      "source_records": [
+        {
+          "uuid": "00000000-0000-4000-8000-000000000101",
+          "sessionId": "00000000-0000-4000-8000-000000000100",
+          "timestamp": "2026-07-08T18:00:00Z",
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "List the files in the fixture directory."
+          },
+          "cwd": "fixture-cwd",
+          "version": "2.1.204",
+          "gitBranch": "fixture-branch"
+        },
+        {
+          "uuid": "00000000-0000-4000-8000-000000000102",
+          "parentUuid": "00000000-0000-4000-8000-000000000101",
+          "sessionId": "00000000-0000-4000-8000-000000000100",
+          "timestamp": "2026-07-08T18:00:01Z",
+          "type": "assistant",
+          "message": {
+            "id": "msg_replay_tool_cycle_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+              {
+                "type": "text",
+                "text": "I will inspect the fixture directory."
+              }
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 18,
+              "output_tokens": 5
+            }
+          },
+          "requestId": "req_replay_tool_cycle_01",
+          "cwd": "fixture-cwd",
+          "version": "2.1.204",
+          "gitBranch": "fixture-branch"
+        },
+        {
+          "uuid": "00000000-0000-4000-8000-000000000103",
+          "parentUuid": "00000000-0000-4000-8000-000000000102",
+          "sessionId": "00000000-0000-4000-8000-000000000100",
+          "timestamp": "2026-07-08T18:00:02Z",
+          "type": "assistant",
+          "message": {
+            "id": "msg_replay_tool_cycle_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_replay_bash_01",
+                "name": "Bash",
+                "input": {
+                  "command": "ls fixtures"
+                }
+              }
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 18,
+              "output_tokens": 11
+            }
+          },
+          "requestId": "req_replay_tool_cycle_01",
+          "cwd": "fixture-cwd",
+          "version": "2.1.204",
+          "gitBranch": "fixture-branch"
+        }
+      ]
+    },
+    {
+      "name": "messages-tool-result",
+      "path": "/v1/messages",
+      "request": {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "List the files in the fixture directory."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "I will inspect the fixture directory."
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_replay_bash_01",
+                "name": "Bash",
+                "input": {
+                  "command": "ls fixtures"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_replay_bash_01",
+                "content": "alpha.txt\nbeta.txt"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "name": "Bash",
+            "description": "Run a shell command.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        ]
+      },
+      "response": {
+        "id": "msg_replay_tool_cycle_02",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [
+          {
+            "type": "text",
+            "text": "The fixture directory contains alpha.txt and beta.txt."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 31,
+          "output_tokens": 12
+        }
+      },
+      "source_records": [
+        {
+          "uuid": "00000000-0000-4000-8000-000000000104",
+          "parentUuid": "00000000-0000-4000-8000-000000000103",
+          "sessionId": "00000000-0000-4000-8000-000000000100",
+          "timestamp": "2026-07-08T18:00:03Z",
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_replay_bash_01",
+                "content": "alpha.txt\nbeta.txt"
+              }
+            ]
+          },
+          "cwd": "fixture-cwd",
+          "version": "2.1.204",
+          "gitBranch": "fixture-branch"
+        },
+        {
+          "uuid": "00000000-0000-4000-8000-000000000105",
+          "parentUuid": "00000000-0000-4000-8000-000000000104",
+          "sessionId": "00000000-0000-4000-8000-000000000100",
+          "timestamp": "2026-07-08T18:00:04Z",
+          "type": "assistant",
+          "message": {
+            "id": "msg_replay_tool_cycle_02",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+              {
+                "type": "text",
+                "text": "The fixture directory contains alpha.txt and beta.txt."
+              }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 31,
+              "output_tokens": 12
+            }
+          },
+          "requestId": "req_replay_tool_cycle_02",
+          "cwd": "fixture-cwd",
+          "version": "2.1.204",
+          "gitBranch": "fixture-branch"
+        }
+      ]
+    }
+  ]
+}

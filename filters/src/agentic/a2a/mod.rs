@@ -40,7 +40,7 @@ use tracing::{debug, trace};
 use self::{
     config::{A2aConfig, build_config},
     envelope::{A2aEnvelope, extract_a2a_envelope},
-    task_routing::LocalTaskRouteStore,
+    task_routing::{LocalTaskRouteStore, RouteSource, attempt_route_lookup},
 };
 
 // -----------------------------------------------------------------------------
@@ -50,6 +50,16 @@ use self::{
 /// Extracts A2A protocol metadata from JSON-RPC request bodies and promotes
 /// method, family, task ID, streaming detection, and version to request headers,
 /// filter results, and durable metadata for routing.
+///
+/// When `task_routing.enabled` is true, the filter captures task and context
+/// ownership from backend responses and uses it to route follow-up requests.
+/// Task-owner routing sends `GetTask`, `CancelTask`, `SubscribeToTask`, and
+/// push-notification config methods back to the backend that created the task.
+/// Context-owner routing sends `ListTasks`, `SendMessage`, and
+/// `SendStreamingMessage` requests carrying a known `contextId` back to the
+/// backend that owns the context. Task-ID routes take precedence over
+/// context-ID routes. Context routes always use `ttl_seconds`; a completed
+/// task does not evict the context route.
 ///
 /// # YAML
 ///
@@ -302,45 +312,79 @@ impl HttpFilter for A2aFilter {
 // Private Utilities
 // -----------------------------------------------------------------------------
 
-/// Look up a task route and inject the route cluster header on hit.
-#[expect(clippy::too_many_lines, reason = "sequential lookup-inject-trace pipeline")]
+/// Look up a task or context route and inject the route cluster header on hit.
+///
+/// Task routes take precedence over context routes. For task-routable methods,
+/// only the task ID is consulted. For context-routable methods, the context ID
+/// is consulted. Because the method sets are disjoint in the current A2A spec,
+/// both lookups cannot apply in practice — but the ordering guarantees task
+/// wins if both IDs are ever simultaneously present.
+#[expect(clippy::too_many_lines, reason = "sequential lookup-classify-trace pipeline")]
 fn lookup_task_route(
     ctx: &mut HttpFilterContext<'_>,
     a2a_envelope: &A2aEnvelope,
     store: &LocalTaskRouteStore,
     config: &A2aConfig,
 ) {
-    if !a2a_envelope.method.is_task_routable() {
+    let task_id = if a2a_envelope.method.is_task_routable() {
+        a2a_envelope.task_id.as_deref()
+    } else {
+        None
+    };
+
+    let context_id = if a2a_envelope.method.is_context_routable() {
+        a2a_envelope.context_id.as_deref()
+    } else {
+        None
+    };
+
+    if task_id.is_none() && context_id.is_none() {
         return;
     }
 
-    let Some(task_id) = &a2a_envelope.task_id else {
-        return;
-    };
+    let has_task_id = task_id.is_some();
+    let has_context_id = context_id.is_some();
 
-    if let Some(cluster) = store.get_by_task_id(task_id) {
+    if let Some((cluster, source)) = attempt_route_lookup(store, task_id, context_id) {
         ctx.extra_request_headers.push((
             Cow::Owned(config.task_routing.route_cluster_header.clone()),
             (*cluster).to_owned(),
         ));
-        ctx.set_metadata("a2a.route_decision", "task_route_hit");
+
+        let decision = match source {
+            RouteSource::Task => "task_route_hit",
+            RouteSource::Context => "context_route_hit",
+        };
+        ctx.set_metadata("a2a.route_decision", decision);
+        ctx.set_metadata("a2a.route_source", source.as_str());
         ctx.set_metadata("a2a.route_cluster", &*cluster);
+
         debug!(
-            has_task_id = true,
-            task_id_len = task_id.len(),
+            has_task_id,
+            task_id_len = task_id.map_or(0, str::len),
+            has_context_id,
+            context_id_len = context_id.map_or(0, str::len),
             lookup_hit = true,
+            route_source = source.as_str(),
             cluster = %cluster,
             method = a2a_envelope.method.as_str(),
-            "task route lookup hit"
+            "route lookup hit"
         );
     } else {
-        ctx.set_metadata("a2a.route_decision", "task_route_miss");
+        let miss = if has_task_id {
+            "task_route_miss"
+        } else {
+            "context_route_miss"
+        };
+        ctx.set_metadata("a2a.route_decision", miss);
         debug!(
-            has_task_id = true,
-            task_id_len = task_id.len(),
+            has_task_id,
+            task_id_len = task_id.map_or(0, str::len),
+            has_context_id,
+            context_id_len = context_id.map_or(0, str::len),
             lookup_hit = false,
             method = a2a_envelope.method.as_str(),
-            "task route lookup miss"
+            "route lookup miss"
         );
     }
 }
@@ -370,7 +414,12 @@ fn try_capture_from_buffer(
     }
 }
 
-/// Uses terminal TTL when the task state is final.
+/// Store task and context routes extracted from a response body.
+///
+/// Task routes use `terminal_ttl_seconds` when the task is done; context routes
+/// always use `ttl_seconds` because a completed task does not end the context —
+/// later messages or `ListTasks` calls in the same context still need routing.
+#[expect(clippy::too_many_lines, reason = "sequential extract-store-log pipeline")]
 fn store_task_route(
     value: &serde_json::Value,
     cluster: &str,
@@ -381,7 +430,7 @@ fn store_task_route(
         return;
     };
 
-    let ttl = task_routing::route_ttl(extracted.terminal, config);
+    let task_ttl = task_routing::route_ttl(extracted.terminal, config);
 
     if extracted.terminal && config.terminal_ttl_seconds == 0 {
         store.remove(&extracted.task_id);
@@ -392,13 +441,27 @@ fn store_task_route(
             "terminal task route removed (terminal_ttl_seconds=0)"
         );
     } else {
-        store.put(&extracted.task_id, cluster, ttl);
+        store.put(&extracted.task_id, cluster, task_ttl);
         debug!(
             has_task_id = true,
             task_id_len = extracted.task_id.len(),
             cluster = %cluster,
             terminal = extracted.terminal,
             "stored task route from response"
+        );
+    }
+
+    // Context routes always use the normal TTL. A completed task does not
+    // signal context completion; the same context may receive further messages
+    // or ListTasks queries.
+    if let Some(ctx_id) = &extracted.context_id {
+        let ctx_ttl = std::time::Duration::from_secs(config.ttl_seconds);
+        store.put_context(ctx_id, cluster, ctx_ttl);
+        debug!(
+            has_context_id = true,
+            context_id_len = ctx_id.len(),
+            cluster = %cluster,
+            "stored context route from response"
         );
     }
 }

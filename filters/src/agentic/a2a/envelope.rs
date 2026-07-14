@@ -163,6 +163,12 @@ impl A2aMethod {
                 | Self::DeleteTaskPushNotificationConfig
         )
     }
+
+    /// Whether a follow-up request with this method should be routed
+    /// by stored context ownership when no task route applies.
+    pub(crate) fn is_context_routable(&self) -> bool {
+        matches!(self, Self::SendMessage | Self::SendStreamingMessage | Self::ListTasks)
+    }
 }
 
 impl A2aFamily {

@@ -24,6 +24,9 @@ configuration.
 
 - `claude/messages-basic.json` replays one Anthropic Messages turn through
   `examples/configs/anthropic/messages-protocol.yaml`.
+- `claude/messages-tool-cycle.json` replays a sanitized Claude Code client-tool
+  cycle with preserved source records for the assistant `tool_use` and user
+  `tool_result` records.
 - `codex/responses-basic.json` replays one OpenAI Responses turn through
   `examples/configs/openai/responses/full-flow.yaml` and verifies the response
   can be read back from the response store.
@@ -43,7 +46,8 @@ before it is used.
       "name": "stable-fixture-local-turn-name",
       "path": "/v1/messages",
       "request": {},
-      "response": {}
+      "response": {},
+      "source_records": []
     }
   ]
 }
@@ -51,7 +55,9 @@ before it is used.
 
 Top-level fields:
 
-- `source`: describes the origin and sanitization level of the sample.
+- `source`: describes the origin and sanitization level of the sample, such as
+  `Sanitized Claude Code session log`. Keep scenario names in the turn `name`
+  and fixture filename, not in `source`.
 - `protocol`: currently `anthropic_messages` or `openai_responses`.
 - `turns`: ordered request/response pairs from the session.
 
@@ -62,6 +68,12 @@ Turn fields:
   `/v1/responses`.
 - `request`: JSON request body sent by the agent client.
 - `response`: JSON response body returned by the mocked upstream service.
+- `source_records`: optional original session records used to derive the turn.
+  Importers should preserve records here when the replayable `request` and
+  `response` fields are projections of a richer session log.
+  For OpenAI Responses/Codex sessions, `request` and `response` should be
+  direct copies of the original `response_item.payload.request` and
+  `response_item.payload.response` values, not normalized or filtered shapes.
 
 ## How to add a replay example
 
@@ -82,7 +94,9 @@ Turn fields:
    Remove secrets, hostnames, account identifiers, user text that should not be
    committed, local file paths, and unstable timestamps. Replace real IDs with
    deterministic fixture IDs like `msg_replay_tool_call` or
-   `resp_replay_structured_output`.
+   `resp_replay_structured_output`. When redacting linked IDs such as `uuid`,
+   `parentUuid`, `promptId`, or `sessionId`, preserve equality and parent-child
+   relationships instead of inventing new links.
 
 4. Add or extend an integration test in
    `tests/integration/tests/suite/examples/session_replay.rs`.

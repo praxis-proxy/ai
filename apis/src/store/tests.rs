@@ -1282,6 +1282,30 @@ async fn conversation_item_methods_fail_without_items_table() {
 }
 
 // -----------------------------------------------------------------------------
+// StoreError Display & Error trait
+// -----------------------------------------------------------------------------
+
+#[test]
+fn store_error_invalid_input_display() {
+    let err = StoreError::InvalidInput("bad cursor".into());
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bad cursor"),
+        "InvalidInput Display should include the message: {msg}"
+    );
+}
+
+#[test]
+fn store_error_implements_std_error() {
+    use std::error::Error as _;
+    let err = StoreError::Database("connection lost".into());
+    assert!(
+        err.source().is_none(),
+        "StoreError should implement std::error::Error with no source"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // File-Backed Store
 // -----------------------------------------------------------------------------
 

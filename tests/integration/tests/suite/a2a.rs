@@ -772,6 +772,207 @@ fn a2a_spoofed_context_id_header_rejected() {
 }
 
 // -----------------------------------------------------------------------------
+// Context Owner Routing Tests (Integration 1–6)
+// -----------------------------------------------------------------------------
+
+/// Integration 1: Context captured from SendMessage response, then ListTasks
+/// routes by context.
+#[test]
+fn a2a_context_captured_from_send_message_then_list_tasks_routes_by_context() {
+    let json_body = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-ctx-1","contextId":"ctx-int-1","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+    let agent_a_guard = Backend::fixed(json_body)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let agent_b_guard = start_backend_with_shutdown("agent-b");
+    let proxy_port = free_port();
+
+    let yaml = a2a_context_owner_routing_yaml(proxy_port, agent_a_guard.port(), agent_b_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    // Step 1: SendMessage routed to agent-a (by static rule), response stores context.
+    let send_body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[]}}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", send_body, &[]);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200, "SendMessage should succeed");
+
+    // Step 2: ListTasks with ctx-int-1 must route to agent-a (not fallback agent-b).
+    let list_body = r#"{"jsonrpc":"2.0","id":2,"method":"ListTasks","params":{"contextId":"ctx-int-1"}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", list_body, &[]);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        json_body,
+        "ListTasks should route to agent-a (which owns ctx-int-1), not fallback agent-b"
+    );
+}
+
+/// Integration 2: Context captured from SendMessage response, then SendMessage
+/// in same context routes by context.
+#[test]
+fn a2a_context_captured_from_send_message_then_send_message_in_same_context_routes() {
+    let json_body = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-ctx-2","contextId":"ctx-int-2","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+    let agent_a_guard = Backend::fixed(json_body)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let agent_b_guard = start_backend_with_shutdown("agent-b");
+    let proxy_port = free_port();
+
+    let yaml = a2a_context_owner_routing_yaml(proxy_port, agent_a_guard.port(), agent_b_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    // First SendMessage creates task/context on agent-a.
+    let send_body1 =
+        r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[]}}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", send_body1, &[]);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200, "first SendMessage should succeed");
+
+    // Second SendMessage in same context must route to agent-a via context routing.
+    let send_body2 = r#"{"jsonrpc":"2.0","id":2,"method":"SendMessage","params":{"message":{"contextId":"ctx-int-2","role":"ROLE_USER","parts":[]}}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", send_body2, &[]);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        json_body,
+        "second SendMessage in same context should route to agent-a via context routing"
+    );
+}
+
+/// Integration 3: Context miss continues.
+#[test]
+fn a2a_context_miss_follows_fallback_route() {
+    let agent_a_guard = start_backend_with_shutdown("agent-a");
+    let agent_b_guard = start_backend_with_shutdown("agent-b");
+    let proxy_port = free_port();
+
+    let yaml = a2a_context_owner_routing_yaml(proxy_port, agent_a_guard.port(), agent_b_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    // No prior context mapping for ctx-missing.
+    let list_body = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-missing"}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", list_body, &[]);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        "agent-b",
+        "unknown context should follow fallback route to agent-b"
+    );
+}
+
+// Integration 4: Task route beats context route.
+//
+// Validated at the unit level in `task_route_hit_takes_precedence_over_context_route_hit`.
+// An integration-level test is not meaningful because the methods that carry task_id
+// (GetTask, CancelTask, etc.) do not also carry contextId; the route stores are populated
+// separately. Unit coverage is authoritative for this requirement.
+
+/// Integration 5: Terminal task with context keeps context route.
+#[test]
+fn a2a_terminal_task_with_context_keeps_context_route() {
+    let json_body = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-final","contextId":"ctx-final","status":{"state":"TASK_STATE_COMPLETED"}}}}"#;
+    let agent_a_guard = Backend::fixed(json_body)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let agent_b_guard = start_backend_with_shutdown("agent-b");
+    let proxy_port = free_port();
+
+    // Use terminal_ttl_seconds=0 so the task route is removed immediately.
+    let yaml = a2a_context_owner_routing_zero_terminal_ttl_yaml(proxy_port, agent_a_guard.port(), agent_b_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    // SendMessage returns a terminal task with context.
+    let send_body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[]}}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", send_body, &[]);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200, "SendMessage should succeed");
+
+    // GetTask for the now-removed task should fall through (task route gone).
+    let get_body = r#"{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{"id":"task-final"}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", get_body, &[]);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        "agent-b",
+        "GetTask for terminal task with ttl=0 should fall through to fallback"
+    );
+
+    // ListTasks with ctx-final should still route to agent-a (context route survived).
+    let list_body = r#"{"jsonrpc":"2.0","id":3,"method":"ListTasks","params":{"contextId":"ctx-final"}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", list_body, &[]);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        json_body,
+        "ListTasks for ctx-final should still route to agent-a (context route survived task removal)"
+    );
+}
+
+/// Integration 6: Streaming task event with context stores context route.
+#[test]
+fn a2a_streaming_task_event_with_context_stores_context_route() {
+    let sse_body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-sse-ctx\",\"contextId\":\"ctx-sse-int\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n";
+    let sse_guard = Backend::fixed(sse_body)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .start_with_shutdown();
+    let agent_b_guard = start_backend_with_shutdown("agent-b");
+    let proxy_port = free_port();
+
+    let yaml = a2a_context_owner_routing_yaml(proxy_port, sse_guard.port(), agent_b_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let _proxy = start_proxy(&config);
+
+    let send_body = r#"{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"role":"ROLE_USER","parts":[]}}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", send_body, &[]);
+
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut response = Vec::new();
+    read_until_timeout(&mut stream, &mut response);
+    let raw = String::from_utf8_lossy(&response);
+
+    assert_eq!(parse_status(&raw), 200, "SendStreamingMessage should succeed");
+    assert!(
+        raw.contains("text/event-stream"),
+        "SSE content-type should reach client"
+    );
+
+    // Verify SSE body passes through unchanged.
+    let response_body = parse_body(&raw);
+    assert_eq!(
+        response_body, sse_body,
+        "SSE response body should pass through unchanged"
+    );
+
+    // ListTasks with ctx-sse-int should route to agent-a (context captured from SSE event).
+    let list_body = r#"{"jsonrpc":"2.0","id":2,"method":"ListTasks","params":{"contextId":"ctx-sse-int"}}"#;
+    let request = json_post_with_a2a_headers("/a2a/", list_body, &[]);
+    let raw = http_send(&format!("127.0.0.1:{proxy_port}"), &request);
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        sse_body,
+        "ListTasks should route to agent-a after SSE event captured context route"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -1170,6 +1371,118 @@ filter_chains:
           - name: "backend"
             endpoints:
               - "127.0.0.1:{backend_port}"
+"#,
+    )
+}
+
+/// Context-owner routing config with standard TTLs.
+///
+/// Initial SendMessage/SendStreamingMessage route to agent-a by static rule.
+/// Context/task route hits route to the owning cluster.
+/// Fallback goes to agent-b.
+fn a2a_context_owner_routing_yaml(proxy_port: u16, agent_a_port: u16, agent_b_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: a2a
+        max_body_bytes: 65536
+        on_invalid: continue
+        headers:
+          method: x-praxis-a2a-method
+          task_id: x-praxis-a2a-task-id
+          streaming: x-praxis-a2a-streaming
+        task_routing:
+          enabled: true
+          route_cluster_header: x-praxis-a2a-route-cluster
+          ttl_seconds: 3600
+          terminal_ttl_seconds: 300
+          max_response_body_bytes: 65536
+      - filter: router
+        routes:
+          - path_prefix: "/a2a/"
+            headers:
+              x-praxis-a2a-route-cluster: "agent-a"
+            cluster: "agent-a"
+          - path_prefix: "/a2a/"
+            headers:
+              x-praxis-a2a-route-cluster: "agent-b"
+            cluster: "agent-b"
+          - path_prefix: "/a2a/"
+            headers:
+              x-praxis-a2a-method: "SendMessage"
+            cluster: "agent-a"
+          - path_prefix: "/a2a/"
+            headers:
+              x-praxis-a2a-streaming: "true"
+            cluster: "agent-a"
+          - path_prefix: "/a2a/"
+            cluster: "agent-b"
+      - filter: load_balancer
+        clusters:
+          - name: "agent-a"
+            endpoints:
+              - "127.0.0.1:{agent_a_port}"
+          - name: "agent-b"
+            endpoints:
+              - "127.0.0.1:{agent_b_port}"
+"#,
+    )
+}
+
+/// Context-owner routing config with `terminal_ttl_seconds: 0` to test
+/// that task routes are immediately removed while context routes survive.
+fn a2a_context_owner_routing_zero_terminal_ttl_yaml(proxy_port: u16, agent_a_port: u16, agent_b_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: a2a
+        max_body_bytes: 65536
+        on_invalid: continue
+        headers:
+          method: x-praxis-a2a-method
+          task_id: x-praxis-a2a-task-id
+        task_routing:
+          enabled: true
+          route_cluster_header: x-praxis-a2a-route-cluster
+          ttl_seconds: 3600
+          terminal_ttl_seconds: 0
+          max_response_body_bytes: 65536
+      - filter: router
+        routes:
+          - path_prefix: "/a2a/"
+            headers:
+              x-praxis-a2a-route-cluster: "agent-a"
+            cluster: "agent-a"
+          - path_prefix: "/a2a/"
+            headers:
+              x-praxis-a2a-route-cluster: "agent-b"
+            cluster: "agent-b"
+          - path_prefix: "/a2a/"
+            headers:
+              x-praxis-a2a-method: "SendMessage"
+            cluster: "agent-a"
+          - path_prefix: "/a2a/"
+            cluster: "agent-b"
+      - filter: load_balancer
+        clusters:
+          - name: "agent-a"
+            endpoints:
+              - "127.0.0.1:{agent_a_port}"
+          - name: "agent-b"
+            endpoints:
+              - "127.0.0.1:{agent_b_port}"
 "#,
     )
 }

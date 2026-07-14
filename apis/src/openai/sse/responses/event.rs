@@ -486,4 +486,110 @@ mod tests {
             assert!(!event.is_terminal(), "{event_type} should not be terminal");
         }
     }
+
+    /// All canonical event type strings (no aliases).
+    const ALL_CANONICAL_EVENT_TYPES: &[&str] = &[
+        "response.created",
+        "response.queued",
+        "response.in_progress",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_text.annotation.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.refusal.delta",
+        "response.refusal.done",
+        "response.reasoning.delta",
+        "response.reasoning.done",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+        "error",
+    ];
+
+    #[test]
+    fn event_type_roundtrips_for_all_canonical_variants() {
+        for event_type in ALL_CANONICAL_EVENT_TYPES {
+            let event = ResponsesEvent::from_event_type(event_type, json!({}));
+            assert_eq!(
+                event.event_type(),
+                *event_type,
+                "event_type() should roundtrip for '{event_type}'"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_variant_preserves_event_type_string() {
+        let event = ResponsesEvent::from_event_type("response.future_event.custom", json!({}));
+        assert_eq!(
+            event.event_type(),
+            "response.future_event.custom",
+            "Unknown variant should preserve the original event type"
+        );
+    }
+
+    #[test]
+    fn reasoning_text_done_alias_maps_to_reasoning_done() {
+        let event = ResponsesEvent::from_event_type("response.reasoning_text.done", json!({"text": "done"}));
+        assert!(
+            matches!(event, ResponsesEvent::ReasoningDone(_)),
+            "response.reasoning_text.done alias should map to ReasoningDone"
+        );
+        assert_eq!(
+            event.event_type(),
+            "response.reasoning.done",
+            "event_type() should return canonical name for alias"
+        );
+    }
+
+    #[test]
+    fn reasoning_text_done_alias_via_frame() {
+        let f = typed_frame("response.reasoning_text.done", json!({"text": "done"}));
+        let event = ResponsesEvent::from_frame(&f).unwrap();
+        assert!(
+            matches!(event, ResponsesEvent::ReasoningDone(_)),
+            "response.reasoning_text.done should parse via from_frame"
+        );
+    }
+
+    #[test]
+    fn canonical_event_type_maps_reasoning_text_done() {
+        assert_eq!(
+            canonical_event_type("response.reasoning_text.done"),
+            "response.reasoning.done",
+            "reasoning_text.done should canonicalize to reasoning.done"
+        );
+    }
+
+    #[test]
+    fn canonical_event_type_maps_reasoning_text_delta() {
+        assert_eq!(
+            canonical_event_type("response.reasoning_text.delta"),
+            "response.reasoning.delta",
+            "reasoning_text.delta should canonicalize to reasoning.delta"
+        );
+    }
+
+    #[test]
+    fn canonical_event_type_passes_through_non_aliases() {
+        assert_eq!(
+            canonical_event_type("response.created"),
+            "response.created",
+            "non-alias event types should pass through unchanged"
+        );
+        assert_eq!(
+            canonical_event_type("error"),
+            "error",
+            "non-alias event types should pass through unchanged"
+        );
+    }
 }

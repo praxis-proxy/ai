@@ -9,7 +9,7 @@ Validates Anthropic Messages request bodies for proxy-owned JSON envelope requir
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_body_bytes` | usize | no | Maximum body size in bytes for `StreamBuffer` mode. |
+| `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 
 ## Example
 

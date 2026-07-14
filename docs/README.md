@@ -14,6 +14,7 @@ API integrations built on
 
 - [Filter reference](filters/)
 - [Anthropic Messages](anthropic-messages.md)
+- [Anthropic Messages replay test plan](anthropic-messages-replay-test-plan.md)
 
 ## Reference
 

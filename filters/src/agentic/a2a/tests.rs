@@ -1617,6 +1617,11 @@ async fn task_route_miss_continues_without_route_cluster_header() {
         !headers.contains_key("x-praxis-a2a-route-cluster"),
         "task route miss should not inject route cluster header"
     );
+    assert_eq!(
+        ctx.get_metadata("a2a.route_decision"),
+        Some("task_route_miss"),
+        "task miss should record task_route_miss, not generic route_miss"
+    );
 }
 
 #[tokio::test]
@@ -1850,6 +1855,477 @@ async fn mixed_case_sse_content_type_skips_capture() {
 }
 
 // -----------------------------------------------------------------------------
+// Context Route Lookup Tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "exhaustive routing assertions")]
+async fn context_route_hit_injects_route_cluster_header_for_list_tasks() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    store.put_context("ctx-list", "agent-a", std::time::Duration::from_secs(60));
+
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-list"}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+
+    assert_eq!(
+        headers.get("x-praxis-a2a-route-cluster"),
+        Some(&"agent-a"),
+        "ListTasks context route hit should inject route cluster header"
+    );
+    assert_eq!(
+        ctx.get_metadata("a2a.route_decision"),
+        Some("context_route_hit"),
+        "route_decision should reflect context hit"
+    );
+    assert_eq!(
+        ctx.get_metadata("a2a.route_source"),
+        Some("context"),
+        "route_source should be context"
+    );
+    assert_eq!(
+        ctx.get_metadata("a2a.route_cluster"),
+        Some("agent-a"),
+        "route_cluster metadata should be set"
+    );
+}
+
+#[tokio::test]
+async fn context_route_hit_injects_route_cluster_header_for_send_message() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    store.put_context("ctx-msg", "agent-a", std::time::Duration::from_secs(60));
+
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"contextId":"ctx-msg","role":"ROLE_USER","parts":[]}}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+
+    assert_eq!(
+        headers.get("x-praxis-a2a-route-cluster"),
+        Some(&"agent-a"),
+        "SendMessage context route hit should inject route cluster header"
+    );
+    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
+}
+
+#[tokio::test]
+async fn context_route_hit_injects_route_cluster_header_for_send_streaming_message() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    store.put_context("ctx-stream", "agent-a", std::time::Duration::from_secs(60));
+
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"contextId":"ctx-stream","role":"ROLE_USER","parts":[]}}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+
+    assert_eq!(
+        headers.get("x-praxis-a2a-route-cluster"),
+        Some(&"agent-a"),
+        "SendStreamingMessage context route hit should inject route cluster header"
+    );
+    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
+}
+
+#[tokio::test]
+async fn context_route_miss_continues_without_route_header() {
+    let filter = make_task_routing_filter();
+
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-missing"}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+
+    assert!(
+        !headers.contains_key("x-praxis-a2a-route-cluster"),
+        "context route miss should not inject route cluster header"
+    );
+    assert_eq!(
+        ctx.get_metadata("a2a.route_decision"),
+        Some("context_route_miss"),
+        "context miss should record context_route_miss"
+    );
+}
+
+#[tokio::test]
+async fn task_route_hit_takes_precedence_over_context_route_hit() {
+    // Seed both a task route and a context route with different clusters.
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    store.put("task-prec", "agent-task", std::time::Duration::from_secs(60));
+    store.put_context("ctx-prec", "agent-context", std::time::Duration::from_secs(60));
+
+    // Call the route resolution helper directly with both IDs to prove
+    // task wins over context regardless of method classification.
+    let result = super::task_routing::attempt_route_lookup(store, Some("task-prec"), Some("ctx-prec"));
+    assert!(result.is_some(), "should find a route");
+    let (cluster, source) = result.unwrap();
+    assert_eq!(
+        cluster.as_ref(),
+        "agent-task",
+        "task route should win over context route"
+    );
+    assert_eq!(source, super::task_routing::RouteSource::Task, "source should be task");
+}
+
+#[tokio::test]
+async fn context_route_not_used_for_non_context_methods() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    // Seed a context route, but GetTask is task-routable, not context-routable.
+    store.put_context("ctx-1", "agent-a", std::time::Duration::from_secs(60));
+
+    // GetTask with no task mapping should miss (context not consulted).
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"no-task"}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+
+    assert!(
+        !headers.contains_key("x-praxis-a2a-route-cluster"),
+        "task-routable methods should not fall back to context routing"
+    );
+}
+
+#[tokio::test]
+async fn classifier_only_unchanged_when_task_routing_disabled() {
+    // Classifier-only config: task_routing is not enabled.
+    let filter = make_default_filter();
+
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-123"}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+
+    // No task_routing.enabled means no route lookup attempted.
+    assert_eq!(
+        ctx.get_metadata("a2a.route_decision"),
+        None,
+        "classifier-only mode should not set route_decision"
+    );
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key("x-praxis-a2a-route-cluster"),
+        "classifier-only mode should not inject route cluster header"
+    );
+}
+
+#[tokio::test]
+async fn context_route_hit_records_bounded_metadata() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    store.put_context("ctx-meta", "agent-b", std::time::Duration::from_secs(60));
+
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{"contextId":"ctx-meta"}}"#;
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
+    assert_eq!(ctx.get_metadata("a2a.route_source"), Some("context"));
+    assert_eq!(ctx.get_metadata("a2a.route_cluster"), Some("agent-b"));
+    assert_eq!(
+        ctx.get_metadata("a2a.context_id"),
+        Some("ctx-meta"),
+        "classifier-promoted context_id should still be in metadata"
+    );
+}
+
+#[tokio::test]
+async fn context_id_with_control_chars_is_not_promoted_and_does_not_route() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    // Seed a route for a clean ID.
+    store.put_context("ctx-clean", "agent-a", std::time::Duration::from_secs(60));
+
+    let body_str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ListTasks\",\"params\":{\"contextId\":\"ctx\\n-bad\"}}";
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key("x-praxis-a2a-route-cluster"),
+        "context ID with control chars should not route"
+    );
+    assert_eq!(
+        ctx.get_metadata("a2a.context_id"),
+        None,
+        "context ID with control chars should not be promoted"
+    );
+}
+
+#[tokio::test]
+async fn too_long_context_id_is_not_promoted_and_does_not_route() {
+    let filter = make_task_routing_filter();
+    let long_ctx = "c".repeat(257);
+    let body_str = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{{"contextId":"{long_ctx}"}}}}"#);
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key("x-praxis-a2a-route-cluster"),
+        "too-long context ID should not route"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Context Response Body Tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn non_streaming_task_response_stores_task_and_context_routes() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-ctx-1","contextId":"ctx-resp-1","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+    let mut body = Some(Bytes::from(json));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert_eq!(
+        store.get_by_task_id("task-ctx-1").as_deref(),
+        Some("agent-a"),
+        "task route should be stored"
+    );
+    assert_eq!(
+        store.get_by_context_id("ctx-resp-1").as_deref(),
+        Some("agent-a"),
+        "context route should be stored alongside task route"
+    );
+}
+
+#[tokio::test]
+async fn terminal_task_zero_ttl_removes_task_but_keeps_context_route() {
+    let filter = make_task_routing_filter_with_config(
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "terminal_ttl_seconds": 0}}"#,
+    );
+    let store = filter.task_route_store.as_ref().unwrap();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-term","contextId":"ctx-term","status":{"state":"TASK_STATE_COMPLETED"}}}}"#;
+    let mut body = Some(Bytes::from(json));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(
+        store.get_by_task_id("task-term").is_none(),
+        "terminal task with ttl=0 should have task route removed"
+    );
+    assert_eq!(
+        store.get_by_context_id("ctx-term").as_deref(),
+        Some("agent-a"),
+        "context route must survive even when the task route is removed at terminal_ttl=0"
+    );
+}
+
+#[tokio::test]
+async fn completed_task_context_uses_normal_ttl() {
+    // Seeding a terminal task response should store context with normal TTL, not terminal TTL.
+    let filter = make_task_routing_filter_with_config(
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "ttl_seconds": 3600, "terminal_ttl_seconds": 1}}"#,
+    );
+    let store = filter.task_route_store.as_ref().unwrap();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-norml-ctx","contextId":"ctx-norml","status":{"state":"TASK_STATE_COMPLETED"}}}}"#;
+    let mut body = Some(Bytes::from(json));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    // Wait long enough for terminal TTL (1s) to expire.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Task route should be expired (terminal_ttl=1s).
+    assert!(
+        store.get_by_task_id("task-norml-ctx").is_none(),
+        "task route should have expired at terminal TTL"
+    );
+    // Context route should still be live (normal TTL=3600s).
+    assert_eq!(
+        store.get_by_context_id("ctx-norml").as_deref(),
+        Some("agent-a"),
+        "context route should still be live (uses normal TTL, not terminal TTL)"
+    );
+}
+
+#[tokio::test]
+async fn split_json_response_with_context_stores_context_route() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-split-ctx","contextId":"ctx-split","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+    let (chunk1, chunk2) = json.split_at(50);
+
+    let mut body1 = Some(Bytes::from(chunk1.to_owned()));
+    drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+    assert!(
+        store.get_by_context_id("ctx-split").is_none(),
+        "incomplete JSON should not capture"
+    );
+
+    let mut body2 = Some(Bytes::from(chunk2.to_owned()));
+    drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+    assert_eq!(
+        store.get_by_context_id("ctx-split").as_deref(),
+        Some("agent-a"),
+        "context route should be captured once JSON completes"
+    );
+}
+
+#[tokio::test]
+async fn oversized_response_does_not_store_context_route() {
+    let filter = make_task_routing_filter_with_config(
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "max_response_body_bytes": 32}}"#,
+    );
+    let store = filter.task_route_store.as_ref().unwrap();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let large_json = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"result":{{"task":{{"id":"task-big-ctx","contextId":"ctx-big","status":{{"state":"TASK_STATE_WORKING"}}}},"padding":"{}"}}}}"#,
+        "x".repeat(64)
+    );
+    let mut body = Some(Bytes::from(large_json));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(
+        store.get_by_context_id("ctx-big").is_none(),
+        "oversized response should not store context route"
+    );
+}
+
+#[tokio::test]
+async fn invalid_json_response_does_not_store_context_route() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let mut body = Some(Bytes::from("not valid json"));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(
+        store.get_by_context_id("anything").is_none(),
+        "invalid JSON should not store context route"
+    );
+}
+
+#[tokio::test]
+async fn sse_task_event_with_context_stores_context_route() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_sse_capture(&mut ctx);
+
+    let sse_data =
+        b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-sse-ctx\",\"contextId\":\"ctx-sse-1\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n";
+    let mut body = Some(Bytes::from(sse_data.to_vec()));
+    drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+    assert_eq!(
+        store.get_by_task_id("task-sse-ctx").as_deref(),
+        Some("agent-a"),
+        "SSE task event should capture task route"
+    );
+    assert_eq!(
+        store.get_by_context_id("ctx-sse-1").as_deref(),
+        Some("agent-a"),
+        "SSE task event should also capture context route when contextId present"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Task Routable Method Tests
 // -----------------------------------------------------------------------------
 
@@ -1882,6 +2358,48 @@ fn non_task_routable_methods() {
         assert!(
             !method.is_task_routable(),
             "{} should not be task-routable",
+            method.as_str()
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Context Routable Method Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn context_routable_methods() {
+    let routable = [
+        A2aMethod::SendMessage,
+        A2aMethod::SendStreamingMessage,
+        A2aMethod::ListTasks,
+    ];
+    for method in &routable {
+        assert!(
+            method.is_context_routable(),
+            "{} should be context-routable",
+            method.as_str()
+        );
+    }
+}
+
+#[test]
+fn non_context_routable_methods() {
+    let non_routable = [
+        A2aMethod::GetTask,
+        A2aMethod::CancelTask,
+        A2aMethod::SubscribeToTask,
+        A2aMethod::CreateTaskPushNotificationConfig,
+        A2aMethod::GetTaskPushNotificationConfig,
+        A2aMethod::ListTaskPushNotificationConfigs,
+        A2aMethod::DeleteTaskPushNotificationConfig,
+        A2aMethod::GetExtendedAgentCard,
+        A2aMethod::Unknown("custom".to_owned()),
+    ];
+    for method in &non_routable {
+        assert!(
+            !method.is_context_routable(),
+            "{} should not be context-routable",
             method.as_str()
         );
     }

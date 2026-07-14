@@ -10,7 +10,13 @@ pub(crate) mod providers;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::needless_raw_strings,
+    clippy::needless_raw_string_hashes,
+    reason = "tests"
+)]
 mod tests;
 
 pub use filter::AiGuardrailsFilter;

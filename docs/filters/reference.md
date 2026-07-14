@@ -62,6 +62,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`prompt_enrich`](prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
 
+### Token Count
+
+| Filter | Description |
+|--------|-------------|
+| [`token_count`](token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`]. |
+
 ### Token Usage
 
 | Filter | Description |

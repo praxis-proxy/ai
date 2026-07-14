@@ -782,3 +782,201 @@ async fn collect_conversation_messages(
     }
     Ok(messages)
 }
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // store_error_response
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn store_error_invalid_input_returns_400() {
+        let error = StoreError::InvalidInput("bad cursor".to_owned());
+        let rejection = store_error_response(&error).unwrap();
+        assert_eq!(rejection.status, 400);
+        let body: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "bad cursor");
+    }
+
+    #[test]
+    fn store_error_database_returns_500() {
+        let error = StoreError::Database("connection lost".to_owned());
+        let rejection = store_error_response(&error).unwrap();
+        assert_eq!(rejection.status, 500);
+        let body: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "Internal server error.");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_item_list_params
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_params_skips_pair_without_separator() {
+        let params = parse_item_list_params(Some("noseparator&limit=5"));
+        assert_eq!(params.limit, 5);
+        assert!(params.after_item_id.is_none());
+    }
+
+    #[test]
+    fn parse_params_unknown_order_stays_default() {
+        let params = parse_item_list_params(Some("order=random"));
+        assert!(!params.ascending, "unknown order should keep default descending");
+    }
+
+    #[test]
+    fn parse_params_non_numeric_limit_uses_default() {
+        let params = parse_item_list_params(Some("limit=abc"));
+        assert_eq!(params.limit, DEFAULT_PAGE_LIMIT);
+    }
+
+    // -------------------------------------------------------------------------
+    // decode_query_component / decode_item_id_path_segment
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn decode_query_component_invalid_utf8_uses_lossy() {
+        let result = decode_query_component("%FF%FE");
+        assert!(
+            result.contains('\u{FFFD}'),
+            "invalid UTF-8 should produce replacement characters"
+        );
+    }
+
+    #[test]
+    fn decode_item_id_path_segment_invalid_utf8_returns_error() {
+        let result = decode_item_id_path_segment("%FF%FE");
+        assert!(result.is_err(), "invalid UTF-8 should return error");
+        assert!(
+            result.unwrap_err().contains("valid UTF-8"),
+            "error should mention UTF-8 requirement"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ItemListParams::effective_limit
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn effective_limit_clamps_zero_to_one() {
+        let params = ItemListParams {
+            limit: 0,
+            ..ItemListParams::default()
+        };
+        assert_eq!(params.effective_limit(), 1);
+    }
+
+    #[test]
+    fn effective_limit_clamps_above_max() {
+        let params = ItemListParams {
+            limit: MAX_PAGE_LIMIT + 50,
+            ..ItemListParams::default()
+        };
+        assert_eq!(params.effective_limit(), MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn effective_limit_returns_value_within_range() {
+        let params = ItemListParams {
+            limit: 50,
+            ..ItemListParams::default()
+        };
+        assert_eq!(params.effective_limit(), 50);
+    }
+
+    // -------------------------------------------------------------------------
+    // store_error_response — catch-all variants
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn store_error_serialization_returns_500() {
+        let error = StoreError::Serialization("corrupt data".to_owned());
+        let rejection = store_error_response(&error).unwrap();
+        assert_eq!(rejection.status, 500);
+        let body: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "Internal server error.");
+    }
+
+    #[test]
+    fn store_error_unavailable_returns_500() {
+        let error = StoreError::Unavailable("not connected".to_owned());
+        let rejection = store_error_response(&error).unwrap();
+        assert_eq!(rejection.status, 500);
+        let body: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "Internal server error.");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_item_list_params — additional edges
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_params_none_query_returns_defaults() {
+        let params = parse_item_list_params(None);
+        assert_eq!(params.limit, DEFAULT_PAGE_LIMIT);
+        assert!(!params.ascending);
+        assert!(params.after_item_id.is_none());
+    }
+
+    #[test]
+    fn parse_params_valid_after_parameter() {
+        let params = parse_item_list_params(Some("after=item_abc123&limit=10"));
+        assert_eq!(params.after_item_id.as_deref(), Some("item_abc123"));
+        assert_eq!(params.limit, 10);
+    }
+
+    #[test]
+    fn parse_params_asc_order() {
+        let params = parse_item_list_params(Some("order=asc"));
+        assert!(params.ascending, "order=asc should set ascending");
+    }
+
+    #[test]
+    fn parse_params_desc_order() {
+        let params = parse_item_list_params(Some("order=desc"));
+        assert!(!params.ascending, "order=desc should set descending");
+    }
+
+    #[test]
+    fn parse_params_negative_limit_uses_default() {
+        let params = parse_item_list_params(Some("limit=-5"));
+        assert_eq!(
+            params.limit, DEFAULT_PAGE_LIMIT,
+            "negative limit should not parse as u32"
+        );
+    }
+
+    #[test]
+    fn parse_params_percent_encoded_after() {
+        let params = parse_item_list_params(Some("after=item%20with+space"));
+        assert_eq!(
+            params.after_item_id.as_deref(),
+            Some("item with space"),
+            "percent-encoded and plus-encoded values should decode"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // decode_item_id_path_segment — additional cases
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn decode_item_id_plain_ascii_passes_through() {
+        let result = decode_item_id_path_segment("item_abc123").unwrap();
+        assert_eq!(result.as_ref(), "item_abc123");
+    }
+
+    #[test]
+    fn decode_item_id_percent_encoded_ascii() {
+        let result = decode_item_id_path_segment("item%5Fabc").unwrap();
+        assert_eq!(result.as_ref(), "item_abc", "percent-encoded underscore should decode");
+    }
+}

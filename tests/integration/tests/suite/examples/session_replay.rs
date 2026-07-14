@@ -7,8 +7,9 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     Backend, SessionReplay, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body,
-    parse_status, patch_yaml, start_proxy,
+    parse_status, patch_yaml, start_capturing_backend, start_echo_backend, start_proxy,
 };
+use serde_json::json;
 
 use super::load_example_config;
 
@@ -43,6 +44,186 @@ fn replay_claude_messages_session_through_protocol_example() {
         &response, &turn.response,
         "client response should match the replayed Claude fixture response"
     );
+}
+
+#[test]
+fn replay_claude_messages_image_session_through_protocol_example() {
+    let replay = SessionReplay::load("replay/claude/messages-image.json");
+    let turn = replay.single_turn();
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-protocol.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let status = parse_status(&raw);
+    let body = parse_body(&raw);
+    let forwarded: serde_json::Value = serde_json::from_str(&body).expect("echoed request body should be JSON");
+
+    assert_eq!(status, 200, "Claude image replay request should return 200");
+    assert_eq!(
+        forwarded, turn.request,
+        "backend should receive the image-bearing Claude request unchanged"
+    );
+    assert_eq!(
+        forwarded["messages"][0]["content"][1]["source"]["media_type"], "image/png",
+        "forwarded request should preserve the image content block"
+    );
+
+    drop(proxy);
+}
+
+#[test]
+fn replay_claude_messages_tool_cycle_preserves_source_records() {
+    let replay = SessionReplay::load("replay/claude/messages-tool-cycle.json");
+    assert_eq!(
+        replay.turns.len(),
+        2,
+        "tool-cycle replay should cover both request phases"
+    );
+    assert_eq!(
+        replay.turns[0]
+            .source_records
+            .as_ref()
+            .expect("first turn should preserve source records")
+            .len(),
+        3,
+        "first turn should preserve user request plus split assistant text and tool_use records"
+    );
+    assert_eq!(
+        replay.turns[1]
+            .source_records
+            .as_ref()
+            .expect("second turn should preserve source records")
+            .len(),
+        2,
+        "second turn should preserve tool_result and final assistant records"
+    );
+    for turn in &replay.turns {
+        let backend_guard = start_capturing_backend(&turn.response_body());
+        let proxy_port = free_port();
+
+        let config = load_example_config(
+            "anthropic/messages-protocol.yaml",
+            proxy_port,
+            HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+        );
+        let proxy = start_proxy(&config);
+
+        let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+        let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client body should be JSON");
+
+        assert_eq!(parse_status(&raw), 200, "{} should return 200", turn.name);
+        assert_eq!(
+            response, turn.response,
+            "{} client response should match the replay fixture response",
+            turn.name
+        );
+        let forwarded: serde_json::Value =
+            serde_json::from_str(&backend_guard.body()).expect("captured backend body should be JSON");
+        assert_eq!(
+            forwarded, turn.request,
+            "{} backend request should match the replay fixture request",
+            turn.name
+        );
+
+        drop(proxy);
+    }
+    assert_eq!(
+        replay.turns[0].response["content"][0]["type"], "text",
+        "first turn should preserve assistant text before the tool request"
+    );
+    assert_eq!(
+        replay.turns[0].response["content"][1]["type"], "tool_use",
+        "first turn should replay the assistant tool request"
+    );
+    assert_eq!(
+        replay.turns[1].request["messages"][1]["content"][1]["type"], "tool_use",
+        "second turn should include the assistant tool_use history required by Anthropic"
+    );
+    assert_eq!(
+        replay.turns[1].request["messages"][1]["content"][1]["id"], "toolu_replay_bash_01",
+        "second turn assistant history should expose the tool_use id"
+    );
+    assert_eq!(
+        replay.turns[1].request["messages"][2]["content"][0]["type"], "tool_result",
+        "second turn should preserve the client tool result request shape"
+    );
+    assert_eq!(
+        replay.turns[1].request["messages"][2]["content"][0]["tool_use_id"],
+        replay.turns[1].request["messages"][1]["content"][1]["id"],
+        "tool_result should refer to the preceding assistant tool_use"
+    );
+    assert_eq!(
+        replay.turns[1].source_records.as_ref().expect("source records")[0]["message"]["content"][0]["tool_use_id"],
+        "toolu_replay_bash_01",
+        "source records should retain the original tool_result linkage"
+    );
+}
+
+#[test]
+fn replay_claude_messages_image_session_through_chat_completions_translation_example() {
+    let replay = SessionReplay::load("replay/claude/messages-image.json");
+    let turn = replay.single_turn();
+    let assistant_text = turn.response["content"][0]["text"]
+        .as_str()
+        .expect("fixture response should contain assistant text");
+    let chat_response = json!({
+        "id": "chatcmpl_replay_image",
+        "object": "chat.completion",
+        "model": turn.request["model"],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": assistant_text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 202, "total_tokens": 205}
+    });
+    let backend = start_capturing_backend(&chat_response.to_string());
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-to-openai.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let status = parse_status(&raw);
+    let body = parse_body(&raw);
+    let transformed: serde_json::Value = serde_json::from_str(&body).expect("client body should be JSON");
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&backend.body()).expect("captured backend body should be JSON");
+    let image_data = turn.request["messages"][0]["content"][1]["source"]["data"]
+        .as_str()
+        .expect("fixture image data should be base64");
+
+    assert_eq!(status, 200, "Claude image replay translation should return 200");
+    assert_eq!(
+        forwarded["messages"][0]["content"][1]["type"], "image_url",
+        "backend should receive a Chat Completions image content part"
+    );
+    assert_eq!(
+        forwarded["messages"][0]["content"][1]["image_url"]["url"],
+        format!("data:image/png;base64,{image_data}"),
+        "base64 Anthropic image should translate to Chat Completions data URL"
+    );
+    assert_eq!(
+        transformed["content"][0]["text"], assistant_text,
+        "Chat Completions response should translate back to Anthropic text content"
+    );
+    assert_eq!(
+        transformed["stop_reason"], "end_turn",
+        "Chat Completions stop finish reason should translate to Anthropic end_turn"
+    );
+
+    drop(proxy);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

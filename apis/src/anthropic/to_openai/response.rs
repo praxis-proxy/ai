@@ -263,4 +263,73 @@ mod tests {
 
         assert_eq!(parsed["usage"]["cache_read_input_tokens"], 80, "cached tokens mapped");
     }
+
+    #[test]
+    fn transform_response_non_json_body() {
+        let result = transform_response(b"not json at all", "gpt-4");
+        let err = result.err().unwrap();
+        assert!(err.contains("invalid JSON"), "error should mention invalid JSON: {err}");
+    }
+
+    #[test]
+    fn transform_response_json_array_body() {
+        let result = transform_response(b"[1,2,3]", "gpt-4");
+        let err = result.err().unwrap();
+        assert!(
+            err.contains("not a JSON object"),
+            "error should mention not a JSON object: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_id_generates_msg_prefixed_id() {
+        let body = br#"{"model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
+        let tr = transform_response(body, "gpt-4").unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        let id = parsed["id"].as_str().unwrap();
+        assert!(
+            id.starts_with("msg_"),
+            "generated ID should start with msg_ but got: {id}"
+        );
+    }
+
+    #[test]
+    fn empty_choices_produces_empty_content() {
+        let body =
+            br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0}}"#;
+        let tr = transform_response(body, "gpt-4").unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        assert!(
+            parsed["content"].as_array().unwrap().is_empty(),
+            "empty choices should produce empty content"
+        );
+    }
+
+    #[test]
+    fn empty_string_content_produces_no_text_block() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":0}}"#;
+        let tr = transform_response(body, "gpt-4").unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        assert!(
+            parsed["content"].as_array().unwrap().is_empty(),
+            "empty content string should not produce a text block"
+        );
+    }
+
+    #[test]
+    fn invalid_tool_call_arguments_fallback_to_empty_object() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"not{json"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let tr = transform_response(body, "gpt-4").unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        assert_eq!(parsed["content"][0]["type"], "tool_use");
+        assert_eq!(
+            parsed["content"][0]["input"],
+            json!({}),
+            "invalid JSON arguments should fallback to empty object"
+        );
+    }
 }

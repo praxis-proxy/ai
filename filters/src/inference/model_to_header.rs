@@ -283,4 +283,65 @@ mod tests {
 
         assert!(matches!(action, FilterAction::Continue), "on_request should be a no-op");
     }
+
+    #[tokio::test]
+    async fn on_response_delegates_to_inner() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut resp = crate::test_utils::make_response();
+        ctx.response_header = Some(&mut resp);
+
+        let action = filter.on_response(&mut ctx).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "on_response should delegate to inner and return Continue"
+        );
+    }
+
+    #[test]
+    fn response_body_access_delegates_to_inner() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        assert_eq!(
+            filter.response_body_access(),
+            BodyAccess::None,
+            "response body access should delegate to inner"
+        );
+    }
+
+    #[test]
+    fn response_body_mode_delegates_to_inner() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        assert!(
+            matches!(filter.response_body_mode(), BodyMode::Stream),
+            "response body mode should delegate to inner"
+        );
+    }
+
+    #[test]
+    fn needs_request_context_delegates_to_inner() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        // JsonBodyFieldFilter does not need request context on the
+        // response path; verify the delegate forwards the inner value.
+        assert!(
+            !filter.needs_request_context(),
+            "needs_request_context should delegate to inner and return false"
+        );
+    }
+
+    #[test]
+    fn on_response_body_delegates_to_inner() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut body = Some(Bytes::from_static(b"response data"));
+
+        let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "on_response_body should delegate to inner and return Continue"
+        );
+    }
 }
