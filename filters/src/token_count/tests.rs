@@ -23,7 +23,14 @@ fn from_config_with_valid_provider() {
 
 #[test]
 fn from_config_all_providers() {
-    for provider in ["openai", "anthropic", "google", "bedrock", "azure"] {
+    for provider in [
+        "openai",
+        "anthropic",
+        "google",
+        "bedrock",
+        "bedrock_invoke_model",
+        "azure",
+    ] {
         let yaml = format!("provider: {provider}");
         let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let result = TokenCountFilter::from_config(&config);
@@ -594,12 +601,182 @@ fn decode_hex_rejects_invalid_chars() {
 }
 
 // -----------------------------------------------------------------------------
+// Bedrock InvokeModel: Header-Only Path
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bedrock_invoke_model_extracts_headers_on_response() {
+    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers.insert(HEADER_BEDROCK_INPUT, "25".parse().unwrap());
+    resp.headers.insert(HEADER_BEDROCK_OUTPUT, "50".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("25"),
+        "Bedrock InvokeModel input tokens"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("50"),
+        "Bedrock InvokeModel output tokens"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.total"),
+        Some("75"),
+        "Bedrock InvokeModel total tokens (computed)"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_invoke_model_headers_absent_is_noop() {
+    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "missing headers should not set input"
+    );
+    assert!(
+        ctx.get_metadata("token.output").is_none(),
+        "missing headers should not set output"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_invoke_model_partial_headers_is_noop() {
+    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers.insert(HEADER_BEDROCK_INPUT, "25".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "only-input header should not set tokens"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_invoke_model_non_numeric_headers_is_noop() {
+    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers.insert(HEADER_BEDROCK_INPUT, "abc".parse().unwrap());
+    resp.headers.insert(HEADER_BEDROCK_OUTPUT, "50".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "non-numeric input header should not set tokens"
+    );
+    assert!(
+        ctx.get_metadata("token.output").is_none(),
+        "non-numeric input header should also suppress the otherwise-valid output header"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_invoke_model_skips_non_success_status() {
+    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp =
+        make_response_with_status_and_content_type(http::StatusCode::INTERNAL_SERVER_ERROR, "application/json");
+    resp.headers.insert(HEADER_BEDROCK_INPUT, "25".parse().unwrap());
+    resp.headers.insert(HEADER_BEDROCK_OUTPUT, "50".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "non-success status should skip extraction even with valid token headers present"
+    );
+    assert!(
+        ctx.get_metadata("token.output").is_none(),
+        "non-success status should skip extraction even with valid token headers present"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_invoke_model_does_not_set_content_type_mode() {
+    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    resp.headers.insert(HEADER_BEDROCK_INPUT, "25".parse().unwrap());
+    resp.headers.insert(HEADER_BEDROCK_OUTPUT, "50".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert!(
+        ctx.get_metadata(META_MODE).is_none(),
+        "header-only path should never set the body extraction mode"
+    );
+}
+
+#[test]
+fn bedrock_invoke_model_response_body_access_is_none() {
+    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    assert_eq!(filter.response_body_access(), BodyAccess::None);
+}
+
+#[test]
+fn other_providers_response_body_access_is_read_only() {
+    let filter = make_filter(TokenUsageProvider::OpenAi);
+    assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
+}
+
+#[test]
+fn on_response_body_noop_for_bedrock_invoke_model() {
+    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(ctx.get_metadata("token.input").is_none());
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
 use std::fmt::Write as _;
 
 fn make_filter(provider: TokenUsageProvider) -> TokenCountFilter {
+    TokenCountFilter {
+        provider: provider.into(),
+    }
+}
+
+fn make_filter_kind(provider: ProviderKind) -> TokenCountFilter {
     TokenCountFilter { provider }
 }
 
