@@ -12,9 +12,12 @@
 # filter metadata and injects them as response headers. When no token
 # data is present the filter is a no-op.
 #
-# NOTE: A token-counting filter (or any filter that calls
-# set_token_usage()) must precede token_usage_headers in the pipeline
-# for headers to appear. Without it the filter is always a no-op.
+# NOTE: response hooks run in reverse declared order (the last filter's
+# on_response fires first), so a token-counting filter (or any filter
+# that calls set_token_usage()) must be declared AFTER token_usage_headers
+# in the pipeline for headers to appear. Without it the filter is always
+# a no-op. See token-counting.yaml for a filter that populates
+# token.input/token.output/token.total.
 
 listeners:
   - name: default
