@@ -167,6 +167,65 @@ fn replay_claude_messages_tool_cycle_preserves_source_records() {
 }
 
 #[test]
+fn replay_claude_messages_thinking_session_through_protocol_example() {
+    let replay = SessionReplay::load("replay/claude/messages-thinking.json");
+    let turn = replay.single_turn();
+    let backend_guard = start_capturing_backend(&turn.response_body());
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-protocol.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let status = parse_status(&raw);
+    let body = parse_body(&raw);
+    let response: serde_json::Value = serde_json::from_str(&body).expect("client body should be JSON");
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&backend_guard.body()).expect("captured backend body should be JSON");
+
+    assert_eq!(status, 200, "Claude thinking replay request should return 200");
+    assert_eq!(
+        response, turn.response,
+        "client response should match the replayable Anthropic response"
+    );
+    assert_eq!(
+        forwarded, turn.request,
+        "backend should receive the Claude request unchanged"
+    );
+    assert_eq!(
+        turn.response["content"][0]["type"], "text",
+        "fixture response should contain the replayable visible answer"
+    );
+    assert!(
+        turn.response["content"][0]["text"]
+            .as_str()
+            .expect("fixture response text")
+            .contains("NPV = $500,000"),
+        "fixture should preserve Claude's visible NPV result"
+    );
+
+    let source_records = turn.source_records.as_ref().expect("thinking fixture source records");
+    assert_eq!(
+        source_records[1]["message"]["content"][0]["type"], "thinking",
+        "source records should preserve Claude Code thinking records"
+    );
+    assert_eq!(
+        source_records[2]["message"]["content"][0]["type"], "text",
+        "source records should preserve the visible assistant response record"
+    );
+    assert_eq!(
+        source_records[1]["message"]["id"], source_records[2]["message"]["id"],
+        "split thinking and text records should retain their shared Claude message id"
+    );
+
+    drop(proxy);
+}
+
+#[test]
 fn replay_claude_messages_image_session_through_chat_completions_translation_example() {
     let replay = SessionReplay::load("replay/claude/messages-image.json");
     let turn = replay.single_turn();
@@ -216,6 +275,70 @@ fn replay_claude_messages_image_session_through_chat_completions_translation_exa
     );
     assert_eq!(
         transformed["content"][0]["text"], assistant_text,
+        "Chat Completions response should translate back to Anthropic text content"
+    );
+    assert_eq!(
+        transformed["stop_reason"], "end_turn",
+        "Chat Completions stop finish reason should translate to Anthropic end_turn"
+    );
+
+    drop(proxy);
+}
+
+#[test]
+fn replay_claude_messages_thinking_fixture_translates_visible_text_for_openai() {
+    let replay = SessionReplay::load("replay/claude/messages-thinking.json");
+    let turn = replay.single_turn();
+    let visible_text = turn.response["content"][0]["text"]
+        .as_str()
+        .expect("fixture response should contain final assistant text");
+    let chat_response = json!({
+        "id": "chatcmpl_replay_thinking",
+        "object": "chat.completion",
+        "model": turn.request["model"],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": visible_text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+    });
+    let backend = start_capturing_backend(&chat_response.to_string());
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-to-openai.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let status = parse_status(&raw);
+    let body = parse_body(&raw);
+    let transformed: serde_json::Value = serde_json::from_str(&body).expect("client body should be JSON");
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&backend.body()).expect("captured backend body should be JSON");
+    let messages = forwarded["messages"]
+        .as_array()
+        .expect("OpenAI request should contain messages");
+
+    assert_eq!(status, 200, "Claude thinking replay translation should return 200");
+    assert_eq!(
+        messages.len(),
+        1,
+        "Claude Code NPV fixture should translate its single user replay request"
+    );
+    assert_eq!(
+        messages[0]["role"], "user",
+        "user prompt should be forwarded to Chat Completions"
+    );
+    assert_eq!(
+        messages[0]["content"], turn.request["messages"][0]["content"],
+        "user prompt text should be forwarded to Chat Completions"
+    );
+    assert_eq!(
+        transformed["content"][0]["text"], visible_text,
         "Chat Completions response should translate back to Anthropic text content"
     );
     assert_eq!(

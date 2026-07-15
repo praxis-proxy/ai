@@ -24,9 +24,14 @@ configuration.
 
 - `claude/messages-basic.json` replays one Anthropic Messages turn through
   `examples/configs/anthropic/messages-protocol.yaml`.
+- `claude/messages-image.json` replays an Anthropic Messages image block
+  through native protocol forwarding and Chat Completions translation.
 - `claude/messages-tool-cycle.json` replays a sanitized Claude Code client-tool
   cycle with preserved source records for the assistant `tool_use` and user
   `tool_result` records.
+- `claude/messages-thinking.json` replays a sanitized Claude Code NPV prompt
+  with a real `thinking` source record, preserving it in `source_records` while
+  replaying only the visible Anthropic response text.
 - `codex/responses-basic.json` replays one OpenAI Responses turn through
   `examples/configs/openai/responses/full-flow.yaml` and verifies the response
   can be read back from the response store.
@@ -161,6 +166,8 @@ gateway should keep handling. Useful next examples include:
 - Anthropic Messages with `tools`, `tool_use`, and `tool_result` content.
 - OpenAI Responses with function tools, tool calls, and tool outputs.
 - Mixed content arrays with text plus non-text blocks.
+- Additional Anthropic reasoning variants, such as `redacted_thinking` blocks
+  or thinking signatures mixed with tool calls.
 - Structured output requests with nested JSON schemas.
 - Responses using `previous_response_id` or stored-response retrieval.
 - Requests with `store: false`, null fields, booleans, arrays, and numeric
