@@ -86,7 +86,7 @@ fn configure_pipeline(
 // -----------------------------------------------------------------------------
 
 /// Run pipeline ordering validation; either fail or warn depending
-/// on the `skip` flag.
+/// on insecure option flags.
 #[expect(clippy::cognitive_complexity, reason = "pre-existing complexity above threshold")]
 fn validate_pipeline(
     pipeline: &FilterPipeline,

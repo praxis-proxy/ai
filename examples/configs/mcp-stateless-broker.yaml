@@ -7,8 +7,10 @@
 # MCP-Protocol-Version, Mcp-Method, and Mcp-Name
 # headers on every request.
 #
-# Backend tools/call routing is not yet implemented;
-# tools/call returns a controlled unsupported response.
+# The broker serves server/discover and tools/list from
+# the configured static catalog. tools/call routes to the
+# backend cluster by exposed tool name, stripping the tool
+# prefix before forwarding.
 #
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/mcp-stateless-broker.yaml
 
