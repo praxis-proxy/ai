@@ -381,6 +381,13 @@ fn handle_sse_body(
     }
 
     if end_of_stream {
+        let mut state = load_sse_scan_state(ctx);
+        let mut pending = Vec::new();
+        sse::flush_sse_state(&mut state, &mut pending);
+        for payload in &pending {
+            process_sse_payload(ctx, payload, provider);
+        }
+
         finalize_streaming_counts(ctx);
         clear_all_metadata(ctx);
     }
@@ -443,6 +450,11 @@ fn merge_accumulated_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: u6
 
 /// Write accumulated streaming counts to the well-known metadata keys.
 fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>) {
+    let has_accumulated = ctx.filter_metadata.contains_key(META_INPUT) || ctx.filter_metadata.contains_key(META_OUTPUT);
+    if !has_accumulated {
+        return;
+    }
+
     let input: u64 = ctx
         .filter_metadata
         .get(META_INPUT)
@@ -454,10 +466,8 @@ fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    if input > 0 || output > 0 {
-        set_token_usage(ctx, input, output, None);
-        debug!(input, output, "finalized streaming token counts");
-    }
+    set_token_usage(ctx, input, output, None);
+    debug!(input, output, "finalized streaming token counts");
 }
 
 // -----------------------------------------------------------------------------
