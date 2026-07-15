@@ -3,16 +3,23 @@
 
 //! Integration tests for token counting filters.
 //!
+//! These tests only verify that the proxy passes requests/responses
+//! through **unchanged** (status, headers, body) when the `token_count`
+//! filter is in the chain; they do not assert the extracted token
+//! counts themselves — see "Why extracted counts aren't asserted here"
+//! below for why that isn't observable from an HTTP integration test
+//! for these providers.
+//!
 //! ## What is tested
 //!
 //! | Test | Provider | What is verified |
 //! |------|----------|-----------------|
-//! | Non-streaming | openai/anthropic/google/bedrock/azure | 200 OK + body byte-for-byte unchanged |
-//! | SSE streaming | openai/anthropic/google | 200 OK + body byte-for-byte unchanged |
+//! | `*_body_passes_through` (non-streaming) | openai/anthropic/google/bedrock/azure | 200 OK + body byte-for-byte unchanged |
+//! | `*_body_passes_through` (SSE streaming) | openai/anthropic/google | 200 OK + body byte-for-byte unchanged |
 //! | `missing_usage_fields_*` | openai | Praxis-Token-* headers absent |
 //! | `example_config_*` | openai | 200 OK + body unchanged |
 //!
-//! ## Why Praxis-Token headers are never asserted present here
+//! ## Why extracted counts aren't asserted here
 //!
 //! In the Praxis/Pingora filter pipeline, response headers are committed
 //! *before* the response body is processed. The `token_usage_headers`
@@ -22,17 +29,19 @@
 //! Every provider covered by this test file extracts counts from the
 //! response body inside `on_response_body`, at which point response
 //! headers have already been sent downstream — so `token_usage_headers`
-//! never has anything to inject for these providers. The `Praxis-Token-*`
-//! header assertions below only check for *absence*.
+//! never has anything to inject for these providers, and the extracted
+//! counts (written to internal `filter_metadata`) are otherwise not
+//! observable from an HTTP client. The `Praxis-Token-*` header
+//! assertions below only check for *absence*.
 //!
 //! Header-based extraction (e.g. Bedrock `InvokeModel`, which reports
 //! counts via upstream response *headers* available during
-//! `token_count.on_response`) is the one case where header injection is
-//! observable; that provider is not yet supported by `token_count` and is
-//! covered separately once it lands.
+//! `token_count.on_response`) is the one case where header injection
+//! *is* observable end-to-end; that path is covered separately in
+//! `tests/integration/tests/suite/examples/token_count.rs`.
 //!
-//! Detailed token extraction logic is covered by unit tests in
-//! `filters/src/token_count/tests.rs`.
+//! Actual extracted-value correctness for every provider is covered by
+//! unit tests in `filters/src/token_count/tests.rs`.
 
 use std::collections::HashMap;
 
@@ -106,7 +115,7 @@ fn token_count_config(proxy_port: u16, backend_port: u16, provider: &str) -> pra
 // -----------------------------------------------------------------------------
 
 #[test]
-fn openai_non_streaming_extracts_token_counts() {
+fn openai_non_streaming_body_passes_through() {
     let backend = Backend::fixed(OPENAI_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -120,7 +129,7 @@ fn openai_non_streaming_extracts_token_counts() {
 }
 
 #[test]
-fn anthropic_non_streaming_extracts_token_counts() {
+fn anthropic_non_streaming_body_passes_through() {
     let backend = Backend::fixed(ANTHROPIC_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -134,7 +143,7 @@ fn anthropic_non_streaming_extracts_token_counts() {
 }
 
 #[test]
-fn google_non_streaming_extracts_token_counts() {
+fn google_non_streaming_body_passes_through() {
     let backend = Backend::fixed(GOOGLE_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -151,7 +160,7 @@ fn google_non_streaming_extracts_token_counts() {
 }
 
 #[test]
-fn bedrock_converse_non_streaming_extracts_token_counts() {
+fn bedrock_converse_non_streaming_body_passes_through() {
     let backend = Backend::fixed(BEDROCK_CONVERSE_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -169,7 +178,7 @@ fn bedrock_converse_non_streaming_extracts_token_counts() {
 }
 
 #[test]
-fn azure_non_streaming_extracts_token_counts() {
+fn azure_non_streaming_body_passes_through() {
     let backend = Backend::fixed(AZURE_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -190,7 +199,7 @@ fn azure_non_streaming_extracts_token_counts() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn openai_streaming_extracts_token_counts() {
+fn openai_streaming_body_passes_through() {
     let backend = Backend::fixed(OPENAI_SSE)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
@@ -205,7 +214,7 @@ fn openai_streaming_extracts_token_counts() {
 }
 
 #[test]
-fn anthropic_streaming_split_events_extracts_token_counts() {
+fn anthropic_streaming_split_events_body_passes_through() {
     let backend = Backend::fixed(ANTHROPIC_SSE)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
@@ -224,7 +233,7 @@ fn anthropic_streaming_split_events_extracts_token_counts() {
 }
 
 #[test]
-fn google_streaming_no_done_sentinel_extracts_token_counts() {
+fn google_streaming_no_done_sentinel_body_passes_through() {
     let backend = Backend::fixed(GOOGLE_SSE)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
