@@ -166,9 +166,10 @@ pub(crate) struct ParsedTools {
     pub web_search: Option<WebSearchConfig>,
     /// File search configuration (if a `file_search` entry is present).
     pub file_search: Option<FileSearchConfig>,
-    /// MCP tool entries preserved as opaque JSON for downstream
-    /// processing by the MCP tool listing filter (#43).
-    pub mcp_tools: Vec<serde_json::Value>,
+    /// Number of MCP tool entries found. Full payloads will be
+    /// extracted when the MCP tool listing filter (#43) is added.
+    ///
+    /// Until then, only the count is needed for routing/presence.
     /// Parsed `tool_choice` value.
     pub tool_choice: Option<ToolChoice>,
     /// Number of function tools.
@@ -198,7 +199,6 @@ impl ParsedTools {
             function_tools: Vec::new(),
             web_search: None,
             file_search: None,
-            mcp_tools: Vec::new(),
             tool_choice: None,
             function_count: 0,
             builtin_count: 0,
@@ -302,23 +302,18 @@ fn classify_tools_array(tools_array: &[serde_json::Value], tool_choice: Option<T
         let Some(entry_obj) = entry.as_object() else {
             continue;
         };
-        accumulate_tool(&mut acc, entry, entry_obj);
+        accumulate_tool(&mut acc, entry_obj);
     }
 
-    acc.mcp_count = acc.mcp_tools.len();
     acc
 }
 
 /// Classify and accumulate a single tool entry.
 ///
-/// Extracts full tool details (names, configs, MCP entries) even though
-/// `tool_parse` only promotes counts and presence flags today.
-/// `tool_dispatch` (#26) will need these fields for routing and invocation.
-fn accumulate_tool(
-    acc: &mut ParsedTools,
-    entry: &serde_json::Value,
-    entry_obj: &serde_json::Map<String, serde_json::Value>,
-) {
+/// Extracts routing-relevant details (names, configs) without
+/// cloning opaque payloads. `tool_dispatch` (#26) will add
+/// owned extraction when it needs full tool entries.
+fn accumulate_tool(acc: &mut ParsedTools, entry_obj: &serde_json::Map<String, serde_json::Value>) {
     match classify_tool_type(entry_obj) {
         ToolType::Function => {
             acc.function_count += 1;
@@ -341,7 +336,7 @@ fn accumulate_tool(
             accumulate_hosted_tool(acc, &hosted);
         },
         ToolType::Mcp => {
-            acc.mcp_tools.push(entry.clone());
+            acc.mcp_count += 1;
         },
         ToolType::Unknown(_) => {
             acc.unknown_count += 1;
@@ -641,12 +636,6 @@ mod tests {
 
         assert!(result.has_mcp(), "should detect MCP tools");
         assert_eq!(result.mcp_count, 1, "should count 1 MCP tool");
-        assert_eq!(result.mcp_tools.len(), 1, "should preserve MCP entry");
-        assert_eq!(
-            result.mcp_tools[0]["server_label"].as_str(),
-            Some("weather"),
-            "MCP entry should be preserved as opaque JSON"
-        );
     }
 
     #[test]

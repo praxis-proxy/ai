@@ -1,0 +1,170 @@
+{
+  "source": "Converted Claude Code session log: claude-npv-thinking.jsonl",
+  "protocol": "anthropic_messages",
+  "turns": [
+    {
+      "name": "messages-thinking-npv",
+      "path": "/v1/messages",
+      "request": {
+        "model": "claude-sonnet-4-5-20250929",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Calculate the NPV on a 30 year loan with a 10% interest rate on a 500,000 loan. Show the formula and the final number."
+          }
+        ]
+      },
+      "response": {
+        "model": "claude-sonnet-4-5-20250929",
+        "id": "msg_replay_npv_thinking",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "I'll calculate the present value and payment details for a 30-year loan of $500,000 at 10% annual interest.\n\n## Monthly Payment Formula\n\nFor a loan, the monthly payment is calculated using:\n\n**PMT = P × [r(1 + r)^n] / [(1 + r)^n - 1]**\n\nWhere:\n- P = Principal ($500,000)\n- r = Monthly interest rate (10% / 12 = 0.008333)\n- n = Number of payments (30 years × 12 = 360 months)\n\n## Calculation\n\n```\nr = 0.10 / 12 = 0.008333\nn = 30 × 12 = 360\n\nPMT = 500,000 × [0.008333(1.008333)^360] / [(1.008333)^360 - 1]\n    = 500,000 × [0.008333 × 19.8374] / [19.8374 - 1]\n    = 500,000 × [0.1653] / [18.8374]\n    = 500,000 × 0.008776\n    = $4,387.86\n```\n\n## Results\n\n- **Monthly Payment**: $4,387.86\n- **Total Paid**: $4,387.86 × 360 = $1,579,629.60\n- **Total Interest**: $1,579,629.60 - $500,000 = $1,079,629.60\n\n## Net Present Value (NPV)\n\nIf we discount those monthly payments back at the same 10% rate:\n\n**NPV = Σ [PMT / (1 + r)^t] for t = 1 to 360**\n\nThis simplifies to the present value of an annuity formula, which equals:\n\n**NPV = $500,000** (the original loan amount)\n\nThis makes sense: when you discount future payments at the same rate as the loan's interest rate, the present value equals the principal borrowed."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "stop_details": null,
+        "usage": {
+          "input_tokens": 10,
+          "cache_creation_input_tokens": 34517,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 868,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 34517
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        }
+      },
+      "source_records": [
+        {
+          "parentUuid": null,
+          "isSidechain": false,
+          "promptId": "prompt_replay_npv_thinking",
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "Calculate the NPV on a 30 year loan with a 10% interest rate on a 500,000 loan. Show the formula and the final number."
+          },
+          "uuid": "00000000-0000-4000-8000-000000000301",
+          "timestamp": "2026-07-14T15:22:24.233Z",
+          "permissionMode": "default",
+          "promptSource": "sdk",
+          "userType": "external",
+          "entrypoint": "sdk-cli",
+          "cwd": "fixture-cwd",
+          "sessionId": "00000000-0000-4000-8000-000000000300",
+          "version": "2.1.208",
+          "gitBranch": "fixture-branch"
+        },
+        {
+          "parentUuid": "00000000-0000-4000-8000-000000000301",
+          "isSidechain": false,
+          "message": {
+            "model": "claude-sonnet-4-5-20250929",
+            "id": "msg_replay_npv_thinking",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "[sanitized Claude thinking text from real NPV session]",
+                "signature": "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"
+              }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "stop_details": null,
+            "usage": {
+              "input_tokens": 10,
+              "cache_creation_input_tokens": 34517,
+              "cache_read_input_tokens": 0,
+              "output_tokens": 868,
+              "server_tool_use": {
+                "web_search_requests": 0,
+                "web_fetch_requests": 0
+              },
+              "service_tier": "standard",
+              "cache_creation": {
+                "ephemeral_1h_input_tokens": 0,
+                "ephemeral_5m_input_tokens": 34517
+              },
+              "inference_geo": "",
+              "iterations": [],
+              "speed": "standard"
+            }
+          },
+          "requestId": "req_replay_npv_thinking",
+          "type": "assistant",
+          "uuid": "00000000-0000-4000-8000-000000000302",
+          "timestamp": "2026-07-14T15:22:35.951Z",
+          "userType": "external",
+          "entrypoint": "sdk-cli",
+          "cwd": "fixture-cwd",
+          "sessionId": "00000000-0000-4000-8000-000000000300",
+          "version": "2.1.208",
+          "gitBranch": "fixture-branch"
+        },
+        {
+          "parentUuid": "00000000-0000-4000-8000-000000000302",
+          "isSidechain": false,
+          "message": {
+            "model": "claude-sonnet-4-5-20250929",
+            "id": "msg_replay_npv_thinking",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "I'll calculate the present value and payment details for a 30-year loan of $500,000 at 10% annual interest.\n\n## Monthly Payment Formula\n\nFor a loan, the monthly payment is calculated using:\n\n**PMT = P × [r(1 + r)^n] / [(1 + r)^n - 1]**\n\nWhere:\n- P = Principal ($500,000)\n- r = Monthly interest rate (10% / 12 = 0.008333)\n- n = Number of payments (30 years × 12 = 360 months)\n\n## Calculation\n\n```\nr = 0.10 / 12 = 0.008333\nn = 30 × 12 = 360\n\nPMT = 500,000 × [0.008333(1.008333)^360] / [(1.008333)^360 - 1]\n    = 500,000 × [0.008333 × 19.8374] / [19.8374 - 1]\n    = 500,000 × [0.1653] / [18.8374]\n    = 500,000 × 0.008776\n    = $4,387.86\n```\n\n## Results\n\n- **Monthly Payment**: $4,387.86\n- **Total Paid**: $4,387.86 × 360 = $1,579,629.60\n- **Total Interest**: $1,579,629.60 - $500,000 = $1,079,629.60\n\n## Net Present Value (NPV)\n\nIf we discount those monthly payments back at the same 10% rate:\n\n**NPV = Σ [PMT / (1 + r)^t] for t = 1 to 360**\n\nThis simplifies to the present value of an annuity formula, which equals:\n\n**NPV = $500,000** (the original loan amount)\n\nThis makes sense: when you discount future payments at the same rate as the loan's interest rate, the present value equals the principal borrowed."
+              }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "stop_details": null,
+            "usage": {
+              "input_tokens": 10,
+              "cache_creation_input_tokens": 34517,
+              "cache_read_input_tokens": 0,
+              "output_tokens": 868,
+              "server_tool_use": {
+                "web_search_requests": 0,
+                "web_fetch_requests": 0
+              },
+              "service_tier": "standard",
+              "cache_creation": {
+                "ephemeral_1h_input_tokens": 0,
+                "ephemeral_5m_input_tokens": 34517
+              },
+              "inference_geo": "",
+              "iterations": [],
+              "speed": "standard"
+            }
+          },
+          "requestId": "req_replay_npv_thinking",
+          "type": "assistant",
+          "uuid": "00000000-0000-4000-8000-000000000303",
+          "timestamp": "2026-07-14T15:22:43.278Z",
+          "userType": "external",
+          "entrypoint": "sdk-cli",
+          "cwd": "fixture-cwd",
+          "sessionId": "00000000-0000-4000-8000-000000000300",
+          "version": "2.1.208",
+          "gitBranch": "fixture-branch"
+        }
+      ]
+    }
+  ]
+}
