@@ -148,9 +148,13 @@ pub(crate) async fn list_tools(
     tools_to_json(tools)
 }
 
-/// Paginate `tools/list` and stop once the accumulated count
-/// exceeds `max_tools`, preventing unbounded allocation from
-/// a hostile server.
+/// Cap on pagination rounds to prevent infinite loops from
+/// servers returning empty pages with valid cursors.
+const MAX_PAGES: usize = 100;
+
+/// Paginate `tools/list`, bounded by both `max_tools` and
+/// [`MAX_PAGES`].
+#[expect(clippy::too_many_lines, reason = "pagination loop with error branches")]
 async fn paginate_tools(
     client: &Peer<RoleClient>,
     timeout: Duration,
@@ -159,7 +163,7 @@ async fn paginate_tools(
 ) -> Result<Vec<rmcp::model::Tool>, McpClientError> {
     let mut all_tools = Vec::new();
     let mut cursor = None;
-    loop {
+    for _ in 0..MAX_PAGES {
         let params = PaginatedRequestParams::default().with_cursor(cursor);
         let page = tokio::time::timeout(timeout, Box::pin(client.list_tools(Some(params))))
             .await
@@ -181,10 +185,14 @@ async fn paginate_tools(
         }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
-            None => break,
+            None => return Ok(all_tools),
         }
     }
-    Ok(all_tools)
+    Err(McpClientError::TooManyTools {
+        url: url.to_owned(),
+        count: all_tools.len(),
+        max: max_tools,
+    })
 }
 
 // -----------------------------------------------------------------------------
