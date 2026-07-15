@@ -59,10 +59,8 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// filter: openai_responses_rehydrate
 /// ```
 pub struct RehydrateFilter {
-    /// Maximum serialized byte size of stored conversation history.
-    max_history_bytes: usize,
-    /// Optional cap on the number of stored history items.
-    max_history_items: Option<usize>,
+    /// Enforces byte-size and item-count caps on stored conversation history.
+    limiter: HistoryLimiter,
 }
 
 impl RehydrateFilter {
@@ -86,10 +84,11 @@ impl RehydrateFilter {
                 "openai_responses_rehydrate: max_history_items must be greater than 0",
             ));
         }
-        Ok(Box::new(Self {
-            max_history_bytes: validated.max_history_bytes,
-            max_history_items: validated.max_history_items,
-        }))
+        let limiter = HistoryLimiter {
+            max_bytes: validated.max_history_bytes,
+            max_items: validated.max_history_items,
+        };
+        Ok(Box::new(Self { limiter }))
     }
 
     /// Parse body, resolve rehydration source (`previous_response_id` or
@@ -130,13 +129,7 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        let state = match build_state(
-            parsed_body,
-            &record,
-            self.max_history_bytes,
-            self.max_history_items,
-            streaming,
-        ) {
+        let state = match build_state(parsed_body, &record, &self.limiter, streaming) {
             Ok(s) => s,
             Err(action) => return Ok(action),
         };
@@ -167,13 +160,7 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        let state = match build_state(
-            parsed_body,
-            &record,
-            self.max_history_bytes,
-            self.max_history_items,
-            streaming,
-        ) {
+        let state = match build_state(parsed_body, &record, &self.limiter, streaming) {
             Ok(s) => s,
             Err(action) => return Ok(action),
         };
@@ -188,7 +175,7 @@ impl RehydrateFilter {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RehydrateConfig {
-    /// Maximum serialized byte size of stored conversation history.
+    /// Maximum serialized byte size of stored conversation history. Default: 2,097,152 (2 MiB).
     #[serde(default = "default_max_history_bytes")]
     max_history_bytes: usize,
     /// Optional cap on the number of stored history items.
@@ -267,40 +254,53 @@ fn is_responses_cancel_path(path: &str) -> bool {
     !response_id.is_empty() && !response_id.contains('/')
 }
 
-/// Reject the request when stored conversation history exceeds configured limits.
-fn enforce_history_limits(
-    stored: &[Value],
-    max_history_bytes: usize,
-    max_history_items: Option<usize>,
-    streaming: bool,
-) -> Result<(), FilterAction> {
-    if let Some(max) = max_history_items {
-        let count = stored.len();
-        if count > max {
+// -----------------------------------------------------------------------------
+// HistoryLimiter
+// -----------------------------------------------------------------------------
+
+/// Enforces byte-size and item-count caps on stored conversation history.
+///
+/// Constructed once from filter config and passed into [`RehydrationSource`]
+/// so limits are checked *before* cloning the stored messages.
+struct HistoryLimiter {
+    /// Maximum serialized byte size of stored conversation history.
+    pub(super) max_bytes: usize,
+    /// Optional cap on the number of stored history items.
+    pub(super) max_items: Option<usize>,
+}
+
+impl HistoryLimiter {
+    /// Reject when `items` exceeds the configured byte-size or item-count cap.
+    fn check(&self, items: &[Value], streaming: bool) -> Result<(), FilterAction> {
+        if let Some(max) = self.max_items {
+            let count = items.len();
+            if count > max {
+                return Err(reject_too_large(
+                    &format!(
+                        "stored conversation history contains {count} items, \
+                       exceeding the {max} item limit; \
+                       compact or shorten the conversation before continuing"
+                    ),
+                    streaming,
+                ));
+            }
+        }
+
+        let byte_size = serde_json::to_string(items).map_or(usize::MAX, |s| s.len());
+        if byte_size > self.max_bytes {
             return Err(reject_too_large(
                 &format!(
-                    "stored conversation history contains {count} items, \
-                   exceeding the {max} item limit; \
-                   compact or shorten the conversation before continuing"
+                    "stored conversation history is {byte_size} bytes, \
+                   exceeding the {} byte limit; \
+                   compact or shorten the conversation before continuing",
+                    self.max_bytes
                 ),
                 streaming,
             ));
         }
-    }
 
-    let byte_size = serde_json::to_string(stored).map_or(usize::MAX, |s| s.len());
-    if byte_size > max_history_bytes {
-        return Err(reject_too_large(
-            &format!(
-                "stored conversation history is {byte_size} bytes, \
-               exceeding the {max_history_bytes} byte limit; \
-               compact or shorten the conversation before continuing"
-            ),
-            streaming,
-        ));
+        Ok(())
     }
-
-    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -309,8 +309,9 @@ fn enforce_history_limits(
 
 /// Common interface for records that supply stored conversation history.
 trait RehydrationSource {
-    /// Extract stored messages for rehydration.
-    fn stored_messages(&self) -> Vec<Value>;
+    /// Extract stored messages for rehydration, enforcing history limits
+    /// before cloning.
+    fn stored_messages(&self, limiter: &HistoryLimiter, streaming: bool) -> Result<Vec<Value>, FilterAction>;
     /// Recover MCP tool listings from stored history.
     fn mcp_tool_listings(&self) -> Vec<Value> {
         vec![]
@@ -322,8 +323,12 @@ trait RehydrationSource {
 }
 
 impl RehydrationSource for ResponseRecord {
-    fn stored_messages(&self) -> Vec<Value> {
-        stored_messages_for_rehydrate(self)
+    fn stored_messages(&self, limiter: &HistoryLimiter, streaming: bool) -> Result<Vec<Value>, FilterAction> {
+        if let Some(messages) = self.messages.as_array().filter(|a| !a.is_empty()) {
+            limiter.check(messages, streaming)?;
+            return Ok(messages.clone());
+        }
+        reconstruct_messages_from_public_response(self, limiter, streaming)
     }
 
     fn mcp_tool_listings(&self) -> Vec<Value> {
@@ -336,8 +341,11 @@ impl RehydrationSource for ResponseRecord {
 }
 
 impl RehydrationSource for ConversationRecord {
-    fn stored_messages(&self) -> Vec<Value> {
-        conversation_messages_for_rehydrate(self)
+    fn stored_messages(&self, limiter: &HistoryLimiter, streaming: bool) -> Result<Vec<Value>, FilterAction> {
+        let empty: &[Value] = &[];
+        let messages = self.messages.as_array().map_or(empty, Vec::as_slice);
+        limiter.check(messages, streaming)?;
+        Ok(messages.to_vec())
     }
 }
 
@@ -413,23 +421,16 @@ async fn fetch_conversation(
     })
 }
 
-/// Extract messages from a conversation record for rehydration.
-fn conversation_messages_for_rehydrate(record: &ConversationRecord) -> Vec<Value> {
-    record.messages.as_array().cloned().unwrap_or_default()
-}
-
 /// Build [`ResponsesState`] by resolving stored messages, enforcing
 /// history limits, and prepending conversation history before
 /// current input.
 fn build_state(
     parsed_body: Value,
     source: &impl RehydrationSource,
-    max_history_bytes: usize,
-    max_history_items: Option<usize>,
+    limiter: &HistoryLimiter,
     streaming: bool,
 ) -> Result<ResponsesState, FilterAction> {
-    let stored = source.stored_messages();
-    enforce_history_limits(&stored, max_history_bytes, max_history_items, streaming)?;
+    let stored = source.stored_messages(limiter, streaming)?;
     let previous_tools = source.mcp_tool_listings();
     let previous_usage = source.previous_usage();
     let replay = replay_messages_from_stored(&stored);
@@ -443,16 +444,11 @@ fn build_state(
 
 /// Return stored history, reconstructing from public fields for
 /// records created before hidden messages were persisted.
-fn stored_messages_for_rehydrate(record: &ResponseRecord) -> Vec<Value> {
-    if let Some(messages) = record.messages.as_array().filter(|messages| !messages.is_empty()) {
-        return messages.clone();
-    }
-
-    reconstruct_messages_from_public_response(record)
-}
-
-/// Reconstruct previous input/output items from public stored fields.
-fn reconstruct_messages_from_public_response(record: &ResponseRecord) -> Vec<Value> {
+fn reconstruct_messages_from_public_response(
+    record: &ResponseRecord,
+    limiter: &HistoryLimiter,
+    streaming: bool,
+) -> Result<Vec<Value>, FilterAction> {
     let mut messages = Vec::new();
 
     append_stored_input_items(&mut messages, record.input.clone());
@@ -461,7 +457,8 @@ fn reconstruct_messages_from_public_response(record: &ResponseRecord) -> Vec<Val
         append_stored_output_items(&mut messages, output);
     }
 
-    messages
+    limiter.check(&messages, streaming)?;
+    Ok(messages)
 }
 
 /// Append stored response input as Responses API item params.
