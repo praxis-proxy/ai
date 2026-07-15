@@ -10,6 +10,8 @@
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
+use std::collections::HashMap;
+
 /// Request-scoped state shared across Responses API filters.
 ///
 /// Stored in [`RequestExtensions`] by the validate filter and read
@@ -59,6 +61,13 @@ pub(crate) struct ResponsesState {
     /// `tool_dispatch` checks this to cap iterations. `None` means
     /// no explicit limit was set by the client.
     pub max_tool_calls: Option<u32>,
+
+    /// Resolved MCP tool definitions keyed by `(server_label,
+    /// tool_name)`.
+    ///
+    /// Built by `mcp_tool_resolve` from `tools/list` responses.
+    /// Consumed by `mcp_tool` (#27) for dispatch routing.
+    pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
 
     /// Resolved conversation history sent to the backend.
     ///
@@ -133,6 +142,7 @@ impl Default for ResponsesState {
             input: Vec::new(),
             iteration: 0,
             max_tool_calls: None,
+            mcp_tool_map: HashMap::new(),
             messages: Vec::new(),
             output_items: Vec::new(),
             parallel_tool_calls: true,
@@ -467,6 +477,7 @@ mod tests {
         assert!(state.input.is_empty());
         assert_eq!(state.iteration, 0);
         assert!(state.max_tool_calls.is_none());
+        assert!(state.mcp_tool_map.is_empty());
         assert!(state.messages.is_empty());
         assert!(state.output_items.is_empty());
         assert!(state.parallel_tool_calls);
@@ -487,5 +498,18 @@ mod tests {
         let body = json!({"model": "gpt-4o", "input": "test", "parallel_tool_calls": false});
         let state = ResponsesState::from_request_body(body);
         assert!(!state.parallel_tool_calls);
+    }
+
+    #[test]
+    fn default_has_empty_mcp_tool_map() {
+        let state = ResponsesState::default();
+        assert!(state.mcp_tool_map.is_empty(), "default mcp_tool_map should be empty");
+    }
+
+    #[test]
+    fn from_request_body_has_empty_mcp_tool_map() {
+        let body = json!({"model": "gpt-4o", "input": "test"});
+        let state = ResponsesState::from_request_body(body);
+        assert!(state.mcp_tool_map.is_empty(), "initial mcp_tool_map should be empty");
     }
 }

@@ -35,7 +35,8 @@ quote = "1.0.46"
 rand = "0.10.1"
 rcgen = "0.14.8"
 regex = "1.12.4"
-reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+rmcp = { version = "2.0.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 rustls = "0.23.41"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
@@ -49,7 +50,7 @@ thiserror = "2.0.18"
 tikv-jemallocator = "0.7.0"
 tokio = { version = "1.52.3", features = ["macros", "rt"] }
 tokio-rustls = "0.26.4"
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }

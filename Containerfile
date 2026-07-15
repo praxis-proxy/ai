@@ -53,7 +53,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY apis/src ./apis/src
 COPY filters/src ./filters/src
 COPY server/src ./server/src
-COPY examples ./examples
 
 RUN find apis/src filters/src server/src \
     -name '*.rs' -exec touch {} +

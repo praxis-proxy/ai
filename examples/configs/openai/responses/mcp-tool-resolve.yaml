@@ -1,0 +1,82 @@
+# MCP Tool Resolution
+#
+# Demonstrates the `mcp_tool_resolve` filter, which resolves MCP
+# tool entries in the Responses API `tools` array into concrete
+# tool definitions by calling `tools/list` on each upstream MCP
+# server.
+#
+# The filter runs after `tool_parse` (gated on `tool_parse.has_mcp`)
+# and before `responses_proxy`. It reads MCP entries from the
+# buffered request body, checks `previous_tools` for cached
+# listings, calls `tools/list` via the `mcp_client` module, and
+# writes `mcp_tool_map` to `ResponsesState`.
+#
+# This is a minimal pipeline focused on MCP tool discovery. For a
+# complete setup with multi-turn conversation support (rehydrate,
+# response store), see full-flow.yaml.
+#
+# For cross-request caching via `previous_tools`, add
+# `openai_responses_rehydrate` before this filter so that
+# `ResponsesState.previous_tools` is populated from the stored
+# previous response.
+#
+# Example requests:
+#
+#   # Request with MCP tools
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather?",
+#       "tools": [{
+#         "type": "mcp",
+#         "server_label": "weather",
+#         "server_url": "http://mcp-server:8001/mcp",
+#         "allowed_tools": ["get_weather"]
+#       }]
+#     }'
+#
+#   # Request without MCP tools (passthrough)
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model": "gpt-4.1", "input": "Hello, world!"}'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-pipeline]
+
+filter_chains:
+  - name: responses-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+
+      - filter: tool_parse
+
+      - filter: mcp_tool_resolve
+        timeout_ms: 5000
+
+      - filter: responses_proxy
+        name: inference
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"

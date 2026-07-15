@@ -46,6 +46,7 @@ mod failure_mode;
 mod guardrails;
 mod mcp;
 mod mcp_broker;
+mod mcp_tool_resolve;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod prompt_enrich;

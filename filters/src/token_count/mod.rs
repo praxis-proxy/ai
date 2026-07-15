@@ -8,6 +8,10 @@
 //! for downstream consumers. The filter is transparent: response bodies
 //! and status codes pass through unchanged.
 //!
+//! Bedrock `InvokeModel` is the one exception: it reports token counts as
+//! HTTP response headers rather than in the response body, so it is read
+//! directly in `on_response` with no body buffering at all.
+//!
 //! [`filter_metadata`]: HttpFilterContext::filter_metadata
 
 #[cfg(test)]
@@ -25,7 +29,7 @@ use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::token_usage::{TokenUsageProvider, extract_streaming_tokens, extract_token_usage, set_token_usage};
+use praxis_ai_apis::token_usage::{TokenUsageProvider, set_token_usage};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -77,6 +81,12 @@ const META_SSE_PREV_CR: &str = "token_count.sse_prev_cr";
 /// Metadata key for SSE scanner scratch byte count.
 const META_SSE_SCRATCH: &str = "token_count.sse_scratch_bytes";
 
+/// Bedrock `InvokeModel` response header carrying the input token count.
+const HEADER_BEDROCK_INPUT: &str = "x-amzn-bedrock-input-token-count";
+
+/// Bedrock `InvokeModel` response header carrying the output token count.
+const HEADER_BEDROCK_OUTPUT: &str = "x-amzn-bedrock-output-token-count";
+
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
@@ -86,7 +96,59 @@ const META_SSE_SCRATCH: &str = "token_count.sse_scratch_bytes";
 #[serde(deny_unknown_fields)]
 struct TokenCountConfig {
     /// AI provider whose response format to parse.
-    provider: TokenUsageProvider,
+    provider: ProviderKind,
+}
+
+/// AI provider selecting the token extraction strategy.
+///
+/// Distinct from [`TokenUsageProvider`] because Bedrock `InvokeModel` has no
+/// body format to parse — its counts live in response headers — so it needs
+/// a variant that [`TokenUsageProvider`] intentionally has no equivalent for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderKind {
+    /// OpenAI Chat Completions API.
+    #[serde(rename = "openai")]
+    OpenAi,
+    /// Anthropic Claude API.
+    Anthropic,
+    /// Google Gemini API.
+    Google,
+    /// AWS Bedrock Converse API (JSON body / SSE, like other providers).
+    Bedrock,
+    /// AWS Bedrock `InvokeModel` API (token counts in response headers only).
+    BedrockInvokeModel,
+    /// Azure OpenAI (same JSON schema as OpenAI).
+    Azure,
+}
+
+impl ProviderKind {
+    /// Maps to the shared library provider used for body-based extraction.
+    ///
+    /// Returns `None` for `BedrockInvokeModel`, which has no body format
+    /// and is instead handled directly via response headers.
+    fn to_library_provider(self) -> Option<TokenUsageProvider> {
+        match self {
+            Self::OpenAi => Some(TokenUsageProvider::OpenAi),
+            Self::Anthropic => Some(TokenUsageProvider::Anthropic),
+            Self::Google => Some(TokenUsageProvider::Google),
+            Self::Bedrock => Some(TokenUsageProvider::Bedrock),
+            Self::Azure => Some(TokenUsageProvider::Azure),
+            Self::BedrockInvokeModel => None,
+        }
+    }
+}
+
+impl From<TokenUsageProvider> for ProviderKind {
+    fn from(provider: TokenUsageProvider) -> Self {
+        match provider {
+            TokenUsageProvider::OpenAi => Self::OpenAi,
+            TokenUsageProvider::Anthropic => Self::Anthropic,
+            TokenUsageProvider::Google => Self::Google,
+            TokenUsageProvider::Bedrock => Self::Bedrock,
+            TokenUsageProvider::Azure => Self::Azure,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -96,20 +158,21 @@ struct TokenCountConfig {
 /// Extracts token usage from AI inference responses and writes unified
 /// counts to [`filter_metadata`].
 ///
-/// Supports both streaming (SSE) and non-streaming (JSON) responses
-/// across all five providers (OpenAI, Anthropic, Google, Bedrock, Azure).
+/// Supports both streaming (SSE) and non-streaming (JSON) responses across
+/// five providers (OpenAI, Anthropic, Google, Bedrock Converse, Azure), plus
+/// a header-only extraction path for Bedrock `InvokeModel`.
 ///
 /// # YAML
 ///
 /// ```yaml
 /// filter: token_count
-/// provider: openai
+/// provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure
 /// ```
 ///
 /// [`filter_metadata`]: HttpFilterContext::filter_metadata
 pub struct TokenCountFilter {
     /// Which provider's response format to parse.
-    provider: TokenUsageProvider,
+    provider: ProviderKind,
 }
 
 impl TokenCountFilter {
@@ -132,7 +195,11 @@ impl HttpFilter for TokenCountFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        if self.provider == ProviderKind::BedrockInvokeModel {
+            BodyAccess::None
+        } else {
+            BodyAccess::ReadOnly
+        }
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -143,11 +210,21 @@ impl HttpFilter for TokenCountFilter {
         Ok(FilterAction::Continue)
     }
 
+    /// Skips extraction entirely for non-success statuses, for every
+    /// provider. For `bedrock_invoke_model`, reads token counts directly
+    /// from response headers since that provider has no body format to
+    /// parse. For all other providers, detects the content-type to select
+    /// the body extraction strategy used by `on_response_body`.
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let is_success = ctx.response_header.as_ref().is_some_and(|r| r.status.is_success());
 
         if !is_success {
             trace!("non-success response, skipping token extraction");
+            return Ok(FilterAction::Continue);
+        }
+
+        if self.provider == ProviderKind::BedrockInvokeModel {
+            extract_bedrock_headers(ctx);
             return Ok(FilterAction::Continue);
         }
 
@@ -178,16 +255,54 @@ impl HttpFilter for TokenCountFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        let Some(provider) = self.provider.to_library_provider() else {
+            return Ok(FilterAction::Continue);
+        };
+
         let mode = ctx.get_metadata(META_MODE).map(str::to_owned);
 
         match mode.as_deref() {
-            Some("sse") => handle_sse_body(ctx, body, end_of_stream, self.provider),
-            Some("json") => handle_json_body(ctx, body, end_of_stream, self.provider),
+            Some("sse") => handle_sse_body(ctx, body, end_of_stream, &provider),
+            Some("json") => handle_json_body(ctx, body, end_of_stream, &provider),
             _ => {},
         }
 
         Ok(FilterAction::Continue)
     }
+}
+
+// -----------------------------------------------------------------------------
+// Bedrock InvokeModel (Header-Only) Path
+// -----------------------------------------------------------------------------
+
+/// Reads Bedrock `InvokeModel` token counts from response headers; no-op if
+/// either header is absent or unparseable. Unlike every other provider, no
+/// body access is required for this path.
+fn extract_bedrock_headers(ctx: &mut HttpFilterContext<'_>) {
+    let input = ctx
+        .response_header
+        .as_ref()
+        .and_then(|r| r.headers.get(HEADER_BEDROCK_INPUT))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let output = ctx
+        .response_header
+        .as_ref()
+        .and_then(|r| r.headers.get(HEADER_BEDROCK_OUTPUT))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let (Some(input), Some(output)) = (input, output) else {
+        trace!("Bedrock InvokeModel token headers not present or unparseable");
+        return;
+    };
+
+    set_token_usage(ctx, input, output, None);
+    debug!(
+        input,
+        output, "extracted Bedrock InvokeModel token counts from response headers"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -199,7 +314,7 @@ fn handle_json_body(
     ctx: &mut HttpFilterContext<'_>,
     body: &Option<Bytes>,
     end_of_stream: bool,
-    provider: TokenUsageProvider,
+    provider: &TokenUsageProvider,
 ) {
     if let Some(chunk) = body.as_ref()
         && !accumulate_response_hex(ctx, chunk, DEFAULT_MAX_BODY_BYTES)
@@ -212,7 +327,7 @@ fn handle_json_body(
         let bytes = ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex));
 
         if let Some(data) = bytes
-            && let Some(usage) = extract_token_usage(provider, &data)
+            && let Some(usage) = provider.extract_token_usage(&data)
         {
             set_token_usage(
                 ctx,
@@ -241,7 +356,7 @@ fn handle_sse_body(
     ctx: &mut HttpFilterContext<'_>,
     body: &Option<Bytes>,
     end_of_stream: bool,
-    provider: TokenUsageProvider,
+    provider: &TokenUsageProvider,
 ) {
     if let Some(chunk) = body.as_ref() {
         let mut state = load_sse_scan_state(ctx);
@@ -272,7 +387,7 @@ fn handle_sse_body(
 }
 
 /// Try to extract token usage from a single SSE data payload.
-fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: TokenUsageProvider) {
+fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) {
     if payload == b"[DONE]" {
         return;
     }
@@ -285,8 +400,8 @@ fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider
 }
 
 /// Try complete usage extraction (OpenAI, Google, Azure final events).
-fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: TokenUsageProvider) -> bool {
-    let Some(usage) = extract_token_usage(provider, payload) else {
+fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) -> bool {
+    let Some(usage) = provider.extract_token_usage(payload) else {
         return false;
     };
 
@@ -303,8 +418,8 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
 }
 
 /// Try partial extraction (Anthropic, Bedrock streaming).
-fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: TokenUsageProvider) {
-    let (input, output) = extract_streaming_tokens(provider, payload);
+fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) {
+    let (input, output) = provider.extract_streaming_tokens(payload);
 
     if let Some(inp) = input {
         merge_accumulated_count(ctx, META_INPUT, inp);

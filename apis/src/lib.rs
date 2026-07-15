@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod classifier;
+pub(crate) mod mcp_client;
 pub mod openai;
 #[cfg(feature = "store")]
 pub mod store;

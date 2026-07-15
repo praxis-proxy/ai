@@ -25,6 +25,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`mcp_tool_resolve`](mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
 | [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
 | [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
 | [`openai_responses_format`](openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
