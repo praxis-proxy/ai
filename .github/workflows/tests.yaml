@@ -51,17 +51,16 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache Cargo registry and build artifacts
+      - name: Cache Cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-rust-1.96.0-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-1.96.0-lint-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-cargo-
+            ${{ runner.os }}-rust-1.96.0-lint-cargo-
           save-always: true
 
       - name: Install cargo-machete
@@ -92,9 +91,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-rust-1.96.0-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-1.96.0-test-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-cargo-
+            ${{ runner.os }}-rust-1.96.0-test-cargo-
           save-always: true
 
       - name: Unit tests

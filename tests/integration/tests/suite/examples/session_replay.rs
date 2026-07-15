@@ -74,8 +74,6 @@ fn replay_claude_messages_image_session_through_protocol_example() {
         forwarded["messages"][0]["content"][1]["source"]["media_type"], "image/png",
         "forwarded request should preserve the image content block"
     );
-
-    drop(proxy);
 }
 
 #[test]
@@ -131,8 +129,6 @@ fn replay_claude_messages_tool_cycle_preserves_source_records() {
             "{} backend request should match the replay fixture request",
             turn.name
         );
-
-        drop(proxy);
     }
     assert_eq!(
         replay.turns[0].response["content"][0]["type"], "text",
@@ -221,8 +217,6 @@ fn replay_claude_messages_thinking_session_through_protocol_example() {
         source_records[1]["message"]["id"], source_records[2]["message"]["id"],
         "split thinking and text records should retain their shared Claude message id"
     );
-
-    drop(proxy);
 }
 
 #[test]
@@ -281,8 +275,6 @@ fn replay_claude_messages_image_session_through_chat_completions_translation_exa
         transformed["stop_reason"], "end_turn",
         "Chat Completions stop finish reason should translate to Anthropic end_turn"
     );
-
-    drop(proxy);
 }
 
 #[test]
@@ -345,8 +337,6 @@ fn replay_claude_messages_thinking_fixture_translates_visible_text_for_openai() 
         transformed["stop_reason"], "end_turn",
         "Chat Completions stop finish reason should translate to Anthropic end_turn"
     );
-
-    drop(proxy);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -393,6 +383,4 @@ async fn replay_codex_responses_session_through_full_flow_example() {
         stored, turn.response,
         "stored response should match the replayed Codex fixture response"
     );
-
-    drop(proxy);
 }
