@@ -91,6 +91,12 @@ pub(crate) mod test_utils {
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,
             upstream: None,
+            #[cfg(feature = "praxis-main")]
+            peer_identity: None,
+            #[cfg(feature = "praxis-main")]
+            pre_read_mutations: Vec::new(),
+            #[cfg(feature = "praxis-main")]
+            structured_metadata: std::collections::HashMap::new(),
         }
     }
 

@@ -64,7 +64,10 @@ jobs:
             ${{ runner.os }}-rust-1.96.0-praxis-main-
 
       - name: Unit tests
-        run: make test-unit
+        run: |
+          cargo test -p praxis-ai-apis --features praxis-main
+          cargo test -p praxis-ai-filters --features praxis-main
+          cargo test -p praxis-ai-proxy
 
       - name: Schema tests
         run: make test-schema
