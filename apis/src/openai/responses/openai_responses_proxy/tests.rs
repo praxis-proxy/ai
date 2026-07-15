@@ -21,8 +21,8 @@ fn from_config_accepts_null() {
     let filter = super::ResponsesProxyFilter::from_config(&yaml).unwrap();
     assert_eq!(
         filter.name(),
-        "responses_proxy",
-        "filter name should be responses_proxy"
+        "openai_responses_proxy",
+        "filter name should be openai_responses_proxy"
     );
 }
 
@@ -32,8 +32,8 @@ fn from_config_accepts_empty_mapping() {
     let filter = super::ResponsesProxyFilter::from_config(&yaml).unwrap();
     assert_eq!(
         filter.name(),
-        "responses_proxy",
-        "filter name should be responses_proxy"
+        "openai_responses_proxy",
+        "filter name should be openai_responses_proxy"
     );
 }
 
@@ -50,7 +50,7 @@ fn body_access_is_read_write() {
     assert_eq!(
         filter.request_body_access(),
         BodyAccess::ReadWrite,
-        "responses_proxy must declare ReadWrite to modify the body"
+        "openai_responses_proxy must declare ReadWrite to modify the body"
     );
 }
 
@@ -59,7 +59,7 @@ fn body_mode_is_stream_buffer() {
     let filter = make_filter();
     assert!(
         matches!(filter.request_body_mode(), BodyMode::StreamBuffer { .. }),
-        "responses_proxy must use StreamBuffer to receive complete body at EOS"
+        "openai_responses_proxy must use StreamBuffer to receive complete body at EOS"
     );
 }
 

@@ -4,7 +4,7 @@
 # response, confirming its status is completed, and
 # promoting the ID to filter metadata. Body construction
 # from the resolved conversation is handled downstream by
-# the `responses_proxy` filter.
+# the `openai_responses_proxy` filter.
 #
 # Pipeline ordering:
 #   1. openai_responses_format — classifies body, promotes metadata

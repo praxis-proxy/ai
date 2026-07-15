@@ -21,7 +21,7 @@
 #      and conversation IDs, and writes responses.* metadata for
 #      downstream filters. Skips non-Responses requests gracefully.
 #
-#   4. tool_parse parses the tools array and tool_choice from
+#   4. openai_tool_parse parses the tools array and tool_choice from
 #      Responses API requests and promotes summary facts (has_tools,
 #      has_web_search, tool_choice, function_count, etc.) to
 #      metadata and filter results. Does not mutate the request body.
@@ -39,13 +39,13 @@
 #      history to the current request. previous_response_id takes
 #      precedence when both are present.
 #
-#   8. mcp_tool_resolve resolves MCP tool entries from the tools
+#   8. openai_mcp_tool_resolve resolves MCP tool entries from the tools
 #      array by calling tools/list on each upstream MCP server.
 #      Runs after rehydrate so previous_tools is available for
 #      cross-request caching. Writes mcp_tool_map to
 #      ResponsesState for downstream tool dispatch.
 #
-#   9. responses_proxy reads the assembled ResponsesState and
+#   9. openai_responses_proxy reads the assembled ResponsesState and
 #      rebuilds the outbound request body with the full conversation
 #      history. Strips previous_response_id and conversation
 #      (already resolved by rehydrate). Passthrough when no
@@ -118,7 +118,7 @@ filter_chains:
 
       - filter: openai_responses_validate
 
-      - filter: tool_parse
+      - filter: openai_tool_parse
 
       - filter: openai_response_store
         backend: sqlite
@@ -133,9 +133,9 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
-      - filter: mcp_tool_resolve
+      - filter: openai_mcp_tool_resolve
 
-      - filter: responses_proxy
+      - filter: openai_responses_proxy
         name: inference
 
       - filter: router

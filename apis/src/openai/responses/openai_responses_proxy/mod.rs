@@ -4,7 +4,7 @@
 //! Responses API proxy filter.
 //!
 //! Body-preparation waypoint in the Responses API filter pipeline.
-//! Sits between upstream enrichment filters (`rehydrate`, `tool_parse`)
+//! Sits between upstream enrichment filters (`rehydrate`, `openai_tool_parse`)
 //! and downstream consumption filters (`stream_events`, `tool_dispatch`).
 //! Named `inference` in pipeline configs so branch chains can
 //! `rejoin` here for the agentic tool loop.
@@ -61,13 +61,13 @@ use super::{error::responses_error_rejection, state::ResponsesState};
 /// # YAML
 ///
 /// ```yaml
-/// filter: responses_proxy
+/// filter: openai_responses_proxy
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: responses_proxy
+/// filter: openai_responses_proxy
 /// max_body_bytes: 67108864
 /// ```
 ///
@@ -78,7 +78,7 @@ use super::{error::responses_error_rejection, state::ResponsesState};
 ///
 /// let yaml = serde_yaml::Value::Null;
 /// let filter = ResponsesProxyFilter::from_config(&yaml).unwrap();
-/// assert_eq!(filter.name(), "responses_proxy");
+/// assert_eq!(filter.name(), "openai_responses_proxy");
 /// ```
 pub struct ResponsesProxyFilter {
     /// Parsed and validated configuration.
@@ -97,7 +97,7 @@ impl ResponsesProxyFilter {
         let cfg: ResponsesProxyConfig = if config.is_null() {
             ResponsesProxyConfig::default()
         } else {
-            parse_filter_config("responses_proxy", config)?
+            parse_filter_config("openai_responses_proxy", config)?
         };
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
@@ -110,8 +110,8 @@ impl ResponsesProxyFilter {
         streaming: bool,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let outbound = rebuild_outbound_body(state);
-        let serialized =
-            serde_json::to_vec(&outbound).map_err(|e| -> FilterError { format!("responses_proxy: {e}").into() })?;
+        let serialized = serde_json::to_vec(&outbound)
+            .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
         if serialized.len() > self.config.max_body_bytes {
             debug!(
                 body_bytes = serialized.len(),
@@ -139,7 +139,7 @@ impl ResponsesProxyFilter {
 #[async_trait]
 impl HttpFilter for ResponsesProxyFilter {
     fn name(&self) -> &'static str {
-        "responses_proxy"
+        "openai_responses_proxy"
     }
 
     fn request_body_access(&self) -> BodyAccess {

@@ -1,32 +1,42 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration types for the tool parse filter.
+//! Configuration types for the Responses proxy filter.
 
 use praxis_filter::{
-    FilterError, body::DEFAULT_JSON_BODY_MAX_BYTES,
+    FilterError, body::MAX_JSON_BODY_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes,
 };
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
-// ToolParseConfig
+// ResponsesProxyConfig
 // -----------------------------------------------------------------------------
 
-/// YAML configuration for the [`ToolParseFilter`].
+/// Deserialized YAML config for the Responses proxy filter.
 ///
-/// [`ToolParseFilter`]: super::ToolParseFilter
+/// ```yaml
+/// filter: openai_responses_proxy
+/// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ToolParseConfig {
+pub(super) struct ResponsesProxyConfig {
     /// Maximum body size in bytes for `StreamBuffer` mode.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
 }
 
-/// Default max body bytes.
+impl Default for ResponsesProxyConfig {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: MAX_JSON_BODY_BYTES,
+        }
+    }
+}
+
+/// Serde default for `max_body_bytes`.
 fn default_max_body_bytes() -> usize {
-    DEFAULT_JSON_BODY_MAX_BYTES
+    MAX_JSON_BODY_BYTES
 }
 
 // -----------------------------------------------------------------------------
@@ -34,7 +44,7 @@ fn default_max_body_bytes() -> usize {
 // -----------------------------------------------------------------------------
 
 /// Validate the parsed configuration.
-pub(crate) fn build_config(cfg: ToolParseConfig) -> Result<ToolParseConfig, FilterError> {
-    validate_max_body_bytes("tool_parse", cfg.max_body_bytes)?;
+pub(super) fn build_config(cfg: ResponsesProxyConfig) -> Result<ResponsesProxyConfig, FilterError> {
+    validate_max_body_bytes("openai_responses_proxy", cfg.max_body_bytes)?;
     Ok(cfg)
 }

@@ -62,13 +62,13 @@ const MAX_PROMOTED_VALUE_LEN: usize = 256;
 /// # YAML
 ///
 /// ```yaml
-/// filter: tool_parse
+/// filter: openai_tool_parse
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: tool_parse
+/// filter: openai_tool_parse
 /// max_body_bytes: 67108864
 /// ```
 pub struct ToolParseFilter {
@@ -85,7 +85,7 @@ impl ToolParseFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ToolParseConfig = parse_filter_config("tool_parse", config)?;
+        let cfg: ToolParseConfig = parse_filter_config("openai_tool_parse", config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
@@ -94,7 +94,7 @@ impl ToolParseFilter {
 #[async_trait]
 impl HttpFilter for ToolParseFilter {
     fn name(&self) -> &'static str {
-        "tool_parse"
+        "openai_tool_parse"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -164,21 +164,21 @@ impl HttpFilter for ToolParseFilter {
 /// Write durable metadata that persists across all Pingora lifecycle phases.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) {
     if parsed.has_tools() {
-        ctx.set_metadata("tool_parse.has_tools", "true");
+        ctx.set_metadata("openai_tool_parse.has_tools", "true");
     }
 
     if parsed.function_count > 0 {
-        ctx.set_metadata("tool_parse.function_count", parsed.function_count.to_string());
+        ctx.set_metadata("openai_tool_parse.function_count", parsed.function_count.to_string());
     }
 
     write_tool_presence_metadata(ctx, parsed);
 
     if let Some(tc) = &parsed.tool_choice {
         if let Some(val) = promotable_tool_choice_value(tc) {
-            ctx.set_metadata("tool_parse.tool_choice", val);
+            ctx.set_metadata("openai_tool_parse.tool_choice", val);
         }
         if let Some(type_str) = promotable_tool_choice_type(tc) {
-            ctx.set_metadata("tool_parse.tool_choice_type", type_str);
+            ctx.set_metadata("openai_tool_parse.tool_choice_type", type_str);
         }
     }
 }
@@ -186,13 +186,13 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) {
 /// Write per-tool-type presence flags to metadata.
 fn write_tool_presence_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) {
     let flags: &[(&str, bool)] = &[
-        ("tool_parse.has_web_search", parsed.has_web_search()),
-        ("tool_parse.has_file_search", parsed.has_file_search()),
-        ("tool_parse.has_mcp", parsed.has_mcp()),
-        ("tool_parse.has_code_interpreter", parsed.has_code_interpreter()),
-        ("tool_parse.has_computer_use", parsed.has_computer_use()),
-        ("tool_parse.has_image_generation", parsed.has_image_generation()),
-        ("tool_parse.has_tool_search", parsed.has_tool_search()),
+        ("openai_tool_parse.has_web_search", parsed.has_web_search()),
+        ("openai_tool_parse.has_file_search", parsed.has_file_search()),
+        ("openai_tool_parse.has_mcp", parsed.has_mcp()),
+        ("openai_tool_parse.has_code_interpreter", parsed.has_code_interpreter()),
+        ("openai_tool_parse.has_computer_use", parsed.has_computer_use()),
+        ("openai_tool_parse.has_image_generation", parsed.has_image_generation()),
+        ("openai_tool_parse.has_tool_search", parsed.has_tool_search()),
     ];
     for &(key, present) in flags {
         if present {
@@ -204,9 +204,9 @@ fn write_tool_presence_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &Parsed
 /// Re-promote filter results from metadata written during the body phase.
 ///
 /// The pipeline clears `filter_results` after evaluating each filter's
-/// branch conditions. When `tool_parse` is not the first filter in the
+/// branch conditions. When `openai_tool_parse` is not the first filter in the
 /// chain, a preceding filter's (possibly empty) branch evaluation
-/// clears results before `tool_parse`'s branches are checked. Metadata
+/// clears results before `openai_tool_parse`'s branches are checked. Metadata
 /// persists across phases, so we rebuild `filter_results` from it.
 fn restore_filter_results(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterError> {
     let any = restore_presence_flags(ctx)? | restore_function_count(ctx)? | restore_tool_choice(ctx)?;
@@ -221,20 +221,20 @@ fn restore_filter_results(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterE
 /// Restore boolean presence flags from metadata to filter results.
 fn restore_presence_flags(ctx: &mut HttpFilterContext<'_>) -> Result<bool, FilterError> {
     const FLAGS: &[(&str, &str)] = &[
-        ("tool_parse.has_tools", "has_tools"),
-        ("tool_parse.has_web_search", "has_web_search"),
-        ("tool_parse.has_file_search", "has_file_search"),
-        ("tool_parse.has_mcp", "has_mcp"),
-        ("tool_parse.has_code_interpreter", "has_code_interpreter"),
-        ("tool_parse.has_computer_use", "has_computer_use"),
-        ("tool_parse.has_image_generation", "has_image_generation"),
-        ("tool_parse.has_tool_search", "has_tool_search"),
+        ("openai_tool_parse.has_tools", "has_tools"),
+        ("openai_tool_parse.has_web_search", "has_web_search"),
+        ("openai_tool_parse.has_file_search", "has_file_search"),
+        ("openai_tool_parse.has_mcp", "has_mcp"),
+        ("openai_tool_parse.has_code_interpreter", "has_code_interpreter"),
+        ("openai_tool_parse.has_computer_use", "has_computer_use"),
+        ("openai_tool_parse.has_image_generation", "has_image_generation"),
+        ("openai_tool_parse.has_tool_search", "has_tool_search"),
     ];
 
     let mut any = false;
     for &(meta_key, result_key) in FLAGS {
         if ctx.get_metadata(meta_key).is_some_and(|v| v == "true") {
-            let results = ctx.filter_results.entry("tool_parse").or_default();
+            let results = ctx.filter_results.entry("openai_tool_parse").or_default();
             results.set(result_key, "true")?;
             any = true;
         }
@@ -244,9 +244,9 @@ fn restore_presence_flags(ctx: &mut HttpFilterContext<'_>) -> Result<bool, Filte
 
 /// Restore `function_count` from metadata.
 fn restore_function_count(ctx: &mut HttpFilterContext<'_>) -> Result<bool, FilterError> {
-    if let Some(fc) = ctx.get_metadata("tool_parse.function_count") {
+    if let Some(fc) = ctx.get_metadata("openai_tool_parse.function_count") {
         let fc = fc.to_owned();
-        let results = ctx.filter_results.entry("tool_parse").or_default();
+        let results = ctx.filter_results.entry("openai_tool_parse").or_default();
         results.set("function_count", fc)?;
         return Ok(true);
     }
@@ -257,16 +257,16 @@ fn restore_function_count(ctx: &mut HttpFilterContext<'_>) -> Result<bool, Filte
 fn restore_tool_choice(ctx: &mut HttpFilterContext<'_>) -> Result<bool, FilterError> {
     let mut any = false;
 
-    if let Some(tc) = ctx.get_metadata("tool_parse.tool_choice") {
+    if let Some(tc) = ctx.get_metadata("openai_tool_parse.tool_choice") {
         let tc = tc.to_owned();
-        let results = ctx.filter_results.entry("tool_parse").or_default();
+        let results = ctx.filter_results.entry("openai_tool_parse").or_default();
         results.set("tool_choice", tc)?;
         any = true;
     }
 
-    if let Some(tct) = ctx.get_metadata("tool_parse.tool_choice_type") {
+    if let Some(tct) = ctx.get_metadata("openai_tool_parse.tool_choice_type") {
         let tct = tct.to_owned();
-        let results = ctx.filter_results.entry("tool_parse").or_default();
+        let results = ctx.filter_results.entry("openai_tool_parse").or_default();
         results.set("tool_choice_type", tct)?;
         any = true;
     }
@@ -276,7 +276,7 @@ fn restore_tool_choice(ctx: &mut HttpFilterContext<'_>) -> Result<bool, FilterEr
 
 /// Promote tool facts to filter results for branch conditions.
 fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) -> Result<(), FilterError> {
-    let results = ctx.filter_results.entry("tool_parse").or_default();
+    let results = ctx.filter_results.entry("openai_tool_parse").or_default();
 
     if parsed.has_tools() {
         results.set("has_tools", "true")?;

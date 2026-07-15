@@ -140,14 +140,14 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "responses_proxy" => praxis_ai_apis::openai::ResponsesProxyFilter::from_config
+        http "openai_responses_proxy" => praxis_ai_apis::openai::ResponsesProxyFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "mcp_tool_resolve" => praxis_ai_apis::openai::McpToolResolveFilter::from_config
+        http "openai_mcp_tool_resolve" => praxis_ai_apis::openai::McpToolResolveFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
+        http "openai_tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
     );
 }

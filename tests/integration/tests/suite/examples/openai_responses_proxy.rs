@@ -15,7 +15,7 @@ use praxis_test_utils::{
 // -----------------------------------------------------------------------------
 
 #[test]
-fn responses_proxy_example_forwards_to_backend() {
+fn openai_responses_proxy_example_forwards_to_backend() {
     let backend_guard = start_backend_with_shutdown("inference-ok");
     let proxy_port = free_port();
 
@@ -38,7 +38,7 @@ fn responses_proxy_example_forwards_to_backend() {
 }
 
 #[test]
-fn responses_proxy_example_preserves_json_response() {
+fn openai_responses_proxy_example_preserves_json_response() {
     let json_response = r#"{"id":"resp_abc","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"Hi!"}]}]}"#;
     let backend_guard = start_backend_with_shutdown(json_response);
     let proxy_port = free_port();
@@ -62,7 +62,7 @@ fn responses_proxy_example_preserves_json_response() {
 }
 
 #[test]
-fn responses_proxy_example_forwards_subresource_paths() {
+fn openai_responses_proxy_example_forwards_subresource_paths() {
     let backend_guard = start_backend_with_shutdown("subresource-ok");
     let proxy_port = free_port();
 

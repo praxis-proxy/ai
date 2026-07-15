@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration for the `mcp_tool_resolve` filter.
+//! Configuration for the `openai_mcp_tool_resolve` filter.
 
 use praxis_filter::{
     FilterError, body::DEFAULT_JSON_BODY_MAX_BYTES,
@@ -26,7 +26,7 @@ const DEFAULT_MAX_TOOLS: usize = 128;
 // McpToolResolveConfig
 // -----------------------------------------------------------------------------
 
-/// YAML configuration for the `mcp_tool_resolve` filter.
+/// YAML configuration for the `openai_mcp_tool_resolve` filter.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpToolResolveConfig {
@@ -76,15 +76,15 @@ fn default_max_tools() -> usize {
 
 /// Validate the parsed configuration.
 pub(crate) fn build_config(cfg: McpToolResolveConfig) -> Result<McpToolResolveConfig, FilterError> {
-    validate_max_body_bytes("mcp_tool_resolve", cfg.max_body_bytes)?;
+    validate_max_body_bytes("openai_mcp_tool_resolve", cfg.max_body_bytes)?;
     if cfg.timeout_ms == 0 {
-        return Err("mcp_tool_resolve: timeout_ms must be greater than 0".into());
+        return Err("openai_mcp_tool_resolve: timeout_ms must be greater than 0".into());
     }
     if cfg.max_servers == 0 {
-        return Err("mcp_tool_resolve: max_servers must be greater than 0".into());
+        return Err("openai_mcp_tool_resolve: max_servers must be greater than 0".into());
     }
     if cfg.max_tools == 0 {
-        return Err("mcp_tool_resolve: max_tools must be greater than 0".into());
+        return Err("openai_mcp_tool_resolve: max_tools must be greater than 0".into());
     }
     Ok(cfg)
 }

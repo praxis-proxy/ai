@@ -64,10 +64,10 @@ pub(crate) struct ClassifiedRequest {
     /// This does NOT validate individual entries: an array like
     /// `[{"unexpected": true}]` will set this to `true` even though
     /// no entry carries a recognised `type` discriminator.
-    /// [`tool_parse`] applies stricter per-entry classification and
+    /// [`openai_tool_parse`] applies stricter per-entry classification and
     /// may disagree on malformed arrays.
     ///
-    /// [`tool_parse`]: crate::openai::responses::tool_parse
+    /// [`openai_tool_parse`]: crate::openai::responses::openai_tool_parse
     pub has_tools: bool,
     /// Extracted `max_output_tokens` field value (Responses API), if present.
     pub max_output_tokens: Option<u64>,

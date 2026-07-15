@@ -40,7 +40,7 @@ filter_chains:
                 filters:
                   # Placeholder: the full stateful chain would include
                   # request_validate, response_store, rehydrate,
-                  # tool_parse, responses_proxy, stream_events,
+                  # openai_tool_parse, openai_responses_proxy, stream_events,
                   # tool_dispatch, reasoning, etc.
                   #
                   # For now, proxy to the same backend. Future

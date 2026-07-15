@@ -294,7 +294,7 @@ Proxy-needed fields (read and act upon):
 - `conversation` — triggers conversation context loading
 - `tools` — proxy needs to read tool types to know which tool backends to invoke
 - `tool_choice` — proxy reads to determine tool dispatch behavior
-- `instructions` — preserved in state (do NOT inject as system message — in pass-through mode the inference server handles it; in conversion mode `responses_proxy` injects it during Responses → Chat Completions transformation)
+- `instructions` — preserved in state (do NOT inject as system message — in pass-through mode the inference server handles it; in conversion mode `openai_responses_proxy` injects it during Responses → Chat Completions transformation)
 
 Preserved and forwarded (proxy reads but does not validate):
 - `include`, `metadata`, `text`, `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `parallel_tool_calls`, `stream_options`, `max_output_tokens`, `max_tool_calls`, `reasoning`, `safety_identifier`, `prompt_cache_key`, `service_tier`, `top_logprobs`, `truncation`
@@ -414,7 +414,7 @@ database_url: ${DATABASE_URL}  # e.g. postgres://user:pass@host:5432/db or sqlit
 
 ---
 
-#### Filter 4: `tool_parse`
+#### Filter 4: `openai_tool_parse`
 
 **Purpose:** Parse tool definitions from the request. List MCP tools. Synthesize built-in tool definitions. Normalize tool choice. Register all tools for inference.
 
@@ -443,7 +443,7 @@ database_url: ${DATABASE_URL}  # e.g. postgres://user:pass@host:5432/db or sqlit
 
 ---
 
-#### Filter 5: `responses_proxy`
+#### Filter 5: `openai_responses_proxy`
 
 **Purpose:** Call the inference backend. Pass-through to `/v1/responses` if backend supports it, or convert to `/v1/chat/completions` and proxy.
 
@@ -466,7 +466,7 @@ database_url: ${DATABASE_URL}  # e.g. postgres://user:pass@host:5432/db or sqlit
 
 **Config:**
 ```yaml
-filter: responses_proxy
+filter: openai_responses_proxy
 backend_api: auto  # auto | responses | chat_completions
 ```
 
@@ -584,7 +584,7 @@ Error:
   - Never assume all tool calls in a turn are the same type.
 
 - Loop control via `filter_results`:
-  - `tool_dispatch.action = "loop"` → branch back to `responses_proxy` (Praxis branch chain). Only when ALL tool calls in the turn were server-side and results are ready for the next inference call.
+  - `tool_dispatch.action = "loop"` → branch back to `openai_responses_proxy` (Praxis branch chain). Only when ALL tool calls in the turn were server-side and results are ready for the next inference call.
   - `tool_dispatch.action = "done"` → exit loop. Happens when client-side function calls are present (client must provide results before the loop can continue) or when no tool calls remain.
 - Exit conditions:
   - No tool calls → done
@@ -769,7 +769,7 @@ tiktoken_encoding: cl100k_base
 
 #### Filter 12: `reasoning`
 
-**Purpose:** Post-streaming reasoning summarization. The reasoning accumulation and streaming events (`response.reasoning.delta/done`) are handled by `stream_events`. The reasoning endpoint fallback (`openai_chat_completions_with_reasoning` → `openai_chat_completion`) is handled by `responses_proxy`. This filter only runs after streaming completes to optionally generate a reasoning summary via a second inference call.
+**Purpose:** Post-streaming reasoning summarization. The reasoning accumulation and streaming events (`response.reasoning.delta/done`) are handled by `stream_events`. The reasoning endpoint fallback (`openai_chat_completions_with_reasoning` → `openai_chat_completion`) is handled by `openai_responses_proxy`. This filter only runs after streaming completes to optionally generate a reasoning summary via a second inference call.
 
 **Praxis trait methods:**
 - `on_response` — after streaming completes, check if summarization is needed, make second inference call
@@ -894,8 +894,8 @@ sandbox_network: none  # none | restricted | full
 
 | Tool type | Filter | Status |
 |-----------|--------|--------|
-| `function` | `tool_parse` + `tool_dispatch` (client-side) | Covered |
-| `mcp` | `tool_parse` + `mcp_tool` | Covered |
+| `function` | `openai_tool_parse` + `tool_dispatch` (client-side) | Covered |
+| `mcp` | `openai_tool_parse` + `mcp_tool` | Covered |
 | `web_search` (+ preview variants) | `web_search` | Covered |
 | `file_search` | `file_search` | Covered |
 | `code_interpreter` | `code_interpreter` | Future (filter 14) |
@@ -931,10 +931,10 @@ filter_chains:
       - filter: compact
         name: compact
 
-      - filter: tool_parse
+      - filter: openai_tool_parse
         name: tools
 
-      - filter: responses_proxy
+      - filter: openai_responses_proxy
         name: inference
 
       - filter: stream_events
@@ -950,7 +950,7 @@ filter_chains:
               filter: dispatch
               key: action
               result: loop
-            rejoin: inference  # re-enter at responses_proxy
+            rejoin: inference  # re-enter at openai_responses_proxy
             max_iterations: 10
 
       - filter: reasoning
@@ -966,7 +966,7 @@ filter_chains:
     filters:
       - filter: request_validate
       - filter: response_store
-      - filter: responses_proxy
+      - filter: openai_responses_proxy
       - filter: stream_events
 ```
 
@@ -979,8 +979,8 @@ filter_chains:
       - filter: request_validate
       - filter: response_store
       - filter: rehydrate
-      - filter: tool_parse
-      - filter: responses_proxy
+      - filter: openai_tool_parse
+      - filter: openai_responses_proxy
       - filter: stream_events
       - filter: tool_dispatch
         branch_chains:
@@ -989,7 +989,7 @@ filter_chains:
               filter: tool_dispatch
               key: action
               result: loop
-            rejoin: responses_proxy
+            rejoin: openai_responses_proxy
             max_iterations: 10
 ```
 
@@ -999,9 +999,9 @@ Build order, each tier produces a working system:
 
 | Tier | Filters | What works after | External deps |
 |------|---------|-----------------|---------------|
-| 0 | `request_validate`, `response_store`, `responses_proxy`, `stream_events` | Stateless proxy with persistence. Text streaming. CRUD works. | Inference backend, SQL |
+| 0 | `request_validate`, `response_store`, `openai_responses_proxy`, `stream_events` | Stateless proxy with persistence. Text streaming. CRUD works. | Inference backend, SQL |
 | 1 | + `rehydrate` | Multi-turn via `previous_response_id` and `conversation`. | None (reads from response_store) |
-| 2 | + `tool_parse`, `tool_dispatch` | Tool definitions parsed, loop control. Client-side function tools. | None |
+| 2 | + `openai_tool_parse`, `tool_dispatch` | Tool definitions parsed, loop control. Client-side function tools. | None |
 | 3 | + `web_search` | Server-side web search tool execution. | Search API (Brave/Tavily) |
 | 4 | + `mcp_tool` | MCP server-side tool execution with session reuse and approval. | MCP servers, #24 foundation |
 | 5 | + `file_search` | Vector store search with citations. | Vector Store API, Files API |
@@ -1033,10 +1033,10 @@ filter/src/builtins/http/ai/openai/responses/
   file_resolve/
     mod.rs
     config.rs
-  tool_parse/
+  openai_tool_parse/
     mod.rs
     config.rs
-  responses_proxy/
+  openai_responses_proxy/
     mod.rs
     config.rs
     convert.rs              # Chat Completion ↔ Responses conversion
@@ -1103,11 +1103,11 @@ This design does not exist in isolation. Several Praxis epics provide foundation
 The MCP epic has a 9-PR implementation plan covering JSON-RPC parsing, MCP classification, gateway, and sessions. Our `mcp_tool` filter must depend on this foundation:
 
 - **PRs 1-2** (`agentic-foundation`, `agentic-safety`): JSON-RPC parser and header hygiene — already landed as the `json_rpc` and `mcp` filters in `filter/src/builtins/http/ai/agentic/`. Our filters reuse these for MCP envelope parsing.
-- **PRs 3-4** (`mcp-classifier`, `mcp-gateway`): Tool discovery, backend registry, catalog aggregation, `tools/list` body mutation. Our `tool_parse` filter's MCP tool listing should delegate to the MCP gateway's tool catalog rather than reimplementing `tools/list` calls directly. When the gateway is available, `tool_parse` reads from the gateway's aggregated catalog. When running without the gateway (standalone mode), `tool_parse` calls MCP servers directly as a fallback.
+- **PRs 3-4** (`mcp-classifier`, `mcp-gateway`): Tool discovery, backend registry, catalog aggregation, `tools/list` body mutation. Our `openai_tool_parse` filter's MCP tool listing should delegate to the MCP gateway's tool catalog rather than reimplementing `tools/list` calls directly. When the gateway is available, `openai_tool_parse` reads from the gateway's aggregated catalog. When running without the gateway (standalone mode), `openai_tool_parse` calls MCP servers directly as a fallback.
 - **PR 5** (`mcp-sessions`): Session lifecycle, lazy backend init, local session store. Our `mcp_tool` filter's session management (`responses.mcp_sessions` in metadata) should use the session traits defined by this PR. This means `mcp_tool` implements tool invocation and approval logic, but delegates session create/get/cleanup to the MCP session infrastructure.
 - **PR 6** (`agentic-state-redis`): Distributed session state via Redis/Valkey. Enables horizontal scaling of MCP sessions across Praxis instances. Our filters don't depend on this directly, but `mcp_tool` automatically benefits when the session backend is Redis instead of local.
 
-**Action:** `mcp_tool` and `tool_parse` should be implemented after PRs 3-5 land, or in parallel with clear trait boundaries so the integration is a swap, not a rewrite.
+**Action:** `mcp_tool` and `openai_tool_parse` should be implemented after PRs 3-5 land, or in parallel with clear trait boundaries so the integration is a swap, not a rewrite.
 
 #### SSE Streaming Inspection ([#143](https://github.com/praxis-proxy/praxis/issues/143), part of [#19](https://github.com/praxis-proxy/praxis/issues/19))
 
@@ -1123,11 +1123,11 @@ Our `stream_events` filter is the primary consumer of this infrastructure. Speci
 
 #### Inference API Translation ([#96](https://github.com/praxis-proxy/praxis/issues/96) → [#213](https://github.com/praxis-proxy/praxis/issues/213))
 
-Our `responses_proxy` filter with `backend_api: chat_completions` mode performs Responses API → Chat Completions conversion. #96 was closed as duplicate of #213 (Provider abstraction: unified request/response types), which defines unified request/response envelopes across OpenAI, Anthropic, and Google with per-provider serialization and streaming normalization.
+Our `openai_responses_proxy` filter with `backend_api: chat_completions` mode performs Responses API → Chat Completions conversion. #96 was closed as duplicate of #213 (Provider abstraction: unified request/response types), which defines unified request/response envelopes across OpenAI, Anthropic, and Google with per-provider serialization and streaming normalization.
 
 #213 is open and unassigned. No conversion utilities exist yet.
 
-**Action:** Our `responses_proxy` implements Responses ↔ Chat Completions conversion inline in `convert.rs`. Structure the conversion as a standalone module with clear input/output types so it can adopt #213's unified types when they land. The conversion module should be reusable by other filters or crates — not coupled to Praxis filter internals.
+**Action:** Our `openai_responses_proxy` implements Responses ↔ Chat Completions conversion inline in `convert.rs`. Structure the conversion as a standalone module with clear input/output types so it can adopt #213's unified types when they land. The conversion module should be reusable by other filters or crates — not coupled to Praxis filter internals.
 
 #### Multi-Tenancy ([#91](https://github.com/praxis-proxy/praxis/issues/91))
 
@@ -1143,7 +1143,7 @@ Tenant-level routing and persistence configuration affects several of our filter
 
 ### Open Questions
 
-1. **Branch chain API for tool loop.** The `rejoin` directive in branch chains needs to support re-entering mid-chain (at `responses_proxy`) rather than restarting from the top. Validate this works with Praxis's current branch chain implementation. See [praxis#354](https://github.com/praxis-proxy/praxis/issues/354).
+1. **Branch chain API for tool loop.** The `rejoin` directive in branch chains needs to support re-entering mid-chain (at `openai_responses_proxy`) rather than restarting from the top. Validate this works with Praxis's current branch chain implementation. See [praxis#354](https://github.com/praxis-proxy/praxis/issues/354).
 
 2. **Sub-filter invocation.** `tool_dispatch` needs to call `mcp_tool`, `web_search`, `file_search` — but these are peer filters, not nested. Options: (a) direct Rust function calls (not via filter chain), (b) sub-chains, (c) trait objects. Direct function calls are simplest and match ADR-03's "public functions" philosophy.
 
@@ -1219,7 +1219,7 @@ The following filters are part of the full Responses API vision but require back
 - Resolve each `connector_id` → `server_url` via Connectors API
 - Note: does NOT resolve auth tokens. Auth comes from the tool's own `authorization` field.
 
-**MVP workaround:** MCP tools must specify `server_url` directly instead of using `connector_id`. The `tool_parse` filter accepts `server_url` on MCP tool definitions.
+**MVP workaround:** MCP tools must specify `server_url` directly instead of using `connector_id`. The `openai_tool_parse` filter accepts `server_url` on MCP tool definitions.
 
 
 

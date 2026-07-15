@@ -1,12 +1,12 @@
 # MCP Tool Resolution
 #
-# Demonstrates the `mcp_tool_resolve` filter, which resolves MCP
+# Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP
 # tool entries in the Responses API `tools` array into concrete
 # tool definitions by calling `tools/list` on each upstream MCP
 # server.
 #
-# The filter runs after `tool_parse` (gated on `tool_parse.has_mcp`)
-# and before `responses_proxy`. It reads MCP entries from the
+# The filter runs after `openai_tool_parse` (gated on `openai_tool_parse.has_mcp`)
+# and before `openai_responses_proxy`. It reads MCP entries from the
 # buffered request body, checks `previous_tools` for cached
 # listings, calls `tools/list` via the `mcp_client` module, and
 # writes `mcp_tool_map` to `ResponsesState`.
@@ -60,12 +60,12 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: tool_parse
+      - filter: openai_tool_parse
 
-      - filter: mcp_tool_resolve
+      - filter: openai_mcp_tool_resolve
         timeout_ms: 5000
 
-      - filter: responses_proxy
+      - filter: openai_responses_proxy
         name: inference
 
       - filter: router

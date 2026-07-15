@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the `tool_parse` filter.
+//! Integration tests for the `openai_tool_parse` filter.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
@@ -387,11 +387,11 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: tool_parse
+      - filter: openai_tool_parse
         branch_chains:
           - name: has_tools_branch
             on_result:
-              filter: tool_parse
+              filter: openai_tool_parse
               key: has_tools
               result: "true"
             rejoin: terminal
@@ -431,11 +431,11 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: tool_parse
+      - filter: openai_tool_parse
         branch_chains:
           - name: required_branch
             on_result:
-              filter: tool_parse
+              filter: openai_tool_parse
               key: tool_choice
               result: "required"
             rejoin: terminal
@@ -475,7 +475,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: tool_parse
+      - filter: openai_tool_parse
       - filter: router
         routes:
           - path_prefix: "/"
@@ -489,10 +489,10 @@ filter_chains:
     )
 }
 
-/// Branch on has_web_search with `openai_responses_format` preceding `tool_parse`.
+/// Branch on has_web_search with `openai_responses_format` preceding `openai_tool_parse`.
 ///
 /// Verifies that filter_results and branch conditions work correctly
-/// when tool_parse is NOT the first body-reading filter in the chain.
+/// when openai_tool_parse is NOT the first body-reading filter in the chain.
 fn chained_branch_yaml(proxy_port: u16, web_port: u16, default_port: u16) -> String {
     format!(
         r#"
@@ -505,11 +505,11 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-      - filter: tool_parse
+      - filter: openai_tool_parse
         branch_chains:
           - name: web_search_branch
             on_result:
-              filter: tool_parse
+              filter: openai_tool_parse
               key: has_web_search
               result: "true"
             rejoin: terminal
@@ -549,11 +549,11 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: tool_parse
+      - filter: openai_tool_parse
         branch_chains:
           - name: web_search_branch
             on_result:
-              filter: tool_parse
+              filter: openai_tool_parse
               key: has_web_search
               result: "true"
             rejoin: terminal

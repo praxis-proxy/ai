@@ -42,7 +42,7 @@ filters/src/              Cross-provider filters
 | `openai_responses_rehydrate` | Fetches stored responses for conversation context |
 | `openai_response_store` | Persists responses to storage backend |
 | `openai_conversations` | Handles `/v1/conversations` endpoints |
-| `responses_proxy` | Rebuilds request body from `ResponsesState` |
+| `openai_responses_proxy` | Rebuilds request body from `ResponsesState` |
 
 ### Cross-Provider Filters (`praxis-ai-filters`)
 

@@ -16,5 +16,6 @@ pub(crate) mod translation;
 pub use conversations::OpenaiConversationsFilter;
 pub use responses::{
     McpToolResolveFilter, ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter,
-    ResponsesFormatFilter, ToolParseFilter, proxy::ResponsesProxyFilter, stream_events::OpenaiStreamEventsFilter,
+    ResponsesFormatFilter, ToolParseFilter, openai_responses_proxy::ResponsesProxyFilter,
+    stream_events::OpenaiStreamEventsFilter,
 };

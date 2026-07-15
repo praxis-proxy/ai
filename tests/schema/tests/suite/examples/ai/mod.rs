@@ -4,4 +4,4 @@
 //! AI example configuration tests.
 
 mod model_to_header;
-mod responses_proxy;
+mod openai_responses_proxy;

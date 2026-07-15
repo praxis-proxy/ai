@@ -296,7 +296,7 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
-      - filter: responses_proxy
+      - filter: openai_responses_proxy
 
       - filter: router
         routes:
