@@ -463,6 +463,29 @@ async fn sse_bedrock_metadata_event() {
     assert_eq!(total.as_deref(), Some("48"), "Bedrock SSE total tokens (computed)");
 }
 
+#[tokio::test]
+async fn sse_zero_token_counts_are_written() {
+    let events = b"data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n";
+
+    let (input, output, total) = run_sse_extraction(TokenUsageProvider::OpenAi, events).await;
+
+    assert_eq!(input.as_deref(), Some("0"), "zero input tokens should be written");
+    assert_eq!(output.as_deref(), Some("0"), "zero output tokens should be written");
+    assert_eq!(total.as_deref(), Some("0"), "zero total tokens should be written");
+}
+
+#[tokio::test]
+async fn sse_final_event_without_trailing_blank_line() {
+    let events =
+        b"data: {\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":34,\"totalTokenCount\":46}}";
+
+    let (input, output, total) = run_sse_extraction(TokenUsageProvider::Google, events).await;
+
+    assert_eq!(input.as_deref(), Some("12"), "Google EOF usage should be extracted");
+    assert_eq!(output.as_deref(), Some("34"), "Google EOF usage should be extracted");
+    assert_eq!(total.as_deref(), Some("46"), "Google EOF total should be extracted");
+}
+
 // -----------------------------------------------------------------------------
 // SSE: Scratch Overflow
 // -----------------------------------------------------------------------------
