@@ -1,42 +1,32 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration types for the Responses proxy filter.
+//! Configuration types for the tool parse filter.
 
 use praxis_filter::{
-    FilterError, body::MAX_JSON_BODY_BYTES,
+    FilterError, body::DEFAULT_JSON_BODY_MAX_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes,
 };
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
-// ResponsesProxyConfig
+// ToolParseConfig
 // -----------------------------------------------------------------------------
 
-/// Deserialized YAML config for the Responses proxy filter.
+/// YAML configuration for the [`ToolParseFilter`].
 ///
-/// ```yaml
-/// filter: responses_proxy
-/// ```
+/// [`ToolParseFilter`]: super::ToolParseFilter
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ResponsesProxyConfig {
+pub(crate) struct ToolParseConfig {
     /// Maximum body size in bytes for `StreamBuffer` mode.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
 }
 
-impl Default for ResponsesProxyConfig {
-    fn default() -> Self {
-        Self {
-            max_body_bytes: MAX_JSON_BODY_BYTES,
-        }
-    }
-}
-
-/// Serde default for `max_body_bytes`.
+/// Default max body bytes.
 fn default_max_body_bytes() -> usize {
-    MAX_JSON_BODY_BYTES
+    DEFAULT_JSON_BODY_MAX_BYTES
 }
 
 // -----------------------------------------------------------------------------
@@ -44,7 +34,7 @@ fn default_max_body_bytes() -> usize {
 // -----------------------------------------------------------------------------
 
 /// Validate the parsed configuration.
-pub(super) fn build_config(cfg: ResponsesProxyConfig) -> Result<ResponsesProxyConfig, FilterError> {
-    validate_max_body_bytes("responses_proxy", cfg.max_body_bytes)?;
+pub(crate) fn build_config(cfg: ToolParseConfig) -> Result<ToolParseConfig, FilterError> {
+    validate_max_body_bytes("openai_tool_parse", cfg.max_body_bytes)?;
     Ok(cfg)
 }

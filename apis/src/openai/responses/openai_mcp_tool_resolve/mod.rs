@@ -4,7 +4,7 @@
 //! Filter 18: resolve MCP tool declarations into concrete tool
 //! definitions by calling upstream MCP servers' `tools/list`.
 //!
-//! Runs after `tool_parse`, gated on `tool_parse.has_mcp`.
+//! Runs after `openai_tool_parse`, gated on `openai_tool_parse.has_mcp`.
 //! Reads MCP entries from the buffered request body, checks
 //! `previous_tools` for cached listings, calls `tools/list` via
 //! the `mcp_client` module, and writes `mcp_tool_map` to
@@ -49,13 +49,13 @@ use crate::mcp_client;
 /// # YAML
 ///
 /// ```yaml
-/// filter: mcp_tool_resolve
+/// filter: openai_mcp_tool_resolve
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: mcp_tool_resolve
+/// filter: openai_mcp_tool_resolve
 /// timeout_ms: 5000
 /// max_body_bytes: 67108864
 /// max_tools: 128
@@ -84,7 +84,7 @@ impl McpToolResolveFilter {
     ///
     /// Returns [`FilterError`] if the config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: McpToolResolveConfig = parse_filter_config("mcp_tool_resolve", config)?;
+        let cfg: McpToolResolveConfig = parse_filter_config("openai_mcp_tool_resolve", config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
@@ -186,7 +186,7 @@ impl McpToolResolveFilter {
 #[async_trait]
 impl HttpFilter for McpToolResolveFilter {
     fn name(&self) -> &'static str {
-        "mcp_tool_resolve"
+        "openai_mcp_tool_resolve"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -260,11 +260,11 @@ fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction 
     match err {
         ResolveError::TooManyServers { count, max } => {
             let msg = format!("too many MCP servers: {count} exceeds limit of {max}");
-            debug!(error = %msg, "mcp_tool_resolve rejected");
+            debug!(error = %msg, "openai_mcp_tool_resolve rejected");
             FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", &msg, streaming))
         },
         ResolveError::Client(e) => {
-            debug!(error = %e, "mcp_tool_resolve failed");
+            debug!(error = %e, "openai_mcp_tool_resolve failed");
             FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
@@ -334,7 +334,7 @@ async fn fetch_tools(
 ///
 /// Skips state creation when the body carries
 /// `previous_response_id` to avoid the downstream rebuild
-/// path in `responses_proxy` which would strip it.
+/// path in `openai_responses_proxy` which would strip it.
 fn write_tool_map(ctx: &mut HttpFilterContext<'_>, body: &[u8], map: HashMap<(String, String), serde_json::Value>) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.mcp_tool_map = map;
@@ -353,9 +353,10 @@ fn write_tool_map(ctx: &mut HttpFilterContext<'_>, body: &[u8], map: HashMap<(St
     }
 }
 
-/// Check whether `tool_parse` detected MCP tools.
+/// Check whether `openai_tool_parse` detected MCP tools.
 fn has_mcp_tools(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("tool_parse.has_mcp").is_some_and(|v| v == "true")
+    ctx.get_metadata("openai_tool_parse.has_mcp")
+        .is_some_and(|v| v == "true")
 }
 
 /// Check whether the request is streaming.

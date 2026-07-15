@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the `mcp_tool_resolve` filter.
+//! Integration tests for the `openai_mcp_tool_resolve` filter.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
@@ -183,15 +183,15 @@ fn non_responses_path_passes_through() {
 }
 
 // =============================================================================
-// Body Preservation with responses_proxy (get_or_insert_with regression)
+// Body Preservation with openai_responses_proxy (get_or_insert_with regression)
 // =============================================================================
 
 #[test]
-fn body_preserved_through_responses_proxy_with_function_tools() {
+fn body_preserved_through_openai_responses_proxy_with_function_tools() {
     let backend_guard = start_echo_backend();
     let proxy_port = free_port();
 
-    let yaml = resolve_with_responses_proxy_yaml(proxy_port, backend_guard.port());
+    let yaml = resolve_with_openai_responses_proxy_yaml(proxy_port, backend_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -207,11 +207,11 @@ fn body_preserved_through_responses_proxy_with_function_tools() {
 }
 
 #[test]
-fn body_preserved_through_responses_proxy_without_tools() {
+fn body_preserved_through_openai_responses_proxy_without_tools() {
     let backend_guard = start_echo_backend();
     let proxy_port = free_port();
 
-    let yaml = resolve_with_responses_proxy_yaml(proxy_port, backend_guard.port());
+    let yaml = resolve_with_openai_responses_proxy_yaml(proxy_port, backend_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -458,8 +458,8 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-      - filter: tool_parse
-      - filter: mcp_tool_resolve
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
         timeout_ms: {timeout_ms}
       - filter: router
         routes:
@@ -474,7 +474,7 @@ filter_chains:
     )
 }
 
-fn resolve_with_responses_proxy_yaml(proxy_port: u16, backend_port: u16) -> String {
+fn resolve_with_openai_responses_proxy_yaml(proxy_port: u16, backend_port: u16) -> String {
     format!(
         r#"
 listeners:
@@ -486,9 +486,9 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-      - filter: tool_parse
-      - filter: mcp_tool_resolve
-      - filter: responses_proxy
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
+      - filter: openai_responses_proxy
         name: inference
       - filter: router
         routes:
@@ -515,8 +515,8 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-      - filter: tool_parse
-      - filter: mcp_tool_resolve
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
         allow_loopback: true
       - filter: router
         routes:
@@ -543,8 +543,8 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-      - filter: tool_parse
-      - filter: mcp_tool_resolve
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
         allow_loopback: true
         max_tools: {max_tools}
       - filter: router
@@ -572,10 +572,10 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-      - filter: tool_parse
-      - filter: mcp_tool_resolve
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
         allow_loopback: true
-      - filter: responses_proxy
+      - filter: openai_responses_proxy
         name: inference
       - filter: router
         routes:

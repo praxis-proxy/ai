@@ -11,7 +11,7 @@ use praxis_test_utils::{free_port, http_send, json_post, parse_body, parse_statu
 // -----------------------------------------------------------------------------
 
 #[test]
-fn responses_proxy_example_forwards_request() {
+fn openai_responses_proxy_example_forwards_request() {
     let backend_port = start_backend("backend-ok");
     let proxy_port = free_port();
     let yaml = make_yaml(proxy_port, backend_port);
@@ -33,7 +33,7 @@ fn responses_proxy_example_forwards_request() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-/// Build YAML config for a responses_proxy passthrough.
+/// Build YAML config for a openai_responses_proxy passthrough.
 fn make_yaml(proxy_port: u16, backend_port: u16) -> String {
     format!(
         r#"
@@ -44,7 +44,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: responses_proxy
+      - filter: openai_responses_proxy
         name: inference
       - filter: router
         routes:

@@ -11,7 +11,7 @@
 # order, so the store is listed before stream_events while
 # stream_events still parses final chunks before store persistence.
 # For a complete setup with multi-turn conversation support
-# (rehydrate, responses_proxy), see
+# (rehydrate, openai_responses_proxy), see
 # full-flow.yaml.
 #
 # Example requests:

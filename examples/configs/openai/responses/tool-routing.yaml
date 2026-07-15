@@ -1,11 +1,11 @@
 # Tool Composition Routing
 #
-# Demonstrates using `tool_parse` to route Responses API requests
+# Demonstrates using `openai_tool_parse` to route Responses API requests
 # by their tool composition. All requests go to the same inference
 # backend — the branch conditions select different processing
 # chains based on what tools are present in the request body.
 #
-# The `tool_parse` filter parses the `tools` array and `tool_choice`
+# The `openai_tool_parse` filter parses the `tools` array and `tool_choice`
 # from Responses API create requests and promotes summary facts to
 # metadata and filter results. These promoted facts drive branch
 # conditions and downstream filter decisions.
@@ -44,11 +44,11 @@ listeners:
 filter_chains:
   - name: tool-routing
     filters:
-      - filter: tool_parse
+      - filter: openai_tool_parse
         branch_chains:
           - name: web-search
             on_result:
-              filter: tool_parse
+              filter: openai_tool_parse
               key: has_web_search
               result: "true"
             chains:

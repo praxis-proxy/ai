@@ -5,7 +5,7 @@
 //!
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
 //! across filter phases. It holds the heavy data needed by the
-//! validate → rehydrate → `tool_parse` → `responses_proxy` →
+//! validate → rehydrate → `openai_tool_parse` → `openai_responses_proxy` →
 //! `stream_events` → `tool_dispatch` pipeline.
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
@@ -65,7 +65,7 @@ pub(crate) struct ResponsesState {
     /// Resolved MCP tool definitions keyed by `(server_label,
     /// tool_name)`.
     ///
-    /// Built by `mcp_tool_resolve` from `tools/list` responses.
+    /// Built by `openai_mcp_tool_resolve` from `tools/list` responses.
     /// Consumed by `mcp_tool` (#27) for dispatch routing.
     pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
 
@@ -74,7 +74,7 @@ pub(crate) struct ResponsesState {
     /// Initialized from the current request's input. When
     /// `previous_response_id` is set, `rehydrate` prepends stored
     /// history. `tool_dispatch` appends tool results during agentic
-    /// loops. `responses_proxy` reads this as the authoritative
+    /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,

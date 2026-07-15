@@ -63,7 +63,7 @@ health checks, etc.), see the
 - **Conversation management**
   (`openai_conversations`): handles all
   `/v1/conversations` endpoints locally.
-- **Responses proxy** (`responses_proxy`): rebuilds
+- **Responses proxy** (`openai_responses_proxy`): rebuilds
   the request body from `ResponsesState` when present.
 
 ## Anthropic Messages API
