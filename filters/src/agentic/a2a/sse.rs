@@ -117,6 +117,25 @@ pub(crate) fn scan_sse_chunk(state: &mut SseScanState, chunk: &[u8], max_scratch
     }
 }
 
+/// Flush any incomplete line or pending `data:` event at stream end.
+///
+/// Providers such as Google Gemini may omit a trailing blank line before
+/// closing the connection, so the scanner must dispatch buffered state on
+/// `end_of_stream` rather than waiting for another `\n\n` boundary.
+pub(crate) fn flush_sse_state(state: &mut SseScanState, payloads: &mut Vec<Vec<u8>>) {
+    if !state.line_buf.is_empty() {
+        process_line(&state.line_buf, &mut state.data_buf, &mut state.has_data, payloads);
+        state.line_buf.clear();
+    }
+
+    if state.has_data {
+        payloads.push(std::mem::take(&mut state.data_buf));
+        state.has_data = false;
+    }
+
+    state.scratch_bytes = 0;
+}
+
 // -----------------------------------------------------------------------------
 // Private Utilities
 // -----------------------------------------------------------------------------
@@ -181,6 +200,23 @@ mod tests {
     // -------------------------------------------------------------------------
     // Single Complete Frame
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn flush_pending_event_without_trailing_blank_line() {
+        let mut state = SseScanState::default();
+        let chunk = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}";
+
+        let SseScanResult { payloads, .. } = scan_sse_chunk(&mut state, chunk, MAX_SCRATCH);
+        assert!(payloads.is_empty(), "no blank line yet");
+
+        let mut flushed = Vec::new();
+        flush_sse_state(&mut state, &mut flushed);
+        assert_eq!(flushed.len(), 1, "EOF flush should dispatch pending event");
+        assert_eq!(
+            flushed[0],
+            b"{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}"
+        );
+    }
 
     #[test]
     fn single_data_frame_yields_payload() {
