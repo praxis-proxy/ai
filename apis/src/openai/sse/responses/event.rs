@@ -71,6 +71,14 @@ pub(crate) enum ResponsesEvent {
     /// `response.reasoning_summary_part.done` — reasoning summary part completed.
     ReasoningSummaryPartDone(Value),
 
+    // Web search
+    /// `response.web_search_call.in_progress` — web search call initiated.
+    WebSearchCallInProgress(Value),
+    /// `response.web_search_call.searching` — web search call executing.
+    WebSearchCallSearching(Value),
+    /// `response.web_search_call.completed` — web search call completed.
+    WebSearchCallCompleted(Value),
+
     // Error
     /// `error` — error event.
     Error(Value),
@@ -114,6 +122,10 @@ impl ResponsesEvent {
     }
 
     /// Match event type string to enum variant.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the Responses event discriminator keeps canonical wire names together"
+    )]
     fn from_event_type(event_type: &str, data: Value) -> Self {
         match event_type {
             "response.created" => Self::ResponseCreated(data),
@@ -141,6 +153,9 @@ impl ResponsesEvent {
             "response.reasoning_summary_text.done" => Self::ReasoningSummaryTextDone(data),
             "response.reasoning_summary_part.added" => Self::ReasoningSummaryPartAdded(data),
             "response.reasoning_summary_part.done" => Self::ReasoningSummaryPartDone(data),
+            "response.web_search_call.in_progress" => Self::WebSearchCallInProgress(data),
+            "response.web_search_call.searching" => Self::WebSearchCallSearching(data),
+            "response.web_search_call.completed" => Self::WebSearchCallCompleted(data),
             "error" => Self::Error(data),
             other => Self::Unknown {
                 event_type: other.to_owned(),
@@ -183,6 +198,9 @@ impl ResponsesEvent {
             Self::ReasoningSummaryTextDone(_) => "response.reasoning_summary_text.done",
             Self::ReasoningSummaryPartAdded(_) => "response.reasoning_summary_part.added",
             Self::ReasoningSummaryPartDone(_) => "response.reasoning_summary_part.done",
+            Self::WebSearchCallInProgress(_) => "response.web_search_call.in_progress",
+            Self::WebSearchCallSearching(_) => "response.web_search_call.searching",
+            Self::WebSearchCallCompleted(_) => "response.web_search_call.completed",
             Self::Error(_) => "error",
             Self::Unknown { event_type, .. } => event_type,
         }
@@ -463,6 +481,9 @@ mod tests {
             "response.reasoning_summary_text.done",
             "response.reasoning_summary_part.added",
             "response.reasoning_summary_part.done",
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+            "response.web_search_call.completed",
         ] {
             let f = typed_frame(event_type, json!({}));
             let event = ResponsesEvent::from_frame(&f).unwrap();

@@ -24,9 +24,11 @@ bytes = { workspace = true }
 dashmap = { workspace = true, optional = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
+futures = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -41,3 +43,4 @@ zeroize = { workspace = true }
 chrono = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+wiremock = { workspace = true }

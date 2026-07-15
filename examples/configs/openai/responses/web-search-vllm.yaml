@@ -1,0 +1,31 @@
+# Direct vLLM web-search demo.
+#
+# Requests declaring an OpenAI Responses web_search tool are handled by
+# openai_web_search. Praxis calls vLLM Core, executes You.com with YOU_API_KEY,
+# appends function_call_output, and repeats until vLLM returns the final answer.
+# Requests without web_search pass through to the same vLLM endpoint.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [direct-vllm-web-search]
+
+filter_chains:
+  - name: direct-vllm-web-search
+    filters:
+      - filter: openai_web_search
+        vllm_base_url: "http://10.0.0.99:8000"
+        you_api_base_url: "https://api.you.com"
+        max_tool_rounds: 5
+        timeout_secs: 90
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: vllm
+
+      - filter: load_balancer
+        clusters:
+          - name: vllm
+            endpoints:
+              - "10.0.0.99:8000"
