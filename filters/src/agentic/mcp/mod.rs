@@ -368,11 +368,13 @@ fn write_metadata(
     }
     if let Some(sid) = &mcp.session_id
         && !contains_control_chars(sid)
+        && sid.len() <= max_len
     {
         ctx.set_metadata("mcp.session_id", sid.clone());
     }
     if let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
+        && pv.len() <= max_len
     {
         ctx.set_metadata("mcp.protocol_version", pv.clone());
     }
@@ -405,6 +407,7 @@ fn promote_mcp_headers(
     if let Some(header_name) = &config.headers.protocol_version
         && let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
+        && pv.len() <= max_len
     {
         headers.push((Cow::Owned(header_name.clone()), pv.clone()));
     }
@@ -426,6 +429,7 @@ fn promote_filter_results(
     mcp: &McpEnvelope,
 ) -> Result<(), FilterError> {
     let results = ctx.filter_results.entry("mcp").or_default();
+    let max_len = MAX_DYNAMIC_VALUE_LEN;
     let method_str = mcp.method.as_str();
     if !contains_control_chars(method_str) {
         results.set("method", method_str.to_owned())?;
@@ -439,6 +443,7 @@ fn promote_filter_results(
 
     if let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
+        && pv.len() <= max_len
     {
         results.set("protocol_version", pv.clone())?;
     }

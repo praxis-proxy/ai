@@ -7,7 +7,7 @@ use bytes::Bytes;
 use praxis_filter::{FilterAction, HttpFilter as _};
 
 use super::{
-    McpFilter,
+    MAX_DYNAMIC_VALUE_LEN, McpFilter,
     config::{McpConfig, build_config},
 };
 
@@ -532,6 +532,61 @@ async fn control_char_method_skips_all_promotions() {
         ctx.get_metadata("mcp.method"),
         None,
         "method with control chars should not be set in durable metadata"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Length Bound Tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn over_length_session_id_not_stored() {
+    let filter = make_default_filter();
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    let mut req = make_mcp_request(&[]);
+    let long_sid = "a".repeat(MAX_DYNAMIC_VALUE_LEN + 1);
+    req.headers.insert("mcp-session-id", long_sid.parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release), "should release");
+    assert_eq!(
+        ctx.get_metadata("mcp.session_id"),
+        None,
+        "over-length session id should not be stored"
+    );
+}
+
+#[tokio::test]
+async fn over_length_protocol_version_not_promoted() {
+    let filter = make_default_filter();
+    let long_version = "a".repeat(MAX_DYNAMIC_VALUE_LEN + 1);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": long_version }
+    });
+    let req = make_mcp_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body.to_string()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "should release");
+    assert_eq!(
+        ctx.get_metadata("mcp.protocol_version"),
+        None,
+        "over-length protocol version should not be in metadata"
+    );
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key("x-praxis-mcp-protocol-version"),
+        "over-length protocol version should not be promoted to header"
     );
 }
 
