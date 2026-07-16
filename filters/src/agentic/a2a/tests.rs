@@ -2727,6 +2727,39 @@ async fn non_sse_response_does_not_enter_sse_capture_path() {
 }
 
 #[tokio::test]
+async fn non_sse_response_falls_through_to_non_streaming_capture() {
+    for method in ["SendStreamingMessage", "SubscribeToTask"] {
+        let filter = make_task_routing_filter();
+
+        let req = make_a2a_request(&[]);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("agent-a"));
+        ctx.filter_metadata.insert("a2a.method".to_owned(), method.to_owned());
+
+        let mut resp = praxis_filter::Response {
+            status: http::StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.insert("content-type", "application/json".parse().unwrap());
+        ctx.response_header = Some(&mut resp);
+
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        ctx.response_header = None;
+
+        assert_eq!(
+            ctx.get_metadata("a2a.response.capture_enabled"),
+            Some("true"),
+            "{method} with non-SSE success response should enable non-streaming capture"
+        );
+        assert_eq!(
+            ctx.get_metadata("a2a.response.cluster"),
+            Some("agent-a"),
+            "{method} with non-SSE success response should record cluster for capture"
+        );
+    }
+}
+
+#[tokio::test]
 async fn wrong_method_does_not_enter_sse_capture() {
     let filter = make_task_routing_filter();
 
