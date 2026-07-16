@@ -134,6 +134,11 @@ fn conversations_ddl(c: &str) -> String {
 }
 
 /// Append DDL for the conversation items table and its index.
+///
+/// Items intentionally do not have a cascading foreign key to conversations.
+/// The OpenAI Conversations API preserves items when a conversation is
+/// deleted, so retention cleanup must be implemented separately from
+/// `DELETE /v1/conversations/{id}`.
 fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
     stmts.push(format!(
         "CREATE TABLE IF NOT EXISTS {i} (

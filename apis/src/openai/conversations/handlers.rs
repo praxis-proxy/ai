@@ -208,6 +208,11 @@ pub(super) async fn handle_update_conversation(
 }
 
 /// Handle `DELETE /v1/conversations/{id}` — delete a conversation.
+///
+/// This intentionally deletes only the conversation record. The OpenAI
+/// Conversations API specifies that deleting a conversation does not delete
+/// its items; item cleanup belongs to item deletion or a separate retention
+/// policy, not this endpoint.
 pub(super) async fn handle_delete_conversation(
     ctx: &HttpFilterContext<'_>,
     store: &dyn ConversationItemStore,
