@@ -246,14 +246,12 @@ impl HttpFilter for A2aFilter {
             .and_then(|v| v.to_str().ok())
             .is_some_and(is_event_stream_content_type);
 
-        if is_sse_capable {
-            if is_sse {
-                let cluster = ctx.cluster_name().map(str::to_owned);
-                if let Some(cluster) = cluster {
-                    ctx.filter_metadata
-                        .insert("a2a.response.sse_capture_enabled".to_owned(), "true".to_owned());
-                    ctx.filter_metadata.insert("a2a.response.cluster".to_owned(), cluster);
-                }
+        if is_sse_capable && is_sse {
+            let cluster = ctx.cluster_name().map(str::to_owned);
+            if let Some(cluster) = cluster {
+                ctx.filter_metadata
+                    .insert("a2a.response.sse_capture_enabled".to_owned(), "true".to_owned());
+                ctx.filter_metadata.insert("a2a.response.cluster".to_owned(), cluster);
             }
             return Ok(FilterAction::Continue);
         }
