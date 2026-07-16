@@ -10,9 +10,10 @@ use http::HeaderMap;
 use praxis_filter::{FilterAction, HttpFilter as _};
 
 use super::{
-    A2aFilter,
+    A2aFilter, JsonBalanceState,
     config::{A2aConfig, build_config},
     envelope::{A2aFamily, A2aMethod, extract_a2a_envelope},
+    scan_json_balance,
     task_routing::LocalTaskRouteStore,
 };
 
@@ -1854,6 +1855,31 @@ async fn mixed_case_sse_content_type_skips_capture() {
     );
 }
 
+#[tokio::test]
+async fn many_single_byte_chunks_still_capture_route_before_eos() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-many-chunks","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+
+    for &byte in json.as_bytes() {
+        let mut body = Some(Bytes::from(vec![byte]));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+    }
+
+    assert_eq!(
+        store.get_by_task_id("task-many-chunks").as_deref(),
+        Some("agent-a"),
+        "route should be captured once the JSON is balanced, even when delivered as many \
+         single-byte chunks, without waiting for end_of_stream"
+    );
+    assert_capture_scratch_cleared(&ctx);
+}
+
 // -----------------------------------------------------------------------------
 // Context Route Lookup Tests
 // -----------------------------------------------------------------------------
@@ -3057,6 +3083,103 @@ async fn subscribe_to_task_sse_status_update_stores_route() {
 }
 
 // -----------------------------------------------------------------------------
+// JSON Balance Scanner Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn scan_json_balance_completes_on_minimal_object() {
+    let mut state = JsonBalanceState::default();
+    scan_json_balance(&mut state, b"{}");
+    assert!(state.is_complete(), "empty object is a balanced top-level value");
+}
+
+#[test]
+fn scan_json_balance_not_complete_before_any_object_seen() {
+    let mut state = JsonBalanceState::default();
+    scan_json_balance(&mut state, b"   ");
+    assert!(
+        !state.is_complete(),
+        "depth 0 before any opening bracket is seen must not read as complete"
+    );
+}
+
+#[test]
+fn scan_json_balance_tracks_nested_objects_and_arrays() {
+    let full = br#"{"result":{"items":[1,2,{"id":"x"}],"task":{"id":"y"}}}"#;
+    let mut state = JsonBalanceState::default();
+    scan_json_balance(&mut state, full);
+    assert!(
+        state.is_complete(),
+        "nested objects and arrays should balance to depth 0"
+    );
+}
+
+#[test]
+fn scan_json_balance_ignores_structural_bytes_inside_strings() {
+    // Bytes: { " a " : " } { " }
+    // The `}` and `{` at indices 6 and 7 are inside the string value and
+    // must not be treated as structural; only the final `}` at index 9
+    // should bring depth back to 0.
+    let full = br#"{"a":"}{"}"#;
+    let (chunk1, chunk2) = full.split_at(7);
+
+    let mut state = JsonBalanceState::default();
+    scan_json_balance(&mut state, chunk1);
+    assert!(
+        !state.is_complete(),
+        "brace/bracket bytes inside a string literal must not be counted as structural"
+    );
+
+    scan_json_balance(&mut state, chunk2);
+    assert!(state.is_complete(), "the real closing brace should complete the scan");
+}
+
+#[test]
+fn scan_json_balance_handles_escaped_quotes_inside_strings() {
+    // `x\"y` inside the string value: the escaped quote must not be
+    // treated as the end of the string, or the trailing `}` would never
+    // be recognized as the real top-level closing brace.
+    let full = br#"{"a":"x\"y"}"#;
+    let mut state = JsonBalanceState::default();
+    scan_json_balance(&mut state, full);
+    assert!(
+        state.is_complete(),
+        "an escaped quote inside a string must not end the string early"
+    );
+}
+
+#[test]
+fn scan_json_balance_is_a_no_op_once_complete() {
+    let mut state = JsonBalanceState::default();
+    scan_json_balance(&mut state, b"{}");
+    assert!(state.is_complete());
+    let depth_before = state.depth;
+
+    // Further bytes (even unbalanced ones) must not change the state once
+    // complete — this bounds total scan work to O(n) instead of rescanning.
+    scan_json_balance(&mut state, b"garbage{[}]");
+    assert_eq!(
+        state.depth, depth_before,
+        "scanning must be a no-op once the state is already complete"
+    );
+}
+
+#[test]
+fn scan_json_balance_persists_across_chunk_calls() {
+    let full = br#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+
+    let mut state = JsonBalanceState::default();
+    for byte in full {
+        scan_json_balance(&mut state, std::slice::from_ref(byte));
+    }
+
+    assert!(
+        state.is_complete(),
+        "state accumulated one byte at a time should match a single-shot scan"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -3112,6 +3235,7 @@ fn seed_response_capture(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
         .insert("a2a.response.cluster".to_owned(), "agent-a".to_owned());
 }
 
+#[expect(clippy::too_many_lines, reason = "repetitive per-key cleared assertions")]
 fn assert_capture_scratch_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
     assert!(
         !ctx.filter_metadata.contains_key("a2a.response.capture_enabled"),
@@ -3128,6 +3252,22 @@ fn assert_capture_scratch_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
     assert!(
         !ctx.filter_metadata.contains_key("a2a.response.cluster"),
         "cluster not cleared"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("a2a.response.json_depth"),
+        "json_depth not cleared"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("a2a.response.json_started"),
+        "json_started not cleared"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("a2a.response.json_in_string"),
+        "json_in_string not cleared"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("a2a.response.json_escaped"),
+        "json_escaped not cleared"
     );
 }
 
