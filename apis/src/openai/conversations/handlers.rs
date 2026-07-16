@@ -528,7 +528,7 @@ pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result
 
 /// Normalize easy SDK message inputs into conversation message response objects.
 fn normalize_message_item(map: &mut Map<String, Value>) -> Result<(), String> {
-    if map.get("type") != Some(&Value::String("message".to_owned())) {
+    if map.get("type").and_then(Value::as_str) != Some("message") {
         return Ok(());
     }
 
