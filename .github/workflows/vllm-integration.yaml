@@ -94,7 +94,8 @@ jobs:
             --served-model-name "$VLLM_MODEL" \
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1
+            --reasoning-parser deepseek_r1 \
+            --gpu-memory-utilization 0.7
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
