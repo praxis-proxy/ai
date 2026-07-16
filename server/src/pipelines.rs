@@ -97,6 +97,13 @@ fn validate_pipeline(
     skip: bool,
     allow_open_security: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "praxis-main")]
+    let errors = pipeline.ordering_errors(
+        entries,
+        allow_open_security,
+        &praxis_core::config::SkipPipelineChecks::default(),
+    );
+    #[cfg(not(feature = "praxis-main"))]
     let errors = pipeline.ordering_errors(entries, allow_open_security);
 
     if skip {
