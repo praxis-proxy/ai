@@ -5,6 +5,7 @@
 VERSION          ?= $(shell perl -ne 'print $$1 if /^version\s*=\s*"(.+)"/' Cargo.toml)
 IMAGE            ?= praxis-ai
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+OPENAI_CONFORMANCE_ARGS ?= --implementation-spec docs/conformance/openai-conversations-implementation-openapi.yaml
 V                ?=
 
 ifneq ($(V),)
@@ -13,6 +14,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-schema test-integration \
+	openai-conformance test-openai-conformance \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
@@ -73,6 +75,11 @@ test-schema:
 
 test-integration:
 	cargo test -p praxis-tests-integration $(_NOCAPTURE)
+
+openai-conformance:
+	cargo xtask openai-conformance $(OPENAI_CONFORMANCE_ARGS)
+
+test-openai-conformance: openai-conformance
 
 # -------------------------------------------------------------------
 # Quality
@@ -165,6 +172,7 @@ help:
 	@echo "  test-unit            unit tests (providers, filters, server)"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
+	@echo "  openai-conformance   compare Conversations coverage with OpenAI's OpenAPI spec"
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint                 clippy + rustfmt + separator width + filter docs check"

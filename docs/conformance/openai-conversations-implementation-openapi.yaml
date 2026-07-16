@@ -1,0 +1,254 @@
+openapi: 3.1.0
+info:
+  title: Praxis AI OpenAI Conversations implementation
+  version: 0.1.0
+paths:
+  /conversations:
+    post:
+      operationId: createConversation
+      tags:
+        - Conversations
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateConversationRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationResource"
+  /conversations/{conversation_id}:
+    get:
+      operationId: getConversation
+      tags:
+        - Conversations
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationResource"
+    post:
+      operationId: updateConversation
+      tags:
+        - Conversations
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateConversationRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationResource"
+    delete:
+      operationId: deleteConversation
+      tags:
+        - Conversations
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletedConversationResource"
+  /conversations/{conversation_id}/items:
+    post:
+      operationId: createConversationItems
+      tags:
+        - Conversations
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateConversationItemsRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationItemList"
+    get:
+      operationId: listConversationItems
+      tags:
+        - Conversations
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: order
+          schema:
+            type: string
+            enum:
+              - asc
+              - desc
+        - in: query
+          name: after
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationItemList"
+  /conversations/{conversation_id}/items/{item_id}:
+    get:
+      operationId: getConversationItem
+      tags:
+        - Conversations
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+        - $ref: "#/components/parameters/ItemId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationItem"
+    delete:
+      operationId: deleteConversationItem
+      tags:
+        - Conversations
+      parameters:
+        - $ref: "#/components/parameters/ConversationId"
+        - $ref: "#/components/parameters/ItemId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationResource"
+components:
+  parameters:
+    ConversationId:
+      in: path
+      name: conversation_id
+      required: true
+      schema:
+        type: string
+    ItemId:
+      in: path
+      name: item_id
+      required: true
+      schema:
+        type: string
+  schemas:
+    CreateConversationRequest:
+      type: object
+      properties:
+        metadata:
+          anyOf:
+            - type: object
+              additionalProperties: true
+            - type: "null"
+        items:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: true
+    UpdateConversationRequest:
+      type: object
+      properties:
+        metadata:
+          anyOf:
+            - type: object
+              additionalProperties: true
+            - type: "null"
+    CreateConversationItemsRequest:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: true
+    ConversationResource:
+      type: object
+      required:
+        - id
+        - object
+        - created_at
+        - metadata
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum:
+            - conversation
+        created_at:
+          type: integer
+          format: int64
+        metadata:
+          type: object
+          additionalProperties: true
+    DeletedConversationResource:
+      type: object
+      required:
+        - id
+        - object
+        - deleted
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum:
+            - conversation.deleted
+        deleted:
+          type: boolean
+    ConversationItemList:
+      type: object
+      required:
+        - object
+        - data
+        - has_more
+        - first_id
+        - last_id
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConversationItem"
+        has_more:
+          type: boolean
+        first_id:
+          type: string
+        last_id:
+          type: string
+    ConversationItem:
+      type: object
+      additionalProperties: true

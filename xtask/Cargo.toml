@@ -21,6 +21,7 @@ syn = { workspace = true }
 praxis-ai = { path = "../server", package = "praxis-ai-proxy" }
 praxis-core = { workspace = true }
 praxis-test-utils = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }

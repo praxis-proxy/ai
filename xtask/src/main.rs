@@ -21,6 +21,7 @@ mod lint_deps;
 mod lint_example_tests;
 mod lint_separators;
 mod make_replay_fixture;
+mod openai_conformance;
 mod port;
 mod sync_example_readme;
 
@@ -73,6 +74,9 @@ enum Command {
 
     /// Check that filter doc files are up to date.
     LintFilterDocs(filter_docs::LintArgs),
+
+    /// Compare Conversations coverage with OpenAI's `OpenAPI` spec.
+    OpenaiConformance(openai_conformance::Args),
 }
 
 // -----------------------------------------------------------------------------
@@ -92,6 +96,7 @@ fn main() {
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),
+        Command::OpenaiConformance(args) => openai_conformance::run(&args),
     }
 }
 
