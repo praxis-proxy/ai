@@ -23,7 +23,10 @@ use praxis_filter::{
 use tracing::{debug, trace, warn};
 
 use self::{accumulator::accumulate_event, config::StreamEventsConfig};
-use crate::openai::sse::{SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent};
+use crate::{
+    is_event_stream_content_type,
+    openai::sse::{SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
+};
 
 /// Completion state observed while parsing a Responses SSE stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,12 +309,6 @@ fn is_success_sse_response(ctx: &HttpFilterContext<'_>) -> bool {
         .is_some_and(is_event_stream_content_type)
 }
 
-/// Whether a `Content-Type` header value indicates `text/event-stream`.
-fn is_event_stream_content_type(ct: &str) -> bool {
-    ct.split(';')
-        .next()
-        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
-}
 
 #[cfg(test)]
 mod tests;
