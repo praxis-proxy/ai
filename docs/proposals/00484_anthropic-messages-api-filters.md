@@ -98,7 +98,18 @@ The scope covers five capabilities:
      - `type: "tool_result"` to separate `OpenAI`
        message with `role: "tool"` (images in tool
        results promoted to follow-up user messages
-       since `OpenAI` tool messages are text-only)
+       since `OpenAI` tool messages are text-only);
+       `is_error: true` is represented in the tool
+       message text because Chat Completions has no
+       equivalent tool-result error flag
+     - `type: "search_result"` to backend-visible
+       text context containing available quoted
+       metadata and nested text blocks
+     - `type: "document"` to backend-visible text
+       context when the document source contains text;
+       unresolved URL, file, and base64 sources are
+       represented as quoted stable source references
+       rather than silently disappearing
    - `max_tokens` to `max_tokens` (direct mapping)
    - `stop_sequences` to `stop`
    - `tool_choice`: `"any"` to `"required"`,
@@ -612,6 +623,15 @@ per-chunk SSE conversion.
     message with `role: "tool"`, `tool_call_id`,
     and string content. Images in tool results
     promoted to follow-up user messages.
+    `is_error: true` is marked in the tool message
+    content because Chat Completions has no equivalent
+    flag.
+  - `type: "search_result"` → text context with
+    quoted title/source metadata and nested text blocks
+    when present.
+  - `type: "document"` → text context for text/content
+    sources, or a quoted stable source reference for URL,
+    file, and base64 sources.
   - `type: "thinking"` → dropped (logged)
   - `type: "redacted_thinking"` → dropped (logged)
 - Map parameters:

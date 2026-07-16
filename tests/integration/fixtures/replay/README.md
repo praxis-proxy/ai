@@ -29,6 +29,9 @@ configuration.
 - `claude/messages-tool-cycle.json` replays a sanitized Claude Code client-tool
   cycle with preserved source records for the assistant `tool_use` and user
   `tool_result` records.
+- `claude/messages-tool-error.json` replays a sanitized Claude Code client-tool
+  error result and verifies the `is_error` flag remains visible in the request
+  and source records.
 - `claude/messages-thinking.json` replays a sanitized Claude Code NPV prompt
   with a real `thinking` source record, preserving it in `source_records` while
   replaying only the visible Anthropic response text.
