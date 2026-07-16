@@ -91,12 +91,7 @@ impl RehydrateFilter {
         Ok(Box::new(Self { limiter }))
     }
 
-    /// Parse body, resolve rehydration source (`previous_response_id` or
-    /// `conversation`), and populate [`ResponsesState`] with the full
-    /// conversation history.
-    ///
-    /// `previous_response_id` takes precedence when both fields are
-    /// present.
+    /// Resolve rehydration source and populate [`ResponsesState`].
     async fn rehydrate(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -113,7 +108,7 @@ impl RehydrateFilter {
         }
     }
 
-    /// Rehydrate from a stored response via `previous_response_id`.
+    /// Rehydrate from a stored response.
     async fn rehydrate_from_response(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -143,8 +138,7 @@ impl RehydrateFilter {
         Ok(FilterAction::Release)
     }
 
-    /// Rehydrate from a stored conversation when no `previous_response_id`
-    /// is present.
+    /// Rehydrate from a stored conversation.
     async fn rehydrate_from_conversation(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -262,19 +256,25 @@ fn is_responses_cancel_path(path: &str) -> bool {
 // HistoryLimiter
 // -----------------------------------------------------------------------------
 
-/// Enforces byte-size and item-count caps on stored conversation history.
-///
-/// Constructed once from filter config and passed into the stored-message
-/// extraction functions so limits are checked *before* cloning.
+/// Byte-size and item-count caps on stored conversation history.
 struct HistoryLimiter {
-    /// Maximum serialized byte size of stored conversation history.
+    /// Maximum serialized byte size.
     pub(super) max_bytes: usize,
-    /// Optional cap on the number of stored history items.
+    /// Optional item-count cap.
     pub(super) max_items: Option<usize>,
 }
 
+impl Default for HistoryLimiter {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_max_history_bytes(),
+            max_items: None,
+        }
+    }
+}
+
 impl HistoryLimiter {
-    /// Reject when `items` exceeds the configured byte-size or item-count cap.
+    /// Reject when `items` exceeds configured caps.
     fn check(&self, items: &[Value], streaming: bool) -> Result<(), FilterAction> {
         if let Some(max) = self.max_items {
             let count = items.len();
@@ -311,9 +311,7 @@ impl HistoryLimiter {
 // Stored message extraction
 // -----------------------------------------------------------------------------
 
-/// Extract stored messages from a response record, checking limits
-/// before cloning. Falls back to reconstruction from public fields
-/// for records created before hidden messages were persisted.
+/// Stored messages from a response record, checking limits before cloning.
 fn stored_messages_for_response(
     record: &ResponseRecord,
     limiter: &HistoryLimiter,
@@ -326,8 +324,7 @@ fn stored_messages_for_response(
     reconstruct_messages_from_public_response(record, limiter, streaming)
 }
 
-/// Extract stored messages from a conversation record, checking
-/// limits before cloning.
+/// Stored messages from a conversation record, checking limits before cloning.
 fn stored_messages_for_conversation(
     record: &ConversationRecord,
     limiter: &HistoryLimiter,
@@ -411,8 +408,7 @@ async fn fetch_conversation(
     })
 }
 
-/// Build [`ResponsesState`] from already-resolved stored messages and
-/// prepend conversation history before current input.
+/// Assemble [`ResponsesState`] from resolved stored messages.
 fn build_state(
     parsed_body: Value,
     stored: Vec<Value>,
