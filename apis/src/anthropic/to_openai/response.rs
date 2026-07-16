@@ -158,10 +158,16 @@ fn map_finish_reason(obj: &Map<String, Value>) -> (String, String) {
 // -----------------------------------------------------------------------------
 
 /// Build Anthropic usage object from Chat Completions usage.
+///
+/// Anthropic's `input_tokens` excludes cached tokens (they are reported
+/// separately via `cache_read_input_tokens`), whereas OpenAI's
+/// `prompt_tokens` includes them. The cached count must be subtracted
+/// here so downstream Anthropic-format consumers that sum
+/// `input_tokens + cache_read_input_tokens` don't double-count.
 fn build_usage(obj: &Map<String, Value>) -> Value {
     let usage = obj.get("usage");
 
-    let input_tokens = usage
+    let prompt_tokens = usage
         .and_then(|u| u.get("prompt_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -175,6 +181,11 @@ fn build_usage(obj: &Map<String, Value>) -> Value {
         .and_then(|u| u.get("prompt_tokens_details"))
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64);
+
+    let input_tokens = match cache_read {
+        Some(cached) => prompt_tokens.saturating_sub(cached),
+        None => prompt_tokens,
+    };
 
     let mut usage_obj = json!({
         "input_tokens": input_tokens,
@@ -262,6 +273,45 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["usage"]["cache_read_input_tokens"], 80, "cached tokens mapped");
+        assert_eq!(
+            parsed["usage"]["input_tokens"], 20,
+            "input_tokens should exclude cached tokens (100 prompt - 80 cached)"
+        );
+    }
+
+    #[test]
+    fn cached_tokens_not_double_counted_when_summed() {
+        // OpenAI's prompt_tokens (100) includes the 80 cached tokens. Anthropic's
+        // contract has input_tokens exclude cache, so a downstream consumer that
+        // sums input_tokens + cache_read_input_tokens must recover the original
+        // prompt_tokens total, not double-count the cached portion.
+        let body = br#"{"id":"chatcmpl-5","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+        let tr = transform_response(body, "gpt-4").unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        let input_tokens = parsed["usage"]["input_tokens"].as_u64().unwrap();
+        let cache_read = parsed["usage"]["cache_read_input_tokens"].as_u64().unwrap();
+        assert_eq!(
+            input_tokens + cache_read,
+            100,
+            "input_tokens + cache_read_input_tokens should equal original prompt_tokens"
+        );
+    }
+
+    #[test]
+    fn no_cached_tokens_leaves_input_tokens_unchanged() {
+        let body = br#"{"id":"chatcmpl-6","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
+        let tr = transform_response(body, "gpt-4").unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        assert_eq!(
+            parsed["usage"]["input_tokens"], 42,
+            "input_tokens should be unchanged when no cache info is present"
+        );
+        assert!(
+            parsed["usage"].get("cache_read_input_tokens").is_none(),
+            "cache_read_input_tokens should be absent when no cache info is present"
+        );
     }
 
     #[test]
