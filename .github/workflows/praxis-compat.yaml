@@ -73,7 +73,7 @@ jobs:
           cargo test -p praxis-ai-proxy --features praxis-main
 
       - name: Schema tests
-        run: make test-schema
+        run: cargo test -p praxis-tests-schema --features praxis-main
 
       - name: Integration tests
-        run: make test-integration
+        run: cargo test -p praxis-tests-integration --features praxis-main

@@ -7,6 +7,9 @@ license.workspace = true
 readme = "../../README.md"
 publish = false
 
+[features]
+praxis-main = ["praxis-test-utils/praxis-main"]
+
 [lints]
 workspace = true
 
