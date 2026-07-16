@@ -59,8 +59,10 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// filter: openai_responses_rehydrate
 /// ```
 pub struct RehydrateFilter {
-    /// Enforces byte-size and item-count caps on stored conversation history.
-    limiter: HistoryLimiter,
+    /// Maximum serialized byte size of stored conversation history.
+    max_history_bytes: usize,
+    /// Optional cap on the number of stored history items.
+    max_history_items: Option<usize>,
 }
 
 impl RehydrateFilter {
@@ -84,14 +86,18 @@ impl RehydrateFilter {
                 "openai_responses_rehydrate: max_history_items must be greater than 0",
             ));
         }
-        let limiter = HistoryLimiter {
-            max_bytes: validated.max_history_bytes,
-            max_items: validated.max_history_items,
-        };
-        Ok(Box::new(Self { limiter }))
+        Ok(Box::new(Self {
+            max_history_bytes: validated.max_history_bytes,
+            max_history_items: validated.max_history_items,
+        }))
     }
 
-    /// Resolve rehydration source and populate [`ResponsesState`].
+    /// Parse body, resolve rehydration source (`previous_response_id` or
+    /// `conversation`), and populate [`ResponsesState`] with the full
+    /// conversation history.
+    ///
+    /// `previous_response_id` takes precedence when both fields are
+    /// present.
     async fn rehydrate(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -124,10 +130,11 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        let stored = match stored_messages_for_response(&record, &self.limiter, streaming) {
-            Ok(s) => s,
-            Err(action) => return Ok(action),
-        };
+        let stored =
+            match stored_messages_for_response(&record, self.max_history_bytes, self.max_history_items, streaming) {
+                Ok(s) => s,
+                Err(action) => return Ok(action),
+            };
         let previous_tools = collect_mcp_tool_listings(&record);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let state = build_state(parsed_body, stored, previous_tools, previous_usage);
@@ -138,7 +145,8 @@ impl RehydrateFilter {
         Ok(FilterAction::Release)
     }
 
-    /// Rehydrate from a stored conversation.
+    /// Rehydrate from a stored conversation when no `previous_response_id`
+    /// is present.
     async fn rehydrate_from_conversation(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -157,7 +165,12 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        let stored = match stored_messages_for_conversation(&record, &self.limiter, streaming) {
+        let stored = match stored_messages_for_conversation(
+            &record,
+            self.max_history_bytes,
+            self.max_history_items,
+            streaming,
+        ) {
             Ok(s) => s,
             Err(action) => return Ok(action),
         };
@@ -252,59 +265,40 @@ fn is_responses_cancel_path(path: &str) -> bool {
     !response_id.is_empty() && !response_id.contains('/')
 }
 
-// -----------------------------------------------------------------------------
-// HistoryLimiter
-// -----------------------------------------------------------------------------
-
-/// Byte-size and item-count caps on stored conversation history.
-struct HistoryLimiter {
-    /// Maximum serialized byte size.
-    pub(super) max_bytes: usize,
-    /// Optional item-count cap.
-    pub(super) max_items: Option<usize>,
-}
-
-impl Default for HistoryLimiter {
-    fn default() -> Self {
-        Self {
-            max_bytes: default_max_history_bytes(),
-            max_items: None,
-        }
-    }
-}
-
-impl HistoryLimiter {
-    /// Reject when `items` exceeds configured caps.
-    fn check(&self, items: &[Value], streaming: bool) -> Result<(), FilterAction> {
-        if let Some(max) = self.max_items {
-            let count = items.len();
-            if count > max {
-                return Err(reject_too_large(
-                    &format!(
-                        "stored conversation history contains {count} items, \
-                       exceeding the {max} item limit; \
-                       compact or shorten the conversation before continuing"
-                    ),
-                    streaming,
-                ));
-            }
-        }
-
-        let byte_size = serde_json::to_string(items).map_or(usize::MAX, |s| s.len());
-        if byte_size > self.max_bytes {
+/// Reject when `items` exceeds the configured byte-size or item-count cap.
+fn check_history_limits(
+    items: &[Value],
+    max_bytes: usize,
+    max_items: Option<usize>,
+    streaming: bool,
+) -> Result<(), FilterAction> {
+    if let Some(max) = max_items {
+        let count = items.len();
+        if count > max {
             return Err(reject_too_large(
                 &format!(
-                    "stored conversation history is {byte_size} bytes, \
-                   exceeding the {} byte limit; \
-                   compact or shorten the conversation before continuing",
-                    self.max_bytes
+                    "stored conversation history contains {count} items, \
+                   exceeding the {max} item limit; \
+                   compact or shorten the conversation before continuing"
                 ),
                 streaming,
             ));
         }
-
-        Ok(())
     }
+
+    let byte_size = serde_json::to_string(items).map_or(usize::MAX, |s| s.len());
+    if byte_size > max_bytes {
+        return Err(reject_too_large(
+            &format!(
+                "stored conversation history is {byte_size} bytes, \
+               exceeding the {max_bytes} byte limit; \
+               compact or shorten the conversation before continuing"
+            ),
+            streaming,
+        ));
+    }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -314,25 +308,27 @@ impl HistoryLimiter {
 /// Stored messages from a response record, checking limits before cloning.
 fn stored_messages_for_response(
     record: &ResponseRecord,
-    limiter: &HistoryLimiter,
+    max_bytes: usize,
+    max_items: Option<usize>,
     streaming: bool,
 ) -> Result<Vec<Value>, FilterAction> {
     if let Some(messages) = record.messages.as_array().filter(|a| !a.is_empty()) {
-        limiter.check(messages, streaming)?;
+        check_history_limits(messages, max_bytes, max_items, streaming)?;
         return Ok(messages.clone());
     }
-    reconstruct_messages_from_public_response(record, limiter, streaming)
+    reconstruct_messages_from_public_response(record, max_bytes, max_items, streaming)
 }
 
 /// Stored messages from a conversation record, checking limits before cloning.
 fn stored_messages_for_conversation(
     record: &ConversationRecord,
-    limiter: &HistoryLimiter,
+    max_bytes: usize,
+    max_items: Option<usize>,
     streaming: bool,
 ) -> Result<Vec<Value>, FilterAction> {
     let empty: &[Value] = &[];
     let messages = record.messages.as_array().map_or(empty, Vec::as_slice);
-    limiter.check(messages, streaming)?;
+    check_history_limits(messages, max_bytes, max_items, streaming)?;
     Ok(messages.to_vec())
 }
 
@@ -408,7 +404,7 @@ async fn fetch_conversation(
     })
 }
 
-/// Assemble [`ResponsesState`] from resolved stored messages.
+/// Build [`ResponsesState`] by prepending stored messages before the current input.
 fn build_state(
     parsed_body: Value,
     stored: Vec<Value>,
@@ -428,7 +424,8 @@ fn build_state(
 /// records created before hidden messages were persisted.
 fn reconstruct_messages_from_public_response(
     record: &ResponseRecord,
-    limiter: &HistoryLimiter,
+    max_bytes: usize,
+    max_items: Option<usize>,
     streaming: bool,
 ) -> Result<Vec<Value>, FilterAction> {
     let mut messages = Vec::new();
@@ -439,7 +436,7 @@ fn reconstruct_messages_from_public_response(
         append_stored_output_items(&mut messages, output);
     }
 
-    limiter.check(&messages, streaming)?;
+    check_history_limits(&messages, max_bytes, max_items, streaming)?;
     Ok(messages)
 }
 
