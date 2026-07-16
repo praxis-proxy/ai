@@ -122,9 +122,10 @@ pub trait ConversationItemStore: Send + Sync {
     /// Delete a conversation by ID, scoped to a tenant.
     ///
     /// Returns `true` if a record was deleted, `false` if no
-    /// matching record existed for this tenant. This does not delete
-    /// conversation item rows; items are deleted only through
-    /// [`delete_conversation_item`].
+    /// matching record existed for this tenant. To match the OpenAI
+    /// Conversations API, this does not delete conversation item rows; items
+    /// are deleted only through [`delete_conversation_item`] or an explicit
+    /// retention cleanup path.
     ///
     /// # Errors
     ///
