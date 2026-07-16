@@ -1,0 +1,1495 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Praxis Contributors
+
+//! Resolution logic for `file_id` references in Responses API input.
+//!
+//! Walks the parsed JSON body, finds `file_id` references in
+//! `message` content arrays and `function_call_output` output
+//! arrays, fetches file metadata and content from the Files API
+//! via [`CalloutClient`], and replaces the reference with inline
+//! content: raw base64 in `file_data` for `input_file`, or a
+//! `data:` URL in `image_url` for `input_image`.
+//!
+//! `file_id` is an `OpenAI` schema extension that is not part of
+//! baseline `OpenResponses`. This adapter deliberately accepts that
+//! extension and emits the baseline inline `file_data` / `image_url`
+//! fields before proxying the request.
+//!
+//! [`CalloutClient`]: praxis_core::callout::CalloutClient
+
+use std::collections::HashMap;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use praxis_core::callout::{CalloutClient, CalloutRequest, CalloutResult};
+use tracing::{debug, warn};
+
+use super::config::OnMissing;
+
+/// Characters that could let a client-supplied file ID escape its
+/// single URL path segment.
+///
+/// Encoding path separators, query/fragment delimiters, `%`, and URL
+/// parser special characters keeps the ID opaque when it is appended to
+/// `/v1/files/`. Dots are encoded as an additional defense against path
+/// normalization; exact `.` and `..` IDs are rejected by [`file_url`].
+const FILE_ID_PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'.')
+    .add(b'/')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
+
+/// Errors that can occur during file resolution.
+#[derive(Debug, Clone)]
+pub(crate) enum ResolveError {
+    /// The Files API callout failed (non-2xx, timeout, or circuit open).
+    CalloutFailed {
+        /// The file ID that was requested.
+        file_id: String,
+        /// Human-readable error description.
+        detail: String,
+    },
+
+    /// The file ID cannot be represented safely in a Files API path.
+    InvalidFileId {
+        /// The file ID that was requested.
+        file_id: String,
+        /// Human-readable error description.
+        detail: String,
+    },
+
+    /// The request contains more file references than configured.
+    TooManyReferences {
+        /// Maximum references allowed for one request.
+        limit: usize,
+    },
+
+    /// Resolved content would exceed the configured body limit.
+    TooLarge {
+        /// The file ID that was requested.
+        file_id: String,
+        /// Maximum allowed resolved size in bytes.
+        limit: usize,
+    },
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CalloutFailed { file_id, detail } => {
+                write!(f, "callout failed for file '{file_id}': {detail}")
+            },
+            Self::InvalidFileId { file_id, detail } => {
+                write!(f, "invalid file id '{file_id}': {detail}")
+            },
+            Self::TooManyReferences { limit } => {
+                write!(f, "request exceeds configured file reference limit ({limit})")
+            },
+            Self::TooLarge { file_id, limit } => {
+                write!(f, "resolved file '{file_id}' exceeds configured limit ({limit} bytes)")
+            },
+        }
+    }
+}
+
+/// HTTP client wrapper for fetching files from an OpenAI-compatible
+/// Files API, backed by [`CalloutClient`] for metadata and
+/// bounded `reqwest` reads for content.
+pub(crate) struct FilesApiClient {
+    /// Base URL of the Files API.
+    api_base_url: String,
+
+    /// The underlying callout client for metadata requests
+    /// (small responses; provides circuit breaking).
+    client: CalloutClient,
+
+    /// Direct HTTP client for content downloads with bounded
+    /// reads (prevents unbounded memory allocation).
+    content_client: reqwest::Client,
+
+    /// Header names to forward from the original request.
+    forward_header_names: Vec<http::HeaderName>,
+
+    /// Maximum number of file references processed per request.
+    max_file_references: usize,
+
+    /// Maximum allowed size of one resolved inline data URL.
+    max_resolved_bytes: usize,
+
+    /// Overall deadline applied to all resolution callouts for one request.
+    resolution_timeout: std::time::Duration,
+}
+
+/// Request-scoped limits and cached resolution outcomes.
+pub(crate) struct ResolutionBudget {
+    /// Resolutions cached by content part type and file ID.
+    cache: HashMap<(String, String), Result<ResolvedFile, ResolveError>>,
+    /// Deadline shared by every Files API callout in the request.
+    deadline: tokio::time::Instant,
+    /// Maximum file references allowed for this request.
+    max_file_references: usize,
+    /// Maximum inline bytes available to each state representation.
+    max_resolved_bytes: usize,
+    /// File references encountered so far.
+    references_seen: usize,
+    /// Inline bytes still available across current input and state history.
+    remaining_resolved_bytes: usize,
+}
+
+/// Count and byte accounting saved while a mirrored state
+/// representation is resolved with an independent budget.
+#[derive(Clone, Copy)]
+pub(crate) struct ResolutionAccounting {
+    /// File references charged to the previous representation.
+    references_seen: usize,
+    /// Inline bytes remaining for the previous representation.
+    remaining_resolved_bytes: usize,
+}
+
+/// Runtime limits for a Files API client.
+#[derive(Clone, Copy)]
+pub(crate) struct FilesApiClientOptions {
+    /// Maximum distinct file references per request.
+    pub max_file_references: usize,
+    /// Maximum bytes added by resolved inline content.
+    pub max_resolved_bytes: usize,
+    /// Per-call and overall resolution timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+/// Inputs needed to resolve and cache one file reference.
+struct ResolutionRequest<'a> {
+    /// Files API client.
+    client: &'a FilesApiClient,
+    /// Referenced file ID.
+    file_id: &'a str,
+    /// Maximum resolved bytes remaining for this item collection.
+    max_resolved_bytes: usize,
+    /// Responses content part type.
+    part_type: &'a str,
+    /// Original request headers available for forwarding.
+    request_headers: &'a http::HeaderMap,
+}
+
+/// Shared dependencies for walking content parts in one item collection.
+struct ContentResolver<'a> {
+    /// Request-scoped count, deadline, and resolution cache.
+    budget: &'a mut ResolutionBudget,
+    /// Files API client.
+    client: &'a FilesApiClient,
+    /// Configured behavior when a file cannot be resolved.
+    on_missing: OnMissing,
+    /// Original request headers available for forwarding.
+    request_headers: &'a http::HeaderMap,
+}
+
+impl ResolutionBudget {
+    /// Start fresh count and byte accounting for a mirrored state
+    /// representation while retaining the shared cache and deadline.
+    pub(crate) fn begin_independent_accounting(&mut self) -> ResolutionAccounting {
+        let saved = ResolutionAccounting {
+            references_seen: self.references_seen,
+            remaining_resolved_bytes: self.remaining_resolved_bytes,
+        };
+        self.references_seen = 0;
+        self.remaining_resolved_bytes = self.max_resolved_bytes;
+        saved
+    }
+
+    /// Restore accounting for the authoritative outbound representation.
+    pub(crate) fn restore_accounting(&mut self, saved: ResolutionAccounting) {
+        self.references_seen = saved.references_seen;
+        self.remaining_resolved_bytes = saved.remaining_resolved_bytes;
+    }
+
+    /// Resolve one reference within request-wide count and time limits.
+    async fn resolve(&mut self, request: ResolutionRequest<'_>) -> Result<ResolvedFile, ResolveError> {
+        let ResolutionRequest {
+            client,
+            file_id,
+            max_resolved_bytes,
+            part_type,
+            request_headers,
+        } = request;
+        let key = (part_type.to_owned(), file_id.to_owned());
+        if let Some(cached) = self.cache.get(&key) {
+            // Each rewritten JSON part needs its own owned strings;
+            // the cache retains one copy to avoid repeated callouts.
+            return cached.clone();
+        }
+
+        self.register_reference()?;
+
+        let resolution = tokio::time::timeout_at(
+            self.deadline,
+            client.resolve_file(file_id, request_headers, max_resolved_bytes, part_type),
+        )
+        .await
+        .unwrap_or_else(|_elapsed| overall_timeout_error(file_id));
+        // Retain one owned outcome for repeated references while
+        // returning an independently owned value to the JSON part.
+        self.cache.insert(key, resolution.clone());
+        resolution
+    }
+
+    /// Count one previously unseen reference against the request cap.
+    fn register_reference(&mut self) -> Result<(), ResolveError> {
+        self.references_seen += 1;
+        if self.references_seen > self.max_file_references {
+            return Err(ResolveError::TooManyReferences {
+                limit: self.max_file_references,
+            });
+        }
+        Ok(())
+    }
+
+    /// Consume inline bytes from the request-wide aggregate budget.
+    fn consume_resolved_bytes(&mut self, bytes: usize, limit: usize) -> Result<(), ResolveError> {
+        self.remaining_resolved_bytes =
+            self.remaining_resolved_bytes
+                .checked_sub(bytes)
+                .ok_or_else(|| ResolveError::TooLarge {
+                    file_id: "<aggregate>".to_owned(),
+                    limit,
+                })?;
+        Ok(())
+    }
+}
+
+/// Build the stable error returned when the request-wide deadline expires.
+fn overall_timeout_error(file_id: &str) -> Result<ResolvedFile, ResolveError> {
+    Err(ResolveError::CalloutFailed {
+        file_id: file_id.to_owned(),
+        detail: "overall file resolution deadline exceeded".to_owned(),
+    })
+}
+
+impl FilesApiClient {
+    /// Build a new client from base URL, forward headers, and a
+    /// pre-built [`CalloutClient`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bounded content client cannot be built.
+    pub(crate) fn new(
+        api_base_url: &str,
+        forward_header_names: Vec<http::HeaderName>,
+        client: CalloutClient,
+        options: FilesApiClientOptions,
+    ) -> Result<Self, reqwest::Error> {
+        let FilesApiClientOptions {
+            max_file_references,
+            max_resolved_bytes,
+            timeout_ms,
+        } = options;
+        let content_client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .build()?;
+        Ok(Self {
+            api_base_url: api_base_url.trim_end_matches('/').to_owned(),
+            client,
+            content_client,
+            forward_header_names,
+            max_file_references,
+            max_resolved_bytes,
+            resolution_timeout: std::time::Duration::from_millis(timeout_ms),
+        })
+    }
+
+    /// Create request-scoped resolution limits and cache state.
+    pub(crate) fn resolution_budget(&self) -> ResolutionBudget {
+        ResolutionBudget {
+            cache: HashMap::new(),
+            deadline: tokio::time::Instant::now() + self.resolution_timeout,
+            max_file_references: self.max_file_references,
+            max_resolved_bytes: self.max_resolved_bytes,
+            references_seen: 0,
+            remaining_resolved_bytes: self.max_resolved_bytes,
+        }
+    }
+
+    /// Fetch file metadata from `GET /v1/files/{file_id}`.
+    async fn fetch_metadata(
+        &self,
+        file_id: &str,
+        request_headers: &http::HeaderMap,
+    ) -> Result<FileMetadata, ResolveError> {
+        let url = file_url(&self.api_base_url, file_id, false)?;
+        let headers = forward_headers(request_headers, &self.forward_header_names);
+        let request = build_get_request(url, headers);
+
+        let response = execute_callout(&self.client, request, file_id).await?;
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(|e| ResolveError::CalloutFailed {
+                file_id: file_id.to_owned(),
+                detail: format!("metadata response invalid: {e}"),
+            })?;
+
+        Ok(parse_file_metadata(&body))
+    }
+
+    /// Fetch file content from `GET /v1/files/{file_id}/content`
+    /// using bounded reads.
+    ///
+    /// Uses `reqwest` directly (bypassing [`CalloutClient`]) to
+    /// enforce `max_content_bytes` during download: the
+    /// `Content-Length` header is checked before reading, and the
+    /// body is consumed in chunks that are rejected as soon as
+    /// the accumulated size exceeds the limit.
+    ///
+    /// [`CalloutClient`]: praxis_core::callout::CalloutClient
+    async fn fetch_content(
+        &self,
+        file_id: &str,
+        request_headers: &http::HeaderMap,
+        max_content_bytes: usize,
+        max_resolved_bytes: usize,
+    ) -> Result<Vec<u8>, ResolveError> {
+        let url = file_url(&self.api_base_url, file_id, true)?;
+        let response = self.send_content_request(&url, request_headers, file_id).await?;
+
+        if !response.status().is_success() {
+            return Err(ResolveError::CalloutFailed {
+                file_id: file_id.to_owned(),
+                detail: format!("content download returned {}", response.status()),
+            });
+        }
+
+        if response
+            .content_length()
+            .is_some_and(|cl| usize::try_from(cl).unwrap_or(usize::MAX) > max_content_bytes)
+        {
+            return Err(ResolveError::TooLarge {
+                file_id: file_id.to_owned(),
+                limit: max_resolved_bytes,
+            });
+        }
+
+        read_bounded_body(response, file_id, max_content_bytes, max_resolved_bytes).await
+    }
+
+    /// Send a GET request for file content with forwarded headers
+    /// and timeout.
+    async fn send_content_request(
+        &self,
+        url: &str,
+        request_headers: &http::HeaderMap,
+        file_id: &str,
+    ) -> Result<reqwest::Response, ResolveError> {
+        let headers = forward_headers(request_headers, &self.forward_header_names);
+        let mut req = self.content_client.get(url);
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        req.send().await.map_err(|e| {
+            warn!(file_id, error = %e, "content download request failed");
+            ResolveError::CalloutFailed {
+                file_id: file_id.to_owned(),
+                detail: if e.is_timeout() {
+                    "content download timed out".to_owned()
+                } else {
+                    "content download failed".to_owned()
+                },
+            }
+        })
+    }
+
+    /// Fetch metadata and content, returning the base64 content
+    /// and MIME type for the caller to format per the schema.
+    async fn resolve_file(
+        &self,
+        file_id: &str,
+        request_headers: &http::HeaderMap,
+        max_resolved_bytes: usize,
+        part_type: &str,
+    ) -> Result<ResolvedFile, ResolveError> {
+        let metadata = self.fetch_metadata(file_id, request_headers).await?;
+        let max_content_bytes = match part_type {
+            "input_image" => max_content_bytes_for_data_url(max_resolved_bytes, &metadata.content_type),
+            _ => Some(max_content_bytes_for_base64(max_resolved_bytes)),
+        }
+        .ok_or_else(|| ResolveError::TooLarge {
+            file_id: file_id.to_owned(),
+            limit: max_resolved_bytes,
+        })?;
+        if metadata
+            .bytes
+            .is_some_and(|b| usize::try_from(b).unwrap_or(usize::MAX) > max_content_bytes)
+        {
+            return Err(ResolveError::TooLarge {
+                file_id: file_id.to_owned(),
+                limit: max_resolved_bytes,
+            });
+        }
+        let content = self
+            .fetch_content(file_id, request_headers, max_content_bytes, max_resolved_bytes)
+            .await?;
+        let base64 = BASE64.encode(&content);
+
+        debug!(file_id, content_type = %metadata.content_type, bytes = content.len(), "resolved file");
+        Ok(ResolvedFile {
+            base64,
+            content_type: metadata.content_type,
+            filename: metadata.filename,
+        })
+    }
+}
+
+/// Read a response body in chunks, enforcing a size limit.
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    file_id: &str,
+    max_content_bytes: usize,
+    limit: usize,
+) -> Result<Vec<u8>, ResolveError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| ResolveError::CalloutFailed {
+        file_id: file_id.to_owned(),
+        detail: if e.is_timeout() {
+            "content download timed out".to_owned()
+        } else {
+            format!("content download read error: {e}")
+        },
+    })? {
+        if body.len() + chunk.len() > max_content_bytes {
+            return Err(ResolveError::TooLarge {
+                file_id: file_id.to_owned(),
+                limit,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Build a GET [`CalloutRequest`] with the given URL and headers.
+fn build_get_request(url: String, headers: Vec<(http::HeaderName, http::HeaderValue)>) -> CalloutRequest {
+    CalloutRequest {
+        body: None,
+        depth: 0,
+        headers,
+        method: http::Method::GET,
+        url,
+    }
+}
+
+/// Execute a callout and map non-success outcomes to
+/// [`ResolveError`].
+async fn execute_callout(
+    client: &CalloutClient,
+    request: CalloutRequest,
+    file_id: &str,
+) -> Result<praxis_core::callout::CalloutResponse, ResolveError> {
+    match client.execute(request).await {
+        CalloutResult::Success(r) => Ok(r),
+        CalloutResult::Failed => Err(ResolveError::CalloutFailed {
+            file_id: file_id.to_owned(),
+            detail: "Files API callout failed (fail-open)".to_owned(),
+        }),
+        CalloutResult::Rejected(rejection) => Err(ResolveError::CalloutFailed {
+            file_id: file_id.to_owned(),
+            detail: format!("Files API callout rejected with status {}", rejection.status),
+        }),
+    }
+}
+
+/// Extract content type and reported size from a Files API
+/// metadata response.
+fn parse_file_metadata(body: &serde_json::Value) -> FileMetadata {
+    let content_type = body
+        .get("content_type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| infer_mime_from_filename(body.get("filename").and_then(serde_json::Value::as_str)))
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let bytes = body.get("bytes").and_then(serde_json::Value::as_u64);
+    let filename = body
+        .get("filename")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    FileMetadata {
+        bytes,
+        content_type,
+        filename,
+    }
+}
+
+/// File metadata from the Files API.
+struct FileMetadata {
+    /// Reported file size in bytes (`None` if absent from the
+    /// metadata response).
+    bytes: Option<u64>,
+    /// MIME content type (e.g. `application/pdf`).
+    content_type: String,
+    /// Original filename (e.g. `report.pdf`).
+    filename: Option<String>,
+}
+
+/// Resolved file content ready for inlining.
+#[derive(Clone)]
+pub(crate) struct ResolvedFile {
+    /// Base64-encoded file content (no `data:` prefix).
+    base64: String,
+    /// MIME content type (e.g. `text/plain`).
+    content_type: String,
+    /// Original filename from the Files API metadata.
+    filename: Option<String>,
+}
+
+/// Build a Files API URL with `file_id` encoded as one path segment.
+fn file_url(api_base_url: &str, file_id: &str, content: bool) -> Result<String, ResolveError> {
+    if matches!(file_id, "." | "..") {
+        return Err(ResolveError::InvalidFileId {
+            file_id: file_id.to_owned(),
+            detail: "dot path segments are not valid file IDs".to_owned(),
+        });
+    }
+
+    let encoded_file_id = utf8_percent_encode(file_id, FILE_ID_PATH_SEGMENT_ENCODE_SET);
+    let content_suffix = if content { "/content" } else { "" };
+    Ok(format!("{api_base_url}/v1/files/{encoded_file_id}{content_suffix}"))
+}
+
+/// Walk the Responses API `input` array and resolve all `file_id`
+/// references in place.
+///
+/// Returns the number of references resolved.
+#[cfg(test)]
+pub(crate) async fn resolve_input(
+    body: &mut serde_json::Value,
+    client: &FilesApiClient,
+    on_missing: OnMissing,
+    request_headers: &http::HeaderMap,
+) -> Result<usize, ResolveError> {
+    let mut budget = client.resolution_budget();
+    resolve_input_with_budget(body, client, on_missing, request_headers, &mut budget).await
+}
+
+/// Resolve request input using limits shared with other request state.
+pub(crate) async fn resolve_input_with_budget(
+    body: &mut serde_json::Value,
+    client: &FilesApiClient,
+    on_missing: OnMissing,
+    request_headers: &http::HeaderMap,
+    budget: &mut ResolutionBudget,
+) -> Result<usize, ResolveError> {
+    let Some(serde_json::Value::Array(input)) = body.get_mut("input") else {
+        return Ok(0);
+    };
+
+    resolve_items(input, client, on_missing, request_headers, budget).await
+}
+
+/// Walk a slice of input/message items and resolve all `file_id`
+/// references in their content arrays.
+///
+/// Handles `message` items (with `content`), `function_call_output`
+/// items (with `output`), and the shorthand message form.
+pub(crate) async fn resolve_items(
+    items: &mut [serde_json::Value],
+    client: &FilesApiClient,
+    on_missing: OnMissing,
+    request_headers: &http::HeaderMap,
+    budget: &mut ResolutionBudget,
+) -> Result<usize, ResolveError> {
+    let mut resolved_count = 0_usize;
+    let mut resolver = ContentResolver {
+        budget,
+        client,
+        on_missing,
+        request_headers,
+    };
+
+    for item in items.iter_mut() {
+        resolved_count += resolve_item(item, &mut resolver).await?;
+    }
+
+    Ok(resolved_count)
+}
+
+/// Resolve every supported content part in one input item.
+async fn resolve_item(item: &mut serde_json::Value, resolver: &mut ContentResolver<'_>) -> Result<usize, ResolveError> {
+    let Some(parts) = content_parts_mut(item) else {
+        return Ok(0);
+    };
+    let mut resolved_count = 0_usize;
+    for part in parts {
+        if let Some(resolved_len) = resolve_content_part(part, resolver).await? {
+            resolver
+                .budget
+                .consume_resolved_bytes(resolved_len, resolver.client.max_resolved_bytes)?;
+            resolved_count += 1;
+        }
+    }
+    Ok(resolved_count)
+}
+
+/// Return the mutable content parts array for a given input item,
+/// if applicable.
+fn content_parts_mut(item: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("message") => item.get_mut("content").and_then(serde_json::Value::as_array_mut),
+        Some("function_call_output") => item.get_mut("output").and_then(serde_json::Value::as_array_mut),
+        Some(_) => None,
+        None => {
+            if item.get("role").and_then(serde_json::Value::as_str).is_some() && item.get("content").is_some() {
+                item.get_mut("content").and_then(serde_json::Value::as_array_mut)
+            } else {
+                None
+            }
+        },
+    }
+}
+
+/// Resolve a single content part if it contains a `file_id`.
+async fn resolve_content_part(
+    part: &mut serde_json::Value,
+    resolver: &mut ContentResolver<'_>,
+) -> Result<Option<usize>, ResolveError> {
+    let Some((part_type, file_id)) = resolvable_reference(part) else {
+        return Ok(None);
+    };
+    let (file_id, part_type) = (file_id.to_owned(), part_type.to_owned());
+    debug!(file_id = %file_id, part_type = %part_type, "resolving file reference");
+
+    // Bound proxy resource use with the configured request budget, but leave
+    // provider-specific field-size validation to the upstream (for example,
+    // vLLM). This filter validates only fields needed for safe proxying.
+    let max_resolved_bytes = resolver.budget.remaining_resolved_bytes;
+    let Some(resolved) = resolve_reference(&file_id, &part_type, max_resolved_bytes, resolver).await? else {
+        return Ok(None);
+    };
+    let len = output_len_for_part(&part_type, &resolved);
+    if len > max_resolved_bytes {
+        return Err(ResolveError::TooLarge {
+            file_id,
+            limit: resolver.client.max_resolved_bytes,
+        });
+    }
+    rewrite_part(part, &part_type, resolved);
+    Ok(Some(len))
+}
+
+/// Resolve one reference and apply the configured missing-file policy.
+async fn resolve_reference(
+    file_id: &str,
+    part_type: &str,
+    remaining_resolved_bytes: usize,
+    resolver: &mut ContentResolver<'_>,
+) -> Result<Option<ResolvedFile>, ResolveError> {
+    match resolver
+        .budget
+        .resolve(ResolutionRequest {
+            client: resolver.client,
+            file_id,
+            max_resolved_bytes: remaining_resolved_bytes,
+            part_type,
+            request_headers: resolver.request_headers,
+        })
+        .await
+    {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
+        Err(e) if resolver.on_missing == OnMissing::Continue => {
+            warn!(file_id = %file_id, error = %e, "file resolution failed, passing through");
+            Ok(None)
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Return the type and file ID for a reference that needs resolution.
+fn resolvable_reference(part: &serde_json::Value) -> Option<(&str, &str)> {
+    let part_type @ ("input_file" | "input_image") = part.get("type")?.as_str()? else {
+        return None;
+    };
+    if has_inline_content(part, part_type) {
+        return None;
+    }
+    Some((part_type, part.get("file_id")?.as_str()?))
+}
+
+/// Return whether a content part already has a usable inline source.
+fn has_inline_content(part: &serde_json::Value, part_type: &str) -> bool {
+    match part_type {
+        "input_file" => ["file_data", "file_url"]
+            .into_iter()
+            .any(|field| part.get(field).and_then(serde_json::Value::as_str).is_some()),
+        "input_image" => part.get("image_url").and_then(serde_json::Value::as_str).is_some(),
+        _ => false,
+    }
+}
+
+/// Compute the JSON string length of the resolved value for a
+/// given content part type.
+fn output_len_for_part(part_type: &str, resolved: &ResolvedFile) -> usize {
+    match part_type {
+        "input_file" => resolved.base64.len(),
+        "input_image" => "data:".len() + resolved.content_type.len() + ";base64,".len() + resolved.base64.len(),
+        _ => 0,
+    }
+}
+
+/// Replace `file_id` with the resolved content in a content part.
+///
+/// For `input_file`, writes raw base64 to `file_data` and
+/// populates `filename` from metadata when not already present.
+/// For `input_image`, writes a `data:` URL to `image_url`.
+fn rewrite_part(part: &mut serde_json::Value, part_type: &str, resolved: ResolvedFile) {
+    let Some(obj) = part.as_object_mut() else {
+        return;
+    };
+    let ResolvedFile {
+        mut base64,
+        content_type,
+        filename,
+    } = resolved;
+    obj.remove("file_id");
+    match part_type {
+        "input_file" => {
+            obj.insert("file_data".to_owned(), serde_json::Value::String(base64));
+            if !obj.contains_key("filename")
+                && let Some(filename) = filename
+            {
+                obj.insert("filename".to_owned(), serde_json::Value::String(filename));
+            }
+        },
+        "input_image" => {
+            let prefix = format!("data:{content_type};base64,");
+            base64.insert_str(0, &prefix);
+            obj.insert("image_url".to_owned(), serde_json::Value::String(base64));
+        },
+        _ => {},
+    }
+}
+
+/// Forward configured headers from the original request to a
+/// callout request.
+fn forward_headers(
+    request_headers: &http::HeaderMap,
+    header_names: &[http::HeaderName],
+) -> Vec<(http::HeaderName, http::HeaderValue)> {
+    let mut headers = Vec::new();
+    for name in header_names {
+        if let Some(value) = request_headers.get(name) {
+            headers.push((name.clone(), value.clone()));
+        }
+    }
+    headers
+}
+
+/// Maximum raw file bytes whose base64 encoding fits in
+/// `max_output_bytes`.
+fn max_content_bytes_for_base64(max_output_bytes: usize) -> usize {
+    (max_output_bytes / 4) * 3
+}
+
+/// Maximum raw file bytes that can fit in a data URL with base64
+/// expansion.
+fn max_content_bytes_for_data_url(max_data_url_bytes: usize, content_type: &str) -> Option<usize> {
+    let prefix_len = "data:"
+        .len()
+        .checked_add(content_type.len())?
+        .checked_add(";base64,".len())?;
+    let available = max_data_url_bytes.checked_sub(prefix_len)?;
+    Some((available / 4) * 3)
+}
+
+/// Infer MIME type from a filename extension.
+fn infer_mime_from_filename(filename: Option<&str>) -> Option<&'static str> {
+    let ext = filename?.rsplit('.').next()?;
+    match ext.to_ascii_lowercase().as_str() {
+        "csv" => Some("text/csv"),
+        "doc" => Some("application/msword"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "gif" => Some("image/gif"),
+        "html" | "htm" => Some("text/html"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "json" => Some("application/json"),
+        "pdf" => Some("application/pdf"),
+        "png" => Some("image/png"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        "txt" => Some("text/plain"),
+        "webp" => Some("image/webp"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "xml" => Some("application/xml"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "tests"
+)]
+mod tests {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        time::Duration,
+    };
+
+    use praxis_core::callout::{CalloutConfig, FailureMode};
+
+    use super::*;
+
+    #[test]
+    fn infer_mime_pdf() {
+        assert_eq!(
+            infer_mime_from_filename(Some("document.pdf")),
+            Some("application/pdf"),
+            "PDF extension should map to application/pdf"
+        );
+    }
+
+    #[test]
+    fn infer_mime_png() {
+        assert_eq!(
+            infer_mime_from_filename(Some("image.png")),
+            Some("image/png"),
+            "PNG extension should map to image/png"
+        );
+    }
+
+    #[test]
+    fn infer_mime_case_insensitive() {
+        assert_eq!(
+            infer_mime_from_filename(Some("IMAGE.PNG")),
+            Some("image/png"),
+            "extension matching should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn infer_mime_unknown_extension() {
+        assert_eq!(
+            infer_mime_from_filename(Some("archive.tar.gz")),
+            None,
+            "unknown extension should return None"
+        );
+    }
+
+    #[test]
+    fn infer_mime_no_filename() {
+        assert_eq!(infer_mime_from_filename(None), None, "None filename should return None");
+    }
+
+    #[test]
+    fn resolve_error_display_callout_failed() {
+        let err = ResolveError::CalloutFailed {
+            file_id: "file-abc".to_owned(),
+            detail: "connection refused".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "callout failed for file 'file-abc': connection refused",
+            "CalloutFailed display should format correctly"
+        );
+    }
+
+    #[test]
+    fn resolve_error_display_too_large() {
+        let err = ResolveError::TooLarge {
+            file_id: "file-abc".to_owned(),
+            limit: 1024,
+        };
+        assert_eq!(
+            err.to_string(),
+            "resolved file 'file-abc' exceeds configured limit (1024 bytes)",
+            "TooLarge display should format correctly"
+        );
+    }
+
+    #[test]
+    fn resolve_error_display_too_many_references() {
+        let err = ResolveError::TooManyReferences { limit: 32 };
+
+        assert_eq!(
+            err.to_string(),
+            "request exceeds configured file reference limit (32)",
+            "TooManyReferences display should include the configured limit"
+        );
+    }
+
+    #[test]
+    fn file_url_encodes_file_id_as_single_path_segment() {
+        let url = file_url("http://ogx:8321", "../admin?x#y", false).unwrap();
+
+        assert!(
+            url.starts_with("http://ogx:8321/v1/files/"),
+            "metadata URL should use the files endpoint: {url}"
+        );
+        assert!(
+            !url.contains("../admin"),
+            "raw path traversal should not appear in URL: {url}"
+        );
+        assert!(!url.contains("?x"), "query delimiter should be encoded: {url}");
+        assert!(!url.contains("#y"), "fragment delimiter should be encoded: {url}");
+        assert!(url.contains("%2F"), "slash should be encoded: {url}");
+        assert!(url.contains("%3F"), "question mark should be encoded: {url}");
+        assert!(url.contains("%23"), "fragment marker should be encoded: {url}");
+    }
+
+    #[test]
+    fn file_url_rejects_exact_dot_dot_segment() {
+        let err = file_url("http://ogx:8321", "..", false).unwrap_err();
+
+        assert!(
+            matches!(err, ResolveError::InvalidFileId { .. }),
+            "exact dot-dot file id should be rejected before URL construction"
+        );
+    }
+
+    #[test]
+    fn file_url_preserves_base_path_and_adds_content_suffix() {
+        let url = file_url("http://ogx:8321/files-api", "file-abc", true).unwrap();
+
+        assert_eq!(
+            url, "http://ogx:8321/files-api/v1/files/file-abc/content",
+            "content URL should preserve configured base path"
+        );
+    }
+
+    #[test]
+    fn max_content_bytes_accounts_for_base64_expansion() {
+        let prefix_len = "data:text/plain;base64,".len();
+
+        assert_eq!(
+            max_content_bytes_for_data_url(prefix_len + 4, "text/plain"),
+            Some(3),
+            "four base64 bytes can carry three raw bytes"
+        );
+        assert_eq!(
+            max_content_bytes_for_data_url(prefix_len + 3, "text/plain"),
+            Some(0),
+            "partial base64 quantum should not allow extra raw bytes"
+        );
+        assert_eq!(
+            max_content_bytes_for_data_url(prefix_len - 1, "text/plain"),
+            None,
+            "limit smaller than data URL prefix should reject before fetch"
+        );
+    }
+
+    #[test]
+    fn parse_metadata_extracts_bytes_and_filename() {
+        let body = serde_json::json!({
+            "id": "file-abc",
+            "content_type": "text/plain",
+            "filename": "test.txt",
+            "bytes": 12345
+        });
+        let meta = parse_file_metadata(&body);
+        assert_eq!(meta.bytes, Some(12345), "bytes should be extracted from metadata");
+        assert_eq!(meta.content_type, "text/plain");
+        assert_eq!(
+            meta.filename.as_deref(),
+            Some("test.txt"),
+            "filename should be extracted"
+        );
+    }
+
+    #[test]
+    fn parse_metadata_missing_bytes_returns_none() {
+        let body = serde_json::json!({
+            "id": "file-abc",
+            "content_type": "text/plain",
+            "filename": "test.txt"
+        });
+        let meta = parse_file_metadata(&body);
+        assert_eq!(meta.bytes, None, "bytes should be None when absent from metadata");
+    }
+
+    fn test_client(api_base_url: &str) -> FilesApiClient {
+        test_client_with_limits(api_base_url, 1024, 1_000)
+    }
+
+    fn test_client_with_limits(api_base_url: &str, max_resolved_bytes: usize, timeout_ms: u64) -> FilesApiClient {
+        let callout = CalloutClient::new(CalloutConfig {
+            failure_mode: FailureMode::Closed,
+            timeout_ms,
+            ..CalloutConfig::default()
+        })
+        .unwrap();
+        FilesApiClient::new(
+            api_base_url,
+            Vec::new(),
+            callout,
+            FilesApiClientOptions {
+                max_file_references: 32,
+                max_resolved_bytes,
+                timeout_ms,
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn content_download_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let client = test_client(&format!("http://{address}"));
+
+        let err = client
+            .fetch_content("file-redirect", &http::HeaderMap::new(), 1024, 1024)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ResolveError::CalloutFailed { detail, .. } if detail.contains("302 Found")
+            ),
+            "redirect response should be rejected without contacting its target"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_download_transport_failure_sanitizes_error_detail() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let client = test_client(&format!("http://{address}"));
+
+        let err = client
+            .fetch_content("file-disconnect", &http::HeaderMap::new(), 1024, 1024)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ResolveError::CalloutFailed { detail, .. } if detail == "content download failed"
+            ),
+            "transport errors should retain a generic detail after the internal error is logged"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_download_timeout_covers_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\na")
+                .unwrap();
+            stream.flush().unwrap();
+            std::thread::park_timeout(Duration::from_millis(250));
+            let _result = stream.write_all(b"bcde");
+        });
+        let client = test_client_with_limits(&format!("http://{address}"), 1024, 50);
+
+        let err = client
+            .fetch_content("file-slow", &http::HeaderMap::new(), 1024, 1024)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ResolveError::CalloutFailed { detail, .. } if detail.contains("timed out")
+            ),
+            "timeout should remain active while the response body is being downloaded: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_download_without_length_is_bounded_while_streaming() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n0123456789abcdef")
+                .unwrap();
+        });
+        let client = test_client(&format!("http://{address}"));
+
+        let err = client
+            .fetch_content("file-large", &http::HeaderMap::new(), 8, 1024)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ResolveError::TooLarge { .. }),
+            "streamed bodies without Content-Length should be rejected at the byte limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_input_accepts_message_shorthand_without_type() {
+        let client = test_client("http://ogx:8321");
+        let mut body = serde_json::json!({
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_file", "file_id": ".."}]
+            }]
+        });
+        let err = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ResolveError::InvalidFileId { .. }),
+            "shorthand message items should be walked and attempt file resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_input_walks_function_call_output_arrays() {
+        let client = test_client("http://ogx:8321");
+        let mut body = serde_json::json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call-123",
+                "output": [{"type": "input_file", "file_id": ".."}]
+            }]
+        });
+
+        let err = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ResolveError::InvalidFileId { .. }),
+            "function call output arrays should be walked for file references"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_policy_preserves_unresolvable_reference() {
+        let client = test_client("http://ogx:8321");
+        let mut body = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_file", "file_id": ".."}]
+            }]
+        });
+        let original = body.clone();
+
+        let resolved = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, 0, "failed resolution should not increment the count");
+        assert_eq!(
+            body, original,
+            "continue policy should preserve the original file reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_reference_limit_is_enforced_in_continue_mode() {
+        let mut client = test_client("http://ogx:8321");
+        client.max_file_references = 2;
+        let mut body = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_id": "."},
+                    {"type": "input_file", "file_id": ".."},
+                    {"type": "input_image", "file_id": "."}
+                ]
+            }]
+        });
+
+        let err = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ResolveError::TooManyReferences { limit: 2 }),
+            "reference limit should reject even when missing files normally pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_reference_reuses_cached_failure() {
+        let mut client = test_client("http://ogx:8321");
+        client.max_file_references = 1;
+        let mut body = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_id": "."},
+                    {"type": "input_file", "file_id": "."}
+                ]
+            }]
+        });
+
+        let count = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0, "cached failures should remain unresolved in continue mode");
+    }
+
+    #[tokio::test]
+    async fn cached_successes_share_request_wide_byte_budget() {
+        let client = test_client_with_limits("http://ogx:8321", 8, 1_000);
+        let mut budget = client.resolution_budget();
+        budget.cache.insert(
+            ("input_file".to_owned(), "file-cached".to_owned()),
+            Ok(ResolvedFile {
+                base64: "ZGF0".to_owned(),
+                content_type: "text/plain".to_owned(),
+                filename: Some("data.txt".to_owned()),
+            }),
+        );
+
+        for _ in 0..2 {
+            let count = resolve_cached_items(&client, &mut budget).await.unwrap();
+            assert_eq!(
+                count, 1,
+                "cached content should resolve while aggregate capacity remains"
+            );
+        }
+
+        let err = resolve_cached_items(&client, &mut budget).await.unwrap_err();
+        assert!(
+            matches!(err, ResolveError::TooLarge { .. }),
+            "cached copies across item collections should share one aggregate byte budget"
+        );
+    }
+
+    async fn resolve_cached_items(
+        client: &FilesApiClient,
+        budget: &mut ResolutionBudget,
+    ) -> Result<usize, ResolveError> {
+        let mut items = cached_file_items();
+        resolve_items(&mut items, client, OnMissing::Reject, &http::HeaderMap::new(), budget).await
+    }
+
+    fn cached_file_items() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-cached"}]
+        })]
+    }
+
+    #[tokio::test]
+    async fn inline_content_takes_precedence_over_file_id() {
+        let client = test_client("http://ogx:8321");
+
+        for (part_type, field, value) in [
+            ("input_file", "file_data", "SGVsbG8="),
+            ("input_file", "file_url", "https://example.com/report.pdf"),
+            ("input_image", "image_url", "data:image/png;base64,iVBOR"),
+        ] {
+            let mut inline_part = serde_json::json!({"type": part_type, "file_id": ".."});
+            inline_part[field] = serde_json::Value::String(value.to_owned());
+            let mut body = serde_json::json!({
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [inline_part]
+                }]
+            });
+            let original = body.clone();
+
+            let resolved = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+                .await
+                .unwrap();
+
+            assert_eq!(resolved, 0, "inline content should not be resolved again");
+            assert_eq!(
+                body, original,
+                "inline content should pass through unchanged even when file_id is also present"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_input_skips_untyped_non_message_content() {
+        let client = test_client("http://ogx:8321");
+        let mut body = serde_json::json!({
+            "input": [{
+                "content": [{"type": "input_file", "file_id": ".."}]
+            }]
+        });
+        let resolved = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved, 0,
+            "untyped items without a role should not be treated as messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_data_parts_pass_through_unchanged() {
+        let client = test_client("http://ogx:8321");
+        let mut body = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_file",
+                    "file_data": "SGVsbG8=",
+                    "filename": "hello.txt"
+                }]
+            }]
+        });
+        let original = body.clone();
+        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0, "parts with file_data (no file_id) should not be resolved");
+        assert_eq!(body, original, "body should be unchanged");
+    }
+
+    #[tokio::test]
+    async fn file_url_parts_pass_through_unchanged() {
+        let client = test_client("http://ogx:8321");
+        let mut body = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_file",
+                    "file_url": "https://example.com/file.pdf",
+                    "filename": "file.pdf"
+                }]
+            }]
+        });
+        let original = body.clone();
+        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0, "parts with file_url (no file_id) should not be resolved");
+        assert_eq!(body, original, "body should be unchanged");
+    }
+
+    #[tokio::test]
+    async fn image_url_parts_pass_through_unchanged() {
+        let client = test_client("http://ogx:8321");
+        let mut body = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,iVBOR",
+                    "detail": "high"
+                }]
+            }]
+        });
+        let original = body.clone();
+        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0, "parts with image_url (no file_id) should not be resolved");
+        assert_eq!(body, original, "body should be unchanged, including detail field");
+    }
+
+    #[test]
+    fn rewrite_part_preserves_detail_on_input_image() {
+        let mut part = serde_json::json!({
+            "type": "input_image",
+            "file_id": "img-456",
+            "detail": "high"
+        });
+        let resolved = ResolvedFile {
+            base64: "iVBOR".to_owned(),
+            content_type: "image/png".to_owned(),
+            filename: None,
+        };
+        rewrite_part(&mut part, "input_image", resolved);
+
+        assert!(part.get("file_id").is_none(), "file_id should be removed");
+        assert_eq!(part["detail"].as_str().unwrap(), "high", "detail should be preserved");
+        assert!(
+            part["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "image_url should be set"
+        );
+    }
+
+    #[test]
+    fn rewrite_part_preserves_user_filename_on_input_file() {
+        let mut part = serde_json::json!({
+            "type": "input_file",
+            "file_id": "file-abc",
+            "filename": "user-provided.pdf"
+        });
+        let resolved = ResolvedFile {
+            base64: "JVBER".to_owned(),
+            content_type: "application/pdf".to_owned(),
+            filename: Some("api-filename.pdf".to_owned()),
+        };
+        rewrite_part(&mut part, "input_file", resolved);
+
+        assert_eq!(
+            part["filename"].as_str().unwrap(),
+            "user-provided.pdf",
+            "user-provided filename should take precedence over metadata"
+        );
+    }
+
+    #[test]
+    fn rewrite_part_populates_filename_from_metadata() {
+        let mut part = serde_json::json!({
+            "type": "input_file",
+            "file_id": "file-abc"
+        });
+        let resolved = ResolvedFile {
+            base64: "SGVsbG8=".to_owned(),
+            content_type: "text/plain".to_owned(),
+            filename: Some("test.txt".to_owned()),
+        };
+        rewrite_part(&mut part, "input_file", resolved);
+
+        assert_eq!(
+            part["filename"].as_str().unwrap(),
+            "test.txt",
+            "filename should be populated from metadata when not provided by user"
+        );
+    }
+}
