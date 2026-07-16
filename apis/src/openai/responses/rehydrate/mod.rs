@@ -129,10 +129,13 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        let state = match build_state(parsed_body, &record, &self.limiter, streaming) {
+        let stored = match stored_messages_for_response(&record, &self.limiter, streaming) {
             Ok(s) => s,
             Err(action) => return Ok(action),
         };
+        let previous_tools = collect_mcp_tool_listings(&record);
+        let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
+        let state = build_state(parsed_body, stored, previous_tools, previous_usage);
         write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
         ctx.extensions.insert(state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
@@ -160,10 +163,11 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        let state = match build_state(parsed_body, &record, &self.limiter, streaming) {
+        let stored = match stored_messages_for_conversation(&record, &self.limiter, streaming) {
             Ok(s) => s,
             Err(action) => return Ok(action),
         };
+        let state = build_state(parsed_body, stored, vec![], None);
         write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
         ctx.extensions.insert(state);
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
@@ -260,8 +264,8 @@ fn is_responses_cancel_path(path: &str) -> bool {
 
 /// Enforces byte-size and item-count caps on stored conversation history.
 ///
-/// Constructed once from filter config and passed into [`RehydrationSource`]
-/// so limits are checked *before* cloning the stored messages.
+/// Constructed once from filter config and passed into the stored-message
+/// extraction functions so limits are checked *before* cloning.
 struct HistoryLimiter {
     /// Maximum serialized byte size of stored conversation history.
     pub(super) max_bytes: usize,
@@ -304,49 +308,35 @@ impl HistoryLimiter {
 }
 
 // -----------------------------------------------------------------------------
-// RehydrationSource
+// Stored message extraction
 // -----------------------------------------------------------------------------
 
-/// Common interface for records that supply stored conversation history.
-trait RehydrationSource {
-    /// Extract stored messages for rehydration, enforcing history limits
-    /// before cloning.
-    fn stored_messages(&self, limiter: &HistoryLimiter, streaming: bool) -> Result<Vec<Value>, FilterAction>;
-    /// Recover MCP tool listings from stored history.
-    fn mcp_tool_listings(&self) -> Vec<Value> {
-        vec![]
-    }
-    /// Extract token usage from the previous response.
-    fn previous_usage(&self) -> Option<Value> {
-        None
-    }
-}
-
-impl RehydrationSource for ResponseRecord {
-    fn stored_messages(&self, limiter: &HistoryLimiter, streaming: bool) -> Result<Vec<Value>, FilterAction> {
-        if let Some(messages) = self.messages.as_array().filter(|a| !a.is_empty()) {
-            limiter.check(messages, streaming)?;
-            return Ok(messages.clone());
-        }
-        reconstruct_messages_from_public_response(self, limiter, streaming)
-    }
-
-    fn mcp_tool_listings(&self) -> Vec<Value> {
-        collect_mcp_tool_listings(self)
-    }
-
-    fn previous_usage(&self) -> Option<Value> {
-        self.response_object.get("usage").filter(|u| !u.is_null()).cloned()
-    }
-}
-
-impl RehydrationSource for ConversationRecord {
-    fn stored_messages(&self, limiter: &HistoryLimiter, streaming: bool) -> Result<Vec<Value>, FilterAction> {
-        let empty: &[Value] = &[];
-        let messages = self.messages.as_array().map_or(empty, Vec::as_slice);
+/// Extract stored messages from a response record, checking limits
+/// before cloning. Falls back to reconstruction from public fields
+/// for records created before hidden messages were persisted.
+fn stored_messages_for_response(
+    record: &ResponseRecord,
+    limiter: &HistoryLimiter,
+    streaming: bool,
+) -> Result<Vec<Value>, FilterAction> {
+    if let Some(messages) = record.messages.as_array().filter(|a| !a.is_empty()) {
         limiter.check(messages, streaming)?;
-        Ok(messages.to_vec())
+        return Ok(messages.clone());
     }
+    reconstruct_messages_from_public_response(record, limiter, streaming)
+}
+
+/// Extract stored messages from a conversation record, checking
+/// limits before cloning.
+fn stored_messages_for_conversation(
+    record: &ConversationRecord,
+    limiter: &HistoryLimiter,
+    streaming: bool,
+) -> Result<Vec<Value>, FilterAction> {
+    let empty: &[Value] = &[];
+    let messages = record.messages.as_array().map_or(empty, Vec::as_slice);
+    limiter.check(messages, streaming)?;
+    Ok(messages.to_vec())
 }
 
 /// Fetch the previous response and validate its status in one step.
@@ -421,25 +411,21 @@ async fn fetch_conversation(
     })
 }
 
-/// Build [`ResponsesState`] by resolving stored messages, enforcing
-/// history limits, and prepending conversation history before
-/// current input.
+/// Build [`ResponsesState`] from already-resolved stored messages and
+/// prepend conversation history before current input.
 fn build_state(
     parsed_body: Value,
-    source: &impl RehydrationSource,
-    limiter: &HistoryLimiter,
-    streaming: bool,
-) -> Result<ResponsesState, FilterAction> {
-    let stored = source.stored_messages(limiter, streaming)?;
-    let previous_tools = source.mcp_tool_listings();
-    let previous_usage = source.previous_usage();
+    stored: Vec<Value>,
+    previous_tools: Vec<Value>,
+    previous_usage: Option<Value>,
+) -> ResponsesState {
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.messages.splice(0..0, replay);
     state.persisted_messages.splice(0..0, stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
-    Ok(state)
+    state
 }
 
 /// Return stored history, reconstructing from public fields for
