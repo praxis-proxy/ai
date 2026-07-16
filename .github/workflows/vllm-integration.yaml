@@ -111,7 +111,7 @@ jobs:
 
       - name: Run vLLM integration tests
         run: |
-          uv run pytest tests/integration/sdk/openai/test_openai_responses_vllm.py -v -s
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 
       - name: vLLM container logs
         if: failure()
