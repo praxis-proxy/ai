@@ -299,7 +299,7 @@ pub(super) async fn handle_create_items(
     if let Err(e) = store.create_conversation_items(&item_records).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
-    if let Err(e) = sync_conversation_messages(store, existing).await {
+    if let Err(e) = sync_conversation_messages(store, &existing.tenant_id, &existing.conversation_id).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     debug!(
@@ -411,7 +411,7 @@ pub(super) async fn handle_delete_item(
         .await
     {
         Ok(true) => {
-            if let Err(e) = sync_conversation_messages(store, existing).await {
+            if let Err(e) = sync_conversation_messages(store, &existing.tenant_id, &existing.conversation_id).await {
                 return Ok(FilterAction::Reject(store_error_response(&e)?));
             }
             debug!(conversation_id, item_id, tenant_id, "conversation item deleted");
@@ -741,19 +741,18 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
 /// number of items; incremental updates would risk drift.
 pub(super) async fn sync_conversation_messages(
     store: &dyn ConversationItemStore,
-    record: ConversationRecord,
+    tenant_id: &str,
+    conversation_id: &str,
 ) -> Result<(), StoreError> {
-    let messages =
-        Value::Array(collect_conversation_messages(store, &record.tenant_id, &record.conversation_id).await?);
+    let messages = Value::Array(collect_conversation_messages(store, tenant_id, conversation_id).await?);
     let updated = store
-        .update_conversation_messages(&record.tenant_id, &record.conversation_id, &messages)
+        .update_conversation_messages(tenant_id, conversation_id, &messages)
         .await?;
     if updated {
         Ok(())
     } else {
         Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {}",
-            record.conversation_id
+            "conversation disappeared during message sync: {conversation_id}"
         )))
     }
 }

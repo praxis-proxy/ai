@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     openai::responses::{DEFAULT_TENANT_ID, TENANT_METADATA_KEY, state::ResponsesState},
-    store::{ConversationItemStore, ConversationRecord, PostgresResponseStore, SqliteResponseStore, StoreError},
+    store::{ConversationItemStore, PostgresResponseStore, SqliteResponseStore, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -311,11 +311,7 @@ impl HttpFilter for OpenaiConversationsFilter {
         true
     }
 
-    #[expect(
-        clippy::large_stack_frames,
-        clippy::too_many_lines,
-        reason = "dispatcher with one arm per endpoint"
-    )]
+    #[expect(clippy::too_many_lines, reason = "dispatcher with one arm per endpoint")]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let path = ctx.request.uri.path();
         let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
@@ -580,14 +576,7 @@ async fn persist_items(
 
 /// Refresh the denormalized conversation message cache after item mutation.
 async fn refresh_message_cache(store: &dyn ConversationItemStore, tenant_id: &str, conversation_id: &str) {
-    let record = ConversationRecord {
-        conversation_id: conversation_id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
-        created_at: 0,
-        metadata: Value::Object(serde_json::Map::default()),
-        messages: Value::Null,
-    };
-    if let Err(e) = handlers::sync_conversation_messages(store, record).await {
+    if let Err(e) = handlers::sync_conversation_messages(store, tenant_id, conversation_id).await {
         warn!(error = %e, conversation_id, "conversation message sync failed after append-back");
     }
 }
