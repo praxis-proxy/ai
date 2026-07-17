@@ -571,3 +571,20 @@ async fn allow_loopback_still_blocks_unspecified() {
             .is_err()
     );
 }
+
+// =========================================================================
+// CallTool Error
+// =========================================================================
+
+#[test]
+fn call_tool_error_display() {
+    let err = McpClientError::CallTool {
+        url: "http://example.com/mcp".to_owned(),
+        tool_name: "get_weather".to_owned(),
+        source: Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused")),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("tools/call failed"), "should mention tools/call: {msg}");
+    assert!(msg.contains("get_weather"), "should mention tool name: {msg}");
+    assert!(msg.contains("example.com"), "should mention URL: {msg}");
+}
