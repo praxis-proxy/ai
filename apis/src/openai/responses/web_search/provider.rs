@@ -6,15 +6,14 @@
 //! Uses [`CalloutClient`] from praxis-core for HTTP callouts with
 //! circuit breaking, timeout, and loop prevention.
 
-use praxis_core::callout::{
-    CalloutClient, CalloutConfig, CalloutRequest, CalloutResult, CircuitBreakerConfig, FailureMode as CoreFailureMode,
-};
+use praxis_core::callout::{CalloutClient, CalloutRequest, CalloutResult};
 use praxis_filter::FilterError;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::config::{FailureMode, SearchContextSize, SearchProvider, ValidatedConfig};
+use crate::openai::responses::config_validation::FailureMode;
+use super::config::{SearchContextSize, SearchProvider, ValidatedConfig};
 
 // -----------------------------------------------------------------------------
 // SearchResult
@@ -82,24 +81,6 @@ impl std::fmt::Debug for SearchClient {
     }
 }
 
-/// Build a [`CalloutConfig`] from validated filter config.
-fn build_callout_config(config: &ValidatedConfig) -> CalloutConfig {
-    let failure_mode = match config.failure_mode {
-        FailureMode::Closed => CoreFailureMode::Closed,
-        FailureMode::Open => CoreFailureMode::Open,
-    };
-    CalloutConfig {
-        circuit_breaker: Some(CircuitBreakerConfig {
-            consecutive_failures: 5,
-            recovery_window_ms: 30_000,
-        }),
-        failure_mode,
-        status_on_error: config.status_on_error,
-        timeout_ms: config.timeout_ms,
-        ..CalloutConfig::default()
-    }
-}
-
 impl SearchClient {
     /// Build a search client from validated filter config.
     ///
@@ -108,15 +89,15 @@ impl SearchClient {
     /// Returns [`FilterError`] if the underlying [`CalloutClient`]
     /// cannot be constructed.
     pub(crate) fn from_config(config: &ValidatedConfig) -> Result<Self, FilterError> {
-        let callout_config = build_callout_config(config);
+        let callout_config = config.callout.build_callout_config();
         let client = CalloutClient::new(callout_config).map_err(|e| FilterError::from(e.to_string()))?;
         Ok(Self {
             client,
             provider: config.provider,
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
-            failure_mode: config.failure_mode,
-            status_on_error: config.status_on_error,
+            failure_mode: config.callout.failure_mode,
+            status_on_error: config.callout.status_on_error,
         })
     }
 
@@ -360,6 +341,7 @@ mod tests {
     use secrecy::SecretString;
     use serde_json::json;
 
+    use crate::openai::responses::config_validation::CalloutSettings;
     use super::*;
 
     #[test]
@@ -508,10 +490,12 @@ mod tests {
             provider: SearchProvider::Brave,
             api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
-            timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
+            callout: CalloutSettings {
+                timeout_ms: 5000,
+                failure_mode: FailureMode::Closed,
+                status_on_error: 502,
+            },
         };
         let client = SearchClient::from_config(&config);
         assert!(client.is_ok());
@@ -523,10 +507,12 @@ mod tests {
             provider: SearchProvider::Brave,
             api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
-            timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
+            callout: CalloutSettings {
+                timeout_ms: 5000,
+                failure_mode: FailureMode::Closed,
+                status_on_error: 502,
+            },
         };
         let client = SearchClient::from_config(&config).unwrap();
         let outcome = client.parse_response(b"not json");
@@ -542,10 +528,12 @@ mod tests {
             provider: SearchProvider::Brave,
             api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
-            timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Open,
-            status_on_error: 502,
+            callout: CalloutSettings {
+                timeout_ms: 5000,
+                failure_mode: FailureMode::Open,
+                status_on_error: 502,
+            },
         };
         let client = SearchClient::from_config(&config).unwrap();
         let outcome = client.parse_response(b"not json");

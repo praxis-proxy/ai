@@ -6,6 +6,8 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
+use crate::openai::responses::config_validation::{self, CalloutSettings, FailureMode};
+
 /// Default callout timeout (30 seconds — summarization can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -13,27 +15,9 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_STATUS_ON_ERROR: u16 = 502;
 
 // -----------------------------------------------------------------------------
-// FailureMode
-// -----------------------------------------------------------------------------
-
-/// What happens when the summarization callout fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum FailureMode {
-    /// Reject the request on summarization failure (default).
-    Closed,
-    /// Continue with full (uncompacted) history on failure.
-    Open,
-}
-
-// -----------------------------------------------------------------------------
 // CompactFilterConfig (YAML deserialization)
 // -----------------------------------------------------------------------------
 
-#[expect(
-    dead_code,
-    reason = "scaffolding — fields used once build_config is implemented"
-)]
 /// Raw YAML config, deserialized then validated.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,14 +76,8 @@ pub(super) struct ValidatedConfig {
     /// Tiktoken encoding name.
     pub tiktoken_encoding: String,
 
-    /// Callout timeout in milliseconds.
-    pub timeout_ms: u64,
-
-    /// Failure mode for the inference callout.
-    pub failure_mode: FailureMode,
-
-    /// HTTP status on error.
-    pub status_on_error: u16,
+    /// Shared callout settings (timeout, failure mode, status).
+    pub callout: CalloutSettings,
 }
 
 /// Validate raw config and apply defaults.
@@ -108,21 +86,28 @@ pub(super) struct ValidatedConfig {
 ///
 /// Returns [`FilterError`] if `inference_url` is empty,
 /// `timeout_ms` is zero, or `status_on_error` is out of range.
-///
-/// Follow the pattern in `web_search/config.rs:build_config()`:
-///
-/// - Validate `inference_url` is not empty
-/// - Validate `timeout_ms` (default [`DEFAULT_TIMEOUT_MS`], reject 0)
-/// - Validate `status_on_error` (default [`DEFAULT_STATUS_ON_ERROR`],
-///   must be 100..=599)
-/// - Validate `tiktoken_encoding` is a known encoding name
-///   (use `tiktoken_rs` to check)
-/// - Return `ValidatedConfig` with defaults applied
-#[expect(
-    clippy::todo,
-    reason = "scaffolding — implement config validation"
-)]
 pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig, FilterError> {
-    let _ = (raw, DEFAULT_TIMEOUT_MS, DEFAULT_STATUS_ON_ERROR);
-    todo!("implement config validation")
+    if raw.inference_url.is_empty() {
+        return Err(FilterError::from("openai_responses_compact: inference_url is empty"));
+    }
+
+    let timeout_ms =
+        config_validation::validate_timeout_ms("openai_responses_compact", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
+
+    let status_on_error = config_validation::validate_status_on_error(
+        "openai_responses_compact",
+        raw.status_on_error,
+        DEFAULT_STATUS_ON_ERROR,
+    )?;
+
+    Ok(ValidatedConfig {
+        inference_url: raw.inference_url.to_owned(),
+        default_model: raw.default_model.to_owned(),
+        tiktoken_encoding: raw.tiktoken_encoding.to_owned(),
+        callout: CalloutSettings {
+            timeout_ms,
+            failure_mode: raw.failure_mode.unwrap_or(FailureMode::Closed),
+            status_on_error,
+        },
+    })
 }

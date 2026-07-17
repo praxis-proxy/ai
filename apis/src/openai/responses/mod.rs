@@ -18,6 +18,7 @@
 //! to validate parameter combinations and extract additional fields.
 
 mod config;
+pub(crate) mod config_validation;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;

@@ -30,17 +30,14 @@ mod tests;
 use {
     async_trait::async_trait,
     bytes::Bytes,
-    praxis_core::callout::{
-        CalloutClient, CalloutConfig, CalloutRequest, CalloutResult, CircuitBreakerConfig,
-        FailureMode as CoreFailureMode,
-    },
+    praxis_core::callout::{CalloutClient, CalloutRequest, CalloutResult},
     praxis_filter::{
         BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
         body::MAX_JSON_BODY_BYTES, parse_filter_config,
     },
     serde_json::Value,
     tracing::{debug, warn},
-    self::config::{CompactFilterConfig, FailureMode, ValidatedConfig, build_config},
+    self::config::{CompactFilterConfig, ValidatedConfig, build_config},
     super::{error::responses_error_rejection, state::ResponsesState},
 };
 
@@ -121,28 +118,16 @@ impl CompactFilter {
     ///
     /// Returns [`FilterError`] if config validation fails or the
     /// callout client cannot be constructed.
-    #[expect(
-        clippy::todo,
-        unused_variables,
-        reason = "scaffolding — implement CalloutClient construction"
-    )]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: CompactFilterConfig = parse_filter_config("openai_responses_compact", config)?;
         let validated = build_config(&cfg)?;
-
-        // TODO: build CalloutConfig from validated config
-        //       (follow the pattern in web_search/provider.rs:build_callout_config)
-        //
-        // Map FailureMode -> CoreFailureMode:
-        //   FailureMode::Closed -> CoreFailureMode::Closed
-        //   FailureMode::Open   -> CoreFailureMode::Open
-        //
-        // Include CircuitBreakerConfig with:
-        //   consecutive_failures: 5
-        //   recovery_window_ms: 30_000
-        //
-        // Then construct Self { callout_client, config: validated }
-        todo!("construct CalloutClient and return CompactFilter")
+        let callout_config = validated.callout.build_callout_config();
+        let callout_client =
+            CalloutClient::new(callout_config).map_err(|e| FilterError::from(e.to_string()))?;
+        Ok(Box::new(Self {
+            callout_client,
+            config: validated,
+        }))
     }
 }
 
