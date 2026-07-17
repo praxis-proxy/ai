@@ -58,6 +58,7 @@ before sending requests.
 | [stream-events.yaml](configs/openai/responses/stream-events.yaml) | Demonstrates the `openai_stream_events` filter, which observes SSE chunks from the backend without modification, accumulates state (response object, output items, tool calls, usage), and writes it to ResponsesState metadata |
 | [tool-routing.yaml](configs/openai/responses/tool-routing.yaml) | Demonstrates using `openai_tool_parse` to route Responses API requests by their tool composition |
 | [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search` filter configuration for model-driven web search dispatch |
+| [vllm-agentic-api.yaml](configs/openai/responses/vllm-agentic-api.yaml) | Routes Responses API traffic to vLLM Agentic API without Praxis hydration, response persistence, or tool dispatch |
 
 ### Payload Processing
 
