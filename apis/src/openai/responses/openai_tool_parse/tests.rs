@@ -201,6 +201,31 @@ async fn web_search_metadata() {
 }
 
 #[tokio::test]
+async fn web_search_context_size_metadata() {
+    let body = r#"{"input":"test","tools":[{"type":"web_search","search_context_size":"high"}]}"#;
+    let (_action, ctx) = run_filter("{}", body).await;
+
+    assert_eq!(
+        ctx.filter_metadata
+            .get("tool_parse.search_context_size")
+            .map(String::as_str),
+        Some("high"),
+        "should set search_context_size from tool entry"
+    );
+}
+
+#[tokio::test]
+async fn web_search_no_context_size_metadata() {
+    let body = r#"{"input":"test","tools":[{"type":"web_search"}]}"#;
+    let (_action, ctx) = run_filter("{}", body).await;
+
+    assert!(
+        !ctx.filter_metadata.contains_key("tool_parse.search_context_size"),
+        "should not set search_context_size when absent"
+    );
+}
+
+#[tokio::test]
 async fn file_search_metadata() {
     let body = r#"{"input":"test","tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]}"#;
     let (action, ctx) = run_filter("{}", body).await;

@@ -1,0 +1,41 @@
+# Web Search Filter
+#
+# Demonstrates the `openai_web_search` filter configuration. The filter
+# validates its configuration (provider, API key, timeouts) and
+# constructs a search client at startup but does not execute searches
+# at runtime. When `tool_dispatch` (#26) and branch re-entrance land
+# in praxis-core, this filter will handle model-driven
+# `web_search_call` dispatch in the agentic loop.
+#
+# Configuration:
+#   provider:             Search backend (brave or tavily)
+#   api_key:              Provider API key (supports ${ENV_VAR} syntax)
+#   default_context_size: How many results to return (low/medium/high)
+#   timeout_ms:           Callout timeout in milliseconds
+#   failure_mode:         closed (reject on error) or open (skip on error)
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [web-search-pipeline]
+
+filter_chains:
+  - name: web-search-pipeline
+    filters:
+      - filter: openai_tool_parse
+      - filter: openai_web_search
+        provider: brave
+        api_key: ${WEB_SEARCH_API_KEY}
+        default_context_size: medium
+        timeout_ms: 10000
+        failure_mode: closed
+        status_on_error: 502
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "inference"
+      - filter: load_balancer
+        clusters:
+          - name: "inference"
+            endpoints:
+              - "127.0.0.1:3001"

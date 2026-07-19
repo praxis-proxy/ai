@@ -1,4 +1,4 @@
-name: Tests (Integration)
+name: Tests (praxis main)
 
 # ------------------------------------------------------------------------------
 # Workflow Settings
@@ -9,14 +9,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
-      debug:
-        description: "Enable verbose test output (V=1)"
+      praxis_ref:
+        description: "Praxis core git ref to test against"
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: "main"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -25,19 +26,30 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
-  V: ${{ inputs.debug && '1' || '' }}
 
 jobs:
   # ----------------------------------------------------------------------------
-  # Integration test suites (tests/ crates)
+  # Build + test against praxis core main
   # ----------------------------------------------------------------------------
 
-  test:
+  test-praxis-main:
     runs-on: ubuntu-24.04
+    continue-on-error: ${{ contains(github.event.pull_request.labels.*.name, 'praxis-known-issue') }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Clone Praxis core (path dependency)
+        uses: ./.github/actions/clone-praxis
+        with:
+          ref: ${{ inputs.praxis_ref || 'main' }}
+
+      - name: Patch Praxis dependencies
+        uses: ./.github/actions/patch-praxis
+
+      - name: Update lockfile for patched dependencies
+        run: cargo update
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
@@ -50,13 +62,18 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-rust-1.96.0-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-1.96.0-praxis-main-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.96.0-cargo-
-          save-always: true
+            ${{ runner.os }}-rust-1.96.0-praxis-main-
+
+      - name: Unit tests
+        run: |
+          cargo test -p praxis-ai-apis --features praxis-main
+          cargo test -p praxis-ai-filters --features praxis-main
+          cargo test -p praxis-ai-proxy --features praxis-main
 
       - name: Schema tests
-        run: make test-schema
+        run: cargo test -p praxis-tests-schema --features praxis-main
 
       - name: Integration tests
-        run: make test-integration
+        run: cargo test -p praxis-tests-integration --features praxis-main

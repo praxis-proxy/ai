@@ -417,6 +417,8 @@ fn promote_boolean_results(
 
 pub(crate) mod rehydrate;
 pub(crate) mod validate;
+pub(crate) mod web_search;
 
 pub use rehydrate::RehydrateFilter;
 pub use validate::OpenaiResponsesValidateFilter;
+pub use web_search::WebSearchFilter;

@@ -9,6 +9,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened]
   merge_group:
     branches: [main]
   workflow_dispatch:
@@ -18,7 +19,6 @@ on:
         required: false
         type: boolean
         default: false
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}

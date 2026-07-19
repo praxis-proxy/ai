@@ -14,6 +14,7 @@ name = "praxis_ai_apis"
 [features]
 default = ["store"]
 store = ["dep:sqlx", "dep:dashmap"]
+praxis-main = []
 
 [lints]
 workspace = true

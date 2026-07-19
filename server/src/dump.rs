@@ -177,7 +177,7 @@ fn redact_sensitive_keys(value: &mut serde_yaml::Value) {
 }
 
 /// Field names that should be redacted in config dumps.
-const SENSITIVE_FIELD_NAMES: &[&str] = &["database_url", "key_path", "password", "secret", "token"];
+const SENSITIVE_FIELD_NAMES: &[&str] = &["api_key", "database_url", "key_path", "password", "secret", "token"];
 
 /// Resolve all listeners into their dump representations.
 fn build_resolved_listeners(
@@ -654,6 +654,27 @@ filter_chains:
             nested_password.as_str(),
             Some("[REDACTED]"),
             "nested password field must be redacted"
+        );
+    }
+
+    #[test]
+    fn redact_sensitive_keys_api_key() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str("openai_web_search:\n  api_key: brave-secret-key-123").expect("test YAML must parse");
+        redact_sensitive_keys(&mut value);
+        let redacted = value
+            .as_mapping()
+            .unwrap()
+            .get(serde_yaml::Value::String("openai_web_search".to_owned()))
+            .unwrap()
+            .as_mapping()
+            .unwrap()
+            .get(serde_yaml::Value::String("api_key".to_owned()))
+            .unwrap();
+        assert_eq!(
+            redacted.as_str(),
+            Some("[REDACTED]"),
+            "api_key field must be redacted in config dumps"
         );
     }
 

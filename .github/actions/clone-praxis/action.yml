@@ -1,0 +1,20 @@
+name: Clone Praxis core
+description: >-
+  Clone praxis core repo as a sibling directory so
+  path-based [patch.crates-io] overrides resolve.
+
+inputs:
+  ref:
+    description: "Git ref to checkout (branch, tag, or SHA)"
+    required: false
+    default: "main"
+
+runs:
+  using: composite
+  steps:
+    - name: Clone praxis core
+      run: >-
+        git clone --depth 1 --branch "${{ inputs.ref }}"
+        https://github.com/praxis-proxy/praxis.git
+        "$GITHUB_WORKSPACE/../praxis"
+      shell: bash

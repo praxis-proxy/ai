@@ -17,6 +17,9 @@ path = "src/lib.rs"
 name = "praxis-ai"
 path = "src/main.rs"
 
+[features]
+praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
+
 [lints]
 workspace = true
 

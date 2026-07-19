@@ -4,10 +4,7 @@
 //! `cargo xtask echo` — quick HTTP test server.
 
 use clap::Parser;
-use praxis_core::config::{
-    AdminConfig, BodyLimitsConfig, Config, FailureMode, FilterChainConfig, FilterEntry, InsecureOptions, Listener,
-    ProtocolKind, RuntimeConfig,
-};
+use praxis_core::config::{Config, FailureMode, FilterChainConfig, FilterEntry, Listener, ProtocolKind};
 
 // -----------------------------------------------------------------------------
 // CLI Arguments
@@ -60,19 +57,21 @@ pub(crate) fn run(mut args: Args) {
 /// [`Config`]: praxis_core::config::Config
 fn build_config(args: &Args) -> Config {
     let entry = build_static_response_entry(args);
-    Config {
-        admin: AdminConfig::default(),
-        body_limits: BodyLimitsConfig::default(),
-        clusters: vec![],
-        filter_chains: vec![FilterChainConfig {
-            name: "echo".into(),
-            filters: vec![entry],
-        }],
-        insecure_options: InsecureOptions::default(),
-        listeners: vec![echo_listener(&args.address)],
-        runtime: RuntimeConfig::default(),
-        shutdown_timeout_secs: 30,
-    }
+
+    let chain = FilterChainConfig {
+        name: "echo".into(),
+        filters: vec![entry],
+    };
+
+    let mut map = serde_yaml::Mapping::new();
+    map.insert("clusters".into(), serde_yaml::to_value(Vec::<()>::new()).unwrap());
+    map.insert("filter_chains".into(), serde_yaml::to_value(vec![chain]).unwrap());
+    map.insert(
+        "listeners".into(),
+        serde_yaml::to_value(vec![echo_listener(&args.address)]).unwrap(),
+    );
+    map.insert("shutdown_timeout_secs".into(), serde_yaml::to_value(30_u64).unwrap());
+    serde_yaml::from_value(serde_yaml::Value::Mapping(map)).unwrap()
 }
 
 /// Build the echo listener bound to `address`.

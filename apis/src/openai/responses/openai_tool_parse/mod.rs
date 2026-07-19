@@ -199,6 +199,14 @@ fn write_tool_presence_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &Parsed
             ctx.set_metadata(key, "true");
         }
     }
+
+    if let Some(size) = parsed
+        .web_search
+        .as_ref()
+        .and_then(|ws| ws.search_context_size.as_deref())
+    {
+        ctx.set_metadata("tool_parse.search_context_size", size);
+    }
 }
 
 /// Re-promote filter results from metadata written during the body phase.

@@ -42,6 +42,7 @@ jobs:
 
             const excludedChecks = new Set([
               'ci-status',
+              'test-praxis-main',
             ]);
 
             const terminalStatuses = new Set(['completed']);

@@ -10,6 +10,7 @@ publish = false
 [features]
 cpex-policy-engine = ["praxis-filter/cpex-policy-engine"]
 no-mac-cert-rotation-tests = [] # We use this to disable testing cert rotation on macOS
+praxis-main = ["praxis-test-utils/praxis-main"]
 
 [lints]
 workspace = true

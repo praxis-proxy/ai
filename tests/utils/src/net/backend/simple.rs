@@ -10,8 +10,7 @@ use std::{
 };
 
 use praxis_core::config::{
-    AdminConfig, BodyLimitsConfig, Cluster, Config, Endpoint, FailureMode, FilterChainConfig, FilterEntry,
-    InsecureOptions, Listener, ProtocolKind, RuntimeConfig,
+    Cluster, Config, Endpoint, FailureMode, FilterChainConfig, FilterEntry, Listener, ProtocolKind,
 };
 
 use super::specialized::{BackendGuard, read_until_headers_complete, spawn_tcp_server, spawn_tcp_server_with_shutdown};
@@ -401,32 +400,36 @@ fn build_static_response_filter(entry: &RoutedEntry) -> FilterEntry {
 }
 
 /// Assemble a [`Config`] from parts.
+///
+/// Uses serde round-trip so new `#[serde(default)]` fields in
+/// upstream praxis-core (e.g. `metrics`) are filled automatically,
+/// keeping this compatible with both crates.io and path deps.
 fn build_config(address: &str, clusters: Vec<Cluster>, filters: Vec<FilterEntry>) -> Config {
-    Config {
-        admin: AdminConfig::default(),
-        body_limits: BodyLimitsConfig::default(),
-        clusters,
-        filter_chains: vec![FilterChainConfig {
-            name: "backend".to_owned(),
-            filters,
-        }],
-        insecure_options: InsecureOptions::default(),
-        listeners: vec![Listener {
-            address: address.to_owned(),
-            cluster: None,
-            downstream_read_timeout_ms: None,
-            filter_chains: vec!["backend".to_owned()],
-            max_connections: None,
-            name: "backend".to_owned(),
-            protocol: ProtocolKind::default(),
-            tcp_session_timeout_ms: None,
-            tcp_max_duration_secs: None,
-            tls: None,
-            upstream: None,
-        }],
-        runtime: RuntimeConfig::default(),
-        shutdown_timeout_secs: 5,
-    }
+    let listener = Listener {
+        address: address.to_owned(),
+        cluster: None,
+        downstream_read_timeout_ms: None,
+        filter_chains: vec!["backend".to_owned()],
+        max_connections: None,
+        name: "backend".to_owned(),
+        protocol: ProtocolKind::default(),
+        tcp_session_timeout_ms: None,
+        tcp_max_duration_secs: None,
+        tls: None,
+        upstream: None,
+    };
+
+    let chain = FilterChainConfig {
+        name: "backend".to_owned(),
+        filters,
+    };
+
+    let mut map = serde_yaml::Mapping::new();
+    map.insert("clusters".into(), serde_yaml::to_value(clusters).unwrap());
+    map.insert("filter_chains".into(), serde_yaml::to_value(vec![chain]).unwrap());
+    map.insert("listeners".into(), serde_yaml::to_value(vec![listener]).unwrap());
+    map.insert("shutdown_timeout_secs".into(), serde_yaml::to_value(5_u64).unwrap());
+    serde_yaml::from_value(serde_yaml::Value::Mapping(map)).unwrap()
 }
 
 /// Build a YAML header mapping with `name` and `value` keys.

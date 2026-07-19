@@ -150,4 +150,8 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
         @register registry,
         http "openai_tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_web_search" => praxis_ai_apis::openai::WebSearchFilter::from_config
+    );
 }

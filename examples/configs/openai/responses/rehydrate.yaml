@@ -50,6 +50,8 @@ filter_chains:
         conversations_table: openai_conversations
 
       - filter: openai_responses_rehydrate
+        # max_history_bytes: 2097152  # 2 MiB (default)
+        # max_history_items: ~        # unlimited (default)
 
       - filter: router
         routes:
