@@ -96,13 +96,15 @@ impl McpToolResolveFilter {
     }
 
     /// Core resolution: parse MCP entries, check cache, call
-    /// `tools/list`, build `mcp_tool_map`.
+    /// `tools/list`, build `mcp_tool_map`, and rewrite the request
+    /// body to replace `type: "mcp"` entries with `type: "function"`.
     async fn resolve_mcp_tools(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        body: &[u8],
+        body: &mut Option<Bytes>,
+        original_bytes: &[u8],
     ) -> Result<FilterAction, ResolveError> {
-        let mcp_entries = extract_mcp_entries(body);
+        let mcp_entries = extract_mcp_entries(original_bytes);
         if mcp_entries.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -124,7 +126,11 @@ impl McpToolResolveFilter {
         }
 
         debug!(tool_count = map.len(), "mcp_tool_map built");
-        write_tool_map(ctx, body, map);
+
+        rewrite_request_body(ctx, body, original_bytes, &map)?;
+
+        let body_for_state = body.as_ref().map_or(original_bytes, |b| b.as_ref());
+        write_tool_map(ctx, body_for_state, map);
         Ok(FilterAction::Continue)
     }
 
@@ -190,7 +196,7 @@ impl HttpFilter for McpToolResolveFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadWrite
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -217,13 +223,13 @@ impl HttpFilter for McpToolResolveFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(bytes) = body.as_ref() else {
+        let Some(bytes) = body.as_ref().map(|b| b.to_vec()) else {
             return Ok(FilterAction::Continue);
         };
 
         let streaming = is_streaming(ctx);
 
-        match Box::pin(self.resolve_mcp_tools(ctx, bytes)).await {
+        match Box::pin(self.resolve_mcp_tools(ctx, body, &bytes)).await {
             Ok(action) => Ok(action),
             Err(e) => Ok(resolve_error_rejection(&e, streaming)),
         }
@@ -249,6 +255,10 @@ enum ResolveError {
         /// Configured maximum.
         max: usize,
     },
+
+    /// Failed to serialize the rewritten request body.
+    #[error("failed to serialize rewritten request body: {0}")]
+    Serialization(serde_json::Error),
 }
 
 // -----------------------------------------------------------------------------
@@ -267,6 +277,15 @@ fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction 
             debug!(error = %e, "openai_mcp_tool_resolve failed");
             FilterAction::Reject(responses_error_rejection(
                 502,
+                "server_error",
+                &err.to_string(),
+                streaming,
+            ))
+        },
+        ResolveError::Serialization(e) => {
+            debug!(error = %e, "openai_mcp_tool_resolve serialization failed");
+            FilterAction::Reject(responses_error_rejection(
+                500,
                 "server_error",
                 &err.to_string(),
                 streaming,
@@ -327,6 +346,134 @@ async fn fetch_tools(
     )
     .await
     .map_err(ResolveError::Client)
+}
+
+/// Rewrite the request body, replacing resolved `type: "mcp"`
+/// entries with `type: "function"` entries.
+///
+/// MCP entries that were not resolved (no `server_url`, deferred,
+/// or `connector_id` only) are left unchanged for upstream to
+/// handle.
+fn rewrite_request_body(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    original_bytes: &[u8],
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+) -> Result<(), ResolveError> {
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
+        return Ok(());
+    };
+
+    let Some(tools) = parsed.get("tools").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+
+    let rewritten = rewrite_tools_array(tools, tool_map);
+
+    if rewritten.is_empty() {
+        return Ok(());
+    }
+
+    let rewritten_count = rewritten.len();
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
+    }
+
+    let serialized = serde_json::to_vec(&parsed).map_err(|e| {
+        debug!(error = %e, "failed to serialize rewritten body");
+        ResolveError::Serialization(e)
+    })?;
+
+    let len = serialized.len();
+    *body = Some(Bytes::from(serialized));
+    ctx.extra_request_headers
+        .push((std::borrow::Cow::Borrowed("content-length"), len.to_string()));
+
+    debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
+    Ok(())
+}
+
+/// Rewrite a tools array, replacing resolved MCP entries with
+/// function entries derived from the tool map.
+fn rewrite_tools_array(
+    tools: &[serde_json::Value],
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut result = Vec::with_capacity(tools.len());
+
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(serde_json::Value::as_str);
+        if tool_type != Some("mcp") {
+            result.push(tool.clone());
+            continue;
+        }
+
+        let label = server_label(tool);
+
+        let function_tools = convert_mcp_to_function_tools(label, tool, tool_map);
+        if function_tools.is_empty() {
+            result.push(tool.clone());
+        } else {
+            result.extend(function_tools);
+        }
+    }
+
+    result
+}
+
+/// Convert an MCP entry into one or more function tool entries.
+///
+/// Returns an empty vec if this MCP entry was not resolved (e.g.,
+/// `connector_id` only, deferred, or no matching tools in the map).
+fn convert_mcp_to_function_tools(
+    label: &str,
+    mcp_entry: &serde_json::Value,
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut function_tools = Vec::new();
+
+    for ((map_label, tool_name), map_value) in tool_map {
+        if map_label != label {
+            continue;
+        }
+
+        if let Some(definition) = map_value.get("tool_definition") {
+            let function_tool = mcp_tool_to_function_tool(label, tool_name, definition, mcp_entry);
+            function_tools.push(function_tool);
+        }
+    }
+
+    function_tools
+}
+
+/// Convert a single MCP tool definition to a Responses API
+/// function tool.
+///
+/// The tool name is prefixed with `{server_label}__` to ensure
+/// uniqueness across MCP servers and enable dispatch routing.
+fn mcp_tool_to_function_tool(
+    label: &str,
+    tool_name: &str,
+    definition: &serde_json::Value,
+    _mcp_entry: &serde_json::Value,
+) -> serde_json::Value {
+    let prefixed_name = format!("{label}__{tool_name}");
+
+    let description = definition.get("description").cloned();
+    let parameters = definition
+        .get("inputSchema")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".to_owned(), serde_json::json!("function"));
+    obj.insert("name".to_owned(), serde_json::json!(prefixed_name));
+    if let Some(desc) = description {
+        obj.insert("description".to_owned(), desc);
+    }
+    obj.insert("parameters".to_owned(), parameters);
+
+    serde_json::Value::Object(obj)
 }
 
 /// Write the resolved tool map to `ResponsesState`, creating

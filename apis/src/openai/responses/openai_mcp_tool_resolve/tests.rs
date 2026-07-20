@@ -1004,3 +1004,101 @@ fn write_tool_map_creates_state_with_previous_response_id() {
         .expect("state should be created even with previous_response_id");
     assert!(!state.mcp_tool_map.is_empty(), "tool map should be populated");
 }
+
+// =========================================================================
+// Body Rewrite: MCP to Function
+// =========================================================================
+
+fn weather_tool_map() -> HashMap<(String, String), serde_json::Value> {
+    let mut map = HashMap::new();
+    map.insert(
+        ("weather".to_owned(), "get_weather".to_owned()),
+        serde_json::json!({
+            "server_label": "weather",
+            "tool_definition": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }),
+    );
+    map
+}
+
+#[test]
+fn rewrite_tools_array_converts_mcp_to_function() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "calc"}),
+        serde_json::json!({"type": "mcp", "server_label": "weather"}),
+    ];
+    let rewritten = rewrite_tools_array(&tools, &weather_tool_map());
+
+    assert_eq!(rewritten.len(), 2, "should have 2 tools");
+    assert_eq!(rewritten[0]["name"], "calc", "first tool unchanged");
+    assert_eq!(rewritten[1]["type"], "function", "MCP converted to function");
+    assert_eq!(rewritten[1]["name"], "weather__get_weather", "prefixed name");
+    assert_eq!(rewritten[1]["description"], "Get current weather");
+    assert!(rewritten[1]["parameters"]["properties"]["city"].is_object());
+}
+
+#[test]
+fn rewrite_tools_array_preserves_unresolved_mcp() {
+    let tools = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "unknown",
+        "server_url": "http://10.0.0.99/mcp"
+    })];
+
+    let tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
+    let rewritten = rewrite_tools_array(&tools, &tool_map);
+
+    assert_eq!(rewritten.len(), 1, "should preserve unresolved entry");
+    assert_eq!(rewritten[0]["type"], "mcp", "unresolved MCP left unchanged");
+}
+
+#[test]
+fn mcp_tool_to_function_tool_adds_default_parameters() {
+    let definition = serde_json::json!({"name": "simple_tool", "description": "Does something"});
+
+    let function_tool = mcp_tool_to_function_tool("srv", "simple_tool", &definition, &serde_json::json!({}));
+
+    assert_eq!(function_tool["type"], "function");
+    assert_eq!(function_tool["name"], "srv__simple_tool");
+    assert_eq!(function_tool["description"], "Does something");
+    assert_eq!(
+        function_tool["parameters"]["type"], "object",
+        "default parameters when inputSchema absent"
+    );
+}
+
+#[test]
+fn rewrite_tools_array_expands_multiple_tools_from_one_server() {
+    let tools = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "math",
+        "server_url": "http://10.0.0.5/mcp"
+    })];
+
+    let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
+    tool_map.insert(
+        ("math".to_owned(), "add".to_owned()),
+        serde_json::json!({
+            "server_label": "math",
+            "tool_definition": {"name": "add", "description": "Add numbers"}
+        }),
+    );
+    tool_map.insert(
+        ("math".to_owned(), "subtract".to_owned()),
+        serde_json::json!({
+            "server_label": "math",
+            "tool_definition": {"name": "subtract", "description": "Subtract numbers"}
+        }),
+    );
+
+    let rewritten = rewrite_tools_array(&tools, &tool_map);
+
+    assert_eq!(rewritten.len(), 2, "one MCP entry expands to multiple function tools");
+    let names: Vec<&str> = rewritten.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"math__add"), "should have add tool");
+    assert!(names.contains(&"math__subtract"), "should have subtract tool");
+}

@@ -407,6 +407,50 @@ fn mcp_mock_server_echoes_resolved_body() {
 }
 
 #[test]
+fn mcp_tools_rewritten_to_function_type() {
+    let mcp_config = McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather").with_description("Get weather"),
+            McpToolFixture::new("set_alarm"),
+        ],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback_with_proxy(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"function","name":"calc"}},{{"type":"mcp","server_label":"home","server_url":"{mcp_url}","allowed_tools":["get_weather"]}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 200, "should return 200");
+    let echoed = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+
+    let tools = parsed["tools"].as_array().expect("tools should be an array");
+    assert_eq!(tools.len(), 2, "should have 2 tools (1 function + 1 rewritten MCP)");
+
+    assert_eq!(tools[0]["type"], "function", "first tool type unchanged");
+    assert_eq!(tools[0]["name"], "calc", "first tool name unchanged");
+
+    assert_eq!(tools[1]["type"], "function", "MCP tool rewritten to function");
+    assert_eq!(tools[1]["name"], "home__get_weather", "MCP tool name prefixed");
+    assert_eq!(tools[1]["description"], "Get weather", "description preserved");
+    assert!(tools[1]["parameters"].is_object(), "parameters added");
+
+    assert!(
+        mcp_server.method_count("tools/list") >= 1,
+        "should have called tools/list"
+    );
+}
+
+#[test]
 fn mcp_invalid_authorization_rejected() {
     let mcp_config = McpMockConfig {
         tools: vec![McpToolFixture::new("tool_a")],
