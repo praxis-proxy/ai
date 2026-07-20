@@ -981,7 +981,7 @@ async fn deferred_entries_not_counted_against_max_servers() {
 // =========================================================================
 
 #[test]
-fn write_tool_map_skips_state_creation_with_previous_response_id() {
+fn write_tool_map_creates_state_with_previous_response_id() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let body_json = serde_json::json!({
@@ -998,8 +998,9 @@ fn write_tool_map_skips_state_creation_with_previous_response_id() {
     );
     write_tool_map(&mut ctx, &body_bytes, map);
 
-    assert!(
-        ctx.extensions.get::<ResponsesState>().is_none(),
-        "should not create state when previous_response_id is present"
-    );
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("state should be created even with previous_response_id");
+    assert!(!state.mcp_tool_map.is_empty(), "tool map should be populated");
 }
