@@ -72,6 +72,10 @@ fn register_general_ai_filters(registry: &mut praxis_filter::FilterRegistry) {
         @register registry,
         http "token_usage_headers" => praxis_ai_filters::TokenUsageHeadersFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "semantic_router" => praxis_ai_filters::SemanticRouterFilter::from_config
+    );
 }
 
 /// Register Anthropic-specific filters.

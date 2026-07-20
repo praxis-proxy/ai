@@ -33,3 +33,4 @@ mod token_counting;
 mod token_usage_headers;
 mod vllm_agentic_api;
 mod web_search;
+mod semantic_router;

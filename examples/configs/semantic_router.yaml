@@ -1,0 +1,51 @@
+# Semantic Router Evaluation
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+#
+# Routes LLM API requests dynamically based on the complexity
+# of the prompt text extracted from the JSON body. Uses the
+# `semantic_router` filter to score the prompt and rewrite the
+# destination cluster.
+#
+# Example request:
+#
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}'
+#
+# This configuration relies on the mock EvaluationBackend for
+# testing purposes, which always returns a score of 0.1, routing
+# everything to the light_cluster.
+
+listeners:
+  - name: semantic-gateway
+    address: "0.0.0.0:8080" # dev value; binds all interfaces
+    filter_chains:
+      - routing
+
+filter_chains:
+  - name: routing
+    filters:
+      - filter: semantic_router
+        backend: mock
+        routes:
+          - min_score: 0.8
+            target_cluster: heavy_cluster
+          - max_score: 0.79
+            target_cluster: light_cluster
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: default_cluster
+      - filter: load_balancer
+        clusters:
+          - name: heavy_cluster
+            endpoints:
+              - "10.0.1.1:8080"
+          - name: light_cluster
+            endpoints:
+              - "10.0.2.1:8080"
+          - name: default_cluster
+            endpoints:
+              - "10.0.3.1:8080"

@@ -25,10 +25,12 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 http = { workspace = true }
+ort = "2.0.0-rc.12"
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 rand = { workspace = true }
+reqwest.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

@@ -4,5 +4,7 @@
 //! AI inference proxy filters.
 
 mod model_to_header;
+mod semantic_router;
 
 pub use model_to_header::ModelToHeaderFilter;
+pub use semantic_router::SemanticRouterFilter;
