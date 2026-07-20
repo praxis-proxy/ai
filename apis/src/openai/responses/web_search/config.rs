@@ -28,6 +28,8 @@ pub(crate) enum SearchProvider {
     Brave,
     /// Tavily Search API.
     Tavily,
+    /// You.com Search API.
+    You,
 }
 
 impl SearchProvider {
@@ -36,6 +38,7 @@ impl SearchProvider {
         match self {
             Self::Brave => "brave",
             Self::Tavily => "tavily",
+            Self::You => "you",
         }
     }
 }
@@ -147,7 +150,7 @@ pub(crate) struct ValidatedConfig {
     pub provider: SearchProvider,
 
     /// Resolved API key.
-    pub api_key: String,
+    pub api_key: SecretString,
 
     /// Default search context size.
     pub default_context_size: SearchContextSize,
@@ -201,7 +204,7 @@ pub(super) fn build_config(raw: &WebSearchFilterConfig) -> Result<ValidatedConfi
     let status_on_error = validate_status_on_error(raw.status_on_error)?;
     Ok(ValidatedConfig {
         provider: raw.provider,
-        api_key,
+        api_key: SecretString::from(api_key),
         default_context_size,
         timeout_ms,
         max_body_bytes: validate_max_body_bytes_field(raw.max_body_bytes)?,
@@ -281,7 +284,7 @@ fn resolve_api_key(raw: &str) -> Result<String, FilterError> {
     reason = "tests"
 )]
 mod tests {
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret as _, SecretString};
 
     use super::*;
 
@@ -301,7 +304,7 @@ mod tests {
     fn build_config_applies_defaults() {
         let cfg = build_config(&base_config()).unwrap();
         assert_eq!(cfg.provider, SearchProvider::Brave);
-        assert_eq!(cfg.api_key, "test-key-123");
+        assert_eq!(cfg.api_key.expose_secret(), "test-key-123");
         assert_eq!(cfg.default_context_size, SearchContextSize::Medium);
         assert_eq!(cfg.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert_eq!(cfg.max_body_bytes, MAX_JSON_BODY_BYTES);
@@ -441,5 +444,6 @@ mod tests {
     fn search_provider_as_str() {
         assert_eq!(SearchProvider::Brave.as_str(), "brave");
         assert_eq!(SearchProvider::Tavily.as_str(), "tavily");
+        assert_eq!(SearchProvider::You.as_str(), "you");
     }
 }

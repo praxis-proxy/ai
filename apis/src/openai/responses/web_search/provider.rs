@@ -10,6 +10,7 @@ use praxis_core::callout::{
     CalloutClient, CalloutConfig, CalloutRequest, CalloutResult, CircuitBreakerConfig, FailureMode as CoreFailureMode,
 };
 use praxis_filter::FilterError;
+use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -59,7 +60,7 @@ pub(crate) struct SearchClient {
     /// Search backend provider.
     provider: SearchProvider,
     /// API key for the search provider.
-    api_key: String,
+    api_key: SecretString,
     /// Default search context size.
     default_context_size: SearchContextSize,
     /// Failure mode governing what happens on parse errors.
@@ -127,6 +128,7 @@ impl SearchClient {
         let request = match self.provider {
             SearchProvider::Brave => self.build_brave_request(query, count),
             SearchProvider::Tavily => self.build_tavily_request(query, size),
+            SearchProvider::You => self.build_you_request(query, count),
         };
         self.handle_callout_result(self.client.execute(request).await)
     }
@@ -164,7 +166,8 @@ impl SearchClient {
                 (http::header::ACCEPT, http::HeaderValue::from_static("application/json")),
                 (
                     http::HeaderName::from_static("x-subscription-token"),
-                    http::HeaderValue::from_str(&self.api_key).unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                    http::HeaderValue::from_str(self.api_key.expose_secret())
+                        .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                 ),
             ],
             body: None,
@@ -181,7 +184,7 @@ impl SearchClient {
         let max_results = context_size.result_count();
 
         let body = serde_json::json!({
-            "api_key": self.api_key,
+            "api_key": self.api_key.expose_secret(),
             "query": query,
             "search_depth": search_depth,
             "max_results": max_results,
@@ -202,6 +205,33 @@ impl SearchClient {
         }
     }
 
+    /// Build a You.com Search API request.
+    fn build_you_request(&self, query: &str, count: u32) -> CalloutRequest {
+        let body = serde_json::json!({
+            "query": query,
+            "count": count,
+        });
+
+        CalloutRequest {
+            method: http::Method::POST,
+            url: "https://api.you.com/v1/search".to_owned(),
+            headers: vec![
+                (
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
+                ),
+                (http::header::ACCEPT, http::HeaderValue::from_static("application/json")),
+                (
+                    http::HeaderName::from_static("x-api-key"),
+                    http::HeaderValue::from_str(self.api_key.expose_secret())
+                        .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                ),
+            ],
+            body: Some(serde_json::to_vec(&body).unwrap_or_default()),
+            depth: 0,
+        }
+    }
+
     /// Parse search results from the provider's JSON response.
     fn parse_response(&self, body: &[u8]) -> SearchOutcome {
         let json: Value = match serde_json::from_slice(body) {
@@ -215,6 +245,7 @@ impl SearchClient {
         let results = match self.provider {
             SearchProvider::Brave => parse_brave_results(&json),
             SearchProvider::Tavily => parse_tavily_results(&json),
+            SearchProvider::You => parse_you_results(&json),
         };
 
         debug!(
@@ -290,6 +321,28 @@ fn parse_tavily_results(json: &Value) -> Vec<SearchResult> {
         .unwrap_or_default()
 }
 
+/// Parse You.com Search API results.
+///
+/// Expected shape: `{ "results": { "web": [ { "title", "url", "description" } ], "news": [...] } }`.
+fn parse_you_results(json: &Value) -> Vec<SearchResult> {
+    ["web", "news"]
+        .into_iter()
+        .filter_map(|section| json.get("results")?.get(section)?.as_array())
+        .flatten()
+        .filter_map(|result| {
+            Some(SearchResult {
+                title: result.get("title")?.as_str()?.to_owned(),
+                url: result.get("url")?.as_str()?.to_owned(),
+                snippet: result
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -304,6 +357,7 @@ fn parse_tavily_results(json: &Value) -> Vec<SearchResult> {
     reason = "tests"
 )]
 mod tests {
+    use secrecy::SecretString;
     use serde_json::json;
 
     use super::*;
@@ -392,10 +446,67 @@ mod tests {
     }
 
     #[test]
+    fn build_you_request_uses_callout_client_contract() {
+        let config = ValidatedConfig {
+            provider: SearchProvider::You,
+            api_key: SecretString::from("test-key".to_owned()),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            failure_mode: FailureMode::Closed,
+            status_on_error: 502,
+        };
+        let client = SearchClient::from_config(&config).unwrap();
+
+        let request = client.build_you_request("Praxis proxy", 5);
+
+        assert_eq!(request.method, http::Method::POST);
+        assert_eq!(request.url, "https://api.you.com/v1/search");
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-api-key" && value == "test-key"),
+            "You.com requests must send X-API-Key through the Praxis callout"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(request.body.as_deref().unwrap()).unwrap(),
+            json!({"query": "Praxis proxy", "count": 5})
+        );
+    }
+
+    #[test]
+    fn parse_you_results_merges_web_and_news_sections() {
+        let json = json!({
+            "results": {
+                "web": [
+                    {"title": "Praxis", "url": "https://praxis.example", "description": "Proxy"},
+                    {"description": "Missing identity"}
+                ],
+                "news": [
+                    {"title": "vLLM", "url": "https://vllm.example", "description": "Inference"}
+                ]
+            }
+        });
+
+        let results = parse_you_results(&json);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Praxis");
+        assert_eq!(results[0].snippet, "Proxy");
+        assert_eq!(results[1].title, "vLLM");
+    }
+
+    #[test]
+    fn parse_you_results_handles_missing_sections() {
+        assert!(parse_you_results(&json!({"results": {}})).is_empty());
+    }
+
+    #[test]
     fn search_client_from_config() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: "test-key".into(),
+            api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -410,7 +521,7 @@ mod tests {
     fn parse_failure_closed_mode_rejects() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: "test-key".into(),
+            api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
@@ -429,7 +540,7 @@ mod tests {
     fn parse_failure_open_mode_skips() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: "test-key".into(),
+            api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
