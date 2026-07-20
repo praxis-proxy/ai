@@ -38,6 +38,7 @@ use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
+use serde::ser::SerializeMap as _;
 use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
@@ -109,8 +110,7 @@ impl ResponsesProxyFilter {
         state: &ResponsesState,
         streaming: bool,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let outbound = rebuild_outbound_body(state);
-        let serialized = serde_json::to_vec(&outbound)
+        let serialized = serialize_outbound_body(state)
             .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
         if serialized.len() > self.config.max_body_bytes {
             debug!(
@@ -215,17 +215,70 @@ fn strip_conversation_field(body: &mut Option<Bytes>) {
     }
 }
 
-/// Build the outbound JSON body from conversation state.
-fn rebuild_outbound_body(state: &ResponsesState) -> serde_json::Value {
-    let mut outbound = state.request_body.clone();
-    if let Some(obj) = outbound.as_object_mut() {
-        obj.insert("input".to_owned(), serde_json::Value::Array(state.messages.clone()));
-        if obj.remove("previous_response_id").is_some() {
-            debug!("stripped previous_response_id from outbound body");
+/// Borrowed view of the outbound request body.
+///
+/// This keeps the original request and message history borrowed while
+/// replacing `input` and omitting locally consumed fields during
+/// serialization, avoiding full-body and message clones.
+struct OutboundBody<'a> {
+    /// Shared request state to project into the provider body.
+    state: &'a ResponsesState,
+}
+
+impl serde::Serialize for OutboundBody<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Some(object) = self.state.request_body.as_object() else {
+            return self.state.request_body.serialize(serializer);
+        };
+
+        let mut map = serializer.serialize_map(None)?;
+        let mut wrote_input = false;
+        for (name, value) in object {
+            match name.as_str() {
+                "input" => {
+                    map.serialize_entry(name, &self.state.messages)?;
+                    wrote_input = true;
+                },
+                "previous_response_id" | "conversation" => {},
+                _ => map.serialize_entry(name, value)?,
+            }
         }
-        if obj.remove("conversation").is_some() {
-            debug!("stripped conversation from outbound body");
+        if !wrote_input {
+            map.serialize_entry("input", &self.state.messages)?;
         }
+        map.end()
     }
-    outbound
+}
+
+/// Serialize the outbound body without cloning request state.
+fn serialize_outbound_body(state: &ResponsesState) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&OutboundBody { state })
+}
+
+/// Count the exact bytes the proxy will serialize for an outbound body.
+pub(super) fn serialized_outbound_body_len(state: &ResponsesState) -> Result<usize, serde_json::Error> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, &OutboundBody { state })?;
+    Ok(counter.bytes)
+}
+
+/// Writer that counts serialized bytes without allocating a second body.
+#[derive(Default)]
+struct ByteCounter {
+    /// Number of bytes written by the serializer.
+    bytes: usize,
+}
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

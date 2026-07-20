@@ -14,6 +14,7 @@ mod full_flow;
 mod mcp_broker;
 mod model_to_header;
 mod openai_conversations;
+mod openai_file_resolve;
 mod openai_mcp_tool_resolve;
 mod openai_response_store;
 mod openai_response_store_postgres;

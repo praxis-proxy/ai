@@ -2839,6 +2839,7 @@ name = "praxis-ai-apis"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "dashmap 6.2.1",

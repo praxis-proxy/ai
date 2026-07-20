@@ -1,0 +1,67 @@
+# Responses File Resolve
+#
+# Resolves `file_id` references in Responses API input by fetching
+# file metadata and content from a Files API, then inlining base64
+# content as `file_data` or `image_url` before forwarding.
+#
+# This pipeline uses `openai_responses_format` to classify the
+# request, then `openai_file_resolve` to resolve any
+# `input_file` or `input_image` content parts that reference
+# files by ID.
+#
+# Use case: Codex or other Responses API clients send file
+# references (`file_id: "file-abc123"`) and the proxy
+# transparently inlines the content so the backend receives
+# a self-contained request.
+#
+# This filter resolves the file transport reference only. The
+# inference backend must support inline `input_file` / `file_data`
+# or `input_image` / `image_url` content. Backend-specific document
+# extraction for vLLM is tracked separately in issue #397.
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [file-resolve-pipeline]
+
+filter_chains:
+  - name: file-resolve-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:9999"
+        allow_private_files_api_url: true
+        # StreamBuffer body filters run before this listener's
+        # header-phase security filters. Enable only when an outer
+        # trust boundary has already authenticated and authorized
+        # requests reaching this listener.
+        allow_pre_security_callout: true
+        forward_headers:
+          - authorization
+          - x-tenant-id
+        on_missing: reject
+        timeout_ms: 10000
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            cluster: "inference-backend"
+          - path_prefix: "/"
+            cluster: "default-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "default-backend"
+            endpoints:
+              - "127.0.0.1:3002"
