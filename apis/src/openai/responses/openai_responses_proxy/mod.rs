@@ -9,11 +9,11 @@
 //! Named `inference` in pipeline configs so branch chains can
 //! `rejoin` here for the agentic tool loop.
 //!
-//! When `ResponsesState` is present in `RequestExtensions`,
-//! rebuilds the request body with the full conversation history
-//! from `state.messages` and strips `previous_response_id` (already
-//! resolved by the rehydrate filter). When no state is present,
-//! passes the body through unchanged.
+//! When `ResponsesState` is present in `RequestExtensions`, replaces
+//! the request input with `state.messages` only after conversation
+//! history has changed it. It strips `previous_response_id` only after
+//! the rehydrate filter has resolved it locally. Every path removes the
+//! Praxis-owned `conversation` field before forwarding upstream.
 
 mod config;
 
@@ -52,12 +52,12 @@ use super::{error::responses_error_rejection, state::ResponsesState};
 ///
 /// Reads the assembled conversation history from
 /// `ResponsesState::messages` and replaces the `input` field in
-/// the outbound body. Strips `previous_response_id` since Praxis
-/// already resolved it locally via the rehydrate filter.
+/// the outbound body when it differs from the original normalized
+/// input. Strips `previous_response_id` after Praxis resolves it
+/// locally via the rehydrate filter.
 ///
-/// When no `ResponsesState` exists (non-Responses requests, or
-/// requests without `previous_response_id`), passes through
-/// unchanged.
+/// When no `ResponsesState` exists, preserves the request body apart
+/// from removing the Praxis-owned `conversation` field.
 ///
 /// # YAML
 ///
@@ -173,6 +173,12 @@ impl HttpFilter for ResponsesProxyFilter {
             return Ok(FilterAction::Continue);
         };
 
+        if !request_needs_rebuild(state) {
+            strip_conversation_field(ctx, body);
+            debug!("ResponsesState does not require an outbound rewrite, passthrough");
+            return Ok(FilterAction::Continue);
+        }
+
         let streaming = ctx
             .get_metadata("openai_responses_format.stream")
             .is_some_and(|v| v == "true");
@@ -284,4 +290,14 @@ impl std::io::Write for ByteCounter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Return whether state requires parsing and rebuilding the outbound body.
+fn request_needs_rebuild(state: &ResponsesState) -> bool {
+    state.messages != state.input
+        || (state.history_rehydrated
+            && (state.previous_response_id.is_some()
+                || state.conversation.is_some()
+                || state.request_body.get("previous_response_id").is_some()
+                || state.request_body.get("conversation").is_some()))
 }
