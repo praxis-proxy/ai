@@ -15,7 +15,7 @@ using the official OpenAI Python SDK.
 
 Usage:
     cargo build -p praxis-ai-proxy
-    uv run pytest tests/integration/sdk/openai/test_openai_responses_vllm.py -v
+    uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 """
 
 import os
@@ -38,19 +38,6 @@ VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
-
-# ---------------------------------------------------------------------------
-# Failure tracking for log output
-# ---------------------------------------------------------------------------
-
-_any_test_failed = False
-
-
-def pytest_runtest_makereport(item, call):
-    global _any_test_failed
-    if call.when == "call" and call.excinfo is not None:
-        _any_test_failed = True
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -119,7 +106,7 @@ def _wait_for_proxy(port: int, timeout: float = 30.0) -> None:
 
 
 @pytest.fixture(scope="session")
-def praxis_proxy(tmp_path_factory):
+def praxis_proxy(tmp_path_factory, request):
     """Start a Praxis proxy backed by vLLM for the test session."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses")
@@ -148,7 +135,7 @@ def praxis_proxy(tmp_path_factory):
             proc.kill()
             proc.wait()
         log_file.close()
-        if not started or _any_test_failed:
+        if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
                     f"\n=== Praxis logs ===\n{f.read()}",
