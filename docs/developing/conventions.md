@@ -298,6 +298,16 @@ Before submitting or merging PRs, ensure that you have:
 > **Note**: `Draft` pull requests are not exempt from these guidelines.
 > They are still expected to be reviewed before submission.
 
+## Issue Assignment
+
+If you are interested in working on an issue, comment on
+it to express your interest. A maintainer will assign it
+to you. **Do not open a pull request for an issue you are
+not assigned to.** Unassigned PRs will be closed.
+
+This avoids duplicate effort and gives maintainers
+visibility into who is working on what.
+
 ## PR Review Process
 
 The `praxis-bot` GitHub App runs automated code review
