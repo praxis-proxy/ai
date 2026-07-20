@@ -122,7 +122,7 @@ impl McpDispatchFilter {
             warn!("ResponsesState missing when handling approval");
             return FilterAction::Continue;
         };
-        state.output_items.push(approval_event);
+        state.output_items_mut().push(approval_event);
 
         ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "done".to_owned());
 
@@ -169,7 +169,7 @@ impl HttpFilter for McpDispatchFilter {
         for result in results {
             state.messages.push(result.message.clone());
             state.persisted_messages.push(result.message);
-            state.output_items.push(result.output_item);
+            state.output_items_mut().push(result.output_item);
         }
 
         let tool_map_ref = &state.mcp_tool_map;

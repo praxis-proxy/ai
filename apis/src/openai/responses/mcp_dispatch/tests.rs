@@ -907,6 +907,6 @@ async fn on_request_executes_and_appends_results() {
     assert!(matches!(result, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(!state.messages.is_empty(), "should append result messages");
-    assert!(!state.output_items.is_empty(), "should append output items");
+    assert!(!state.output_items().is_empty(), "should append output items");
     assert!(state.tool_calls.is_empty(), "should clear executed MCP tool calls");
 }
