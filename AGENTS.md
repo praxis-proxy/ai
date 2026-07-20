@@ -86,9 +86,9 @@ coding style guide.
 
 ## Git Workflow
 
-- **Never amend commits** (`git commit --amend`).
-- When addressing PR review feedback, add new
-  fixup commits on top of the branch.
+- **Never amend commits** — when addressing PR
+  review feedback, add new fixup commits on top
+  of the branch.
 - PRs are merged with **squash and merge**, so the
   final commit on the target branch is always clean
   regardless of intermediate fixup commits.
