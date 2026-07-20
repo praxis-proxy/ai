@@ -282,6 +282,31 @@ impl ConversationItemStore for SqliteResponseStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        expected_messages: &serde_json::Value,
+        messages: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        let expected =
+            serde_json::to_string(expected_messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let messages = serde_json::to_string(messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let sql = format!(
+            "UPDATE {} SET messages = ? WHERE conversation_id = ? AND tenant_id = ? AND messages = ?",
+            self.tables.conversations
+        );
+        let result = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&messages)
+            .bind(conversation_id)
+            .bind(tenant_id)
+            .bind(&expected)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn get_conversation(
         &self,
         tenant_id: &str,

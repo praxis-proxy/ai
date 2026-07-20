@@ -544,6 +544,39 @@ async fn update_conversation_messages_preserves_metadata() {
 }
 
 #[tokio::test]
+async fn compare_and_swap_conversation_messages_rejects_stale_snapshot() {
+    let store = make_store().await;
+    let initial = json!([{"role":"user","content":"initial"}]);
+    let record = ConversationRecord {
+        conversation_id: "conv_cas".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: initial.clone(),
+    };
+    store.upsert_conversation(&record).await.expect("upsert should succeed");
+
+    let first = json!([{"role":"assistant","content":"first"}]);
+    assert!(
+        store
+            .compare_and_swap_conversation_messages("tenant_a", "conv_cas", &initial, &first)
+            .await
+            .expect("first compare-and-swap should succeed")
+    );
+    assert!(
+        !store
+            .compare_and_swap_conversation_messages("tenant_a", "conv_cas", &initial, &json!([]))
+            .await
+            .expect("stale compare-and-swap should be conflict-free")
+    );
+    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_cas")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    assert_eq!(fetched.messages, first);
+}
+
+#[tokio::test]
 async fn get_missing_conversation_returns_none() {
     let store = make_store().await;
 
