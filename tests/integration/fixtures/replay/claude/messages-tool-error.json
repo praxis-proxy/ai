@@ -1,0 +1,124 @@
+{
+  "source": "Sanitized Claude Code session log",
+  "protocol": "anthropic_messages",
+  "turns": [
+    {
+      "name": "messages-tool-result-error",
+      "path": "/v1/messages",
+      "request": {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Show the contents of the missing fixture file."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "I will inspect that file from the shell."
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_replay_bash_error_01",
+                "name": "bash",
+                "input": {
+                  "command": "cat fixtures/missing.txt"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_replay_bash_error_01",
+                "content": "cat: fixtures/missing.txt: No such file or directory",
+                "is_error": true
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "bash_20250124",
+            "name": "bash"
+          }
+        ]
+      },
+      "response": {
+        "id": "msg_replay_tool_error_01",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "content": [
+          {
+            "type": "text",
+            "text": "The command failed because fixtures/missing.txt does not exist."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 42,
+          "output_tokens": 9
+        }
+      },
+      "source_records": [
+        {
+          "uuid": "00000000-0000-4000-8000-000000000204",
+          "parentUuid": "00000000-0000-4000-8000-000000000203",
+          "sessionId": "00000000-0000-4000-8000-000000000200",
+          "timestamp": "2026-07-08T18:10:03Z",
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_replay_bash_error_01",
+                "content": "cat: fixtures/missing.txt: No such file or directory",
+                "is_error": true
+              }
+            ]
+          },
+          "cwd": "fixture-cwd",
+          "version": "2.1.204",
+          "gitBranch": "fixture-branch"
+        },
+        {
+          "uuid": "00000000-0000-4000-8000-000000000205",
+          "parentUuid": "00000000-0000-4000-8000-000000000204",
+          "sessionId": "00000000-0000-4000-8000-000000000200",
+          "timestamp": "2026-07-08T18:10:04Z",
+          "type": "assistant",
+          "message": {
+            "id": "msg_replay_tool_error_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [
+              {
+                "type": "text",
+                "text": "The command failed because fixtures/missing.txt does not exist."
+              }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+              "input_tokens": 42,
+              "output_tokens": 9
+            }
+          },
+          "requestId": "req_replay_tool_error_01",
+          "cwd": "fixture-cwd",
+          "version": "2.1.204",
+          "gitBranch": "fixture-branch"
+        }
+      ]
+    }
+  ]
+}

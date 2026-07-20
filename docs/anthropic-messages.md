@@ -178,7 +178,10 @@ filter_chains:
 The `anthropic_to_openai` filter:
 - Hoists `system` to an OpenAI system message
 - Flattens content blocks (text, image, tool_use,
-  tool_result)
+  tool_result, document, search_result)
+- Marks `tool_result.is_error` in translated tool
+  message text because Chat Completions has no
+  equivalent tool-result error flag
 - Maps `stop_sequences` to `stop`,
   `tool_choice` semantics, tool definitions
 - Preserves `top_k` as an extra body parameter

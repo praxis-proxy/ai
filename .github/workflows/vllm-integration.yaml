@@ -1,0 +1,122 @@
+name: vLLM Integration
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apis/src/openai/responses/**"
+      - "apis/src/openai/sse/**"
+      - "server/**"
+      - "tests/integration/sdk/openai/**"
+      - "examples/configs/openai/responses/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/vllm-integration.yaml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "apis/src/openai/responses/**"
+      - "apis/src/openai/sse/**"
+      - "server/**"
+      - "tests/integration/sdk/openai/**"
+      - "examples/configs/openai/responses/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/vllm-integration.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
+  VLLM_MODEL: "Qwen/Qwen3-0.6B"
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Responses API integration tests against a real vLLM CPU backend
+  # ----------------------------------------------------------------------------
+
+  vllm-responses:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+
+      - name: Cache Cargo artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-1.96.0-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.96.0-cargo-
+          save-always: true
+
+      - name: Pull vLLM CPU image
+        run: docker pull "$VLLM_IMAGE"
+
+      - name: Start vLLM
+        run: |
+          docker run -d --name vllm \
+            -p 8000:8000 \
+            --privileged=true \
+            "$VLLM_IMAGE" \
+            --model /root/.cache/Qwen/Qwen3-0.6B \
+            --max-model-len 4096 \
+            --served-model-name "$VLLM_MODEL" \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            --reasoning-parser deepseek_r1 \
+            --gpu-memory-utilization 0.7
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Wait for vLLM readiness
+        run: |
+          echo "Waiting for vLLM health and model endpoints..."
+          timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+            sleep 5
+          done'
+          echo "vLLM is ready"
+
+      - name: Run vLLM integration tests
+        run: |
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+
+      - name: vLLM container logs
+        if: failure()
+        run: docker logs vllm
+
+      - name: Stop vLLM
+        if: always()
+        run: docker rm -f vllm || true
