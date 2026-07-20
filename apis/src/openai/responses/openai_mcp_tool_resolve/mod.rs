@@ -21,11 +21,12 @@ mod config;
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     reason = "tests"
 )]
 mod tests;
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -117,7 +118,7 @@ impl McpToolResolveFilter {
 
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
 
-        let map = self.build_tool_map(&mcp_entries, previous_tools).await?;
+        let map = self.build_tool_map(mcp_entries, previous_tools).await?;
 
         if map.is_empty() {
             return Ok(FilterAction::Continue);
@@ -128,59 +129,165 @@ impl McpToolResolveFilter {
         Ok(FilterAction::Continue)
     }
 
-    /// Build tool map from all MCP entries, resolving each
-    /// server once and applying per-entry filters.
+    /// Build tool map from all MCP entries, resolving each distinct
+    /// server concurrently and applying per-entry filters in the
+    /// original entry order.
+    ///
+    /// Network I/O runs per distinct server, not per entry:
+    /// credential-less entries that share a `(server_label,
+    /// server_url)` are fetched exactly once, while credentialed
+    /// entries fetch individually because their `authorization` and
+    /// `headers` make each request distinct. Fetches are skipped when
+    /// `previous_tools` already covers an entry, but every resolvable
+    /// server URL is still validated so the SSRF check always runs.
+    /// The resulting listings are then filtered and inserted per entry.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "per-distinct-server concurrent resolution plus per-entry post-processing"
+    )]
     async fn build_tool_map(
         &self,
-        entries: &[serde_json::Value],
+        entries: Vec<serde_json::Value>,
         previous_tools: Option<&Vec<serde_json::Value>>,
     ) -> Result<HashMap<(String, String), serde_json::Value>, ResolveError> {
         let mut tool_map = HashMap::new();
-        let mut fetched: HashMap<(&str, &str), Vec<serde_json::Value>> = HashMap::new();
+        if entries.is_empty() {
+            return Ok(tool_map);
+        }
 
-        for entry in entries {
-            let Some(tools) = self.resolve_entry(entry, previous_tools, &mut fetched).await? else {
+        let entries = Arc::new(entries);
+        let previous_tools = previous_tools.map(|pt| Arc::new(pt.clone()));
+
+        // Classify resolvable entries: credential-less entries dedupe
+        // into per-distinct-server units keyed by `(label, url)`;
+        // credentialed entries stay per-entry because their
+        // credentials make each `tools/list` request distinct.
+        let mut server_units: HashMap<(String, String), ServerUnit> = HashMap::new();
+        let mut credentialed_idxs: Vec<usize> = Vec::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            let Some(server_url) = resolvable_server_url(entry) else {
                 continue;
             };
+            let label = server_label(entry);
+            if has_entry_credentials(entry) {
+                credentialed_idxs.push(idx);
+                continue;
+            }
             let allowed = extract_allowed_tools(entry);
-            insert_tools(&apply_allowed_tools_filter(tools, &allowed), entry, &mut tool_map);
+            let covered =
+                find_cached_listing(previous_tools.as_deref(), label, server_url, allowed.as_names()).is_some();
+            let unit = server_units
+                .entry((label.to_owned(), server_url.to_owned()))
+                .or_insert(ServerUnit {
+                    entry_idx: idx,
+                    needs_fetch: false,
+                });
+            if !covered {
+                unit.needs_fetch = true;
+            }
+        }
+
+        let timeout = self.timeout;
+        let max_tools = self.max_tools;
+        let allow_loopback = self.allow_loopback;
+
+        // Resolve each distinct server concurrently: fetch once when a
+        // live listing is needed, otherwise validate the URL so the
+        // SSRF check still runs on the cache-hit path. Credentialed
+        // entries fetch as their own concurrent tasks.
+        let mut join_set = tokio::task::JoinSet::new();
+        for ((label, server_url), unit) in server_units {
+            let entries = Arc::clone(&entries);
+            join_set.spawn(async move {
+                if unit.needs_fetch {
+                    let tools = match entries.get(unit.entry_idx) {
+                        Some(entry) => Some(fetch_tools(entry, &server_url, timeout, max_tools, allow_loopback).await?),
+                        None => None,
+                    };
+                    Ok::<ResolveOutcome, ResolveError>(ResolveOutcome::Server((label, server_url), tools))
+                } else {
+                    mcp_client::validate_mcp_url(&server_url, timeout, allow_loopback)
+                        .await
+                        .map_err(ResolveError::Client)?;
+                    Ok(ResolveOutcome::Server((label, server_url), None))
+                }
+            });
+        }
+        for idx in credentialed_idxs {
+            let entries = Arc::clone(&entries);
+            join_set.spawn(async move {
+                let Some(entry) = entries.get(idx) else {
+                    return Ok::<ResolveOutcome, ResolveError>(ResolveOutcome::Entry(idx, None));
+                };
+                let Some(server_url) = resolvable_server_url(entry) else {
+                    return Ok(ResolveOutcome::Entry(idx, None));
+                };
+                let tools = fetch_tools(entry, server_url, timeout, max_tools, allow_loopback).await?;
+                Ok(ResolveOutcome::Entry(idx, Some(tools)))
+            });
+        }
+
+        let mut fetched: HashMap<(String, String), Vec<serde_json::Value>> = HashMap::new();
+        let mut credentialed: HashMap<usize, Vec<serde_json::Value>> = HashMap::new();
+        while let Some(res) = join_set.join_next().await {
+            match res.map_err(ResolveError::Join)?? {
+                ResolveOutcome::Server(key, Some(tools)) => {
+                    fetched.insert(key, tools);
+                },
+                ResolveOutcome::Entry(idx, Some(tools)) => {
+                    credentialed.insert(idx, tools);
+                },
+                ResolveOutcome::Server(_, None) | ResolveOutcome::Entry(_, None) => {},
+            }
+        }
+
+        // Apply per-entry allowed_tools filters in original order,
+        // reusing the previous_tools cache before the freshly fetched
+        // per-server listing.
+        for (idx, entry) in entries.iter().enumerate() {
+            let Some(server_url) = resolvable_server_url(entry) else {
+                continue;
+            };
+            let label = server_label(entry);
+            let allowed = extract_allowed_tools(entry);
+            let tools = if has_entry_credentials(entry) {
+                credentialed.remove(&idx)
+            } else if let Some(cached) =
+                find_cached_listing(previous_tools.as_deref(), label, server_url, allowed.as_names())
+            {
+                debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
+                Some(cached)
+            } else {
+                fetched.get(&(label.to_owned(), server_url.to_owned())).cloned()
+            };
+            if let Some(tools) = tools {
+                insert_tools(&apply_allowed_tools_filter(tools, &allowed), entry, &mut tool_map);
+            }
         }
 
         Ok(tool_map)
     }
+}
 
-    /// Resolve tools for a single entry, reusing within-request
-    /// cached results for the same `(label, url)`.
-    async fn resolve_entry<'a>(
-        &self,
-        entry: &'a serde_json::Value,
-        previous_tools: Option<&Vec<serde_json::Value>>,
-        fetched: &mut HashMap<(&'a str, &'a str), Vec<serde_json::Value>>,
-    ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
-        let Some(server_url) = resolvable_server_url(entry) else {
-            return Ok(None);
-        };
-        let label = server_label(entry);
-        let has_credentials = has_entry_credentials(entry);
-        if !has_credentials && let Some(cached) = fetched.get(&(label, server_url)) {
-            return Ok(Some(cached.clone()));
-        }
-        mcp_client::validate_mcp_url(server_url, self.timeout, self.allow_loopback)
-            .await
-            .map_err(ResolveError::Client)?;
-        let allowed = extract_allowed_tools(entry);
-        if !has_credentials
-            && let Some(cached) = find_cached_listing(previous_tools, label, server_url, allowed.as_names())
-        {
-            debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
-            return Ok(Some(cached));
-        }
-        let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools, self.allow_loopback).await?;
-        if !has_credentials {
-            fetched.insert((label, server_url), tools.clone());
-        }
-        Ok(Some(tools))
-    }
+/// A distinct credential-less server to resolve.
+struct ServerUnit {
+    /// Index of a representative entry for this `(label, url)`,
+    /// used to source the `tools/list` request.
+    entry_idx: usize,
+
+    /// Whether at least one entry for this server needs a live
+    /// fetch (i.e. is not already covered by `previous_tools`).
+    needs_fetch: bool,
+}
+
+/// Result of one concurrent resolution task.
+enum ResolveOutcome {
+    /// A distinct credential-less server's fetched listing, keyed by
+    /// `(label, url)`; `None` when the URL was only validated.
+    Server((String, String), Option<Vec<serde_json::Value>>),
+
+    /// A credentialed entry's fetched listing, keyed by entry index.
+    Entry(usize, Option<Vec<serde_json::Value>>),
 }
 
 #[async_trait]
@@ -249,6 +356,10 @@ enum ResolveError {
         /// Configured maximum.
         max: usize,
     },
+
+    /// A concurrent resolution task panicked or was cancelled.
+    #[error("MCP resolution task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
 }
 
 // -----------------------------------------------------------------------------
@@ -257,22 +368,16 @@ enum ResolveError {
 
 /// Map a [`ResolveError`] to an appropriate rejection response.
 fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction {
-    match err {
+    let (status, error_type, msg, log_kind) = match err {
         ResolveError::TooManyServers { count, max } => {
             let msg = format!("too many MCP servers: {count} exceeds limit of {max}");
-            debug!(error = %msg, "openai_mcp_tool_resolve rejected");
-            FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", &msg, streaming))
+            (400, "invalid_request_error", msg, "rejected")
         },
-        ResolveError::Client(e) => {
-            debug!(error = %e, "openai_mcp_tool_resolve failed");
-            FilterAction::Reject(responses_error_rejection(
-                502,
-                "server_error",
-                &err.to_string(),
-                streaming,
-            ))
-        },
-    }
+        ResolveError::Client(_) => (502, "server_error", err.to_string(), "failed"),
+        ResolveError::Join(_) => (500, "server_error", err.to_string(), "failed"),
+    };
+    debug!(error = %msg, "openai_mcp_tool_resolve {log_kind}");
+    FilterAction::Reject(responses_error_rejection(status, error_type, &msg, streaming))
 }
 
 /// Return the `server_url` if the entry should be eagerly

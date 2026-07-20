@@ -3,6 +3,8 @@
 
 //! Unit tests for the `openai_mcp_tool_resolve` filter.
 
+use std::time::Duration;
+
 use super::*;
 
 // =========================================================================
@@ -1001,5 +1003,126 @@ fn write_tool_map_skips_state_creation_with_previous_response_id() {
     assert!(
         ctx.extensions.get::<ResponsesState>().is_none(),
         "should not create state when previous_response_id is present"
+    );
+}
+
+// =========================================================================
+// Concurrent resolution
+// =========================================================================
+
+/// Per-distinct-server `build_tool_map` must produce the same
+/// deterministic result as the former sequential implementation for a
+/// multi-server fixture, including two entries that share one
+/// `(server_label, server_url)`. Entries are resolved from the
+/// `previous_tools` cache so no real network calls are needed; the
+/// assertion verifies original entry-order insertion and overwrite
+/// behavior across distinct servers.
+#[tokio::test]
+async fn per_server_build_tool_map_matches_sequential_result() {
+    let filter = McpToolResolveFilter {
+        allow_loopback: false,
+        max_body_bytes: 64 * 1024,
+        max_servers: 10,
+        max_tools: 128,
+        timeout: Duration::from_millis(5000),
+    };
+
+    let entries = vec![
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": "http://10.0.0.5/mcp",
+            "allowed_tools": ["get_weather"]
+        }),
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "calendar",
+            "server_url": "http://10.0.0.6/mcp",
+            "allowed_tools": ["get_events"]
+        }),
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": "http://10.0.0.5/mcp",
+            "allowed_tools": ["get_forecast"]
+        }),
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "shared_label",
+            "server_url": "http://10.0.0.7/mcp",
+            "allowed_tools": ["shared_tool"],
+            "require_approval": "always"
+        }),
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "shared_label",
+            "server_url": "http://10.0.0.8/mcp",
+            "allowed_tools": ["shared_tool"],
+            "require_approval": "never"
+        }),
+    ];
+
+    let previous_tools = vec![
+        serde_json::json!({
+            "server_label": "weather",
+            "server_url": "http://10.0.0.5/mcp",
+            "tools": [
+                {"name": "get_weather", "description": "Get weather"},
+                {"name": "get_forecast", "description": "Get forecast"}
+            ]
+        }),
+        serde_json::json!({
+            "server_label": "calendar",
+            "server_url": "http://10.0.0.6/mcp",
+            "tools": [
+                {"name": "get_events", "description": "Get events"}
+            ]
+        }),
+        serde_json::json!({
+            "server_label": "shared_label",
+            "server_url": "http://10.0.0.7/mcp",
+            "tools": [
+                {"name": "shared_tool"}
+            ]
+        }),
+        serde_json::json!({
+            "server_label": "shared_label",
+            "server_url": "http://10.0.0.8/mcp",
+            "tools": [
+                {"name": "shared_tool"}
+            ]
+        }),
+    ];
+
+    let map = filter.build_tool_map(entries, Some(&previous_tools)).await.unwrap();
+
+    assert_eq!(map.len(), 4, "should contain four distinct (label, tool_name) entries");
+    assert!(
+        map.contains_key(&("weather".to_owned(), "get_weather".to_owned())),
+        "weather/get_weather should be present"
+    );
+    assert!(
+        map.contains_key(&("weather".to_owned(), "get_forecast".to_owned())),
+        "weather/get_forecast should be present"
+    );
+    assert!(
+        map.contains_key(&("calendar".to_owned(), "get_events".to_owned())),
+        "calendar/get_events should be present"
+    );
+    assert!(
+        map.contains_key(&("shared_label".to_owned(), "shared_tool".to_owned())),
+        "shared_label/shared_tool should be present"
+    );
+
+    let shared = &map[&("shared_label".to_owned(), "shared_tool".to_owned())];
+    assert_eq!(
+        shared.get("require_approval").and_then(serde_json::Value::as_str),
+        Some("never"),
+        "later entry with duplicate (label, tool_name) should overwrite the earlier one"
+    );
+    assert_eq!(
+        shared.get("server_url").and_then(serde_json::Value::as_str),
+        Some("http://10.0.0.8/mcp"),
+        "overwrite should keep the later entry's server_url"
     );
 }

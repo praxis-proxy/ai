@@ -336,6 +336,49 @@ fn mcp_tools_list_succeeds_against_mock_server() {
     );
 }
 
+/// Two entries referencing the SAME credential-less server must be
+/// resolved with exactly ONE `tools/list` fetch. This is the
+/// per-distinct-server concurrency contract (issue #344): the former
+/// per-entry implementation could race both entries past the shared
+/// cache and fetch twice.
+#[test]
+fn same_credential_less_server_fetched_once_for_two_entries() {
+    let mcp_config = McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather"),
+            McpToolFixture::new("get_forecast"),
+        ],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    // Two MCP entries on the same (server_label, server_url) with no
+    // credentials, differing only in allowed_tools.
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["get_weather"]}},{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["get_forecast"]}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 200, "resolution should succeed");
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        1,
+        "two entries on the same credential-less server must trigger exactly one tools/list fetch"
+    );
+    assert_eq!(
+        mcp_server.method_count("initialize"),
+        1,
+        "the shared server should be initialized exactly once"
+    );
+}
+
 #[test]
 fn mcp_too_many_tools_rejected() {
     let tools: Vec<McpToolFixture> = (0..5).map(|i| McpToolFixture::new(format!("tool_{i}"))).collect();
