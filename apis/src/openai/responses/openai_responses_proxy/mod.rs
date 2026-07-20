@@ -174,7 +174,7 @@ impl HttpFilter for ResponsesProxyFilter {
         };
 
         if !request_needs_rebuild(state) {
-            strip_conversation_field(ctx, body);
+            strip_conversation_field(body);
             debug!("ResponsesState does not require an outbound rewrite, passthrough");
             return Ok(FilterAction::Continue);
         }
