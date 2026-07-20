@@ -20,7 +20,7 @@ mod tests;
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
@@ -36,9 +36,6 @@ use rmcp::{
 
 /// Alibaba Cloud instance metadata service IPv4 endpoint.
 const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
-
-/// AWS EC2 instance metadata service IPv6 endpoint.
-const AWS_IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
 
 // -----------------------------------------------------------------------------
 // McpClientError
@@ -436,7 +433,8 @@ fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
 }
 
 /// AWS EC2 IMDS IPv6 endpoint.
-fn is_cloud_metadata_v6(v6: &Ipv6Addr) -> bool {
+fn is_cloud_metadata_v6(v6: &std::net::Ipv6Addr) -> bool {
+    const AWS_IMDS_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
     *v6 == AWS_IMDS_V6
 }
 
