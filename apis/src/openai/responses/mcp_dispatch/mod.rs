@@ -159,7 +159,7 @@ impl HttpFilter for McpDispatchFilter {
         debug!(count = mcp_calls.len(), "executing pending MCP tool calls");
 
         let parallel = state.parallel_tool_calls;
-        let tool_map = state.mcp_tool_map.clone();
+        let tool_map = std::sync::Arc::new(state.mcp_tool_map.clone());
         let results = execute_mcp_calls(&mcp_calls, &tool_map, parallel, self.timeout, self.allow_loopback).await;
 
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -357,37 +357,76 @@ struct McpCallResult {
 /// sequentially otherwise.
 async fn execute_mcp_calls(
     mcp_calls: &[serde_json::Value],
-    tool_map: &HashMap<(String, String), serde_json::Value>,
+    tool_map: &std::sync::Arc<HashMap<(String, String), serde_json::Value>>,
     parallel: bool,
     timeout: Duration,
     allow_loopback: bool,
 ) -> Vec<McpCallResult> {
     if parallel {
-        let shared_map = std::sync::Arc::new(tool_map.clone());
-        let handles: Vec<_> = mcp_calls
-            .iter()
-            .map(|tc| {
-                let tc = tc.clone();
-                let map = std::sync::Arc::clone(&shared_map);
-                tokio::spawn(async move { execute_single_call(&tc, &map, timeout, allow_loopback).await })
-            })
-            .collect();
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            if let Ok(Some(result)) = handle.await {
-                results.push(result);
-            }
-        }
-        results
+        execute_parallel(mcp_calls, tool_map, timeout, allow_loopback).await
     } else {
-        let mut results = Vec::with_capacity(mcp_calls.len());
-        for tc in mcp_calls {
-            if let Some(result) = execute_single_call(tc, tool_map, timeout, allow_loopback).await {
-                results.push(result);
-            }
-        }
-        results
+        execute_sequential(mcp_calls, tool_map, timeout, allow_loopback).await
     }
+}
+
+/// Execute MCP tool calls concurrently, emitting error results
+/// for any dropped or panicked tasks.
+async fn execute_parallel(
+    mcp_calls: &[serde_json::Value],
+    tool_map: &std::sync::Arc<HashMap<(String, String), serde_json::Value>>,
+    timeout: Duration,
+    allow_loopback: bool,
+) -> Vec<McpCallResult> {
+    let handles: Vec<_> = mcp_calls
+        .iter()
+        .map(|tc| {
+            let tc = tc.clone();
+            let map = std::sync::Arc::clone(tool_map);
+            tokio::spawn(async move { execute_single_call(&tc, &map, timeout, allow_loopback).await })
+        })
+        .collect();
+    let mut results = Vec::with_capacity(handles.len());
+    for (tc, handle) in mcp_calls.iter().zip(handles) {
+        match handle.await {
+            Ok(Some(result)) => results.push(result),
+            Ok(None) => {
+                if let Some(r) = error_result_for_dropped_call(tc, "internal error: call produced no result") {
+                    warn!(tool = ?tc.get("name"), "parallel MCP call returned None, emitting error");
+                    results.push(r);
+                }
+            },
+            Err(e) => {
+                if let Some(r) = error_result_for_dropped_call(tc, &format!("task failed: {e}")) {
+                    warn!(tool = ?tc.get("name"), error = %e, "parallel MCP call task failed, emitting error");
+                    results.push(r);
+                }
+            },
+        }
+    }
+    results
+}
+
+/// Execute MCP tool calls sequentially, emitting error results
+/// for any calls that produce no result.
+async fn execute_sequential(
+    mcp_calls: &[serde_json::Value],
+    tool_map: &std::sync::Arc<HashMap<(String, String), serde_json::Value>>,
+    timeout: Duration,
+    allow_loopback: bool,
+) -> Vec<McpCallResult> {
+    let mut results = Vec::with_capacity(mcp_calls.len());
+    for tc in mcp_calls {
+        match execute_single_call(tc, tool_map, timeout, allow_loopback).await {
+            Some(result) => results.push(result),
+            None => {
+                if let Some(r) = error_result_for_dropped_call(tc, "internal error: call produced no result") {
+                    warn!(tool = ?tc.get("name"), "sequential MCP call returned None, emitting error");
+                    results.push(r);
+                }
+            },
+        }
+    }
+    results
 }
 
 /// Resolve a tool name to its unique entry, rejecting ambiguity.
@@ -610,6 +649,20 @@ fn build_success_result(
     };
 
     McpCallResult { message, output_item }
+}
+
+/// Build an error result for a tool call that was dropped
+/// (task panic, cancellation, or missing fields).
+fn error_result_for_dropped_call(tool_call: &serde_json::Value, reason: &str) -> Option<McpCallResult> {
+    let call_id = tool_call
+        .get("call_id")
+        .or_else(|| tool_call.get("id"))
+        .and_then(serde_json::Value::as_str)?;
+    let tool_name = tool_call
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    Some(build_error_result(call_id, "unknown", tool_name, "", reason))
 }
 
 /// Build result structs for a failed MCP call.

@@ -729,13 +729,14 @@ async fn execute_single_call_connection_error() {
 async fn execute_mcp_calls_empty_input() {
     let map = sample_tool_map();
     let timeout = std::time::Duration::from_millis(100);
+    let map = std::sync::Arc::new(map);
     let results = execute_mcp_calls(&[], &map, false, timeout, true).await;
     assert!(results.is_empty());
 }
 
 #[tokio::test]
 async fn execute_mcp_calls_sequential() {
-    let map = sample_tool_map();
+    let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
     let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
@@ -745,7 +746,7 @@ async fn execute_mcp_calls_sequential() {
 
 #[tokio::test]
 async fn execute_mcp_calls_parallel() {
-    let map = sample_tool_map();
+    let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
     let results = execute_mcp_calls(&calls, &map, true, timeout, true).await;
@@ -754,12 +755,13 @@ async fn execute_mcp_calls_parallel() {
 }
 
 #[tokio::test]
-async fn execute_mcp_calls_skips_unknown_tools() {
-    let map = sample_tool_map();
+async fn execute_mcp_calls_emits_error_for_unknown_tools() {
+    let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "nonexistent", "call_id": "c1"})];
     let timeout = std::time::Duration::from_millis(100);
     let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
-    assert!(results.is_empty());
+    assert_eq!(results.len(), 1);
+    assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
 }
 
 // =========================================================================

@@ -28,12 +28,12 @@ filter_chains:
   - name: mcp-dispatch-pipeline
     filters:
       - filter: openai_tool_parse
-      - filter: mcp_tool_resolve
+      - filter: openai_mcp_tool_resolve
         timeout_ms: 5000
+      - filter: openai_stream_events
       - filter: openai_mcp_dispatch
         timeout_ms: 30000
         allow_loopback: false
-      - filter: openai_stream_events
       - filter: router
         routes:
           - path_prefix: "/"
