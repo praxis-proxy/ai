@@ -13,6 +13,25 @@ async fn validate_url(url: &str) -> Result<(), McpClientError> {
     validate_mcp_url(url, TEST_TIMEOUT, false).await
 }
 
+fn display_url(url: &str) -> McpDisplayUrl {
+    McpDisplayUrl::from_uri(&url.parse().unwrap())
+}
+
+fn assert_error_uses_sanitized_url(error: &McpClientError) {
+    let message = error.to_string();
+    assert!(
+        message.contains("https://example.com:8443/mcp/tools"),
+        "error should retain the sanitized endpoint: {message}"
+    );
+    assert!(!message.contains("user"), "error must redact URL userinfo: {message}");
+    assert!(!message.contains("pass"), "error must redact URL passwords: {message}");
+    assert!(!message.contains("api_key"), "error must redact query names: {message}");
+    assert!(
+        !message.contains("TOPSECRET"),
+        "error must redact query values: {message}"
+    );
+}
+
 // =========================================================================
 // Transport Config
 // =========================================================================
@@ -171,8 +190,7 @@ fn authorization_with_invalid_chars_returns_error() {
 #[test]
 fn connection_error_display() {
     let err = McpClientError::Connection {
-        url: "http://example.com/mcp".to_owned(),
-        source: "refused".into(),
+        url: display_url("http://example.com/mcp"),
     };
     let msg = err.to_string();
     assert!(msg.contains("example.com"), "should include URL");
@@ -182,7 +200,7 @@ fn connection_error_display() {
 #[test]
 fn timeout_error_display() {
     let err = McpClientError::Timeout {
-        url: "http://example.com/mcp".to_owned(),
+        url: display_url("http://example.com/mcp"),
         timeout: Duration::from_secs(5),
     };
     let msg = err.to_string();
@@ -193,7 +211,7 @@ fn timeout_error_display() {
 #[test]
 fn too_many_tools_error_display() {
     let err = McpClientError::TooManyTools {
-        url: "http://example.com/mcp".to_owned(),
+        url: display_url("http://example.com/mcp"),
         count: 200,
         max: 128,
     };
@@ -205,8 +223,7 @@ fn too_many_tools_error_display() {
 #[test]
 fn list_tools_error_display() {
     let err = McpClientError::ListTools {
-        url: "http://example.com/mcp".to_owned(),
-        source: "protocol error".into(),
+        url: display_url("http://example.com/mcp"),
     };
     let msg = err.to_string();
     assert!(msg.contains("tools/list failed"), "should describe failure");
@@ -221,6 +238,41 @@ fn invalid_authorization_error_display() {
         msg.contains("invalid HTTP header"),
         "should describe invalid header: {msg}"
     );
+}
+
+#[test]
+fn display_url_retains_only_routable_components() {
+    let display = display_url("https://user:pass@example.com:8443/mcp/tools?api_key=TOPSECRET");
+    assert_eq!(display.to_string(), "https://example.com:8443/mcp/tools");
+}
+
+#[test]
+fn display_url_preserves_ipv6_authority() {
+    let display = display_url("https://user:pass@[2001:db8::1]:8443/mcp?api_key=TOPSECRET");
+    assert_eq!(display.to_string(), "https://[2001:db8::1]:8443/mcp");
+}
+
+#[test]
+fn url_bearing_errors_only_format_sanitized_urls() {
+    let url = display_url("https://user:pass@example.com:8443/mcp/tools?api_key=TOPSECRET");
+    let errors = [
+        McpClientError::Connection { url: url.clone() },
+        McpClientError::ListTools { url: url.clone() },
+        McpClientError::Timeout {
+            url: url.clone(),
+            timeout: Duration::from_secs(5),
+        },
+        McpClientError::TooManyTools {
+            url: url.clone(),
+            count: 200,
+            max: 128,
+        },
+        McpClientError::SsrfBlocked(url),
+    ];
+
+    for error in &errors {
+        assert_error_uses_sanitized_url(error);
+    }
 }
 
 // =========================================================================
@@ -278,6 +330,57 @@ async fn ssrf_blocks_unresolvable_hostname() {
 }
 
 #[tokio::test]
+async fn ssrf_errors_redact_sensitive_url_components() {
+    let urls = [
+        "http://unresolvable.invalid/mcp?api_key=TOPSECRET",
+        "http://127.0.0.1/mcp?api_key=TOPSECRET",
+        "http://127.0.0.1/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
+    ];
+
+    for url in urls {
+        let message = validate_url(url).await.unwrap_err().to_string();
+        assert!(
+            !message.contains("TOPSECRET"),
+            "error must redact URL query credentials: {message}"
+        );
+        assert!(
+            !message.contains("FRAGMENTSECRET"),
+            "error must redact URL fragments: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_url_errors_use_opaque_display_value() {
+    let urls = [
+        "http://exa mple.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
+        "//user:pass@example.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
+        "ftp://user:pass@example.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
+    ];
+
+    for url in urls {
+        let message = validate_url(url).await.unwrap_err().to_string();
+        assert!(
+            message.contains("<invalid MCP URL>"),
+            "invalid URL should be opaque: {message}"
+        );
+        assert!(!message.contains("user"), "invalid URL must redact userinfo: {message}");
+        assert!(
+            !message.contains("pass"),
+            "invalid URL must redact passwords: {message}"
+        );
+        assert!(
+            !message.contains("TOPSECRET"),
+            "invalid URL must redact query values: {message}"
+        );
+        assert!(
+            !message.contains("FRAGMENTSECRET"),
+            "invalid URL must redact fragments: {message}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn ssrf_allows_public_ips() {
     assert!(validate_url("http://8.8.8.8/mcp").await.is_ok());
     assert!(validate_url("https://1.1.1.1:443/v1").await.is_ok());
@@ -291,7 +394,7 @@ async fn ssrf_allows_private_rfc1918() {
 
 #[test]
 fn ssrf_error_display() {
-    let err = McpClientError::SsrfBlocked("http://127.0.0.1/mcp".to_owned());
+    let err = McpClientError::SsrfBlocked(display_url("http://127.0.0.1/mcp"));
     let msg = err.to_string();
     assert!(msg.contains("SSRF"), "should mention SSRF");
     assert!(msg.contains("127.0.0.1"), "should include the URL");
@@ -318,6 +421,17 @@ async fn ssrf_blocks_url_with_userinfo() {
     let msg = err.to_string();
     assert!(!msg.contains("pass"), "error must not leak credentials");
     assert!(validate_url("https://user@example.com/mcp").await.is_err());
+
+    let ipv6_message = validate_url("http://user:pass@[::1]:8080/mcp?api_key=TOPSECRET")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!ipv6_message.contains("user"), "IPv6 error must redact URL userinfo");
+    assert!(!ipv6_message.contains("pass"), "IPv6 error must redact URL passwords");
+    assert!(
+        !ipv6_message.contains("TOPSECRET"),
+        "IPv6 error must redact URL queries"
+    );
 }
 
 #[tokio::test]
