@@ -1,5 +1,7 @@
 # vLLM Agentic API Responses passthrough
 #
+# vLLM Agentic API: https://github.com/vllm-project/agentic-api
+#
 # Agentic API owns previous_response_id hydration, response persistence,
 # web-search credentials, tool execution, and the model loop. Praxis only
 # classifies and routes this traffic, preserving the original request body.
