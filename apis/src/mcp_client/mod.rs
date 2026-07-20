@@ -20,7 +20,7 @@ mod tests;
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -29,6 +29,16 @@ use rmcp::{
     model::PaginatedRequestParams,
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Alibaba Cloud instance metadata service IPv4 endpoint.
+const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+
+/// AWS EC2 instance metadata service IPv6 endpoint.
+const AWS_IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
 
 // -----------------------------------------------------------------------------
 // McpClientError
@@ -351,19 +361,19 @@ async fn resolve_hostname_ssrf(
         })?
         .map_err(|_dns_err| McpClientError::SsrfBlocked(url.to_owned()))?
         .collect();
-    for addr in &addrs {
-        let ip = praxis_core::connectivity::normalize_mapped_ipv4(addr.ip());
-        if allow_loopback && ip.is_loopback() {
-            continue;
-        }
-        if is_ssrf_sensitive(&ip) {
-            return Err(McpClientError::SsrfBlocked(url.to_owned()));
-        }
-    }
+    check_resolved_addrs(&addrs, url, allow_loopback)?;
     Ok(ResolvedMcpUrl {
         hostname: Some(host.to_owned()),
         addrs,
     })
+}
+
+/// Check DNS-resolved addresses against the SSRF block list.
+fn check_resolved_addrs(addrs: &[SocketAddr], url: &str, allow_loopback: bool) -> Result<(), McpClientError> {
+    for addr in addrs {
+        check_ip(addr.ip(), url, allow_loopback)?;
+    }
+    Ok(())
 }
 
 /// Build a reqwest client with resolved addresses pinned, so
@@ -415,7 +425,9 @@ fn is_blocked_hostname(host: &str) -> bool {
 /// metadata addresses are SSRF-sensitive.
 fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || *v4 == ALIBABA_CLOUD_METADATA_V4
+        },
         IpAddr::V6(v6) => {
             let [a, b, ..] = v6.octets();
             v6.is_loopback() || v6.is_unspecified() || (a == 0xFE && (b & 0xC0) == 0x80) || is_cloud_metadata_v6(v6)
@@ -424,8 +436,7 @@ fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
 }
 
 /// AWS EC2 IMDS IPv6 endpoint.
-fn is_cloud_metadata_v6(v6: &std::net::Ipv6Addr) -> bool {
-    const AWS_IMDS_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
+fn is_cloud_metadata_v6(v6: &Ipv6Addr) -> bool {
     *v6 == AWS_IMDS_V6
 }
 
