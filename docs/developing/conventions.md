@@ -297,3 +297,47 @@ Before submitting or merging PRs, ensure that you have:
 
 > **Note**: `Draft` pull requests are not exempt from these guidelines.
 > They are still expected to be reviewed before submission.
+
+## Community Interactions
+
+Contributors interact with each other through issues,
+pull requests, discussions, code reviews, and other
+project channels. These interactions must be genuine
+and human.
+
+### Write Your Own Words
+
+When you reply to someone — a code review comment, a
+discussion thread, a question on an issue — write it
+yourself. These are conversations between people, and
+they should read that way.
+
+AI-generated boilerplate is easy to spot and erodes
+trust. A short, honest sentence you wrote yourself is
+worth more than three polished paragraphs a model
+produced. Say what you mean, ask what you do not
+understand, and skip what you have nothing to add to.
+
+This applies to:
+
+- Code review comments and replies
+- Discussion posts and responses
+
+Using AI tools to assist with *code* (generation,
+refactoring, debugging) or to help draft structured
+content like issue reports, PR descriptions, commit
+messages, and pull request titles is fine. The line is
+person-to-person communication: when you are replying
+to another human, do the talking yourself.
+
+### Be Present
+
+Engaging with a project means engaging with its people.
+Read what others wrote before replying. Ask genuine
+questions. Give feedback that shows you understood the
+context. If you disagree, explain why in your own
+reasoning.
+
+Conversations that feel like talking to a wall drive
+people away. Conversations that feel like talking to a
+person keep communities alive.
