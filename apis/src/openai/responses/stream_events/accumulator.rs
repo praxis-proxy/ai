@@ -58,21 +58,7 @@ pub(super) fn accumulate_event(
 
 /// Overwrite `ResponsesState` from a terminal event's authoritative payload.
 fn handle_terminal_event(ctx: &mut HttpFilterContext<'_>, payload: &Value, event: &ResponsesEvent) {
-    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-
     let response = payload.get("response").unwrap_or(payload);
-
-    response.clone_into(&mut state.response_object);
-
-    if let Some(Value::Array(output)) = response.get("output") {
-        output.clone_into(&mut state.output_items);
-    }
-
-    if let Some(usage) = response.get("usage")
-        && !usage.is_null()
-    {
-        usage.clone_into(&mut state.usage);
-    }
 
     let status = match event {
         ResponsesEvent::ResponseCompleted(_) => "completed",
@@ -80,9 +66,66 @@ fn handle_terminal_event(ctx: &mut HttpFilterContext<'_>, payload: &Value, event
         ResponsesEvent::ResponseFailed(_) => "failed",
         _ => "unknown",
     };
-    ctx.set_metadata("responses.status", status.to_owned());
+    // SSE payloads are borrowed from the frame parser, so terminal accumulation
+    // is the one path that must clone a complete response object.
+    let _ = accumulate_response_object(ctx, response.clone(), Some(status));
+}
 
-    debug!(status, "terminal event received, ResponsesState updated");
+/// Overwrite response fields from an authoritative complete response object.
+///
+/// `status_override` is authoritative for SSE terminal events. Other callers
+/// use the response object's own `status` field.
+pub(super) fn accumulate_response_object(
+    ctx: &mut HttpFilterContext<'_>,
+    mut response: Value,
+    status_override: Option<&str>,
+) -> bool {
+    let status = status_override
+        .map(str::to_owned)
+        .or_else(|| response.get("status").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let had_prior_usage = {
+        let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
+        let had_prior_usage = !state.usage.is_null();
+        if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
+            merge_usage(&mut state.usage, usage);
+        }
+        if !state.usage.is_null()
+            && let Some(object) = response.as_object_mut()
+        {
+            object.insert("usage".to_owned(), state.usage.clone());
+        }
+        state.response_object = response;
+        had_prior_usage
+    };
+    ctx.set_metadata("responses.status", status.clone());
+
+    debug!(status, "complete response received, ResponsesState updated");
+    had_prior_usage
+}
+
+/// Saturating recursive sum for numeric token-usage fields.
+fn merge_usage(accumulated: &mut Value, current: &Value) {
+    match (accumulated, current) {
+        (Value::Object(accumulated), Value::Object(current)) => {
+            for (key, value) in current {
+                match accumulated.get_mut(key) {
+                    Some(existing) => merge_usage(existing, value),
+                    None => {
+                        accumulated.insert(key.clone(), value.clone());
+                    },
+                }
+            }
+        },
+        (Value::Number(accumulated), Value::Number(current)) => {
+            if let (Some(left), Some(right)) = (accumulated.as_u64(), current.as_u64()) {
+                *accumulated = serde_json::Number::from(left.saturating_add(right));
+            } else {
+                *accumulated = current.clone();
+            }
+        },
+        (accumulated, current) => current.clone_into(accumulated),
+    }
 }
 
 /// Push a new output item to the incremental accumulator.

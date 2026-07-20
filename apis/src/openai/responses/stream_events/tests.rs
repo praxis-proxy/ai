@@ -13,7 +13,7 @@ use bytes::Bytes;
 use praxis_filter::{FilterAction, HttpFilter};
 use serde_json::json;
 
-use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState};
+use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object};
 use crate::{
     openai::{responses::state::ResponsesState, sse::SseFrameParser},
     test_utils::{make_filter_context, make_request},
@@ -196,6 +196,48 @@ async fn terminal_event_writes_response_object() {
     assert_eq!(state.output_items.len(), 1);
     assert_eq!(state.usage["total_tokens"], 15);
     assert_eq!(ctx.get_metadata("responses.status"), Some("completed"),);
+}
+
+#[test]
+fn response_accumulation_sums_usage_across_iterations() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.extensions.insert(ResponsesState::default());
+    let first = json!({
+        "status":"completed",
+        "output":[],
+        "usage":{
+            "input_tokens":10,
+            "output_tokens":4,
+            "total_tokens":14,
+            "input_tokens_details":{"cached_tokens":3}
+        }
+    });
+    let second = json!({
+        "status":"completed",
+        "output":[],
+        "usage":{
+            "input_tokens":7,
+            "output_tokens":2,
+            "total_tokens":9,
+            "input_tokens_details":{"cached_tokens":1}
+        }
+    });
+
+    assert!(!accumulate_response_object(&mut ctx, first, None));
+    assert!(accumulate_response_object(&mut ctx, second, None));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.usage["input_tokens"], 17);
+    assert_eq!(state.usage["output_tokens"], 6);
+    assert_eq!(state.usage["total_tokens"], 23);
+    assert_eq!(state.usage["input_tokens_details"]["cached_tokens"], 4);
+    assert_eq!(state.response_object["usage"], state.usage);
+
+    let final_without_usage = json!({"status":"completed","output":[]});
+    assert!(accumulate_response_object(&mut ctx, final_without_usage, None));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.response_object["usage"], state.usage);
+    assert_eq!(state.usage["total_tokens"], 23);
 }
 
 #[tokio::test]

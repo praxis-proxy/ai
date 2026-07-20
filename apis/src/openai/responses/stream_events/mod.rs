@@ -22,6 +22,8 @@ use praxis_filter::{
 };
 use tracing::{debug, trace, warn};
 
+#[cfg(test)]
+use self::accumulator::accumulate_response_object;
 use self::{accumulator::accumulate_event, config::StreamEventsConfig};
 use crate::openai::sse::{SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent};
 
