@@ -84,6 +84,15 @@ Follows the same conventions as
 See `docs/developing/conventions.md` for the full
 coding style guide.
 
+## Git Workflow
+
+- **Never amend commits** — when addressing PR
+  review feedback, add new fixup commits on top
+  of the branch.
+- PRs are merged with **squash and merge**, so the
+  final commit on the target branch is always clean
+  regardless of intermediate fixup commits.
+
 ## Test Requirements
 
 New capabilities require:
