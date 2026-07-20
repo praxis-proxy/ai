@@ -1,0 +1,71 @@
+# Compact Filter Example
+#
+# Demonstrates the compaction flow: store a response, rehydrate it
+# on the next turn, and count tokens to check if compaction is needed.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/openai/responses/compact.yaml
+#
+# Requires an OpenAI-compatible backend on port 11434 (e.g. Ollama).
+#
+# Test:
+#   # Step 1 — store a response
+#   RESP_ID=$(curl -s -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"llama3.2:1b","input":"Explain TCP vs UDP in detail"}' \
+#     | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+#
+#   # Step 2 — follow up with compaction (threshold=200 tokens)
+#   curl -s -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d "{\"model\":\"llama3.2:1b\",\"input\":\"Compare with QUIC\",\"previous_response_id\":\"$RESP_ID\",\"context_management\":[{\"type\":\"compaction\",\"compact_threshold\":200}],\"store\":false}"
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [compact-pipeline]
+
+filter_chains:
+  - name: compact-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+
+      - filter: openai_responses_validate
+
+      - filter: openai_tool_parse
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_stream_events
+
+      - filter: openai_responses_rehydrate
+
+      - filter: openai_responses_compact
+        inference_url: "http://localhost:11434/v1/chat/completions"
+        default_model: llama3.2:1b
+
+      - filter: openai_responses_proxy
+        name: inference
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:11434"

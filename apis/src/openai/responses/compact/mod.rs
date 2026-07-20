@@ -45,10 +45,6 @@ use {
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Metadata key for previous response total token count.
-/// Written by the rehydrate filter.
-const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
-
 #[expect(dead_code, reason = "scaffolding — used once build_summarization_request is implemented")]
 /// System prompt for the summarization call.
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
@@ -178,23 +174,32 @@ impl HttpFilter for CompactFilter {
             .get_metadata("openai_responses_format.stream")
             .is_some_and(|v| v == "true");
 
-        // TODO: implement the compaction flow:
-        //
-        // 1. Get ResponsesState from ctx.extensions
-        //    - If absent, return Release (no state to compact)
-        //
-        // 2. Call extract_compaction_config() on state.context_management
-        //    - If None, return Release (no compaction requested)
-        //
-        // 3. Call get_token_count() to get the current token count
-        //    - Try previous_usage metadata first, fall back to tiktoken
-        //    - If None (no count available), return Release
-        //
-        // 4. Compare token_count against params.compact_threshold
-        //    - If token_count <= threshold, return Release
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            debug!("no ResponsesState in extensions, passthrough");
+            return Ok(FilterAction::Release);
+        };
+
+
+        let Some(compaction_config) = extract_compaction_config(&state.context_management) else {
+            debug!("no compaction config in context management");
+            return Ok(FilterAction::Release);
+        };
+
+        let Some(token_count) = get_token_count(&state.messages, &self.config.tiktoken_encoding) else {
+            return Ok(FilterAction::Release);
+        };
+
+        if token_count <= compaction_config.compact_threshold {
+            debug!(token_count, threshold = compaction_config.compact_threshold, "under threshold, skipping compaction");
+            return Ok(FilterAction::Release);
+        }
+
+        debug!(token_count, threshold = compaction_config.compact_threshold, "threshold exceeded, compaction needed");
+
+        // TODO: implement remaining compaction flow:
         //
         // 5. Build summarization request via build_summarization_request()
-        //    - Use params.compaction_model or self.config.default_model
+        //    - Use compaction_config.compaction_model or self.config.default_model
         //    - Include state.request_body["instructions"] if present
         //
         // 6. Execute via self.callout_client.execute(request).await
@@ -206,7 +211,8 @@ impl HttpFilter for CompactFilter {
         // 7. Set metadata: "responses.compacted" = "true"
         //
         // 8. Return Release
-        todo!("implement compaction flow")
+        warn!("compaction not yet implemented, passing through");
+        Ok(FilterAction::Release)
     }
 }
 
@@ -220,53 +226,51 @@ impl HttpFilter for CompactFilter {
 /// `[{"type": "compaction", "compact_threshold": 50000}]`
 ///
 /// Returns `None` if no compaction entry is found.
-#[expect(
-    clippy::todo,
-    dead_code,
-    unused_variables,
-    reason = "scaffolding — implement context_management parsing"
-)]
 fn extract_compaction_config(context_management: &Option<Value>) -> Option<CompactionParams> {
-    // TODO: iterate the array, find the first entry where
-    //       type == "compaction", extract compact_threshold (u64)
-    //       and optional compaction_model (String)
-    todo!("parse context_management array")
+   let array = context_management.as_ref()?.as_array()?;
+
+    for entry in array {
+        let Some(entry_type) = entry.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if entry_type != "compaction" {
+            continue;
+        }
+        let compact_threshold = entry
+            .get("compact_threshold")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let compaction_model = entry
+            .get("compaction_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+        return Some(CompactionParams {
+            compact_threshold,
+            compaction_model,
+        });
+    }
+    None
 }
 
-/// Get the current token count.
+/// Estimate the token count for the given messages using tiktoken.
 ///
-/// Tries `previous_usage` metadata first (exact, written by
-/// rehydrate). Falls back to tiktoken estimation on
-/// `state.messages` using the configured encoding.
-#[expect(
-    clippy::todo,
-    dead_code,
-    unused_variables,
-    reason = "scaffolding — implement tiktoken fallback"
-)]
-fn get_token_count(
-    ctx: &HttpFilterContext<'_>,
-    messages: &[Value],
-    tiktoken_encoding: &str,
-) -> Option<u64> {
-    // Try metadata from rehydrate first (exact count from the
-    // previous response's usage stats)
-    if let Some(total) = ctx.get_metadata(PREV_USAGE_TOTAL_KEY) {
-        if let Ok(count) = total.parse::<u64>() {
-            debug!(count, source = "previous_usage", "token count from metadata");
-            return Some(count);
+/// Uses the configured encoding (e.g. `cl100k_base`, `o200k_base`)
+/// to tokenize the serialized conversation text.
+///
+/// Returns `None` if the encoding name is not recognized.
+fn get_token_count(messages: &[Value], tiktoken_encoding: &str) -> Option<u64> {
+    let bpe = match tiktoken_encoding {
+        "cl100k_base" => tiktoken_rs::cl100k_base_singleton(),
+        "o200k_base" => tiktoken_rs::o200k_base_singleton(),
+        other => {
+            warn!(encoding = other, "unknown tiktoken encoding, cannot estimate tokens");
+            return None;
         }
-    }
-
-    // TODO: fall back to tiktoken estimation
-    //
-    // 1. Call build_conversation_text(messages) to serialize
-    // 2. Use tiktoken_rs to get a BPE encoder for tiktoken_encoding
-    //    (e.g., tiktoken_rs::cl100k_base() for "cl100k_base")
-    // 3. Encode the text and return the token count as u64
-    // 4. Log with source = "tiktoken_estimate"
-    // 5. Return None if encoding fails
-    todo!("tiktoken fallback estimation")
+    };
+    let text = build_conversation_text(messages);
+    let count = bpe.encode_ordinary(&text).len() as u64;
+    debug!(count, source = "tiktoken", encoding = tiktoken_encoding, "token count estimated");
+    Some(count)
 }
 
 /// Build a Chat Completions request for summarization.
@@ -369,20 +373,36 @@ fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
 ///
 /// Each message becomes: `<role>: <content>`
 /// Messages are separated by blank lines.
-#[expect(
-    clippy::todo,
-    dead_code,
-    unused_variables,
-    reason = "scaffolding — implement message serialization"
-)]
 fn build_conversation_text(messages: &[Value]) -> String {
-    // TODO: iterate messages, extract role and content from each,
-    //       format as "role: content" separated by "\n\n"
-    //
-    // Content can be:
-    //   - A string: use directly
-    //   - An array of content parts: extract "text" from each
-    //     input_text/output_text part and join them
-    //   - Missing/null: skip the message
-    todo!("serialize messages to readable text")
+    let mut parts = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
+        let content = extract_content(msg);
+        if content.is_empty() {
+            continue;
+        }
+        parts.push(format!("{role}: {content}"));
+    }
+    parts.join("\n\n")
+}
+
+/// Extract text content from a message's `content` field.
+///
+/// Content can be a plain string, an array of content parts
+/// (each with a `"text"` field), or absent/null.
+fn extract_content(msg: &Value) -> String {
+    let Some(content) = msg.get("content") else {
+        return String::new();
+    };
+    if let Some(s) = content.as_str() {
+        return s.to_owned();
+    }
+    if let Some(arr) = content.as_array() {
+        let texts: Vec<&str> = arr
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect();
+        return texts.join(" ");
+    }
+    String::new()
 }
