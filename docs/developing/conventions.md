@@ -297,3 +297,33 @@ Before submitting or merging PRs, ensure that you have:
 
 > **Note**: `Draft` pull requests are not exempt from these guidelines.
 > They are still expected to be reviewed before submission.
+
+## PR Review Process
+
+The `praxis-bot` GitHub App runs automated code review
+on every pull request. Its comments are treated with the
+same weight as human reviewer comments — **every finding
+must be addressed** before the PR can be merged. This
+ensures maintainers can quickly verify that all feedback
+has been handled and keeps the review process moving
+smoothly.
+
+### Responding to praxis-bot comments
+
+Each comment must be resolved in one of two ways:
+
+1. **Acknowledge and fix**: apply the suggested change
+   (or an equivalent fix), reply to the comment with
+   a reference to the commit that addresses it
+   (e.g. `Fixed in <commit-sha>`), then resolve the
+   conversation.
+
+2. **Reject with justification**: if the finding does
+   not apply or the current code is intentionally
+   correct, reply with a comment explaining why the
+   suggestion is being declined, then resolve the
+   conversation.
+
+Leaving praxis-bot comments unresolved blocks merge.
+Do not dismiss or ignore findings without an explicit
+response.
