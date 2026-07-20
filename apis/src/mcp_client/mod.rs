@@ -75,6 +75,11 @@ impl fmt::Display for McpDisplayUrl {
     }
 }
 
+/// Build an SSRF error from a sanitized URL and safe reason.
+fn ssrf_blocked(url: McpDisplayUrl, reason: &'static str) -> McpClientError {
+    McpClientError::SsrfBlocked { url, reason }
+}
+
 // -----------------------------------------------------------------------------
 // McpClientError
 // -----------------------------------------------------------------------------
@@ -135,12 +140,15 @@ pub(crate) enum McpClientError {
         max: usize,
     },
 
-    /// MCP server URL resolves to a blocked address.
-    #[error("mcp server URL blocked (SSRF): {0}")]
-    SsrfBlocked(
+    /// MCP server URL is invalid or resolves to a blocked address.
+    #[error("mcp server URL blocked (SSRF): {url}: {reason}")]
+    SsrfBlocked {
         /// The blocked URL.
-        McpDisplayUrl,
-    ),
+        url: McpDisplayUrl,
+
+        /// Safe explanation of why the URL was blocked.
+        reason: &'static str,
+    },
 
     /// Authorization token contains invalid header characters.
     #[error("authorization token contains invalid HTTP header characters")]
@@ -172,11 +180,11 @@ pub(crate) async fn list_tools(
     allow_loopback: bool,
 ) -> Result<Vec<serde_json::Value>, McpClientError> {
     let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
-    let display_url = resolved.display_url.clone();
     let transport = StreamableHttpClientTransport::with_client(
         build_pinned_client(&resolved)?,
         build_transport_config(server_url, headers, authorization)?,
     );
+    let display_url = resolved.display_url;
     let client = tokio::time::timeout(timeout, Box::pin(().serve(transport)))
         .await
         .map_err(|_elapsed| McpClientError::Timeout {
@@ -335,21 +343,21 @@ async fn resolve_and_validate(
 ) -> Result<ResolvedMcpUrl, McpClientError> {
     let uri: http::Uri = url
         .parse()
-        .map_err(|_parse_err| McpClientError::SsrfBlocked(McpDisplayUrl::invalid()))?;
+        .map_err(|_parse_err| ssrf_blocked(McpDisplayUrl::invalid(), "invalid URL"))?;
     let scheme = uri.scheme_str().unwrap_or_default();
     if scheme != "http" && scheme != "https" {
-        return Err(McpClientError::SsrfBlocked(McpDisplayUrl::invalid()));
+        return Err(ssrf_blocked(McpDisplayUrl::invalid(), "scheme must be http or https"));
     }
     let display_url = McpDisplayUrl::from_uri(&uri);
     if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
-        return Err(McpClientError::SsrfBlocked(display_url));
+        return Err(ssrf_blocked(display_url, "embedded credentials are not allowed"));
     }
     let Some(host) = uri.host() else {
-        return Err(McpClientError::SsrfBlocked(display_url));
+        return Err(ssrf_blocked(display_url, "URL must include a host"));
     };
     let host = host.trim_matches(|c| c == '[' || c == ']');
     if !allow_loopback && is_blocked_hostname(host) {
-        return Err(McpClientError::SsrfBlocked(display_url));
+        return Err(ssrf_blocked(display_url, "localhost hostnames are not allowed"));
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
         check_ip(ip, &display_url, allow_loopback)?;
@@ -370,7 +378,10 @@ fn check_ip(ip: IpAddr, url: &McpDisplayUrl, allow_loopback: bool) -> Result<(),
         return Ok(());
     }
     if is_ssrf_sensitive(&ip) {
-        return Err(McpClientError::SsrfBlocked(url.clone()));
+        return Err(ssrf_blocked(
+            url.clone(),
+            "address is loopback, link-local, unspecified, or cloud metadata",
+        ));
     }
     Ok(())
 }
@@ -391,7 +402,7 @@ async fn resolve_hostname_ssrf(
             url: url.clone(),
             timeout,
         })?
-        .map_err(|_dns_err| McpClientError::SsrfBlocked(url.clone()))?
+        .map_err(|_dns_err| ssrf_blocked(url.clone(), "DNS resolution failed"))?
         .collect();
     for addr in &addrs {
         let ip = praxis_core::connectivity::normalize_mapped_ipv4(addr.ip());
@@ -399,7 +410,10 @@ async fn resolve_hostname_ssrf(
             continue;
         }
         if is_ssrf_sensitive(&ip) {
-            return Err(McpClientError::SsrfBlocked(url));
+            return Err(ssrf_blocked(
+                url,
+                "address is loopback, link-local, unspecified, or cloud metadata",
+            ));
         }
     }
     Ok(ResolvedMcpUrl {

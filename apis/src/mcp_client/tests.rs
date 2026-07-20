@@ -267,7 +267,10 @@ fn url_bearing_errors_only_format_sanitized_urls() {
             count: 200,
             max: 128,
         },
-        McpClientError::SsrfBlocked(url),
+        McpClientError::SsrfBlocked {
+            url,
+            reason: "test reason",
+        },
     ];
 
     for error in &errors {
@@ -381,6 +384,30 @@ async fn invalid_url_errors_use_opaque_display_value() {
 }
 
 #[tokio::test]
+async fn ssrf_errors_include_actionable_reason() {
+    let cases = [
+        ("ftp://example.com/mcp", "scheme must be http or https"),
+        (
+            "http://user:pass@example.com/mcp",
+            "embedded credentials are not allowed",
+        ),
+        ("http://localhost/mcp", "localhost hostnames are not allowed"),
+        (
+            "http://127.0.0.1/mcp",
+            "address is loopback, link-local, unspecified, or cloud metadata",
+        ),
+    ];
+
+    for (url, expected_reason) in cases {
+        let message = validate_url(url).await.unwrap_err().to_string();
+        assert!(
+            message.contains(expected_reason),
+            "error should explain how to fix the blocked URL: {message}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn ssrf_allows_public_ips() {
     assert!(validate_url("http://8.8.8.8/mcp").await.is_ok());
     assert!(validate_url("https://1.1.1.1:443/v1").await.is_ok());
@@ -394,10 +421,14 @@ async fn ssrf_allows_private_rfc1918() {
 
 #[test]
 fn ssrf_error_display() {
-    let err = McpClientError::SsrfBlocked(display_url("http://127.0.0.1/mcp"));
+    let err = McpClientError::SsrfBlocked {
+        url: display_url("http://127.0.0.1/mcp"),
+        reason: "loopback address is not allowed",
+    };
     let msg = err.to_string();
     assert!(msg.contains("SSRF"), "should mention SSRF");
     assert!(msg.contains("127.0.0.1"), "should include the URL");
+    assert!(msg.contains("loopback address"), "should include the reason");
 }
 
 #[tokio::test]
