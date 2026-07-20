@@ -40,29 +40,24 @@ worked on until a maintainer has reviewed them**.
 
 ### Review Process
 
-A maintainer reviews the issue and leaves a comment with
-one of the following verdicts:
+A maintainer reviews the issue and applies one of the
+following labels:
 
-**Approved:**
+| Label | Meaning |
+| --- | --- |
+| `NEED HUMAN REVIEW` | Awaiting maintainer review (applied automatically by the bot) |
+| `HUMAN REVIEWED` | A maintainer has validated the issue |
 
-```
-Reviewed by: @<maintainer>
-Verdict: Approved
-Reason: <optional explanation>
-```
+To **approve** an issue, replace the `NEED HUMAN REVIEW`
+label with `HUMAN REVIEWED`. The label history records
+who approved and when.
 
-**Rejected:**
-
-```
-Reviewed by: @<maintainer>
-Verdict: Rejected
-Reason: <mandatory explanation>
-```
+To **reject** an issue, remove the `NEED HUMAN REVIEW`
+label, leave a comment explaining why, and close the
+issue.
 
 Once an issue is approved, it follows the normal triage
-workflow (milestone assignment, priority, sizing). Rejected
-issues are closed with the reason stated in the review
-comment.
+workflow (milestone assignment, priority, sizing).
 
 ## Milestones
 
