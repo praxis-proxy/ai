@@ -24,6 +24,46 @@ reverts it to `triage/needs-triage`.
 | `triage/needs-triage` | Awaiting maintainer review |
 | `triage/accepted` | Assigned to a milestone; accepted for work |
 
+## Bot-Generated Issues
+
+A weekly bot opens issues on the repository to surface
+potential improvements, bugs, or maintenance tasks. These
+issues are labeled `NEED HUMAN REVIEW` and **must not be
+worked on until a maintainer has reviewed them**.
+
+### Rules
+
+- **Do not self-assign** a bot-generated issue before it
+  has been reviewed.
+- **Do not submit a PR** for a bot-generated issue before
+  it has been validated by a maintainer.
+
+### Review Process
+
+A maintainer reviews the issue and leaves a comment with
+one of the following verdicts:
+
+**Approved:**
+
+```
+Reviewed by: @<maintainer>
+Verdict: Approved
+Reason: <optional explanation>
+```
+
+**Rejected:**
+
+```
+Reviewed by: @<maintainer>
+Verdict: Rejected
+Reason: <mandatory explanation>
+```
+
+Once an issue is approved, it follows the normal triage
+workflow (milestone assignment, priority, sizing). Rejected
+issues are closed with the reason stated in the review
+comment.
+
 ## Milestones
 
 Milestones represent a body of work toward a shared
