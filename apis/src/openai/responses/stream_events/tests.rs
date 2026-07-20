@@ -144,6 +144,29 @@ async fn does_not_arm_for_non_responses_format() {
     );
 }
 
+#[tokio::test]
+async fn does_not_arm_for_other_responses_routes() {
+    for (method, path) in [
+        (http::Method::GET, "/v1/responses"),
+        (http::Method::POST, "/v1/responses/input_tokens"),
+    ] {
+        let filter = make_filter();
+        let req = make_request(method, path);
+        let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+        ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+        ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+        ctx.current_filter_id = Some(0);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.get_filter_state::<StreamEventsState>().is_none(),
+            "filter should not arm for {path}"
+        );
+    }
+}
+
 #[test]
 fn unarmed_filter_passes_through_body() {
     let filter = make_filter();
