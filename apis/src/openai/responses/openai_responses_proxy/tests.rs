@@ -334,6 +334,13 @@ async fn passthrough_strips_conversation_from_body() {
         "conversation should be stripped even without ResponsesState"
     );
     assert_eq!(parsed["model"], "gpt-4.1", "other fields should be preserved");
+    assert_eq!(
+        ctx.extra_request_headers
+            .iter()
+            .find(|(name, _value)| name.as_ref() == "content-length")
+            .map(|(_name, value)| value.parse::<usize>().unwrap()),
+        body.as_ref().map(Bytes::len)
+    );
 }
 
 #[tokio::test]
