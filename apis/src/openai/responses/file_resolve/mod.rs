@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Resolves `file_id` references in `OpenAI` Responses API requests.
+//! Resolves `file_id` and `file_url` references in `OpenAI` Responses API requests.
 //!
 //! Walks `message` content arrays and `function_call_output` output
-//! arrays, finds content parts that reference files by ID, fetches
-//! file metadata and content from an external Files API
-//! via [`ApiClient`], and inlines the content: raw base64 in
-//! `file_data` for `input_file`, or a `data:` URL in `image_url`
-//! for `input_image`. Forwards configurable headers
-//! (`Authorization`, `X-Tenant-ID`) to the Files API for tenant
-//! isolation.
+//! arrays, finds content parts that reference files by ID or URL, fetches
+//! file metadata and content from an external Files API (e.g. OGX) or
+//! remote URL via [`ApiClient`], and inlines the content: raw base64
+//! in `file_data` for `input_file`, or a `data:` URL in `image_url` for
+//! `input_image`. Forwards configurable headers (`Authorization`,
+//! `X-Tenant-ID`) to the Files API for tenant isolation.
 //!
 //! Praxis runs `StreamBuffer` body hooks before header-phase request
 //! filters. Configuration therefore requires an explicit
@@ -24,9 +23,11 @@
 //! `state.messages`, and `state.persisted_messages` so that
 //! `responses_proxy` does not overwrite the rewritten body.
 //!
-//! Content parts with `file_data`, `file_url`, or `image_url`
-//! pass through unchanged. No content-part validation — the
-//! inference backend handles that.
+//! Content parts with `file_data` or `image_url` pass through unchanged.
+//! Content parts with `file_url` are resolved to `file_data` when
+//! `file_url: resolve` (default), or passed through when `file_url:
+//! passthrough`. No content-part validation — the inference backend
+//! handles that.
 //!
 //! This filter resolves the file transport reference but does not
 //! interpret document contents. The inference backend must already
@@ -82,9 +83,10 @@ use crate::{
     openai::api_client::{ApiClient, ApiClientConfig},
 };
 
-/// Resolves `file_id` references in Responses API input by fetching
-/// content from a Files API via `ApiClient` and inlining the
-/// base64-encoded content in the provider-native field.
+/// Resolves `file_id` and `file_url` references in Responses API input
+/// by fetching content from a Files API or remote URL via
+/// [`ApiClient`] and inlining the base64-encoded content in the
+/// provider-native field.
 ///
 /// The inference backend must support the resulting inline content
 /// part. This filter does not extract documents into backend-specific
@@ -118,6 +120,18 @@ use crate::{
 /// timeout_ms: 30000
 /// max_body_bytes: 67108864
 /// max_file_references: 32
+/// ```
+///
+/// # File URL Resolution YAML
+///
+/// ```yaml
+/// filter: openai_file_resolve
+/// files_api_url: "http://ogx:8321"
+/// allow_private_files_api_url: true
+/// allow_pre_security_callout: true
+/// file_url: resolve
+/// allowed_file_url_origins:
+///   - "https://files.internal:8443"
 /// ```
 pub struct FileResolveFilter {
     /// Files API HTTP client backed by shared API callout.

@@ -3,7 +3,7 @@
 
 # `openai_file_resolve`
 
-Resolves `file_id` references in Responses API input by fetching content from a Files API via `ApiClient` and inlining the base64-encoded content in the provider-native field.
+Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via [`ApiClient`] and inlining the base64-encoded content in the provider-native field.
 
 ## Configuration Notes
 
@@ -51,4 +51,16 @@ on_missing: continue
 timeout_ms: 30000
 max_body_bytes: 67108864
 max_file_references: 32
+```
+
+### Example 3
+
+```yaml
+filter: openai_file_resolve
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+file_url: resolve
+allowed_file_url_origins:
+  - "https://files.internal:8443"
 ```
