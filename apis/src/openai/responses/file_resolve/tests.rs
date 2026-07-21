@@ -749,3 +749,294 @@ fn serve_file_request(mut stream: std::net::TcpStream) {
     stream.write_all(headers.as_bytes()).unwrap();
     stream.write_all(body).unwrap();
 }
+
+// -----------------------------------------------------------------------------
+// Integration-level tests using TCP stubs
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn file_url_resolved_to_data_uri() {
+    use praxis_core::callout::{CalloutClient, CalloutConfig};
+
+    use crate::openai::responses::file_resolve::{
+        config::OnMissing,
+        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
+        resolve_url::{FileUrlResolver, NormalizedOrigin},
+    };
+
+    // Start TCP stub serving file content
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stub_url = format!("http://{address}/file.txt");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut request = [0_u8; 4096];
+                let mut stream = stream;
+                let _read = stream.read(&mut request).unwrap();
+                let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nHello World";
+                stream.write_all(response).unwrap();
+            });
+        }
+    });
+
+    // Build request body with input_file containing file_url
+    let mut body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": stub_url.clone()
+            }]
+        }]
+    });
+
+    // Create FilesApiClient
+    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
+    let client = FilesApiClient::new(
+        "http://unused:9999",
+        vec![],
+        callout,
+        FilesApiClientOptions {
+            max_file_references: 32,
+            max_resolved_bytes: 64 * 1024 * 1024,
+            timeout_ms: 30_000,
+        },
+    )
+    .unwrap();
+
+    // Create FileUrlResolver with allowed private origins (localhost)
+    let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![localhost_origin],
+    };
+
+    // Call resolve_input with url_resolver
+    let count = resolve_input(
+        &mut body,
+        &client,
+        OnMissing::Reject,
+        &http::HeaderMap::new(),
+        Some(&resolver),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(count, 1, "should resolve one file_url reference");
+
+    // Assert file_url removed and file_data is data URI
+    let part = &body["input"][0]["content"][0];
+    assert!(part.get("file_url").is_none(), "file_url should be removed");
+    let file_data = part["file_data"].as_str().unwrap();
+    assert!(
+        file_data.starts_with("data:text/plain;base64,"),
+        "file_data should be a data URI"
+    );
+    let base64_part = file_data.strip_prefix("data:text/plain;base64,").unwrap();
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_part).unwrap();
+    assert_eq!(decoded, b"Hello World", "data URI should contain the file content");
+}
+
+#[tokio::test]
+async fn file_url_passthrough_when_no_resolver() {
+    use praxis_core::callout::{CalloutClient, CalloutConfig};
+
+    use crate::openai::responses::file_resolve::{
+        config::OnMissing,
+        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
+    };
+
+    // Build body with file_url
+    let mut body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": "http://example.com/file.txt"
+            }]
+        }]
+    });
+    let original = body.clone();
+
+    // Create FilesApiClient
+    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
+    let client = FilesApiClient::new(
+        "http://unused:9999",
+        vec![],
+        callout,
+        FilesApiClientOptions {
+            max_file_references: 32,
+            max_resolved_bytes: 64 * 1024 * 1024,
+            timeout_ms: 30_000,
+        },
+    )
+    .unwrap();
+
+    // Call resolve_input without url_resolver (None)
+    let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(count, 0, "should not resolve when url_resolver is None");
+    assert_eq!(body, original, "body should be unchanged");
+}
+
+#[tokio::test]
+async fn file_url_in_shorthand_message_resolved() {
+    use praxis_core::callout::{CalloutClient, CalloutConfig};
+
+    use crate::openai::responses::file_resolve::{
+        config::OnMissing,
+        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
+        resolve_url::{FileUrlResolver, NormalizedOrigin},
+    };
+
+    // Start TCP stub
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stub_url = format!("http://{address}/file.txt");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut request = [0_u8; 4096];
+                let mut stream = stream;
+                let _read = stream.read(&mut request).unwrap();
+                let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nShort";
+                stream.write_all(response).unwrap();
+            });
+        }
+    });
+
+    // Build body with shorthand message format (no "type" field)
+    let mut body = json!({
+        "model": "m",
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": stub_url.clone()
+            }]
+        }]
+    });
+
+    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
+    let client = FilesApiClient::new(
+        "http://unused:9999",
+        vec![],
+        callout,
+        FilesApiClientOptions {
+            max_file_references: 32,
+            max_resolved_bytes: 64 * 1024 * 1024,
+            timeout_ms: 30_000,
+        },
+    )
+    .unwrap();
+
+    let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![localhost_origin],
+    };
+
+    let count = resolve_input(
+        &mut body,
+        &client,
+        OnMissing::Reject,
+        &http::HeaderMap::new(),
+        Some(&resolver),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(count, 1, "should resolve file_url in shorthand message");
+
+    let part = &body["input"][0]["content"][0];
+    assert!(part.get("file_url").is_none(), "file_url should be removed");
+    let file_data = part["file_data"].as_str().unwrap();
+    assert!(
+        file_data.starts_with("data:text/plain;base64,"),
+        "file_data should be a data URI"
+    );
+}
+
+#[tokio::test]
+async fn file_url_in_function_call_output_resolved() {
+    use praxis_core::callout::{CalloutClient, CalloutConfig};
+
+    use crate::openai::responses::file_resolve::{
+        config::OnMissing,
+        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
+        resolve_url::{FileUrlResolver, NormalizedOrigin},
+    };
+
+    // Start TCP stub
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stub_url = format!("http://{address}/doc.pdf");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut request = [0_u8; 4096];
+                let mut stream = stream;
+                let _read = stream.read(&mut request).unwrap();
+                let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: 8\r\nConnection: close\r\n\r\n%PDF-1.4";
+                stream.write_all(response).unwrap();
+            });
+        }
+    });
+
+    // Build body with function_call_output containing input_file with file_url
+    let mut body = json!({
+        "model": "m",
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [{
+                "type": "input_file",
+                "file_url": stub_url.clone()
+            }]
+        }]
+    });
+
+    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
+    let client = FilesApiClient::new(
+        "http://unused:9999",
+        vec![],
+        callout,
+        FilesApiClientOptions {
+            max_file_references: 32,
+            max_resolved_bytes: 64 * 1024 * 1024,
+            timeout_ms: 30_000,
+        },
+    )
+    .unwrap();
+
+    let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![localhost_origin],
+    };
+
+    let count = resolve_input(
+        &mut body,
+        &client,
+        OnMissing::Reject,
+        &http::HeaderMap::new(),
+        Some(&resolver),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(count, 1, "should resolve file_url in function_call_output");
+
+    let part = &body["input"][0]["output"][0];
+    assert!(part.get("file_url").is_none(), "file_url should be removed");
+    let file_data = part["file_data"].as_str().unwrap();
+    assert!(
+        file_data.starts_with("data:application/pdf;base64,"),
+        "file_data should be a data URI with correct MIME type"
+    );
+}

@@ -37,6 +37,15 @@ pub(crate) enum ReferenceSource {
     FileUrl(String),
 }
 
+impl std::fmt::Display for ReferenceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileId(id) => write!(f, "{id}"),
+            Self::FileUrl(url) => write!(f, "{url}"),
+        }
+    }
+}
+
 /// Errors that can occur during file resolution.
 #[derive(Debug, Clone)]
 pub(crate) enum ResolveError {
@@ -612,7 +621,7 @@ async fn resolve_content_part(
     }
 
     let (source, part_type) = (source, part_type.to_owned());
-    debug!(source = ?source, part_type = %part_type, "resolving file reference");
+    debug!(source = %source, part_type = %part_type, "resolving file reference");
 
     let max_resolved_bytes = resolver.budget.remaining_resolved_bytes;
     let Some(resolved) = resolve_reference(&source, &part_type, max_resolved_bytes, resolver).await? else {
@@ -621,7 +630,7 @@ async fn resolve_content_part(
     let len = output_len_for_part(&part_type, &source, &resolved);
     if len > max_resolved_bytes {
         return Err(ResolveError::TooLarge {
-            file_id: format!("{source:?}"),
+            file_id: source.to_string(),
             limit: resolver.client.max_resolved_bytes,
         });
     }
@@ -651,7 +660,7 @@ async fn resolve_reference(
         Ok(resolved) => Ok(Some(resolved)),
         Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
         Err(e) if resolver.on_missing == OnMissing::Continue => {
-            warn!(source = ?source, error = %e, "file resolution failed, passing through");
+            warn!(source = %source, error = %e, "file resolution failed, passing through");
             Ok(None)
         },
         Err(e) => Err(e),
@@ -767,14 +776,18 @@ fn rewrite_part(part: &mut serde_json::Value, part_type: &str, source: &Referenc
     match (part_type, source) {
         ("input_file", ReferenceSource::FileId(_)) => {
             obj.insert("file_data".to_owned(), serde_json::Value::String(base64));
-            if !obj.contains_key("filename") && let Some(filename) = filename {
+            if !obj.contains_key("filename")
+                && let Some(filename) = filename
+            {
                 obj.insert("filename".to_owned(), serde_json::Value::String(filename));
             }
         },
         ("input_file", ReferenceSource::FileUrl(_)) => {
             let data_uri = format!("data:{content_type};base64,{base64}");
             obj.insert("file_data".to_owned(), serde_json::Value::String(data_uri));
-            if !obj.contains_key("filename") && let Some(filename) = filename {
+            if !obj.contains_key("filename")
+                && let Some(filename) = filename
+            {
                 obj.insert("filename".to_owned(), serde_json::Value::String(filename));
             }
         },
