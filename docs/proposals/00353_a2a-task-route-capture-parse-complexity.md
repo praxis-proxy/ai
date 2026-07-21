@@ -9,8 +9,7 @@ graduation_criteria:
   - No full-buffer hex-decode or `serde_json::from_slice` attempt on a buffer known to hold incomplete JSON
   - Existing A2A response-body unit test coverage passes unmodified
 stakeholders:
-  - shaneutt
-  - nerdalert
+  - aslakknutsen
 ---
 
 # A2A Task Route Capture Parse Complexity
