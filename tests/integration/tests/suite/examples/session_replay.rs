@@ -435,6 +435,10 @@ fn replay_claude_messages_tool_error_translates_error_marker_for_openai() {
         turn.request["tools"][0]["type"], "bash_20250124",
         "the native replay fixture should retain the original Anthropic built-in tool"
     );
+    assert_eq!(
+        forwarded["tools"][0]["function"]["name"], "bash",
+        "the translated OpenAI request should retain the custom tool definition"
+    );
     assert_eq!(status, 200, "Claude tool error translation should return 200");
     assert_eq!(messages[2]["role"], "tool", "tool_result should become a tool message");
     assert_eq!(
