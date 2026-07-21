@@ -764,6 +764,17 @@ async fn execute_mcp_calls_emits_error_for_unknown_tools() {
     assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
 }
 
+#[tokio::test]
+async fn execute_mcp_calls_emits_error_for_unknown_tool_without_call_id() {
+    let map = std::sync::Arc::new(sample_tool_map());
+    let calls = vec![json!({"name": "nonexistent"})];
+    let timeout = std::time::Duration::from_millis(100);
+    let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
+    assert_eq!(results.len(), 1, "must emit error even without call_id");
+    assert_eq!(results[0].output_item["id"], "unknown");
+    assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
+}
+
 // =========================================================================
 // process_call_result: non-text content blocks
 // =========================================================================

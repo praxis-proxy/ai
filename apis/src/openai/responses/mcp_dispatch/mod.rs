@@ -390,16 +390,15 @@ async fn execute_parallel(
         match handle.await {
             Ok(Some(result)) => results.push(result),
             Ok(None) => {
-                if let Some(r) = error_result_for_dropped_call(tc, "internal error: call produced no result") {
-                    warn!(tool = ?tc.get("name"), "parallel MCP call returned None, emitting error");
-                    results.push(r);
-                }
+                warn!(tool = ?tc.get("name"), "parallel MCP call returned None, emitting error");
+                results.push(error_result_for_dropped_call(
+                    tc,
+                    "internal error: call produced no result",
+                ));
             },
             Err(e) => {
-                if let Some(r) = error_result_for_dropped_call(tc, &format!("task failed: {e}")) {
-                    warn!(tool = ?tc.get("name"), error = %e, "parallel MCP call task failed, emitting error");
-                    results.push(r);
-                }
+                warn!(tool = ?tc.get("name"), error = %e, "parallel MCP call task failed, emitting error");
+                results.push(error_result_for_dropped_call(tc, &format!("task failed: {e}")));
             },
         }
     }
@@ -416,14 +415,14 @@ async fn execute_sequential(
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     for tc in mcp_calls {
-        match execute_single_call(tc, tool_map, timeout, allow_loopback).await {
-            Some(result) => results.push(result),
-            None => {
-                if let Some(r) = error_result_for_dropped_call(tc, "internal error: call produced no result") {
-                    warn!(tool = ?tc.get("name"), "sequential MCP call returned None, emitting error");
-                    results.push(r);
-                }
-            },
+        if let Some(result) = execute_single_call(tc, tool_map, timeout, allow_loopback).await {
+            results.push(result);
+        } else {
+            warn!(tool = ?tc.get("name"), "sequential MCP call returned None, emitting error");
+            results.push(error_result_for_dropped_call(
+                tc,
+                "internal error: call produced no result",
+            ));
         }
     }
     results
@@ -653,16 +652,17 @@ fn build_success_result(
 
 /// Build an error result for a tool call that was dropped
 /// (task panic, cancellation, or missing fields).
-fn error_result_for_dropped_call(tool_call: &serde_json::Value, reason: &str) -> Option<McpCallResult> {
+fn error_result_for_dropped_call(tool_call: &serde_json::Value, reason: &str) -> McpCallResult {
     let call_id = tool_call
         .get("call_id")
         .or_else(|| tool_call.get("id"))
-        .and_then(serde_json::Value::as_str)?;
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
     let tool_name = tool_call
         .get("name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    Some(build_error_result(call_id, "unknown", tool_name, "", reason))
+    build_error_result(call_id, "unknown", tool_name, "", reason)
 }
 
 /// Build result structs for a failed MCP call.
