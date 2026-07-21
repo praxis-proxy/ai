@@ -283,22 +283,7 @@ impl HttpFilter for A2aFilter {
         };
 
         if ctx.get_metadata("a2a.response.capture_enabled") == Some("true") {
-            if let Some(chunk) = body.as_ref()
-                && !accumulate_response_hex(ctx, chunk, self.config.task_routing.max_response_body_bytes)
-            {
-                return Ok(FilterAction::Continue);
-            }
-
-            let mut balance = load_json_balance_state(ctx);
-            if let Some(chunk) = body.as_ref() {
-                scan_json_balance(&mut balance, chunk);
-            }
-            let is_complete = balance.is_complete();
-            save_json_balance_state(ctx, balance);
-
-            if is_complete || end_of_stream {
-                try_capture_from_buffer(ctx, store, &self.config.task_routing);
-            }
+            handle_non_streaming_capture(ctx, body, end_of_stream, store, &self.config.task_routing);
             return Ok(FilterAction::Continue);
         }
 
@@ -393,6 +378,43 @@ fn lookup_task_route(
             method = a2a_envelope.method.as_str(),
             "route lookup miss"
         );
+    }
+}
+
+/// Drives non-streaming A2A task-route capture for one `on_response_body`
+/// call: accumulate the chunk, update the [`JsonBalanceState`] scanner,
+/// and either abandon capture (invalid buffer), attempt a parse (buffer
+/// looks complete, or this is the last chunk), or wait for more bytes.
+fn handle_non_streaming_capture(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    end_of_stream: bool,
+    store: &LocalTaskRouteStore,
+    config: &config::TaskRoutingConfig,
+) {
+    if let Some(chunk) = body.as_ref()
+        && !accumulate_response_hex(ctx, chunk, config.max_response_body_bytes)
+    {
+        return;
+    }
+
+    let mut balance = load_json_balance_state(ctx);
+    if let Some(chunk) = body.as_ref() {
+        scan_json_balance(&mut balance, chunk);
+    }
+    let is_complete = balance.is_complete();
+    let is_invalid = balance.invalid;
+    save_json_balance_state(ctx, balance);
+
+    if is_invalid {
+        // Mismatched or unmatched brackets are permanent: no further
+        // bytes can make this buffer type-matched. Stop accumulating
+        // and abandon capture now instead of hex-appending every
+        // remaining chunk up to max_response_body_bytes only to hit
+        // this same dead end at end_of_stream.
+        clear_capture_metadata(ctx);
+    } else if is_complete || end_of_stream {
+        try_capture_from_buffer(ctx, store, config);
     }
 }
 

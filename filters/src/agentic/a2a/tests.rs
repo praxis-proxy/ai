@@ -1907,6 +1907,30 @@ async fn balanced_but_invalid_json_abandons_capture_immediately() {
     assert_capture_scratch_cleared(&ctx);
 }
 
+#[tokio::test]
+async fn mismatched_bracket_types_abandon_capture_immediately() {
+    let filter = make_task_routing_filter();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    // `{` closed by `]` marks the scanner permanently invalid; `is_complete`
+    // never becomes true for the rest of the stream, so without abandoning
+    // capture here it would otherwise keep hex-accumulating every further
+    // chunk up to max_response_body_bytes only to hit the same dead end at
+    // end_of_stream.
+    let mut first = Some(Bytes::from_static(b"{]"));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+
+    assert_capture_scratch_cleared(&ctx);
+
+    let mut more = Some(Bytes::from_static(b"more-bytes-that-must-be-ignored"));
+    let action = filter.on_response_body(&mut ctx, &mut more, false).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_capture_scratch_cleared(&ctx);
+}
+
 // -----------------------------------------------------------------------------
 // Context Route Lookup Tests
 // -----------------------------------------------------------------------------
