@@ -22,8 +22,11 @@ use praxis_filter::{
 };
 use tracing::{debug, trace, warn};
 
+#[cfg(test)]
+use self::accumulator::accumulate_response_object;
 use self::{accumulator::accumulate_event, config::StreamEventsConfig};
 use crate::{
+    classifier::is_responses_create,
     is_event_stream_content_type,
     openai::sse::{SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
 };
@@ -124,7 +127,8 @@ impl HttpFilter for OpenaiStreamEventsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let is_responses = ctx.get_metadata("openai_responses_format.format") == Some("openai_responses");
+        let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
+            && ctx.get_metadata("openai_responses_format.format") == Some("openai_responses");
         let is_streaming = ctx.get_metadata("openai_responses_format.stream") == Some("true");
 
         if is_responses && is_streaming {

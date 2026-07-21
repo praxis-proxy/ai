@@ -45,6 +45,12 @@ pub(crate) struct ResponsesState {
     /// optional sections to populate.
     pub include: Vec<String>,
 
+    /// Whether stored history was successfully resolved into this state.
+    ///
+    /// The proxy uses this to distinguish locally consumed history identifiers
+    /// from provider-owned identifiers that must pass through unchanged.
+    pub history_rehydrated: bool,
+
     /// The current request's input items, immutable after construction.
     ///
     /// Preserved as-is so downstream filters can inspect what the
@@ -78,9 +84,6 @@ pub(crate) struct ResponsesState {
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
-
-    /// Output items accumulated across the current response.
-    pub output_items: Vec<serde_json::Value>,
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
@@ -139,12 +142,12 @@ impl Default for ResponsesState {
             context_management: None,
             conversation: None,
             include: Vec::new(),
+            history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
             max_tool_calls: None,
             mcp_tool_map: HashMap::new(),
             messages: Vec::new(),
-            output_items: Vec::new(),
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
             previous_response_id: None,
@@ -187,6 +190,36 @@ impl ResponsesState {
             tools,
             ..Default::default()
         }
+    }
+
+    /// Borrow the public output owned by [`Self::response_object`].
+    #[cfg(test)]
+    pub(crate) fn output_items(&self) -> &[serde_json::Value] {
+        self.response_object
+            .get("output")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Mutably borrow public output, creating a valid array when absent.
+    pub(crate) fn output_items_mut(&mut self) -> &mut Vec<serde_json::Value> {
+        if !self.response_object.is_object() {
+            self.response_object = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let serde_json::Value::Object(response) = &mut self.response_object else {
+            unreachable!("response_object was normalized to an object")
+        };
+        let output = response
+            .entry("output".to_owned())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if !output.is_array() {
+            *output = serde_json::Value::Array(Vec::new());
+        }
+        let serde_json::Value::Array(items) = output else {
+            unreachable!("output was normalized to an array")
+        };
+        items
     }
 }
 
@@ -479,7 +512,7 @@ mod tests {
         assert!(state.max_tool_calls.is_none());
         assert!(state.mcp_tool_map.is_empty());
         assert!(state.messages.is_empty());
-        assert!(state.output_items.is_empty());
+        assert!(state.output_items().is_empty());
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
         assert!(state.previous_response_id.is_none());
@@ -498,6 +531,35 @@ mod tests {
         let body = json!({"model": "gpt-4o", "input": "test", "parallel_tool_calls": false});
         let state = ResponsesState::from_request_body(body);
         assert!(!state.parallel_tool_calls);
+    }
+
+    #[test]
+    fn response_object_is_the_single_output_owner() {
+        let first = json!({"type": "message", "id": "msg_1"});
+        let second = json!({"type": "reasoning", "id": "rs_1"});
+        let mut state = ResponsesState {
+            response_object: json!({"id": "resp_1", "output": [first.clone()]}),
+            ..Default::default()
+        };
+
+        state.output_items_mut().push(second.clone());
+        assert_eq!(state.output_items(), &[first.clone(), second.clone()]);
+        assert_eq!(state.response_object["output"], json!([first, second]));
+        assert_eq!(state.response_object["id"], "resp_1");
+    }
+
+    #[test]
+    fn mutable_output_normalizes_missing_or_malformed_response_output() {
+        let mut state = ResponsesState {
+            response_object: json!({"id": "resp_1", "output": "invalid"}),
+            ..Default::default()
+        };
+
+        state.output_items_mut().push(json!({"type": "message"}));
+
+        assert_eq!(state.output_items().len(), 1);
+        assert!(state.response_object["output"].is_array());
+        assert_eq!(state.response_object["id"], "resp_1");
     }
 
     #[test]

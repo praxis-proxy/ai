@@ -13,7 +13,7 @@ use bytes::Bytes;
 use praxis_filter::{FilterAction, HttpFilter};
 use serde_json::json;
 
-use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState};
+use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object};
 use crate::{
     openai::{responses::state::ResponsesState, sse::SseFrameParser},
     test_utils::{make_filter_context, make_request},
@@ -144,6 +144,29 @@ async fn does_not_arm_for_non_responses_format() {
     );
 }
 
+#[tokio::test]
+async fn does_not_arm_for_other_responses_routes() {
+    for (method, path) in [
+        (http::Method::GET, "/v1/responses"),
+        (http::Method::POST, "/v1/responses/input_tokens"),
+    ] {
+        let filter = make_filter();
+        let req = make_request(method, path);
+        let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+        ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+        ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+        ctx.current_filter_id = Some(0);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.get_filter_state::<StreamEventsState>().is_none(),
+            "filter should not arm for {path}"
+        );
+    }
+}
+
 #[test]
 fn unarmed_filter_passes_through_body() {
     let filter = make_filter();
@@ -193,9 +216,51 @@ async fn terminal_event_writes_response_object() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.response_object["id"], "resp_123");
-    assert_eq!(state.output_items.len(), 1);
+    assert_eq!(state.output_items().len(), 1);
     assert_eq!(state.usage["total_tokens"], 15);
     assert_eq!(ctx.get_metadata("responses.status"), Some("completed"),);
+}
+
+#[test]
+fn response_accumulation_sums_usage_across_iterations() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.extensions.insert(ResponsesState::default());
+    let first = json!({
+        "status":"completed",
+        "output":[],
+        "usage":{
+            "input_tokens":10,
+            "output_tokens":4,
+            "total_tokens":14,
+            "input_tokens_details":{"cached_tokens":3}
+        }
+    });
+    let second = json!({
+        "status":"completed",
+        "output":[],
+        "usage":{
+            "input_tokens":7,
+            "output_tokens":2,
+            "total_tokens":9,
+            "input_tokens_details":{"cached_tokens":1}
+        }
+    });
+
+    assert!(!accumulate_response_object(&mut ctx, first, None));
+    assert!(accumulate_response_object(&mut ctx, second, None));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.usage["input_tokens"], 17);
+    assert_eq!(state.usage["output_tokens"], 6);
+    assert_eq!(state.usage["total_tokens"], 23);
+    assert_eq!(state.usage["input_tokens_details"]["cached_tokens"], 4);
+    assert_eq!(state.response_object["usage"], state.usage);
+
+    let final_without_usage = json!({"status":"completed","output":[]});
+    assert!(accumulate_response_object(&mut ctx, final_without_usage, None));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.response_object["usage"], state.usage);
+    assert_eq!(state.usage["total_tokens"], 23);
 }
 
 #[tokio::test]
@@ -210,8 +275,8 @@ async fn output_item_added_accumulates_incrementally() {
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items.len(), 1);
-    assert_eq!(state.output_items[0]["id"], "item_1");
+    assert_eq!(state.output_items().len(), 1);
+    assert_eq!(state.output_items()[0]["id"], "item_1");
 }
 
 #[tokio::test]
@@ -222,7 +287,7 @@ async fn terminal_event_overwrites_incremental_output() {
     let item = json!({"item": {"type": "message", "id": "item_1"}});
     let mut body1 = Some(make_sse_chunk("response.output_item.added", &item));
     filter.on_response_body(&mut ctx, &mut body1, false).unwrap();
-    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().output_items.len(), 1);
+    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().output_items().len(), 1);
 
     let completed = json!({
         "id": "resp_123",
@@ -240,11 +305,11 @@ async fn terminal_event_overwrites_incremental_output() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
-        state.output_items.len(),
+        state.output_items().len(),
         2,
         "terminal event should overwrite incremental output"
     );
-    assert_eq!(state.output_items[0]["id"], "item_final_1");
+    assert_eq!(state.output_items()[0]["id"], "item_final_1");
 }
 
 #[tokio::test]
@@ -289,7 +354,7 @@ async fn function_call_accumulation() {
     assert_eq!(state.tool_calls[0]["name"], "get_weather");
     assert_eq!(state.tool_calls[0]["arguments"], "{\"city\":\"NYC\"}");
     assert_eq!(state.tool_calls[0]["status"], "completed");
-    assert_eq!(state.output_items[0]["arguments"], "{\"city\":\"NYC\"}");
+    assert_eq!(state.output_items()[0]["arguments"], "{\"city\":\"NYC\"}");
 }
 
 #[tokio::test]
@@ -427,9 +492,9 @@ async fn output_item_done_replaces_by_index() {
     filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items.len(), 1, "should replace, not append");
+    assert_eq!(state.output_items().len(), 1, "should replace, not append");
     assert!(
-        state.output_items[0]["content"][0]["text"] == "final",
+        state.output_items()[0]["content"][0]["text"] == "final",
         "should have updated content"
     );
 }
@@ -453,7 +518,7 @@ async fn terminal_incomplete_sets_status() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.response_object["id"], "resp_inc");
-    assert_eq!(state.output_items.len(), 1);
+    assert_eq!(state.output_items().len(), 1);
     assert_eq!(ctx.get_metadata("responses.status"), Some("incomplete"));
 }
 
@@ -476,7 +541,7 @@ async fn terminal_failed_sets_status() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.response_object["id"], "resp_fail");
-    assert_eq!(state.output_items.len(), 0);
+    assert_eq!(state.output_items().len(), 0);
     assert_eq!(ctx.get_metadata("responses.status"), Some("failed"));
 }
 
@@ -496,8 +561,8 @@ async fn output_item_done_replaces_by_id() {
     filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items.len(), 1, "should replace by id, not append");
-    assert_eq!(state.output_items[0]["content"][0]["text"], "replaced");
+    assert_eq!(state.output_items().len(), 1, "should replace by id, not append");
+    assert_eq!(state.output_items()[0]["content"][0]["text"], "replaced");
 }
 
 #[tokio::test]

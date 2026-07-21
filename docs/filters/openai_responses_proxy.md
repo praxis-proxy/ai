@@ -7,9 +7,9 @@ Rebuilds the request body from `ResponsesState` when present.
 
 ## Configuration Notes
 
-Reads the assembled conversation history from `ResponsesState::messages` and replaces the `input` field in the outbound body. Strips `previous_response_id` since Praxis already resolved it locally via the rehydrate filter.
+Reads the assembled conversation history from `ResponsesState::messages` and replaces the `input` field in the outbound body when it differs from the original normalized input. Strips `previous_response_id` after Praxis resolves it locally via the rehydrate filter.
 
-When no `ResponsesState` exists (non-Responses requests, or requests without `previous_response_id`), passes through unchanged.
+When no `ResponsesState` exists, preserves the request body apart from removing the Praxis-owned `conversation` field.
 
 ## Configuration
 

@@ -111,6 +111,10 @@ fn register_openai_filters(registry: &mut praxis_filter::FilterRegistry) {
 fn register_openai_responses_filters(registry: &mut praxis_filter::FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
+        http "openai_file_resolve" => praxis_ai_apis::openai::FileResolveFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "openai_responses_format" => praxis_ai_apis::openai::ResponsesFormatFilter::from_config
     );
     praxis_filter::register_filters!(

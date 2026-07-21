@@ -413,6 +413,7 @@ fn build_state(
 ) -> ResponsesState {
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
+    state.history_rehydrated = true;
     state.messages.splice(0..0, replay);
     state.persisted_messages.splice(0..0, stored);
     state.previous_tools = previous_tools;

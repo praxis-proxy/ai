@@ -21,7 +21,7 @@ mod tests;
 use std::{
     collections::HashMap,
     fmt,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
@@ -30,6 +30,13 @@ use rmcp::{
     model::PaginatedRequestParams,
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Alibaba Cloud instance metadata service IPv4 endpoint.
+const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 
 // -----------------------------------------------------------------------------
 // McpDisplayUrl
@@ -404,23 +411,20 @@ async fn resolve_hostname_ssrf(
         })?
         .map_err(|_dns_err| ssrf_blocked(url.clone(), "DNS resolution failed"))?
         .collect();
-    for addr in &addrs {
-        let ip = praxis_core::connectivity::normalize_mapped_ipv4(addr.ip());
-        if allow_loopback && ip.is_loopback() {
-            continue;
-        }
-        if is_ssrf_sensitive(&ip) {
-            return Err(ssrf_blocked(
-                url,
-                "address is loopback, link-local, unspecified, or cloud metadata",
-            ));
-        }
-    }
+    check_resolved_addrs(&addrs, &url, allow_loopback)?;
     Ok(ResolvedMcpUrl {
         display_url: url,
         hostname: Some(host.to_owned()),
         addrs,
     })
+}
+
+/// Check DNS-resolved addresses against the SSRF block list.
+fn check_resolved_addrs(addrs: &[SocketAddr], url: &McpDisplayUrl, allow_loopback: bool) -> Result<(), McpClientError> {
+    for addr in addrs {
+        check_ip(addr.ip(), url, allow_loopback)?;
+    }
+    Ok(())
 }
 
 /// Build a reqwest client with resolved addresses pinned, so
@@ -471,7 +475,9 @@ fn is_blocked_hostname(host: &str) -> bool {
 /// metadata addresses are SSRF-sensitive.
 fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || *v4 == ALIBABA_CLOUD_METADATA_V4
+        },
         IpAddr::V6(v6) => {
             let [a, b, ..] = v6.octets();
             v6.is_loopback() || v6.is_unspecified() || (a == 0xFE && (b & 0xC0) == 0x80) || is_cloud_metadata_v6(v6)
