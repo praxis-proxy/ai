@@ -18,7 +18,6 @@ workspace = true
 [dev-dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
-axum = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
@@ -30,10 +29,8 @@ praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-protocol = { workspace = true }
 praxis-test-utils = { workspace = true }
-rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -42,4 +39,3 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
-tokio-util = { workspace = true }

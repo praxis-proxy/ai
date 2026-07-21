@@ -594,13 +594,19 @@ fn process_call_result_tool_error() {
 
 #[test]
 fn process_call_result_transport_error() {
-    let err = crate::mcp_client::McpClientError::Timeout {
+    let err = crate::mcp_client::McpClientError::CallTool {
         url: "http://example.com/mcp".to_owned(),
-        timeout: std::time::Duration::from_secs(5),
+        tool_name: "tool".to_owned(),
+        source: Box::new(std::io::Error::other("transport error")),
     };
     let result = process_call_result(Err(err), "c1", "srv", "tool", "{}");
     assert!(result.message["output"].as_str().unwrap().contains("Error:"));
-    assert!(result.output_item["error"].as_str().unwrap().contains("timed out"));
+    assert!(
+        result.output_item["error"]
+            .as_str()
+            .unwrap()
+            .contains("tools/call failed")
+    );
 }
 
 // =========================================================================

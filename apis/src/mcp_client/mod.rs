@@ -96,7 +96,7 @@ fn ssrf_blocked(url: McpDisplayUrl, reason: &'static str) -> McpClientError {
 
 /// Errors from MCP server communication.
 #[derive(Debug, thiserror::Error)]
-pub enum McpClientError {
+pub(crate) enum McpClientError {
     /// Failed to connect to the MCP server or complete the
     /// handshake.
     ///
@@ -195,7 +195,7 @@ pub enum McpClientError {
 /// Returns [`McpClientError`] on connection failure, timeout, or
 /// invalid server response.
 #[expect(clippy::too_many_arguments, reason = "allow_loopback extends the existing param set")]
-pub async fn list_tools(
+pub(crate) async fn list_tools(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
@@ -235,7 +235,7 @@ pub async fn list_tools(
 #[expect(clippy::too_many_arguments, reason = "allow_loopback extends the existing param set")]
 #[expect(clippy::too_many_lines, reason = "transport setup + call follows list_tools pattern")]
 #[expect(clippy::large_stack_frames, reason = "rmcp call_tool future is inherently large")]
-pub async fn call_tool(
+pub(crate) async fn call_tool(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
@@ -249,17 +249,16 @@ pub async fn call_tool(
         build_pinned_client(&resolved)?,
         build_transport_config(server_url, headers, authorization)?,
     );
-    let url = server_url.to_owned();
+    let display_url = resolved.display_url;
 
     let client = tokio::time::timeout(timeout, Box::pin(().serve(transport)))
         .await
         .map_err(|_elapsed| McpClientError::Timeout {
-            url: url.clone(),
+            url: display_url.clone(),
             timeout,
         })?
-        .map_err(|e| McpClientError::Connection {
-            url: url.clone(),
-            source: Box::new(e),
+        .map_err(|_source| McpClientError::Connection {
+            url: display_url.clone(),
         })?;
 
     let parsed_args = match &arguments {
@@ -275,11 +274,11 @@ pub async fn call_tool(
     tokio::time::timeout(timeout, Box::pin(client.call_tool(params)))
         .await
         .map_err(|_elapsed| McpClientError::Timeout {
-            url: url.clone(),
+            url: display_url.clone(),
             timeout,
         })?
         .map_err(|e| McpClientError::CallTool {
-            url,
+            url: server_url.to_owned(),
             tool_name: tool_name.to_owned(),
             source: Box::new(e),
         })
@@ -402,7 +401,7 @@ fn inject_authorization(
 ///
 /// Returns [`McpClientError::SsrfBlocked`] if the URL resolves to
 /// a loopback, link-local, or metadata address.
-pub async fn validate_mcp_url(url: &str, timeout: Duration, allow_loopback: bool) -> Result<(), McpClientError> {
+pub(crate) async fn validate_mcp_url(url: &str, timeout: Duration, allow_loopback: bool) -> Result<(), McpClientError> {
     resolve_and_validate(url, timeout, allow_loopback)
         .await
         .map(|_resolved| ())
