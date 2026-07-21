@@ -89,22 +89,23 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let input = echoed["input"]
         .as_array()
         .expect("proxy should rebuild input from rehydrated history");
-    let file_part = input
+    let text_part = input
         .iter()
         .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
         .flatten()
-        .find(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("input_file"))
-        .expect("rehydrated input_file should reach the backend");
+        .find(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("input_text"))
+        .expect("rehydrated file should be extracted to input_text by doc_extract");
 
-    // https://developers.openai.com/api/docs/guides/file-inputs#base64-encoded-files
-    assert_eq!(
-        file_part,
-        &serde_json::json!({
-            "type": "input_file",
-            "filename": "test.txt",
-            "file_data": "SGVsbG8sIHdvcmxkIQ=="
-        }),
-        "rehydrated upstream content part should match the OpenAI inline input_file shape"
+    let text = text_part["text"]
+        .as_str()
+        .expect("extracted input_text should have a text field");
+    assert!(
+        text.contains("[Source: test.txt]"),
+        "extracted text should include filename prefix: {text}"
+    );
+    assert!(
+        text.contains("Hello, world!"),
+        "extracted text should include file content: {text}"
     );
 }
 

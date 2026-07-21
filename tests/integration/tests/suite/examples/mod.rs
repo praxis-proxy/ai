@@ -14,6 +14,7 @@ mod full_flow;
 mod mcp_broker;
 mod model_to_header;
 mod openai_conversations;
+mod openai_doc_extract;
 mod openai_file_resolve;
 mod openai_mcp_dispatch;
 mod openai_mcp_tool_resolve;

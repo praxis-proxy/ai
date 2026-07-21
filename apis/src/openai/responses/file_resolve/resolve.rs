@@ -641,7 +641,7 @@ async fn resolve_item(item: &mut serde_json::Value, resolver: &mut ContentResolv
 
 /// Return the mutable content parts array for a given input item,
 /// if applicable.
-fn content_parts_mut(item: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
+pub(crate) fn content_parts_mut(item: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
     match item.get("type").and_then(serde_json::Value::as_str) {
         Some("message") => item.get_mut("content").and_then(serde_json::Value::as_array_mut),
         Some("function_call_output") => item.get_mut("output").and_then(serde_json::Value::as_array_mut),
@@ -811,7 +811,7 @@ fn max_content_bytes_for_data_url(max_data_url_bytes: usize, content_type: &str)
 }
 
 /// Infer MIME type from a filename extension.
-fn infer_mime_from_filename(filename: Option<&str>) -> Option<&'static str> {
+pub(crate) fn infer_mime_from_filename(filename: Option<&str>) -> Option<&'static str> {
     let ext = filename?.rsplit('.').next()?;
     match ext.to_ascii_lowercase().as_str() {
         "csv" => Some("text/csv"),

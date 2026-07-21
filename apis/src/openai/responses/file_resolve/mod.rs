@@ -44,7 +44,7 @@
 //! [`ResponsesState`]: super::state::ResponsesState
 
 mod config;
-mod resolve;
+pub(crate) mod resolve;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]

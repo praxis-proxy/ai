@@ -18,6 +18,7 @@
 //! to validate parameter combinations and extract additional fields.
 
 mod config;
+pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
 pub(crate) mod mcp_dispatch;
@@ -29,6 +30,7 @@ pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;
 
+pub use doc_extract::DocExtractFilter;
 pub use file_resolve::FileResolveFilter;
 pub use mcp_dispatch::McpDispatchFilter;
 pub use model_rewrite::ModelRewriteFilter;
