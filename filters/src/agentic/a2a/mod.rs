@@ -293,9 +293,11 @@ impl HttpFilter for A2aFilter {
             if let Some(chunk) = body.as_ref() {
                 scan_json_balance(&mut balance, chunk);
             }
+            let is_complete = balance.is_complete();
             save_json_balance_state(ctx, balance);
 
-            if balance.is_complete() || end_of_stream {
+            let gate_exhausted = ctx.get_metadata("a2a.response.capture_gate_exhausted") == Some("true");
+            if should_attempt_capture(is_complete, gate_exhausted, end_of_stream) {
                 try_capture_from_buffer(ctx, store, &self.config.task_routing, end_of_stream);
             }
             return Ok(FilterAction::Continue);
@@ -395,11 +397,34 @@ fn lookup_task_route(
     }
 }
 
+/// Whether [`try_capture_from_buffer`] should run for this chunk.
+///
+/// Skips the parse once the scanner reports `is_complete` but a prior
+/// non-final attempt already failed (`gate_exhausted`), deferring to
+/// `end_of_stream` instead of repeating a doomed hex-decode + parse on
+/// every subsequent chunk — see [`try_capture_from_buffer`].
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "three independent per-chunk flags read directly off saved scanner/gate state"
+)]
+fn should_attempt_capture(is_complete: bool, gate_exhausted: bool, end_of_stream: bool) -> bool {
+    (is_complete && !gate_exhausted) || end_of_stream
+}
+
 /// Pingora may not deliver a separate EOS callback after the final data
 /// chunk, so callers attempt this as soon as [`JsonBalanceState`] reports
 /// the buffer holds a balanced top-level JSON value, rather than waiting
 /// for `end_of_stream`. This avoids repeating a full hex-decode and
 /// `serde_json` parse of the whole accumulated buffer on every chunk.
+///
+/// [`JsonBalanceState`] is a heuristic gate, not a validator: a buffer
+/// can be balanced and type-matched yet still fail to parse (e.g.
+/// trailing bytes after a complete object). Once that happens on a
+/// non-final chunk, the scanner is permanently "complete" and would
+/// otherwise trigger this same doomed parse on every later chunk,
+/// reintroducing the O(n²) cost this scanner exists to avoid. Set
+/// `a2a.response.capture_gate_exhausted` in that case so callers stop
+/// re-attempting until `end_of_stream`.
 fn try_capture_from_buffer(
     ctx: &mut HttpFilterContext<'_>,
     store: &LocalTaskRouteStore,
@@ -419,6 +444,9 @@ fn try_capture_from_buffer(
         clear_capture_metadata(ctx);
     } else if end_of_stream {
         clear_capture_metadata(ctx);
+    } else {
+        ctx.filter_metadata
+            .insert("a2a.response.capture_gate_exhausted".to_owned(), "true".to_owned());
     }
 }
 
@@ -475,16 +503,19 @@ fn store_task_route(
 }
 
 /// Removes `a2a.response.*` keys from `filter_metadata`, including the
-/// [`JsonBalanceState`] scratch fields.
+/// [`JsonBalanceState`] scratch fields and the post-completion parse
+/// gate.
 fn clear_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.capture_enabled");
     ctx.filter_metadata.remove("a2a.response.buffer_hex");
     ctx.filter_metadata.remove("a2a.response.buffer_bytes");
     ctx.filter_metadata.remove("a2a.response.cluster");
-    ctx.filter_metadata.remove("a2a.response.json_depth");
+    ctx.filter_metadata.remove("a2a.response.json_stack");
     ctx.filter_metadata.remove("a2a.response.json_started");
     ctx.filter_metadata.remove("a2a.response.json_in_string");
     ctx.filter_metadata.remove("a2a.response.json_escaped");
+    ctx.filter_metadata.remove("a2a.response.json_invalid");
+    ctx.filter_metadata.remove("a2a.response.capture_gate_exhausted");
 }
 
 /// Accumulate raw bytes as hex to avoid corruption when chunk boundaries
@@ -523,44 +554,72 @@ fn accumulate_response_hex(ctx: &mut HttpFilterContext<'_>, chunk: &[u8], max_by
     true
 }
 
-/// Incremental brace/bracket-depth state for detecting when an
-/// accumulated buffer holds a complete, balanced top-level JSON value,
-/// without re-parsing the whole buffer on every chunk.
+/// Incremental brace/bracket state for detecting when an accumulated
+/// buffer holds a complete, type-matched top-level JSON value, without
+/// re-parsing the whole buffer on every chunk.
 ///
 /// A2A JSON-RPC responses are always a top-level `{...}` object, so
-/// tracking `{}`/`[]` depth while skipping bytes inside string literals
-/// is sufficient to detect completion — a full incremental JSON parser
-/// is unnecessary. Structural JSON bytes (`{`, `}`, `[`, `]`, `"`, `\`)
-/// are always single-byte ASCII, so scanning raw bytes is safe even
-/// when a chunk boundary splits a multibyte UTF-8 code point.
-#[derive(Debug, Default, Clone, Copy)]
+/// tracking a stack of expected closing brackets while skipping bytes
+/// inside string literals is sufficient to detect completion — a full
+/// incremental JSON parser is unnecessary. Structural JSON bytes (`{`,
+/// `}`, `[`, `]`, `"`, `\`) are always single-byte ASCII, so scanning raw
+/// bytes is safe even when a chunk boundary splits a multibyte UTF-8
+/// code point.
+///
+/// This is a heuristic gate, not a validator: a balanced, type-matched
+/// top-level value does not guarantee the buffer is valid JSON (e.g.
+/// trailing bytes after a complete object, or a trailing comma). The
+/// real `serde_json` parse in [`try_capture_from_buffer`] remains the
+/// source of truth; that function gates re-attempts after a failed
+/// parse so a structurally-balanced-but-invalid buffer cannot force a
+/// full re-parse on every subsequent chunk.
+#[derive(Debug, Default, Clone)]
 #[expect(clippy::struct_excessive_bools, reason = "independent per-byte scan flags")]
 struct JsonBalanceState {
-    /// Nested `{`/`[` depth. Saturates at 0 so a stray leading closing
-    /// bracket cannot underflow the counter.
-    depth: u32,
-    /// Whether an opening `{`/`[` has been seen. A depth of 0 before
+    /// Expected closing bytes (`}` for `{`, `]` for `[`) for currently
+    /// open brackets, innermost last. `{]` must not read as balanced,
+    /// so closers are matched against the opener type, not just counted.
+    stack: Vec<u8>,
+    /// Whether an opening `{`/`[` has been seen. An empty stack before
     /// this is true means "no object seen yet", not "complete".
     started: bool,
     /// Whether the scan is currently positioned inside a string literal.
     in_string: bool,
     /// Whether the previous byte inside a string was an unconsumed `\`.
     escaped: bool,
+    /// Set once a closing bracket does not match the type of its
+    /// corresponding opener, or appears with no opener on the stack.
+    /// Once set, scanning stops and `is_complete` always reports
+    /// `false`, so the caller falls back to `end_of_stream` instead of
+    /// treating a structurally invalid buffer as a completed value.
+    invalid: bool,
 }
 
 impl JsonBalanceState {
-    /// Whether the bytes scanned so far form a balanced top-level value.
-    fn is_complete(self) -> bool {
-        self.started && self.depth == 0
+    /// Whether the bytes scanned so far form a balanced, type-matched
+    /// top-level value. See the struct-level doc comment: this does not
+    /// guarantee the buffer is valid JSON.
+    fn is_complete(&self) -> bool {
+        self.started && !self.invalid && self.stack.is_empty()
+    }
+
+    /// Whether further scanning could still change the outcome. `false`
+    /// once the buffer is either complete or marked invalid.
+    fn is_done(&self) -> bool {
+        self.is_complete() || self.invalid
     }
 }
 
 /// Update `state` with the bytes in `chunk`. A no-op once `state` is
-/// already complete, so total work across all chunks is O(n) in bytes
-/// rather than the O(n²) of re-scanning the whole buffer every call.
-#[expect(clippy::too_many_lines, reason = "31 lines; single per-byte match pipeline")]
+/// already complete or invalid, so total work across all chunks is
+/// O(n) in bytes rather than the O(n²) of re-scanning the whole buffer
+/// every call.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single per-byte match pipeline, now with bracket-type matching"
+)]
 fn scan_json_balance(state: &mut JsonBalanceState, chunk: &[u8]) {
-    if state.is_complete() {
+    if state.is_done() {
         return;
     }
 
@@ -581,15 +640,24 @@ fn scan_json_balance(state: &mut JsonBalanceState, chunk: &[u8]) {
 
         match byte {
             b'"' => state.in_string = true,
-            b'{' | b'[' => {
+            b'{' => {
                 state.started = true;
-                state.depth = state.depth.saturating_add(1);
+                state.stack.push(b'}');
             },
-            b'}' | b']' => {
-                state.depth = state.depth.saturating_sub(1);
-                if state.is_complete() {
+            b'[' => {
+                state.started = true;
+                state.stack.push(b']');
+            },
+            b'}' | b']' => match state.stack.pop() {
+                Some(expected) if expected == byte => {
+                    if state.is_complete() {
+                        return;
+                    }
+                },
+                _ => {
+                    state.invalid = true;
                     return;
-                }
+                },
             },
             _ => {},
         }
@@ -599,11 +667,11 @@ fn scan_json_balance(state: &mut JsonBalanceState, chunk: &[u8]) {
 /// Reconstructs [`JsonBalanceState`] from `filter_metadata`.
 fn load_json_balance_state(ctx: &HttpFilterContext<'_>) -> JsonBalanceState {
     JsonBalanceState {
-        depth: ctx
+        stack: ctx
             .filter_metadata
-            .get("a2a.response.json_depth")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
+            .get("a2a.response.json_stack")
+            .map(|v| v.as_bytes().to_vec())
+            .unwrap_or_default(),
         started: ctx
             .filter_metadata
             .get("a2a.response.json_started")
@@ -616,13 +684,20 @@ fn load_json_balance_state(ctx: &HttpFilterContext<'_>) -> JsonBalanceState {
             .filter_metadata
             .get("a2a.response.json_escaped")
             .is_some_and(|v| v == "true"),
+        invalid: ctx
+            .filter_metadata
+            .get("a2a.response.json_invalid")
+            .is_some_and(|v| v == "true"),
     }
 }
 
 /// Persists [`JsonBalanceState`] back to `filter_metadata` for the next chunk.
 fn save_json_balance_state(ctx: &mut HttpFilterContext<'_>, state: JsonBalanceState) {
-    ctx.filter_metadata
-        .insert("a2a.response.json_depth".to_owned(), state.depth.to_string());
+    ctx.filter_metadata.insert(
+        "a2a.response.json_stack".to_owned(),
+        // Stack bytes are always `}`/`]`, so this is always valid UTF-8.
+        String::from_utf8(state.stack).unwrap_or_default(),
+    );
     ctx.filter_metadata.insert(
         "a2a.response.json_started".to_owned(),
         if state.started { "true" } else { "false" }.to_owned(),
@@ -634,6 +709,10 @@ fn save_json_balance_state(ctx: &mut HttpFilterContext<'_>, state: JsonBalanceSt
     ctx.filter_metadata.insert(
         "a2a.response.json_escaped".to_owned(),
         if state.escaped { "true" } else { "false" }.to_owned(),
+    );
+    ctx.filter_metadata.insert(
+        "a2a.response.json_invalid".to_owned(),
+        if state.invalid { "true" } else { "false" }.to_owned(),
     );
 }
 
