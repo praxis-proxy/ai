@@ -10,12 +10,12 @@
 ## Conventions
 
 **All contributors must read and understand
-[conventions.md] before contributing.** The conventions
+[CONTRIBUTING.md] before contributing.** The conventions
 cover code style, testing requirements, file
 organization, and security practices. Submissions
 that do not follow these conventions will be rejected.
 
-[conventions.md]:./conventions.md
+[CONTRIBUTING.md]:../../CONTRIBUTING.md
 
 ## Build
 
