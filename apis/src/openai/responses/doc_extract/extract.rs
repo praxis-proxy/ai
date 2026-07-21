@@ -177,11 +177,13 @@ pub(crate) fn extract_input_file(
 
     budget.register_reference()?;
 
-    let (content_bytes, mime) = extract_from_file_data(data, filename, budget)?;
+    let mime = determine_mime(data, filename);
 
     if !is_text_safe_mime(&mime) {
         return skip_or_reject_unsupported(&mime, filename, budget.on_unsupported);
     }
+
+    let content_bytes = decode_file_data(data, budget.max_content_bytes)?;
 
     let text = validate_and_decode_utf8(content_bytes, &mime, filename, budget)?;
     let Some(text) = text else {
@@ -266,29 +268,31 @@ fn check_encoded_size(encoded: &str, max_content_bytes: usize) -> Result<(), Ext
     Ok(())
 }
 
-/// Extract content from a `file_data` value (data-URI or raw base64).
-fn extract_from_file_data(
-    data: &str,
-    filename: Option<&str>,
-    budget: &ExtractionBudget,
-) -> Result<(Vec<u8>, String), ExtractError> {
+/// Determine the MIME type from `file_data` without decoding the payload.
+fn determine_mime(data: &str, filename: Option<&str>) -> String {
     if let Some(data_uri) = parse_data_uri(data) {
-        check_encoded_size(data_uri.base64_payload, budget.max_content_bytes)?;
-        let decoded = BASE64
+        data_uri.mime.to_owned()
+    } else {
+        infer_mime_from_filename(filename)
+            .unwrap_or("application/octet-stream")
+            .to_owned()
+    }
+}
+
+/// Decode the base64 payload from `file_data` (data-URI or raw).
+fn decode_file_data(data: &str, max_content_bytes: usize) -> Result<Vec<u8>, ExtractError> {
+    if let Some(data_uri) = parse_data_uri(data) {
+        check_encoded_size(data_uri.base64_payload, max_content_bytes)?;
+        BASE64
             .decode(data_uri.base64_payload)
             .map_err(|e| ExtractError::DecodeFailed {
                 detail: format!("invalid base64 in data URI: {e}"),
-            })?;
-        Ok((decoded, data_uri.mime.to_owned()))
+            })
     } else {
-        check_encoded_size(data, budget.max_content_bytes)?;
-        let decoded = BASE64.decode(data).map_err(|e| ExtractError::DecodeFailed {
+        check_encoded_size(data, max_content_bytes)?;
+        BASE64.decode(data).map_err(|e| ExtractError::DecodeFailed {
             detail: format!("invalid base64 in file_data: {e}"),
-        })?;
-        let mime = infer_mime_from_filename(filename)
-            .unwrap_or("application/octet-stream")
-            .to_owned();
-        Ok((decoded, mime))
+        })
     }
 }
 

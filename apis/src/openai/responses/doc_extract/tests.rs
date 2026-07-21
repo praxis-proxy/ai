@@ -482,6 +482,32 @@ async fn unsupported_format_continue_leaves_input_file() {
     );
 }
 
+#[test]
+fn non_text_data_uri_skips_without_decoding() {
+    let mut budget = ExtractionBudget::new(&DocExtractConfig {
+        allow_pre_security_callout: true,
+        max_body_bytes: MAX_JSON_BODY_BYTES,
+        max_content_bytes: 10_485_760,
+        max_file_references: 32,
+        max_total_text_bytes: 67_108_864,
+        on_unsupported: OnUnsupported::Continue,
+    });
+
+    let part = serde_json::json!({
+        "type": "input_file",
+        "filename": "slide.pptx",
+        "file_data": pdf_file_data()
+    });
+
+    let result = extract_input_file(&part, &mut budget).unwrap();
+    assert_eq!(result, None, "non-text MIME should return None without decoding");
+    assert_eq!(budget.references_seen, 1, "reference should still be counted");
+    assert_eq!(
+        budget.remaining_total_text_bytes, budget.max_total_text_bytes,
+        "no text bytes should be consumed for skipped files"
+    );
+}
+
 #[tokio::test]
 async fn unsupported_format_reject_returns_400() {
     let filter = make_filter_reject();
