@@ -300,7 +300,7 @@ impl FilesApiClient {
 
         let body = self
             .client
-            .get_json(&url, request_headers)
+            .get_json(url, request_headers)
             .await
             .map_err(|e| map_api_error(e, file_id))?;
 

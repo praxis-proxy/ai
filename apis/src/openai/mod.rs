@@ -6,7 +6,7 @@
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
 #[allow(
     dead_code,
-    reason = "api_base_url and post_json are wired in by the vector-store search client (#312)"
+    reason = "api_base_url and timeout are wired in by the vector-store search client (#312)"
 )]
 pub(crate) mod api_client;
 pub(crate) mod conversations;

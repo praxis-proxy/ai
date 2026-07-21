@@ -5,8 +5,9 @@
 //!
 //! Provides URL construction, SSRF-safe base-URL validation,
 //! resource-ID path-segment encoding, header forwarding, bounded
-//! JSON and byte reads, and normalized error mapping. Used by
-//! [`FilesApiClient`] and (in the future) vector-store search.
+//! byte reads, JSON metadata fetches, and normalized error
+//! mapping. Used by [`FilesApiClient`] and (in the future)
+//! vector-store search.
 //!
 //! JSON requests route through `praxis_core::callout::CalloutClient`
 //! for circuit breaking, callout-depth protection, and timeout.
@@ -51,9 +52,9 @@ pub(crate) struct ApiClientConfig {
 
 /// Shared HTTP client for OpenAI-compatible API callouts.
 ///
-/// JSON requests (`get_json`, `post_json`) route through
-/// [`CalloutClient`] for circuit breaking and callout-depth
-/// protection. Content downloads (`get_bytes`) use a direct
+/// JSON requests (`get_json`) route through [`CalloutClient`]
+/// for circuit breaking and callout-depth protection. Content
+/// downloads (`get_bytes`) use a direct
 /// `reqwest::Client` with chunk-by-chunk bounded reads so
 /// oversized responses are rejected during collection without
 /// unbounded memory consumption. Unifying both paths behind
@@ -140,7 +141,7 @@ impl ApiClient {
     /// response body as JSON.
     pub(crate) async fn get_json(
         &self,
-        url: &str,
+        url: String,
         request_headers: &http::HeaderMap,
     ) -> Result<serde_json::Value, ApiClientError> {
         let headers = self.forward_headers(request_headers);
@@ -149,41 +150,7 @@ impl ApiClient {
             depth: 0,
             headers,
             method: http::Method::GET,
-            url: url.to_owned(),
-        };
-
-        let response = execute_callout(&self.client, request).await?;
-
-        serde_json::from_slice(&response.body).map_err(|e| ApiClientError::DecodeFailed {
-            detail: format!("JSON decode failed: {e}"),
-        })
-    }
-
-    /// Send a POST request with a JSON body via the callout client
-    /// and parse the response body as JSON.
-    pub(crate) async fn post_json(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-        request_headers: &http::HeaderMap,
-    ) -> Result<serde_json::Value, ApiClientError> {
-        let mut headers = self.forward_headers(request_headers);
-        headers.retain(|(name, _)| name != http::header::CONTENT_TYPE);
-        headers.push((
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("application/json"),
-        ));
-
-        let serialized = serde_json::to_vec(body).map_err(|e| ApiClientError::DecodeFailed {
-            detail: format!("request body serialization failed: {e}"),
-        })?;
-
-        let request = CalloutRequest {
-            body: Some(serialized),
-            depth: 0,
-            headers,
-            method: http::Method::POST,
-            url: url.to_owned(),
+            url,
         };
 
         let response = execute_callout(&self.client, request).await?;
@@ -490,7 +457,7 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let json = client
-            .get_json(&format!("http://{address}/v1/files/file-abc"), &http::HeaderMap::new())
+            .get_json(format!("http://{address}/v1/files/file-abc"), &http::HeaderMap::new())
             .await
             .unwrap();
 
@@ -513,82 +480,13 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let err = client
-            .get_json(&format!("http://{address}/v1/files/file-abc"), &http::HeaderMap::new())
+            .get_json(format!("http://{address}/v1/files/file-abc"), &http::HeaderMap::new())
             .await
             .unwrap_err();
 
         assert!(
             matches!(err, ApiClientError::DecodeFailed { .. }),
             "invalid JSON should return a decode error"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_json_sends_body_and_parses_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let n = stream.read(&mut request).unwrap();
-            let request_str = String::from_utf8_lossy(&request[..n]);
-            assert!(request_str.starts_with("POST"), "should be a POST request");
-            assert!(
-                request_str.contains("content-type: application/json"),
-                "should have JSON content-type: {request_str}"
-            );
-            let body = r#"{"results":[]}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        let client = test_client(&format!("http://{address}"));
-
-        let request_body = serde_json::json!({"query": "test"});
-        let json = client
-            .post_json(
-                &format!("http://{address}/v1/vector_stores/vs-123/search"),
-                &request_body,
-                &http::HeaderMap::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(json["results"].as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn post_json_strips_forwarded_content_type() {
-        let (listener, address) = bind_test_server();
-        let captured = capture_request(listener, r#"{"ok":true}"#);
-
-        let client = ApiClient::new(ApiClientConfig {
-            api_base_url: format!("http://{address}"),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms: 1_000,
-                ..CalloutConfig::default()
-            },
-            forward_header_names: vec![http::header::CONTENT_TYPE],
-        })
-        .unwrap();
-
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
-
-        client
-            .post_json(&format!("http://{address}/v1/search"), &serde_json::json!({}), &headers)
-            .await
-            .unwrap();
-
-        let req = captured.join().unwrap();
-        let ct_count = req.matches("content-type:").count();
-        assert_eq!(ct_count, 1, "exactly one content-type header, got {ct_count}");
-        assert!(
-            req.contains("content-type: application/json"),
-            "should be application/json"
         );
     }
 
@@ -610,7 +508,7 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let err = client
-            .get_json(&format!("http://{address}/v1/files/missing"), &http::HeaderMap::new())
+            .get_json(format!("http://{address}/v1/files/missing"), &http::HeaderMap::new())
             .await
             .unwrap_err();
 
@@ -706,5 +604,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(bytes.len(), payload_size, "should receive full >1 MiB payload");
+    }
+
+    fn slow_body_server(listener: TcpListener) {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 4096];
+            let _n = stream.read(&mut buf).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\na")
+                .unwrap();
+            stream.flush().unwrap();
+            std::thread::park_timeout(Duration::from_millis(250));
+            let _result = stream.write_all(b"bcde");
+        });
+    }
+
+    #[tokio::test]
+    async fn get_bytes_timeout_covers_response_body() {
+        let (listener, addr) = bind_test_server();
+        slow_body_server(listener);
+
+        let client = ApiClient::new(ApiClientConfig {
+            api_base_url: format!("http://{addr}"),
+            callout_config: CalloutConfig {
+                failure_mode: FailureMode::Closed,
+                timeout_ms: 50,
+                ..CalloutConfig::default()
+            },
+            forward_header_names: Vec::new(),
+        })
+        .unwrap();
+
+        let err = client
+            .get_bytes(
+                &format!("http://{addr}/v1/files/slow/content"),
+                &http::HeaderMap::new(),
+                1024,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ApiClientError::CalloutFailed { .. }),
+            "slow body should fail before completing: {err}"
+        );
     }
 }
