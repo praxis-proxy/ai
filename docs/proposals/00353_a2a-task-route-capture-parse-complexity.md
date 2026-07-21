@@ -1,5 +1,6 @@
 ---
 issue: https://github.com/praxis-proxy/ai/issues/353
+discussion: https://github.com/praxis-proxy/ai/pull/396
 status: proposed
 authors:
   - mkoushni
