@@ -107,6 +107,8 @@ fn is_cloud_metadata(ip: &IpAddr) -> bool {
             *v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
                 || *v4 == std::net::Ipv4Addr::new(169, 254, 170, 2)
                 || *v4 == std::net::Ipv4Addr::new(169, 254, 170, 23)
+                || *v4 == std::net::Ipv4Addr::new(169, 254, 0, 23)
+                || *v4 == std::net::Ipv4Addr::new(169, 254, 10, 10)
                 || *v4 == std::net::Ipv4Addr::new(100, 100, 100, 200)
         },
         IpAddr::V6(v6) => {
@@ -274,7 +276,8 @@ pub(crate) fn is_file_url_ssrf_blocked(ip: &IpAddr, allow_private: bool) -> bool
 
 /// Redact sensitive parts of a URL for safe logging.
 ///
-/// Strips credentials entirely and replaces query parameter values with `[REDACTED]`.
+/// Strips credentials and fragments, and replaces query parameter values
+/// with `[REDACTED]`.
 pub(crate) fn redact_url(raw: &str) -> String {
     let Ok(mut url) = url::Url::parse(raw) else {
         return "<invalid URL>".to_owned();
@@ -285,6 +288,8 @@ pub(crate) fn redact_url(raw: &str) -> String {
         let _ = url.set_username("");
         let _ = url.set_password(None);
     }
+
+    url.set_fragment(None);
 
     // Redact query values
     if url.query().is_some() {
@@ -805,6 +810,14 @@ mod tests {
             NormalizedOrigin::parse("http://100.100.100.200").is_err(),
             "Alibaba metadata should be rejected"
         );
+        assert!(
+            NormalizedOrigin::parse("http://169.254.0.23").is_err(),
+            "Tencent metadata 169.254.0.23 should be rejected"
+        );
+        assert!(
+            NormalizedOrigin::parse("http://169.254.10.10").is_err(),
+            "Tencent metadata 169.254.10.10 should be rejected"
+        );
     }
 
     #[test]
@@ -1015,6 +1028,30 @@ mod tests {
         assert!(
             is_file_url_ssrf_blocked(&"100.100.100.200".parse().unwrap(), true),
             "Alibaba metadata should be blocked even with allowlist"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_tencent_metadata() {
+        assert!(
+            is_file_url_ssrf_blocked(&"169.254.0.23".parse().unwrap(), true),
+            "Tencent metadata 169.254.0.23 should be blocked even with allowlist"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"169.254.10.10".parse().unwrap(), true),
+            "Tencent metadata 169.254.10.10 should be blocked even with allowlist"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_tencent_metadata_via_nat64() {
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b::a9fe:0017".parse().unwrap(), true),
+            "Tencent 169.254.0.23 via NAT64 should be blocked even with allowlist"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b::a9fe:0a0a".parse().unwrap(), true),
+            "Tencent 169.254.10.10 via NAT64 should be blocked even with allowlist"
         );
     }
 
@@ -1560,6 +1597,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn redact_url_strips_fragment() {
+        let redacted = redact_url("https://example.com/file#access_token=secret");
+        assert!(
+            !redacted.contains("access_token"),
+            "fragment should be stripped entirely"
+        );
+        assert!(!redacted.contains('#'), "fragment delimiter should not remain");
+    }
+
     // validate_file_url tests
     #[test]
     fn validate_file_url_accepts_http() {
@@ -1788,5 +1835,131 @@ mod tests {
             None,
             "empty quoted filename should return None"
         );
+    }
+
+    // Coverage: matches_url with no host (cannot-be-a-base URL)
+    #[test]
+    fn matches_url_no_host() {
+        let origin = NormalizedOrigin::parse("https://example.com").unwrap();
+        let url = url::Url::parse("data:text/plain,hello").unwrap();
+        assert!(!origin.matches_url(&url), "cannot-be-a-base URL has no host");
+    }
+
+    // Coverage: backslash escape inside quoted Content-Disposition value
+    #[test]
+    fn content_disposition_escaped_quote_in_filename() {
+        assert_eq!(
+            parse_content_disposition_filename(r#"attachment; filename="file\"name.pdf""#),
+            Some("file\"name.pdf".to_owned()),
+            "backslash-escaped quote inside filename should be unescaped"
+        );
+    }
+
+    // Coverage: invalid percent sequence in percent_decode_utf8
+    #[test]
+    fn content_disposition_invalid_percent_encoding() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename*=UTF-8''file%ZZname.pdf"),
+            Some("file_name.pdf".to_owned()),
+            "invalid percent sequence should produce underscore replacement"
+        );
+    }
+
+    // Coverage: multi-byte UTF-8 truncation in sanitize_filename
+    #[test]
+    fn sanitize_filename_multibyte_truncation() {
+        // 254 ASCII bytes + 2-byte UTF-8 char = 256 bytes, exceeds 255
+        let mut name = "a".repeat(254);
+        name.push('\u{00E9}'); // é is 2 bytes in UTF-8
+        let sanitized = sanitize_filename(&name).unwrap();
+        assert!(
+            sanitized.len() <= 255,
+            "multi-byte truncation should stay within 255 bytes"
+        );
+        assert_eq!(sanitized.len(), 254, "should truncate to 254 (before the 2-byte char)");
+    }
+
+    // Coverage: Content-Disposition with no = sign in a segment
+    #[test]
+    fn content_disposition_no_equals() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; noequals"),
+            None,
+            "parameter without = should be skipped"
+        );
+    }
+
+    // Coverage: Content-Disposition with empty parameter name
+    #[test]
+    fn content_disposition_empty_param_name() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; =value"),
+            None,
+            "empty parameter name should be skipped"
+        );
+    }
+
+    // Coverage: percent_decode_utf8 truncated sequence (single char after %)
+    #[test]
+    fn content_disposition_truncated_percent() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename*=UTF-8''file%2"),
+            Some("file_".to_owned()),
+            "truncated percent sequence should produce underscore"
+        );
+    }
+
+    // Coverage: MIME type edge cases for is_valid_mime_type
+    #[test]
+    fn mime_rejects_double_slash() {
+        assert!(
+            !is_valid_mime_type("text/plain/extra"),
+            "MIME with multiple slashes should be rejected (subtype contains /)"
+        );
+    }
+
+    #[test]
+    fn mime_accepts_with_dash_dot_plus() {
+        assert!(
+            is_valid_mime_type("application/vnd.openxml-officedocument+xml"),
+            "MIME with dashes, dots, and plus should be accepted"
+        );
+    }
+
+    // Coverage: is_blocked_hostname
+    #[test]
+    fn blocked_hostname_localhost() {
+        assert!(is_blocked_hostname("localhost"), "localhost should be blocked");
+        assert!(
+            is_blocked_hostname("app.localhost"),
+            ".localhost subdomain should be blocked"
+        );
+        assert!(
+            !is_blocked_hostname("example.com"),
+            "non-localhost should not be blocked"
+        );
+    }
+
+    // Coverage: NormalizedOrigin::parse with non-IP hostname
+    #[test]
+    fn parse_accepts_dns_hostname() {
+        let origin = NormalizedOrigin::parse("https://files.example.com").unwrap();
+        assert_eq!(origin.host, "files.example.com", "hostname should be preserved");
+    }
+
+    // Coverage: validate_file_url accepts localhost (validation doesn't check hostname)
+    #[test]
+    fn validate_file_url_passes_localhost() {
+        assert!(
+            validate_file_url("https://localhost/file.pdf").is_ok(),
+            "validate_file_url only checks scheme/credentials/fragment, not hostname"
+        );
+    }
+
+    // Coverage: NormalizedOrigin default HTTP port
+    #[test]
+    fn parse_normalizes_http_default_port() {
+        let origin = NormalizedOrigin::parse("http://example.com").unwrap();
+        assert_eq!(origin.port, 80, "HTTP default port should be 80");
     }
 }
