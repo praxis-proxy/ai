@@ -53,6 +53,7 @@ filter_chains:
       - filter: openai_responses_compact
         inference_url: "http://localhost:11434/v1/chat/completions"
         default_model: llama3.2:1b
+        timeout_ms: 60000
 
       - filter: openai_responses_proxy
         name: inference

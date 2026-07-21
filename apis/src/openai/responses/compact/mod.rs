@@ -115,6 +115,42 @@ impl CompactFilter {
             config: validated,
         }))
     }
+
+    /// Run the summarization callout and return the summary text.
+    ///
+    /// Returns `Ok(Some(summary))` on success, `Ok(None)` when
+    /// compaction should be skipped, or `Err(FilterAction)` to
+    /// short-circuit the request.
+    async fn execute_compaction(
+        &self,
+        state: &ResponsesState,
+        params: &CompactionParams,
+        streaming: bool,
+    ) -> Result<Option<String>, FilterAction> {
+        let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
+        let instructions = state.request_body.get("instructions").and_then(Value::as_str);
+        let request =
+            build_summarization_request(&state.messages, instructions, model, &self.config.inference_url);
+
+        match self.callout_client.execute(request).await {
+            CalloutResult::Success(resp) => parse_summarization_response(&resp.body)
+                .map(Some)
+                .or_else(|e| {
+                    warn!(error = %e, "failed to parse summarization response, skipping compaction");
+                    Ok(None)
+                }),
+            CalloutResult::Failed => {
+                warn!("summarization callout failed, skipping compaction");
+                Ok(None)
+            }
+            CalloutResult::Rejected(rejection) => {
+                warn!(status = rejection.status, "summarization callout rejected");
+                Err(FilterAction::Reject(responses_error_rejection(
+                    rejection.status, "server_error", "summarization callout rejected", streaming,
+                )))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -147,80 +183,33 @@ impl HttpFilter for CompactFilter {
         _body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
-        }
-
-        // Skip non-Responses requests
+        if !end_of_stream { return Ok(FilterAction::Continue); }
         if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
             return Ok(FilterAction::Release);
         }
-
-        let streaming = ctx
-            .get_metadata("openai_responses_format.stream")
-            .is_some_and(|v| v == "true");
-
+        let streaming = ctx.get_metadata("openai_responses_format.stream").is_some_and(|v| v == "true");
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
-            debug!("no ResponsesState in extensions, passthrough");
             return Ok(FilterAction::Release);
         };
-
-
-        let Some(compaction_config) = extract_compaction_config(&state.context_management) else {
-            debug!("no compaction config in context management");
+        let Some(params) = extract_compaction_config(&state.context_management) else {
             return Ok(FilterAction::Release);
         };
-
         let Some(token_count) = get_token_count(&state.messages, &self.config.tiktoken_encoding) else {
             return Ok(FilterAction::Release);
         };
-
-        if token_count <= compaction_config.compact_threshold {
-            debug!(token_count, threshold = compaction_config.compact_threshold, "under threshold, skipping compaction");
+        if token_count <= params.compact_threshold {
+            debug!(token_count, threshold = params.compact_threshold, "under threshold, skipping");
             return Ok(FilterAction::Release);
         }
-
-        debug!(token_count, threshold = compaction_config.compact_threshold, "threshold exceeded, compaction needed");
-
-        let model = compaction_config.compaction_model
-            .as_deref()
-            .unwrap_or(&self.config.default_model);
-
-        let instructions = state.request_body
-            .get("instructions")
-            .and_then(Value::as_str);
-
-        let request = build_summarization_request(&state.messages, instructions, model, &self.config.inference_url);
-        let response = match self.callout_client.execute(request).await {
-            CalloutResult::Success(response) => parse_summarization_response(&response.body),
-            CalloutResult::Failed => {
-                warn!("summarization callout failed, skipping compaction");
-                return Ok(FilterAction::Release);
-            }
-            CalloutResult::Rejected(rejection) => {
-                warn!(status = rejection.status, "summarization callout rejected (closed failure mode)");
-                return Ok(FilterAction::Reject(responses_error_rejection(
-                    rejection.status,
-                    "server_error",
-                    "summarization callout rejected",
-                    streaming,
-                )));
-            }
+        let summary = match self.execute_compaction(state, &params, streaming).await {
+            Ok(Some(s)) => s,
+            Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
+            Err(action) => return Ok(action),
         };
-
-        let summary = match response {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "failed to parse summarization response, skipping compaction");
-                return Ok(FilterAction::Release);
-            }
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            return Ok(FilterAction::Release);
         };
-
-        let compaction_item = build_compaction_item(&summary);
-
-        let state = ctx.extensions.get_mut::<ResponsesState>().expect("ResponsesState was present above");
-        replace_messages(state, compaction_item);
-
+        replace_messages(state, build_compaction_item(&summary));
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
@@ -248,12 +237,12 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Option<Compa
         }
         let compact_threshold = entry
             .get("compact_threshold")
-            .and_then(|v| v.as_u64())
+            .and_then(Value::as_u64)
             .unwrap_or(0);
         let compaction_model = entry
             .get("compaction_model")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned());
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         return Some(CompactionParams {
             compact_threshold,
             compaction_model,
@@ -316,7 +305,7 @@ fn build_summarization_request(
         ]
     });
 
-    let body_bytes = serde_json::to_vec(&body).expect("json! values always serialize");
+    let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
 
     CalloutRequest {
         method: http::Method::POST,
@@ -339,12 +328,12 @@ fn parse_summarization_response(body: &[u8]) -> Result<String, String> {
         Ok(body) => {
             body.get("choices")
                 .and_then(Value::as_array)
-                .and_then(|choices| choices.get(0))
+                .and_then(|choices| choices.first())
                 .and_then(|choice| choice.get("message"))
                 .and_then(|msg| msg.get("content"))
                 .and_then(Value::as_str)
-                .map(|s| s.to_owned())
-                .ok_or_else(|| "Chat Completions response missing choices[0].message.content".to_string())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "Chat Completions response missing choices[0].message.content".to_owned())
         }
         Err(err) => { Err(format!("failed to parse Chat Completions response JSON: {err}"))}
     }
@@ -358,8 +347,8 @@ fn parse_summarization_response(body: &[u8]) -> Result<String, String> {
 /// in the proxy context this is plain text.
 fn build_compaction_item(summary: &str) -> Value {
     serde_json::json!({
-        "type": "compaction",
-        "encrypted_content": summary
+        "role": "system",
+        "content": summary
     })
 }
 
@@ -372,10 +361,10 @@ fn build_compaction_item(summary: &str) -> Value {
 /// `state.input` holds the current request's input items (unchanged
 /// by rehydrate), so the current turn's messages are preserved.
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
-    let mut new_messages = vec![compaction_item.clone()];
+    let mut new_messages = vec![compaction_item];
     new_messages.extend(state.input.iter().cloned());
-    state.messages = new_messages.clone();
-    state.persisted_messages = new_messages;
+    state.persisted_messages = new_messages.clone();
+    state.messages = new_messages;
 }
 
 /// Format a message array as readable text for the summarization prompt.

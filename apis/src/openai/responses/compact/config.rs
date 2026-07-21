@@ -49,10 +49,12 @@ pub(super) struct CompactFilterConfig {
     pub status_on_error: Option<u16>,
 }
 
+/// Default summarization model when not overridden per-request.
 fn default_model() -> String {
     "gpt-4o-mini".to_owned()
 }
 
+/// Default tiktoken encoding for local token estimation.
 fn default_tiktoken_encoding() -> String {
     "cl100k_base".to_owned()
 }
@@ -97,9 +99,9 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
     )?;
 
     Ok(ValidatedConfig {
-        inference_url: raw.inference_url.to_owned(),
-        default_model: raw.default_model.to_owned(),
-        tiktoken_encoding: raw.tiktoken_encoding.to_owned(),
+        inference_url: raw.inference_url.clone(),
+        default_model: raw.default_model.clone(),
+        tiktoken_encoding: raw.tiktoken_encoding.clone(),
         callout: CalloutSettings {
             timeout_ms,
             failure_mode: raw.failure_mode.unwrap_or(FailureMode::Closed),
