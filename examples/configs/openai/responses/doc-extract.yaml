@@ -40,6 +40,7 @@ filter_chains:
           - authorization
         on_missing: reject
         timeout_ms: 10000
+        file_url: passthrough
 
       - filter: openai_doc_extract
         # StreamBuffer body filters run before this listener's
