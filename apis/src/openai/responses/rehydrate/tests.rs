@@ -964,7 +964,7 @@ async fn extracts_partial_usage_fields() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fallback_reconstruction_excludes_mcp_list_tools_but_preserves_outputs() {
+async fn fallback_reconstruction_replays_only_canonical_input_items() {
     let mut records = std::collections::HashMap::new();
     records.insert(
         "resp_mcp_fb".to_owned(),
@@ -1017,26 +1017,24 @@ async fn fallback_reconstruction_excludes_mcp_list_tools_but_preserves_outputs()
         .expect("ResponsesState should be populated");
     assert_eq!(
         state.messages.len(),
-        4,
-        "fallback should reconstruct previous replay items before current input"
+        3,
+        "fallback should reconstruct canonical replay items before current input"
     );
     assert_eq!(state.messages[0]["content"], "Hello", "previous input should be first");
     assert!(
-        state
-            .messages
-            .iter()
-            .all(|item| item.get("type").and_then(Value::as_str) != Some("mcp_list_tools")),
-        "fallback should not replay output-only MCP list items as request input"
+        state.messages.iter().all(|item| {
+            !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("mcp_list_tools" | "web_search_call")
+            )
+        }),
+        "fallback should not replay hosted output items as request input"
     );
     assert_eq!(
-        state.messages[1]["type"], "web_search_call",
-        "non-MCP previous output should be preserved"
-    );
-    assert_eq!(
-        state.messages[2]["type"], "message",
+        state.messages[1]["type"], "message",
         "previous message output should follow"
     );
-    assert_eq!(state.messages[3]["content"], "Next", "current input should be last");
+    assert_eq!(state.messages[2]["content"], "Next", "current input should be last");
     assert_eq!(
         state.persisted_messages.len(),
         5,
@@ -1047,6 +1045,26 @@ async fn fallback_reconstruction_excludes_mcp_list_tools_but_preserves_outputs()
         "fallback persistence history should preserve MCP list metadata"
     );
     assert_eq!(state.previous_tools.len(), 1, "fallback should populate previous tools");
+}
+
+#[test]
+fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
+    let stored = vec![
+        json!({"id":"item-1"}),
+        json!({"id":"item-2","type":null}),
+        json!({"id":"msg-1","role":"assistant","content":"answer"}),
+        json!({"id":"hosted-1","type":"web_search_call","status":"completed"}),
+        json!({"type":"unknown","content":"not replayable"}),
+    ];
+
+    assert_eq!(
+        replay_messages_from_stored(&stored),
+        vec![
+            json!({"id":"item-1","type":"item_reference"}),
+            json!({"id":"item-2","type":"item_reference"}),
+            json!({"id":"msg-1","type":"message","role":"assistant","content":"answer"}),
+        ]
+    );
 }
 
 // -----------------------------------------------------------------------------

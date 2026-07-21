@@ -30,6 +30,8 @@ on:
       - "Cargo.lock"
       - "Makefile"
       - ".github/workflows/vllm-integration.yaml"
+  merge_group:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -45,10 +47,50 @@ env:
 
 jobs:
   # ----------------------------------------------------------------------------
+  # Path filter for merge_group (which does not support on.paths)
+  # ----------------------------------------------------------------------------
+
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant path changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
+                                         "${{ github.event.merge_group.head_sha }}" -- \
+            'apis/src/openai/responses/' \
+            'apis/src/openai/sse/' \
+            'server/' \
+            'tests/integration/sdk/openai/' \
+            'examples/configs/openai/responses/' \
+            'Cargo.toml' \
+            'Cargo.lock' \
+            'Makefile' \
+            '.github/workflows/vllm-integration.yaml')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ----------------------------------------------------------------------------
   # Responses API integration tests against a real vLLM CPU backend
   # ----------------------------------------------------------------------------
 
   vllm-responses:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:

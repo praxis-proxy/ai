@@ -14,6 +14,9 @@
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    missing_docs,
     reason = "tests"
 )]
 mod tests;
@@ -27,7 +30,7 @@ use std::{
 
 use rmcp::{
     Peer, RoleClient, ServiceExt as _,
-    model::PaginatedRequestParams,
+    model::{CallToolRequestParams, PaginatedRequestParams},
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
 
@@ -114,6 +117,20 @@ pub(crate) enum McpClientError {
     ListTools {
         /// URL of the MCP server.
         url: McpDisplayUrl,
+    },
+
+    /// The `tools/call` request failed.
+    #[error("mcp tools/call failed for {url} tool {tool_name}: {source}")]
+    CallTool {
+        /// URL of the MCP server.
+        url: String,
+
+        /// Name of the tool that was called.
+        tool_name: String,
+
+        /// Underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Timed out waiting for the MCP server.
@@ -203,6 +220,68 @@ pub(crate) async fn list_tools(
         })?;
     let tools = paginate_tools(&client, timeout, max_tools, &display_url).await?;
     tools_to_json(tools)
+}
+
+/// Call `tools/call` on an MCP server and return the result.
+///
+/// Creates a fresh Streamable HTTP transport per call, same
+/// pattern as [`list_tools`]. Session reuse deferred to MCP
+/// Foundation PR 5.
+///
+/// # Errors
+///
+/// Returns [`McpClientError`] on connection failure, timeout, or
+/// tool execution failure.
+#[expect(clippy::too_many_arguments, reason = "allow_loopback extends the existing param set")]
+#[expect(clippy::too_many_lines, reason = "transport setup + call follows list_tools pattern")]
+#[expect(clippy::large_stack_frames, reason = "rmcp call_tool future is inherently large")]
+pub(crate) async fn call_tool(
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeout: Duration,
+    allow_loopback: bool,
+) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
+    let transport = StreamableHttpClientTransport::with_client(
+        build_pinned_client(&resolved)?,
+        build_transport_config(server_url, headers, authorization)?,
+    );
+    let display_url = resolved.display_url;
+
+    let client = tokio::time::timeout(timeout, Box::pin(().serve(transport)))
+        .await
+        .map_err(|_elapsed| McpClientError::Timeout {
+            url: display_url.clone(),
+            timeout,
+        })?
+        .map_err(|_source| McpClientError::Connection {
+            url: display_url.clone(),
+        })?;
+
+    let parsed_args = match &arguments {
+        serde_json::Value::Object(obj) => Some(obj.clone()),
+        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s).ok(),
+        _ => None,
+    };
+    let mut params = CallToolRequestParams::new(tool_name.to_owned());
+    if let Some(args_obj) = parsed_args {
+        params = params.with_arguments(args_obj);
+    }
+
+    tokio::time::timeout(timeout, Box::pin(client.call_tool(params)))
+        .await
+        .map_err(|_elapsed| McpClientError::Timeout {
+            url: display_url.clone(),
+            timeout,
+        })?
+        .map_err(|e| McpClientError::CallTool {
+            url: server_url.to_owned(),
+            tool_name: tool_name.to_owned(),
+            source: Box::new(e),
+        })
 }
 
 /// Cap on pagination rounds to prevent infinite loops from
@@ -315,8 +394,13 @@ fn inject_authorization(
 /// Reject MCP server URLs that point at SSRF-sensitive addresses.
 ///
 /// Lightweight validation for use on the cache-hit path where no
-/// connection is made. For the connect path, use
-/// [`resolve_and_validate`] to also pin resolved addresses.
+/// connection is made. For the connect path, `resolve_and_validate`
+/// also pins resolved addresses.
+///
+/// # Errors
+///
+/// Returns [`McpClientError::SsrfBlocked`] if the URL resolves to
+/// a loopback, link-local, or metadata address.
 pub(crate) async fn validate_mcp_url(url: &str, timeout: Duration, allow_loopback: bool) -> Result<(), McpClientError> {
     resolve_and_validate(url, timeout, allow_loopback)
         .await

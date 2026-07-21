@@ -1,0 +1,68 @@
+# Responses Document Extraction (vLLM / llm-d)
+#
+# Converts `input_file` content parts to `input_text` for inference
+# backends that do not natively support `input_file` (e.g. vLLM,
+# llm-d). Text-safe document content (text/*, application/json,
+# application/xml) is decoded from base64, validated as UTF-8, and
+# forwarded as plain text.
+#
+# Pipeline order:
+#   1. openai_responses_format  — classify the request
+#   2. openai_file_resolve      — resolve file_id → inline file_data
+#   3. openai_doc_extract       — convert input_file → input_text
+#   4. router + load_balancer   — forward to vLLM backend
+#
+# The file_resolve step is optional. If your clients always send
+# inline file_data (not file_id references), you can omit it.
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [doc-extract-pipeline]
+
+filter_chains:
+  - name: doc-extract-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:9999"
+        allow_private_files_api_url: true
+        allow_pre_security_callout: true
+        forward_headers:
+          - authorization
+        on_missing: reject
+        timeout_ms: 10000
+
+      - filter: openai_doc_extract
+        # StreamBuffer body filters run before this listener's
+        # header-phase security filters. Enable only when an outer
+        # trust boundary has already authenticated and authorized
+        # requests reaching this listener.
+        allow_pre_security_callout: true
+        # Leave unsupported file types (PDF, images) as input_file.
+        # The backend decides whether to accept or reject them.
+        on_unsupported: continue
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            cluster: "vllm-backend"
+          - path_prefix: "/"
+            cluster: "default-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "vllm-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "default-backend"
+            endpoints:
+              - "127.0.0.1:3002"

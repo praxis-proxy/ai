@@ -382,6 +382,17 @@ fn replay_claude_messages_thinking_fixture_translates_visible_text_for_openai() 
 fn replay_claude_messages_tool_error_translates_error_marker_for_openai() {
     let replay = SessionReplay::load("replay/claude/messages-tool-error.json");
     let turn = replay.single_turn();
+    let mut translation_request: serde_json::Value =
+        serde_json::from_str(&turn.request_body()).expect("fixture request should be JSON");
+    translation_request["tools"] = json!([{
+        "name": "bash",
+        "description": "Execute a shell command",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        }
+    }]);
     let assistant_text = turn.response["content"][0]["text"]
         .as_str()
         .expect("fixture response should contain assistant text");
@@ -406,7 +417,7 @@ fn replay_claude_messages_tool_error_translates_error_marker_for_openai() {
     );
     let proxy = start_proxy(&config);
 
-    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let raw = http_send(proxy.addr(), &json_post(turn.path(), &translation_request.to_string()));
     let status = parse_status(&raw);
     let body = parse_body(&raw);
     let transformed: serde_json::Value = serde_json::from_str(&body).expect("client body should be JSON");
@@ -416,6 +427,18 @@ fn replay_claude_messages_tool_error_translates_error_marker_for_openai() {
         .as_array()
         .expect("OpenAI request should contain messages");
 
+    assert!(
+        translation_request["tools"][0].get("type").is_none(),
+        "translation replay should use a custom tool accepted by the compatibility policy"
+    );
+    assert_eq!(
+        turn.request["tools"][0]["type"], "bash_20250124",
+        "the native replay fixture should retain the original Anthropic built-in tool"
+    );
+    assert_eq!(
+        forwarded["tools"][0]["function"]["name"], "bash",
+        "the translated OpenAI request should retain the custom tool definition"
+    );
     assert_eq!(status, 200, "Claude tool error translation should return 200");
     assert_eq!(messages[2]["role"], "tool", "tool_result should become a tool message");
     assert_eq!(

@@ -18,12 +18,14 @@ workspace = true
 [dev-dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 # Used only by the cpex example test to mint HS256 JWTs for the
 # happy-path case (matches the filter crate's signing dependency).
 jsonwebtoken = "10"
+praxis-ai-apis = { path = "../../apis" }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-protocol = { workspace = true }

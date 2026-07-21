@@ -44,23 +44,29 @@
 #      input and rehydrated history through a configured Files API.
 #      Runs after rehydrate so stored history is available, and before
 #      responses_proxy so the rebuilt upstream body contains file_data
-#      or image_url rather than stale file_id references. The inference
-#      backend must already support those inline content parts; document
-#      extraction for vLLM is tracked separately in issue #397.
+#      or image_url rather than stale file_id references.
 #
-#   9. openai_mcp_tool_resolve resolves MCP tool entries from the tools
+#   9. openai_doc_extract converts input_file content parts to
+#      input_text for backends that do not natively support input_file
+#      (e.g. vLLM, llm-d). Text-safe content (text/*, application/json,
+#      application/xml) is decoded from base64, validated as UTF-8, and
+#      forwarded as plain text. Unsupported formats are left unchanged
+#      (on_unsupported: continue). This filter is optional — omit it
+#      when the inference backend natively supports input_file.
+#
+#   10. openai_mcp_tool_resolve resolves MCP tool entries from the tools
 #      array by calling tools/list on each upstream MCP server.
 #      Runs after rehydrate so previous_tools is available for
 #      cross-request caching. Writes mcp_tool_map to
 #      ResponsesState for downstream tool dispatch.
 #
-#   10. openai_responses_proxy reads the assembled ResponsesState and
+#   11. openai_responses_proxy reads the assembled ResponsesState and
 #      rebuilds the outbound request body with the full conversation
 #      history. Strips previous_response_id and conversation
 #      (already resolved by rehydrate). Passthrough when no
 #      ResponsesState exists.
 #
-#   11. The router sends all valid Responses API create requests to
+#   12. The router sends all valid Responses API create requests to
 #      the same inference backend. The promoted mode remains available
 #      as headers/metadata for downstream filters; it does not change
 #      backend selection in this example.
@@ -162,6 +168,10 @@ filter_chains:
           - x-tenant-id
         on_missing: reject
         timeout_ms: 10000
+
+      - filter: openai_doc_extract
+        allow_pre_security_callout: true
+        on_unsupported: continue
 
       - filter: openai_mcp_tool_resolve
 

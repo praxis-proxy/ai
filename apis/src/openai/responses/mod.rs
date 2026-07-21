@@ -18,8 +18,10 @@
 //! to validate parameter combinations and extract additional fields.
 
 mod config;
+pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
+pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
 pub(crate) mod openai_mcp_tool_resolve;
 pub(crate) mod openai_responses_proxy;
@@ -28,7 +30,9 @@ pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;
 
+pub use doc_extract::DocExtractFilter;
 pub use file_resolve::FileResolveFilter;
+pub use mcp_dispatch::McpDispatchFilter;
 pub use model_rewrite::ModelRewriteFilter;
 pub use openai_mcp_tool_resolve::McpToolResolveFilter;
 pub use openai_tool_parse::ToolParseFilter;
@@ -415,6 +419,47 @@ fn promote_boolean_results(
     }
 
     Ok(())
+}
+
+/// Return an item that can be sent back as canonical `OpenResponses` input.
+///
+/// Hosted-tool output items remain available in persisted history, but
+/// `OpenResponses` backends do not accept them in a subsequent request. Old
+/// stored rows without the defaulted `type` field are normalized.
+pub(crate) fn canonical_openresponses_replay_item(item: &serde_json::Value) -> Option<serde_json::Value> {
+    if matches!(
+        item.get("type").and_then(serde_json::Value::as_str),
+        Some("item_reference" | "reasoning" | "compaction" | "message" | "function_call" | "function_call_output")
+    ) {
+        return Some(item.clone());
+    }
+    let object = item.as_object()?;
+    let item_type = defaulted_openresponses_item_type(object)?;
+    let mut normalized = object.clone();
+    normalized.insert("type".to_owned(), serde_json::Value::String(item_type.to_owned()));
+    Some(serde_json::Value::Object(normalized))
+}
+
+/// Resolve a schema-defaulted input item type from its distinguishing fields.
+fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
+    if object.get("type").is_some_and(|item_type| !item_type.is_null()) {
+        return None;
+    }
+    let legacy_message = matches!(
+        object.get("role").and_then(serde_json::Value::as_str),
+        Some("user" | "system" | "developer" | "assistant")
+    ) && matches!(
+        object.get("content"),
+        Some(serde_json::Value::String(_) | serde_json::Value::Array(_))
+    );
+    if legacy_message {
+        Some("message")
+    } else {
+        object
+            .get("id")
+            .is_some_and(serde_json::Value::is_string)
+            .then_some("item_reference")
+    }
 }
 
 pub(crate) mod rehydrate;

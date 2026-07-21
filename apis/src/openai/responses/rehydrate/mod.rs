@@ -24,7 +24,8 @@ use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 use super::{
-    DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, error::responses_error_rejection, state::ResponsesState,
+    DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, canonical_openresponses_replay_item,
+    error::responses_error_rejection, state::ResponsesState,
 };
 use crate::store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry};
 
@@ -462,16 +463,7 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: &Value) {
 
 /// Return stored items that should be replayed as backend request input.
 fn replay_messages_from_stored(stored: &[Value]) -> Vec<Value> {
-    stored
-        .iter()
-        .filter(|item| !is_output_only_metadata_item(item))
-        .cloned()
-        .collect()
-}
-
-/// Return whether a stored output item carries metadata rather than replay context.
-fn is_output_only_metadata_item(item: &Value) -> bool {
-    item.get("type").and_then(Value::as_str) == Some("mcp_list_tools")
+    stored.iter().filter_map(canonical_openresponses_replay_item).collect()
 }
 
 /// Build a Responses API user message item from string input.

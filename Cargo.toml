@@ -22,6 +22,7 @@ repository = "https://github.com/praxis-proxy/ai"
 async-trait = "0.1.89"
 base64 = "0.22.1"
 bytes = "1.12.0"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.1", features = ["derive"] }
 dashmap = "6.2.1"
@@ -38,6 +39,7 @@ regex = "1.12.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rmcp = { version = "2.0.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 rustls = "0.23.41"
+schemars = "1.2.1"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }

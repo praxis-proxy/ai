@@ -1,0 +1,45 @@
+# MCP Dispatch Filter
+#
+# Demonstrates the `openai_mcp_dispatch` filter configuration. The
+# filter executes MCP tool calls against upstream MCP servers within
+# the Responses API agentic loop. It identifies MCP tool calls from
+# the model response, checks approval policies, calls `tools/call`
+# on the originating server, and appends the results.
+#
+# Requires `agentic_loop` (#26) for end-to-end execution. Without
+# it the filter validates its configuration at startup but cannot
+# be triggered at runtime.
+#
+# Pipeline ordering:
+#   tool_parse → mcp_tool_resolve → stream_events → mcp_dispatch
+#
+# Configuration:
+#   timeout_ms:      Per-call timeout for tools/call (default: 30000)
+#   max_body_bytes:  Maximum response body bytes (default: 64 MiB)
+#   allow_loopback:  Allow MCP servers on 127.0.0.1/localhost
+#                    (default: false)
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [mcp-dispatch-pipeline]
+
+filter_chains:
+  - name: mcp-dispatch-pipeline
+    filters:
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
+        timeout_ms: 5000
+      - filter: openai_stream_events
+      - filter: openai_mcp_dispatch
+        timeout_ms: 30000
+        allow_loopback: false
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "inference"
+      - filter: load_balancer
+        clusters:
+          - name: "inference"
+            endpoints:
+              - "127.0.0.1:3001"

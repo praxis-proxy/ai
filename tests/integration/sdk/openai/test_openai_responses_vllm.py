@@ -217,6 +217,58 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert "VIOLET-7319" in second.output_text
 
+    def test_doc_extract_inline_file_to_input_text(self, openai_client):
+        """Issue #397: inline file_data is extracted to input_text and
+        consumed by vLLM inference.
+
+        Sends an input_file with base64-encoded text through the full
+        pipeline (file_resolve → doc_extract → responses_proxy → vLLM).
+        The doc_extract filter converts the input_file to input_text
+        before forwarding. Asserts a unique marker from the document
+        appears in the model output, proving vLLM consumed the
+        extracted text.
+        """
+        import base64
+
+        marker = "PRAXIS-DOC-9271"
+        file_content = f"The secret marker is: {marker}"
+        file_data = (
+            "data:text/plain;base64,"
+            + base64.b64encode(file_content.encode()).decode()
+        )
+
+        response = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "filename": "document.txt",
+                            "file_data": file_data,
+                        },
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "What marker appears in the document? "
+                                "Repeat it exactly. /no_think"
+                            ),
+                        },
+                    ],
+                }
+            ],
+            store=False,
+            max_output_tokens=128,
+        )
+
+        assert response.status == "completed"
+        assert marker in response.output_text, (
+            f"vLLM should produce output containing the document "
+            f"marker '{marker}'; got: {response.output_text}"
+        )
+
     def test_streaming(self, openai_client):
         stream = openai_client.responses.create(
             model=VLLM_MODEL,
