@@ -70,10 +70,11 @@ use praxis_filter::{
 use tracing::{debug, trace, warn};
 
 use self::{
-    config::{FileResolveConfig, OnMissing, validate_config},
+    config::{FileResolveConfig, FileUrlMode, OnMissing, validate_config},
     resolve::{
         FilesApiClient, FilesApiClientOptions, ResolutionBudget, ResolveError, resolve_input_with_budget, resolve_items,
     },
+    resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState};
 use crate::{
@@ -123,6 +124,8 @@ pub struct FileResolveFilter {
     client: FilesApiClient,
     /// Parsed and validated configuration.
     config: FileResolveConfig,
+    /// URL resolver for `file_url` references.
+    url_resolver: Option<FileUrlResolver>,
 }
 
 impl FileResolveFilter {
@@ -132,6 +135,7 @@ impl FileResolveFilter {
     ///
     /// Returns [`FilterError`] if the YAML config is invalid or the
     /// callout client cannot be constructed.
+    #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
         let validated = validate_config(cfg)?;
@@ -157,9 +161,24 @@ impl FileResolveFilter {
             },
         );
 
+        let url_resolver = if validated.file_url == FileUrlMode::Resolve {
+            let origins = validated
+                .allowed_file_url_origins
+                .iter()
+                .map(|raw| NormalizedOrigin::parse(raw))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| -> FilterError { format!("openai_file_resolve: {e}").into() })?;
+            Some(FileUrlResolver {
+                allowed_private_origins: origins,
+            })
+        } else {
+            None
+        };
+
         Ok(Box::new(Self {
             client,
             config: validated,
+            url_resolver,
         }))
     }
 }
@@ -298,6 +317,7 @@ async fn resolve_current_input(
         &filter.client,
         filter.config.on_missing,
         &ctx.request.headers,
+        filter.url_resolver.as_ref(),
         budget,
     ))
     .await
@@ -317,6 +337,7 @@ async fn update_state(
                 body,
                 &filter.client,
                 filter.config.on_missing,
+                filter.url_resolver.as_ref(),
                 budget,
             ))
             .await
@@ -326,6 +347,7 @@ async fn update_state(
                 ctx,
                 &filter.client,
                 filter.config.on_missing,
+                filter.url_resolver.as_ref(),
                 budget,
             ))
             .await
@@ -364,11 +386,13 @@ fn rewrite_body(
     clippy::large_stack_frames,
     reason = "ResolveError enum size increased by file_url variants"
 )]
+#[expect(clippy::too_many_arguments, reason = "threading resolver through state sync")]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: &serde_json::Value,
     client: &FilesApiClient,
     on_missing: OnMissing,
+    url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -386,6 +410,7 @@ async fn sync_state_with_budget(
         client,
         on_missing,
         request_headers: &ctx.request.headers,
+        url_resolver,
     };
 
     sync_message_history(&mut state.messages, input_len, Some(resolved_input), resolver, budget).await?;
@@ -408,15 +433,20 @@ async fn sync_state(
     on_missing: OnMissing,
 ) -> Result<(), ResolveError> {
     let mut budget = client.resolution_budget();
-    sync_state_with_budget(ctx, resolved_body, client, on_missing, &mut budget).await
+    sync_state_with_budget(ctx, resolved_body, client, on_missing, None, &mut budget).await
 }
 
-/// Resolve `file_id` references in rehydrated history when the
+/// Resolve file references in rehydrated history when the
 /// current input did not require a body rewrite.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "ResolveError enum size increased by file_url variants"
+)]
 async fn resolve_state_history(
     ctx: &mut HttpFilterContext<'_>,
     client: &FilesApiClient,
     on_missing: OnMissing,
+    url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -428,6 +458,7 @@ async fn resolve_state_history(
         client,
         on_missing,
         request_headers: &ctx.request.headers,
+        url_resolver,
     };
 
     sync_message_history(&mut state.messages, input_len, None, resolver, budget).await?;
@@ -443,6 +474,8 @@ struct HistoryResolver<'a> {
     on_missing: OnMissing,
     /// Original request headers available for configured forwarding.
     request_headers: &'a http::HeaderMap,
+    /// URL resolver for `file_url` references.
+    url_resolver: Option<&'a FileUrlResolver>,
 }
 
 /// Resolve the persistence mirror with independent count and byte
@@ -488,7 +521,7 @@ fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved
     }
 }
 
-/// Resolve `file_id` references in history messages (the prefix
+/// Resolve file references in history messages (the prefix
 /// before the current input).
 async fn resolve_history(
     messages: &mut [serde_json::Value],
@@ -507,6 +540,7 @@ async fn resolve_history(
         resolver.client,
         resolver.on_missing,
         resolver.request_headers,
+        resolver.url_resolver,
         budget,
     )
     .await

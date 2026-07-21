@@ -572,7 +572,7 @@ async fn mirrored_history_has_independent_inline_budget() {
     ctx.extensions.insert(state);
     let mut budget = client.resolution_budget();
 
-    resolve_state_history(&mut ctx, &client, OnMissing::Reject, &mut budget)
+    resolve_state_history(&mut ctx, &client, OnMissing::Reject, None, &mut budget)
         .await
         .unwrap();
 

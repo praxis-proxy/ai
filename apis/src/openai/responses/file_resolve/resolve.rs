@@ -30,7 +30,6 @@ const FILES_PATH_PREFIX: &str = "v1/files";
 
 /// Identifies the source of a file reference for dispatch and caching.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "FileUrl variant used in Task 4"))]
 pub(crate) enum ReferenceSource {
     /// Files API `file_id` reference.
     FileId(String),
@@ -198,6 +197,8 @@ struct ResolutionRequest<'a> {
     part_type: &'a str,
     /// Original request headers available for forwarding.
     request_headers: &'a http::HeaderMap,
+    /// URL resolver for `file_url` references.
+    url_resolver: Option<&'a FileUrlResolver>,
 }
 
 /// Shared dependencies for walking content parts in one item collection.
@@ -211,7 +212,6 @@ struct ContentResolver<'a> {
     /// Original request headers available for forwarding.
     request_headers: &'a http::HeaderMap,
     /// URL resolver for `file_url` references.
-    #[expect(dead_code, reason = "Wired in Task 4")]
     url_resolver: Option<&'a FileUrlResolver>,
 }
 
@@ -235,6 +235,7 @@ impl ResolutionBudget {
     }
 
     /// Resolve one reference within request-wide count and time limits.
+    #[expect(clippy::too_many_lines, reason = "inline dispatch logic for FileId vs FileUrl")]
     async fn resolve(&mut self, request: ResolutionRequest<'_>) -> Result<ResolvedFile, ResolveError> {
         let ResolutionRequest {
             client,
@@ -242,6 +243,7 @@ impl ResolutionBudget {
             max_resolved_bytes,
             part_type,
             request_headers,
+            url_resolver,
         } = request;
         let key = (part_type.to_owned(), source.clone());
         if let Some(cached) = self.cache.get(&key) {
@@ -250,15 +252,27 @@ impl ResolutionBudget {
 
         self.register_reference()?;
 
-        let resolution = dispatch_resolution(
-            &source,
-            client,
-            request_headers,
-            max_resolved_bytes,
-            part_type,
-            self.deadline,
-        )
-        .await;
+        let resolution = tokio::time::timeout_at(self.deadline, async {
+            match &source {
+                ReferenceSource::FileId(file_id) => {
+                    client
+                        .resolve_file(file_id, request_headers, max_resolved_bytes, part_type)
+                        .await
+                },
+                ReferenceSource::FileUrl(url) => {
+                    let Some(resolver) = url_resolver else {
+                        return Err(ResolveError::FileUrlFailed {
+                            label: url.clone(),
+                            detail: "file URL resolution not configured".to_owned(),
+                        });
+                    };
+                    resolver.resolve_url(url, self.deadline, max_resolved_bytes).await
+                },
+            }
+        })
+        .await
+        .unwrap_or_else(|_elapsed| overall_timeout_error_for_source(&source));
+
         // Retain one owned outcome for repeated references while
         // returning an independently owned value to the JSON part.
         self.cache.insert(key, resolution.clone());
@@ -290,37 +304,16 @@ impl ResolutionBudget {
 }
 
 /// Build the stable error returned when the request-wide deadline expires.
-fn overall_timeout_error(file_id: &str) -> Result<ResolvedFile, ResolveError> {
-    Err(ResolveError::CalloutFailed {
-        file_id: file_id.to_owned(),
-        detail: "overall file resolution deadline exceeded".to_owned(),
-    })
-}
-
-/// Dispatch one reference to the appropriate resolver backend.
-#[expect(clippy::too_many_arguments, reason = "Task 4 will refactor this")]
-async fn dispatch_resolution(
-    source: &ReferenceSource,
-    client: &FilesApiClient,
-    request_headers: &http::HeaderMap,
-    max_resolved_bytes: usize,
-    part_type: &str,
-    deadline: tokio::time::Instant,
-) -> Result<ResolvedFile, ResolveError> {
+fn overall_timeout_error_for_source(source: &ReferenceSource) -> Result<ResolvedFile, ResolveError> {
     match source {
-        ReferenceSource::FileId(file_id) => tokio::time::timeout_at(
-            deadline,
-            client.resolve_file(file_id, request_headers, max_resolved_bytes, part_type),
-        )
-        .await
-        .unwrap_or_else(|_elapsed| overall_timeout_error(file_id)),
-        ReferenceSource::FileUrl(_url) => {
-            // Placeholder until Task 3 wires the real FileUrlResolver.
-            Err(ResolveError::CalloutFailed {
-                file_id: "<file_url>".to_owned(),
-                detail: "file_url resolution not yet implemented".to_owned(),
-            })
-        },
+        ReferenceSource::FileId(file_id) => Err(ResolveError::CalloutFailed {
+            file_id: file_id.clone(),
+            detail: "overall file resolution deadline exceeded".to_owned(),
+        }),
+        ReferenceSource::FileUrl(url) => Err(ResolveError::FileUrlFailed {
+            label: url.clone(),
+            detail: "overall file resolution deadline exceeded".to_owned(),
+        }),
     }
 }
 
@@ -508,8 +501,7 @@ pub(crate) struct ResolvedFile {
     pub(super) filename: Option<String>,
 }
 
-/// Walk the Responses API `input` array and resolve all `file_id`
-/// references in place.
+/// Walk the Responses API `input` array and resolve all references in place.
 ///
 /// Returns the number of references resolved.
 #[cfg(test)]
@@ -518,36 +510,41 @@ pub(crate) async fn resolve_input(
     client: &FilesApiClient,
     on_missing: OnMissing,
     request_headers: &http::HeaderMap,
+    url_resolver: Option<&FileUrlResolver>,
 ) -> Result<usize, ResolveError> {
     let mut budget = client.resolution_budget();
-    resolve_input_with_budget(body, client, on_missing, request_headers, &mut budget).await
+    resolve_input_with_budget(body, client, on_missing, request_headers, url_resolver, &mut budget).await
 }
 
 /// Resolve request input using limits shared with other request state.
+#[expect(clippy::too_many_arguments, reason = "threading url_resolver through resolution")]
 pub(crate) async fn resolve_input_with_budget(
     body: &mut serde_json::Value,
     client: &FilesApiClient,
     on_missing: OnMissing,
     request_headers: &http::HeaderMap,
+    url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<usize, ResolveError> {
     let Some(serde_json::Value::Array(input)) = body.get_mut("input") else {
         return Ok(0);
     };
 
-    resolve_items(input, client, on_missing, request_headers, budget).await
+    resolve_items(input, client, on_missing, request_headers, url_resolver, budget).await
 }
 
-/// Walk a slice of input/message items and resolve all `file_id`
-/// references in their content arrays.
+/// Walk a slice of input/message items and resolve all file references
+/// in their content arrays.
 ///
 /// Handles `message` items (with `content`), `function_call_output`
 /// items (with `output`), and the shorthand message form.
+#[expect(clippy::too_many_arguments, reason = "threading url_resolver through resolution")]
 pub(crate) async fn resolve_items(
     items: &mut [serde_json::Value],
     client: &FilesApiClient,
     on_missing: OnMissing,
     request_headers: &http::HeaderMap,
+    url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<usize, ResolveError> {
     let mut resolved_count = 0_usize;
@@ -556,7 +553,7 @@ pub(crate) async fn resolve_items(
         client,
         on_missing,
         request_headers,
-        url_resolver: None,
+        url_resolver,
     };
 
     for item in items.iter_mut() {
@@ -600,35 +597,41 @@ pub(crate) fn content_parts_mut(item: &mut serde_json::Value) -> Option<&mut Vec
     }
 }
 
-/// Resolve a single content part if it contains a `file_id`.
+/// Resolve a single content part if it contains a resolvable reference.
 async fn resolve_content_part(
     part: &mut serde_json::Value,
     resolver: &mut ContentResolver<'_>,
 ) -> Result<Option<usize>, ResolveError> {
-    let Some((part_type, file_id)) = resolvable_reference(part) else {
+    let Some((part_type, source)) = resolvable_reference(part) else {
         return Ok(None);
     };
-    let (file_id, part_type) = (file_id.to_owned(), part_type.to_owned());
-    debug!(file_id = %file_id, part_type = %part_type, "resolving file reference");
+
+    // Skip file_url references when url_resolver is not configured.
+    if matches!(source, ReferenceSource::FileUrl(_)) && resolver.url_resolver.is_none() {
+        return Ok(None);
+    }
+
+    let (source, part_type) = (source, part_type.to_owned());
+    debug!(source = ?source, part_type = %part_type, "resolving file reference");
 
     let max_resolved_bytes = resolver.budget.remaining_resolved_bytes;
-    let Some(resolved) = resolve_reference(&file_id, &part_type, max_resolved_bytes, resolver).await? else {
+    let Some(resolved) = resolve_reference(&source, &part_type, max_resolved_bytes, resolver).await? else {
         return Ok(None);
     };
-    let len = output_len_for_part(&part_type, &resolved);
+    let len = output_len_for_part(&part_type, &source, &resolved);
     if len > max_resolved_bytes {
         return Err(ResolveError::TooLarge {
-            file_id,
+            file_id: format!("{source:?}"),
             limit: resolver.client.max_resolved_bytes,
         });
     }
-    rewrite_part(part, &part_type, resolved);
+    rewrite_part(part, &part_type, &source, resolved);
     Ok(Some(len))
 }
 
 /// Resolve one reference and apply the configured missing-file policy.
 async fn resolve_reference(
-    file_id: &str,
+    source: &ReferenceSource,
     part_type: &str,
     remaining_resolved_bytes: usize,
     resolver: &mut ContentResolver<'_>,
@@ -637,57 +640,112 @@ async fn resolve_reference(
         .budget
         .resolve(ResolutionRequest {
             client: resolver.client,
-            source: ReferenceSource::FileId(file_id.to_owned()),
+            source: source.clone(),
             max_resolved_bytes: remaining_resolved_bytes,
             part_type,
             request_headers: resolver.request_headers,
+            url_resolver: resolver.url_resolver,
         })
         .await
     {
         Ok(resolved) => Ok(Some(resolved)),
         Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
         Err(e) if resolver.on_missing == OnMissing::Continue => {
-            warn!(file_id = %file_id, error = %e, "file resolution failed, passing through");
+            warn!(source = ?source, error = %e, "file resolution failed, passing through");
             Ok(None)
         },
         Err(e) => Err(e),
     }
 }
 
-/// Return the type and file ID for a reference that needs resolution.
-fn resolvable_reference(part: &serde_json::Value) -> Option<(&str, &str)> {
-    let part_type @ ("input_file" | "input_image") = part.get("type")?.as_str()? else {
+/// Return the type and reference source for a part that needs resolution.
+///
+/// Classifies `input_file` parts by their single valid source field:
+/// `file_id` or `file_url`. Parts with multiple sources, no sources, or
+/// malformed (present, non-null, non-string) fields are skipped. Null
+/// values are treated as absent per the Responses schema.
+///
+/// `input_image` parts continue to resolve only via `file_id`.
+#[expect(clippy::too_many_lines, reason = "explicit field validation logic")]
+fn resolvable_reference(part: &serde_json::Value) -> Option<(&str, ReferenceSource)> {
+    let part_type @ "input_file" = part.get("type")?.as_str()? else {
+        // input_image file_id resolution is unchanged — keep the
+        // existing has_inline_content/file_id path for it.
+        if part.get("type")?.as_str()? == "input_image" {
+            return resolvable_image_reference(part);
+        }
         return None;
     };
-    if has_inline_content(part, part_type) {
+
+    // Count valid string sources and detect malformed (present, non-null,
+    // non-string) fields. Null is valid per the Responses schema and
+    // treated as absent.
+    let mut valid_sources = 0_u8;
+    let mut has_malformed = false;
+    let mut file_id: Option<&str> = None;
+    let mut file_url_str: Option<&str> = None;
+
+    for field in ["file_data", "file_id", "file_url"] {
+        if let Some(val) = part.get(field) {
+            if val.is_null() {
+                continue;
+            }
+            if let Some(s) = val.as_str() {
+                valid_sources += 1;
+                match field {
+                    "file_id" => file_id = Some(s),
+                    "file_url" => file_url_str = Some(s),
+                    _ => {},
+                }
+            } else {
+                has_malformed = true;
+            }
+        }
+    }
+
+    if has_malformed || valid_sources != 1 {
         return None;
     }
-    Some((part_type, part.get("file_id")?.as_str()?))
+
+    if let Some(url) = file_url_str {
+        return Some((part_type, ReferenceSource::FileUrl(url.to_owned())));
+    }
+    if let Some(id) = file_id {
+        return Some((part_type, ReferenceSource::FileId(id.to_owned())));
+    }
+    None
 }
 
-/// Return whether a content part already has a usable inline source.
-fn has_inline_content(part: &serde_json::Value, part_type: &str) -> bool {
-    match part_type {
-        "input_file" => ["file_data", "file_url"]
-            .into_iter()
-            .any(|field| part.get(field).and_then(serde_json::Value::as_str).is_some()),
-        "input_image" => part.get("image_url").and_then(serde_json::Value::as_str).is_some(),
-        _ => false,
+/// Existing `input_image` `file_id` resolution (unchanged behavior).
+fn resolvable_image_reference(part: &serde_json::Value) -> Option<(&'static str, ReferenceSource)> {
+    if part.get("image_url").and_then(serde_json::Value::as_str).is_some() {
+        return None;
     }
+    let file_id = part.get("file_id")?.as_str()?;
+    Some(("input_image", ReferenceSource::FileId(file_id.to_owned())))
 }
 
 /// Compute the JSON string length of the resolved value for a
-/// given content part type.
-fn output_len_for_part(part_type: &str, resolved: &ResolvedFile) -> usize {
-    match part_type {
-        "input_file" => resolved.base64.len(),
-        "input_image" => "data:".len() + resolved.content_type.len() + ";base64,".len() + resolved.base64.len(),
+/// given content part type and source.
+fn output_len_for_part(part_type: &str, source: &ReferenceSource, resolved: &ResolvedFile) -> usize {
+    match (part_type, source) {
+        ("input_file", ReferenceSource::FileId(_)) => resolved.base64.len(),
+        ("input_file", ReferenceSource::FileUrl(_)) => {
+            "data:".len() + resolved.content_type.len() + ";base64,".len() + resolved.base64.len()
+        },
+        ("input_image", _) => "data:".len() + resolved.content_type.len() + ";base64,".len() + resolved.base64.len(),
         _ => 0,
     }
 }
 
-/// Replace `file_id` with the resolved content in a content part.
-fn rewrite_part(part: &mut serde_json::Value, part_type: &str, resolved: ResolvedFile) {
+/// Replace the reference field with the resolved content in a content part.
+///
+/// For `input_file` with `FileId`, writes raw base64 to `file_data`.
+/// For `input_file` with `FileUrl`, writes a data URI to `file_data`.
+/// For `input_image`, writes a `data:` URL to `image_url`.
+/// Populates `filename` from metadata when not already user-provided.
+#[expect(clippy::too_many_lines, reason = "explicit branching per part type and source")]
+fn rewrite_part(part: &mut serde_json::Value, part_type: &str, source: &ReferenceSource, resolved: ResolvedFile) {
     let Some(obj) = part.as_object_mut() else {
         return;
     };
@@ -696,17 +754,31 @@ fn rewrite_part(part: &mut serde_json::Value, part_type: &str, resolved: Resolve
         content_type,
         filename,
     } = resolved;
-    obj.remove("file_id");
-    match part_type {
-        "input_file" => {
+
+    match source {
+        ReferenceSource::FileId(_) => {
+            obj.remove("file_id");
+        },
+        ReferenceSource::FileUrl(_) => {
+            obj.remove("file_url");
+        },
+    }
+
+    match (part_type, source) {
+        ("input_file", ReferenceSource::FileId(_)) => {
             obj.insert("file_data".to_owned(), serde_json::Value::String(base64));
-            if !obj.contains_key("filename")
-                && let Some(filename) = filename
-            {
+            if !obj.contains_key("filename") && let Some(filename) = filename {
                 obj.insert("filename".to_owned(), serde_json::Value::String(filename));
             }
         },
-        "input_image" => {
+        ("input_file", ReferenceSource::FileUrl(_)) => {
+            let data_uri = format!("data:{content_type};base64,{base64}");
+            obj.insert("file_data".to_owned(), serde_json::Value::String(data_uri));
+            if !obj.contains_key("filename") && let Some(filename) = filename {
+                obj.insert("filename".to_owned(), serde_json::Value::String(filename));
+            }
+        },
+        ("input_image", _) => {
             let prefix = format!("data:{content_type};base64,");
             base64.insert_str(0, &prefix);
             obj.insert("image_url".to_owned(), serde_json::Value::String(base64));
@@ -1012,7 +1084,7 @@ mod tests {
                 "content": [{"type": "input_file", "file_id": ".."}]
             }]
         });
-        let err = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+        let err = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
             .await
             .unwrap_err();
 
@@ -1033,7 +1105,7 @@ mod tests {
             }]
         });
 
-        let err = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+        let err = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
             .await
             .unwrap_err();
 
@@ -1055,7 +1127,7 @@ mod tests {
         });
         let original = body.clone();
 
-        let resolved = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new())
+        let resolved = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new(), None)
             .await
             .unwrap();
 
@@ -1089,7 +1161,7 @@ mod tests {
             }]
         });
 
-        let err = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new())
+        let err = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new(), None)
             .await
             .unwrap_err();
 
@@ -1120,7 +1192,7 @@ mod tests {
             }]
         });
 
-        let count = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new())
+        let count = resolve_input(&mut body, &client, OnMissing::Continue, &http::HeaderMap::new(), None)
             .await
             .unwrap();
 
@@ -1163,7 +1235,15 @@ mod tests {
         budget: &mut ResolutionBudget,
     ) -> Result<usize, ResolveError> {
         let mut items = cached_file_items();
-        resolve_items(&mut items, client, OnMissing::Reject, &http::HeaderMap::new(), budget).await
+        resolve_items(
+            &mut items,
+            client,
+            OnMissing::Reject,
+            &http::HeaderMap::new(),
+            None,
+            budget,
+        )
+        .await
     }
 
     fn cached_file_items() -> Vec<serde_json::Value> {
@@ -1194,7 +1274,7 @@ mod tests {
             });
             let original = body.clone();
 
-            let resolved = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+            let resolved = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
                 .await
                 .unwrap();
 
@@ -1214,7 +1294,7 @@ mod tests {
                 "content": [{"type": "input_file", "file_id": ".."}]
             }]
         });
-        let resolved = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+        let resolved = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
             .await
             .unwrap();
 
@@ -1239,7 +1319,7 @@ mod tests {
             }]
         });
         let original = body.clone();
-        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
             .await
             .unwrap();
 
@@ -1262,7 +1342,7 @@ mod tests {
             }]
         });
         let original = body.clone();
-        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
             .await
             .unwrap();
 
@@ -1285,7 +1365,7 @@ mod tests {
             }]
         });
         let original = body.clone();
-        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new())
+        let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
             .await
             .unwrap();
 
@@ -1305,7 +1385,12 @@ mod tests {
             content_type: "image/png".to_owned(),
             filename: None,
         };
-        rewrite_part(&mut part, "input_image", resolved);
+        rewrite_part(
+            &mut part,
+            "input_image",
+            &ReferenceSource::FileId("img-456".to_owned()),
+            resolved,
+        );
 
         assert!(part.get("file_id").is_none(), "file_id should be removed");
         assert_eq!(part["detail"].as_str().unwrap(), "high", "detail should be preserved");
@@ -1330,7 +1415,12 @@ mod tests {
             content_type: "application/pdf".to_owned(),
             filename: Some("api-filename.pdf".to_owned()),
         };
-        rewrite_part(&mut part, "input_file", resolved);
+        rewrite_part(
+            &mut part,
+            "input_file",
+            &ReferenceSource::FileId("file-abc".to_owned()),
+            resolved,
+        );
 
         assert_eq!(
             part["filename"].as_str().unwrap(),
@@ -1350,7 +1440,12 @@ mod tests {
             content_type: "text/plain".to_owned(),
             filename: Some("test.txt".to_owned()),
         };
-        rewrite_part(&mut part, "input_file", resolved);
+        rewrite_part(
+            &mut part,
+            "input_file",
+            &ReferenceSource::FileId("file-abc".to_owned()),
+            resolved,
+        );
 
         assert_eq!(
             part["filename"].as_str().unwrap(),
@@ -1375,5 +1470,75 @@ mod tests {
             "FileUrl key should be distinct from FileId"
         );
         assert_eq!(cache.len(), 2, "two distinct keys should produce two entries");
+    }
+
+    // -------------------------------------------------------------------------
+    // Source classification tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn resolvable_reference_file_url_only() {
+        let part = serde_json::json!({"type": "input_file", "file_url": "https://example.com/file.pdf"});
+        let result = resolvable_reference(&part);
+        assert!(
+            matches!(result, Some(("input_file", ReferenceSource::FileUrl(url))) if url == "https://example.com/file.pdf"),
+            "file_url-only part should be classified as FileUrl"
+        );
+    }
+
+    #[test]
+    fn resolvable_reference_file_id_only() {
+        let part = serde_json::json!({"type": "input_file", "file_id": "file-abc"});
+        let result = resolvable_reference(&part);
+        assert!(
+            matches!(result, Some(("input_file", ReferenceSource::FileId(id))) if id == "file-abc"),
+            "file_id-only part should be classified as FileId"
+        );
+    }
+
+    #[test]
+    fn resolvable_reference_multi_source_skipped() {
+        let part = serde_json::json!({"type": "input_file", "file_id": "abc", "file_url": "https://example.com/f"});
+        assert!(
+            resolvable_reference(&part).is_none(),
+            "multi-source parts should be skipped"
+        );
+    }
+
+    #[test]
+    fn resolvable_reference_file_data_skipped() {
+        let part = serde_json::json!({"type": "input_file", "file_data": "SGVsbG8="});
+        assert!(
+            resolvable_reference(&part).is_none(),
+            "file_data-only parts should be skipped"
+        );
+    }
+
+    #[test]
+    fn resolvable_reference_malformed_non_string_file_url_skipped() {
+        let part = serde_json::json!({"type": "input_file", "file_url": 123, "file_id": "valid-id"});
+        assert!(
+            resolvable_reference(&part).is_none(),
+            "non-string file_url should mark part malformed, skipping even valid file_id"
+        );
+    }
+
+    #[test]
+    fn resolvable_reference_null_file_url_treated_as_absent() {
+        let part = serde_json::json!({"type": "input_file", "file_url": null, "file_id": "valid-id"});
+        let result = resolvable_reference(&part);
+        assert!(
+            matches!(result, Some(("input_file", ReferenceSource::FileId(id))) if id == "valid-id"),
+            "null file_url should be treated as absent, resolving file_id normally"
+        );
+    }
+
+    #[test]
+    fn resolvable_reference_non_string_file_data_marks_malformed() {
+        let part = serde_json::json!({"type": "input_file", "file_data": 42});
+        assert!(
+            resolvable_reference(&part).is_none(),
+            "non-string file_data should mark part malformed"
+        );
     }
 }

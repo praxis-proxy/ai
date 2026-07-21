@@ -236,14 +236,10 @@ pub(crate) fn sanitize_filename(raw: &str) -> Option<String> {
 pub(crate) struct FileUrlResolver {
     /// Origins that permit resolution to private/loopback addresses.
     pub(crate) allowed_private_origins: Vec<NormalizedOrigin>,
-    /// Overall timeout for URL resolution.
-    #[expect(dead_code, reason = "used in Task 4")]
-    pub(crate) timeout: std::time::Duration,
 }
 
 impl FileUrlResolver {
     /// Resolve a `file_url` with SSRF protection and DNS pinning.
-    #[expect(dead_code, reason = "used in Task 4")]
     #[expect(clippy::too_many_lines, reason = "main resolution flow")]
     pub(crate) async fn resolve_url(
         &self,
