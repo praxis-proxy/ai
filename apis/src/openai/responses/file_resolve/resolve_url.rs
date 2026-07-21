@@ -179,10 +179,20 @@ fn is_special_use_v4(ip: std::net::Ipv4Addr) -> bool {
 /// Non-globally-reachable IPv6 special-use ranges per IANA registry.
 fn is_special_use_v6(v6: std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
+    // 64:ff9b:1::/48 — Local-use NAT64 (RFC 8215)
+    (s[0] == 0x0064 && s[1] == 0xFF9B && s[2] == 0x0001)
     // 100::/64 — Discard-Only (RFC 6666)
-    (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+    || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+    // 100::1:0:0/96..100::ffff:ffff:ffff — extended discard prefix
+    || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] >= 1)
+    // 2001:2::/48 — Benchmarking (RFC 5180)
+    || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0)
     // 2001:db8::/32 — Documentation (RFC 3849)
     || (s[0] == 0x2001 && s[1] == 0x0DB8)
+    // 3fff::/20 — Documentation (RFC 9637)
+    || (s[0] & 0xFFF0 == 0x3FF0)
+    // 5f00::/16 — Segment Routing (SRv6) SID (RFC 9602)
+    || s[0] == 0x5F00
 }
 
 /// Validate that a string is a well-formed MIME type (`token/token`).
@@ -969,6 +979,38 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_blocks_nat64_local_use() {
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), false),
+            "64:ff9b:1::/48 local-use NAT64 should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_benchmarking_v6() {
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:2:0::1".parse().unwrap(), false),
+            "2001:2::/48 benchmarking should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_documentation_rfc9637() {
+        assert!(
+            is_file_url_ssrf_blocked(&"3fff::1".parse().unwrap(), false),
+            "3fff::/20 documentation should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_srv6_sid() {
+        assert!(
+            is_file_url_ssrf_blocked(&"5f00::1".parse().unwrap(), false),
+            "5f00::/16 SRv6 SID should be blocked"
+        );
+    }
+
+    #[test]
     fn ssrf_allows_special_use_with_allowlist() {
         assert!(
             !is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), true),
@@ -977,6 +1019,10 @@ mod tests {
         assert!(
             !is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), true),
             "documentation v6 should be allowed with allowlist"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), true),
+            "NAT64 local-use should be allowed with allowlist"
         );
     }
 
