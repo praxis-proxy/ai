@@ -72,14 +72,12 @@ pub(crate) enum ResolveError {
     },
 
     /// The file URL target is blocked by SSRF policy.
-    #[cfg_attr(not(test), expect(dead_code, reason = "Used in Task 3"))]
     FileUrlBlocked {
         /// Redacted URL label for client-facing messages.
         label: String,
     },
 
     /// The file URL fetch failed (DNS, timeout, non-success status).
-    #[cfg_attr(not(test), expect(dead_code, reason = "Used in Task 3"))]
     FileUrlFailed {
         /// Redacted URL label for client-facing messages.
         label: String,

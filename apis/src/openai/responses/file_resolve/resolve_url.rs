@@ -3,11 +3,6 @@
 
 //! URL resolution and SSRF validation for `file_url` references.
 
-// String slicing is validated via `is_char_boundary` in `sanitize_filename`.
-// allow_attributes lint disabled because expect doesn't work for indexing_slicing.
-#![allow(clippy::allow_attributes)]
-#![allow(clippy::indexing_slicing)]
-
 use std::net::{IpAddr, SocketAddr};
 
 use praxis_core::connectivity::normalize_mapped_ipv4;
@@ -68,7 +63,6 @@ impl NormalizedOrigin {
     }
 
     /// Check whether a request URL's origin matches this allowlist entry.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used in Task 3"))]
     pub fn matches_url(&self, url: &url::Url) -> bool {
         let url_scheme = url.scheme();
         let Some(url_host) = url.host_str() else {
@@ -189,9 +183,7 @@ pub(crate) fn redact_url(raw: &str) -> String {
 pub(crate) fn validate_file_url(raw: &str) -> Result<url::Url, ResolveError> {
     let url = url::Url::parse(raw).map_err(|e| {
         tracing::debug!(error = %e, "invalid file_url");
-        ResolveError::FileUrlBlocked {
-            label: redact_url(raw),
-        }
+        ResolveError::FileUrlBlocked { label: redact_url(raw) }
     })?;
 
     let scheme = url.scheme();
@@ -235,13 +227,12 @@ pub(crate) fn sanitize_filename(raw: &str) -> Option<String> {
         if len == 0 {
             None
         } else {
-            Some(sanitized[..len].to_owned())
+            sanitized.get(..len).map(ToOwned::to_owned)
         }
     }
 }
 
 /// Resolves `file_url` references with DNS pinning and SSRF protection.
-#[cfg_attr(not(test), expect(dead_code, reason = "used in Task 4"))]
 pub(crate) struct FileUrlResolver {
     /// Origins that permit resolution to private/loopback addresses.
     pub(crate) allowed_private_origins: Vec<NormalizedOrigin>,
