@@ -10,6 +10,8 @@ use praxis_test_utils::{
     parse_status, patch_yaml, start_backend_with_shutdown, start_echo_backend, start_proxy,
 };
 
+use super::openai_file_resolve::start_files_api_stub;
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -20,6 +22,91 @@ const FIRST_RESPONSE_JSON: &str = r#"{"id":"resp_first","created_at":1000,"model
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_flow_resolves_rehydrated_files_before_proxy() {
+    let files_api_port = start_files_api_stub();
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_file_resolve");
+
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+        .expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([
+            ("127.0.0.1:9999", files_api_port),
+            ("127.0.0.1:3001", backend_guard.port()),
+        ]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let create_raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/conversations",
+            r#"{
+                "metadata": {},
+                "items": [{
+                    "id": "item_file",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_file", "file_id": "test-file-123"}]
+                }]
+            }"#,
+        ),
+    );
+    assert_eq!(parse_status(&create_raw), 200, "conversation creation should succeed");
+    let created: serde_json::Value =
+        serde_json::from_str(&parse_body(&create_raw)).expect("conversation response should be valid JSON");
+    let conversation_id = created["id"]
+        .as_str()
+        .expect("conversation response should contain an id");
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Summarize the file",
+        "conversation": conversation_id,
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            &serde_json::to_string(&request).expect("request should serialize"),
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "response request should reach the backend");
+
+    let echoed: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("echoed backend request should be valid JSON");
+    assert!(
+        echoed.get("conversation").is_none(),
+        "conversation should be stripped after rehydration"
+    );
+
+    let input = echoed["input"]
+        .as_array()
+        .expect("proxy should rebuild input from rehydrated history");
+    let file_part = input
+        .iter()
+        .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .find(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("input_file"))
+        .expect("rehydrated input_file should reach the backend");
+
+    // https://developers.openai.com/api/docs/guides/file-inputs#base64-encoded-files
+    assert_eq!(
+        file_part,
+        &serde_json::json!({
+            "type": "input_file",
+            "filename": "test.txt",
+            "file_data": "SGVsbG8sIHdvcmxkIQ=="
+        }),
+        "rehydrated upstream content part should match the OpenAI inline input_file shape"
+    );
+}
 
 #[test]
 fn full_flow_stateful_valid_request_reaches_backend() {

@@ -163,6 +163,45 @@ fn replay_claude_messages_tool_cycle_preserves_source_records() {
 }
 
 #[test]
+fn replay_claude_messages_tool_result_error_preserves_error_flag() {
+    let replay = SessionReplay::load("replay/claude/messages-tool-error.json");
+    let turn = replay.single_turn();
+    let backend_guard = start_capturing_backend(&turn.response_body());
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-protocol.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client body should be JSON");
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&backend_guard.body()).expect("captured backend body should be JSON");
+
+    assert_eq!(parse_status(&raw), 200, "Claude tool error replay should return 200");
+    assert_eq!(
+        response, turn.response,
+        "client response should match the replayable Anthropic response"
+    );
+    assert_eq!(
+        forwarded, turn.request,
+        "backend should receive the tool-result error request unchanged"
+    );
+    assert_eq!(
+        turn.request["messages"][2]["content"][0]["is_error"], true,
+        "fixture request should preserve the tool_result error flag"
+    );
+    assert_eq!(
+        turn.source_records.as_ref().expect("source records")[0]["message"]["content"][0]["is_error"],
+        true,
+        "source records should preserve the original tool_result error flag"
+    );
+}
+
+#[test]
 fn replay_claude_messages_thinking_session_through_protocol_example() {
     let replay = SessionReplay::load("replay/claude/messages-thinking.json");
     let turn = replay.single_turn();
@@ -336,6 +375,60 @@ fn replay_claude_messages_thinking_fixture_translates_visible_text_for_openai() 
     assert_eq!(
         transformed["stop_reason"], "end_turn",
         "Chat Completions stop finish reason should translate to Anthropic end_turn"
+    );
+}
+
+#[test]
+fn replay_claude_messages_tool_error_translates_error_marker_for_openai() {
+    let replay = SessionReplay::load("replay/claude/messages-tool-error.json");
+    let turn = replay.single_turn();
+    let assistant_text = turn.response["content"][0]["text"]
+        .as_str()
+        .expect("fixture response should contain assistant text");
+    let chat_response = json!({
+        "id": "chatcmpl_replay_tool_error",
+        "object": "chat.completion",
+        "model": turn.request["model"],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": assistant_text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 9, "completion_tokens": 11, "total_tokens": 20}
+    });
+    let backend = start_capturing_backend(&chat_response.to_string());
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-to-openai.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let status = parse_status(&raw);
+    let body = parse_body(&raw);
+    let transformed: serde_json::Value = serde_json::from_str(&body).expect("client body should be JSON");
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&backend.body()).expect("captured backend body should be JSON");
+    let messages = forwarded["messages"]
+        .as_array()
+        .expect("OpenAI request should contain messages");
+
+    assert_eq!(status, 200, "Claude tool error translation should return 200");
+    assert_eq!(messages[2]["role"], "tool", "tool_result should become a tool message");
+    assert_eq!(
+        messages[2]["tool_call_id"], "toolu_replay_bash_error_01",
+        "tool_result should preserve the tool_use id"
+    );
+    assert_eq!(
+        messages[2]["content"], "Anthropic tool_result error:\ncat: fixtures/missing.txt: No such file or directory",
+        "is_error should remain visible after Anthropic-to-OpenAI translation"
+    );
+    assert_eq!(
+        transformed["content"][0]["text"], assistant_text,
+        "Chat Completions response should translate back to Anthropic text content"
     );
 }
 

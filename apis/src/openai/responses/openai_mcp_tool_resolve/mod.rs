@@ -331,22 +331,10 @@ async fn fetch_tools(
 
 /// Write the resolved tool map to `ResponsesState`, creating
 /// the state from the request body if none exists yet.
-///
-/// Skips state creation when the body carries
-/// `previous_response_id` to avoid the downstream rebuild
-/// path in `openai_responses_proxy` which would strip it.
 fn write_tool_map(ctx: &mut HttpFilterContext<'_>, body: &[u8], map: HashMap<(String, String), serde_json::Value>) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.mcp_tool_map = map;
     } else if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) {
-        if parsed
-            .get("previous_response_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
-        {
-            debug!("skipping state creation for continuation request");
-            return;
-        }
         let mut state = ResponsesState::from_request_body(parsed);
         state.mcp_tool_map = map;
         ctx.extensions.insert(state);

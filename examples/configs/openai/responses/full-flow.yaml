@@ -1,8 +1,9 @@
 # Responses API Full Flow
 #
 # Combines conversations, format classification, request validation,
-# and backend routing into a single pipeline. This is the unified
-# config that operators would deploy for a Responses API gateway:
+# file resolution, and backend routing into a single pipeline. This
+# is the unified config that operators would deploy for a Responses
+# API gateway:
 #
 #   1. openai_conversations handles CRUD for the Conversations API
 #      (/v1/conversations) and sets has_conversation metadata when
@@ -39,22 +40,35 @@
 #      history to the current request. previous_response_id takes
 #      precedence when both are present.
 #
-#   8. openai_mcp_tool_resolve resolves MCP tool entries from the tools
+#   8. openai_file_resolve resolves file_id references in the current
+#      input and rehydrated history through a configured Files API.
+#      Runs after rehydrate so stored history is available, and before
+#      responses_proxy so the rebuilt upstream body contains file_data
+#      or image_url rather than stale file_id references. The inference
+#      backend must already support those inline content parts; document
+#      extraction for vLLM is tracked separately in issue #397.
+#
+#   9. openai_mcp_tool_resolve resolves MCP tool entries from the tools
 #      array by calling tools/list on each upstream MCP server.
 #      Runs after rehydrate so previous_tools is available for
 #      cross-request caching. Writes mcp_tool_map to
 #      ResponsesState for downstream tool dispatch.
 #
-#   9. openai_responses_proxy reads the assembled ResponsesState and
+#   10. openai_responses_proxy reads the assembled ResponsesState and
 #      rebuilds the outbound request body with the full conversation
 #      history. Strips previous_response_id and conversation
 #      (already resolved by rehydrate). Passthrough when no
 #      ResponsesState exists.
 #
-#   10. The router sends all valid Responses API create requests to
+#   11. The router sends all valid Responses API create requests to
 #      the same inference backend. The promoted mode remains available
 #      as headers/metadata for downstream filters; it does not change
 #      backend selection in this example.
+#
+# Security: StreamBuffer body callouts run before this listener's
+# header-phase filters. Deploy this example behind an outer
+# authentication and authorization boundary before enabling the
+# required allow_pre_security_callout acknowledgement below.
 #
 # A request is stateful when any of these hold:
 #   - previous_response_id is set
@@ -85,6 +99,12 @@
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"What next?","conversation":"conv_abc"}'
+#
+#   # File reference resolved through the configured Files API
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -H "Authorization: Bearer token" \
+#     -d '{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":[{"type":"input_file","file_id":"file_abc"}]}]}'
 #
 #   # Rejected (stream + background conflict)
 #   curl -X POST http://localhost:8080/v1/responses \
@@ -132,6 +152,16 @@ filter_chains:
       - filter: openai_stream_events
 
       - filter: openai_responses_rehydrate
+
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:9999"
+        allow_private_files_api_url: true
+        allow_pre_security_callout: true
+        forward_headers:
+          - authorization
+          - x-tenant-id
+        on_missing: reject
+        timeout_ms: 10000
 
       - filter: openai_mcp_tool_resolve
 

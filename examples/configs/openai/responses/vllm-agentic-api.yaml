@@ -1,0 +1,33 @@
+# vLLM Agentic API Responses passthrough
+#
+# vLLM Agentic API: https://github.com/vllm-project/agentic-api
+#
+# Agentic API owns previous_response_id hydration, response persistence,
+# web-search credentials, tool execution, and the model loop. Praxis only
+# classifies and routes this traffic, preserving the original request body.
+#
+# This pipeline intentionally does not include openai_response_store,
+# openai_responses_rehydrate, responses_proxy, openai_web_search,
+# openai_tool_parse, or openai_stream_events.
+
+listeners:
+  - name: agentic-api-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [agentic-api-passthrough]
+
+filter_chains:
+  - name: agentic-api-passthrough
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            cluster: "vllm-agentic-api"
+
+      - filter: load_balancer
+        clusters:
+          - name: "vllm-agentic-api"
+            endpoints:
+              - "127.0.0.1:3001"
