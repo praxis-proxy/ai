@@ -128,7 +128,9 @@ fn is_private_range(ip: &IpAddr) -> bool {
         IpAddr::V4(v4) => {
             v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 0 || is_cgnat(*v4)
         },
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || is_unicast_link_local_v6(v6),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unique_local() || is_unicast_link_local_v6(v6) || is_site_local_v6(v6)
+        },
     }
 }
 
@@ -141,6 +143,30 @@ fn is_cgnat(ip: std::net::Ipv4Addr) -> bool {
 fn is_unicast_link_local_v6(v6: &std::net::Ipv6Addr) -> bool {
     let [a, b, ..] = v6.octets();
     a == 0xFE && (b & 0xC0) == 0x80
+}
+
+/// Deprecated site-local range (`fec0::/10`, RFC 3879).
+fn is_site_local_v6(v6: &std::net::Ipv6Addr) -> bool {
+    let [a, b, ..] = v6.octets();
+    a == 0xFE && (b & 0xC0) == 0xC0
+}
+
+/// Validate that a string is a well-formed MIME type (`token/token`).
+///
+/// Rejects values containing commas, spaces, semicolons, or other
+/// characters that are not RFC 2045 tokens.
+fn is_valid_mime_type(s: &str) -> bool {
+    fn is_token_char(c: char) -> bool {
+        c.is_ascii() && !c.is_ascii_control() && !b" \t\"(),/:;<=>?@[\\]{}".contains(&(c as u8))
+    }
+
+    let Some((type_part, subtype)) = s.split_once('/') else {
+        return false;
+    };
+    !type_part.is_empty()
+        && !subtype.is_empty()
+        && type_part.chars().all(is_token_char)
+        && subtype.chars().all(is_token_char)
 }
 
 /// Check if an IP should be blocked for `file_url` fetches.
@@ -310,7 +336,7 @@ impl FileUrlResolver {
             .and_then(|v| v.to_str().ok())
             .and_then(|ct| {
                 let mime = ct.split(';').next().map(str::trim)?;
-                mime.contains('/').then_some(mime)
+                is_valid_mime_type(mime).then_some(mime)
             })
             .or_else(|| {
                 // Fall back to URL path extension
@@ -817,10 +843,77 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_blocks_site_local_v6() {
+        assert!(
+            is_file_url_ssrf_blocked(&"fec0::1".parse().unwrap(), false),
+            "site-local fec0::/10 should be blocked without allowlist"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_site_local_v6_upper() {
+        assert!(
+            is_file_url_ssrf_blocked(&"feff::1".parse().unwrap(), false),
+            "site-local upper range feff:: should be blocked without allowlist"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_site_local_v6_with_allowlist() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"fec0::1".parse().unwrap(), true),
+            "site-local should be allowed with allowlist"
+        );
+    }
+
+    #[test]
     fn ssrf_blocks_zero_octet() {
         assert!(
             is_file_url_ssrf_blocked(&"0.1.2.3".parse().unwrap(), false),
             "IPv4 with leading zero octet should be blocked without allowlist"
+        );
+    }
+
+    // MIME validation tests
+    #[test]
+    fn mime_valid_simple() {
+        assert!(is_valid_mime_type("text/plain"));
+        assert!(is_valid_mime_type("application/octet-stream"));
+        assert!(is_valid_mime_type("image/png"));
+    }
+
+    #[test]
+    fn mime_rejects_comma_separated() {
+        assert!(
+            !is_valid_mime_type("text/plain,application/json"),
+            "comma in MIME should be rejected"
+        );
+    }
+
+    #[test]
+    fn mime_rejects_no_slash() {
+        assert!(
+            !is_valid_mime_type("textplain"),
+            "MIME without slash should be rejected"
+        );
+    }
+
+    #[test]
+    fn mime_rejects_empty_parts() {
+        assert!(!is_valid_mime_type("/plain"), "empty type should be rejected");
+        assert!(!is_valid_mime_type("text/"), "empty subtype should be rejected");
+    }
+
+    #[test]
+    fn mime_rejects_spaces() {
+        assert!(!is_valid_mime_type("text /plain"), "space in type should be rejected");
+    }
+
+    #[test]
+    fn mime_rejects_semicolon_in_type() {
+        assert!(
+            !is_valid_mime_type("text/plain;charset=utf-8"),
+            "semicolon should have been stripped before validation"
         );
     }
 
