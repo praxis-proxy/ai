@@ -3,7 +3,7 @@
 
 # `openai_file_resolve`
 
-Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via [`ApiClient`] and inlining the base64-encoded content in the provider-native field.
+Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field.
 
 ## Configuration Notes
 
