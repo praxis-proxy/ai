@@ -12,7 +12,7 @@ use praxis_core::connectivity::normalize_mapped_ipv4;
 pub(crate) struct NormalizedOrigin {
     /// URL scheme (`http` or `https`).
     pub scheme: String,
-    /// Canonical host (lowercase, brackets stripped for IPv6).
+    /// Canonical host (lowercase; brackets preserved for IPv6).
     pub host: String,
     /// Effective port (443 for https, 80 for http if not explicit).
     pub port: u16,
