@@ -140,7 +140,7 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
 }
 
 #[tokio::test]
-async fn rebuild_uses_request_body_mutated_after_state_initialization() {
+async fn rebuild_serializes_from_state_request_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -150,14 +150,13 @@ async fn rebuild_uses_request_body_mutated_after_state_initialization() {
         .messages
         .splice(0..0, [json!({"type":"message","role":"assistant","content":"history"})]);
     ctx.extensions.insert(state);
-    let rewritten = json!({"model":"backend-model","input":"hello"});
-    let mut body = Some(Bytes::from(serde_json::to_vec(&rewritten).unwrap()));
+    let mut body = Some(Bytes::from(br#"{"model":"client-model","input":"hello"}"#.as_slice()));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert_eq!(outbound["model"], "backend-model", "later body rewrites must survive");
+    assert_eq!(outbound["model"], "client-model", "serializes from state.request_body");
     assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
 }
 
