@@ -258,6 +258,15 @@ async fn ssrf_blocks_link_local() {
 }
 
 #[tokio::test]
+async fn ssrf_blocks_alibaba_cloud_metadata() {
+    assert!(
+        validate_url("http://100.100.100.200/latest/meta-data/instance-id")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn ssrf_blocks_mapped_ipv4_loopback() {
     assert!(validate_url("http://[::ffff:127.0.0.1]/mcp").await.is_err());
 }
@@ -265,6 +274,24 @@ async fn ssrf_blocks_mapped_ipv4_loopback() {
 #[tokio::test]
 async fn ssrf_blocks_mapped_metadata() {
     assert!(validate_url("http://[::ffff:169.254.169.254]/mcp").await.is_err());
+}
+
+#[tokio::test]
+async fn ssrf_blocks_mapped_alibaba_cloud_metadata() {
+    assert!(
+        validate_url("http://[::ffff:100.100.100.200]/latest/meta-data/instance-id")
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn ssrf_blocks_dns_resolved_alibaba_cloud_metadata() {
+    let addrs = ["100.100.100.200:80".parse::<SocketAddr>().unwrap()];
+    assert!(
+        check_resolved_addrs(&addrs, "http://metadata.example/mcp", false).is_err(),
+        "DNS-resolved Alibaba Cloud metadata address should be blocked"
+    );
 }
 
 #[tokio::test]
