@@ -24,6 +24,7 @@ pub(super) mod config;
 mod tests;
 
 use {
+    std::borrow::Cow,
     async_trait::async_trait,
     bytes::Bytes,
     praxis_core::callout::{CalloutClient, CalloutRequest, CalloutResult},
@@ -126,11 +127,12 @@ impl CompactFilter {
         state: &ResponsesState,
         params: &CompactionParams,
         streaming: bool,
+        conversation_text: &str,
     ) -> Result<Option<String>, FilterAction> {
         let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
         let request =
-            build_summarization_request(&state.messages, instructions, model, &self.config.inference_url);
+            build_summarization_request(conversation_text, instructions, model, &self.config.inference_url);
 
         match self.callout_client.execute(request).await {
             CalloutResult::Success(resp) => parse_summarization_response(&resp.body)
@@ -194,14 +196,15 @@ impl HttpFilter for CompactFilter {
         let Some(params) = extract_compaction_config(&state.context_management) else {
             return Ok(FilterAction::Release);
         };
-        let Some(token_count) = get_token_count(&state.messages, &self.config.tiktoken_encoding) else {
+        let conversation_text = build_conversation_text(&state.messages);
+        let Some(token_count) = get_token_count(&conversation_text, &self.config.tiktoken_encoding) else {
             return Ok(FilterAction::Release);
         };
         if token_count <= params.compact_threshold {
             debug!(token_count, threshold = params.compact_threshold, "under threshold, skipping");
             return Ok(FilterAction::Release);
         }
-        let summary = match self.execute_compaction(state, &params, streaming).await {
+        let summary = match self.execute_compaction(state, &params, streaming, &conversation_text).await {
             Ok(Some(s)) => s,
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
             Err(action) => return Ok(action),
@@ -257,7 +260,7 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Option<Compa
 /// to tokenize the serialized conversation text.
 ///
 /// Returns `None` if the encoding name is not recognized.
-fn get_token_count(messages: &[Value], tiktoken_encoding: &str) -> Option<u64> {
+fn get_token_count(conversation_text: &str, tiktoken_encoding: &str) -> Option<u64> {
     let bpe = match tiktoken_encoding {
         "cl100k_base" => tiktoken_rs::cl100k_base_singleton(),
         "o200k_base" => tiktoken_rs::o200k_base_singleton(),
@@ -266,8 +269,7 @@ fn get_token_count(messages: &[Value], tiktoken_encoding: &str) -> Option<u64> {
             return None;
         }
     };
-    let text = build_conversation_text(messages);
-    let count = bpe.encode_ordinary(&text).len() as u64;
+    let count = bpe.count_ordinary(conversation_text) as u64;
     debug!(count, source = "tiktoken", encoding = tiktoken_encoding, "token count estimated");
     Some(count)
 }
@@ -285,7 +287,7 @@ fn get_token_count(messages: &[Value], tiktoken_encoding: &str) -> Option<u64> {
 /// }
 /// ```
 fn build_summarization_request(
-    messages: &[Value],
+    conversation_text: &str,
     instructions: Option<&str>,
     model: &str,
     inference_url: &str,
@@ -294,8 +296,6 @@ fn build_summarization_request(
         Some(inst) => format!("{inst}\n\n{SUMMARIZATION_SYSTEM_PROMPT}"),
         None => SUMMARIZATION_SYSTEM_PROMPT.to_owned(),
     };
-
-    let conversation_text = build_conversation_text(messages);
 
     let body = serde_json::json!({
         "model": model,
@@ -341,10 +341,7 @@ fn parse_summarization_response(body: &[u8]) -> Result<String, String> {
 
 /// Build the compaction output item.
 ///
-/// Returns: `{"type": "compaction", "encrypted_content": "<summary>"}`
-///
-/// Note: `encrypted_content` is a misnomer from the OpenAI spec —
-/// in the proxy context this is plain text.
+/// Returns: `{"role": "system", "content": "<summary>"}`
 fn build_compaction_item(summary: &str) -> Value {
     serde_json::json!({
         "role": "system",
@@ -361,7 +358,8 @@ fn build_compaction_item(summary: &str) -> Value {
 /// `state.input` holds the current request's input items (unchanged
 /// by rehydrate), so the current turn's messages are preserved.
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
-    let mut new_messages = vec![compaction_item];
+    let mut new_messages = Vec::with_capacity(state.input.len() + 1);
+    new_messages.push(compaction_item);
     new_messages.extend(state.input.iter().cloned());
     state.persisted_messages = new_messages.clone();
     state.messages = new_messages;
@@ -372,35 +370,43 @@ fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
 /// Each message becomes: `<role>: <content>`
 /// Messages are separated by blank lines.
 fn build_conversation_text(messages: &[Value]) -> String {
-    let mut parts = Vec::new();
+    let mut buf = String::with_capacity(messages.len() * 100);
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("unknown");
         let content = extract_content(msg);
         if content.is_empty() {
             continue;
         }
-        parts.push(format!("{role}: {content}"));
+        if !buf.is_empty() {
+            buf.push_str("\n\n");
+        }
+        buf.push_str(role);
+        buf.push_str(": ");
+        buf.push_str(&content);
     }
-    parts.join("\n\n")
+    buf
 }
 
 /// Extract text content from a message's `content` field.
 ///
 /// Content can be a plain string, an array of content parts
 /// (each with a `"text"` field), or absent/null.
-fn extract_content(msg: &Value) -> String {
+///
+/// Returns `Cow::Borrowed` for plain strings (zero-copy) and
+/// `Cow::Owned` for array content that must be joined.
+fn extract_content(msg: &Value) -> Cow<'_, str> {
     let Some(content) = msg.get("content") else {
-        return String::new();
+        return Cow::Borrowed("");
     };
     if let Some(s) = content.as_str() {
-        return s.to_owned();
+        return Cow::Borrowed(s);
     }
     if let Some(arr) = content.as_array() {
         let texts: Vec<&str> = arr
             .iter()
             .filter_map(|part| part.get("text").and_then(Value::as_str))
             .collect();
-        return texts.join(" ");
+        return Cow::Owned(texts.join(" "));
     }
-    String::new()
+    Cow::Borrowed("")
 }
