@@ -23,10 +23,6 @@ pub(super) mod config;
 )]
 mod tests;
 
-#[expect(
-    unused_imports,
-    reason = "scaffolding — all imports needed once todo!()s are implemented"
-)]
 use {
     async_trait::async_trait,
     bytes::Bytes,
@@ -45,7 +41,6 @@ use {
 // Constants
 // -----------------------------------------------------------------------------
 
-#[expect(dead_code, reason = "scaffolding — used once build_summarization_request is implemented")]
 /// System prompt for the summarization call.
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
 Summarize the following conversation concisely. \
@@ -58,7 +53,6 @@ capture everything needed to continue coherently.";
 // CompactionParams
 // -----------------------------------------------------------------------------
 
-#[expect(dead_code, reason = "scaffolding — used once extract_compaction_config is implemented")]
 /// Parsed compaction parameters from the request's `context_management`.
 struct CompactionParams {
     /// Token threshold above which compaction triggers.
@@ -93,10 +87,6 @@ struct CompactionParams {
 /// failure_mode: closed
 /// status_on_error: 502
 /// ```
-#[expect(
-    dead_code,
-    reason = "scaffolding — fields used once from_config and on_request_body are implemented"
-)]
 pub struct CompactFilter {
     /// HTTP client for the summarization inference call.
     callout_client: CalloutClient,
@@ -150,11 +140,7 @@ impl HttpFilter for CompactFilter {
         Ok(FilterAction::Continue)
     }
 
-    #[expect(
-        clippy::todo,
-        unused_variables,
-        reason = "scaffolding — implement the compaction flow"
-    )]
+
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -196,22 +182,46 @@ impl HttpFilter for CompactFilter {
 
         debug!(token_count, threshold = compaction_config.compact_threshold, "threshold exceeded, compaction needed");
 
-        // TODO: implement remaining compaction flow:
-        //
-        // 5. Build summarization request via build_summarization_request()
-        //    - Use compaction_config.compaction_model or self.config.default_model
-        //    - Include state.request_body["instructions"] if present
-        //
-        // 6. Execute via self.callout_client.execute(request).await
-        //    - On Success: parse response, build compaction item,
-        //      replace messages
-        //    - On Failed (open mode): log warning, return Release
-        //    - On Rejected: return Reject with responses_error_rejection()
-        //
-        // 7. Set metadata: "responses.compacted" = "true"
-        //
-        // 8. Return Release
-        warn!("compaction not yet implemented, passing through");
+        let model = compaction_config.compaction_model
+            .as_deref()
+            .unwrap_or(&self.config.default_model);
+
+        let instructions = state.request_body
+            .get("instructions")
+            .and_then(Value::as_str);
+
+        let request = build_summarization_request(&state.messages, instructions, model, &self.config.inference_url);
+        let response = match self.callout_client.execute(request).await {
+            CalloutResult::Success(response) => parse_summarization_response(&response.body),
+            CalloutResult::Failed => {
+                warn!("summarization callout failed, skipping compaction");
+                return Ok(FilterAction::Release);
+            }
+            CalloutResult::Rejected(rejection) => {
+                warn!(status = rejection.status, "summarization callout rejected (closed failure mode)");
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    rejection.status,
+                    "server_error",
+                    "summarization callout rejected",
+                    streaming,
+                )));
+            }
+        };
+
+        let summary = match response {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to parse summarization response, skipping compaction");
+                return Ok(FilterAction::Release);
+            }
+        };
+
+        let compaction_item = build_compaction_item(&summary);
+
+        let state = ctx.extensions.get_mut::<ResponsesState>().expect("ResponsesState was present above");
+        replace_messages(state, compaction_item);
+
+        ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
 }
@@ -285,51 +295,59 @@ fn get_token_count(messages: &[Value], tiktoken_encoding: &str) -> Option<u64> {
 ///   ]
 /// }
 /// ```
-#[expect(
-    clippy::todo,
-    dead_code,
-    unused_variables,
-    reason = "scaffolding — implement request construction"
-)]
 fn build_summarization_request(
     messages: &[Value],
     instructions: Option<&str>,
     model: &str,
     inference_url: &str,
 ) -> CalloutRequest {
-    // TODO:
-    // 1. Build the system prompt:
-    //    - If instructions is Some, prepend them before
-    //      SUMMARIZATION_SYSTEM_PROMPT
-    //    - Otherwise just use SUMMARIZATION_SYSTEM_PROMPT
-    //
-    // 2. Build user content via build_conversation_text(messages)
-    //
-    // 3. Construct the Chat Completions JSON body
-    //
-    // 4. Return a CalloutRequest with:
-    //    - method: POST
-    //    - url: inference_url.to_owned()
-    //    - headers: Content-Type + Accept application/json
-    //    - body: Some(serialized JSON bytes)
-    //    - depth: 0
-    todo!("build summarization CalloutRequest")
+    let system_content = match instructions {
+        Some(inst) => format!("{inst}\n\n{SUMMARIZATION_SYSTEM_PROMPT}"),
+        None => SUMMARIZATION_SYSTEM_PROMPT.to_owned(),
+    };
+
+    let conversation_text = build_conversation_text(messages);
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": conversation_text}
+        ]
+    });
+
+    let body_bytes = serde_json::to_vec(&body).expect("json! values always serialize");
+
+    CalloutRequest {
+        method: http::Method::POST,
+        url: inference_url.to_owned(),
+        headers: vec![
+            (http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json")),
+            (http::header::ACCEPT, http::HeaderValue::from_static("application/json")),
+        ],
+        body: Some(body_bytes),
+        depth: 0,
+    }
 }
 
 /// Parse the Chat Completions response and extract the summary text.
 ///
 /// Expected shape: `{"choices": [{"message": {"content": "..."}}]}`
-#[expect(
-    clippy::todo,
-    dead_code,
-    unused_variables,
-    reason = "scaffolding — implement response parsing"
-)]
 fn parse_summarization_response(body: &[u8]) -> Result<String, String> {
-    // TODO: parse JSON, navigate to choices[0].message.content,
-    //       return the string. Return Err with a descriptive
-    //       message if parsing fails or the path doesn't exist.
-    todo!("parse Chat Completions response")
+
+    match serde_json::from_slice::<Value>(body) {
+        Ok(body) => {
+            body.get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.get(0))
+                .and_then(|choice| choice.get("message"))
+                .and_then(|msg| msg.get("content"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_owned())
+                .ok_or_else(|| "Chat Completions response missing choices[0].message.content".to_string())
+        }
+        Err(err) => { Err(format!("failed to parse Chat Completions response JSON: {err}"))}
+    }
 }
 
 /// Build the compaction output item.
@@ -338,15 +356,11 @@ fn parse_summarization_response(body: &[u8]) -> Result<String, String> {
 ///
 /// Note: `encrypted_content` is a misnomer from the OpenAI spec —
 /// in the proxy context this is plain text.
-#[expect(
-    clippy::todo,
-    dead_code,
-    unused_variables,
-    reason = "scaffolding — implement compaction item construction"
-)]
 fn build_compaction_item(summary: &str) -> Value {
-    // TODO: construct the JSON value
-    todo!("build compaction item JSON")
+    serde_json::json!({
+        "type": "compaction",
+        "encrypted_content": summary
+    })
 }
 
 /// Replace conversation history with the compaction item.
@@ -357,16 +371,11 @@ fn build_compaction_item(summary: &str) -> Value {
 ///
 /// `state.input` holds the current request's input items (unchanged
 /// by rehydrate), so the current turn's messages are preserved.
-#[expect(
-    clippy::todo,
-    dead_code,
-    unused_variables,
-    reason = "scaffolding — implement message replacement"
-)]
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
-    // TODO: replace state.messages and state.persisted_messages
-    //       with [compaction_item] followed by state.input items
-    todo!("replace messages with compacted history")
+    let mut new_messages = vec![compaction_item.clone()];
+    new_messages.extend(state.input.iter().cloned());
+    state.messages = new_messages.clone();
+    state.persisted_messages = new_messages;
 }
 
 /// Format a message array as readable text for the summarization prompt.

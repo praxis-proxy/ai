@@ -61,10 +61,6 @@ fn default_tiktoken_encoding() -> String {
 // ValidatedConfig (post-validation)
 // -----------------------------------------------------------------------------
 
-#[expect(
-    dead_code,
-    reason = "scaffolding — fields used once from_config and on_request_body are implemented"
-)]
 /// Validated configuration with defaults applied.
 pub(super) struct ValidatedConfig {
     /// URL of the inference backend for summarization calls.
