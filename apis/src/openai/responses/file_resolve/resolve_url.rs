@@ -208,10 +208,12 @@ fn is_2001_ietf_non_global(s: [u16; 8]) -> bool {
     }
     // Globally reachable exceptions per IANA — these pass through:
     match s[1] {
-        // 2001::/32 Teredo (RFC 4380), 2001:3::/32 AMT (RFC 7450)
-        0x0000 | 0x0003 => false,
-        0x0004 if s[2] == 0x0112 => false,  // 2001:4:112::/48 — AS112-v6 (RFC 7535)
-        v if v & 0xFFF0 == 0x0020 => false, // 2001:20::/28 — ORCHIDv2 (RFC 7343)
+        // 2001:1::1 PCP, 2001:1::2 TURN, 2001:1::3 DNS-SD anycast (RFC 6887/8155/8880)
+        0x0001 if s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 && s[6] == 0 && matches!(s[7], 1..=3) => false,
+        0x0003 => false,                   // 2001:3::/32 — AMT (RFC 7450)
+        0x0004 if s[2] == 0x0112 => false, // 2001:4:112::/48 — AS112-v6 (RFC 7535)
+        // 2001:20::/28 ORCHIDv2 (RFC 7343), 2001:30::/28 Drone Remote ID (RFC 9374)
+        v if v & 0xFFF0 == 0x0020 || v & 0xFFF0 == 0x0030 => false,
         _ => true,
     }
 }
@@ -298,6 +300,60 @@ pub(crate) fn validate_file_url(raw: &str) -> Result<url::Url, ResolveError> {
     }
 
     Ok(url)
+}
+
+/// Extract filename from a `Content-Disposition` header value.
+///
+/// Handles both `filename*=UTF-8''encoded` (RFC 5987) and `filename="quoted"` forms.
+fn parse_content_disposition_filename(header: &str) -> Option<String> {
+    for part in header.split(';').skip(1) {
+        let part = part.trim();
+        // RFC 5987 extended notation: filename*=UTF-8''percent-encoded
+        if let Some(rest) = part.strip_prefix("filename*=") {
+            let rest = rest.trim();
+            if let Some(encoded) = rest.split_once("''").map(|(_, v)| v) {
+                let decoded = percent_decode_utf8(encoded);
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+        // Standard: filename="value" or filename=value
+        if let Some(rest) = part.strip_prefix("filename=") {
+            let rest = rest.trim();
+            let value = if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+                rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(rest)
+            } else {
+                rest
+            };
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Percent-decode a UTF-8 string, replacing invalid sequences with `_`.
+fn percent_decode_utf8(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(&hex, 16)
+            {
+                bytes.push(byte);
+                continue;
+            }
+            bytes.push(b'_');
+        } else {
+            let mut buf = [0_u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// Sanitize a filename by stripping path separators and control characters.
@@ -431,14 +487,22 @@ impl FileUrlResolver {
             });
         }
 
+        // Derive filename before consuming body: prefer Content-Disposition, fall back to URL path
+        let filename = response
+            .headers()
+            .get(http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_disposition_filename)
+            .and_then(|f| sanitize_filename(&f))
+            .or_else(|| {
+                parsed_url
+                    .path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .and_then(sanitize_filename)
+            });
+
         // Read bounded body
         let content = read_bounded_body(response, &label, max_content_bytes, max_resolved_bytes).await?;
-
-        // Derive filename
-        let filename = parsed_url
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            .and_then(sanitize_filename);
 
         // Encode as base64
         let base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &content);
@@ -595,56 +659,98 @@ mod tests {
 
     #[test]
     fn parse_rejects_non_http_scheme() {
-        assert!(NormalizedOrigin::parse("ftp://example.com").is_err());
-        assert!(NormalizedOrigin::parse("file:///tmp/x").is_err());
+        assert!(
+            NormalizedOrigin::parse("ftp://example.com").is_err(),
+            "ftp should be rejected"
+        );
+        assert!(
+            NormalizedOrigin::parse("file:///tmp/x").is_err(),
+            "file scheme should be rejected"
+        );
     }
 
     #[test]
     fn parse_rejects_credentials() {
-        assert!(NormalizedOrigin::parse("https://user@example.com").is_err());
-        assert!(NormalizedOrigin::parse("https://user:pass@example.com").is_err());
+        assert!(
+            NormalizedOrigin::parse("https://user@example.com").is_err(),
+            "username should be rejected"
+        );
+        assert!(
+            NormalizedOrigin::parse("https://user:pass@example.com").is_err(),
+            "user:pass should be rejected"
+        );
     }
 
     #[test]
     fn parse_rejects_path() {
-        assert!(NormalizedOrigin::parse("https://example.com/files").is_err());
+        assert!(
+            NormalizedOrigin::parse("https://example.com/files").is_err(),
+            "path should be rejected"
+        );
     }
 
     #[test]
     fn parse_accepts_root_path() {
-        assert!(NormalizedOrigin::parse("https://example.com/").is_ok());
+        assert!(
+            NormalizedOrigin::parse("https://example.com/").is_ok(),
+            "root path should be accepted"
+        );
     }
 
     #[test]
     fn parse_rejects_query() {
-        assert!(NormalizedOrigin::parse("https://example.com?q=1").is_err());
+        assert!(
+            NormalizedOrigin::parse("https://example.com?q=1").is_err(),
+            "query should be rejected"
+        );
     }
 
     #[test]
     fn parse_rejects_fragment() {
-        assert!(NormalizedOrigin::parse("https://example.com#frag").is_err());
+        assert!(
+            NormalizedOrigin::parse("https://example.com#frag").is_err(),
+            "fragment should be rejected"
+        );
     }
 
     #[test]
     fn parse_rejects_cloud_metadata_ipv4() {
-        assert!(NormalizedOrigin::parse("http://169.254.169.254").is_err());
-        assert!(NormalizedOrigin::parse("http://100.100.100.200").is_err());
+        assert!(
+            NormalizedOrigin::parse("http://169.254.169.254").is_err(),
+            "IMDS should be rejected"
+        );
+        assert!(
+            NormalizedOrigin::parse("http://100.100.100.200").is_err(),
+            "Alibaba metadata should be rejected"
+        );
     }
 
     #[test]
     fn parse_rejects_cloud_metadata_ipv6() {
-        assert!(NormalizedOrigin::parse("http://[fd00:ec2::254]").is_err());
+        assert!(
+            NormalizedOrigin::parse("http://[fd00:ec2::254]").is_err(),
+            "IMDS v6 should be rejected"
+        );
     }
 
     #[test]
     fn parse_rejects_unspecified() {
-        assert!(NormalizedOrigin::parse("http://0.0.0.0").is_err());
-        assert!(NormalizedOrigin::parse("http://[::]").is_err());
+        assert!(
+            NormalizedOrigin::parse("http://0.0.0.0").is_err(),
+            "unspecified v4 should be rejected"
+        );
+        assert!(
+            NormalizedOrigin::parse("http://[::]").is_err(),
+            "unspecified v6 should be rejected"
+        );
     }
 
     #[test]
     fn parse_rejects_multicast() {
-        assert!(NormalizedOrigin::parse("http://224.0.0.1").is_err());
+        assert!(
+            NormalizedOrigin::parse("http://224.0.0.1").is_err(),
+            "multicast should be rejected"
+        );
     }
 
     #[test]
@@ -937,13 +1043,22 @@ mod tests {
     // IPv4 special-use range tests
     #[test]
     fn ssrf_blocks_benchmarking_range() {
-        assert!(is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), false));
-        assert!(is_file_url_ssrf_blocked(&"198.19.255.254".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), false),
+            "198.18.0.0/15 lower bound should be blocked"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"198.19.255.254".parse().unwrap(), false),
+            "198.18.0.0/15 upper bound should be blocked"
+        );
     }
 
     #[test]
     fn ssrf_blocks_ietf_protocol_assignments() {
-        assert!(is_file_url_ssrf_blocked(&"192.0.0.1".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"192.0.0.1".parse().unwrap(), false),
+            "192.0.0.0/24 should be blocked"
+        );
     }
 
     #[test]
@@ -968,21 +1083,39 @@ mod tests {
 
     #[test]
     fn ssrf_blocks_documentation_ranges() {
-        assert!(is_file_url_ssrf_blocked(&"192.0.2.1".parse().unwrap(), false));
-        assert!(is_file_url_ssrf_blocked(&"198.51.100.1".parse().unwrap(), false));
-        assert!(is_file_url_ssrf_blocked(&"203.0.113.1".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"192.0.2.1".parse().unwrap(), false),
+            "TEST-NET-1 should be blocked"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"198.51.100.1".parse().unwrap(), false),
+            "TEST-NET-2 should be blocked"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"203.0.113.1".parse().unwrap(), false),
+            "TEST-NET-3 should be blocked"
+        );
     }
 
     #[test]
     fn ssrf_blocks_reserved_v4() {
-        assert!(is_file_url_ssrf_blocked(&"240.0.0.1".parse().unwrap(), false));
-        assert!(is_file_url_ssrf_blocked(&"255.255.255.254".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"240.0.0.1".parse().unwrap(), false),
+            "240.0.0.0/4 should be blocked"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"255.255.255.254".parse().unwrap(), false),
+            "255.x reserved should be blocked"
+        );
     }
 
     // IPv6 special-use range tests
     #[test]
     fn ssrf_blocks_discard_only_v6() {
-        assert!(is_file_url_ssrf_blocked(&"100::".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"100::".parse().unwrap(), false),
+            "100::/64 discard-only should be blocked"
+        );
         assert!(
             is_file_url_ssrf_blocked(&"100:0:0:1::1".parse().unwrap(), false),
             "100:0:0:1::/64 dummy prefix should be blocked"
@@ -999,7 +1132,10 @@ mod tests {
 
     #[test]
     fn ssrf_blocks_nat64_local_use() {
-        assert!(is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), false),
+            "64:ff9b:1::/48 local-use NAT64 should be blocked"
+        );
     }
 
     #[test]
@@ -1025,19 +1161,53 @@ mod tests {
 
     #[test]
     fn ssrf_blocks_2001_benchmarking() {
-        assert!(is_file_url_ssrf_blocked(&"2001:2:0::1".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:2:0::1".parse().unwrap(), false),
+            "2001:2::/48 benchmarking should be blocked"
+        );
     }
 
     #[test]
     fn ssrf_blocks_2001_documentation() {
-        assert!(is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), false),
+            "2001:db8::/32 documentation should be blocked"
+        );
     }
 
     #[test]
-    fn ssrf_allows_2001_teredo() {
+    fn ssrf_blocks_2001_teredo() {
         assert!(
-            !is_file_url_ssrf_blocked(&"2001::1".parse().unwrap(), false),
-            "2001::/32 Teredo is globally reachable"
+            is_file_url_ssrf_blocked(&"2001::1".parse().unwrap(), false),
+            "2001::/32 Teredo has N/A global reachability, treat as transition range"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_2001_anycast_128s() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:1::1".parse().unwrap(), false),
+            "2001:1::1/128 PCP anycast is globally reachable"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:1::2".parse().unwrap(), false),
+            "2001:1::2/128 TURN anycast is globally reachable"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:1::3".parse().unwrap(), false),
+            "2001:1::3/128 DNS-SD anycast is globally reachable"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_2001_1_non_anycast() {
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:1::4".parse().unwrap(), false),
+            "2001:1::4 is not a registered anycast address"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:1::100".parse().unwrap(), false),
+            "2001:1::100 is not a registered anycast address"
         );
     }
 
@@ -1070,10 +1240,22 @@ mod tests {
     }
 
     #[test]
-    fn ssrf_blocks_outside_orchidv2_in_2001() {
+    fn ssrf_allows_2001_drone_remote_id() {
         assert!(
-            is_file_url_ssrf_blocked(&"2001:30::1".parse().unwrap(), false),
-            "2001:30:: is outside ORCHIDv2, still in 2001::/23 non-global"
+            !is_file_url_ssrf_blocked(&"2001:30::1".parse().unwrap(), false),
+            "2001:30::/28 Drone Remote ID is globally reachable"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:3f::1".parse().unwrap(), false),
+            "2001:3f:: is at the edge of Drone Remote ID"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_between_global_exceptions() {
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:40::1".parse().unwrap(), false),
+            "2001:40:: is outside all globally reachable exceptions"
         );
     }
 
@@ -1088,7 +1270,10 @@ mod tests {
     // 3fff::/20 and 5f00::/16
     #[test]
     fn ssrf_blocks_documentation_rfc9637() {
-        assert!(is_file_url_ssrf_blocked(&"3fff::1".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"3fff::1".parse().unwrap(), false),
+            "3fff::1 documentation prefix (RFC 9637) should be blocked"
+        );
         assert!(
             is_file_url_ssrf_blocked(&"3fff:0fff::1".parse().unwrap(), false),
             "3fff:0fff:: is inside 3fff::/20"
@@ -1109,16 +1294,31 @@ mod tests {
 
     #[test]
     fn ssrf_blocks_srv6_sid() {
-        assert!(is_file_url_ssrf_blocked(&"5f00::1".parse().unwrap(), false));
+        assert!(
+            is_file_url_ssrf_blocked(&"5f00::1".parse().unwrap(), false),
+            "5f00::/16 SRv6 SID should be blocked"
+        );
     }
 
     // Allowlist override
     #[test]
     fn ssrf_allows_special_use_with_allowlist() {
-        assert!(!is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), true));
-        assert!(!is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), true));
-        assert!(!is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), true));
-        assert!(!is_file_url_ssrf_blocked(&"2002:c0a8:1::1".parse().unwrap(), true));
+        assert!(
+            !is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), true),
+            "198.18.0.0/15 should be allowed with allowlist override"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), true),
+            "2001:db8::/32 should be allowed with allowlist override"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), true),
+            "64:ff9b:1::/48 should be allowed with allowlist override"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"2002:c0a8:1::1".parse().unwrap(), true),
+            "2002::/16 (6to4) should be allowed with allowlist override"
+        );
     }
 
     #[test]
@@ -1132,9 +1332,12 @@ mod tests {
     // MIME validation tests
     #[test]
     fn mime_valid_simple() {
-        assert!(is_valid_mime_type("text/plain"));
-        assert!(is_valid_mime_type("application/octet-stream"));
-        assert!(is_valid_mime_type("image/png"));
+        assert!(is_valid_mime_type("text/plain"), "text/plain should be valid");
+        assert!(
+            is_valid_mime_type("application/octet-stream"),
+            "application/octet-stream should be valid"
+        );
+        assert!(is_valid_mime_type("image/png"), "image/png should be valid");
     }
 
     #[test]
@@ -1353,6 +1556,61 @@ mod tests {
             sanitize_filename("///\\\\\\"),
             None,
             "input with only separators should return None"
+        );
+    }
+
+    // Content-Disposition filename tests
+    #[test]
+    fn content_disposition_quoted_filename() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename=\"report.pdf\""),
+            Some("report.pdf".to_owned()),
+            "should extract quoted filename"
+        );
+    }
+
+    #[test]
+    fn content_disposition_unquoted_filename() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename=report.pdf"),
+            Some("report.pdf".to_owned()),
+            "should extract unquoted filename"
+        );
+    }
+
+    #[test]
+    fn content_disposition_star_notation() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf"),
+            Some("résumé.pdf".to_owned()),
+            "should decode RFC 5987 filename*"
+        );
+    }
+
+    #[test]
+    fn content_disposition_star_preferred_over_plain() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename*=UTF-8''correct.pdf; filename=\"fallback.pdf\""),
+            Some("correct.pdf".to_owned()),
+            "filename* should take precedence over filename"
+        );
+    }
+
+    #[test]
+    fn content_disposition_inline() {
+        assert_eq!(
+            parse_content_disposition_filename("inline"),
+            None,
+            "inline without filename should return None"
+        );
+    }
+
+    #[test]
+    fn content_disposition_empty_filename() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename=\"\""),
+            None,
+            "empty quoted filename should return None"
         );
     }
 }
