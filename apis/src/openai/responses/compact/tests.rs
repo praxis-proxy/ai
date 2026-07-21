@@ -71,11 +71,11 @@ fn build_config_custom_values() {
 
 #[test]
 fn extract_compaction_config_with_compaction_entry() {
-    let cm = Some(json!([{"type": "compaction", "compact_threshold": 50000}]));
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": 50_000}]));
     let params = extract_compaction_config(&cm);
     assert!(params.is_some());
     let params = params.unwrap();
-    assert_eq!(params.compact_threshold, 50000);
+    assert_eq!(params.compact_threshold, 50_000);
     assert!(params.compaction_model.is_none());
 }
 
@@ -83,11 +83,11 @@ fn extract_compaction_config_with_compaction_entry() {
 fn extract_compaction_config_with_model_override() {
     let cm = Some(json!([{
         "type": "compaction",
-        "compact_threshold": 100000,
+        "compact_threshold": 100_000,
         "compaction_model": "gpt-4o"
     }]));
     let params = extract_compaction_config(&cm).unwrap();
-    assert_eq!(params.compact_threshold, 100000);
+    assert_eq!(params.compact_threshold, 100_000);
     assert_eq!(params.compaction_model.as_deref(), Some("gpt-4o"));
 }
 
@@ -248,7 +248,12 @@ fn extract_content_null() {
 fn summarization_request_without_instructions() {
     let messages = vec![json!({"role": "user", "content": "Hello"})];
     let conversation_text = build_conversation_text(&messages);
-    let req = build_summarization_request(&conversation_text, None, "gpt-4o-mini", "http://localhost/v1/chat/completions");
+    let req = build_summarization_request(
+        &conversation_text,
+        None,
+        "gpt-4o-mini",
+        "http://localhost/v1/chat/completions",
+    );
     assert_eq!(req.method, http::Method::POST);
     assert_eq!(req.url, "http://localhost/v1/chat/completions");
     assert!(req.body.is_some());
@@ -266,7 +271,12 @@ fn summarization_request_without_instructions() {
 fn summarization_request_with_instructions() {
     let messages = vec![json!({"role": "user", "content": "Hello"})];
     let conversation_text = build_conversation_text(&messages);
-    let req = build_summarization_request(&conversation_text, Some("Be concise"), "gpt-4o-mini", "http://localhost/v1/chat/completions");
+    let req = build_summarization_request(
+        &conversation_text,
+        Some("Be concise"),
+        "gpt-4o-mini",
+        "http://localhost/v1/chat/completions",
+    );
     let body: Value = serde_json::from_slice(&req.body.unwrap()).unwrap();
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.starts_with("Be concise"), "instructions should be prepended");
@@ -283,10 +293,18 @@ fn replace_messages_preserves_current_input() {
         "model": "gpt-4o",
         "input": "What's next?"
     }));
-    state.messages.insert(0, json!({"role": "user", "content": "old question"}));
-    state.messages.insert(1, json!({"role": "assistant", "content": "old answer"}));
-    state.persisted_messages.insert(0, json!({"role": "user", "content": "old question"}));
-    state.persisted_messages.insert(1, json!({"role": "assistant", "content": "old answer"}));
+    state
+        .messages
+        .insert(0, json!({"role": "user", "content": "old question"}));
+    state
+        .messages
+        .insert(1, json!({"role": "assistant", "content": "old answer"}));
+    state
+        .persisted_messages
+        .insert(0, json!({"role": "user", "content": "old question"}));
+    state
+        .persisted_messages
+        .insert(1, json!({"role": "assistant", "content": "old answer"}));
 
     let compaction_item = build_compaction_item("Summary of old conversation.");
     replace_messages(&mut state, compaction_item);

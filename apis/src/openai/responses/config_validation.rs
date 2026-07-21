@@ -65,11 +65,7 @@ impl CalloutSettings {
 /// # Errors
 ///
 /// Returns [`FilterError`] when the resolved value is zero.
-pub(crate) fn validate_timeout_ms(
-    filter: &str,
-    raw: Option<u64>,
-    default: u64,
-) -> Result<u64, FilterError> {
+pub(crate) fn validate_timeout_ms(filter: &str, raw: Option<u64>, default: u64) -> Result<u64, FilterError> {
     let value = raw.unwrap_or(default);
     if value == 0 {
         return Err(format!("{filter}: timeout_ms must be greater than 0").into());
@@ -84,16 +80,10 @@ pub(crate) fn validate_timeout_ms(
 ///
 /// Returns [`FilterError`] when the resolved value is not in
 /// `100..=599`.
-pub(crate) fn validate_status_on_error(
-    filter: &str,
-    raw: Option<u16>,
-    default: u16,
-) -> Result<u16, FilterError> {
+pub(crate) fn validate_status_on_error(filter: &str, raw: Option<u16>, default: u16) -> Result<u16, FilterError> {
     let value = raw.unwrap_or(default);
     if !(100..=599).contains(&value) {
-        return Err(
-            format!("{filter}: status_on_error must be between 100 and 599, got {value}").into(),
-        );
+        return Err(format!("{filter}: status_on_error must be between 100 and 599, got {value}").into());
     }
     Ok(value)
 }
@@ -111,10 +101,7 @@ mod tests {
 
     #[test]
     fn timeout_uses_provided_value() {
-        assert_eq!(
-            validate_timeout_ms("test", Some(10_000), 5000).unwrap(),
-            10_000
-        );
+        assert_eq!(validate_timeout_ms("test", Some(10_000), 5000).unwrap(), 10_000);
     }
 
     #[test]
@@ -137,18 +124,12 @@ mod tests {
 
     #[test]
     fn status_applies_default() {
-        assert_eq!(
-            validate_status_on_error("test", None, 502).unwrap(),
-            502
-        );
+        assert_eq!(validate_status_on_error("test", None, 502).unwrap(), 502);
     }
 
     #[test]
     fn status_uses_provided_value() {
-        assert_eq!(
-            validate_status_on_error("test", Some(503), 502).unwrap(),
-            503
-        );
+        assert_eq!(validate_status_on_error("test", Some(503), 502).unwrap(), 503);
     }
 
     #[test]

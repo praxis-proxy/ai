@@ -12,8 +12,8 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::openai::responses::config_validation::FailureMode;
 use super::config::{SearchContextSize, SearchProvider, ValidatedConfig};
+use crate::openai::responses::config_validation::FailureMode;
 
 // -----------------------------------------------------------------------------
 // SearchResult
@@ -341,8 +341,8 @@ mod tests {
     use secrecy::SecretString;
     use serde_json::json;
 
-    use crate::openai::responses::config_validation::CalloutSettings;
     use super::*;
+    use crate::openai::responses::config_validation::CalloutSettings;
 
     #[test]
     fn parse_brave_results_normal() {

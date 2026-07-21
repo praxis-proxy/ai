@@ -23,20 +23,20 @@ pub(super) mod config;
 )]
 mod tests;
 
-use {
-    std::borrow::Cow,
-    async_trait::async_trait,
-    bytes::Bytes,
-    praxis_core::callout::{CalloutClient, CalloutRequest, CalloutResult},
-    praxis_filter::{
-        BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-        body::MAX_JSON_BODY_BYTES, parse_filter_config,
-    },
-    serde_json::Value,
-    tracing::{debug, warn},
-    self::config::{CompactFilterConfig, ValidatedConfig, build_config},
-    super::{error::responses_error_rejection, state::ResponsesState},
+use std::borrow::Cow;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use praxis_core::callout::{CalloutClient, CalloutRequest, CalloutResult};
+use praxis_filter::{
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
+use serde_json::Value;
+use tracing::{debug, warn};
+
+use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
+use super::{error::responses_error_rejection, state::ResponsesState};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -109,8 +109,7 @@ impl CompactFilter {
         let cfg: CompactFilterConfig = parse_filter_config("openai_responses_compact", config)?;
         let validated = build_config(&cfg)?;
         let callout_config = validated.callout.build_callout_config();
-        let callout_client =
-            CalloutClient::new(callout_config).map_err(|e| FilterError::from(e.to_string()))?;
+        let callout_client = CalloutClient::new(callout_config).map_err(|e| FilterError::from(e.to_string()))?;
         Ok(Box::new(Self {
             callout_client,
             config: validated,
@@ -131,26 +130,26 @@ impl CompactFilter {
     ) -> Result<Option<String>, FilterAction> {
         let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
-        let request =
-            build_summarization_request(conversation_text, instructions, model, &self.config.inference_url);
+        let request = build_summarization_request(conversation_text, instructions, model, &self.config.inference_url);
 
         match self.callout_client.execute(request).await {
-            CalloutResult::Success(resp) => parse_summarization_response(&resp.body)
-                .map(Some)
-                .or_else(|e| {
-                    warn!(error = %e, "failed to parse summarization response, skipping compaction");
-                    Ok(None)
-                }),
+            CalloutResult::Success(resp) => parse_summarization_response(&resp.body).map(Some).or_else(|e| {
+                warn!(error = %e, "failed to parse summarization response, skipping compaction");
+                Ok(None)
+            }),
             CalloutResult::Failed => {
                 warn!("summarization callout failed, skipping compaction");
                 Ok(None)
-            }
+            },
             CalloutResult::Rejected(rejection) => {
                 warn!(status = rejection.status, "summarization callout rejected");
                 Err(FilterAction::Reject(responses_error_rejection(
-                    rejection.status, "server_error", "summarization callout rejected", streaming,
+                    rejection.status,
+                    "server_error",
+                    "summarization callout rejected",
+                    streaming,
                 )))
-            }
+            },
         }
     }
 }
@@ -171,13 +170,9 @@ impl HttpFilter for CompactFilter {
         }
     }
 
-    async fn on_request(
-        &self,
-        _ctx: &mut HttpFilterContext<'_>,
-    ) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
-
 
     async fn on_request_body(
         &self,
@@ -185,26 +180,21 @@ impl HttpFilter for CompactFilter {
         _body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream { return Ok(FilterAction::Continue); }
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+        if !is_responses_request(ctx) {
             return Ok(FilterAction::Release);
         }
-        let streaming = ctx.get_metadata("openai_responses_format.stream").is_some_and(|v| v == "true");
+        let streaming = is_streaming(ctx);
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Release);
         };
-        let Some(params) = extract_compaction_config(&state.context_management) else {
+        let Some((params, conversation_text)) = should_compact(state, &self.config.tiktoken_encoding) else {
             return Ok(FilterAction::Release);
         };
-        let conversation_text = build_conversation_text(&state.messages);
-        let Some(token_count) = get_token_count(&conversation_text, &self.config.tiktoken_encoding) else {
-            return Ok(FilterAction::Release);
-        };
-        if token_count <= params.compact_threshold {
-            debug!(token_count, threshold = params.compact_threshold, "under threshold, skipping");
-            return Ok(FilterAction::Release);
-        }
-        let summary = match self.execute_compaction(state, &params, streaming, &conversation_text).await {
+        let compaction = self.execute_compaction(state, &params, streaming, &conversation_text);
+        let summary = match compaction.await {
             Ok(Some(s)) => s,
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
             Err(action) => return Ok(action),
@@ -222,6 +212,41 @@ impl HttpFilter for CompactFilter {
 // Compaction Logic
 // -----------------------------------------------------------------------------
 
+/// Check whether compaction should run and return the params + text.
+///
+/// Returns `None` if there is no compaction config, the encoding is
+/// unknown, or the token count is below the threshold.
+fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(CompactionParams, String)> {
+    let params = extract_compaction_config(&state.context_management)?;
+    let conversation_text = build_conversation_text(&state.messages);
+    let token_count = get_token_count(&conversation_text, tiktoken_encoding)?;
+    if token_count <= params.compact_threshold {
+        debug!(
+            token_count,
+            threshold = params.compact_threshold,
+            "under threshold, skipping"
+        );
+        return None;
+    }
+    debug!(
+        token_count,
+        threshold = params.compact_threshold,
+        "threshold exceeded, compacting"
+    );
+    Some((params, conversation_text))
+}
+
+/// Check whether this is an OpenAI Responses API request.
+fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+}
+
+/// Check whether the client requested streaming.
+fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_metadata("openai_responses_format.stream")
+        .is_some_and(|v| v == "true")
+}
+
 /// Parse the `context_management` JSON to find a compaction config.
 ///
 /// The `context_management` field is an array like:
@@ -229,7 +254,7 @@ impl HttpFilter for CompactFilter {
 ///
 /// Returns `None` if no compaction entry is found.
 fn extract_compaction_config(context_management: &Option<Value>) -> Option<CompactionParams> {
-   let array = context_management.as_ref()?.as_array()?;
+    let array = context_management.as_ref()?.as_array()?;
 
     for entry in array {
         let Some(entry_type) = entry.get("type").and_then(|v| v.as_str()) else {
@@ -238,10 +263,7 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Option<Compa
         if entry_type != "compaction" {
             continue;
         }
-        let compact_threshold = entry
-            .get("compact_threshold")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let compact_threshold = entry.get("compact_threshold").and_then(Value::as_u64).unwrap_or(0);
         let compaction_model = entry
             .get("compaction_model")
             .and_then(Value::as_str)
@@ -267,10 +289,15 @@ fn get_token_count(conversation_text: &str, tiktoken_encoding: &str) -> Option<u
         other => {
             warn!(encoding = other, "unknown tiktoken encoding, cannot estimate tokens");
             return None;
-        }
+        },
     };
     let count = bpe.count_ordinary(conversation_text) as u64;
-    debug!(count, source = "tiktoken", encoding = tiktoken_encoding, "token count estimated");
+    debug!(
+        count,
+        source = "tiktoken",
+        encoding = tiktoken_encoding,
+        "token count estimated"
+    );
     Some(count)
 }
 
@@ -311,7 +338,10 @@ fn build_summarization_request(
         method: http::Method::POST,
         url: inference_url.to_owned(),
         headers: vec![
-            (http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json")),
+            (
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            ),
             (http::header::ACCEPT, http::HeaderValue::from_static("application/json")),
         ],
         body: Some(body_bytes),
@@ -323,19 +353,17 @@ fn build_summarization_request(
 ///
 /// Expected shape: `{"choices": [{"message": {"content": "..."}}]}`
 fn parse_summarization_response(body: &[u8]) -> Result<String, String> {
-
     match serde_json::from_slice::<Value>(body) {
-        Ok(body) => {
-            body.get("choices")
-                .and_then(Value::as_array)
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("message"))
-                .and_then(|msg| msg.get("content"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| "Chat Completions response missing choices[0].message.content".to_owned())
-        }
-        Err(err) => { Err(format!("failed to parse Chat Completions response JSON: {err}"))}
+        Ok(body) => body
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "Chat Completions response missing choices[0].message.content".to_owned()),
+        Err(err) => Err(format!("failed to parse Chat Completions response JSON: {err}")),
     }
 }
 

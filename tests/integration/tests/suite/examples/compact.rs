@@ -9,8 +9,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, TempSqlite, example_config_path, free_port, http_send, json_post, parse_status,
-    patch_yaml, start_proxy,
+    Backend, TempSqlite, example_config_path, free_port, http_send, json_post, parse_status, patch_yaml, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -32,12 +31,7 @@ const CHAT_COMPLETIONS_RESPONSE: &str = r#"{"id":"chatcmpl-1","object":"chat.com
 
 /// Load the compact example config, replacing the SQLite URL and
 /// patching listener/backend addresses.
-fn load_compact_config(
-    yaml: &str,
-    db_url: &str,
-    proxy_port: u16,
-    backend_port: u16,
-) -> praxis_core::config::Config {
+fn load_compact_config(yaml: &str, db_url: &str, proxy_port: u16, backend_port: u16) -> praxis_core::config::Config {
     let replaced = yaml
         .replace("sqlite://responses.db?mode=rwc", db_url)
         .replace("localhost:11434", &format!("127.0.0.1:{backend_port}"));
@@ -67,13 +61,14 @@ fn compact_passthrough() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
-            "/v1/responses",
-            r#"{"model":"gpt-4.1","input":"Hello"}"#,
-        ),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
     );
 
-    assert_eq!(parse_status(&raw), 200, "request without context_management should pass through");
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request without context_management should pass through"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -92,10 +87,7 @@ async fn compact_multi_turn_compaction() {
 
     let raw1 = http_send(
         proxy1.addr(),
-        &json_post(
-            "/v1/responses",
-            r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#,
-        ),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
     );
     assert_eq!(parse_status(&raw1), 200, "first request should succeed");
 

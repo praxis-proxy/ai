@@ -181,8 +181,7 @@ pub(super) fn build_config(raw: &WebSearchFilterConfig) -> Result<ValidatedConfi
         ));
     }
     let default_context_size = validate_context_size(raw.default_context_size.as_deref())?;
-    let timeout_ms =
-        config_validation::validate_timeout_ms("openai_web_search", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
+    let timeout_ms = config_validation::validate_timeout_ms("openai_web_search", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
     let status_on_error =
         config_validation::validate_status_on_error("openai_web_search", raw.status_on_error, DEFAULT_STATUS_ON_ERROR)?;
     Ok(ValidatedConfig {
