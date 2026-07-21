@@ -433,10 +433,12 @@ mod tests {
             provider: SearchProvider::You,
             api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
-            timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
+            callout: CalloutSettings {
+                timeout_ms: 5000,
+                failure_mode: FailureMode::Closed,
+                status_on_error: 502,
+            },
         };
         let client = SearchClient::from_config(&config).unwrap();
 
