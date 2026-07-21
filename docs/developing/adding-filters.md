@@ -20,5 +20,5 @@ first.
    renamed example configs.
 
 All testing requirements from
-[conventions.md](conventions.md#testing) apply. A
+[CONTRIBUTING.md](../../CONTRIBUTING.md#testing) apply. A
 feature without tests and an example is not complete.
