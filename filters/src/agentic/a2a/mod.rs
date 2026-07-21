@@ -296,9 +296,8 @@ impl HttpFilter for A2aFilter {
             let is_complete = balance.is_complete();
             save_json_balance_state(ctx, balance);
 
-            let gate_exhausted = ctx.get_metadata("a2a.response.capture_gate_exhausted") == Some("true");
-            if should_attempt_capture(is_complete, gate_exhausted, end_of_stream) {
-                try_capture_from_buffer(ctx, store, &self.config.task_routing, end_of_stream);
+            if is_complete || end_of_stream {
+                try_capture_from_buffer(ctx, store, &self.config.task_routing);
             }
             return Ok(FilterAction::Continue);
         }
@@ -397,20 +396,6 @@ fn lookup_task_route(
     }
 }
 
-/// Whether [`try_capture_from_buffer`] should run for this chunk.
-///
-/// Skips the parse once the scanner reports `is_complete` but a prior
-/// non-final attempt already failed (`gate_exhausted`), deferring to
-/// `end_of_stream` instead of repeating a doomed hex-decode + parse on
-/// every subsequent chunk — see [`try_capture_from_buffer`].
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "three independent per-chunk flags read directly off saved scanner/gate state"
-)]
-fn should_attempt_capture(is_complete: bool, gate_exhausted: bool, end_of_stream: bool) -> bool {
-    (is_complete && !gate_exhausted) || end_of_stream
-}
-
 /// Pingora may not deliver a separate EOS callback after the final data
 /// chunk, so callers attempt this as soon as [`JsonBalanceState`] reports
 /// the buffer holds a balanced top-level JSON value, rather than waiting
@@ -419,17 +404,17 @@ fn should_attempt_capture(is_complete: bool, gate_exhausted: bool, end_of_stream
 ///
 /// [`JsonBalanceState`] is a heuristic gate, not a validator: a buffer
 /// can be balanced and type-matched yet still fail to parse (e.g.
-/// trailing bytes after a complete object). Once that happens on a
-/// non-final chunk, the scanner is permanently "complete" and would
-/// otherwise trigger this same doomed parse on every later chunk,
-/// reintroducing the O(n²) cost this scanner exists to avoid. Set
-/// `a2a.response.capture_gate_exhausted` in that case so callers stop
-/// re-attempting until `end_of_stream`.
+/// trailing bytes after a complete object, or a trailing comma). Bytes
+/// already accumulated up to a structurally-closed offset cannot become
+/// parseable by appending more bytes afterward — any further data can
+/// only add trailing content, which `serde_json` rejects just the same.
+/// So a failed parse here is unconditionally terminal: clear capture
+/// state immediately rather than holding the (still-growing) buffer and
+/// re-attempting the same doomed parse at `end_of_stream`.
 fn try_capture_from_buffer(
     ctx: &mut HttpFilterContext<'_>,
     store: &LocalTaskRouteStore,
     config: &config::TaskRoutingConfig,
-    end_of_stream: bool,
 ) {
     let parsed = ctx
         .filter_metadata
@@ -437,17 +422,12 @@ fn try_capture_from_buffer(
         .and_then(|hex| decode_hex(hex))
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
 
-    if let Some(value) = parsed {
-        if let Some(cluster) = ctx.filter_metadata.get("a2a.response.cluster") {
-            store_task_route(&value, cluster, store, config);
-        }
-        clear_capture_metadata(ctx);
-    } else if end_of_stream {
-        clear_capture_metadata(ctx);
-    } else {
-        ctx.filter_metadata
-            .insert("a2a.response.capture_gate_exhausted".to_owned(), "true".to_owned());
+    if let Some(value) = parsed
+        && let Some(cluster) = ctx.filter_metadata.get("a2a.response.cluster")
+    {
+        store_task_route(&value, cluster, store, config);
     }
+    clear_capture_metadata(ctx);
 }
 
 /// Store task and context routes extracted from a response body.
@@ -503,8 +483,7 @@ fn store_task_route(
 }
 
 /// Removes `a2a.response.*` keys from `filter_metadata`, including the
-/// [`JsonBalanceState`] scratch fields and the post-completion parse
-/// gate.
+/// [`JsonBalanceState`] scratch fields.
 fn clear_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.capture_enabled");
     ctx.filter_metadata.remove("a2a.response.buffer_hex");
@@ -515,7 +494,6 @@ fn clear_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.json_in_string");
     ctx.filter_metadata.remove("a2a.response.json_escaped");
     ctx.filter_metadata.remove("a2a.response.json_invalid");
-    ctx.filter_metadata.remove("a2a.response.capture_gate_exhausted");
 }
 
 /// Accumulate raw bytes as hex to avoid corruption when chunk boundaries
@@ -570,9 +548,9 @@ fn accumulate_response_hex(ctx: &mut HttpFilterContext<'_>, chunk: &[u8], max_by
 /// top-level value does not guarantee the buffer is valid JSON (e.g.
 /// trailing bytes after a complete object, or a trailing comma). The
 /// real `serde_json` parse in [`try_capture_from_buffer`] remains the
-/// source of truth; that function gates re-attempts after a failed
-/// parse so a structurally-balanced-but-invalid buffer cannot force a
-/// full re-parse on every subsequent chunk.
+/// source of truth, and that function abandons capture immediately on a
+/// failed parse — see its doc comment for why that is always safe to do
+/// unconditionally, without waiting for `end_of_stream`.
 #[derive(Debug, Default, Clone)]
 #[expect(clippy::struct_excessive_bools, reason = "independent per-byte scan flags")]
 struct JsonBalanceState {

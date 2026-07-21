@@ -13,7 +13,7 @@ use super::{
     A2aFilter, JsonBalanceState,
     config::{A2aConfig, build_config},
     envelope::{A2aFamily, A2aMethod, extract_a2a_envelope},
-    scan_json_balance, should_attempt_capture,
+    scan_json_balance,
     task_routing::LocalTaskRouteStore,
 };
 
@@ -1881,45 +1881,29 @@ async fn many_single_byte_chunks_still_capture_route_before_eos() {
 }
 
 #[tokio::test]
-async fn balanced_but_invalid_json_gates_further_parse_attempts_until_eos() {
+async fn balanced_but_invalid_json_abandons_capture_immediately() {
     let filter = make_task_routing_filter();
+
     let req = make_a2a_request(&[]);
     let mut ctx = crate::test_utils::make_filter_context(&req);
     seed_response_capture(&mut ctx);
 
     // Brackets balance (scanner reports complete) but the trailing comma
     // makes this invalid JSON, so the real parse in try_capture_from_buffer
-    // fails. Without a gate, every later chunk would re-run the full
-    // hex-decode + parse on an ever-growing buffer.
+    // fails. Bytes already accumulated up to a structurally-closed offset
+    // cannot become parseable by appending more bytes afterward, so
+    // capture must abandon immediately rather than holding the growing
+    // buffer for a doomed final parse at end_of_stream.
     let mut first = Some(Bytes::from_static(br#"{"a":1,}"#));
     drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
 
-    assert_eq!(
-        ctx.filter_metadata.get("a2a.response.capture_gate_exhausted"),
-        Some(&"true".to_owned()),
-        "a failed parse on a non-final chunk must latch the gate"
-    );
-    assert_eq!(
-        ctx.get_metadata("a2a.response.capture_enabled"),
-        Some("true"),
-        "capture must stay armed, waiting for end_of_stream, not clear immediately"
-    );
+    assert_capture_scratch_cleared(&ctx);
 
-    // Further non-final chunks must not clear or otherwise disturb the
-    // gated state — the scanner is permanently "complete" from here on,
-    // so the gate alone is what prevents repeated parse attempts.
-    let mut more = Some(Bytes::from_static(b"x"));
-    drop(filter.on_response_body(&mut ctx, &mut more, false).unwrap());
-    assert_eq!(
-        ctx.filter_metadata.get("a2a.response.capture_gate_exhausted"),
-        Some(&"true".to_owned()),
-        "the gate must remain latched across subsequent non-final chunks"
-    );
-
-    // end_of_stream always gets one final attempt, which still fails here
-    // (the buffer is genuinely invalid JSON) and cleans up.
-    let mut none_body: Option<Bytes> = None;
-    drop(filter.on_response_body(&mut ctx, &mut none_body, true).unwrap());
+    // Capture is fully disabled now, not merely gated: further chunks
+    // (even ones that would otherwise look like valid JSON) are ignored.
+    let mut more = Some(Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#));
+    let action = filter.on_response_body(&mut ctx, &mut more, false).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
     assert_capture_scratch_cleared(&ctx);
 }
 
@@ -3249,30 +3233,6 @@ fn scan_json_balance_is_a_no_op_once_invalid() {
     assert!(!state.is_complete(), "an invalid scan must never report complete");
 }
 
-#[test]
-fn should_attempt_capture_skips_reparse_once_gate_exhausted_before_eos() {
-    assert!(
-        should_attempt_capture(true, false, false),
-        "a freshly complete buffer with an open gate should attempt the parse"
-    );
-    assert!(
-        !should_attempt_capture(true, true, false),
-        "complete but gate exhausted before end_of_stream must not re-attempt the doomed parse \
-         on every subsequent chunk"
-    );
-    assert!(
-        should_attempt_capture(true, true, true),
-        "end_of_stream must always get one final attempt even if the gate was exhausted"
-    );
-    assert!(
-        !should_attempt_capture(false, false, false),
-        "an incomplete buffer with no end_of_stream must not attempt a parse"
-    );
-    assert!(
-        should_attempt_capture(false, false, true),
-        "end_of_stream must attempt a parse even if the buffer never looked complete"
-    );
-}
 
 #[test]
 fn scan_json_balance_persists_across_chunk_calls() {
@@ -3382,10 +3342,6 @@ fn assert_capture_scratch_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
     assert!(
         !ctx.filter_metadata.contains_key("a2a.response.json_invalid"),
         "json_invalid not cleared"
-    );
-    assert!(
-        !ctx.filter_metadata.contains_key("a2a.response.capture_gate_exhausted"),
-        "capture_gate_exhausted not cleared"
     );
 }
 
