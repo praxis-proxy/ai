@@ -239,11 +239,32 @@ fn is_valid_mime_type(s: &str) -> bool {
         && subtype.chars().all(is_data_uri_safe_token)
 }
 
+/// Extract the embedded IPv4 from a NAT64 Well-Known Prefix (`64:ff9b::/96`).
+fn nat64_embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    (s[0] == 0x0064 && s[1] == 0xFF9B && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0).then(|| {
+        let [.., a, b, c, d] = v6.octets();
+        std::net::Ipv4Addr::new(a, b, c, d)
+    })
+}
+
 /// Check if an IP should be blocked for `file_url` fetches.
 pub(crate) fn is_file_url_ssrf_blocked(ip: &IpAddr, allow_private: bool) -> bool {
     let ip = &normalize_mapped_ipv4(*ip);
     if is_unconditionally_blocked(ip) {
         return true;
+    }
+    // RFC 6052: apply IPv4 policy to the embedded address in 64:ff9b::/96
+    if let IpAddr::V6(v6) = ip
+        && let Some(v4) = nat64_embedded_ipv4(v6)
+    {
+        let embedded = IpAddr::V4(v4);
+        if is_unconditionally_blocked(&embedded) {
+            return true;
+        }
+        if !allow_private && is_private_range(&embedded) {
+            return true;
+        }
     }
     if !allow_private && is_private_range(ip) {
         return true;
@@ -302,36 +323,97 @@ pub(crate) fn validate_file_url(raw: &str) -> Result<url::Url, ResolveError> {
     Ok(url)
 }
 
-/// Extract filename from a `Content-Disposition` header value.
+/// Extract filename from a `Content-Disposition` header value (RFC 6266).
 ///
-/// Handles both `filename*=UTF-8''encoded` (RFC 5987) and `filename="quoted"` forms.
+/// `filename*` (RFC 5987) always takes precedence over `filename` regardless
+/// of parameter order. Parameter names are matched case-insensitively.
+/// Quoted values may contain embedded semicolons.
 fn parse_content_disposition_filename(header: &str) -> Option<String> {
-    for part in header.split(';').skip(1) {
-        let part = part.trim();
-        // RFC 5987 extended notation: filename*=UTF-8''percent-encoded
-        if let Some(rest) = part.strip_prefix("filename*=") {
-            let rest = rest.trim();
-            if let Some(encoded) = rest.split_once("''").map(|(_, v)| v) {
-                let decoded = percent_decode_utf8(encoded);
-                if !decoded.is_empty() {
-                    return Some(decoded);
-                }
-            }
+    let params = split_header_params(header);
+    // First pass: prefer filename* (RFC 5987 extended notation)
+    for (name, value) in &params {
+        if name.eq_ignore_ascii_case("filename*")
+            && let Some(decoded) = decode_rfc5987(value)
+            && !decoded.is_empty()
+        {
+            return Some(decoded);
         }
-        // Standard: filename="value" or filename=value
-        if let Some(rest) = part.strip_prefix("filename=") {
-            let rest = rest.trim();
-            let value = if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
-                rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(rest)
-            } else {
-                rest
-            };
-            if !value.is_empty() {
-                return Some(value.to_owned());
+    }
+    // Second pass: fall back to filename
+    for (name, value) in &params {
+        if name.eq_ignore_ascii_case("filename") {
+            let unquoted = unquote(value);
+            if !unquoted.is_empty() {
+                return Some(unquoted);
             }
         }
     }
     None
+}
+
+/// Split a header value into `(name, value)` parameter pairs, respecting
+/// quoted strings so that semicolons inside quotes do not split.
+fn split_header_params(header: &str) -> Vec<(String, String)> {
+    split_on_unquoted_semicolons(header)
+        .into_iter()
+        .skip(1)
+        .filter_map(|seg| {
+            let seg = seg.trim();
+            let (name, value) = seg.split_once('=')?;
+            let name = name.trim();
+            (!name.is_empty()).then(|| (name.to_owned(), value.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// Split on `;` outside of double-quoted strings.
+fn split_on_unquoted_semicolons(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut prev_backslash = false;
+    for (i, c) in s.char_indices() {
+        if prev_backslash {
+            prev_backslash = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quote => prev_backslash = true,
+            '"' => in_quote = !in_quote,
+            ';' if !in_quote => {
+                parts.push(s.get(start..i).unwrap_or_default());
+                start = i + 1;
+            },
+            _ => {},
+        }
+    }
+    parts.push(s.get(start..).unwrap_or_default());
+    parts
+}
+
+/// Decode an RFC 5987 `charset'language'percent-encoded` value.
+fn decode_rfc5987(raw: &str) -> Option<String> {
+    let (_, after_charset) = raw.split_once('\'')?;
+    let (_, encoded) = after_charset.split_once('\'')?;
+    Some(percent_decode_utf8(encoded))
+}
+
+/// Strip surrounding double-quotes and unescape backslash-escaped characters.
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    let inner = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s);
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Percent-decode a UTF-8 string, replacing invalid sequences with `_`.
@@ -1300,6 +1382,59 @@ mod tests {
         );
     }
 
+    // NAT64 Well-Known Prefix (64:ff9b::/96) — embedded IPv4 policy (RFC 6052)
+    #[test]
+    fn ssrf_blocks_nat64_embedded_metadata() {
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b::a9fe:a9fe".parse().unwrap(), false),
+            "64:ff9b::169.254.169.254 embeds cloud metadata"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_nat64_embedded_loopback() {
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b::7f00:1".parse().unwrap(), false),
+            "64:ff9b::127.0.0.1 embeds loopback"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_nat64_embedded_private() {
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b::c0a8:1".parse().unwrap(), false),
+            "64:ff9b::192.168.0.1 embeds private range"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b::a9fe:aa02".parse().unwrap(), false),
+            "64:ff9b::169.254.170.2 embeds ECS credential endpoint"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_nat64_embedded_public() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"64:ff9b::808:808".parse().unwrap(), false),
+            "64:ff9b::8.8.8.8 embeds public DNS, should be allowed"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_nat64_embedded_private_with_allowlist() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"64:ff9b::c0a8:1".parse().unwrap(), true),
+            "64:ff9b::192.168.0.1 should be allowed with allowlist override"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_nat64_embedded_metadata_even_with_allowlist() {
+        assert!(
+            is_file_url_ssrf_blocked(&"64:ff9b::a9fe:a9fe".parse().unwrap(), true),
+            "cloud metadata via NAT64 is unconditionally blocked"
+        );
+    }
+
     // Allowlist override
     #[test]
     fn ssrf_allows_special_use_with_allowlist() {
@@ -1593,6 +1728,47 @@ mod tests {
             parse_content_disposition_filename("attachment; filename*=UTF-8''correct.pdf; filename=\"fallback.pdf\""),
             Some("correct.pdf".to_owned()),
             "filename* should take precedence over filename"
+        );
+    }
+
+    #[test]
+    fn content_disposition_plain_before_star() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename=\"fallback.pdf\"; filename*=UTF-8''correct.pdf"),
+            Some("correct.pdf".to_owned()),
+            "filename* should win even when filename appears first"
+        );
+    }
+
+    #[test]
+    fn content_disposition_case_insensitive() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; FILENAME=\"report.pdf\""),
+            Some("report.pdf".to_owned()),
+            "parameter names should be case-insensitive"
+        );
+        assert_eq!(
+            parse_content_disposition_filename("attachment; FileName*=UTF-8''r%C3%A9sum%C3%A9.pdf"),
+            Some("résumé.pdf".to_owned()),
+            "filename* should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn content_disposition_non_empty_language_tag() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename*=UTF-8'en'actual.pdf"),
+            Some("actual.pdf".to_owned()),
+            "non-empty language tag should be accepted"
+        );
+    }
+
+    #[test]
+    fn content_disposition_quoted_semicolon() {
+        assert_eq!(
+            parse_content_disposition_filename("attachment; filename=\"file;name.pdf\""),
+            Some("file;name.pdf".to_owned()),
+            "semicolons inside quotes should not split the value"
         );
     }
 
