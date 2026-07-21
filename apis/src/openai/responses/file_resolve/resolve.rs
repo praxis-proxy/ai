@@ -22,7 +22,10 @@ use std::collections::HashMap;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tracing::{debug, warn};
 
-use super::{config::OnMissing, resolve_url::FileUrlResolver};
+use super::{
+    config::OnMissing,
+    resolve_url::{FileUrlResolver, redact_url},
+};
 use crate::openai::api_client::{ApiClient, ApiClientError};
 
 /// Files API path prefix used in resource URL construction.
@@ -41,7 +44,7 @@ impl std::fmt::Display for ReferenceSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FileId(id) => write!(f, "{id}"),
-            Self::FileUrl(url) => write!(f, "{url}"),
+            Self::FileUrl(url) => write!(f, "{}", redact_url(url)),
         }
     }
 }
@@ -271,7 +274,7 @@ impl ResolutionBudget {
                 ReferenceSource::FileUrl(url) => {
                     let Some(resolver) = url_resolver else {
                         return Err(ResolveError::FileUrlFailed {
-                            label: url.clone(),
+                            label: redact_url(url),
                             detail: "file URL resolution not configured".to_owned(),
                         });
                     };
@@ -320,7 +323,7 @@ fn overall_timeout_error_for_source(source: &ReferenceSource) -> Result<Resolved
             detail: "overall file resolution deadline exceeded".to_owned(),
         }),
         ReferenceSource::FileUrl(url) => Err(ResolveError::FileUrlFailed {
-            label: url.clone(),
+            label: redact_url(url),
             detail: "overall file resolution deadline exceeded".to_owned(),
         }),
     }
@@ -658,7 +661,7 @@ async fn resolve_reference(
         .await
     {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
+        Err(e @ (ResolveError::TooManyReferences { .. } | ResolveError::FileUrlBlocked { .. })) => Err(e),
         Err(e) if resolver.on_missing == OnMissing::Continue => {
             warn!(source = %source, error = %e, "file resolution failed, passing through");
             Ok(None)

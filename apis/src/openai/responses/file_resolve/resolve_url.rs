@@ -100,15 +100,19 @@ impl NormalizedOrigin {
     }
 }
 
-/// Cloud metadata endpoints that are never permitted.
+/// Cloud metadata and credential endpoints that are never permitted.
 fn is_cloud_metadata(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            *v4 == std::net::Ipv4Addr::new(169, 254, 169, 254) || *v4 == std::net::Ipv4Addr::new(100, 100, 100, 200)
+            *v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
+                || *v4 == std::net::Ipv4Addr::new(169, 254, 170, 2)
+                || *v4 == std::net::Ipv4Addr::new(169, 254, 170, 23)
+                || *v4 == std::net::Ipv4Addr::new(100, 100, 100, 200)
         },
         IpAddr::V6(v6) => {
             const AWS_IMDS_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
-            *v6 == AWS_IMDS_V6
+            const AWS_ECS_CREDS_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0023);
+            *v6 == AWS_IMDS_V6 || *v6 == AWS_ECS_CREDS_V6
         },
     }
 }
@@ -305,8 +309,8 @@ impl FileUrlResolver {
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .and_then(|ct| {
-                // Parse MIME type, reject if invalid
-                ct.split(';').next().map(str::trim)
+                let mime = ct.split(';').next().map(str::trim)?;
+                mime.contains('/').then_some(mime)
             })
             .or_else(|| {
                 // Fall back to URL path extension
@@ -785,6 +789,30 @@ mod tests {
         assert!(
             is_file_url_ssrf_blocked(&"fd00:ec2::254".parse().unwrap(), true),
             "cloud metadata IPv6 should be blocked even with allowlist"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_ecs_credential_endpoint() {
+        assert!(
+            is_file_url_ssrf_blocked(&"169.254.170.2".parse().unwrap(), true),
+            "ECS credential endpoint should be blocked even with allowlist"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_eks_credential_endpoint() {
+        assert!(
+            is_file_url_ssrf_blocked(&"169.254.170.23".parse().unwrap(), true),
+            "EKS credential endpoint should be blocked even with allowlist"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_ecs_credential_endpoint_v6() {
+        assert!(
+            is_file_url_ssrf_blocked(&"fd00:ec2::23".parse().unwrap(), true),
+            "ECS/EKS credential IPv6 endpoint should be blocked even with allowlist"
         );
     }
 

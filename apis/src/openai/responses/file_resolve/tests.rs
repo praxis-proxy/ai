@@ -1040,3 +1040,73 @@ async fn file_url_in_function_call_output_resolved() {
         "file_data should be a data URI with correct MIME type"
     );
 }
+
+#[tokio::test]
+async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
+    use praxis_core::callout::{CalloutClient, CalloutConfig};
+
+    use crate::openai::responses::file_resolve::{
+        config::OnMissing,
+        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
+        resolve_url::FileUrlResolver,
+    };
+
+    let mut body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": "http://169.254.169.254/latest/meta-data/"
+            }]
+        }]
+    });
+
+    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
+    let client = FilesApiClient::new(
+        "http://unused:9999",
+        vec![],
+        callout,
+        FilesApiClientOptions {
+            max_file_references: 32,
+            max_resolved_bytes: 64 * 1024 * 1024,
+            timeout_ms: 30_000,
+        },
+    )
+    .unwrap();
+
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![],
+    };
+
+    let result = resolve_input(
+        &mut body,
+        &client,
+        OnMissing::Continue,
+        &http::HeaderMap::new(),
+        Some(&resolver),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "FileUrlBlocked must propagate even with on_missing: continue"
+    );
+}
+
+#[test]
+fn display_redacts_signed_file_url() {
+    use crate::openai::responses::file_resolve::resolve::ReferenceSource;
+
+    let source =
+        ReferenceSource::FileUrl("https://storage.example.com/file.pdf?sig=SECRET_TOKEN&exp=1234567890".to_owned());
+    let displayed = format!("{source}");
+    assert!(
+        !displayed.contains("SECRET_TOKEN"),
+        "Display must not expose signed query parameters: {displayed}"
+    );
+    assert!(
+        displayed.contains("[REDACTED]"),
+        "query values should be redacted: {displayed}"
+    );
+}
