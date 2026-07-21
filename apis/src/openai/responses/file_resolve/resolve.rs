@@ -441,6 +441,32 @@ impl FilesApiClient {
     }
 }
 
+/// Read a response body in chunks, enforcing a size limit.
+pub(super) async fn read_bounded_body(
+    mut response: reqwest::Response,
+    file_id: &str,
+    max_content_bytes: usize,
+    limit: usize,
+) -> Result<Vec<u8>, ResolveError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| ResolveError::CalloutFailed {
+        file_id: file_id.to_owned(),
+        detail: if e.is_timeout() {
+            "content download timed out".to_owned()
+        } else {
+            format!("content download read error: {e}")
+        },
+    })? {
+        if body.len() + chunk.len() > max_content_bytes {
+            return Err(ResolveError::TooLarge {
+                file_id: file_id.to_owned(),
+                limit,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 /// Extract content type and reported size from a Files API
 /// metadata response.
 fn parse_file_metadata(body: &serde_json::Value) -> FileMetadata {
@@ -477,11 +503,11 @@ struct FileMetadata {
 #[derive(Clone)]
 pub(crate) struct ResolvedFile {
     /// Base64-encoded file content (no `data:` prefix).
-    base64: String,
+    pub(super) base64: String,
     /// MIME content type (e.g. `text/plain`).
-    content_type: String,
+    pub(super) content_type: String,
     /// Original filename from the Files API metadata.
-    filename: Option<String>,
+    pub(super) filename: Option<String>,
 }
 
 /// Walk the Responses API `input` array and resolve all `file_id`
@@ -699,7 +725,7 @@ fn max_content_bytes_for_base64(max_output_bytes: usize) -> usize {
 
 /// Maximum raw file bytes that can fit in a data URL with base64
 /// expansion.
-fn max_content_bytes_for_data_url(max_data_url_bytes: usize, content_type: &str) -> Option<usize> {
+pub(super) fn max_content_bytes_for_data_url(max_data_url_bytes: usize, content_type: &str) -> Option<usize> {
     let prefix_len = "data:"
         .len()
         .checked_add(content_type.len())?
