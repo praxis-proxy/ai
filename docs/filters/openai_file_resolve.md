@@ -23,6 +23,8 @@ This filter resolves references inside Responses requests; it does not proxy cli
 | `max_file_references` | integer | no | Maximum number of distinct content-part / `file_id` pairs to resolve in one request, including rehydrated history. |
 | `on_missing` | `continue` \| `reject` | no | Behavior when a referenced file cannot be fetched. |
 | `timeout_ms` | integer | no | HTTP timeout in milliseconds for Files API callout requests. |
+| `file_url` | `resolve` \| `passthrough` | no | Mode for `file_url` content parts in `input_file`. |
+| `allowed_file_url_origins` | string[] | no | Exact origins allowed to resolve to private addresses. Cloud metadata, unspecified, and multicast remain blocked. |
 
 ## Examples
 
