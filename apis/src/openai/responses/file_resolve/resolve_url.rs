@@ -164,8 +164,12 @@ fn is_site_local_v6(v6: &std::net::Ipv6Addr) -> bool {
 fn is_special_use_v4(ip: std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     let n = u32::from(ip);
-    // 192.0.0.0/24 (IETF Protocol Assignments) + 192.0.2.0/24 (TEST-NET-1)
-    (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+    // 192.0.0.0/24 (IETF Protocol Assignments) — 192.0.0.9, 192.0.0.10 are globally reachable
+    (o[0] == 192 && o[1] == 0 && o[2] == 0 && o[3] != 9 && o[3] != 10)
+    // 192.0.2.0/24 — Documentation (TEST-NET-1)
+    || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+    // 192.88.99.0/24 — Deprecated 6to4 relay anycast (RFC 7526)
+    || (o[0] == 192 && o[1] == 88 && o[2] == 99)
     // 198.18.0.0/15 — Benchmarking
     || (n & 0xFFFE_0000 == 0xC612_0000)
     // 198.51.100.0/24 — Documentation (TEST-NET-2)
@@ -183,16 +187,33 @@ fn is_special_use_v6(v6: std::net::Ipv6Addr) -> bool {
     (s[0] == 0x0064 && s[1] == 0xFF9B && s[2] == 0x0001)
     // 100::/64 — Discard-Only (RFC 6666)
     || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-    // 100::1:0:0/96..100::ffff:ffff:ffff — extended discard prefix
-    || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] >= 1)
-    // 2001:2::/48 — Benchmarking (RFC 5180)
-    || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0)
-    // 2001:db8::/32 — Documentation (RFC 3849)
+    // 100:0:0:1::/64 — Discard-Only dummy prefix
+    || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 1)
+    // 2001::/23 — IETF Protocol Assignments (block non-global sub-ranges)
+    || is_2001_ietf_non_global(s)
+    // 2001:db8::/32 — Documentation (RFC 3849, standalone IANA entry outside /23)
     || (s[0] == 0x2001 && s[1] == 0x0DB8)
-    // 3fff::/20 — Documentation (RFC 9637)
-    || (s[0] & 0xFFF0 == 0x3FF0)
-    // 5f00::/16 — Segment Routing (SRv6) SID (RFC 9602)
+    // 2002::/16 — 6to4 (deprecated, RFC 7526)
+    || s[0] == 0x2002
+    // 3fff::/20 — Documentation (RFC 9637): s[0]==0x3FFF, top 4 bits of s[1]==0
+    || (s[0] == 0x3FFF && s[1] & 0xF000 == 0)
+    // 5f00::/16 — Segment Routing SRv6 SID (RFC 9602)
     || s[0] == 0x5F00
+}
+
+/// Non-globally-reachable sub-ranges within `2001::/23` (IETF Protocol Assignments).
+fn is_2001_ietf_non_global(s: [u16; 8]) -> bool {
+    if s[0] != 0x2001 || s[1] > 0x01FF {
+        return false;
+    }
+    // Globally reachable exceptions per IANA — these pass through:
+    match s[1] {
+        // 2001::/32 Teredo (RFC 4380), 2001:3::/32 AMT (RFC 7450)
+        0x0000 | 0x0003 => false,
+        0x0004 if s[2] == 0x0112 => false,  // 2001:4:112::/48 — AS112-v6 (RFC 7535)
+        v if v & 0xFFF0 == 0x0020 => false, // 2001:20::/28 — ORCHIDv2 (RFC 7343)
+        _ => true,
+    }
 }
 
 /// Validate that a string is a well-formed MIME type (`token/token`).
@@ -913,117 +934,191 @@ mod tests {
         );
     }
 
-    // Special-use range tests
+    // IPv4 special-use range tests
     #[test]
     fn ssrf_blocks_benchmarking_range() {
-        assert!(
-            is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), false),
-            "198.18.0.0/15 benchmarking should be blocked"
-        );
-        assert!(
-            is_file_url_ssrf_blocked(&"198.19.255.254".parse().unwrap(), false),
-            "198.19.x upper range should be blocked"
-        );
+        assert!(is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), false));
+        assert!(is_file_url_ssrf_blocked(&"198.19.255.254".parse().unwrap(), false));
     }
 
     #[test]
     fn ssrf_blocks_ietf_protocol_assignments() {
+        assert!(is_file_url_ssrf_blocked(&"192.0.0.1".parse().unwrap(), false));
+    }
+
+    #[test]
+    fn ssrf_allows_globally_reachable_in_192_0_0() {
         assert!(
-            is_file_url_ssrf_blocked(&"192.0.0.1".parse().unwrap(), false),
-            "192.0.0.0/24 IETF assignments should be blocked"
+            !is_file_url_ssrf_blocked(&"192.0.0.9".parse().unwrap(), false),
+            "192.0.0.9 is globally reachable per IANA"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"192.0.0.10".parse().unwrap(), false),
+            "192.0.0.10 is globally reachable per IANA"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_6to4_relay_anycast() {
+        assert!(
+            is_file_url_ssrf_blocked(&"192.88.99.1".parse().unwrap(), false),
+            "192.88.99.0/24 deprecated 6to4 relay should be blocked"
         );
     }
 
     #[test]
     fn ssrf_blocks_documentation_ranges() {
-        assert!(
-            is_file_url_ssrf_blocked(&"192.0.2.1".parse().unwrap(), false),
-            "TEST-NET-1 should be blocked"
-        );
-        assert!(
-            is_file_url_ssrf_blocked(&"198.51.100.1".parse().unwrap(), false),
-            "TEST-NET-2 should be blocked"
-        );
-        assert!(
-            is_file_url_ssrf_blocked(&"203.0.113.1".parse().unwrap(), false),
-            "TEST-NET-3 should be blocked"
-        );
+        assert!(is_file_url_ssrf_blocked(&"192.0.2.1".parse().unwrap(), false));
+        assert!(is_file_url_ssrf_blocked(&"198.51.100.1".parse().unwrap(), false));
+        assert!(is_file_url_ssrf_blocked(&"203.0.113.1".parse().unwrap(), false));
     }
 
     #[test]
     fn ssrf_blocks_reserved_v4() {
-        assert!(
-            is_file_url_ssrf_blocked(&"240.0.0.1".parse().unwrap(), false),
-            "240.0.0.0/4 reserved should be blocked"
-        );
-        assert!(
-            is_file_url_ssrf_blocked(&"255.255.255.254".parse().unwrap(), false),
-            "255.x reserved upper should be blocked"
-        );
+        assert!(is_file_url_ssrf_blocked(&"240.0.0.1".parse().unwrap(), false));
+        assert!(is_file_url_ssrf_blocked(&"255.255.255.254".parse().unwrap(), false));
     }
 
+    // IPv6 special-use range tests
     #[test]
     fn ssrf_blocks_discard_only_v6() {
+        assert!(is_file_url_ssrf_blocked(&"100::".parse().unwrap(), false));
         assert!(
-            is_file_url_ssrf_blocked(&"100::1".parse().unwrap(), false),
-            "100::/64 discard-only should be blocked"
+            is_file_url_ssrf_blocked(&"100:0:0:1::1".parse().unwrap(), false),
+            "100:0:0:1::/64 dummy prefix should be blocked"
         );
     }
 
     #[test]
-    fn ssrf_blocks_documentation_v6() {
+    fn ssrf_allows_outside_discard_prefix() {
         assert!(
-            is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), false),
-            "2001:db8::/32 documentation should be blocked"
+            !is_file_url_ssrf_blocked(&"100:0:0:2::1".parse().unwrap(), false),
+            "100:0:0:2:: is outside the registered discard prefixes"
         );
     }
 
     #[test]
     fn ssrf_blocks_nat64_local_use() {
+        assert!(is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), false));
+    }
+
+    #[test]
+    fn ssrf_blocks_6to4_v6() {
         assert!(
-            is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), false),
-            "64:ff9b:1::/48 local-use NAT64 should be blocked"
+            is_file_url_ssrf_blocked(&"2002:c0a8:1::1".parse().unwrap(), false),
+            "6to4 2002::/16 should be blocked (deprecated RFC 7526)"
+        );
+    }
+
+    // 2001::/23 IETF Protocol Assignments
+    #[test]
+    fn ssrf_blocks_2001_non_global() {
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:5::1".parse().unwrap(), false),
+            "2001:5:: is non-global within 2001::/23"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:1ff::1".parse().unwrap(), false),
+            "2001:1ff:: is at the edge of 2001::/23"
         );
     }
 
     #[test]
-    fn ssrf_blocks_benchmarking_v6() {
+    fn ssrf_blocks_2001_benchmarking() {
+        assert!(is_file_url_ssrf_blocked(&"2001:2:0::1".parse().unwrap(), false));
+    }
+
+    #[test]
+    fn ssrf_blocks_2001_documentation() {
+        assert!(is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), false));
+    }
+
+    #[test]
+    fn ssrf_allows_2001_teredo() {
         assert!(
-            is_file_url_ssrf_blocked(&"2001:2:0::1".parse().unwrap(), false),
-            "2001:2::/48 benchmarking should be blocked"
+            !is_file_url_ssrf_blocked(&"2001::1".parse().unwrap(), false),
+            "2001::/32 Teredo is globally reachable"
         );
     }
 
+    #[test]
+    fn ssrf_allows_2001_amt() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:3::1".parse().unwrap(), false),
+            "2001:3::/32 AMT is globally reachable"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_2001_as112() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:4:112::1".parse().unwrap(), false),
+            "2001:4:112::/48 AS112-v6 is globally reachable"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_2001_orchidv2() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:20::1".parse().unwrap(), false),
+            "2001:20::/28 ORCHIDv2 is globally reachable"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:2f::1".parse().unwrap(), false),
+            "2001:2f:: is at the edge of ORCHIDv2"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_outside_orchidv2_in_2001() {
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:30::1".parse().unwrap(), false),
+            "2001:30:: is outside ORCHIDv2, still in 2001::/23 non-global"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_outside_2001_23() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:200::1".parse().unwrap(), false),
+            "2001:200:: is outside 2001::/23"
+        );
+    }
+
+    // 3fff::/20 and 5f00::/16
     #[test]
     fn ssrf_blocks_documentation_rfc9637() {
+        assert!(is_file_url_ssrf_blocked(&"3fff::1".parse().unwrap(), false));
         assert!(
-            is_file_url_ssrf_blocked(&"3fff::1".parse().unwrap(), false),
-            "3fff::/20 documentation should be blocked"
+            is_file_url_ssrf_blocked(&"3fff:0fff::1".parse().unwrap(), false),
+            "3fff:0fff:: is inside 3fff::/20"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_outside_3fff_20() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"3fff:1000::1".parse().unwrap(), false),
+            "3fff:1000:: is outside 3fff::/20"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"3ffe::1".parse().unwrap(), false),
+            "3ffe:: is outside 3fff::/20"
         );
     }
 
     #[test]
     fn ssrf_blocks_srv6_sid() {
-        assert!(
-            is_file_url_ssrf_blocked(&"5f00::1".parse().unwrap(), false),
-            "5f00::/16 SRv6 SID should be blocked"
-        );
+        assert!(is_file_url_ssrf_blocked(&"5f00::1".parse().unwrap(), false));
     }
 
+    // Allowlist override
     #[test]
     fn ssrf_allows_special_use_with_allowlist() {
-        assert!(
-            !is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), true),
-            "benchmarking range should be allowed with allowlist"
-        );
-        assert!(
-            !is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), true),
-            "documentation v6 should be allowed with allowlist"
-        );
-        assert!(
-            !is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), true),
-            "NAT64 local-use should be allowed with allowlist"
-        );
+        assert!(!is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), true));
+        assert!(!is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), true));
+        assert!(!is_file_url_ssrf_blocked(&"64:ff9b:1::1".parse().unwrap(), true));
+        assert!(!is_file_url_ssrf_blocked(&"2002:c0a8:1::1".parse().unwrap(), true));
     }
 
     #[test]
