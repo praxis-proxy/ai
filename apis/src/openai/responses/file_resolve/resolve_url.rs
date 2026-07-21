@@ -126,10 +126,19 @@ fn is_unconditionally_blocked(ip: &IpAddr) -> bool {
 fn is_private_range(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 0 || is_cgnat(*v4)
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.octets()[0] == 0
+                || is_cgnat(*v4)
+                || is_special_use_v4(*v4)
         },
         IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unique_local() || is_unicast_link_local_v6(v6) || is_site_local_v6(v6)
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || is_unicast_link_local_v6(v6)
+                || is_site_local_v6(v6)
+                || is_special_use_v6(*v6)
         },
     }
 }
@@ -151,13 +160,41 @@ fn is_site_local_v6(v6: &std::net::Ipv6Addr) -> bool {
     a == 0xFE && (b & 0xC0) == 0xC0
 }
 
+/// Non-globally-reachable IPv4 special-use ranges per IANA registry.
+fn is_special_use_v4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    let n = u32::from(ip);
+    // 192.0.0.0/24 (IETF Protocol Assignments) + 192.0.2.0/24 (TEST-NET-1)
+    (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+    // 198.18.0.0/15 — Benchmarking
+    || (n & 0xFFFE_0000 == 0xC612_0000)
+    // 198.51.100.0/24 — Documentation (TEST-NET-2)
+    || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+    // 203.0.113.0/24 — Documentation (TEST-NET-3)
+    || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+    // 240.0.0.0/4 — Reserved for future use
+    || o[0] >= 240
+}
+
+/// Non-globally-reachable IPv6 special-use ranges per IANA registry.
+fn is_special_use_v6(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    // 100::/64 — Discard-Only (RFC 6666)
+    (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+    // 2001:db8::/32 — Documentation (RFC 3849)
+    || (s[0] == 0x2001 && s[1] == 0x0DB8)
+}
+
 /// Validate that a string is a well-formed MIME type (`token/token`).
 ///
-/// Rejects values containing commas, spaces, semicolons, or other
-/// characters that are not RFC 2045 tokens.
+/// Uses the RFC 2045 token production but additionally excludes characters
+/// that are URI-structural (`#`, `%`) or non-printable in data URIs
+/// (`^`, `` ` ``, `|`), preventing corruption when the type is interpolated
+/// into `data:{type};base64,...`.
 fn is_valid_mime_type(s: &str) -> bool {
-    fn is_token_char(c: char) -> bool {
-        c.is_ascii() && !c.is_ascii_control() && !b" \t\"(),/:;<=>?@[\\]{}".contains(&(c as u8))
+    /// RFC 2045 token characters minus URI-unsafe ones (`#%^``|`).
+    fn is_data_uri_safe_token(c: char) -> bool {
+        c.is_ascii() && !c.is_ascii_control() && !b" \t\"(),/:;<=>?@[\\]{}#%^`|".contains(&(c as u8))
     }
 
     let Some((type_part, subtype)) = s.split_once('/') else {
@@ -165,8 +202,8 @@ fn is_valid_mime_type(s: &str) -> bool {
     };
     !type_part.is_empty()
         && !subtype.is_empty()
-        && type_part.chars().all(is_token_char)
-        && subtype.chars().all(is_token_char)
+        && type_part.chars().all(is_data_uri_safe_token)
+        && subtype.chars().all(is_data_uri_safe_token)
 }
 
 /// Check if an IP should be blocked for `file_url` fetches.
@@ -866,6 +903,83 @@ mod tests {
         );
     }
 
+    // Special-use range tests
+    #[test]
+    fn ssrf_blocks_benchmarking_range() {
+        assert!(
+            is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), false),
+            "198.18.0.0/15 benchmarking should be blocked"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"198.19.255.254".parse().unwrap(), false),
+            "198.19.x upper range should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_ietf_protocol_assignments() {
+        assert!(
+            is_file_url_ssrf_blocked(&"192.0.0.1".parse().unwrap(), false),
+            "192.0.0.0/24 IETF assignments should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_documentation_ranges() {
+        assert!(
+            is_file_url_ssrf_blocked(&"192.0.2.1".parse().unwrap(), false),
+            "TEST-NET-1 should be blocked"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"198.51.100.1".parse().unwrap(), false),
+            "TEST-NET-2 should be blocked"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"203.0.113.1".parse().unwrap(), false),
+            "TEST-NET-3 should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_reserved_v4() {
+        assert!(
+            is_file_url_ssrf_blocked(&"240.0.0.1".parse().unwrap(), false),
+            "240.0.0.0/4 reserved should be blocked"
+        );
+        assert!(
+            is_file_url_ssrf_blocked(&"255.255.255.254".parse().unwrap(), false),
+            "255.x reserved upper should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_discard_only_v6() {
+        assert!(
+            is_file_url_ssrf_blocked(&"100::1".parse().unwrap(), false),
+            "100::/64 discard-only should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_documentation_v6() {
+        assert!(
+            is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), false),
+            "2001:db8::/32 documentation should be blocked"
+        );
+    }
+
+    #[test]
+    fn ssrf_allows_special_use_with_allowlist() {
+        assert!(
+            !is_file_url_ssrf_blocked(&"198.18.0.1".parse().unwrap(), true),
+            "benchmarking range should be allowed with allowlist"
+        );
+        assert!(
+            !is_file_url_ssrf_blocked(&"2001:db8::1".parse().unwrap(), true),
+            "documentation v6 should be allowed with allowlist"
+        );
+    }
+
     #[test]
     fn ssrf_blocks_zero_octet() {
         assert!(
@@ -915,6 +1029,15 @@ mod tests {
             !is_valid_mime_type("text/plain;charset=utf-8"),
             "semicolon should have been stripped before validation"
         );
+    }
+
+    #[test]
+    fn mime_rejects_data_uri_unsafe_chars() {
+        assert!(!is_valid_mime_type("text/x-foo#bar"), "# corrupts data URI fragment");
+        assert!(!is_valid_mime_type("text/x%2Fplain"), "% triggers percent-encoding");
+        assert!(!is_valid_mime_type("text/x^plain"), "^ is not URI-safe");
+        assert!(!is_valid_mime_type("text/x`plain"), "backtick is not URI-safe");
+        assert!(!is_valid_mime_type("text/x|plain"), "pipe is not URI-safe");
     }
 
     // RedactedUrl tests
