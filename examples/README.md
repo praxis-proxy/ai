@@ -49,6 +49,7 @@ before sending requests.
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` references in Responses API input by fetching file metadata and content from a Files API, then inlining base64 content as `file_data` or `image_url` before forwarding |
 | [format-routing.yaml](configs/openai/responses/format-routing.yaml) | Routes AI API traffic by detected body format |
 | [full-flow.yaml](configs/openai/responses/full-flow.yaml) | Combines conversations, format classification, request validation, file resolution, and backend routing into a single pipeline |
+| [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
 | [mcp-tool-resolve.yaml](configs/openai/responses/mcp-tool-resolve.yaml) | Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP tool entries in the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server |
 | [model-rewrite.yaml](configs/openai/responses/model-rewrite.yaml) | Rewrites or injects the top-level `model` field in Responses API request bodies before forwarding to the inference backend |
 | [rehydrate.yaml](configs/openai/responses/rehydrate.yaml) | Validates `previous_response_id` by fetching the stored response, confirming its status is completed, and promoting the ID to filter metadata |

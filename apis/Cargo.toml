@@ -42,6 +42,10 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 chrono = { workspace = true }
+rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-util = { workspace = true }

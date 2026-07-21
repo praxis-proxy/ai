@@ -20,6 +20,7 @@
 mod config;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
+pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
 pub(crate) mod openai_mcp_tool_resolve;
 pub(crate) mod openai_responses_proxy;
@@ -29,6 +30,7 @@ pub(crate) mod store;
 pub(crate) mod stream_events;
 
 pub use file_resolve::FileResolveFilter;
+pub use mcp_dispatch::McpDispatchFilter;
 pub use model_rewrite::ModelRewriteFilter;
 pub use openai_mcp_tool_resolve::McpToolResolveFilter;
 pub use openai_tool_parse::ToolParseFilter;
