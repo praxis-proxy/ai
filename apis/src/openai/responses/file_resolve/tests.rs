@@ -161,6 +161,45 @@ fn reject_too_large_returns_413() {
 }
 
 #[test]
+fn reject_file_url_blocked_returns_403() {
+    let err = ResolveError::FileUrlBlocked {
+        label: "https://evil.example.com/file.pdf".to_owned(),
+    };
+    let action = reject_resolve_error(&err);
+    match action {
+        FilterAction::Reject(r) => {
+            assert_eq!(r.status, 403, "blocked file URL should produce 403");
+            let body = std::str::from_utf8(r.body.as_deref().unwrap()).unwrap();
+            assert!(
+                body.contains("blocked by security policy"),
+                "client response should describe the block reason"
+            );
+        },
+        _ => panic!("expected Reject action"),
+    }
+}
+
+#[test]
+fn reject_file_url_failed_returns_502() {
+    let err = ResolveError::FileUrlFailed {
+        label: "https://files.example.com/report.pdf?token=[REDACTED]".to_owned(),
+        detail: "connection refused".to_owned(),
+    };
+    let action = reject_resolve_error(&err);
+    match action {
+        FilterAction::Reject(r) => {
+            assert_eq!(r.status, 502, "failed file URL fetch should produce 502");
+            let body = std::str::from_utf8(r.body.as_deref().unwrap()).unwrap();
+            assert!(
+                !body.contains("connection refused"),
+                "client response must not expose internal transport details"
+            );
+        },
+        _ => panic!("expected Reject action"),
+    }
+}
+
+#[test]
 fn reject_rewritten_body_too_large_returns_413() {
     let action = reject_rewritten_body_too_large(2048, 1024);
     match action {

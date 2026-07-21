@@ -22,11 +22,21 @@ use std::collections::HashMap;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tracing::{debug, warn};
 
-use super::config::OnMissing;
+use super::{config::OnMissing, resolve_url::FileUrlResolver};
 use crate::openai::api_client::{ApiClient, ApiClientError};
 
 /// Files API path prefix used in resource URL construction.
 const FILES_PATH_PREFIX: &str = "v1/files";
+
+/// Identifies the source of a file reference for dispatch and caching.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "FileUrl variant used in Task 4"))]
+pub(crate) enum ReferenceSource {
+    /// Files API `file_id` reference.
+    FileId(String),
+    /// Remote `file_url` reference.
+    FileUrl(String),
+}
 
 /// Errors that can occur during file resolution.
 #[derive(Debug, Clone)]
@@ -60,6 +70,22 @@ pub(crate) enum ResolveError {
         /// Maximum allowed resolved size in bytes.
         limit: usize,
     },
+
+    /// The file URL target is blocked by SSRF policy.
+    #[cfg_attr(not(test), expect(dead_code, reason = "Used in Task 3"))]
+    FileUrlBlocked {
+        /// Redacted URL label for client-facing messages.
+        label: String,
+    },
+
+    /// The file URL fetch failed (DNS, timeout, non-success status).
+    #[cfg_attr(not(test), expect(dead_code, reason = "Used in Task 3"))]
+    FileUrlFailed {
+        /// Redacted URL label for client-facing messages.
+        label: String,
+        /// Human-readable error description.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -76,6 +102,12 @@ impl std::fmt::Display for ResolveError {
             },
             Self::TooLarge { file_id, limit } => {
                 write!(f, "resolved file '{file_id}' exceeds configured limit ({limit} bytes)")
+            },
+            Self::FileUrlBlocked { label } => {
+                write!(f, "file URL '{label}' blocked by security policy")
+            },
+            Self::FileUrlFailed { label, detail } => {
+                write!(f, "file URL fetch failed for '{label}': {detail}")
             },
         }
     }
@@ -123,8 +155,8 @@ pub(crate) struct FilesApiClient {
 
 /// Request-scoped limits and cached resolution outcomes.
 pub(crate) struct ResolutionBudget {
-    /// Resolutions cached by content part type and file ID.
-    cache: HashMap<(String, String), Result<ResolvedFile, ResolveError>>,
+    /// Resolutions cached by content part type and reference source.
+    cache: HashMap<(String, ReferenceSource), Result<ResolvedFile, ResolveError>>,
     /// Deadline shared by every Files API callout in the request.
     deadline: tokio::time::Instant,
     /// Maximum file references allowed for this request.
@@ -160,8 +192,8 @@ pub(crate) struct FilesApiClientOptions {
 struct ResolutionRequest<'a> {
     /// Files API client.
     client: &'a FilesApiClient,
-    /// Referenced file ID.
-    file_id: &'a str,
+    /// Reference source (file ID or file URL).
+    source: ReferenceSource,
     /// Maximum resolved bytes remaining for this item collection.
     max_resolved_bytes: usize,
     /// Responses content part type.
@@ -180,6 +212,9 @@ struct ContentResolver<'a> {
     on_missing: OnMissing,
     /// Original request headers available for forwarding.
     request_headers: &'a http::HeaderMap,
+    /// URL resolver for `file_url` references.
+    #[expect(dead_code, reason = "Wired in Task 4")]
+    url_resolver: Option<&'a FileUrlResolver>,
 }
 
 impl ResolutionBudget {
@@ -205,24 +240,29 @@ impl ResolutionBudget {
     async fn resolve(&mut self, request: ResolutionRequest<'_>) -> Result<ResolvedFile, ResolveError> {
         let ResolutionRequest {
             client,
-            file_id,
+            source,
             max_resolved_bytes,
             part_type,
             request_headers,
         } = request;
-        let key = (part_type.to_owned(), file_id.to_owned());
+        let key = (part_type.to_owned(), source.clone());
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
         }
 
         self.register_reference()?;
 
-        let resolution = tokio::time::timeout_at(
+        let resolution = dispatch_resolution(
+            &source,
+            client,
+            request_headers,
+            max_resolved_bytes,
+            part_type,
             self.deadline,
-            client.resolve_file(file_id, request_headers, max_resolved_bytes, part_type),
         )
-        .await
-        .unwrap_or_else(|_elapsed| overall_timeout_error(file_id));
+        .await;
+        // Retain one owned outcome for repeated references while
+        // returning an independently owned value to the JSON part.
         self.cache.insert(key, resolution.clone());
         resolution
     }
@@ -257,6 +297,33 @@ fn overall_timeout_error(file_id: &str) -> Result<ResolvedFile, ResolveError> {
         file_id: file_id.to_owned(),
         detail: "overall file resolution deadline exceeded".to_owned(),
     })
+}
+
+/// Dispatch one reference to the appropriate resolver backend.
+#[expect(clippy::too_many_arguments, reason = "Task 4 will refactor this")]
+async fn dispatch_resolution(
+    source: &ReferenceSource,
+    client: &FilesApiClient,
+    request_headers: &http::HeaderMap,
+    max_resolved_bytes: usize,
+    part_type: &str,
+    deadline: tokio::time::Instant,
+) -> Result<ResolvedFile, ResolveError> {
+    match source {
+        ReferenceSource::FileId(file_id) => tokio::time::timeout_at(
+            deadline,
+            client.resolve_file(file_id, request_headers, max_resolved_bytes, part_type),
+        )
+        .await
+        .unwrap_or_else(|_elapsed| overall_timeout_error(file_id)),
+        ReferenceSource::FileUrl(_url) => {
+            // Placeholder until Task 3 wires the real FileUrlResolver.
+            Err(ResolveError::CalloutFailed {
+                file_id: "<file_url>".to_owned(),
+                detail: "file_url resolution not yet implemented".to_owned(),
+            })
+        },
+    }
 }
 
 impl FilesApiClient {
@@ -465,6 +532,7 @@ pub(crate) async fn resolve_items(
         client,
         on_missing,
         request_headers,
+        url_resolver: None,
     };
 
     for item in items.iter_mut() {
@@ -545,7 +613,7 @@ async fn resolve_reference(
         .budget
         .resolve(ResolutionRequest {
             client: resolver.client,
-            file_id,
+            source: ReferenceSource::FileId(file_id.to_owned()),
             max_resolved_bytes: remaining_resolved_bytes,
             part_type,
             request_headers: resolver.request_headers,
@@ -1040,7 +1108,10 @@ mod tests {
         let client = test_client_with_limits("http://files-api:8321", 8, 1_000);
         let mut budget = client.resolution_budget();
         budget.cache.insert(
-            ("input_file".to_owned(), "file-cached".to_owned()),
+            (
+                "input_file".to_owned(),
+                ReferenceSource::FileId("file-cached".to_owned()),
+            ),
             Ok(ResolvedFile {
                 base64: "ZGF0".to_owned(),
                 content_type: "text/plain".to_owned(),
@@ -1262,5 +1333,23 @@ mod tests {
             "test.txt",
             "filename should be populated from metadata when not provided by user"
         );
+    }
+
+    #[test]
+    fn reference_source_file_id_and_file_url_are_distinct_cache_keys() {
+        use std::collections::HashMap;
+
+        let mut cache = HashMap::new();
+        let key_id = ("input_file".to_owned(), ReferenceSource::FileId("abc".to_owned()));
+        let key_url = ("input_file".to_owned(), ReferenceSource::FileUrl("abc".to_owned()));
+        cache.insert(key_id.clone(), "from_id");
+        cache.insert(key_url.clone(), "from_url");
+
+        assert_eq!(cache[&key_id], "from_id", "FileId key should be distinct from FileUrl");
+        assert_eq!(
+            cache[&key_url], "from_url",
+            "FileUrl key should be distinct from FileId"
+        );
+        assert_eq!(cache.len(), 2, "two distinct keys should produce two entries");
     }
 }

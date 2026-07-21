@@ -45,6 +45,7 @@
 
 mod config;
 pub(crate) mod resolve;
+pub(crate) mod resolve_url;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -359,6 +360,10 @@ fn rewrite_body(
 /// `messages` / `persisted_messages` with the resolved items.
 /// History messages prepended by rehydrate are also walked so
 /// that any `file_id` references in them are resolved.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "ResolveError enum size increased by file_url variants"
+)]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: &serde_json::Value,
@@ -515,6 +520,8 @@ fn resolve_error_response(err: &ResolveError) -> (u16, String) {
         ResolveError::InvalidFileId { file_id, detail } => invalid_id_error_response(file_id, detail),
         ResolveError::TooManyReferences { limit } => too_many_error_response(*limit),
         ResolveError::TooLarge { file_id, limit } => too_large_error_response(file_id, *limit),
+        ResolveError::FileUrlBlocked { label } => file_url_blocked_response(label),
+        ResolveError::FileUrlFailed { label, detail } => file_url_failed_response(label, detail),
     }
 }
 
@@ -546,6 +553,18 @@ fn too_large_error_response(file_id: &str, limit: usize) -> (u16, String) {
         413,
         format!("failed to resolve file '{file_id}': resolved content exceeds {limit} bytes"),
     )
+}
+
+/// Report a file URL blocked by SSRF policy to the caller.
+fn file_url_blocked_response(label: &str) -> (u16, String) {
+    warn!(url = %label, "file URL blocked by security policy");
+    (403, format!("file URL '{label}' blocked by security policy"))
+}
+
+/// Report a file URL fetch failure to the caller.
+fn file_url_failed_response(label: &str, detail: &str) -> (u16, String) {
+    warn!(url = %label, detail, "file URL fetch failed");
+    (502, format!("failed to fetch file URL '{label}': request failed"))
 }
 
 /// Build a rejection response from a resolution error.

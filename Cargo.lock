@@ -2920,6 +2920,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "yaml_serde",
  "zeroize",
 ]
