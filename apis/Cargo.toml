@@ -37,6 +37,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
+tiktoken-rs = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "net"] }
 tracing = { workspace = true }
 zeroize = { workspace = true }

@@ -9,6 +9,7 @@ pub use test_utils::load_example_config;
 
 mod agentic_routing;
 mod anthropic_messages;
+mod compact;
 mod credential_injection;
 mod full_flow;
 mod mcp_broker;

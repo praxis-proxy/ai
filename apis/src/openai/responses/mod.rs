@@ -18,6 +18,7 @@
 //! to validate parameter combinations and extract additional fields.
 
 mod config;
+pub(crate) mod config_validation;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
@@ -462,10 +463,12 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
     }
 }
 
+pub(crate) mod compact;
 pub(crate) mod rehydrate;
 pub(crate) mod validate;
 pub(crate) mod web_search;
 
+pub use compact::CompactFilter;
 pub use rehydrate::RehydrateFilter;
 pub use validate::OpenaiResponsesValidateFilter;
 pub use web_search::WebSearchFilter;
