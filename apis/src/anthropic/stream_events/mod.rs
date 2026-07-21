@@ -8,6 +8,8 @@
 
 mod config;
 
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -402,18 +404,36 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Process a single SSE event block (lines between double-newlines).
 ///
-/// Accepts both `data: value` and `data:value` per the SSE
-/// specification (the space after the colon is optional).
+/// Collects all `data` fields into one newline-delimited payload before
+/// processing it. Accepts bare `data`, `data: value`, and `data:value`
+/// per the SSE specification.
 fn process_event_block(ctx: &mut HttpFilterContext<'_>, block: &str, output: &mut Vec<u8>) {
+    let mut event_data = None::<Cow<'_, str>>;
+
     for line in block.lines() {
-        let data = line.strip_prefix("data:").map(|d| d.strip_prefix(' ').unwrap_or(d));
+        let data = if line == "data" {
+            Some("")
+        } else {
+            line.strip_prefix("data:").map(|d| d.strip_prefix(' ').unwrap_or(d))
+        };
 
         if let Some(data) = data {
-            if data == OPENAI_DONE_SENTINEL {
-                emit_done(ctx, output);
-            } else if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                transform_chunk(ctx, &chunk, output);
+            match &mut event_data {
+                Some(event_data) => {
+                    let event_data = event_data.to_mut();
+                    event_data.push('\n');
+                    event_data.push_str(data);
+                },
+                None => event_data = Some(Cow::Borrowed(data)),
             }
+        }
+    }
+
+    if let Some(data) = event_data {
+        if data == OPENAI_DONE_SENTINEL {
+            emit_done(ctx, output);
+        } else if let Ok(chunk) = serde_json::from_str::<Value>(&data) {
+            transform_chunk(ctx, &chunk, output);
         }
     }
 }
@@ -1490,6 +1510,23 @@ mod tests {
     }
 
     #[test]
+    fn multiline_data_fields_are_joined_before_json_parsing() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\n\
+                     data: \"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        assert!(
+            out.contains("text_delta"),
+            "multi-line SSE data should be parsed as one JSON payload"
+        );
+        assert!(out.contains("Hi"), "joined JSON content should be transformed");
+    }
+
+    #[test]
     fn done_sentinel_without_space_after_colon() {
         let (filter, mut ctx) = make_filter_and_context();
 
@@ -1505,6 +1542,25 @@ mod tests {
         assert!(
             out.contains("message_stop"),
             "DONE without space should complete stream"
+        );
+    }
+
+    #[test]
+    fn bare_data_field_participates_in_event_payload() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let done = "data\ndata: [DONE]\n\n";
+        let mut body2 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        assert!(
+            !out.contains("message_stop"),
+            "a preceding empty data field should prevent DONE sentinel recognition"
         );
     }
 

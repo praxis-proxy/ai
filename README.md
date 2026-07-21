@@ -12,7 +12,7 @@ AI features and capabilities for [Praxis](https://github.com/praxis-proxy/praxis
 [Issues] and [pull requests] are welcome. Familiarize yourself
 with the following documentation first:
 
-- [Conventions](docs/developing/conventions.md)
+- [Contributing](CONTRIBUTING.md)
 - [Development](docs/developing/getting-started.md)
 
 For larger changes, open a [discussion] and follow the [proposal process](docs/proposals.md).

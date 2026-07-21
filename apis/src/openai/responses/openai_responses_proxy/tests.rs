@@ -96,6 +96,71 @@ async fn passthrough_without_state() {
 }
 
 #[tokio::test]
+async fn initialized_state_preserves_scalar_input_on_first_pass() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request_body = json!({"model":"gpt-4.1","input":"hello"});
+    ctx.extensions.insert(ResponsesState::from_request_body(request_body));
+    let original = br#"{
+  "model": "gpt-4.1",
+  "input": "hello"
+}"#;
+    let mut body = Some(Bytes::copy_from_slice(original));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert!(
+        ctx.extra_request_headers.is_empty(),
+        "byte-exact first-pass forwarding must not synthesize content-length"
+    );
+}
+
+#[tokio::test]
+async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original = br#"{
+  "model": "gpt-4.1",
+  "input": "continue",
+  "previous_response_id": "resp_provider"
+}"#;
+    let parsed = serde_json::from_slice(original).unwrap();
+    ctx.extensions.insert(ResponsesState::from_request_body(parsed));
+    let mut body = Some(Bytes::copy_from_slice(original));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body.as_deref(), Some(original.as_slice()));
+    assert!(ctx.extra_request_headers.is_empty());
+}
+
+#[tokio::test]
+async fn rebuild_serializes_from_state_request_body() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original = json!({"model":"client-model","input":"hello"});
+    let mut state = ResponsesState::from_request_body(original);
+    state
+        .messages
+        .splice(0..0, [json!({"type":"message","role":"assistant","content":"history"})]);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(br#"{"model":"client-model","input":"hello"}"#.as_slice()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["model"], "client-model", "serializes from state.request_body");
+    assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn not_end_of_stream_continues() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
@@ -122,6 +187,7 @@ async fn rebuilds_body_with_conversation_history() {
     });
 
     let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
     let stored_history = vec![
         json!({"role": "user", "content": "Hello"}),
         json!({"role": "assistant", "content": "Hi there!"}),
@@ -167,6 +233,7 @@ async fn updates_content_length_header() {
         "previous_response_id": "resp_abc123"
     });
     let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
     state
         .messages
         .splice(0..0, vec![json!({"role": "user", "content": "stored"})]);
@@ -213,6 +280,7 @@ async fn preserves_other_request_fields() {
         "previous_response_id": "resp_abc123"
     });
     let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
     state
         .messages
         .splice(0..0, vec![json!({"role": "user", "content": "stored"})]);
@@ -269,7 +337,8 @@ async fn strips_conversation_from_outbound_body() {
         "input": "hello",
         "conversation": {"id": "conv_abc123"}
     });
-    let state = ResponsesState::from_request_body(request_body);
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
     ctx.extensions.insert(state);
 
     let mut body = Some(Bytes::from(
@@ -299,6 +368,7 @@ async fn strips_both_previous_response_id_and_conversation() {
         "conversation": "conv_xyz789"
     });
     let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
     state
         .messages
         .splice(0..0, vec![json!({"role": "user", "content": "stored"})]);

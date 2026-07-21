@@ -81,9 +81,9 @@ pipeline, registry; `praxis-core` for config types;
 
 Follows the same conventions as
 [praxis core](https://github.com/praxis-proxy/praxis).
-See `docs/developing/conventions.md` for the full
-coding style guide, including the
-[PR review process](docs/developing/conventions.md#pr-review-process)
+See `CONTRIBUTING.md` for the full coding style guide,
+including the
+[PR review process](CONTRIBUTING.md#pr-review-process)
 for handling `praxis-bot` automated review comments.
 
 ## Git Workflow

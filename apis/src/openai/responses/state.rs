@@ -45,6 +45,12 @@ pub(crate) struct ResponsesState {
     /// optional sections to populate.
     pub include: Vec<String>,
 
+    /// Whether stored history was successfully resolved into this state.
+    ///
+    /// The proxy uses this to distinguish locally consumed history identifiers
+    /// from provider-owned identifiers that must pass through unchanged.
+    pub history_rehydrated: bool,
+
     /// The current request's input items, immutable after construction.
     ///
     /// Preserved as-is so downstream filters can inspect what the
@@ -136,6 +142,7 @@ impl Default for ResponsesState {
             context_management: None,
             conversation: None,
             include: Vec::new(),
+            history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
             max_tool_calls: None,
