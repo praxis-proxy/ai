@@ -1,11 +1,10 @@
 ---
 issue: https://github.com/praxis-proxy/ai/issues/353
-discussion: # XXX
 status: proposed
 authors:
   - mkoushni
 graduation_criteria:
-  - Task-route capture work is O(n) in total response body bytes, not O(n²)
+  - Task-route capture work is O(n) in total response body bytes, not O(n·k) / O(n²) under fine-grained chunking
   - Opportunistic pre-EOS capture behavior is unchanged (route still captured as soon as the JSON body is complete, without waiting for `end_of_stream`)
   - No full-buffer hex-decode or `serde_json::from_slice` attempt on a buffer known to hold incomplete JSON
   - Existing A2A response-body unit test coverage passes unmodified
@@ -19,8 +18,7 @@ stakeholders:
 ## What?
 
 Bound the per-chunk cost of non-streaming A2A task-route capture so
-that total work across a response body is O(n) in body bytes rather
-than O(n²) in the number of chunks.
+that total work across a response body is O(n) in body bytes rather than O(n·k) for body size n and chunk count k (O(n²) when chunks are O(1) bytes).
 
 `try_capture_from_buffer` in `filters/src/agentic/a2a/mod.rs` runs on
 every `on_response_body` invocation while capture is enabled. Each
@@ -29,7 +27,7 @@ call hex-decodes the *entire* accumulated buffer and attempts a full
 the JSON is incomplete. Because the buffer grows on every chunk and
 this decode-and-parse attempt repeats on every chunk, total work is
 proportional to the sum of accumulated buffer sizes across all
-chunks — quadratic in the number of chunks for a fixed body size.
+chunks — Θ(n·k): each of the k chunks re-processes the growing prefix; for fixed n that is linear in k, and Θ(n²) when k scales with n (e.g. 1-byte chunks).
 
 ### Goals
 
@@ -78,8 +76,7 @@ requirement is legitimate and already has test coverage.
 The problem is *how* completeness is currently checked: by repeating
 the full parse attempt, from scratch, over the entire buffer, on
 every chunk. For a response delivered in `k` chunks over `n` total
-bytes, this produces work proportional to `1 + 2 + ... + n`, i.e.
-O(n²), because each of the `k` attempts re-decodes and re-parses
+bytes, this produces work proportional to the sum of prefix lengths ≈ n(k+1)/2 = Θ(n·k); with unit-sized chunks (k ≈ n) that is Θ(n²), because each of the `k` attempts re-decodes and re-parses
 everything accumulated so far rather than only the newly arrived
 bytes.
 
