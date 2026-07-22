@@ -97,7 +97,7 @@ use crate::{
 ///
 /// ```yaml
 /// filter: openai_file_resolve
-/// files_api_url: "http://ogx:8321"
+/// files_api_url: "http://files-api:8321"
 /// allow_private_files_api_url: true
 /// allow_pre_security_callout: true
 /// ```
@@ -106,7 +106,7 @@ use crate::{
 ///
 /// ```yaml
 /// filter: openai_file_resolve
-/// files_api_url: "http://ogx:8321"
+/// files_api_url: "http://files-api:8321"
 /// allow_private_files_api_url: true
 /// allow_pre_security_callout: true
 /// forward_headers:

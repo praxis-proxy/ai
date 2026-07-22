@@ -17,7 +17,7 @@
 # Client-facing Files API requests under /v1/files are routed
 # directly to the same Files API service. The router uses
 # segment-boundary prefix matching, so /v1/files and all of its
-# subresources go to OGX while paths such as /v1/filesystem do not.
+# subresources go to the Files API while paths such as /v1/filesystem do not.
 #
 # This filter resolves the file transport reference only. The
 # inference backend must support inline `input_file` / `file_data`
@@ -58,7 +58,7 @@ filter_chains:
       - filter: router
         routes:
           - path_prefix: "/v1/files"
-            cluster: "ogx-files-api"
+            cluster: "files-api"
           - path: "/v1/responses"
             cluster: "inference-backend"
           - path_prefix: "/"
@@ -66,7 +66,7 @@ filter_chains:
 
       - filter: load_balancer
         clusters:
-          - name: "ogx-files-api"
+          - name: "files-api"
             endpoints:
               - "127.0.0.1:9999"
           - name: "inference-backend"

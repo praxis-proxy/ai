@@ -254,8 +254,8 @@ fn example_config_non_responses_traffic_passes_through() {
 }
 
 #[test]
-fn example_config_routes_files_api_paths_to_ogx() {
-    let ogx_guard = start_backend_with_shutdown("ogx-files-api");
+fn example_config_routes_files_api_paths_to_files_backend() {
+    let files_guard = start_backend_with_shutdown("files-api");
     let inference_guard = start_backend_with_shutdown("inference-backend");
     let default_guard = start_backend_with_shutdown("default-backend");
     let proxy_port = free_port();
@@ -264,7 +264,7 @@ fn example_config_routes_files_api_paths_to_ogx() {
         "openai/responses/file-resolve.yaml",
         proxy_port,
         HashMap::from([
-            ("127.0.0.1:9999", ogx_guard.port()),
+            ("127.0.0.1:9999", files_guard.port()),
             ("127.0.0.1:3001", inference_guard.port()),
             ("127.0.0.1:3002", default_guard.port()),
         ]),
@@ -292,14 +292,14 @@ fn example_config_routes_files_api_paths_to_ogx() {
     assert_eq!(parse_status(&upload_raw), 200, "Files API root should be proxied");
     assert_eq!(
         parse_body(&upload_raw),
-        "ogx-files-api",
-        "POST /v1/files should route to OGX"
+        "files-api",
+        "POST /v1/files should route to Files API backend"
     );
     let (content_status, content_body) = http_get(proxy.addr(), "/v1/files/file-123/content", None);
     assert_eq!(content_status, 200, "Files API subresource should be proxied");
     assert_eq!(
-        content_body, "ogx-files-api",
-        "Files API subresources should route to OGX"
+        content_body, "files-api",
+        "Files API subresources should route to Files API backend"
     );
 
     let (non_files_status, non_files_body) = http_get(proxy.addr(), "/v1/filesystem", None);

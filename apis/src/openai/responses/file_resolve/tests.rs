@@ -24,7 +24,7 @@ use crate::openai::{
 #[test]
 fn from_config_with_valid_url_succeeds() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "files_api_url: \"http://ogx:8321\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true",
+        "files_api_url: \"http://files-api:8321\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true",
     )
     .unwrap();
     let filter = FileResolveFilter::from_config(&yaml).unwrap();
@@ -48,7 +48,7 @@ fn from_config_empty_url_rejected() {
 #[test]
 fn from_config_unknown_field_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "files_api_url: \"http://ogx:8321\"\nallow_private_files_api_url: true\non_mising: reject",
+        "files_api_url: \"http://files-api:8321\"\nallow_private_files_api_url: true\non_mising: reject",
     )
     .unwrap();
     let result = FileResolveFilter::from_config(&yaml);
@@ -584,7 +584,7 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
 #[tokio::test]
 async fn rejects_unresolvable_history_when_configured_to_reject() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "files_api_url: \"http://ogx:8321\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\non_missing: reject",
+        "files_api_url: \"http://files-api:8321\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\non_missing: reject",
     )
     .unwrap();
     let filter = FileResolveFilter::from_config(&yaml).unwrap();
@@ -641,7 +641,7 @@ async fn sync_state_skipped_without_responses_state() {
 // -----------------------------------------------------------------------------
 
 fn make_filter() -> Box<dyn HttpFilter> {
-    make_filter_for_url("http://ogx:8321")
+    make_filter_for_url("http://files-api:8321")
 }
 
 fn make_filter_for_url(files_api_url: &str) -> Box<dyn HttpFilter> {

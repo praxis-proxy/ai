@@ -913,7 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_input_accepts_message_shorthand_without_type() {
-        let client = test_client("http://ogx:8321");
+        let client = test_client("http://files-api:8321");
         let mut body = serde_json::json!({
             "input": [{
                 "role": "user",
@@ -932,7 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_input_walks_function_call_output_arrays() {
-        let client = test_client("http://ogx:8321");
+        let client = test_client("http://files-api:8321");
         let mut body = serde_json::json!({
             "input": [{
                 "type": "function_call_output",
@@ -953,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn continue_policy_preserves_unresolvable_reference() {
-        let client = test_client("http://ogx:8321");
+        let client = test_client("http://files-api:8321");
         let mut body = serde_json::json!({
             "input": [{
                 "type": "message",
@@ -976,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_reference_limit_is_enforced_in_continue_mode() {
-        let api = test_api_client("http://ogx:8321", 1_000);
+        let api = test_api_client("http://files-api:8321", 1_000);
         let mut client = FilesApiClient::new(
             api,
             FilesApiClientOptions {
@@ -1009,7 +1009,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_reference_reuses_cached_failure() {
-        let api = test_api_client("http://ogx:8321", 1_000);
+        let api = test_api_client("http://files-api:8321", 1_000);
         let client = FilesApiClient::new(
             api,
             FilesApiClientOptions {
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_successes_share_request_wide_byte_budget() {
-        let client = test_client_with_limits("http://ogx:8321", 8, 1_000);
+        let client = test_client_with_limits("http://files-api:8321", 8, 1_000);
         let mut budget = client.resolution_budget();
         budget.cache.insert(
             ("input_file".to_owned(), "file-cached".to_owned()),
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn inline_content_takes_precedence_over_file_id() {
-        let client = test_client("http://ogx:8321");
+        let client = test_client("http://files-api:8321");
 
         for (part_type, field, value) in [
             ("input_file", "file_data", "SGVsbG8="),
@@ -1113,7 +1113,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_input_skips_untyped_non_message_content() {
-        let client = test_client("http://ogx:8321");
+        let client = test_client("http://files-api:8321");
         let mut body = serde_json::json!({
             "input": [{
                 "content": [{"type": "input_file", "file_id": ".."}]
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_data_parts_pass_through_unchanged() {
-        let client = test_client("http://ogx:8321");
+        let client = test_client("http://files-api:8321");
         let mut body = serde_json::json!({
             "input": [{
                 "type": "message",
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_url_parts_pass_through_unchanged() {
-        let client = test_client("http://ogx:8321");
+        let client = test_client("http://files-api:8321");
         let mut body = serde_json::json!({
             "input": [{
                 "type": "message",
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_url_parts_pass_through_unchanged() {
-        let client = test_client("http://ogx:8321");
+        let client = test_client("http://files-api:8321");
         let mut body = serde_json::json!({
             "input": [{
                 "type": "message",

@@ -57,7 +57,7 @@ pub(crate) struct FileResolveConfig {
 
     /// Base URL of the Files API endpoint.
     ///
-    /// Example: `http://ogx:8321`
+    /// Example: `http://files-api:8321`
     pub files_api_url: String,
 
     /// Headers to forward from the original request to the
@@ -191,7 +191,7 @@ mod tests {
     use super::*;
 
     const MINIMAL_YAML: &str = r#"
-files_api_url: "http://ogx:8321"
+files_api_url: "http://files-api:8321"
 allow_private_files_api_url: true
 allow_pre_security_callout: true
 "#;
@@ -200,7 +200,10 @@ allow_pre_security_callout: true
     fn minimal_config_parses() {
         let cfg: FileResolveConfig = serde_yaml::from_str(MINIMAL_YAML).unwrap();
         let validated = validate_config(cfg).unwrap();
-        assert_eq!(validated.files_api_url, "http://ogx:8321", "files_api_url should match");
+        assert_eq!(
+            validated.files_api_url, "http://files-api:8321",
+            "files_api_url should match"
+        );
         assert_eq!(
             validated.max_body_bytes, MAX_JSON_BODY_BYTES,
             "max_body_bytes should default to 64 MiB"
@@ -258,7 +261,7 @@ timeout_ms: 10000
 
     #[test]
     fn deny_unknown_fields_rejects_typo() {
-        let yaml = r#"files_api_url: "http://ogx:8321"
+        let yaml = r#"files_api_url: "http://files-api:8321"
 on_mising: reject"#;
         let result: Result<FileResolveConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "typo in config field should be rejected");
@@ -274,7 +277,7 @@ on_mising: reject"#;
 
     #[test]
     fn trailing_slash_files_api_url_rejected() {
-        let yaml = r#"files_api_url: "http://ogx:8321/""#;
+        let yaml = r#"files_api_url: "http://files-api:8321/""#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         let result = validate_config(cfg);
         assert!(result.is_err(), "trailing slash should be rejected");
@@ -282,7 +285,7 @@ on_mising: reject"#;
 
     #[test]
     fn zero_max_body_bytes_rejected() {
-        let yaml = r#"files_api_url: "http://ogx:8321"
+        let yaml = r#"files_api_url: "http://files-api:8321"
 max_body_bytes: 0"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         let result = validate_config(cfg);
@@ -291,7 +294,7 @@ max_body_bytes: 0"#;
 
     #[test]
     fn zero_timeout_rejected() {
-        let yaml = r#"files_api_url: "http://ogx:8321"
+        let yaml = r#"files_api_url: "http://files-api:8321"
 timeout_ms: 0"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         let result = validate_config(cfg);
@@ -300,7 +303,7 @@ timeout_ms: 0"#;
 
     #[test]
     fn zero_max_file_references_rejected() {
-        let yaml = r#"files_api_url: "http://ogx:8321"
+        let yaml = r#"files_api_url: "http://files-api:8321"
 max_file_references: 0"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
 
@@ -312,7 +315,7 @@ max_file_references: 0"#;
 
     #[test]
     fn max_file_references_above_ceiling_rejected() {
-        let yaml = r#"files_api_url: "http://ogx:8321"
+        let yaml = r#"files_api_url: "http://files-api:8321"
 max_file_references: 129"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
 
@@ -324,7 +327,7 @@ max_file_references: 129"#;
 
     #[test]
     fn timeout_above_ceiling_rejected() {
-        let yaml = r#"files_api_url: "http://ogx:8321"
+        let yaml = r#"files_api_url: "http://files-api:8321"
 timeout_ms: 300001"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         let result = validate_config(cfg);
@@ -336,7 +339,7 @@ timeout_ms: 300001"#;
         let cfg = FileResolveConfig {
             allow_private_files_api_url: true,
             allow_pre_security_callout: true,
-            files_api_url: "http://ogx:8321".to_owned(),
+            files_api_url: "http://files-api:8321".to_owned(),
             forward_headers: Vec::new(),
             max_body_bytes: MAX_JSON_BODY_BYTES,
             max_file_references: DEFAULT_MAX_FILE_REFERENCES,
@@ -349,7 +352,7 @@ timeout_ms: 300001"#;
     #[test]
     fn forward_headers_are_normalized() {
         let yaml = r#"
-files_api_url: "http://ogx:8321"
+files_api_url: "http://files-api:8321"
 allow_private_files_api_url: true
 allow_pre_security_callout: true
 forward_headers:
@@ -369,7 +372,7 @@ forward_headers:
     #[test]
     fn invalid_forward_header_rejected() {
         let yaml = r#"
-files_api_url: "http://ogx:8321"
+files_api_url: "http://files-api:8321"
 allow_private_files_api_url: true
 forward_headers: ["bad header"]
 "#;
@@ -391,7 +394,7 @@ forward_headers: ["bad header"]
             "x-praxis-route",
         ] {
             let yaml = format!(
-                "files_api_url: \"http://ogx:8321\"\nallow_private_files_api_url: true\nforward_headers: [\"{name}\"]"
+                "files_api_url: \"http://files-api:8321\"\nallow_private_files_api_url: true\nforward_headers: [\"{name}\"]"
             );
             let cfg: FileResolveConfig = serde_yaml::from_str(&yaml).unwrap();
 
@@ -405,7 +408,7 @@ forward_headers: ["bad header"]
     #[test]
     fn duplicate_forward_headers_rejected_case_insensitively() {
         let yaml = r#"
-files_api_url: "http://ogx:8321"
+files_api_url: "http://files-api:8321"
 allow_private_files_api_url: true
 forward_headers: ["Authorization", "authorization"]
 "#;
@@ -420,7 +423,7 @@ forward_headers: ["Authorization", "authorization"]
     #[test]
     fn pre_security_callout_requires_explicit_opt_in() {
         let yaml = r#"
-files_api_url: "http://ogx:8321"
+files_api_url: "http://files-api:8321"
 allow_private_files_api_url: true
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
@@ -468,7 +471,7 @@ allow_pre_security_callout: true
 
     #[test]
     fn ssrf_rejects_non_http_scheme() {
-        let yaml = r#"files_api_url: "ftp://ogx:8321""#;
+        let yaml = r#"files_api_url: "ftp://files-api:8321""#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(validate_config(cfg).is_err(), "non-http scheme should be rejected");
     }
@@ -476,7 +479,7 @@ allow_pre_security_callout: true
     #[test]
     fn files_api_url_rejects_embedded_credentials() {
         let yaml = r#"
-files_api_url: "http://user:password@ogx:8321"
+files_api_url: "http://user:password@files-api:8321"
 allow_private_files_api_url: true
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
@@ -489,7 +492,7 @@ allow_private_files_api_url: true
     #[test]
     fn files_api_url_rejects_query_string() {
         let yaml = r#"
-files_api_url: "http://ogx:8321/base?tenant=abc"
+files_api_url: "http://files-api:8321/base?tenant=abc"
 allow_private_files_api_url: true
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
@@ -502,7 +505,7 @@ allow_private_files_api_url: true
     #[test]
     fn files_api_url_rejects_fragment() {
         let yaml = r#"
-files_api_url: "http://ogx:8321/base#v2"
+files_api_url: "http://files-api:8321/base#v2"
 allow_private_files_api_url: true
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
