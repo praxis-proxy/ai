@@ -127,6 +127,34 @@
 # Configured downstream read and upstream idle/read/write timeouts remain
 # active after a 101 upgrade and can terminate long-lived WebSockets.
 #
+# Direct OpenAI upstream variant:
+#   - Replace the local inference-backend endpoint with api.openai.com:443 and
+#     configure tls.sni: api.openai.com.
+#   - Add this headers filter after the router to replace the downstream Host:
+#
+#       - filter: headers
+#         request_set:
+#           - name: Host
+#             value: api.openai.com
+#
+#   - Either pass through the client's Authorization header or add this filter
+#     after the router to inject a server-owned credential:
+#
+#       - filter: credential_injection
+#         clusters:
+#           - name: inference-backend
+#             header: Authorization
+#             env_var: OPENAI_API_KEY
+#             header_prefix: "Bearer "
+#
+#   - Configure the inference cluster as:
+#
+#       - name: "inference-backend"
+#         endpoints:
+#           - "api.openai.com:443"
+#         tls:
+#           sni: api.openai.com
+#
 # Build:
 #   cargo build -p praxis-ai-proxy
 
