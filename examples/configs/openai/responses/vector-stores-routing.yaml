@@ -1,0 +1,59 @@
+# Vector Stores API Routing
+#
+# Routes /v1/vector_stores traffic and all its subresources to a
+# dedicated backend (any server compatible with the OpenAI Files /
+# Vector Stores API), while sending everything else to a default
+# backend.
+#
+# The `path_prefix` match uses Gateway API segment-boundary semantics:
+#   /v1/vector_stores      → vector-stores-backend  (exact)
+#   /v1/vector_stores/     → vector-stores-backend  (trailing slash)
+#   /v1/vector_stores/vs_1 → vector-stores-backend  (resource by ID)
+#   /v1/vector_stores/vs_1/files       → vector-stores-backend  (nested)
+#   /v1/vector_stores/vs_1/file_batches → vector-stores-backend  (nested)
+#   /v1/vector_stores_extra            → default-backend (different segment)
+#
+# No AI-specific filters are needed — only the standard router and
+# load_balancer from praxis core.
+#
+# Example requests:
+#
+#   # List vector stores → vector-stores-backend
+#   curl http://localhost:8080/v1/vector_stores
+#
+#   # Get a vector store → vector-stores-backend
+#   curl http://localhost:8080/v1/vector_stores/vs_abc
+#
+#   # Create a vector store file → vector-stores-backend
+#   curl -X POST http://localhost:8080/v1/vector_stores/vs_abc/files \
+#     -H "Content-Type: application/json" \
+#     -d '{"file_id":"file-abc"}'
+#
+#   # Unrelated path → default-backend
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello"}'
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [vector-stores-routing]
+
+filter_chains:
+  - name: vector-stores-routing
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/v1/vector_stores"
+            cluster: "vector-stores-backend"
+          - path_prefix: "/"
+            cluster: "default-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "vector-stores-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "default-backend"
+            endpoints:
+              - "127.0.0.1:3002"
