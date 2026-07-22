@@ -58,6 +58,10 @@ fn register_general_ai_filters(registry: &mut praxis_filter::FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "http_callout" => praxis_ai_filters::HttpCalloutFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "model_to_header" => praxis_ai_filters::ModelToHeaderFilter::from_config
     );
     praxis_filter::register_filters!(

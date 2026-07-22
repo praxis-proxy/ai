@@ -10,6 +10,7 @@
 //! header injection.
 
 pub mod agentic;
+pub mod callout;
 pub mod guardrails;
 pub mod inference;
 pub mod prompt_enrich;
@@ -17,6 +18,7 @@ mod token_count;
 mod token_usage_headers;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
+pub use callout::HttpCalloutFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
