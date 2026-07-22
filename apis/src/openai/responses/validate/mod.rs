@@ -33,7 +33,7 @@ use praxis_filter::{
 use tracing::{debug, trace};
 
 use self::rules::validate_request;
-use super::error::responses_error_rejection;
+use super::{error::responses_error_rejection, state::ResponsesState};
 use crate::is_event_stream_content_type;
 
 // -----------------------------------------------------------------------------
@@ -138,10 +138,12 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         let conversation_id = resolve_conversation_id(ctx, &parsed);
 
         enrich_context(ctx, &response_id, &conversation_id);
+        let initializes_state = initialize_file_search_state(ctx, parsed);
 
         debug!(
             response_id = %response_id,
             conversation_id = %conversation_id,
+            initializes_state,
             "request validated"
         );
 
@@ -160,6 +162,27 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
     ) -> Result<FilterAction, FilterError> {
         Ok(reformat_error_body(ctx, body, end_of_stream))
     }
+}
+
+/// Initialize response state only for requests that need hosted file search.
+fn initialize_file_search_state(ctx: &mut HttpFilterContext<'_>, body: serde_json::Value) -> bool {
+    if !declares_file_search(&body) {
+        return false;
+    }
+    ctx.extensions
+        .insert(ResponsesState::from_file_search_request_body(body));
+    true
+}
+
+/// Return whether a request needs first-pass state for hosted file search.
+fn declares_file_search(body: &serde_json::Value) -> bool {
+    body.get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("file_search"))
+        })
 }
 
 // -----------------------------------------------------------------------------
@@ -627,6 +650,142 @@ mod tests {
             ctx.filter_metadata.get("responses.stream").map(String::as_str),
             Some("false"),
             "stream should default to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_create_defers_file_search_history_for_both_response_modes() {
+        let body = serde_json::json!({
+            "model": "gpt-4.1",
+            "input": [{"type": "message", "role": "user", "content": "search"}],
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        });
+        let body_text = serde_json::to_string(&body).unwrap();
+
+        for stream in ["false", "true"] {
+            let ctx = run_filter(&body_text, &[("openai_responses_format.stream", stream)]).await;
+            let state = ctx
+                .extensions
+                .get::<ResponsesState>()
+                .expect("valid create request should initialize ResponsesState");
+
+            assert!(
+                state.has_deferred_history(),
+                "first-pass history should remain deferred"
+            );
+            assert!(state.request_body.get("input").is_none());
+            assert!(state.request_body.get("tools").is_none());
+            assert!(state.input.is_empty());
+            assert!(state.messages.is_empty());
+            assert!(state.persisted_messages.is_empty());
+            assert_eq!(state.tools, body["tools"].as_array().unwrap().clone());
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks move ownership for both history identifiers"
+    )]
+    async fn file_search_history_requests_remain_move_owned_until_rehydrate() {
+        let large_content = "x".repeat(1_000_000);
+        for history_field in [
+            ("previous_response_id", serde_json::json!("resp_previous")),
+            ("conversation", serde_json::json!({"id": "conv_existing"})),
+        ] {
+            let mut request = serde_json::json!({
+                "model": "gpt-4.1",
+                "input": [{"type": "message", "role": "user", "content": &large_content}],
+                "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
+            });
+            request
+                .as_object_mut()
+                .unwrap()
+                .insert(history_field.0.to_owned(), history_field.1);
+            let ctx = run_filter(&serde_json::to_string(&request).unwrap(), &[]).await;
+            let state = ctx.extensions.get::<ResponsesState>().unwrap();
+
+            assert!(state.has_deferred_history());
+            assert!(state.request_body.get("input").is_none());
+            assert!(state.request_body.get("tools").is_none());
+            assert!(state.request_body.get(history_field.0).is_none());
+            assert_eq!(
+                state
+                    .deferred_input
+                    .as_ref()
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("content"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::len),
+                Some(large_content.len())
+            );
+            assert!(state.input.is_empty());
+            assert!(state.messages.is_empty());
+            assert!(state.persisted_messages.is_empty());
+            assert_eq!(state.tools, request["tools"].as_array().unwrap().clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn null_history_fields_do_not_materialize_file_search_history() {
+        let request = serde_json::json!({
+            "model": "gpt-4.1",
+            "input": [{"type": "message", "role": "user", "content": "search"}],
+            "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+            "previous_response_id": null,
+            "conversation": null
+        });
+        let body_text = serde_json::to_string(&request).unwrap();
+        let ctx = run_filter(&body_text, &[]).await;
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+
+        assert!(state.has_deferred_history());
+        assert!(state.messages.is_empty());
+        assert!(state.persisted_messages.is_empty());
+        assert!(state.request_body["previous_response_id"].is_null());
+        assert!(state.request_body.get("conversation").is_none());
+        assert_eq!(state.conversation, Some(serde_json::Value::Null));
+    }
+
+    #[tokio::test]
+    async fn empty_or_oversized_history_ids_keep_file_search_history_deferred() {
+        let oversized = "x".repeat(513);
+        for (field, value) in [
+            ("previous_response_id", serde_json::json!("")),
+            ("previous_response_id", serde_json::json!(&oversized)),
+            ("conversation", serde_json::json!("")),
+            ("conversation", serde_json::json!({"id": &oversized})),
+        ] {
+            let mut request = serde_json::json!({
+                "model": "gpt-4.1",
+                "input": [{"type": "message", "role": "user", "content": "search"}],
+                "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+            });
+            request.as_object_mut().unwrap().insert(field.to_owned(), value);
+
+            let ctx = run_filter(&serde_json::to_string(&request).unwrap(), &[]).await;
+            let state = ctx.extensions.get::<ResponsesState>().unwrap();
+
+            assert!(
+                state.has_deferred_history(),
+                "invalid {field} must not force full history"
+            );
+            assert!(state.messages.is_empty());
+            assert!(state.persisted_messages.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_create_does_not_retain_duplicate_request_state() {
+        let ctx = run_filter(
+            r#"{"model":"gpt-4.1","input":"hello"}"#,
+            &[("openai_responses_format.stream", "false")],
+        )
+        .await;
+
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "stateless requests should not duplicate the parsed request"
         );
     }
 

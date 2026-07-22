@@ -107,10 +107,18 @@ impl ResponsesProxyFilter {
     /// Serialize the rebuilt body from conversation state.
     fn serialize_body(
         &self,
+        current_body: Option<&Bytes>,
         state: &ResponsesState,
         streaming: bool,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let serialized = serialize_outbound_body(state)
+        let current_body = current_body
+            .map(|bytes| serde_json::from_slice::<serde_json::Value>(bytes))
+            .transpose()
+            .map_err(|error| -> FilterError {
+                format!("openai_responses_proxy: invalid current body: {error}").into()
+            })?;
+        let source = current_body.as_ref().unwrap_or(&state.request_body);
+        let serialized = serialize_outbound_body(source, state)
             .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
         if serialized.len() > self.config.max_body_bytes {
             debug!(
@@ -183,7 +191,7 @@ impl HttpFilter for ResponsesProxyFilter {
             .get_metadata("openai_responses_format.stream")
             .is_some_and(|v| v == "true");
 
-        let serialized = match self.serialize_body(state, streaming)? {
+        let serialized = match self.serialize_body(body.as_ref(), state, streaming)? {
             Ok(bytes) => bytes,
             Err(action) => return Ok(action),
         };
@@ -224,53 +232,161 @@ fn strip_conversation_field(ctx: &mut HttpFilterContext<'_>, body: &mut Option<B
     }
 }
 
-/// Borrowed view of the outbound request body.
+/// Borrowed projection of the current request and response state.
 ///
-/// This keeps the original request and message history borrowed while
-/// replacing `input` and omitting locally consumed fields during
-/// serialization, avoiding full-body and message clones.
+/// Large request fields and replay messages remain borrowed during
+/// serialization. Only the exhausted continuation tool choice may require a
+/// small owned value.
 struct OutboundBody<'a> {
-    /// Shared request state to project into the provider body.
+    /// Current request body, including rewrites from earlier filters.
+    source: &'a serde_json::Value,
+    /// Shared Responses state.
     state: &'a ResponsesState,
+    /// Owned policy used only after exhausting the built-in tool budget.
+    exhausted_tool_choice: Option<serde_json::Value>,
+    /// Remaining provider-visible built-in tool allowance.
+    remaining_tool_calls: Option<u32>,
 }
 
+impl<'a> OutboundBody<'a> {
+    /// Build a borrowed outbound projection.
+    fn new(source: &'a serde_json::Value, state: &'a ResponsesState) -> Self {
+        let remaining_tool_calls = (state.iteration != 0)
+            .then(|| remaining_max_tool_calls(state))
+            .flatten();
+        let exhausted_tool_choice =
+            (remaining_tool_calls == Some(0)).then(|| exhausted_continuation_tool_choice(state));
+        Self {
+            source,
+            state,
+            exhausted_tool_choice,
+            remaining_tool_calls,
+        }
+    }
+
+    /// Resolve the provider-visible tool policy for this request.
+    fn tool_choice(&self) -> Option<&serde_json::Value> {
+        if self.state.iteration != 0 {
+            return self.exhausted_tool_choice.as_ref().or_else(|| {
+                self.state
+                    .continuation_tool_choice
+                    .as_ref()
+                    .or(Some(&self.state.tool_choice))
+            });
+        }
+        self.state.tool_choice_present.then_some(&self.state.tool_choice)
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "projects separately owned request fields without cloning"
+)]
 impl serde::Serialize for OutboundBody<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let Some(object) = self.state.request_body.as_object() else {
-            return self.state.request_body.serialize(serializer);
+        let Some(object) = self.source.as_object() else {
+            return self.source.serialize(serializer);
         };
 
         let mut map = serializer.serialize_map(None)?;
+        let mut wrote_context_management = false;
+        let mut wrote_include = false;
         let mut wrote_input = false;
+        let mut wrote_previous_response_id = false;
+        let mut wrote_tool_choice = false;
+        let mut wrote_tools = false;
+
         for (name, value) in object {
             match name.as_str() {
+                "conversation" => {},
+                "context_management" => {
+                    map.serialize_entry(name, value)?;
+                    wrote_context_management = true;
+                },
+                "include" => {
+                    map.serialize_entry(name, value)?;
+                    wrote_include = true;
+                },
                 "input" => {
-                    map.serialize_entry(name, &self.state.messages)?;
+                    if self.state.messages == self.state.input {
+                        map.serialize_entry(name, value)?;
+                    } else {
+                        map.serialize_entry(name, &self.state.messages)?;
+                    }
                     wrote_input = true;
                 },
-                "previous_response_id" | "conversation" => {},
+                "max_tool_calls" if self.state.iteration != 0 => {
+                    if let Some(remaining @ 1..) = self.remaining_tool_calls {
+                        map.serialize_entry(name, &remaining)?;
+                    }
+                },
+                "previous_response_id" if self.state.history_rehydrated => {},
+                "previous_response_id" => {
+                    map.serialize_entry(name, value)?;
+                    wrote_previous_response_id = true;
+                },
+                "tool_choice" if self.state.iteration != 0 => {
+                    if let Some(tool_choice) = self.tool_choice() {
+                        map.serialize_entry(name, tool_choice)?;
+                        wrote_tool_choice = true;
+                    }
+                },
+                "tool_choice" => {
+                    map.serialize_entry(name, value)?;
+                    wrote_tool_choice = true;
+                },
+                "tools" => {
+                    map.serialize_entry(name, value)?;
+                    wrote_tools = true;
+                },
                 _ => map.serialize_entry(name, value)?,
             }
         }
+
         if !wrote_input {
             map.serialize_entry("input", &self.state.messages)?;
         }
+        if !wrote_tools && !self.state.tools.is_empty() {
+            map.serialize_entry("tools", &self.state.tools)?;
+        }
+        if !wrote_context_management && let Some(context_management) = &self.state.context_management {
+            map.serialize_entry("context_management", context_management)?;
+        }
+        if !wrote_include && !self.state.include.is_empty() {
+            map.serialize_entry("include", &self.state.include)?;
+        }
+        if !wrote_previous_response_id
+            && !self.state.history_rehydrated
+            && let Some(previous_response_id) = &self.state.previous_response_id
+        {
+            map.serialize_entry("previous_response_id", previous_response_id)?;
+        }
+        if !wrote_tool_choice && let Some(tool_choice) = self.tool_choice() {
+            map.serialize_entry("tool_choice", tool_choice)?;
+        }
+        if self.state.iteration != 0
+            && object.get("max_tool_calls").is_none()
+            && let Some(remaining @ 1..) = self.remaining_tool_calls
+        {
+            map.serialize_entry("max_tool_calls", &remaining)?;
+        }
+
         map.end()
     }
 }
 
-/// Serialize the outbound body without cloning request state.
-fn serialize_outbound_body(state: &ResponsesState) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&OutboundBody { state })
+/// Serialize an outbound body without cloning request state or replay history.
+fn serialize_outbound_body(source: &serde_json::Value, state: &ResponsesState) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&OutboundBody::new(source, state))
 }
 
-/// Count the exact bytes the proxy will serialize for an outbound body.
+/// Count the exact bytes serialized from state-owned request data.
 pub(super) fn serialized_outbound_body_len(state: &ResponsesState) -> Result<usize, serde_json::Error> {
     let mut counter = ByteCounter::default();
-    serde_json::to_writer(&mut counter, &OutboundBody { state })?;
+    serde_json::to_writer(&mut counter, &OutboundBody::new(&state.request_body, state))?;
     Ok(counter.bytes)
 }
 
@@ -292,12 +408,107 @@ impl std::io::Write for ByteCounter {
     }
 }
 
+/// Restrict an exhausted built-in budget to eligible custom tool references.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preserves global, scoped, and forced custom choices"
+)]
+fn exhausted_continuation_tool_choice(state: &ResponsesState) -> serde_json::Value {
+    let current = state.continuation_tool_choice.as_ref().unwrap_or(&state.tool_choice);
+    let tools = match current {
+        serde_json::Value::String(mode) if mode == "auto" || mode == "required" => {
+            state.tools.iter().filter_map(custom_tool_choice_reference).collect()
+        },
+        serde_json::Value::Object(choice)
+            if choice.get("type").and_then(serde_json::Value::as_str) == Some("allowed_tools") =>
+        {
+            let allowed = choice
+                .get("allowed_tools")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or(choice);
+            allowed
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(custom_tool_choice_reference)
+                .collect()
+        },
+        serde_json::Value::Object(_) => custom_tool_choice_reference(current).into_iter().collect(),
+        _ => Vec::new(),
+    };
+    if tools.is_empty() {
+        serde_json::Value::String("none".to_owned())
+    } else {
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": tools,
+        })
+    }
+}
+
+/// Build the minimal allowed-tools reference for a custom function or MCP tool.
+fn custom_tool_choice_reference(tool: &serde_json::Value) -> Option<serde_json::Value> {
+    let tool = tool.as_object()?;
+    let tool_type = tool.get("type")?.as_str()?;
+    let mut reference = serde_json::Map::new();
+    reference.insert("type".to_owned(), serde_json::Value::String(tool_type.to_owned()));
+    match tool_type {
+        "function" | "custom" => {
+            let name = tool.get("name").filter(|name| name.is_string())?;
+            reference.insert("name".to_owned(), name.clone());
+        },
+        "mcp" => {
+            let server_label = tool.get("server_label").filter(|label| label.is_string())?;
+            reference.insert("server_label".to_owned(), server_label.clone());
+            if let Some(name) = tool.get("name").filter(|name| name.is_string()) {
+                reference.insert("name".to_owned(), name.clone());
+            }
+        },
+        _ => return None,
+    }
+    Some(serde_json::Value::Object(reference))
+}
+
 /// Return whether state requires parsing and rebuilding the outbound body.
 fn request_needs_rebuild(state: &ResponsesState) -> bool {
-    state.messages != state.input
+    state.iteration != 0
+        || state.messages != state.input
         || (state.history_rehydrated
             && (state.previous_response_id.is_some()
                 || state.conversation.is_some()
                 || state.request_body.get("previous_response_id").is_some()
                 || state.request_body.get("conversation").is_some()))
+}
+
+/// Derive the provider-visible allowance for an internal continuation.
+fn remaining_max_tool_calls(state: &ResponsesState) -> Option<u32> {
+    let max_tool_calls = state.max_tool_calls?;
+    let used_calls = state
+        .output_items()
+        .iter()
+        .filter(|item| is_builtin_tool_call(item))
+        .count();
+    let used_calls = u32::try_from(used_calls).unwrap_or(u32::MAX);
+    Some(max_tool_calls.saturating_sub(used_calls))
+}
+
+/// Return whether an output item consumes the built-in tool-call allowance.
+fn is_builtin_tool_call(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "apply_patch_call"
+                | "code_interpreter_call"
+                | "computer_call"
+                | "file_search_call"
+                | "image_generation_call"
+                | "local_shell_call"
+                | "multi_agent_call"
+                | "shell_call"
+                | "tool_search_call"
+                | "web_search_call"
+        )
+    )
 }

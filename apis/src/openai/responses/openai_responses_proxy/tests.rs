@@ -100,12 +100,37 @@ async fn initialized_state_preserves_scalar_input_on_first_pass() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    let request_body = json!({"model":"gpt-4.1","input":"hello"});
-    ctx.extensions.insert(ResponsesState::from_request_body(request_body));
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "keep this representation"
+    });
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["input"], "keep this representation",
+        "an unmodified first pass must preserve the client's scalar input"
+    );
+}
+
+#[tokio::test]
+async fn deferred_file_search_first_pass_preserves_body_bytes_without_rebuild() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
     let original = br#"{
   "model": "gpt-4.1",
-  "input": "hello"
+  "input": [{"type":"message", "role":"user", "content":"keep formatting"}],
+  "tools": [{"type":"file_search", "vector_store_ids":["vs_1"]}]
 }"#;
+    let parsed = serde_json::from_slice(original).unwrap();
+    ctx.extensions
+        .insert(ResponsesState::from_file_search_request_body(parsed));
     let mut body = Some(Bytes::copy_from_slice(original));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -116,6 +141,10 @@ async fn initialized_state_preserves_scalar_input_on_first_pass() {
         ctx.extra_request_headers.is_empty(),
         "byte-exact first-pass forwarding must not synthesize content-length"
     );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.has_deferred_history());
+    assert!(state.messages.is_empty());
+    assert!(state.persisted_messages.is_empty());
 }
 
 #[tokio::test]
@@ -126,6 +155,7 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
     let original = br#"{
   "model": "gpt-4.1",
   "input": "continue",
+  "tools": [{"type":"file_search", "vector_store_ids":["vs_1"]}],
   "previous_response_id": "resp_provider"
 }"#;
     let parsed = serde_json::from_slice(original).unwrap();
@@ -140,24 +170,72 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
 }
 
 #[tokio::test]
-async fn rebuild_serializes_from_state_request_body() {
+async fn previous_history_id_passes_through_when_rehydrate_did_not_run() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    let original = json!({"model":"client-model","input":"hello"});
-    let mut state = ResponsesState::from_request_body(original);
-    state
-        .messages
-        .splice(0..0, [json!({"type":"message","role":"assistant","content":"history"})]);
-    ctx.extensions.insert(state);
-    let mut body = Some(Bytes::from(br#"{"model":"client-model","input":"hello"}"#.as_slice()));
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "search",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "previous_response_id": null,
+        "conversation": null
+    });
+    ctx.extensions
+        .insert(ResponsesState::from_file_search_request_body(request.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert_eq!(outbound["model"], "client-model", "serializes from state.request_body");
-    assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
+    assert!(outbound["previous_response_id"].is_null());
+    assert!(outbound.get("conversation").is_none());
+    assert_eq!(outbound["input"], "search");
+    assert_eq!(outbound["tools"], request["tools"]);
+    assert_eq!(
+        ctx.extra_request_headers
+            .iter()
+            .find(|(name, _value)| name.as_ref() == "content-length")
+            .map(|(_name, value)| value.parse::<usize>().unwrap()),
+        body.as_ref().map(Bytes::len)
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().has_deferred_history());
+}
+
+#[tokio::test]
+async fn rebuild_uses_request_body_mutated_after_state_initialization() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original = json!({
+        "model": "client-model",
+        "input": "hello",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
+    });
+    let mut state = ResponsesState::from_request_body(original);
+    state.messages.splice(
+        0..0,
+        [json!({"type": "message", "role": "assistant", "content": "history"})],
+    );
+    ctx.extensions.insert(state);
+    let rewritten = json!({
+        "model": "backend-model",
+        "input": "hello",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&rewritten).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["model"], "backend-model", "later body rewrites must survive");
+    assert_eq!(
+        outbound["input"].as_array().unwrap().len(),
+        2,
+        "state history should still replace input"
+    );
 }
 
 #[tokio::test]
@@ -353,6 +431,10 @@ async fn strips_conversation_from_outbound_body() {
         "conversation should be stripped from outbound body"
     );
     assert_eq!(rebuilt["model"], "gpt-4o");
+    assert_eq!(
+        rebuilt["input"], "hello",
+        "stripping conversation must not normalize unchanged scalar input"
+    );
 }
 
 #[tokio::test]
@@ -472,6 +554,218 @@ async fn rebuild_non_object_request_body_passes_through() {
         rebuilt.is_array(),
         "non-object request_body should pass through without modification"
     );
+}
+
+#[tokio::test]
+async fn continuation_resets_forced_tool_choice_to_state_value() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model":"gpt-4o",
+        "input":"search",
+        "tool_choice":{"type":"file_search"}
+    }));
+    state.iteration = 1;
+    state.continuation_tool_choice = Some(json!("auto"));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"search","tool_choice":{"type":"file_search"}}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(rebuilt["tool_choice"], "auto");
+}
+
+#[tokio::test]
+async fn continuation_forwards_only_remaining_max_tool_calls_without_mutating_policy() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_file_search_request_body(json!({
+        "model":"gpt-4.1",
+        "input":"search",
+        "tools":[{"type":"file_search","vector_store_ids":["vs_1"]}],
+        "tool_choice":{"type":"file_search"},
+        "max_tool_calls":3
+    }));
+    state.materialize_deferred_history();
+    state.replace_output_items(vec![
+        json!({"type":"file_search_call","id":"fs_1","status":"completed"}),
+        json!({"type":"web_search_call","id":"ws_1","status":"completed"}),
+        json!({"type":"message","id":"msg_1","content":[]}),
+    ]);
+    state.iteration = 1;
+    state.continuation_tool_choice = Some(json!("auto"));
+    ctx.extensions.insert(state);
+    let mut body = None;
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(rebuilt["input"].as_array().unwrap().len(), 1);
+    assert_eq!(rebuilt["tools"][0]["type"], "file_search");
+    assert_eq!(rebuilt["tool_choice"], "auto");
+    assert_eq!(rebuilt["max_tool_calls"], 1);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.max_tool_calls, Some(3));
+    assert_eq!(state.request_body["max_tool_calls"], 3);
+}
+
+#[tokio::test]
+async fn exhausted_max_tool_calls_allows_answer_round_without_serializing_zero() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original_choice = json!({"type": "file_search"});
+    let tools = json!([{"type": "file_search", "vector_store_ids": ["vs_1"]}]);
+    let mut state = ResponsesState::from_file_search_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "search",
+        "tools": tools,
+        "tool_choice": original_choice,
+        "max_tool_calls": 1,
+    }));
+    state.materialize_deferred_history();
+    state.replace_output_items(vec![json!({
+        "type": "file_search_call",
+        "id": "fs_1",
+        "status": "completed"
+    })]);
+    state.iteration = 1;
+    state.continuation_tool_choice = Some(json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "file_search"}]
+    }));
+    ctx.extensions.insert(state);
+    let mut body = None;
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        outbound,
+        json!({
+            "model":"gpt-4.1",
+            "tool_choice":"none",
+            "input":[{"type":"message","role":"user","content":"search"}],
+            "tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]
+        })
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.max_tool_calls, Some(1));
+    assert_eq!(state.tool_choice, original_choice);
+    assert_eq!(state.request_body["max_tool_calls"], 1);
+}
+
+#[tokio::test]
+async fn exhausted_builtin_budget_preserves_narrow_custom_tool_scope() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original_choice = json!({
+        "type": "allowed_tools",
+        "mode": "required",
+        "tools": [
+            {"type": "file_search"},
+            {"type": "function", "name": "lookup"}
+        ]
+    });
+    let mut state = ResponsesState::from_file_search_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "search",
+        "tools": [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {"type": "function", "name": "outside_scope", "parameters": {"type": "object"}}
+        ],
+        "tool_choice": original_choice,
+        "max_tool_calls": 1,
+    }));
+    state.materialize_deferred_history();
+    state.replace_output_items(vec![json!({
+        "type": "file_search_call",
+        "id": "fs_1",
+        "status": "completed"
+    })]);
+    state.iteration = 1;
+    state.continuation_tool_choice = Some(json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [
+            {"type": "file_search"},
+            {"type": "function", "name": "lookup"}
+        ]
+    }));
+    ctx.extensions.insert(state);
+    let mut body = None;
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(outbound.get("max_tool_calls").is_none());
+    assert_eq!(
+        outbound["tool_choice"],
+        json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "function", "name": "lookup"}]
+        })
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.tool_choice, original_choice);
+}
+
+#[tokio::test]
+async fn continuation_restores_fields_moved_out_of_deferred_fallback_body() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original_choice = json!({
+        "type": "allowed_tools",
+        "mode": "required",
+        "tools": [{"type": "file_search"}, {"type": "function", "name": "other"}]
+    });
+    let continuation_choice = json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "file_search"}, {"type": "function", "name": "other"}]
+    });
+    let mut state = ResponsesState::from_file_search_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "search",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "context_management": {"type": "custom", "payload": "large"},
+        "conversation": {"id": ""},
+        "include": ["file_search_call.results"],
+        "previous_response_id": "",
+        "tool_choice": original_choice,
+    }));
+    state.materialize_deferred_history();
+    state.iteration = 1;
+    state.continuation_tool_choice = Some(continuation_choice.clone());
+    ctx.extensions.insert(state);
+    let mut body = None;
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["input"][0]["content"], "search");
+    assert_eq!(outbound["tools"][0]["type"], "file_search");
+    assert_eq!(outbound["context_management"]["payload"], "large");
+    assert_eq!(outbound["include"], json!(["file_search_call.results"]));
+    assert_eq!(outbound["tool_choice"], continuation_choice);
+    assert!(outbound.get("conversation").is_none());
+    assert_eq!(outbound["previous_response_id"], "");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.tool_choice, original_choice);
 }
 
 // -----------------------------------------------------------------------------
