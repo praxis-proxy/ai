@@ -184,6 +184,84 @@ mod filter_tests {
     }
 
     #[test]
+    fn config_rejects_unknown_field_in_target() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+              bogus: true
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("unknown field"),
+            "unknown field in target should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_field_in_request() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            request:
+              phase: request_body
+              bogus: true
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("unknown field"),
+            "unknown field in request should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_field_in_response() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            response:
+              bogus: true
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("unknown field"),
+            "unknown field in response should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_field_in_circuit_breaker() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            circuit_breaker:
+              failure_threshold: 3
+              recovery_timeout: "30s"
+              bogus: true
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("unknown field"),
+            "unknown field in circuit_breaker should be rejected: {err}"
+        );
+    }
+
+    #[test]
     fn config_rejects_max_body_bytes_one_above_limit() {
         // 100 MiB + 1 byte should be rejected.
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
