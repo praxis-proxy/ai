@@ -26,7 +26,7 @@ bytes = { workspace = true }
 dashmap = { workspace = true, optional = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
-praxis-callout-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "055bd5710dfd5bf5c9ea49706770cf38d979f9f1", package = "praxis-proxy-core", features = ["callout"] }
+praxis-callout-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "055bd5710dfd5bf5c9ea49706770cf38d979f9f1", package = "praxis-proxy-core", version = "0.4.0", features = ["callout"] }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 regex = { workspace = true }
