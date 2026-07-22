@@ -68,13 +68,13 @@ fn handle_terminal_event(ctx: &mut HttpFilterContext<'_>, payload: &Value, event
     };
     // SSE payloads are borrowed from the frame parser, so terminal accumulation
     // is the one path that must clone a complete response object.
-    let _ = accumulate_response_object(ctx, response.clone(), Some(status));
+    let _usage_modified = accumulate_response_object(ctx, response.clone(), Some(status));
 }
 
 /// Overwrite response fields from an authoritative complete response object.
 ///
-/// `status_override` is authoritative for SSE terminal events. Other callers
-/// use the response object's own `status` field.
+/// `status_override` is authoritative for SSE terminal events. Non-streaming
+/// JSON uses the response object's own `status` field.
 pub(super) fn accumulate_response_object(
     ctx: &mut HttpFilterContext<'_>,
     mut response: Value,
@@ -86,6 +86,7 @@ pub(super) fn accumulate_response_object(
         .unwrap_or_else(|| "unknown".to_owned());
     let had_prior_usage = {
         let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
+        state.materialize_deferred_history();
         let had_prior_usage = !state.usage.is_null();
         if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
             merge_usage(&mut state.usage, usage);
@@ -94,9 +95,6 @@ pub(super) fn accumulate_response_object(
             && let Some(object) = response.as_object_mut()
         {
             object.insert("usage".to_owned(), state.usage.clone());
-        }
-        if let Some(Value::Array(output)) = response.get("output") {
-            state.output_items_mut().clone_from(output);
         }
         state.response_object = response;
         had_prior_usage

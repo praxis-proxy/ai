@@ -589,10 +589,6 @@ fn record_valid_marker(
 /// Replace citation markers in every assistant output-text part.
 ///
 /// Returns whether the response was modified.
-#[allow(
-    dead_code,
-    reason = "the response annotation consumer lands in the stacked response-processing change"
-)]
 pub(crate) fn annotate_response(
     response: &mut Value,
     citation_files: &HashMap<String, String>,

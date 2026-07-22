@@ -15,7 +15,10 @@ use super::{
     validate::validate_metadata,
 };
 use crate::{
-    openai::responses::state::ResponsesState,
+    openai::responses::{
+        LOCAL_FILE_SEARCH_MARKER_ARGUMENTS, LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD,
+        local_file_search_public_id_fingerprint, state::ResponsesState,
+    },
     test_utils::{make_filter_context, make_request, make_response},
 };
 
@@ -3371,6 +3374,96 @@ fn conformance_conversations_generated_schema_check_rejects_wrong_discriminator(
         "schema check must reject a response with the wrong object discriminator"
     );
     println!("PRAXIS_CONFORMANCE_OK conversations schema_check_sensitivity");
+}
+
+#[test]
+fn append_back_uses_deferred_file_search_input_without_stream_events() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let input = serde_json::json!({"type":"message","role":"user","content":"search"});
+    let state = ResponsesState::from_file_search_request_body(serde_json::json!({
+        "model":"gpt-4.1",
+        "input":[input.clone()],
+        "tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]
+    }));
+    assert!(state.has_deferred_history());
+    assert!(state.input.is_empty());
+    ctx.extensions.insert(state);
+    let assistant = serde_json::json!({"type":"message","role":"assistant","content":"answer"});
+    let response = serde_json::to_vec(&serde_json::json!({
+        "status":"completed",
+        "output":[assistant.clone()]
+    }))
+    .unwrap();
+
+    let projection = super::filter::merge_input_output_items(&ctx, &response).unwrap();
+
+    assert_eq!(projection.public_items, vec![input, assistant]);
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().has_deferred_history());
+}
+
+#[test]
+fn append_back_separates_public_items_from_private_local_marker() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let local_call = serde_json::json!({
+        "type": "file_search_call",
+        "id": "fs_local",
+        "status": "completed",
+        "results": [{"file_id":"file-a","filename":"a.txt","text":"raw private text"}]
+    });
+    let compact_call = serde_json::json!({
+        "type": "file_search_call",
+        "id": "fs_local",
+        LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD:local_file_search_public_id_fingerprint("fs_local"),
+        "status": "completed",
+        "results": [{"file_id":"file-a","filename":"a.txt","score":0.0,"text":""}]
+    });
+    let marker_call = serde_json::json!({
+        "type": "function_call",
+        "call_id": "file_search_0_0123456789abcdef",
+        "name": "file_search",
+        "arguments": LOCAL_FILE_SEARCH_MARKER_ARGUMENTS,
+        "status": "completed"
+    });
+    let marker_output = serde_json::json!({
+        "type": "function_call_output",
+        "call_id": "file_search_0_0123456789abcdef",
+        "output": ""
+    });
+    let input = serde_json::json!({"type":"message","role":"user","content":"search"});
+    let assistant = serde_json::json!({"type":"message","role":"assistant","content":"answer"});
+    ctx.extensions.insert(ResponsesState {
+        input: vec![input.clone()],
+        continuation_output_count: 1,
+        local_file_search_persistence_start: Some(1),
+        persisted_messages: vec![
+            input.clone(),
+            compact_call.clone(),
+            marker_call.clone(),
+            marker_output.clone(),
+        ],
+        ..ResponsesState::default()
+    });
+    let response = serde_json::to_vec(&serde_json::json!({
+        "status": "completed",
+        "output": [local_call, assistant.clone()]
+    }))
+    .unwrap();
+
+    let projection = super::filter::merge_input_output_items(&ctx, &response).unwrap();
+
+    assert_eq!(projection.public_items, vec![input, local_call, assistant]);
+    let replay = projection.replay.unwrap();
+    assert_eq!(
+        replay.messages,
+        serde_json::json!([compact_call, marker_call, marker_output])
+    );
+    assert!(
+        !serde_json::to_string(&projection.public_items)
+            .unwrap()
+            .contains(LOCAL_FILE_SEARCH_MARKER_ARGUMENTS)
+    );
 }
 
 // -----------------------------------------------------------------------------
