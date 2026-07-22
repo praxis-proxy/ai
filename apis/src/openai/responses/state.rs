@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
+#![allow(
+    dead_code,
+    reason = "continuation state is introduced before its stacked consumers"
+)]
+
 //! Request-scoped state for the Responses API filter set.
 //!
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
