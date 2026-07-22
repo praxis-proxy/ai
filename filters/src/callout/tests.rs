@@ -486,6 +486,56 @@ mod filter_tests {
         assert!(!has_results, "non-JSON response should not produce extraction results");
     }
 
+    #[tokio::test]
+    async fn empty_response_body_skips_extraction() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+            response:
+              extract:
+                - json_path: "$.flagged"
+                  result_key: "flagged"
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "empty response body should continue without error"
+        );
+
+        let has_results = ctx
+            .filter_results
+            .get("http_callout")
+            .is_some_and(|rs| rs.get("flagged").is_some());
+        assert!(
+            !has_results,
+            "empty response body should not produce extraction results"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Failure Modes
     // -------------------------------------------------------------------------
