@@ -278,6 +278,10 @@ impl ResponsesState {
     }
 
     /// Borrow normalized request input before or after deferred materialization.
+    #[allow(
+        dead_code,
+        reason = "conversation append-back consumes this in the next stacked change"
+    )]
     pub(crate) fn request_input_items(&self) -> &[serde_json::Value] {
         if self.input.is_empty() {
             self.deferred_input.as_deref().unwrap_or(&self.input)
