@@ -6,6 +6,7 @@
 use std::{
     io::{Read as _, Write as _},
     net::TcpListener,
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -148,13 +149,18 @@ fn reject_too_many_references_returns_413() {
 #[test]
 fn reject_too_large_returns_413() {
     let err = ResolveError::TooLarge {
-        file_id: "file-abc".to_owned(),
+        reference: "file-abc".to_owned(),
         limit: 1024,
     };
     let action = reject_resolve_error(&err);
     match action {
         FilterAction::Reject(r) => {
             assert_eq!(r.status, 413, "oversized resolved content should produce 413");
+            let body = std::str::from_utf8(r.body.as_deref().unwrap()).unwrap();
+            assert!(
+                body.contains("file reference 'file-abc'"),
+                "oversized response should identify a generic file reference"
+            );
         },
         _ => panic!("expected Reject action"),
     }
@@ -193,6 +199,11 @@ fn reject_file_url_failed_returns_502() {
             assert!(
                 !body.contains("connection refused"),
                 "client response must not expose internal transport details"
+            );
+            assert!(body.contains("file URL"), "client response should identify a URL fetch");
+            assert!(
+                !body.contains("Files API"),
+                "URL fetch failures must not be described as Files API failures"
             );
         },
         _ => panic!("expected Reject action"),
@@ -837,6 +848,96 @@ async fn file_url_resolved_to_data_uri() {
     let base64_part = file_data.strip_prefix("data:text/plain;base64,").unwrap();
     let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_part).unwrap();
     assert_eq!(decoded, b"Hello World", "data URI should contain the file content");
+}
+
+#[tokio::test]
+async fn file_url_truncated_body_reports_url_failure() {
+    use crate::openai::responses::file_resolve::{
+        resolve::ResolveError,
+        resolve_url::{FileUrlResolver, NormalizedOrigin},
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stub_url = format!("http://{address}/file.txt?sig=secret");
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _read = stream.read(&mut request).unwrap();
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nShort";
+        stream.write_all(response).unwrap();
+    });
+
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![
+            NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap(),
+        ],
+    };
+    let result = resolver
+        .resolve_url(
+            &stub_url,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            64 * 1024 * 1024,
+        )
+        .await;
+
+    match result {
+        Err(ResolveError::FileUrlFailed { label, detail }) => {
+            assert!(label.contains("[REDACTED]"), "signed query value should be redacted");
+            assert!(!label.contains("secret"), "signed query value must not be exposed");
+            assert!(
+                detail.contains("read error"),
+                "failure should retain URL body read context"
+            );
+        },
+        Err(other) => panic!("expected FileUrlFailed for a truncated URL body, got {other}"),
+        Ok(_) => panic!("expected FileUrlFailed for a truncated URL body"),
+    }
+}
+
+#[tokio::test]
+async fn file_url_oversized_content_length_reports_generic_too_large() {
+    use crate::openai::responses::file_resolve::{
+        resolve::ResolveError,
+        resolve_url::{FileUrlResolver, NormalizedOrigin},
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stub_url = format!("http://{address}/file.txt?sig=secret");
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _read = stream.read(&mut request).unwrap();
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+        stream.write_all(response).unwrap();
+    });
+
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![
+            NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap(),
+        ],
+    };
+    let result = resolver
+        .resolve_url(&stub_url, tokio::time::Instant::now() + Duration::from_secs(5), 64)
+        .await;
+
+    match result {
+        Err(ResolveError::TooLarge { reference, limit }) => {
+            assert_eq!(limit, 64, "error should report the configured resolved-body limit");
+            assert!(
+                reference.contains("[REDACTED]"),
+                "signed query value should be redacted"
+            );
+            assert!(!reference.contains("secret"), "signed query value must not be exposed");
+        },
+        Err(other) => panic!("expected TooLarge for an oversized URL response, got {other}"),
+        Ok(_) => panic!("expected TooLarge for an oversized URL response"),
+    }
 }
 
 #[tokio::test]

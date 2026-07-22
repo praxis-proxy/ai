@@ -7,9 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use praxis_core::connectivity::normalize_mapped_ipv4;
 
-use super::resolve::{
-    ResolveError, ResolvedFile, infer_mime_from_filename, max_content_bytes_for_data_url, read_bounded_body,
-};
+use super::resolve::{ResolveError, ResolvedFile, infer_mime_from_filename, max_content_bytes_for_data_url};
 
 /// A validated, normalized origin (scheme + host + port) for allowlist matching.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -568,9 +566,9 @@ impl FileUrlResolver {
         if let Some(cl) = response.content_length()
             && usize::try_from(cl).unwrap_or(usize::MAX) > max_content_bytes
         {
-            return Err(ResolveError::FileUrlFailed {
-                label,
-                detail: format!("Content-Length {cl} exceeds limit"),
+            return Err(ResolveError::TooLarge {
+                reference: label,
+                limit: max_resolved_bytes,
             });
         }
 
@@ -589,7 +587,7 @@ impl FileUrlResolver {
             });
 
         // Read bounded body
-        let content = read_bounded_body(response, &label, max_content_bytes, max_resolved_bytes).await?;
+        let content = read_bounded_url_body(response, &label, max_content_bytes, max_resolved_bytes).await?;
 
         // Encode as base64
         let base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &content);
@@ -600,6 +598,33 @@ impl FileUrlResolver {
             filename,
         })
     }
+}
+
+/// Read a file URL response body while preserving URL-specific error context.
+async fn read_bounded_url_body(
+    mut response: reqwest::Response,
+    label: &str,
+    max_content_bytes: usize,
+    limit: usize,
+) -> Result<Vec<u8>, ResolveError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| ResolveError::FileUrlFailed {
+        label: label.to_owned(),
+        detail: if e.is_timeout() {
+            "content download timed out".to_owned()
+        } else {
+            format!("content download read error: {e}")
+        },
+    })? {
+        if chunk.len() > max_content_bytes.saturating_sub(body.len()) {
+            return Err(ResolveError::TooLarge {
+                reference: label.to_owned(),
+                limit,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Resolve DNS and validate all addresses.

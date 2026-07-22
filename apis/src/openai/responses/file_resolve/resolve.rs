@@ -76,8 +76,8 @@ pub(crate) enum ResolveError {
 
     /// Resolved content would exceed the configured body limit.
     TooLarge {
-        /// The file ID that was requested.
-        file_id: String,
+        /// Redacted file reference label.
+        reference: String,
         /// Maximum allowed resolved size in bytes.
         limit: usize,
     },
@@ -109,8 +109,11 @@ impl std::fmt::Display for ResolveError {
             Self::TooManyReferences { limit } => {
                 write!(f, "request exceeds configured file reference limit ({limit})")
             },
-            Self::TooLarge { file_id, limit } => {
-                write!(f, "resolved file '{file_id}' exceeds configured limit ({limit} bytes)")
+            Self::TooLarge { reference, limit } => {
+                write!(
+                    f,
+                    "resolved file reference '{reference}' exceeds configured limit ({limit} bytes)"
+                )
             },
             Self::FileUrlBlocked { label } => {
                 write!(f, "file URL '{label}' blocked by security policy")
@@ -135,7 +138,7 @@ fn map_api_error(err: ApiClientError, file_id: &str) -> ResolveError {
             detail,
         },
         ApiClientError::ResponseTooLarge { limit } => ResolveError::TooLarge {
-            file_id: file_id.to_owned(),
+            reference: file_id.to_owned(),
             limit,
         },
         ApiClientError::DecodeFailed { detail } => ResolveError::CalloutFailed {
@@ -308,7 +311,7 @@ impl ResolutionBudget {
             self.remaining_resolved_bytes
                 .checked_sub(bytes)
                 .ok_or_else(|| ResolveError::TooLarge {
-                    file_id: "<aggregate>".to_owned(),
+                    reference: "<aggregate>".to_owned(),
                     limit,
                 })?;
         Ok(())
@@ -396,7 +399,7 @@ impl FilesApiClient {
             .await
             .map_err(|e| match e {
                 ApiClientError::ResponseTooLarge { .. } => ResolveError::TooLarge {
-                    file_id: file_id.to_owned(),
+                    reference: file_id.to_owned(),
                     limit: max_resolved_bytes,
                 },
                 other => map_api_error(other, file_id),
@@ -418,7 +421,7 @@ impl FilesApiClient {
             _ => Some(max_content_bytes_for_base64(max_resolved_bytes)),
         }
         .ok_or_else(|| ResolveError::TooLarge {
-            file_id: file_id.to_owned(),
+            reference: file_id.to_owned(),
             limit: max_resolved_bytes,
         })?;
         if metadata
@@ -426,7 +429,7 @@ impl FilesApiClient {
             .is_some_and(|b| usize::try_from(b).unwrap_or(usize::MAX) > max_content_bytes)
         {
             return Err(ResolveError::TooLarge {
-                file_id: file_id.to_owned(),
+                reference: file_id.to_owned(),
                 limit: max_resolved_bytes,
             });
         }
@@ -444,32 +447,6 @@ impl FilesApiClient {
     }
 }
 
-/// Read a response body in chunks, enforcing a size limit.
-pub(super) async fn read_bounded_body(
-    mut response: reqwest::Response,
-    file_id: &str,
-    max_content_bytes: usize,
-    limit: usize,
-) -> Result<Vec<u8>, ResolveError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| ResolveError::CalloutFailed {
-        file_id: file_id.to_owned(),
-        detail: if e.is_timeout() {
-            "content download timed out".to_owned()
-        } else {
-            format!("content download read error: {e}")
-        },
-    })? {
-        if body.len() + chunk.len() > max_content_bytes {
-            return Err(ResolveError::TooLarge {
-                file_id: file_id.to_owned(),
-                limit,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
 /// Extract content type and reported size from a Files API
 /// metadata response.
 fn parse_file_metadata(body: &serde_json::Value) -> FileMetadata {
@@ -633,7 +610,7 @@ async fn resolve_content_part(
     let len = output_len_for_part(&part_type, &source, &resolved);
     if len > max_resolved_bytes {
         return Err(ResolveError::TooLarge {
-            file_id: source.to_string(),
+            reference: source.to_string(),
             limit: resolver.client.max_resolved_bytes,
         });
     }
@@ -919,12 +896,12 @@ mod tests {
     #[test]
     fn resolve_error_display_too_large() {
         let err = ResolveError::TooLarge {
-            file_id: "file-abc".to_owned(),
+            reference: "file-abc".to_owned(),
             limit: 1024,
         };
         assert_eq!(
             err.to_string(),
-            "resolved file 'file-abc' exceeds configured limit (1024 bytes)",
+            "resolved file reference 'file-abc' exceeds configured limit (1024 bytes)",
             "TooLarge display should format correctly"
         );
     }

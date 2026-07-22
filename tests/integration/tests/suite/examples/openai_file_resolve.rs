@@ -591,6 +591,127 @@ filter_chains:
 }
 
 #[test]
+fn file_url_passthrough_reaches_upstream_unchanged() {
+    let files_api_port = start_files_api_stub();
+    let inference_guard = start_capturing_backend("{}");
+    let proxy_port = free_port();
+
+    let yaml = format!(
+        r#"
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [file-resolve-pipeline]
+
+filter_chains:
+  - name: file-resolve-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:{files_api_port}"
+        allow_private_files_api_url: true
+        allow_pre_security_callout: true
+        file_url: passthrough
+        on_missing: reject
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:{}"
+"#,
+        inference_guard.port()
+    );
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    let file_url = "https://storage.example.com/document.pdf?sig=opaque";
+    let body = format!(
+        r#"{{
+            "model": "gpt-4.1",
+            "input": [{{
+                "type": "message",
+                "role": "user",
+                "content": [{{"type": "input_file", "file_url": "{file_url}"}}]
+            }}]
+        }}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 200, "passthrough request should reach the backend");
+    let captured: serde_json::Value =
+        serde_json::from_str(&inference_guard.body()).expect("captured body should be valid JSON");
+    assert_eq!(
+        captured["input"][0]["content"][0]["file_url"].as_str(),
+        Some(file_url),
+        "file_url should reach the upstream unchanged"
+    );
+    assert!(
+        captured["input"][0]["content"][0].get("file_data").is_none(),
+        "passthrough mode should not synthesize file_data"
+    );
+}
+
+#[test]
+fn example_config_rejects_ssrf_blocked_file_url_with_403() {
+    let files_api_port = start_files_api_stub();
+    let inference_guard = start_backend_with_shutdown("inference-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "openai/responses/file-resolve.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:9999", files_api_port),
+            ("127.0.0.1:3001", inference_guard.port()),
+            ("127.0.0.1:3002", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+    let body = r#"{
+        "model": "gpt-4.1",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": "http://169.254.169.254/latest/meta-data/"
+            }]
+        }]
+    }"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        403,
+        "metadata file_url should be rejected before proxying"
+    );
+    let error: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("error response should be valid JSON");
+    assert_eq!(
+        error["error"]["type"].as_str(),
+        Some("file_resolve_error"),
+        "blocked file_url should use the file resolution error envelope"
+    );
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("blocked by security policy")),
+        "blocked file_url response should explain the security rejection"
+    );
+}
+
+#[test]
 fn example_config_file_url_no_credentials_forwarded() {
     let files_api_port = start_files_api_stub_auth_required();
     let file_url_port = start_file_url_stub_auth_check();

@@ -567,7 +567,7 @@ fn resolve_error_response(err: &ResolveError) -> (u16, String) {
         ResolveError::CalloutFailed { file_id, detail } => callout_error_response(file_id, detail),
         ResolveError::InvalidFileId { file_id, detail } => invalid_id_error_response(file_id, detail),
         ResolveError::TooManyReferences { limit } => too_many_error_response(*limit),
-        ResolveError::TooLarge { file_id, limit } => too_large_error_response(file_id, *limit),
+        ResolveError::TooLarge { reference, limit } => too_large_error_response(reference, *limit),
         ResolveError::FileUrlBlocked { label } => file_url_blocked_response(label),
         ResolveError::FileUrlFailed { label, detail } => file_url_failed_response(label, detail),
     }
@@ -595,11 +595,11 @@ fn too_many_error_response(limit: usize) -> (u16, String) {
 }
 
 /// Report an exceeded resolved-body size cap to the caller.
-fn too_large_error_response(file_id: &str, limit: usize) -> (u16, String) {
-    warn!(file_id, limit, "resolved file exceeds configured limit");
+fn too_large_error_response(reference: &str, limit: usize) -> (u16, String) {
+    warn!(reference, limit, "resolved file exceeds configured limit");
     (
         413,
-        format!("failed to resolve file '{file_id}': resolved content exceeds {limit} bytes"),
+        format!("failed to resolve file reference '{reference}': resolved content exceeds {limit} bytes"),
     )
 }
 
