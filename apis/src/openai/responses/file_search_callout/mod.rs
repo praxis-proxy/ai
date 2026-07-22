@@ -3,4 +3,5 @@
 
 //! OGX-backed file search support for the OpenAI Responses API.
 
+pub(crate) mod citations;
 pub(crate) mod client;

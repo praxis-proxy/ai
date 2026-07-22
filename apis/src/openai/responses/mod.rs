@@ -57,7 +57,7 @@ pub use store::ResponseStoreFilter;
 )]
 mod tests;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -73,6 +73,55 @@ use crate::classifier::{
     AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path,
     is_responses_websocket_handshake,
 };
+
+/// Count compact JSON bytes without retaining the serialized representation.
+///
+/// Returns `Ok(None)` as soon as serialization would exceed `max_bytes`.
+pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<Option<usize>, serde_json::Error> {
+    let mut counter = BoundedJsonCounter {
+        bytes: 0,
+        exceeded: false,
+        max_bytes,
+    };
+    let result = serde_json::to_writer(&mut counter, value);
+    if counter.exceeded {
+        return Ok(None);
+    }
+    result?;
+    Ok(Some(counter.bytes))
+}
+
+/// JSON writer that counts bytes and stops at a fixed ceiling.
+struct BoundedJsonCounter {
+    /// Bytes accepted so far.
+    bytes: usize,
+    /// Whether a write crossed the configured ceiling.
+    exceeded: bool,
+    /// Maximum accepted bytes.
+    max_bytes: usize,
+}
+
+impl io::Write for BoundedJsonCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(next_bytes) = self.bytes.checked_add(buf.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte count overflow"));
+        };
+        if next_bytes > self.max_bytes {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte limit exceeded"));
+        }
+        self.bytes = next_bytes;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Constants
