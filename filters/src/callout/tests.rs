@@ -713,6 +713,47 @@ mod filter_tests {
         assert!(matches!(action, FilterAction::Continue), "fail-open should continue");
     }
 
+    #[tokio::test]
+    async fn entry_failure_mode_key_does_not_change_on_failure() {
+        // `failure_mode` is a filter-entry structural key stripped before
+        // filter config parsing; it must not alias to `on_failure`.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+            failure_mode: open
+            status_on_error: 403
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 403),
+            "entry-level failure_mode must not make the callout fail-open"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Timeout
     // -------------------------------------------------------------------------

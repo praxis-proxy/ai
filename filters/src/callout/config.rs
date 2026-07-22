@@ -29,7 +29,12 @@ pub(crate) struct HttpCalloutConfig {
     pub response: ResponseConfig,
 
     /// Behavior on callout failure.
-    #[serde(default, alias = "failure_mode")]
+    ///
+    /// Note: the filter-entry structural key `failure_mode` is
+    /// stripped before filter config parsing (it controls pipeline
+    /// error handling, a different semantic), so only `on_failure`
+    /// configures callout failure behavior.
+    #[serde(default)]
     pub on_failure: FailureModeConfig,
 
     /// HTTP status code returned when rejecting on failure.
