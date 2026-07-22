@@ -85,7 +85,11 @@ fn lakera_guard_bypasses_non_post_requests() {
         "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
 
-    assert_eq!(parse_status(&raw), 200, "GET should bypass the callout and reach upstream");
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "GET should bypass the callout and reach upstream"
+    );
     assert!(raw.contains("upstream ok"), "GET should receive upstream body");
 }
 
@@ -115,7 +119,11 @@ fn lakera_guard_rejects_flagged_with_preceding_filter() {
             "      - filter: token_usage_headers\n      - filter: http_callout",
         );
 
-    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_guard.port())]));
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3000", backend_guard.port())]),
+    );
     let config = praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse config: {e}"));
     let proxy = start_proxy(&config);
 

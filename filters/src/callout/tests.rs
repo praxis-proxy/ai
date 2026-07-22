@@ -1470,9 +1470,7 @@ mod filter_tests {
 
         Mock::given(method("POST"))
             .and(path("/guard"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"reason": "x".repeat(300)})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"reason": "x".repeat(300)})))
             .mount(&mock_server)
             .await;
 
@@ -1518,9 +1516,7 @@ mod filter_tests {
 
         Mock::given(method("POST"))
             .and(path("/guard"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"reason": "line1\nline2"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"reason": "line1\nline2"})))
             .mount(&mock_server)
             .await;
 
