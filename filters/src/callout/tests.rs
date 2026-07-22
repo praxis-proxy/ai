@@ -215,6 +215,80 @@ mod filter_tests {
     }
 
     // -------------------------------------------------------------------------
+    // on_denied_headers Removed (Review Fix #1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn config_rejects_on_denied_headers_field() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            response:
+              on_denied_headers:
+                - "x-reason"
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("on_denied_headers") || err.to_string().contains("unknown field"),
+            "on_denied_headers should be rejected as unknown: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejection_carries_no_response_headers() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .append_header("x-reason", "bad-content")
+                    .set_body_string("error"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+            on_failure: closed
+            status_on_error: 403
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        match action {
+            FilterAction::Reject(r) => {
+                assert_eq!(r.status, 403);
+                assert!(
+                    r.headers.is_empty(),
+                    "rejection should carry no response headers; got {:?}",
+                    r.headers
+                );
+            },
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Phase Handling
     // -------------------------------------------------------------------------
 
