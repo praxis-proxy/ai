@@ -411,16 +411,58 @@ mod tests {
         // Should succeed (warning only), not error.
         assert!(
             validate_callout_url("http://127.0.0.1:8080/api").is_ok(),
-            "private/loopback URLs should succeed with a warning"
+            "loopback IPv4 should succeed with a warning"
         );
         assert!(
             validate_callout_url("http://192.168.1.1:8080/api").is_ok(),
-            "private IPs should succeed with a warning"
+            "RFC 1918 (192.168.x) should succeed with a warning"
         );
         assert!(
             validate_callout_url("http://10.0.0.1:8080/api").is_ok(),
-            "private IPs should succeed with a warning"
+            "RFC 1918 (10.x) should succeed with a warning"
         );
+        assert!(
+            validate_callout_url("http://172.16.0.1:8080/api").is_ok(),
+            "RFC 1918 (172.16.x) should succeed with a warning"
+        );
+        assert!(
+            validate_callout_url("http://169.254.169.254/latest/meta-data/").is_ok(),
+            "link-local / cloud metadata endpoint should succeed with a warning"
+        );
+    }
+
+    #[test]
+    fn validate_url_no_warning_on_public_ip() {
+        // Public IPs should succeed without any private-IP warning path.
+        assert!(validate_callout_url("http://8.8.8.8/api").is_ok());
+        assert!(validate_callout_url("https://203.0.113.1/api").is_ok());
+    }
+
+    #[test]
+    fn is_private_or_loopback_covers_all_ranges() {
+        use std::net::IpAddr;
+
+        // Loopback
+        assert!(is_private_or_loopback(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback(&"127.255.255.255".parse::<IpAddr>().unwrap()));
+
+        // RFC 1918 private ranges
+        assert!(is_private_or_loopback(&"10.0.0.0".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback(&"10.255.255.255".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback(&"172.16.0.0".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback(&"172.31.255.255".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback(&"192.168.0.0".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback(&"192.168.255.255".parse::<IpAddr>().unwrap()));
+
+        // Link-local (cloud metadata endpoint)
+        assert!(is_private_or_loopback(&"169.254.169.254".parse::<IpAddr>().unwrap()));
+
+        // IPv6 loopback
+        assert!(is_private_or_loopback(&"::1".parse::<IpAddr>().unwrap()));
+
+        // Public IPs should NOT match
+        assert!(!is_private_or_loopback(&"8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_or_loopback(&"203.0.113.1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
