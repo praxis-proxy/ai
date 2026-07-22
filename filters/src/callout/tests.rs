@@ -907,6 +907,54 @@ mod filter_tests {
         assert!(matches!(action, FilterAction::Continue), "forward_headers should work");
     }
 
+    #[tokio::test]
+    async fn forward_headers_absent_from_request_not_sent() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              forward_headers:
+                - "x-custom"
+            request:
+              phase: request_headers
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        // Request does not carry x-custom.
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        let received = mock_server
+            .received_requests()
+            .await
+            .expect("callout should have fired");
+        assert_eq!(received.len(), 1, "exactly one callout request expected");
+        assert!(
+            !received[0].headers.contains_key("x-custom"),
+            "absent downstream header must not be forwarded; got {:?}",
+            received[0].headers
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Inject Headers
     // -------------------------------------------------------------------------
@@ -1228,6 +1276,48 @@ mod filter_tests {
 
         let results = ctx.filter_results.get("http_callout").expect("should have results");
         assert_eq!(results.get("flagged"), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn non_json_body_with_shaping_forwards_raw() {
+        let mock_server = MockServer::start().await;
+
+        // The mock only matches the raw, unshaped body.
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .and(wiremock::matchers::body_string("not json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              body:
+                messages: "$.messages"
+            request:
+              phase: request_body
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+        let mut body = Some(bytes::Bytes::from("not json"));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "non-JSON body should fall back to raw forwarding"
+        );
     }
 
     // -------------------------------------------------------------------------
