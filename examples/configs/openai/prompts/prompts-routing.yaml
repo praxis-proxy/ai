@@ -1,0 +1,46 @@
+# Prompts API Routing
+#
+# Routes OpenAI Prompts API requests to a dedicated Prompts API
+# backend. The router uses segment-boundary prefix matching, so
+# /v1/prompts and all of its subresources (e.g.
+# /v1/prompts/{prompt_id}, /v1/prompts/{prompt_id}/versions)
+# are routed to the prompts-api cluster, while paths such as
+# /v1/promptsomething do not match and fall through to the
+# default backend.
+#
+# Example requests:
+#
+#   # List prompts
+#   curl http://localhost:8080/v1/prompts
+#
+#   # Get a specific prompt
+#   curl http://localhost:8080/v1/prompts/prompt-abc123
+#
+#   # Create a prompt
+#   curl http://localhost:8080/v1/prompts \
+#     -H "Content-Type: application/json" \
+#     -d '{"name": "greeting", "prompt": {"messages": [{"role": "user", "content": "Hello"}]}}'
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [prompts-routing]
+
+filter_chains:
+  - name: prompts-routing
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/v1/prompts"
+            cluster: "prompts-api"
+          - path_prefix: "/"
+            cluster: "default-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "prompts-api"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "default-backend"
+            endpoints:
+              - "127.0.0.1:3002"

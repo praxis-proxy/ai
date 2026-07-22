@@ -66,10 +66,11 @@
 #      (already resolved by rehydrate). Passthrough when no
 #      ResponsesState exists.
 #
-#   12. The router sends all valid Responses API create requests to
-#      the same inference backend. The promoted mode remains available
-#      as headers/metadata for downstream filters; it does not change
-#      backend selection in this example.
+#   12. The router sends valid Responses API create requests to the
+#      inference backend and routes /v1/prompts (and subresources) to
+#      a dedicated Prompts API service. The promoted mode remains
+#      available as headers/metadata for downstream filters; it does
+#      not change backend selection in this example.
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer
@@ -180,6 +181,8 @@ filter_chains:
 
       - filter: router
         routes:
+          - path_prefix: "/v1/prompts"
+            cluster: "prompts-api"
           - path: "/v1/responses"
             headers:
               x-praxis-ai-format: "openai_responses"
@@ -187,6 +190,9 @@ filter_chains:
 
       - filter: load_balancer
         clusters:
+          - name: "prompts-api"
+            endpoints:
+              - "127.0.0.1:9998"
           - name: "inference-backend"
             endpoints:
               - "127.0.0.1:3001"

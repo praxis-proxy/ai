@@ -18,6 +18,7 @@ mod openai_doc_extract;
 mod openai_file_resolve;
 mod openai_mcp_dispatch;
 mod openai_mcp_tool_resolve;
+mod openai_prompts_routing;
 mod openai_response_store;
 mod openai_response_store_postgres;
 mod openai_responses_format;
