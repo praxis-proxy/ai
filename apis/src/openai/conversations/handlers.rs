@@ -3,12 +3,7 @@
 
 //! Request handlers for the `/v1/conversations` endpoints.
 
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
-    fmt,
-    marker::PhantomData,
-};
+use std::{borrow::Cow, collections::HashSet, fmt, marker::PhantomData};
 
 use percent_encoding::percent_decode_str;
 use praxis_filter::{FilterAction, FilterError, HttpFilterContext, Rejection};
@@ -29,19 +24,11 @@ use super::{
 };
 use crate::{
     openai::responses::{
-        DEFAULT_TENANT_ID, LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD, TENANT_METADATA_KEY,
-        local_file_search_marker_triplet, local_file_search_public_id_fingerprint,
+        DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
         store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
     },
     store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
 };
-
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Maximum optimistic retries for a contended conversation cache refresh.
-const MAX_MESSAGE_SYNC_ATTEMPTS: usize = 16;
 
 // -----------------------------------------------------------------------------
 // ItemListParams
@@ -556,7 +543,6 @@ pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result
         Some(Value::Null) | None => generated_item_id(ctx),
         Some(_) => return Err("item id must be a string".to_owned()),
     };
-    map.remove(LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD);
     map.insert("id".to_owned(), Value::String(item_id.clone()));
     normalize_message_item(&mut map)?;
     Ok((item_id, Value::Object(map)))
@@ -943,127 +929,19 @@ pub(super) async fn sync_conversation_messages(
     store: &dyn ConversationItemStore,
     record: ConversationRecord,
 ) -> Result<(), StoreError> {
-    sync_conversation_messages_inner(store, record, None).await
-}
-
-/// Refresh replay history while adding private markers from the current turn.
-pub(super) async fn sync_conversation_messages_with_overlay(
-    store: &dyn ConversationItemStore,
-    record: ConversationRecord,
-    additional_hidden_messages: &Value,
-) -> Result<(), StoreError> {
-    sync_conversation_messages_inner(store, record, Some(additional_hidden_messages)).await
-}
-
-/// Rebuild the private cache from public rows and hidden provenance.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the bounded compare-and-swap retry keeps each synchronization step visible"
-)]
-async fn sync_conversation_messages_inner(
-    store: &dyn ConversationItemStore,
-    mut record: ConversationRecord,
-    additional_hidden_messages: Option<&Value>,
-) -> Result<(), StoreError> {
-    for _attempt in 0..MAX_MESSAGE_SYNC_ATTEMPTS {
-        let public_messages = collect_conversation_messages(store, &record.tenant_id, &record.conversation_id).await?;
-        let messages = Value::Array(preserve_local_file_search_markers(
-            public_messages,
-            &record.messages,
-            additional_hidden_messages,
-        ));
-        if store
-            .compare_and_swap_conversation_messages(
-                &record.tenant_id,
-                &record.conversation_id,
-                &record.messages,
-                &messages,
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        record = store
-            .get_conversation(&record.tenant_id, &record.conversation_id)
-            .await?
-            .ok_or_else(|| {
-                StoreError::Database(format!(
-                    "conversation disappeared during message sync: {}",
-                    record.conversation_id
-                ))
-            })?;
+    let messages =
+        Value::Array(collect_conversation_messages(store, &record.tenant_id, &record.conversation_id).await?);
+    let updated = store
+        .update_conversation_messages(&record.tenant_id, &record.conversation_id, &messages)
+        .await?;
+    if updated {
+        Ok(())
+    } else {
+        Err(StoreError::Database(format!(
+            "conversation disappeared during message sync: {}",
+            record.conversation_id
+        )))
     }
-    Err(StoreError::Database(format!(
-        "conversation message sync remained contended after {MAX_MESSAGE_SYNC_ATTEMPTS} attempts: {}",
-        record.conversation_id
-    )))
-}
-
-/// Restore private local-search markers without changing public item rows.
-fn preserve_local_file_search_markers(
-    public_messages: Vec<Value>,
-    hidden_messages: &Value,
-    additional_hidden_messages: Option<&Value>,
-) -> Vec<Value> {
-    let mut markers = hidden_messages
-        .as_array()
-        .map_or_else(HashMap::new, |hidden| local_file_search_marker_queues(hidden));
-    if let Some(additional) = additional_hidden_messages.and_then(Value::as_array) {
-        append_local_file_search_marker_queues(&mut markers, additional);
-    }
-    if markers.is_empty() {
-        return public_messages;
-    }
-
-    let mut replay_messages = Vec::with_capacity(public_messages.len().saturating_add(markers.len().saturating_mul(2)));
-    for item in public_messages {
-        if let Some(marker) = pop_local_file_search_marker(&mut markers, &item) {
-            replay_messages.extend(marker.into_iter().cloned());
-        } else {
-            replay_messages.push(item);
-        }
-    }
-    replay_messages
-}
-
-/// Pop the matching private marker for one public call occurrence.
-fn pop_local_file_search_marker<'a>(
-    markers: &mut HashMap<String, VecDeque<[&'a Value; 3]>>,
-    item: &Value,
-) -> Option<[&'a Value; 3]> {
-    let id = item
-        .get("type")
-        .and_then(Value::as_str)
-        .filter(|item_type| *item_type == "file_search_call")
-        .and_then(|_| item.get("id"))
-        .and_then(Value::as_str)?;
-    let fingerprint_key = format!("fingerprint:{}", local_file_search_public_id_fingerprint(id));
-    markers.get_mut(&fingerprint_key).and_then(VecDeque::pop_front)
-}
-
-/// Collect every exact marker in occurrence order without collapsing IDs.
-fn local_file_search_marker_queues(hidden_messages: &[Value]) -> HashMap<String, VecDeque<[&Value; 3]>> {
-    let mut markers: HashMap<_, VecDeque<_>> = HashMap::new();
-    append_local_file_search_marker_queues(&mut markers, hidden_messages);
-    markers
-}
-
-/// Append exact marker occurrences to an existing association index.
-fn append_local_file_search_marker_queues<'a>(
-    markers: &mut HashMap<String, VecDeque<[&'a Value; 3]>>,
-    hidden_messages: &'a [Value],
-) {
-    for window in hidden_messages.windows(3) {
-        if let Some((id, marker)) = local_file_search_marker(window) {
-            markers.entry(id).or_default().push_back(marker);
-        }
-    }
-}
-
-/// Index one exact private compact local-search marker triplet.
-fn local_file_search_marker(items: &[Value]) -> Option<(String, [&Value; 3])> {
-    let (fingerprint, marker) = local_file_search_marker_triplet(items)?;
-    Some((format!("fingerprint:{fingerprint}"), marker))
 }
 
 /// Collect all item JSON values for a conversation in ascending order.
@@ -1096,218 +974,6 @@ async fn collect_conversation_messages(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::openai::responses::LOCAL_FILE_SEARCH_MARKER_ARGUMENTS;
-
-    #[test]
-    #[expect(clippy::too_many_lines, reason = "constructs two complete marker occurrences")]
-    fn current_marker_overlay_follows_existing_duplicate_id_occurrence() {
-        let fingerprint = local_file_search_public_id_fingerprint("fs-duplicate");
-        let compact_first = serde_json::json!({
-            "type":"file_search_call","id":"fs-duplicate","status":"completed",
-            LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD:fingerprint,
-            "results":[{"file_id":"file-a","filename":"a.txt","score":0.0,"text":""}]
-        });
-        let marker_first = serde_json::json!({
-            "type":"function_call","call_id":"file_search_0_0123456789abcdef","name":"file_search",
-            "arguments":LOCAL_FILE_SEARCH_MARKER_ARGUMENTS,"status":"completed"
-        });
-        let output_first = serde_json::json!({
-            "type":"function_call_output","call_id":"file_search_0_0123456789abcdef","output":""
-        });
-        let compact_second = serde_json::json!({
-            "type":"file_search_call","id":"fs-duplicate","status":"completed",
-            LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD:fingerprint,
-            "results":[{"file_id":"file-b","filename":"b.txt","score":0.0,"text":""}]
-        });
-        let marker_second = serde_json::json!({
-            "type":"function_call","call_id":"file_search_1_fedcba9876543210","name":"file_search",
-            "arguments":LOCAL_FILE_SEARCH_MARKER_ARGUMENTS,"status":"completed"
-        });
-        let output_second = serde_json::json!({
-            "type":"function_call_output","call_id":"file_search_1_fedcba9876543210","output":""
-        });
-        let hidden = serde_json::json!([compact_first, marker_first, output_first]);
-        let current = serde_json::json!([compact_second, marker_second, output_second]);
-        let public = vec![
-            serde_json::json!({"type":"file_search_call","id":"fs-duplicate","status":"completed"}),
-            serde_json::json!({"type":"message","id":"intervening","role":"assistant","content":[]}),
-            serde_json::json!({"type":"file_search_call","id":"fs-duplicate","status":"completed"}),
-        ];
-
-        let replay = preserve_local_file_search_markers(public, &hidden, Some(&current));
-
-        assert_eq!(replay.len(), 7);
-        assert_eq!(
-            replay[0].pointer("/results/0/file_id"),
-            Some(&Value::String("file-a".to_owned()))
-        );
-        assert_eq!(
-            replay[4].pointer("/results/0/file_id"),
-            Some(&Value::String("file-b".to_owned()))
-        );
-        assert_eq!(replay[3]["id"], "intervening");
-        assert_eq!(replay[1]["call_id"], "file_search_0_0123456789abcdef");
-        assert_eq!(replay[5]["call_id"], "file_search_1_fedcba9876543210");
-    }
-
-    #[test]
-    fn private_fingerprint_matches_an_untruncated_public_id() {
-        let public_id = format!("fs-{}", "x".repeat(512));
-        let fingerprint = local_file_search_public_id_fingerprint(&public_id);
-        let truncated_id: String = public_id.chars().take(256).collect();
-        let hidden = serde_json::json!([
-            {
-                "type":"file_search_call","id":truncated_id,
-                LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD:fingerprint,
-                "status":"completed","results":[]
-            },
-            {
-                "type":"function_call","call_id":"file_search_0_0123456789abcdef","name":"file_search",
-                "arguments":LOCAL_FILE_SEARCH_MARKER_ARGUMENTS,"status":"completed"
-            },
-            {"type":"function_call_output","call_id":"file_search_0_0123456789abcdef","output":""}
-        ]);
-        let public = vec![serde_json::json!({"type":"file_search_call","id":public_id,"status":"completed"})];
-
-        let replay = preserve_local_file_search_markers(public, &hidden, None);
-
-        assert_eq!(replay.len(), 3);
-        assert_eq!(replay[0][LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD], fingerprint);
-    }
-
-    #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "covers both current and legacy public marker lookalikes across two syncs"
-    )]
-    fn public_marker_lookalikes_remain_stable_across_repeated_syncs() {
-        let req = crate::test_utils::make_request(http::Method::POST, "/v1/conversations/conv/items");
-        let ctx = crate::test_utils::make_filter_context(&req);
-        let public = vec![
-            serde_json::json!({
-                "type":"file_search_call","id":"fs-public","status":"completed","results":[],
-                LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD:local_file_search_public_id_fingerprint("fs-public")
-            }),
-            serde_json::json!({
-                "type":"function_call","id":"fc-public","call_id":"file_search_0_0123456789abcdef",
-                "name":"file_search","arguments":LOCAL_FILE_SEARCH_MARKER_ARGUMENTS,"status":"completed"
-            }),
-            serde_json::json!({
-                "type":"function_call_output","id":"fco-public","call_id":"file_search_0_0123456789abcdef",
-                "output":""
-            }),
-            serde_json::json!({
-                "type":"file_search_call","id":"fs-legacy","status":"completed","results":[]
-            }),
-            serde_json::json!({
-                "type":"function_call","id":"fc-legacy","call_id":"legacy","name":"file_search",
-                "arguments":"{}","status":"completed"
-            }),
-            serde_json::json!({
-                "type":"function_call_output","id":"fco-legacy","call_id":"legacy","output":""
-            }),
-        ];
-        let normalized: Vec<_> = public
-            .into_iter()
-            .map(|item| normalize_item(&ctx, item).expect("public item must normalize").1)
-            .collect();
-
-        let first = preserve_local_file_search_markers(normalized.clone(), &Value::Null, None);
-        let second = preserve_local_file_search_markers(normalized.clone(), &Value::Array(first), None);
-
-        assert_eq!(second, normalized);
-        assert!(
-            second
-                .iter()
-                .all(|item| item.get(LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD).is_none())
-        );
-    }
-
-    #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "constructs two concurrent persisted marker overlays"
-    )]
-    async fn concurrent_marker_overlays_retry_without_losing_provenance() {
-        use crate::store::SqliteResponseStore;
-
-        let store = SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", Some("items"))
-            .await
-            .expect("store must initialize");
-        let conversation = ConversationRecord {
-            conversation_id: "conv-race".to_owned(),
-            tenant_id: "tenant".to_owned(),
-            created_at: 1,
-            metadata: serde_json::json!({}),
-            messages: serde_json::json!([]),
-        };
-        ConversationItemStore::upsert_conversation(&store, &conversation)
-            .await
-            .expect("conversation must persist");
-        let public_ids = ["fs-a", "fs-b"];
-        let rows: Vec<_> = public_ids
-            .iter()
-            .enumerate()
-            .map(|(position, id)| ConversationItemRecord {
-                item_id: (*id).to_owned(),
-                tenant_id: "tenant".to_owned(),
-                conversation_id: "conv-race".to_owned(),
-                item_data: serde_json::json!({"type":"file_search_call","id":id,"status":"completed"}),
-                created_at: 1,
-                position: i64::try_from(position).expect("position must fit"),
-            })
-            .collect();
-        store
-            .create_conversation_items(&rows)
-            .await
-            .expect("public rows must persist");
-        let first_snapshot = ConversationItemStore::get_conversation(&store, "tenant", "conv-race")
-            .await
-            .expect("read must succeed")
-            .expect("conversation must exist");
-        let second_snapshot = ConversationItemStore::get_conversation(&store, "tenant", "conv-race")
-            .await
-            .expect("read must succeed")
-            .expect("conversation must exist");
-        let overlay = |id: &str| {
-            let call_id = if id == "fs-a" {
-                "file_search_0_0123456789abcdef"
-            } else {
-                "file_search_1_fedcba9876543210"
-            };
-            serde_json::json!([
-                {
-                    "type":"file_search_call","id":id,
-                    LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD:local_file_search_public_id_fingerprint(id),
-                    "status":"completed","results":[]
-                },
-                {
-                    "type":"function_call","call_id":call_id,"name":"file_search",
-                    "arguments":LOCAL_FILE_SEARCH_MARKER_ARGUMENTS,"status":"completed"
-                },
-                {"type":"function_call_output","call_id":call_id,"output":""}
-            ])
-        };
-        let overlay_a = overlay("fs-a");
-        let overlay_b = overlay("fs-b");
-
-        let (first, second) = tokio::join!(
-            sync_conversation_messages_with_overlay(&store, first_snapshot, &overlay_a),
-            sync_conversation_messages_with_overlay(&store, second_snapshot, &overlay_b)
-        );
-        first.expect("first overlay must sync");
-        second.expect("second overlay must retry and sync");
-        let final_record = ConversationItemStore::get_conversation(&store, "tenant", "conv-race")
-            .await
-            .expect("read must succeed")
-            .expect("conversation must exist");
-        let messages = final_record.messages.as_array().expect("messages must be an array");
-        assert_eq!(messages.len(), 6);
-        assert_eq!(
-            messages.iter().filter(|item| item["type"] == "function_call").count(),
-            2
-        );
-    }
 
     // -------------------------------------------------------------------------
     // store_error_response

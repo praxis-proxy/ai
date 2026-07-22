@@ -24,8 +24,6 @@ use super::{
     config::{FileSearchFilterConfig, build_config},
     *,
 };
-use crate::openai::responses::local_file_search_marker_triplet;
-
 // -----------------------------------------------------------------------------
 // Configuration and transport validation
 // -----------------------------------------------------------------------------
@@ -323,7 +321,7 @@ fn plan_bounds_owned_inputs_but_accounts_for_every_store() {
 }
 
 #[test]
-fn synthetic_bridge_call_ids_are_bounded_and_iteration_specific() {
+fn synthetic_bridge_call_ids_are_bounded_and_response_specific() {
     let item = json!({"id":"x".repeat(100_000)});
     let first = model_context_messages(&item, usize::MAX, stable_call_hash(&["resp-a"]), "query", "output");
     let second = model_context_messages(&item, usize::MAX, stable_call_hash(&["resp-b"]), "query", "output");
@@ -334,34 +332,6 @@ fn synthetic_bridge_call_ids_are_bounded_and_iteration_specific() {
     assert!(first_id.len() <= 64);
     assert_eq!(first[1]["call_id"], first_id);
     assert_ne!(first_id, second_id);
-}
-
-#[test]
-fn continuation_allowed_tools_relaxes_mode_without_widening_scope() {
-    let original = json!({
-        "type": "allowed_tools",
-        "mode": "required",
-        "tools": [
-            {"type": "file_search"},
-            {"type": "web_search_preview"}
-        ]
-    });
-
-    let continuation = continuation_tool_choice(&original);
-
-    assert_eq!(continuation["type"], "allowed_tools");
-    assert_eq!(continuation["mode"], "auto");
-    assert_eq!(continuation["tools"], original["tools"]);
-}
-
-#[test]
-fn continuation_forced_file_search_does_not_enable_a_second_tool() {
-    let continuation = continuation_tool_choice(&json!({"type": "file_search"}));
-
-    assert_eq!(continuation["type"], "allowed_tools");
-    assert_eq!(continuation["mode"], "auto");
-    assert_eq!(continuation["tools"], json!([{"type": "file_search"}]));
-    assert_eq!(continuation["tools"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -462,49 +432,6 @@ fn bridge_budget_reserves_nonmonotonic_outer_wrapper_before_chunks() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "constructs competing persisted metadata candidates"
-)]
-fn persisted_budget_skips_empty_expensive_mapping_for_later_fitting_result() {
-    let results = [
-        SearchResult {
-            attributes: None,
-            content: Vec::new(),
-            file_id: "file-empty".to_owned(),
-            filename: "e".repeat(1_024),
-            score: 1.0,
-        },
-        SearchResult {
-            attributes: None,
-            content: vec![ContentChunk {
-                _chunk_type: ContentChunkType::Text,
-                text: "retained".to_owned(),
-            }],
-            file_id: "file-later".to_owned(),
-            filename: "later.txt".to_owned(),
-            score: 0.9,
-        },
-    ];
-    let expected_files = HashMap::from([("file-later".to_owned(), "later.txt".to_owned())]);
-    let metadata_budget = citation_metadata_bytes(&canonical_citation_results(&expected_files)).unwrap();
-
-    let budgeted = format_test_bridge_with_budgets(
-        &results,
-        "query",
-        "<|{file_id}|>{content}",
-        "{results}",
-        4_096,
-        metadata_budget,
-        1,
-    );
-
-    assert!(budgeted.model_messages.is_some());
-    assert_eq!(budgeted.citation_files, expected_files);
-    assert_eq!(budgeted.persisted_metadata_bytes, metadata_budget);
-}
-
-#[test]
 fn model_facing_query_join_is_bounded() {
     let queries = vec!["a".repeat(40_000), "b".repeat(40_000)];
     let (joined, truncated) = join_queries_bounded(&queries);
@@ -515,36 +442,14 @@ fn model_facing_query_join_is_bounded() {
 }
 
 #[test]
-fn continuation_commit_appends_only_the_new_output_suffix() {
-    let prior = json!({"type":"reasoning","id":"rs-prior","summary":[]});
-    let current = json!({"type":"message","id":"msg-current","role":"assistant","content":[]});
-    let mut state = ResponsesState {
-        continuation_output_count: 1,
-        messages: vec![prior.clone()],
-        persisted_messages: vec![prior.clone()],
-        response_object: json!({"output":[prior.clone(), current.clone()]}),
-        ..Default::default()
-    };
-
-    commit_current_output(&mut state, vec![]);
-
-    assert_eq!(state.messages, vec![prior.clone(), current.clone()]);
-    assert_eq!(state.persisted_messages, vec![prior, current]);
-    assert_eq!(state.continuation_output_count, state.output_items().len());
-    assert_eq!(state.iteration, 0);
-    assert_eq!(state.tool_choice, "auto");
-}
-
-#[test]
-fn continuation_output_is_sized_before_ledger_commit() {
-    let mut state = ResponsesState {
+fn response_output_is_bounded_after_search_formatting() {
+    let state = ResponsesState {
         response_object: json!({"id":"resp","output":[{"type":"message","content":"x".repeat(200)}]}),
         ..Default::default()
     };
 
-    assert!(!continuation_response_fits(&state, 128));
-    state.replace_output_items(vec![json!({"type":"message","content":"ok"})]);
-    assert!(continuation_response_fits(&state, 128));
+    assert!(!response_fits(&state, 128));
+    assert!(response_fits(&state, 1_024));
 }
 
 #[tokio::test]
@@ -628,7 +533,6 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     state
         .messages
         .push(json!({"type":"message","id":"input-1","role":"user","content":"search"}));
-    state.persisted_messages = state.messages.clone();
     state.response_object = json!({"id":"resp-1","output":output});
     let mut ctx = make_context(Some(state));
 
@@ -639,16 +543,11 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.output_items()[1]["status"], "completed");
     assert_eq!(state.messages.iter().filter(|item| item["id"] == "mcp-list").count(), 0);
-    assert_eq!(item_ids(&state.messages), vec!["input-1", "rs-1", "msg-1"]);
-    assert_eq!(
-        item_ids(&state.persisted_messages),
-        vec!["input-1", "rs-1", "fs-1", "mcp-list", "msg-1"]
-    );
+    assert_eq!(item_ids(&state.messages), vec!["input-1"]);
     assert_eq!(
         state.response_object["output"],
         Value::Array(state.output_items().to_vec())
     );
-    assert_eq!(state.continuation_output_count, state.output_items().len());
     assert_eq!(
         state.citation_files.get("file-a").map(String::as_str),
         Some("report.pdf")
@@ -664,7 +563,6 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     assert!(model_output.contains("<|file-a|>"));
     assert!(model_output.ends_with("END"));
     let message_len = state.messages.len();
-    let persisted_len = state.persisted_messages.len();
 
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
@@ -672,14 +570,13 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     ));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.messages.len(), message_len);
-    assert_eq!(state.persisted_messages.len(), persisted_len);
 }
 
 #[tokio::test]
-async fn local_calls_keep_public_ids_and_store_bounded_fingerprints() {
+async fn local_calls_keep_public_ids() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.8, "A"));
     let filter = make_filter(server.port, "");
-    let long_id = format!("fs-{}", "x".repeat(MAX_PERSISTED_CALL_ID_BYTES + 32));
+    let long_id = format!("fs-{}", "x".repeat(512));
     let output = vec![
         json!({"type":"file_search_call","status":"searching","queries":["missing id"]}),
         json!({"type":"file_search_call","id":long_id,"status":"searching","queries":["long id"]}),
@@ -696,125 +593,6 @@ async fn local_calls_keep_public_ids_and_store_bounded_fingerprints() {
     let generated_id = state.output_items()[0]["id"].as_str().unwrap();
     assert!(generated_id.starts_with("fs_"));
     assert_eq!(state.output_items()[1]["id"], long_id);
-    let private_calls: Vec<_> = state
-        .persisted_messages
-        .iter()
-        .filter(|item| item["type"] == "file_search_call")
-        .collect();
-    assert_eq!(private_calls[0]["id"], generated_id);
-    assert!(private_calls[1]["id"].as_str().unwrap().len() <= MAX_PERSISTED_CALL_ID_BYTES);
-    assert_eq!(
-        private_calls[1][LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD],
-        local_file_search_public_id_fingerprint(&long_id)
-    );
-}
-
-#[test]
-fn generated_call_ids_are_included_in_mandatory_persistence_admission() {
-    let output = (0..16)
-        .map(|_| json!({"type":"file_search_call","status":"searching","queries":["query"]}))
-        .collect();
-    let mut state = state_with(&["vs-a"], output);
-    state.response_object["id"] = json!("resp-persistence-admission");
-    let plan = build_search_plan(&state);
-    let response_identity_hash = stable_call_hash(&["resp-persistence-admission"]);
-
-    let admitted_bytes =
-        prepare_persisted_base_bytes(&mut state, response_identity_hash).expect("mandatory provenance must fit");
-    let mut actual = Vec::new();
-    for call in &plan.calls {
-        let item = &state.output_items()[call.output_index];
-        let model_messages = model_context_messages(item, call.output_index, response_identity_hash, "query", "");
-        actual.push(persisted_file_search_item(item, "completed", Vec::new()));
-        actual.extend(persisted_bridge_marker(&model_messages));
-    }
-    let actual_bytes = bounded_json_size(&actual, usize::MAX)
-        .unwrap()
-        .expect("mandatory history must serialize");
-
-    assert!(admitted_bytes >= actual_bytes);
-    assert!(state.output_items().iter().all(|item| item["id"].is_string()));
-}
-
-#[test]
-fn generated_call_ids_cannot_push_persisted_metadata_over_the_hard_limit() {
-    fn result(index: usize, filename: String) -> SearchResult {
-        SearchResult {
-            attributes: None,
-            content: vec![ContentChunk {
-                _chunk_type: ContentChunkType::Text,
-                text: "x".to_owned(),
-            }],
-            file_id: format!("file-{index:04x}{}", "a".repeat(503)),
-            filename,
-            score: 1.0,
-        }
-    }
-
-    let max_filename = "\"".repeat(1_024);
-    let tuned_filename = format!("{}a", "\"".repeat(19));
-    let max_files = HashMap::from([(format!("file-{:04x}{}", 0, "a".repeat(503)), max_filename.clone())]);
-    let tuned_files = HashMap::from([(format!("file-{:04x}{}", 0, "a".repeat(503)), tuned_filename.clone())]);
-    assert_eq!(
-        citation_metadata_bytes(&canonical_citation_results(&max_files)),
-        Some(2_628)
-    );
-    assert_eq!(
-        citation_metadata_bytes(&canonical_citation_results(&tuned_files)),
-        Some(619)
-    );
-
-    let output = (0..16)
-        .map(|_| json!({"type":"file_search_call","status":"searching","queries":["query"]}))
-        .collect();
-    let mut state = state_with(&["vs-a"], output);
-    state.response_object["id"] = json!("resp-exact-persistence-boundary");
-    let plan = build_search_plan(&state);
-    let mut batch = SearchBatch::new(plan.calls.len());
-    let mut result_index = 0_usize;
-    for results in batch.results_by_call.iter_mut().take(15) {
-        for _ in 0..50 {
-            results.push(result(result_index, max_filename.clone()));
-            result_index = result_index.saturating_add(1);
-        }
-    }
-    let final_results = &mut batch.results_by_call[15];
-    for _ in 0..45 {
-        final_results.push(result(result_index, max_filename.clone()));
-        result_index = result_index.saturating_add(1);
-    }
-    final_results.push(result(result_index, tuned_filename));
-    result_index = result_index.saturating_add(1);
-    final_results.push(result(result_index, max_filename));
-
-    let filter = make_concrete_filter(
-        1,
-        "annotation_template: '<|{file_id}|>{content}'\ncontext_template: '{results}'\n",
-    );
-    assert!(filter.apply_batch(&mut state, &plan, &batch).is_ok());
-    drop(batch);
-
-    let persistence_start = state
-        .local_file_search_persistence_start
-        .expect("local persistence suffix should be recorded");
-    let persisted_bytes = bounded_json_size(
-        &state.persisted_messages[persistence_start..],
-        MAX_TOTAL_PERSISTED_LOCAL_BYTES,
-    )
-    .unwrap()
-    .expect("persisted local history must fit its hard limit");
-    let retained_results: usize = state.persisted_messages[persistence_start..]
-        .iter()
-        .filter(|item| item["type"] == "file_search_call")
-        .filter_map(|item| item["results"].as_array())
-        .map(Vec::len)
-        .sum();
-
-    assert!(persisted_bytes <= MAX_TOTAL_PERSISTED_LOCAL_BYTES);
-    assert_eq!(
-        retained_results, 795,
-        "the post-identity budget must truncate the tuned boundary entry"
-    );
 }
 
 #[tokio::test]
@@ -839,44 +617,6 @@ async fn mixed_valid_and_empty_calls_are_both_terminalized() {
     assert_eq!(state.output_items()[1]["status"], "incomplete");
     assert!(state.output_items()[0].get("results").is_none());
     assert!(state.output_items()[1].get("results").is_none());
-    let retained = private_results(state, "same");
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0]["file_id"], "file-a");
-    assert_eq!(retained[0]["text"], "", "raw result text must not be persisted");
-    assert_eq!(
-        state
-            .persisted_messages
-            .iter()
-            .filter(|item| item["type"] == "file_search_call")
-            .count(),
-        2,
-        "duplicate public IDs must not collapse private calls"
-    );
-    assert_eq!(
-        state
-            .persisted_messages
-            .iter()
-            .filter(|item| item["type"] == "function_call_output")
-            .count(),
-        2,
-        "each local call needs one bounded replay marker"
-    );
-    assert!(
-        state
-            .persisted_messages
-            .iter()
-            .filter(|item| item["type"] == "function_call_output")
-            .all(|item| item["output"] == ""),
-        "persisted markers must not retain model context"
-    );
-    assert!(
-        state
-            .persisted_messages
-            .iter()
-            .filter(|item| item["type"] == "function_call")
-            .all(|item| item["arguments"] == LOCAL_FILE_SEARCH_MARKER_ARGUMENTS),
-        "persisted markers must carry the local sentinel"
-    );
     assert_eq!(
         state
             .messages
@@ -978,15 +718,6 @@ async fn pending_call_cap_terminalizes_excess_and_preserves_duplicate_siblings()
     );
     assert_eq!(
         state
-            .persisted_messages
-            .iter()
-            .filter(|item| item["type"] == "file_search_call")
-            .count(),
-        MAX_PENDING_CALLS + 2,
-        "every local call needs private omission provenance"
-    );
-    assert_eq!(
-        state
             .messages
             .iter()
             .filter(|item| item["type"] == "function_call_output")
@@ -1004,28 +735,22 @@ async fn pending_call_cap_terminalizes_excess_and_preserves_duplicate_siblings()
     );
     assert_eq!(
         state
-            .persisted_messages
-            .windows(3)
-            .filter(|window| local_file_search_marker_triplet(window).is_some())
+            .output_items()
+            .iter()
+            .filter(|item| item["id"] == "duplicate")
             .count(),
-        MAX_PENDING_CALLS + 2,
-        "planned and capped calls must carry the same replay omission marker"
-    );
-    assert_eq!(
-        state.messages.iter().filter(|item| item["id"] == "duplicate").count(),
         2
     );
     assert!(server.requests().is_empty());
 }
 
 #[tokio::test]
-async fn max_tool_calls_limits_pending_execution_across_iterations() {
+async fn max_tool_calls_counts_completed_calls_before_pending_execution() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let prior = json!({"type":"apply_patch_call","id":"ap-prior","status":"completed"});
     let pending = json!({"type":"file_search_call","id":"fs-new","status":"searching","queries":["q"]});
     let mut state = state_with(&["vs-a"], vec![prior, pending]);
-    state.continuation_output_count = 1;
     state.max_tool_calls = Some(1);
     let mut ctx = make_context(Some(state));
 
@@ -1072,7 +797,6 @@ async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
     let mcp = json!({"type":"mcp_call","id":"mcp-prior","status":"completed"});
     let pending = json!({"type":"file_search_call","id":"fs-new","status":"searching","queries":["q"]});
     let mut state = state_with(&["vs-a"], vec![mcp, pending]);
-    state.continuation_output_count = 1;
     state.max_tool_calls = Some(1);
     let mut ctx = make_context(Some(state));
 
@@ -1102,48 +826,8 @@ async fn no_store_ids_terminalizes_calls_and_replays_siblings() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.output_items()[1]["status"], "incomplete");
     assert!(state.output_items()[1].get("results").is_none());
-    assert_eq!(private_results(state, "fs-1").len(), 0);
-    assert_eq!(state.messages.len(), 3);
+    assert_eq!(state.messages.len(), 2);
     assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn hosted_output_siblings_are_persisted_but_not_replayed_immediately() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let hosted = vec![
-        json!({"type":"file_search_call","id":"fs-native","status":"completed"}),
-        json!({"type":"web_search_call","id":"ws-native","status":"completed"}),
-        json!({"type":"code_interpreter_call","id":"ci-native","status":"completed"}),
-        json!({"type":"computer_call","id":"computer-native","status":"completed"}),
-        json!({"type":"mcp_call","id":"mcp-native","status":"completed"}),
-        json!({"type":"mcp_list_tools","id":"mcp-list-native","tools":[]}),
-    ];
-    let pending = json!({"type":"file_search_call","id":"fs-local","status":"searching","queries":["q"]});
-    let mut output = hosted.clone();
-    output.push(pending);
-    let mut ctx = make_context(Some(state_with(&["vs-a"], output)));
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-
-    for sibling in hosted {
-        assert!(!state.messages.contains(&sibling));
-        assert_eq!(
-            state.persisted_messages.iter().filter(|item| **item == sibling).count(),
-            1
-        );
-    }
-    assert!(
-        state
-            .messages
-            .iter()
-            .all(|item| item.get("id").and_then(Value::as_str) != Some("fs-local")),
-        "locally executed calls are represented by their function bridge"
-    );
 }
 
 #[tokio::test]
@@ -1264,7 +948,6 @@ async fn open_and_closed_failure_modes_are_distinct() {
     let state = open_ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.output_items()[0]["status"], "incomplete");
     assert!(state.output_items()[0].get("results").is_none());
-    assert!(private_results(state, "fs-1").is_empty());
     assert!(state.messages.iter().any(|item| item["type"] == "function_call_output"));
 }
 
@@ -1289,43 +972,9 @@ async fn aggregate_budget_stops_later_searches_and_marks_call_incomplete() {
     );
     assert_eq!(state.output_items()[0]["status"], "incomplete");
     assert!(state.output_items()[0].get("results").is_none());
-    let retained = private_results(state, "fs-1");
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0]["file_id"], "file-a");
-    assert_eq!(retained[0]["text"], "");
+    assert_eq!(state.citation_files.get("file-a").map(String::as_str), Some("a.txt"));
 }
 
-#[tokio::test]
-async fn hidden_search_context_is_not_persisted() {
-    let server = MockServer::json(200, &one_result("file-large", "large.txt", 0.9, &"x".repeat(100_000)));
-    let filter = make_filter(server.port, "");
-    let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    let persisted_bytes = serde_json::to_vec(&state.persisted_messages).unwrap().len();
-
-    assert!(state.messages.iter().any(|item| item["type"] == "function_call_output"));
-    let retained = private_results(state, "fs-1");
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0]["file_id"], "file-large");
-    assert_eq!(retained[0]["text"], "", "raw result text must not be persisted");
-    assert!(
-        state
-            .persisted_messages
-            .iter()
-            .filter(|item| item["type"] == "function_call_output")
-            .all(|item| item["output"] == ""),
-        "stored bridge output must remain constant-size"
-    );
-    assert!(
-        persisted_bytes < 4_096,
-        "hidden context must not consume rehydrate history budget"
-    );
-}
 
 #[tokio::test]
 async fn malformed_success_bodies_are_charged_to_the_aggregate_budget() {
@@ -1702,30 +1351,6 @@ fn format_test_bridge(
     context_template: &str,
     remaining_model_bytes: usize,
 ) -> BudgetedSearchResults {
-    format_test_bridge_with_budgets(
-        results,
-        query,
-        annotation_template,
-        context_template,
-        remaining_model_bytes,
-        MAX_TOTAL_PERSISTED_LOCAL_BYTES,
-        MAX_CITATION_FILES,
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "test helper exposes independent bridge budgets"
-)]
-fn format_test_bridge_with_budgets(
-    results: &[SearchResult],
-    query: &str,
-    annotation_template: &str,
-    context_template: &str,
-    remaining_model_bytes: usize,
-    remaining_persisted_metadata_bytes: usize,
-    max_new_citation_files: usize,
-) -> BudgetedSearchResults {
     let source_item = json!({
         "type": "file_search_call",
         "id": "fs-test",
@@ -1739,9 +1364,8 @@ fn format_test_bridge_with_budgets(
     };
     BridgeBudget {
         known_citation_files: &known_citation_files,
-        max_new_citation_files,
+        max_new_citation_files: MAX_CITATION_FILES,
         remaining_model_bytes,
-        remaining_persisted_metadata_bytes,
         source_item: &source_item,
         output_index: 0,
         query,
@@ -1808,15 +1432,6 @@ fn item_ids(items: &[Value]) -> Vec<&str> {
         .iter()
         .filter_map(|item| item.get("id").and_then(Value::as_str))
         .collect()
-}
-
-fn private_results<'a>(state: &'a ResponsesState, id: &str) -> &'a [Value] {
-    state
-        .persisted_messages
-        .iter()
-        .find(|item| item["type"] == "file_search_call" && item["id"] == id)
-        .and_then(|item| item["results"].as_array())
-        .map_or(&[], Vec::as_slice)
 }
 
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {

@@ -3,7 +3,7 @@
 
 # `openai_stream_events`
 
-Accumulates state from Responses API SSE and non-streaming JSON responses.
+Accumulates state from native Responses API SSE event streams.
 
 ## Configuration Notes
 

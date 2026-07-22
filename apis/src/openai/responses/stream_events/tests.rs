@@ -10,13 +10,10 @@
 )]
 
 use bytes::Bytes;
-use praxis_filter::{BodyMode, FilterAction, FilterEntry, FilterPipeline, HttpFilter};
+use praxis_filter::{FilterAction, HttpFilter};
 use serde_json::json;
 
-use super::{
-    CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object,
-    has_identity_content_encoding, process_non_streaming_response,
-};
+use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object};
 use crate::{
     openai::{responses::state::ResponsesState, sse::SseFrameParser},
     test_utils::{make_filter_context, make_request},
@@ -33,12 +30,6 @@ fn make_armed_context() -> (Box<dyn HttpFilter>, praxis_filter::HttpFilterContex
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
     ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
-    ctx.extensions.insert(ResponsesState::from_request_body(json!({
-        "model": "gpt-4o",
-        "input": "preserve this input",
-        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
-        "stream": true,
-    })));
     ctx.current_filter_id = Some(0);
     (filter, ctx)
 }
@@ -153,6 +144,29 @@ async fn does_not_arm_for_non_responses_format() {
     );
 }
 
+#[tokio::test]
+async fn does_not_arm_for_other_responses_routes() {
+    for (method, path) in [
+        (http::Method::GET, "/v1/responses"),
+        (http::Method::POST, "/v1/responses/input_tokens"),
+    ] {
+        let filter = make_filter();
+        let req = make_request(method, path);
+        let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+        ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+        ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+        ctx.current_filter_id = Some(0);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.get_filter_state::<StreamEventsState>().is_none(),
+            "filter should not arm for {path}"
+        );
+    }
+}
+
 #[test]
 fn unarmed_filter_passes_through_body() {
     let filter = make_filter();
@@ -204,161 +218,7 @@ async fn terminal_event_writes_response_object() {
     assert_eq!(state.response_object["id"], "resp_123");
     assert_eq!(state.output_items().len(), 1);
     assert_eq!(state.usage["total_tokens"], 15);
-    assert_eq!(state.request_body["input"], "preserve this input");
-    assert_eq!(state.tools[0]["type"], "file_search");
     assert_eq!(ctx.get_metadata("responses.status"), Some("completed"),);
-}
-
-#[tokio::test]
-async fn non_streaming_json_uses_bounded_buffer_and_accumulates_state() {
-    let filter = make_filter();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
-    ctx.extensions.insert(ResponsesState::from_request_body(json!({
-        "model": "gpt-4o",
-        "input": "keep me",
-        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
-    })));
-    ctx.current_filter_id = Some(0);
-
-    let response = Box::leak(Box::new(crate::test_utils::make_response()));
-    response.headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json; charset=utf-8"),
-    );
-    ctx.response_header = Some(response);
-
-    filter.on_request(&mut ctx).await.unwrap();
-    assert!(ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING));
-    assert_eq!(
-        ctx.request_headers_to_set
-            .iter()
-            .find(|(name, _value)| name == http::header::ACCEPT_ENCODING)
-            .map(|(_name, value)| value),
-        Some(&http::HeaderValue::from_static("identity"))
-    );
-    filter.on_response(&mut ctx).await.unwrap();
-    assert_eq!(
-        ctx.response_body_mode,
-        BodyMode::StreamBuffer {
-            max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES),
-        },
-        "non-streaming JSON should be buffered with the shared JSON limit"
-    );
-
-    let response_body = json!({
-        "id": "resp_json",
-        "object": "response",
-        "status": "completed",
-        "model": "gpt-4o",
-        "created_at": 1_700_000_000,
-        "output": [
-            {"type": "reasoning", "id": "rs_1", "summary": []},
-            {"type": "file_search_call", "id": "fs_1", "status": "in_progress", "queries": ["query"]}
-        ],
-        "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
-    });
-    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
-    filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.response_object, response_body);
-    assert_eq!(state.output_items().len(), 2);
-    assert_eq!(state.usage["total_tokens"], 14);
-    assert_eq!(state.request_body["input"], "keep me");
-    assert_eq!(state.tools[0]["vector_store_ids"][0], "vs_1");
-    assert_eq!(ctx.get_metadata("responses.status"), Some("completed"));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(body.as_ref().unwrap()).unwrap(),
-        response_body,
-        "ordinary first-pass accumulation must not rewrite the response body"
-    );
-}
-
-#[tokio::test]
-async fn non_streaming_continuation_prepends_prior_output_exactly_once() {
-    let filter = make_filter();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "false");
-    let prior = json!({
-        "type": "file_search_call",
-        "id": "fs_1",
-        "status": "completed"
-    });
-    let mut state = ResponsesState::from_request_body(json!({"model":"gpt-4o","input":"search"}));
-    state.output_items_mut().push(prior.clone());
-    state.continuation_output_count = 1;
-    ctx.extensions.insert(state);
-    ctx.current_filter_id = Some(0);
-
-    let response = Box::leak(Box::new(crate::test_utils::make_response()));
-    response.headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
-    response
-        .headers
-        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("999"));
-    response
-        .headers
-        .insert(http::header::ETAG, http::HeaderValue::from_static("stale"));
-    ctx.response_header = Some(response);
-
-    filter.on_request(&mut ctx).await.unwrap();
-    filter.on_response(&mut ctx).await.unwrap();
-    let backend_response = json!({
-        "id":"resp-final",
-        "status":"completed",
-        "output":[{
-            "type":"message",
-            "id":"msg-final",
-            "role":"assistant",
-            "content":[{"type":"output_text","text":"Final answer","annotations":[]}]
-        }]
-    });
-    let mut body = Some(Bytes::from(serde_json::to_vec(&backend_response).unwrap()));
-
-    filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-
-    let merged: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    let output = merged["output"].as_array().unwrap();
-    assert_eq!(output.len(), 2, "prior and final output should both be visible");
-    assert_eq!(output[0], prior, "prior continuation output should remain first");
-    assert_eq!(output[1], backend_response["output"][0]);
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.response_object, merged);
-    assert_eq!(state.output_items(), output.as_slice());
-    assert!(
-        ctx.response_header
-            .as_ref()
-            .unwrap()
-            .headers
-            .get(http::header::CONTENT_LENGTH)
-            .is_none(),
-        "continuity rewriting invalidates the original body length"
-    );
-    assert!(
-        ctx.response_header
-            .as_ref()
-            .unwrap()
-            .headers
-            .get(http::header::ETAG)
-            .is_none(),
-        "continuity rewriting invalidates representation validators"
-    );
-
-    filter.on_response(&mut ctx).await.unwrap();
-    filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    let repeated: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert_eq!(
-        repeated["output"].as_array().unwrap().len(),
-        2,
-        "repeated accumulation must not duplicate prior output"
-    );
 }
 
 #[test]
@@ -401,478 +261,6 @@ fn response_accumulation_sums_usage_across_iterations() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.response_object["usage"], state.usage);
     assert_eq!(state.usage["total_tokens"], 23);
-}
-
-#[test]
-fn continuation_restores_original_public_tool_policy() {
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    let mut state = ResponsesState::from_request_body(json!({
-        "model":"gpt-4o",
-        "input":"search",
-        "tool_choice":{"type":"file_search"},
-        "max_tool_calls":3
-    }));
-    state.iteration = 1;
-    state.continuation_tool_choice = Some(json!("auto"));
-    ctx.extensions.insert(state);
-    let mut body = Some(Bytes::from_static(
-        br#"{"id":"resp","output":[],"tool_choice":"auto","max_tool_calls":1}"#,
-    ));
-
-    process_non_streaming_response(&mut ctx, &mut body).unwrap();
-
-    let public: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(public["tool_choice"], json!({"type":"file_search"}));
-    assert_eq!(public["max_tool_calls"], 3);
-    assert_eq!(state.response_object["tool_choice"], public["tool_choice"]);
-    assert_eq!(state.response_object["max_tool_calls"], 3);
-}
-
-#[test]
-fn continuation_restores_effective_auto_when_client_omitted_tool_choice() {
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    let mut state = ResponsesState::from_request_body(json!({
-        "model":"gpt-4o",
-        "input":"search",
-        "max_tool_calls":1
-    }));
-    state.iteration = 1;
-    state.continuation_tool_choice = Some(json!("none"));
-    ctx.extensions.insert(state);
-    let mut body = Some(Bytes::from_static(br#"{"id":"resp","output":[],"tool_choice":"none"}"#));
-
-    process_non_streaming_response(&mut ctx, &mut body).unwrap();
-
-    let public: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(public["tool_choice"], "auto");
-    assert_eq!(public["max_tool_calls"], 1);
-    assert!(!state.tool_choice_present);
-    assert_eq!(state.tool_choice, "auto");
-}
-
-#[test]
-fn continuation_restores_canonical_response_tool_choice_from_request_shorthand() {
-    let cases = [
-        (json!(null), json!("auto")),
-        (
-            json!({
-                "type":"allowed_tools",
-                "tools":[{"type":"function","name":"lookup"}]
-            }),
-            json!({
-                "type":"allowed_tools",
-                "mode":"auto",
-                "tools":[{"type":"function","name":"lookup"}]
-            }),
-        ),
-    ];
-    for (request_choice, expected) in cases {
-        let req = make_request(http::Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-        let mut state = ResponsesState::from_request_body(json!({
-            "model":"gpt-4o",
-            "input":"search",
-            "tool_choice":request_choice
-        }));
-        state.iteration = 1;
-        state.continuation_tool_choice = Some(json!("none"));
-        ctx.extensions.insert(state);
-        let mut body = Some(Bytes::from_static(br#"{"id":"resp","output":[],"tool_choice":"none"}"#));
-
-        process_non_streaming_response(&mut ctx, &mut body).unwrap();
-
-        let public: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-        assert_eq!(public["tool_choice"], expected);
-        assert_eq!(
-            ctx.extensions.get::<ResponsesState>().unwrap().response_object["tool_choice"],
-            expected
-        );
-    }
-}
-
-#[test]
-fn response_accumulation_materializes_deferred_first_pass_history() {
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    let initial_input = json!([
-        {"type": "message", "role": "user", "content": "search the files"},
-        {"type": "message", "role": "assistant", "content": "prior context"}
-    ]);
-    ctx.extensions
-        .insert(ResponsesState::from_file_search_request_body(json!({
-            "model": "gpt-4.1",
-            "input": initial_input,
-            "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
-        })));
-
-    let response = json!({
-        "id": "resp_1",
-        "status": "completed",
-        "output": [{"type": "file_search_call", "id": "fs_1", "status": "in_progress"}]
-    });
-    assert!(!accumulate_response_object(&mut ctx, response, None));
-
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(!state.has_deferred_history());
-    assert_eq!(state.input, initial_input.as_array().unwrap().clone());
-    assert_eq!(state.messages, initial_input.as_array().unwrap().clone());
-    assert_eq!(state.persisted_messages, state.messages);
-    assert_eq!(state.request_body["model"], "gpt-4.1");
-    assert!(state.request_body.get("input").is_none());
-}
-
-#[tokio::test]
-async fn non_streaming_json_rewrites_file_citations_consistently() {
-    let filter = make_filter();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
-    let mut state = ResponsesState::from_request_body(json!({"model":"gpt-4o","input":"search"}));
-    state
-        .citation_files
-        .insert("file-a".to_owned(), "report.pdf".to_owned());
-    ctx.extensions.insert(state);
-    ctx.current_filter_id = Some(0);
-
-    let response = Box::leak(Box::new(crate::test_utils::make_response()));
-    response.headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
-    response
-        .headers
-        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("999"));
-    response
-        .headers
-        .insert(http::header::ETAG, http::HeaderValue::from_static("stale"));
-    response
-        .headers
-        .insert("content-digest", http::HeaderValue::from_static("sha-256=:stale:"));
-    ctx.response_header = Some(response);
-
-    filter.on_response(&mut ctx).await.unwrap();
-    assert!(
-        ctx.response_headers_modified,
-        "rewritten response headers should be marked modified"
-    );
-    assert!(
-        ctx.response_header
-            .as_ref()
-            .unwrap()
-            .headers
-            .get(http::header::ETAG)
-            .is_none()
-    );
-    assert!(
-        ctx.response_header
-            .as_ref()
-            .unwrap()
-            .headers
-            .get("content-digest")
-            .is_none()
-    );
-
-    let response_body = json!({
-        "id":"resp-citation",
-        "status":"completed",
-        "output":[{
-            "type":"message",
-            "id":"msg-1",
-            "role":"assistant",
-            "content":[{
-                "type":"output_text",
-                "text":"See source <|file-a|>.",
-                "annotations":[{"type":"url_citation","start_index":0,"end_index":3,"url":"https://example.com","title":"existing"}]
-            }]
-        }]
-    });
-    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
-    filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-
-    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    let text = &rewritten["output"][0]["content"][0];
-    assert_eq!(text["text"], "See source.");
-    assert_eq!(text["annotations"].as_array().unwrap().len(), 2);
-    assert_eq!(text["annotations"][1]["type"], "file_citation");
-    assert_eq!(text["annotations"][1]["file_id"], "file-a");
-    assert_eq!(text["annotations"][1]["filename"], "report.pdf");
-    assert_eq!(text["annotations"][1]["index"], 10);
-
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.response_object, rewritten);
-    assert_eq!(state.output_items(), rewritten["output"].as_array().unwrap());
-    assert!(
-        ctx.response_header
-            .as_ref()
-            .unwrap()
-            .headers
-            .get(http::header::CONTENT_LENGTH)
-            .is_none(),
-        "the protocol layer must frame the rewritten buffered response"
-    );
-}
-
-#[tokio::test]
-async fn pipeline_open_failure_mode_cannot_bypass_citation_rewrite_failure() {
-    let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
-        "
-        - filter: openai_stream_events
-          failure_mode: open
-        ",
-    )
-    .unwrap();
-    let registry = crate::test_utils::make_ai_registry();
-    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "false");
-    let mut state = ResponsesState::from_request_body(json!({
-        "model":"gpt-4o",
-        "input":"search",
-        "tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]
-    }));
-    state
-        .citation_files
-        .insert("file-a".to_owned(), "report.pdf".to_owned());
-    ctx.extensions.insert(state);
-
-    assert!(matches!(
-        pipeline.execute_http_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let response = Box::leak(Box::new(crate::test_utils::make_response()));
-    response.headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
-    ctx.response_header = Some(response);
-    assert!(matches!(
-        pipeline.execute_http_response(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-
-    let backend = json!({
-        "id":"resp-citation-overflow",
-        "status":"completed",
-        "output":[{
-            "type":"message",
-            "role":"assistant",
-            "content":[{
-                "type":"output_text",
-                "text":"<|file-a|>".repeat(4_097),
-                "annotations":[]
-            }]
-        }]
-    });
-    let original = Bytes::from(serde_json::to_vec(&backend).unwrap());
-    let mut body = Some(original.clone());
-
-    let action = pipeline.execute_http_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(
-        matches!(&action, FilterAction::Reject(_)),
-        "rewrite failure must reject even when the pipeline failure mode is open"
-    );
-    let FilterAction::Reject(rejection) = action else {
-        return;
-    };
-    assert_eq!(rejection.status, 502);
-    assert_eq!(
-        body,
-        Some(original),
-        "the backend body must never be released after rejection"
-    );
-    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
-    assert_eq!(error["error"]["code"], "server_error");
-}
-
-#[tokio::test]
-async fn encoded_file_search_response_is_rejected_without_header_corruption() {
-    let filter = make_filter();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "false");
-    ctx.extensions.insert(ResponsesState::from_request_body(json!({
-        "model":"gpt-4o",
-        "input":"search",
-        "tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]
-    })));
-    ctx.current_filter_id = Some(0);
-
-    let response = Box::leak(Box::new(crate::test_utils::make_response()));
-    response.headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
-    response
-        .headers
-        .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
-    ctx.response_header = Some(response);
-
-    assert!(matches!(
-        filter.on_response(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert_eq!(
-        ctx.response_header
-            .as_ref()
-            .unwrap()
-            .headers
-            .get(http::header::CONTENT_ENCODING),
-        Some(&http::HeaderValue::from_static("gzip"))
-    );
-}
-
-#[test]
-fn content_encoding_requires_only_identity_across_all_values() {
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    let response = Box::leak(Box::new(crate::test_utils::make_response()));
-    response.headers.append(
-        http::header::CONTENT_ENCODING,
-        http::HeaderValue::from_static("identity"),
-    );
-    response
-        .headers
-        .append(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
-    ctx.response_header = Some(response);
-
-    assert!(
-        !has_identity_content_encoding(&ctx),
-        "a later non-identity header value must not bypass validation"
-    );
-
-    let headers = &mut ctx.response_header.as_mut().unwrap().headers;
-    headers.remove(http::header::CONTENT_ENCODING);
-    headers.insert(
-        http::header::CONTENT_ENCODING,
-        http::HeaderValue::from_static("identity, identity"),
-    );
-    assert!(
-        has_identity_content_encoding(&ctx),
-        "a list containing only identity tokens must be accepted"
-    );
-
-    let headers = &mut ctx.response_header.as_mut().unwrap().headers;
-    headers.insert(
-        http::header::CONTENT_ENCODING,
-        http::HeaderValue::from_static("identity, gzip"),
-    );
-    assert!(
-        !has_identity_content_encoding(&ctx),
-        "a non-identity token in one header value must be rejected"
-    );
-}
-
-#[tokio::test]
-async fn non_streaming_json_parse_failure_preserves_initialized_state() {
-    let filter = make_filter();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
-    ctx.extensions.insert(ResponsesState::from_request_body(json!({
-        "model": "gpt-4o",
-        "input": "keep me",
-        "tools": [{"type":"file_search","vector_store_ids":["vs_1"]}]
-    })));
-    ctx.current_filter_id = Some(0);
-
-    let response = Box::leak(Box::new(crate::test_utils::make_response()));
-    response.headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
-    ctx.response_header = Some(response);
-    filter.on_response(&mut ctx).await.unwrap();
-
-    let mut body = Some(Bytes::from_static(b"{not json"));
-    filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.request_body["input"], "keep me");
-    assert!(state.response_object.is_null());
-    assert_eq!(ctx.get_metadata("responses.response_parse_error"), Some("true"));
-}
-
-#[tokio::test]
-async fn continuation_rejects_empty_or_malformed_json_instead_of_losing_prior_output() {
-    for mut body in [None, Some(Bytes::new()), Some(Bytes::from_static(b"{not json"))] {
-        let filter = make_filter();
-        let req = make_request(http::Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
-        ctx.set_metadata("openai_responses_format.stream", "false");
-        let prior = json!({"type":"file_search_call","id":"fs-1","status":"completed"});
-        let mut state = ResponsesState::from_request_body(json!({"model":"gpt-4o","input":"search"}));
-        state.response_object = json!({"id":"resp-prior","output":[prior]});
-        state.continuation_output_count = 1;
-        ctx.extensions.insert(state);
-        ctx.current_filter_id = Some(0);
-        let response = Box::leak(Box::new(crate::test_utils::make_response()));
-        response.headers.insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("application/json"),
-        );
-        ctx.response_header = Some(response);
-
-        assert!(matches!(
-            filter.on_response(&mut ctx).await.unwrap(),
-            FilterAction::Continue
-        ));
-        assert!(matches!(
-            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
-            FilterAction::Reject(_)
-        ));
-        assert_eq!(ctx.get_metadata("responses.response_parse_error"), Some("true"));
-    }
-}
-
-#[tokio::test]
-async fn continuation_rejects_success_response_with_non_json_content_type() {
-    let filter = make_filter();
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "false");
-    let mut state = ResponsesState::from_request_body(json!({"model":"gpt-4o","input":"search"}));
-    state.response_object = json!({
-        "id":"resp-prior",
-        "output":[{"type":"file_search_call","id":"fs-1","status":"completed"}]
-    });
-    state.continuation_output_count = 1;
-    ctx.extensions.insert(state);
-    ctx.current_filter_id = Some(0);
-    let response = Box::leak(Box::new(crate::test_utils::make_response()));
-    response
-        .headers
-        .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/plain"));
-    ctx.response_header = Some(response);
-
-    let action = filter.on_response(&mut ctx).await.unwrap();
-
-    assert!(matches!(action, FilterAction::Reject(_)));
-}
-
-#[tokio::test]
-async fn complete_response_without_initialized_state_preserves_standalone_behavior() {
-    let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
-    ctx.extensions.remove::<ResponsesState>();
-
-    let completed =
-        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
-    let mut body = Some(make_sse_chunk("response.completed", &completed));
-    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.response_object["id"], "resp_1");
 }
 
 #[tokio::test]
@@ -1307,11 +695,9 @@ async fn error_event_does_not_mutate_state() {
     let result = filter.on_response_body(&mut ctx, &mut body, false);
 
     assert!(result.is_ok(), "error event should not fail the filter");
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.request_body["input"], "preserve this input");
     assert!(
-        state.response_object.is_null(),
-        "error event should not write a response"
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "error event should not create ResponsesState"
     );
 }
 

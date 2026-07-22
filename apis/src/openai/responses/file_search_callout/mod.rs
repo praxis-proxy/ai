@@ -24,7 +24,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::{
-    citations::{FormatLimits, FormatTemplates, format_search_results, prospective_citation_files},
+    citations::{FormatLimits, FormatTemplates, format_search_results},
     client::{
         FileSearchClient, FileSearchClientConfig, MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES,
         SearchBatch, SearchFailure, SearchSpec, request_error,
@@ -32,10 +32,8 @@ use self::{
     config::{FileSearchFilterConfig, build_config},
 };
 use crate::openai::responses::{
-    LOCAL_FILE_SEARCH_MARKER_ARGUMENTS, LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD, bounded_json_size,
-    canonical_openresponses_replay_item,
+    bounded_json_size,
     error::responses_error_rejection,
-    local_file_search_public_id_fingerprint,
     state::{MAX_CITATION_FILES, ResponsesState},
 };
 
@@ -55,18 +53,12 @@ const MAX_QUERIES_PER_CALL: usize = 64;
 /// inference round and are not persisted into rehydration history.
 const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 
-/// Maximum compact local replay history added by one continuation execution.
-const MAX_TOTAL_PERSISTED_LOCAL_BYTES: usize = 2_097_152;
-
-/// Maximum response item ID bytes retained in private persistence history.
-const MAX_PERSISTED_CALL_ID_BYTES: usize = 256;
-
 /// Executes pending file search calls against an OGX vector store API.
 ///
-/// First-pass streaming requests remain unchanged. A continuation carrying a
-/// pending file-search call or citation metadata is rejected when `stream=true`,
-/// because citation markers require an incremental SSE transformer.
-/// Non-streaming continuations support structured citation annotations.
+/// First-pass requests remain unchanged until core continuation support can
+/// re-enter the request phase with pending file-search calls. Re-entered
+/// streaming requests are rejected because citation markers require an
+/// incremental SSE transformer.
 pub struct FileSearchCalloutFilter {
     /// Per-result formatting template.
     annotation_template: String,
@@ -109,8 +101,8 @@ impl FileSearchCalloutFilter {
         }))
     }
 
-    /// Apply one completed search batch to response state.
-    #[expect(clippy::too_many_lines, reason = "sequential public and private state commit")]
+    /// Apply one completed search batch to request-scoped response state.
+    #[expect(clippy::too_many_lines, reason = "sequential result formatting and state commit")]
     fn apply_batch(
         &self,
         state: &mut ResponsesState,
@@ -123,23 +115,14 @@ impl FileSearchCalloutFilter {
             annotation: &self.annotation_template,
             context: &self.context_template,
         };
-        let mut applied_calls = Vec::with_capacity(plan.calls.len());
+        let mut model_messages = Vec::with_capacity(plan.calls.len().saturating_mul(2));
         let mut remaining_model_bytes = MAX_TOTAL_MODEL_CONTEXT_BYTES;
         let response_identity_hash = state
             .response_object
             .get("id")
             .and_then(Value::as_str)
             .map_or(FNV_OFFSET_BASIS, |response_id| stable_call_hash(&[response_id]));
-        let Some(persisted_base_bytes) = prepare_persisted_base_bytes(state, response_identity_hash) else {
-            return Err(FilterAction::Reject(responses_error_rejection(
-                502,
-                "server_error",
-                "openai_file_search_callout: local replay provenance exceeds the persistence byte limit",
-                false,
-            )));
-        };
-        let mut remaining_persisted_metadata_bytes =
-            MAX_TOTAL_PERSISTED_LOCAL_BYTES.saturating_sub(persisted_base_bytes);
+        ensure_pending_file_search_call_ids(state, response_identity_hash);
 
         for (call_index, call) in plan.calls.iter().enumerate() {
             let results = batch.results_by_call.get(call_index).map_or(&[][..], Vec::as_slice);
@@ -149,18 +132,14 @@ impl FileSearchCalloutFilter {
             };
             let BudgetedSearchResults {
                 citation_files,
-                citation_results,
-                model_messages,
-                persisted_marker,
+                model_messages: call_model_messages,
                 public_results,
                 serialized_bytes,
-                persisted_metadata_bytes,
                 truncated,
             } = BridgeBudget {
                 known_citation_files: &state.citation_files,
                 max_new_citation_files: MAX_CITATION_FILES.saturating_sub(state.citation_files.len()),
                 remaining_model_bytes,
-                remaining_persisted_metadata_bytes,
                 source_item,
                 output_index: call.output_index,
                 query: &query,
@@ -169,8 +148,6 @@ impl FileSearchCalloutFilter {
             }
             .format(results, expose_results);
             remaining_model_bytes = remaining_model_bytes.saturating_sub(serialized_bytes);
-            remaining_persisted_metadata_bytes =
-                remaining_persisted_metadata_bytes.saturating_sub(persisted_metadata_bytes);
 
             let complete = !call.queries.is_empty()
                 && call.planning_error.is_none()
@@ -179,7 +156,7 @@ impl FileSearchCalloutFilter {
                 && !failed_calls.contains(&call_index)
                 && !query_truncated
                 && !truncated
-                && model_messages.is_some();
+                && call_model_messages.is_some();
             let status = if complete { "completed" } else { "incomplete" };
 
             let mut applied = false;
@@ -193,12 +170,9 @@ impl FileSearchCalloutFilter {
                     object.remove("results");
                 }
 
-                applied_calls.push(AppliedCall {
-                    history_item: persisted_file_search_item(item, status, citation_results),
-                    model_messages,
-                    output_index: call.output_index,
-                    persisted_marker,
-                });
+                if let Some(messages) = call_model_messages {
+                    model_messages.extend(messages);
+                }
                 applied = true;
             }
             if applied {
@@ -206,8 +180,8 @@ impl FileSearchCalloutFilter {
             }
         }
 
-        applied_calls.extend(terminalize_unplanned_pending_calls(state, plan, response_identity_hash));
-        if !continuation_response_fits(state, MAX_JSON_BODY_BYTES) {
+        terminalize_unplanned_pending_calls(state, plan);
+        if !response_fits(state, MAX_JSON_BODY_BYTES) {
             return Err(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
@@ -215,14 +189,7 @@ impl FileSearchCalloutFilter {
                 false,
             )));
         }
-        if !applied_calls.is_empty() {
-            state
-                .local_file_search_persistence_start
-                .get_or_insert(state.persisted_messages.len());
-        }
-        commit_current_output(state, applied_calls);
-        state.iteration = state.iteration.saturating_add(1);
-        state.continuation_tool_choice = Some(continuation_tool_choice(&state.tool_choice));
+        state.messages.extend(model_messages);
         Ok(())
     }
 
@@ -375,24 +342,6 @@ struct PendingCall {
     scheduled_specs: usize,
 }
 
-/// Private history and model context for one completed public call.
-struct AppliedCall {
-    /// Public call retained in response history.
-    ///
-    /// Results remain absent unless the client requested them through
-    /// `include`; model-visible content is carried by `model_messages`.
-    history_item: Value,
-
-    /// Responses bridge consumed by the next inference round when it fits.
-    model_messages: Option<[Value; 2]>,
-
-    /// Position of the public call in `output_items`.
-    output_index: usize,
-
-    /// Constant-size replay marker retained without full model context.
-    persisted_marker: [Value; 2],
-}
-
 /// Exact execution-wide budget inputs for one synthetic model bridge.
 struct BridgeBudget<'a> {
     /// Citation mappings already retained by earlier calls.
@@ -403,9 +352,6 @@ struct BridgeBudget<'a> {
 
     /// Remaining compact JSON bytes for immediate model messages.
     remaining_model_bytes: usize,
-
-    /// Remaining compact JSON bytes for persisted citation metadata.
-    remaining_persisted_metadata_bytes: usize,
 
     /// Response item used to derive a deterministic bridge identity.
     source_item: &'a Value,
@@ -428,23 +374,14 @@ struct BudgetedSearchResults {
     /// Newly retained citation mappings.
     citation_files: HashMap<String, String>,
 
-    /// Canonical citation metadata retained privately.
-    citation_results: Vec<Value>,
-
     /// Model-visible context bridge when at least one context form fits.
     model_messages: Option<[Value; 2]>,
-
-    /// Constant-size persisted bridge identifier.
-    persisted_marker: [Value; 2],
 
     /// Canonical results optionally exposed in public output.
     public_results: Vec<Value>,
 
     /// Exact execution-wide byte charge.
     serialized_bytes: usize,
-
-    /// Exact persisted citation-metadata charge beyond the reserved base triplet.
-    persisted_metadata_bytes: usize,
 
     /// Whether formatting or budget bounds omitted context.
     truncated: bool,
@@ -461,21 +398,19 @@ impl BridgeBudget<'_> {
             self.query,
             "",
         );
-        let persisted_marker = persisted_bridge_marker(&empty_model_messages);
         let structural_bytes = bounded_json_size(&empty_model_messages, self.remaining_model_bytes)
             .ok()
             .flatten();
         let max_context_bytes = structural_bytes
             .and_then(|bytes| self.remaining_model_bytes.checked_sub(bytes))
             .unwrap_or_default();
-        let max_new_citation_files = self.fitting_citation_capacity(results);
         let formatted = format_search_results(
             results,
             self.query,
             self.templates,
             &FormatLimits {
                 max_model_context_bytes: max_context_bytes,
-                max_new_citation_files,
+                max_new_citation_files: self.max_new_citation_files,
                 known_citation_files: self.known_citation_files,
                 include_public_results,
             },
@@ -487,87 +422,30 @@ impl BridgeBudget<'_> {
             self.query,
             &formatted.model_context,
         );
-        let citation_results = canonical_citation_results(&formatted.citation_files);
-        let persisted_metadata_bytes = citation_metadata_bytes(&citation_results).unwrap_or(usize::MAX);
         let serialized_bytes = bounded_json_size(&model_messages, self.remaining_model_bytes)
             .ok()
             .flatten();
         let context_available = !formatted.model_context.is_empty() || !formatted.truncated;
         if let Some(serialized_bytes) = serialized_bytes
             && context_available
-            && persisted_metadata_bytes <= self.remaining_persisted_metadata_bytes
         {
             return BudgetedSearchResults {
                 citation_files: formatted.citation_files,
-                citation_results,
                 model_messages: Some(model_messages),
-                persisted_marker,
                 public_results: formatted.public_results,
                 serialized_bytes,
-                persisted_metadata_bytes,
                 truncated: formatted.truncated,
             };
         }
 
         BudgetedSearchResults {
             citation_files: HashMap::new(),
-            citation_results: Vec::new(),
             model_messages: None,
-            persisted_marker,
             public_results: formatted.public_results,
             serialized_bytes: 0,
-            persisted_metadata_bytes: 0,
             truncated: true,
         }
     }
-
-    /// Find the largest result-order mapping capacity whose compact stubs fit.
-    fn fitting_citation_capacity(&self, results: &[client::SearchResult]) -> usize {
-        let mut low = 0_usize;
-        let mut high = self.max_new_citation_files.min(results.len());
-        while low < high {
-            let midpoint = low + (high - low).div_ceil(2);
-            let prospective =
-                prospective_citation_files(results, self.known_citation_files, midpoint, self.templates.annotation);
-            let metadata = canonical_citation_results(&prospective);
-            if citation_metadata_bytes(&metadata).is_some_and(|bytes| bytes <= self.remaining_persisted_metadata_bytes)
-            {
-                low = midpoint;
-            } else {
-                high = midpoint - 1;
-            }
-        }
-        low
-    }
-}
-
-/// Return the exact bytes added when replacing an empty results array.
-fn citation_metadata_bytes(citation_results: &[Value]) -> Option<usize> {
-    if citation_results.is_empty() {
-        return Some(0);
-    }
-    bounded_json_size(citation_results, usize::MAX)
-        .ok()
-        .flatten()?
-        .checked_sub(2)
-}
-
-/// Build deterministic compact citation metadata without raw result content.
-fn canonical_citation_results(citation_files: &HashMap<String, String>) -> Vec<Value> {
-    let mut files: Vec<_> = citation_files.iter().collect();
-    files.sort_unstable();
-    files
-        .into_iter()
-        .map(|(file_id, filename)| {
-            serde_json::json!({
-                "attributes": null,
-                "file_id": file_id,
-                "filename": filename,
-                "score": 0.0,
-                "text": "",
-            })
-        })
-        .collect()
 }
 
 /// Index-only coordinate used to borrow from one stable owned plan.
@@ -673,15 +551,10 @@ fn remaining_file_search_call_budget(state: &ResponsesState) -> usize {
     let Some(max_tool_calls) = state.max_tool_calls else {
         return MAX_PENDING_CALLS;
     };
-    let output = state.output_items();
-    let prior_count = state.continuation_output_count.min(output.len());
     let used_calls = state
         .output_items()
         .iter()
-        .enumerate()
-        .filter(|(index, item)| {
-            is_builtin_tool_call(item) && (*index < prior_count || !is_pending_file_search_call(item))
-        })
+        .filter(|item| is_builtin_tool_call(item) && !is_pending_file_search_call(item))
         .count();
     usize::try_from(max_tool_calls)
         .unwrap_or(usize::MAX)
@@ -870,13 +743,8 @@ fn is_pending_file_search_call(item: &Value) -> bool {
         )
 }
 
-/// Mark capped calls incomplete and retain compact omission provenance.
-fn terminalize_unplanned_pending_calls(
-    state: &mut ResponsesState,
-    plan: &SearchPlan,
-    response_identity_hash: u64,
-) -> Vec<AppliedCall> {
-    let mut terminalized = Vec::new();
+/// Mark pending calls that could not be scheduled as incomplete.
+fn terminalize_unplanned_pending_calls(state: &mut ResponsesState, plan: &SearchPlan) {
     for (output_index, item) in state.output_items_mut().iter_mut().enumerate() {
         if !is_pending_file_search_call(item)
             || plan
@@ -889,16 +757,8 @@ fn terminalize_unplanned_pending_calls(
         if let Some(object) = item.as_object_mut() {
             object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
             object.remove("results");
-            let model_messages = model_context_messages(item, output_index, response_identity_hash, "", "");
-            terminalized.push(AppliedCall {
-                history_item: persisted_file_search_item(item, "incomplete", Vec::new()),
-                model_messages: None,
-                output_index,
-                persisted_marker: persisted_bridge_marker(&model_messages),
-            });
         }
     }
-    terminalized
 }
 
 /// Give every pending call its final public identity before budgeting or capping.
@@ -910,39 +770,6 @@ fn ensure_pending_file_search_call_ids(state: &mut ResponsesState, response_iden
             ensure_public_file_search_call_id(object, output_index, response_identity_hash);
         }
     }
-}
-
-/// Finalize call identities before measuring their mandatory private history.
-fn prepare_persisted_base_bytes(state: &mut ResponsesState, response_identity_hash: u64) -> Option<usize> {
-    ensure_pending_file_search_call_ids(state, response_identity_hash);
-    mandatory_persisted_base_bytes(state, response_identity_hash)
-}
-
-/// Measure exact compact base triplets for every locally owned pending call.
-fn mandatory_persisted_base_bytes(state: &ResponsesState, response_identity_hash: u64) -> Option<usize> {
-    let mut bytes = 2_usize;
-    let mut item_count = 0_usize;
-    for (output_index, item) in state.output_items().iter().enumerate() {
-        if !is_pending_file_search_call(item) {
-            continue;
-        }
-        let model_messages = model_context_messages(item, output_index, response_identity_hash, "", "");
-        let history_item = persisted_file_search_item(item, "incomplete", Vec::new());
-        let marker = persisted_bridge_marker(&model_messages);
-        for value in [&history_item, &marker[0], &marker[1]] {
-            let value_bytes = bounded_json_size(value, MAX_TOTAL_PERSISTED_LOCAL_BYTES)
-                .ok()
-                .flatten()?;
-            bytes = bytes
-                .checked_add(usize::from(item_count != 0))?
-                .checked_add(value_bytes)?;
-            if bytes > MAX_TOTAL_PERSISTED_LOCAL_BYTES {
-                return None;
-            }
-            item_count = item_count.saturating_add(1);
-        }
-    }
-    Some(bytes)
 }
 
 /// Build the standard Responses bridge carrying private model context.
@@ -974,28 +801,6 @@ fn model_context_messages(
     ]
 }
 
-/// Relax required selection without widening a scoped tool choice.
-fn continuation_tool_choice(original: &Value) -> Value {
-    match original {
-        Value::String(mode) if mode == "required" => Value::String("auto".to_owned()),
-        Value::String(_) => original.clone(),
-        Value::Object(choice) if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") => {
-            let allowed = choice.get("allowed_tools").and_then(Value::as_object).unwrap_or(choice);
-            serde_json::json!({
-                "type": "allowed_tools",
-                "mode": "auto",
-                "tools": allowed.get("tools").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
-            })
-        },
-        Value::Object(_) => serde_json::json!({
-            "type": "allowed_tools",
-            "mode": "auto",
-            "tools": [original.clone()],
-        }),
-        _ => Value::String("auto".to_owned()),
-    }
-}
-
 /// Build a deterministic bounded identity for one synthetic bridge.
 const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
 
@@ -1018,70 +823,11 @@ fn stable_call_hash_with_seed(mut hash: u64, parts: &[&str]) -> u64 {
 }
 
 /// Return whether replacing the response output remains within its hard body ceiling.
-fn continuation_response_fits(state: &ResponsesState, max_bytes: usize) -> bool {
+fn response_fits(state: &ResponsesState, max_bytes: usize) -> bool {
     bounded_json_size(&state.response_object, max_bytes)
         .ok()
         .flatten()
         .is_some()
-}
-
-/// Commit public output and private model context to their owned histories.
-fn commit_current_output(state: &mut ResponsesState, applied_calls: Vec<AppliedCall>) {
-    // Public output is lightweight unless the caller explicitly requested raw
-    // results. Private formatted context is retained only in histories.
-    let public_output = state.take_output_items();
-    let committed_prefix_len = state.continuation_output_count.min(public_output.len());
-    let mut applied_calls = applied_calls.into_iter().peekable();
-    for (output_index, item) in public_output.iter().enumerate().skip(committed_prefix_len) {
-        let applied = if applied_calls
-            .peek()
-            .is_some_and(|call| call.output_index == output_index)
-        {
-            applied_calls.next()
-        } else {
-            None
-        };
-        if let Some(applied) = applied {
-            state.persisted_messages.push(applied.history_item);
-            if let Some(model_messages) = applied.model_messages {
-                state.messages.extend(model_messages);
-            }
-            state.persisted_messages.extend(applied.persisted_marker);
-        } else {
-            append_history_item(&mut state.persisted_messages, item);
-            if let Some(replay_item) = canonical_openresponses_replay_item(item) {
-                state.messages.push(replay_item);
-            }
-        }
-    }
-    state.continuation_output_count = public_output.len();
-
-    state.replace_output_items(public_output);
-}
-
-/// Build bounded private metadata without retaining raw queries or result text.
-fn persisted_file_search_item(item: &Value, status: &str, results: Vec<Value>) -> Value {
-    let public_id = item.get("id").and_then(Value::as_str).unwrap_or("file_search_unknown");
-    let id = bounded_persisted_call_id(public_id);
-    let mut persisted = serde_json::Map::new();
-    persisted.insert("type".to_owned(), Value::String("file_search_call".to_owned()));
-    persisted.insert("id".to_owned(), Value::String(id));
-    persisted.insert(
-        LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD.to_owned(),
-        Value::String(local_file_search_public_id_fingerprint(public_id)),
-    );
-    persisted.insert("status".to_owned(), Value::String(status.to_owned()));
-    persisted.insert("results".to_owned(), Value::Array(results));
-    Value::Object(persisted)
-}
-
-/// Retain a valid UTF-8 prefix for the compact private call ledger.
-fn bounded_persisted_call_id(public_id: &str) -> String {
-    let mut end = public_id.len().min(MAX_PERSISTED_CALL_ID_BYTES);
-    while !public_id.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    public_id.get(..end).unwrap_or_default().to_owned()
 }
 
 /// Normalize a malformed provider call ID without changing valid opaque IDs.
@@ -1097,37 +843,6 @@ fn ensure_public_file_search_call_id(
             Value::String(format!("fs_{response_identity_hash:016x}_{output_index}")),
         );
     }
-}
-
-/// Build a constant-size persisted bridge that identifies a local file search.
-///
-/// The full search context is needed only for the immediate inference round.
-/// This triplet retains bounded provenance and citation metadata; rehydrate
-/// omits all three items from later model replay.
-fn persisted_bridge_marker(model_messages: &[Value; 2]) -> [Value; 2] {
-    let call_id = model_messages[0]
-        .get("call_id")
-        .and_then(Value::as_str)
-        .unwrap_or("file_search_unknown");
-    [
-        serde_json::json!({
-            "type": "function_call",
-            "call_id": call_id,
-            "name": "file_search",
-            "arguments": LOCAL_FILE_SEARCH_MARKER_ARGUMENTS,
-            "status": "completed",
-        }),
-        serde_json::json!({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": "",
-        }),
-    ]
-}
-
-/// Append one output item, preserving API-significant duplicate entries.
-fn append_history_item(history: &mut Vec<Value>, item: &Value) {
-    history.push(item.clone());
 }
 
 #[cfg(test)]

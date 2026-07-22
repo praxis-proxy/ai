@@ -382,28 +382,6 @@ pub(super) fn format_search_results(
     }
 }
 
-/// Precompute bounded citation mappings for conservative bridge reservation.
-pub(super) fn prospective_citation_files(
-    results: &[SearchResult],
-    known_citation_files: &HashMap<String, String>,
-    max_new_citation_files: usize,
-    annotation_template: &str,
-) -> HashMap<String, String> {
-    let mut citation_files = HashMap::new();
-    if !annotation_template.contains("<|{file_id}|>") {
-        return citation_files;
-    }
-    for result in results {
-        if !result.content.is_empty()
-            && citation_metadata_compatible(result, known_citation_files, &citation_files, max_new_citation_files)
-            && !known_citation_files.contains_key(&result.file_id)
-        {
-            citation_files.insert(result.file_id.clone(), result.filename.clone());
-        }
-    }
-    citation_files
-}
-
 /// Check one mapping against syntax, conflict, and capacity limits.
 fn citation_metadata_compatible(
     result: &SearchResult,
@@ -589,6 +567,10 @@ fn record_valid_marker(
 /// Replace citation markers in every assistant output-text part.
 ///
 /// Returns whether the response was modified.
+#[expect(
+    dead_code,
+    reason = "consumed when core continuation returns the final inference response"
+)]
 pub(crate) fn annotate_response(
     response: &mut Value,
     citation_files: &HashMap<String, String>,
@@ -1107,24 +1089,6 @@ mod tests {
         assert_eq!(escaped.model_context, "Q:\0");
         assert!(escaped.truncated);
         assert_eq!(json_string_content_bytes(&escaped.model_context), Some(8));
-    }
-
-    #[test]
-    fn prospective_citations_reuse_formatter_validation() {
-        let results = [SearchResult {
-            attributes: None,
-            content: vec![ContentChunk {
-                _chunk_type: ContentChunkType::Text,
-                text: "x".to_owned(),
-            }],
-            file_id: "file-a".to_owned(),
-            filename: "bad\nname".to_owned(),
-            score: 0.9,
-        }];
-
-        let files = prospective_citation_files(&results, &HashMap::new(), 1, "<|{file_id}|>{content}");
-
-        assert!(files.is_empty());
     }
 
     #[test]

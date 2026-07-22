@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     openai::responses::{DEFAULT_TENANT_ID, TENANT_METADATA_KEY, state::ResponsesState},
-    store::{ConversationItemStore, PostgresResponseStore, SqliteResponseStore, StoreError},
+    store::{ConversationItemStore, ConversationRecord, PostgresResponseStore, SqliteResponseStore, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -265,7 +265,13 @@ impl OpenaiConversationsFilter {
     }
 
     /// Persist conversation items synchronously using `block_in_place`.
-    fn append_items_blocking(&self, ctx: &HttpFilterContext<'_>, items: AppendBackItems) -> Result<(), FilterError> {
+    fn append_items_blocking(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        ctx: &HttpFilterContext<'_>,
+        items: Vec<Value>,
+    ) -> Result<(), FilterError> {
         let store = self
             .store
             .get()
@@ -273,7 +279,9 @@ impl OpenaiConversationsFilter {
             .ok_or_else(|| FilterError::from("openai_conversations: store unavailable for append-back"))?;
 
         let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| handle.block_on(persist_items(store.as_ref(), ctx, items)))
+        tokio::task::block_in_place(|| {
+            handle.block_on(persist_items(store.as_ref(), tenant_id, conversation_id, ctx, items))
+        })
     }
 }
 
@@ -465,8 +473,8 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let conv_id = items.conversation_id.clone();
-        if let Err(e) = self.append_items_blocking(ctx, items) {
+        let conv_id = items.conversation_id;
+        if let Err(e) = self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items) {
             warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed");
         }
 
@@ -493,22 +501,8 @@ struct AppendBackItems {
     conversation_id: String,
     /// Tenant scope for the conversation.
     tenant_id: String,
-    /// Public and private projections of this append.
-    projection: AppendBackProjection,
-}
-
-/// Public items and optional private replay history from one response.
-pub(super) struct AppendBackProjection {
-    /// Input + output items exposed by the Conversations API.
-    pub(super) public_items: Vec<Value>,
-    /// Richer replay state, when a Responses filter owns it.
-    pub(super) replay: Option<ReplayProjection>,
-}
-
-/// Private local-search replay markers added by the current request.
-pub(super) struct ReplayProjection {
-    /// Current-turn compact marker messages.
-    pub(super) messages: Value,
+    /// Input + output items to persist.
+    all_items: Vec<Value>,
 }
 
 /// Extract and merge input+output items from the response body for
@@ -521,37 +515,19 @@ fn extract_append_back_items(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) 
         .unwrap_or(DEFAULT_TENANT_ID)
         .to_owned();
 
-    let projection = merge_input_output_items(ctx, bytes)?;
+    let all_items = merge_input_output_items(ctx, bytes)?;
 
     Some(AppendBackItems {
         conversation_id: conv_id,
         tenant_id,
-        projection,
+        all_items,
     })
 }
 
 /// Parse the response body and combine request input items with
 /// response output items. Returns `None` when both are empty.
-pub(super) fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<AppendBackProjection> {
-    let output_items = completed_output_items(bytes)?;
-    let state = ctx.extensions.get::<ResponsesState>();
-    let input_items = state
-        .map(|state| state.request_input_items().to_vec())
-        .unwrap_or_default();
-    let replay = state.and_then(build_replay_projection);
-
-    if input_items.is_empty() && output_items.is_empty() {
-        return None;
-    }
-
-    let mut public_items = input_items;
-    public_items.extend(output_items);
-    Some(AppendBackProjection { public_items, replay })
-}
-
-/// Parse one completed response and move out its public output ledger.
-fn completed_output_items(bytes: &[u8]) -> Option<Vec<Value>> {
-    let mut response_json: Value = match serde_json::from_slice(bytes) {
+fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<Vec<Value>> {
+    let response_json: Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "conversation append-back: invalid response JSON");
@@ -565,64 +541,56 @@ fn completed_output_items(bytes: &[u8]) -> Option<Vec<Value>> {
         return None;
     }
 
-    Some(
-        response_json
-            .get_mut("output")
-            .and_then(Value::as_array_mut)
-            .map(std::mem::take)
-            .unwrap_or_default(),
-    )
-}
+    let output_items = response_json
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
-/// Build only the current request's private local-marker overlay.
-fn build_replay_projection(state: &ResponsesState) -> Option<ReplayProjection> {
-    let messages = state
-        .local_file_search_persistence_start
-        .and_then(|start| state.persisted_messages.get(start..))?
-        .to_vec();
-    Some(ReplayProjection {
-        messages: Value::Array(messages),
-    })
+    let input_items = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .map(|state| state.input.clone())
+        .unwrap_or_default();
+
+    if input_items.is_empty() && output_items.is_empty() {
+        return None;
+    }
+
+    let mut all_items = input_items;
+    all_items.extend(output_items);
+    Some(all_items)
 }
 
 /// Persist items and refresh the denormalized message cache.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps public row creation and private cache refresh ordered"
-)]
 async fn persist_items(
     store: &dyn ConversationItemStore,
+    tenant_id: &str,
+    conversation_id: &str,
     ctx: &HttpFilterContext<'_>,
-    items: AppendBackItems,
+    items: Vec<Value>,
 ) -> Result<(), FilterError> {
-    let AppendBackItems {
-        conversation_id,
-        tenant_id,
-        projection,
-    } = items;
     let max_pos = store
-        .max_item_position(&tenant_id, &conversation_id)
+        .max_item_position(tenant_id, conversation_id)
         .await
         .map_err(|e| -> FilterError { Box::new(e) })?;
     let start_position = max_pos.saturating_add(1);
     let created_at = handlers::current_timestamp(ctx);
 
-    let records = handlers::build_item_records(
-        ctx,
-        &tenant_id,
-        &conversation_id,
-        created_at,
-        start_position,
-        projection.public_items,
-    )
-    .map_err(|e| -> FilterError { e.into() })?;
+    let records = handlers::build_item_records(ctx, tenant_id, conversation_id, created_at, start_position, items)
+        .map_err(|e| -> FilterError { e.into() })?;
 
-    let count = create_append_records(store, &records).await?;
-    if count == 0 {
+    if records.is_empty() {
         return Ok(());
     }
 
-    refresh_message_cache(store, &tenant_id, &conversation_id, projection.replay).await;
+    let count = records.len();
+    store
+        .create_conversation_items(&records)
+        .await
+        .map_err(|e| -> FilterError { Box::new(e) })?;
+
+    refresh_message_cache(store, tenant_id, conversation_id).await;
     debug!(
         conversation_id,
         tenant_id, count, "conversation items appended from response"
@@ -631,58 +599,17 @@ async fn persist_items(
     Ok(())
 }
 
-/// Create normalized public item rows and return their count.
-async fn create_append_records(
-    store: &dyn ConversationItemStore,
-    records: &[crate::store::ConversationItemRecord],
-) -> Result<usize, FilterError> {
-    if records.is_empty() {
-        return Ok(0);
-    }
-    store
-        .create_conversation_items(records)
-        .await
-        .map_err(|e| -> FilterError { Box::new(e) })?;
-    Ok(records.len())
-}
-
 /// Refresh the denormalized conversation message cache after item mutation.
-async fn refresh_message_cache(
-    store: &dyn ConversationItemStore,
-    tenant_id: &str,
-    conversation_id: &str,
-    replay: Option<ReplayProjection>,
-) {
-    let record = match store.get_conversation(tenant_id, conversation_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            warn!(
-                conversation_id,
-                "conversation disappeared during append-back message sync"
-            );
-            return;
-        },
-        Err(error) => {
-            warn!(%error, conversation_id, "conversation lookup failed after append-back");
-            return;
-        },
+async fn refresh_message_cache(store: &dyn ConversationItemStore, tenant_id: &str, conversation_id: &str) {
+    let record = ConversationRecord {
+        conversation_id: conversation_id.to_owned(),
+        tenant_id: tenant_id.to_owned(),
+        created_at: 0,
+        metadata: Value::Object(serde_json::Map::default()),
+        messages: Value::Null,
     };
-    if let Err(error) = write_message_cache(store, record, replay).await {
-        warn!(%error, conversation_id, "conversation message sync failed after append-back");
-    }
-}
-
-/// Persist either a complete private history or an overlay onto public rows.
-async fn write_message_cache(
-    store: &dyn ConversationItemStore,
-    record: crate::store::ConversationRecord,
-    replay: Option<ReplayProjection>,
-) -> Result<(), StoreError> {
-    match replay {
-        Some(ReplayProjection { messages }) => {
-            handlers::sync_conversation_messages_with_overlay(store, record, &messages).await
-        },
-        None => handlers::sync_conversation_messages(store, record).await,
+    if let Err(e) = handlers::sync_conversation_messages(store, record).await {
+        warn!(error = %e, conversation_id, "conversation message sync failed after append-back");
     }
 }
 

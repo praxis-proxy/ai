@@ -100,37 +100,12 @@ async fn initialized_state_preserves_scalar_input_on_first_pass() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    let request_body = json!({
-        "model": "gpt-4o",
-        "input": "keep this representation"
-    });
-    ctx.extensions
-        .insert(ResponsesState::from_request_body(request_body.clone()));
-    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    assert!(matches!(action, FilterAction::Continue));
-    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert_eq!(
-        rebuilt["input"], "keep this representation",
-        "an unmodified first pass must preserve the client's scalar input"
-    );
-}
-
-#[tokio::test]
-async fn deferred_file_search_first_pass_preserves_body_bytes_without_rebuild() {
-    let filter = make_filter();
-    let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let request_body = json!({"model":"gpt-4.1","input":"hello"});
+    ctx.extensions.insert(ResponsesState::from_request_body(request_body));
     let original = br#"{
   "model": "gpt-4.1",
-  "input": [{"type":"message", "role":"user", "content":"keep formatting"}],
-  "tools": [{"type":"file_search", "vector_store_ids":["vs_1"]}]
+  "input": "hello"
 }"#;
-    let parsed = serde_json::from_slice(original).unwrap();
-    ctx.extensions
-        .insert(ResponsesState::from_file_search_request_body(parsed));
     let mut body = Some(Bytes::copy_from_slice(original));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -141,10 +116,6 @@ async fn deferred_file_search_first_pass_preserves_body_bytes_without_rebuild() 
         ctx.request_headers_to_set.is_empty(),
         "byte-exact first-pass forwarding must not synthesize content-length"
     );
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(state.has_deferred_history());
-    assert!(state.messages.is_empty());
-    assert!(state.persisted_messages.is_empty());
 }
 
 #[tokio::test]
@@ -155,7 +126,6 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
     let original = br#"{
   "model": "gpt-4.1",
   "input": "continue",
-  "tools": [{"type":"file_search", "vector_store_ids":["vs_1"]}],
   "previous_response_id": "resp_provider"
 }"#;
     let parsed = serde_json::from_slice(original).unwrap();
@@ -170,72 +140,24 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
 }
 
 #[tokio::test]
-async fn previous_history_id_passes_through_when_rehydrate_did_not_run() {
+async fn rebuild_serializes_from_state_request_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    let request = json!({
-        "model": "gpt-4.1",
-        "input": "search",
-        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
-        "previous_response_id": null,
-        "conversation": null
-    });
-    ctx.extensions
-        .insert(ResponsesState::from_file_search_request_body(request.clone()));
-    let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    assert!(matches!(action, FilterAction::Continue));
-    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert!(outbound["previous_response_id"].is_null());
-    assert!(outbound.get("conversation").is_none());
-    assert_eq!(outbound["input"], "search");
-    assert_eq!(outbound["tools"], request["tools"]);
-    assert_eq!(
-        ctx.extra_request_headers
-            .iter()
-            .find(|(name, _value)| name.as_ref() == "content-length")
-            .map(|(_name, value)| value.parse::<usize>().unwrap()),
-        body.as_ref().map(Bytes::len)
-    );
-    assert!(ctx.extensions.get::<ResponsesState>().unwrap().has_deferred_history());
-}
-
-#[tokio::test]
-async fn rebuild_uses_request_body_mutated_after_state_initialization() {
-    let filter = make_filter();
-    let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
-    let original = json!({
-        "model": "client-model",
-        "input": "hello",
-        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
-    });
+    let original = json!({"model":"client-model","input":"hello"});
     let mut state = ResponsesState::from_request_body(original);
-    state.messages.splice(
-        0..0,
-        [json!({"type": "message", "role": "assistant", "content": "history"})],
-    );
+    state
+        .messages
+        .splice(0..0, [json!({"type":"message","role":"assistant","content":"history"})]);
     ctx.extensions.insert(state);
-    let rewritten = json!({
-        "model": "backend-model",
-        "input": "hello",
-        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
-    });
-    let mut body = Some(Bytes::from(serde_json::to_vec(&rewritten).unwrap()));
+    let mut body = Some(Bytes::from(br#"{"model":"client-model","input":"hello"}"#.as_slice()));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert_eq!(outbound["model"], "backend-model", "later body rewrites must survive");
-    assert_eq!(
-        outbound["input"].as_array().unwrap().len(),
-        2,
-        "state history should still replace input"
-    );
+    assert_eq!(outbound["model"], "client-model", "serializes from state.request_body");
+    assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -417,10 +339,6 @@ async fn strips_conversation_from_outbound_body() {
         "conversation should be stripped from outbound body"
     );
     assert_eq!(rebuilt["model"], "gpt-4o");
-    assert_eq!(
-        rebuilt["input"], "hello",
-        "stripping conversation must not normalize unchanged scalar input"
-    );
 }
 
 #[tokio::test]

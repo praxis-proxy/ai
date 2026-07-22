@@ -25,9 +25,7 @@ use tracing::{debug, trace, warn};
 
 use super::{
     DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, canonical_openresponses_replay_item,
-    error::responses_error_rejection,
-    local_file_search_marker_triplet,
-    state::{MAX_CITATION_FILES, ResponsesState},
+    error::responses_error_rejection, state::ResponsesState,
 };
 use crate::store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry};
 
@@ -43,15 +41,6 @@ const PREV_USAGE_OUTPUT_KEY: &str = "responses.previous_usage_output_tokens";
 
 /// Metadata key for previous response total token count.
 const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
-
-/// Maximum accepted byte length for a stored file identifier.
-const MAX_CITATION_FILE_ID_BYTES: usize = 512;
-
-/// Maximum accepted byte length for a stored filename.
-const MAX_CITATION_FILENAME_BYTES: usize = 1_024;
-
-/// Validated citation metadata recovered from stored history.
-type CitationFiles = std::collections::HashMap<String, String>;
 
 // -----------------------------------------------------------------------------
 // RehydrateFilter
@@ -149,8 +138,7 @@ impl RehydrateFilter {
             };
         let previous_tools = collect_mcp_tool_listings(&record);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
-        let citation_files = collect_citation_files(&stored, record.response_object.get("output"));
-        let state = build_state(parsed_body, stored, previous_tools, previous_usage, citation_files);
+        let state = build_state(parsed_body, stored, previous_tools, previous_usage);
         write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
         ctx.extensions.insert(state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
@@ -187,8 +175,7 @@ impl RehydrateFilter {
             Ok(s) => s,
             Err(action) => return Ok(action),
         };
-        let citation_files = collect_citation_files(&stored, None);
-        let state = build_state(parsed_body, stored, vec![], None, citation_files);
+        let state = build_state(parsed_body, stored, vec![], None);
         write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
         ctx.extensions.insert(state);
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
@@ -424,7 +411,6 @@ fn build_state(
     stored: Vec<Value>,
     previous_tools: Vec<Value>,
     previous_usage: Option<Value>,
-    citation_files: CitationFiles,
 ) -> ResponsesState {
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
@@ -433,119 +419,7 @@ fn build_state(
     state.persisted_messages.splice(0..0, stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
-    state.citation_files = citation_files;
     state
-}
-
-/// Recover bounded citation metadata from persisted history and the public output.
-fn collect_citation_files(stored: &[Value], response_output: Option<&Value>) -> CitationFiles {
-    let mut files = CitationFiles::new();
-    match response_output {
-        Some(Value::Array(items)) => collect_citation_files_from_items(items, &mut files),
-        Some(item @ Value::Object(_)) => collect_citation_files_from_items(std::slice::from_ref(item), &mut files),
-        _ => {},
-    }
-
-    for item in stored.iter().rev() {
-        if files.len() >= MAX_CITATION_FILES {
-            break;
-        }
-        collect_citation_files_from_item(item, &mut files);
-    }
-
-    files
-}
-
-/// Add file-search results and assistant file citations from one item sequence.
-fn collect_citation_files_from_items(items: &[Value], files: &mut CitationFiles) {
-    for item in items {
-        if files.len() >= MAX_CITATION_FILES {
-            break;
-        }
-        collect_citation_files_from_item(item, files);
-    }
-}
-
-/// Add file metadata from one search call or assistant message.
-fn collect_citation_files_from_item(item: &Value, files: &mut CitationFiles) {
-    match item.get("type").and_then(Value::as_str) {
-        Some("file_search_call") => collect_file_search_result_citations(item, files),
-        Some("message") if item.get("role").and_then(Value::as_str) == Some("assistant") => {
-            collect_assistant_annotation_citations(item, files);
-        },
-        _ => {},
-    }
-}
-
-/// Recover file metadata carried by canonical `file_search_call.results` entries.
-fn collect_file_search_result_citations(item: &Value, files: &mut CitationFiles) {
-    let Some(results) = item.get("results").and_then(Value::as_array) else {
-        return;
-    };
-    for result in results {
-        if files.len() >= MAX_CITATION_FILES {
-            break;
-        }
-        insert_citation_file(result, files);
-    }
-}
-
-/// Recover file metadata from assistant `output_text` file-citation annotations.
-fn collect_assistant_annotation_citations(item: &Value, files: &mut CitationFiles) {
-    let Some(content) = item.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    for part in content {
-        if part.get("type").and_then(Value::as_str) != Some("output_text") {
-            continue;
-        }
-        let Some(annotations) = part.get("annotations").and_then(Value::as_array) else {
-            continue;
-        };
-        for annotation in annotations {
-            if files.len() >= MAX_CITATION_FILES {
-                return;
-            }
-            if annotation.get("type").and_then(Value::as_str) == Some("file_citation") {
-                insert_citation_file(annotation, files);
-            }
-        }
-    }
-}
-
-/// Insert one validated citation pair without allowing stored data to grow state unboundedly.
-fn insert_citation_file(value: &Value, files: &mut CitationFiles) {
-    let Some(file_id) = value.get("file_id").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(filename) = value.get("filename").and_then(Value::as_str) else {
-        return;
-    };
-    if !is_valid_citation_file_id(file_id) || !is_valid_citation_filename(filename) {
-        return;
-    }
-    if files.contains_key(file_id) || files.len() >= MAX_CITATION_FILES {
-        return;
-    }
-    files.insert(file_id.to_owned(), filename.to_owned());
-}
-
-/// Validate the marker-compatible OpenAI file identifier syntax and size.
-fn is_valid_citation_file_id(file_id: &str) -> bool {
-    file_id.len() <= MAX_CITATION_FILE_ID_BYTES
-        && file_id.strip_prefix("file-").is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        })
-}
-
-/// Accept non-empty, bounded filenames without control characters.
-fn is_valid_citation_filename(filename: &str) -> bool {
-    !filename.trim().is_empty()
-        && filename.len() <= MAX_CITATION_FILENAME_BYTES
-        && filename.chars().all(|character| !character.is_control())
 }
 
 /// Return stored history, reconstructing from public fields for
@@ -589,34 +463,7 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: &Value) {
 
 /// Return stored items that should be replayed as backend request input.
 fn replay_messages_from_stored(stored: &[Value]) -> Vec<Value> {
-    stored
-        .iter()
-        .enumerate()
-        .filter(|(index, _item)| !is_minimal_file_search_marker_member(stored, *index))
-        .filter_map(|(_index, item)| canonical_openresponses_replay_item(item))
-        .collect()
-}
-
-/// Detect the private function-call bridge persisted after a local file search.
-fn is_local_file_search_call(stored: &[Value], index: usize, item: &Value) -> bool {
-    if item.get("type").and_then(Value::as_str) != Some("file_search_call") {
-        return false;
-    }
-    index
-        .checked_add(3)
-        .and_then(|end| stored.get(index..end))
-        .and_then(local_file_search_marker_triplet)
-        .is_some()
-}
-
-/// Detect a constant-size local marker that must not become model context.
-fn is_minimal_file_search_marker_member(stored: &[Value], index: usize) -> bool {
-    (index.saturating_sub(2)..=index).any(|start| {
-        index <= start.saturating_add(2)
-            && stored
-                .get(start)
-                .is_some_and(|item| is_local_file_search_call(stored, start, item))
-    })
+    stored.iter().filter_map(canonical_openresponses_replay_item).collect()
 }
 
 /// Build a Responses API user message item from string input.

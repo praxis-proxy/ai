@@ -8,11 +8,8 @@ use praxis_filter::{FilterAction, FilterEntry, FilterPipeline};
 use serde_json::json;
 
 use super::*;
-use crate::{
-    openai::responses::{LOCAL_FILE_SEARCH_MARKER_ARGUMENTS, LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD},
-    store::{
-        ConversationRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
-    },
+use crate::store::{
+    ConversationRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
 };
 
 fn default_filter() -> RehydrateFilter {
@@ -838,280 +835,6 @@ async fn large_mcp_tool_listing_is_preserved_in_state() {
 }
 
 // -----------------------------------------------------------------------------
-// Citation File Recovery
-// -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn rehydrates_valid_citation_files_from_results_and_annotations() {
-    let oversized_id = format!("file-{}", "a".repeat(MAX_CITATION_FILE_ID_BYTES));
-    let oversized_filename = "b".repeat(MAX_CITATION_FILENAME_BYTES + 1);
-    let messages = json!([
-        {
-            "type": "file_search_call",
-            "id": "fs_1",
-            "status": "completed",
-            "results": [
-                {"file_id": "file-result_1", "filename": "report.pdf", "text": "context"},
-                {"file_id": "invalid", "filename": "ignored.txt"},
-                {"file_id": oversized_id, "filename": "ignored.txt"},
-                {"file_id": "file-long-name", "filename": oversized_filename}
-            ]
-        },
-        {
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": "Stored answer",
-                "annotations": [
-                    {"type": "file_citation", "file_id": "file-history", "filename": "history.md", "index": 6},
-                    {"type": "url_citation", "file_id": "file-url", "filename": "ignored.txt"},
-                    {"type": "file_citation", "file_id": "file-control", "filename": "bad\nname", "index": 1}
-                ]
-            }]
-        }
-    ]);
-    let public_output = json!([{
-        "type": "message",
-        "role": "assistant",
-        "content": [{
-            "type": "output_text",
-            "text": "Public answer",
-            "annotations": [{
-                "type": "file_citation",
-                "file_id": "file-public",
-                "filename": "public.txt",
-                "index": 6
-            }]
-        }]
-    }]);
-    let mut store = MockStore::with_completed_response("resp_citations", json!("question"), messages);
-    store.records.get_mut("resp_citations").unwrap().response_object["output"] = public_output;
-    let registry = setup_registry(store);
-
-    let filter = default_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"input":"follow up","previous_response_id":"resp_citations"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    assert!(matches!(action, FilterAction::Release));
-    let state = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .expect("ResponsesState should be populated");
-    assert_eq!(
-        state.citation_files.len(),
-        3,
-        "only valid citation pairs should survive"
-    );
-    assert_eq!(
-        state.citation_files.get("file-result_1").map(String::as_str),
-        Some("report.pdf")
-    );
-    assert_eq!(
-        state.citation_files.get("file-history").map(String::as_str),
-        Some("history.md")
-    );
-    assert_eq!(
-        state.citation_files.get("file-public").map(String::as_str),
-        Some("public.txt")
-    );
-}
-
-#[test]
-fn citation_file_recovery_caps_mapping_count() {
-    let results: Vec<_> = (0..=MAX_CITATION_FILES)
-        .map(|index| {
-            json!({
-                "file_id": format!("file-{index}"),
-                "filename": format!("document-{index}.txt")
-            })
-        })
-        .collect();
-    let stored = vec![json!({
-        "type": "file_search_call",
-        "results": results
-    })];
-
-    let citation_files = collect_citation_files(&stored, None);
-
-    assert_eq!(
-        citation_files.len(),
-        MAX_CITATION_FILES,
-        "stored citation metadata must have a fixed entry bound"
-    );
-}
-
-#[test]
-fn citation_file_recovery_prioritizes_public_and_newest_history() {
-    let older_results: Vec<_> = (0..MAX_CITATION_FILES)
-        .map(|index| {
-            json!({
-                "file_id": format!("file-old-{index}"),
-                "filename": format!("old-{index}.txt")
-            })
-        })
-        .collect();
-    let stored = vec![
-        json!({"type": "file_search_call", "results": older_results}),
-        json!({
-            "type": "file_search_call",
-            "results": [{"file_id": "file-newest", "filename": "newest.txt"}]
-        }),
-    ];
-    let public_output = json!([{
-        "type": "message",
-        "role": "assistant",
-        "content": [{
-            "type": "output_text",
-            "annotations": [{
-                "type": "file_citation",
-                "file_id": "file-public",
-                "filename": "public.txt"
-            }]
-        }]
-    }]);
-
-    let citation_files = collect_citation_files(&stored, Some(&public_output));
-
-    assert_eq!(citation_files.len(), MAX_CITATION_FILES);
-    assert_eq!(
-        citation_files.get("file-public").map(String::as_str),
-        Some("public.txt")
-    );
-    assert_eq!(
-        citation_files.get("file-newest").map(String::as_str),
-        Some("newest.txt")
-    );
-    assert!(
-        !citation_files.contains_key(&format!("file-old-{}", MAX_CITATION_FILES - 1)),
-        "older citations should yield capacity to public and newer entries"
-    );
-}
-
-#[test]
-fn replay_omits_hosted_file_search_but_preserves_custom_query_bridge() {
-    let stored = vec![
-        json!({
-            "type": "file_search_call",
-            "id": "fs_local",
-            LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD: "0123456789abcdef0123456789abcdef",
-            "status": "completed",
-            "results": [{"file_id": "file-a", "filename": "a.txt", "text": "raw"}]
-        }),
-        json!({
-            "type": "function_call",
-            "call_id": "file_search_0_0123456789abcdef",
-            "name": "file_search",
-            "arguments": "{\"query\":\"q\"}",
-            "status": "completed"
-        }),
-        json!({
-            "type": "function_call_output",
-            "call_id": "file_search_0_0123456789abcdef",
-            "output": "formatted private context"
-        }),
-        json!({
-            "type": "file_search_call",
-            "id": "fs_native",
-            "status": "completed",
-            "results": [{"file_id": "file-b", "filename": "b.txt", "text": "native"}]
-        }),
-    ];
-
-    let replay = replay_messages_from_stored(&stored);
-
-    assert_eq!(
-        replay,
-        stored[1..3],
-        "query-bearing function bridges are canonical replay context"
-    );
-}
-
-#[test]
-fn replay_omits_constant_size_local_marker_triplet() {
-    let stored = vec![
-        json!({
-            "type":"file_search_call",
-            "id":"fs-local",
-            LOCAL_FILE_SEARCH_PUBLIC_ID_FINGERPRINT_FIELD:"0123456789abcdef0123456789abcdef",
-            "status":"completed",
-            "results":[{"file_id":"file-a","filename":"a.txt","score":0.0,"text":""}]
-        }),
-        json!({
-            "type":"function_call",
-            "call_id":"file_search_0_0123456789abcdef",
-            "name":"file_search",
-            "arguments":LOCAL_FILE_SEARCH_MARKER_ARGUMENTS,
-            "status":"completed"
-        }),
-        json!({
-            "type":"function_call_output",
-            "call_id":"file_search_0_0123456789abcdef",
-            "output":""
-        }),
-        json!({"type":"message","role":"assistant","content":"final answer"}),
-    ];
-
-    let citation_files = collect_citation_files(&stored, None);
-    let replay = replay_messages_from_stored(&stored);
-
-    assert_eq!(
-        replay,
-        vec![json!({"type":"message","role":"assistant","content":"final answer"})]
-    );
-    assert_eq!(citation_files.get("file-a").map(String::as_str), Some("a.txt"));
-}
-
-#[test]
-fn replay_preserves_legacy_function_bridge_but_omits_hosted_call() {
-    let stored = vec![
-        json!({"type":"file_search_call","id":"fs-local","status":"completed","results":[]}),
-        json!({
-            "type":"function_call",
-            "call_id":"file_search_0_marker",
-            "name":"file_search",
-            "arguments":"{}",
-            "status":"completed"
-        }),
-        json!({
-            "type":"function_call_output",
-            "call_id":"file_search_0_marker",
-            "output":""
-        }),
-        json!({"type":"message","role":"assistant","content":"final answer"}),
-    ];
-
-    assert_eq!(replay_messages_from_stored(&stored), stored[1..]);
-}
-
-#[test]
-fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
-    let stored = vec![
-        json!({"id":"item-1"}),
-        json!({"id":"item-2","type":null}),
-        json!({"id":"msg-1","role":"assistant","content":"answer"}),
-        json!({"id":"hosted-1","type":"web_search_call","status":"completed"}),
-        json!({"type":"unknown","content":"not replayable"}),
-    ];
-
-    assert_eq!(
-        replay_messages_from_stored(&stored),
-        vec![
-            json!({"id":"item-1","type":"item_reference"}),
-            json!({"id":"item-2","type":"item_reference"}),
-            json!({"id":"msg-1","type":"message","role":"assistant","content":"answer"}),
-        ]
-    );
-}
-
-// -----------------------------------------------------------------------------
 // Usage Extraction
 // -----------------------------------------------------------------------------
 
@@ -1322,6 +1045,26 @@ async fn fallback_reconstruction_replays_only_canonical_input_items() {
         "fallback persistence history should preserve MCP list metadata"
     );
     assert_eq!(state.previous_tools.len(), 1, "fallback should populate previous tools");
+}
+
+#[test]
+fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
+    let stored = vec![
+        json!({"id":"item-1"}),
+        json!({"id":"item-2","type":null}),
+        json!({"id":"msg-1","role":"assistant","content":"answer"}),
+        json!({"id":"hosted-1","type":"web_search_call","status":"completed"}),
+        json!({"type":"unknown","content":"not replayable"}),
+    ];
+
+    assert_eq!(
+        replay_messages_from_stored(&stored),
+        vec![
+            json!({"id":"item-1","type":"item_reference"}),
+            json!({"id":"item-2","type":"item_reference"}),
+            json!({"id":"msg-1","type":"message","role":"assistant","content":"answer"}),
+        ]
+    );
 }
 
 // -----------------------------------------------------------------------------

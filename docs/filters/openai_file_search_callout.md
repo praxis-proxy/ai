@@ -7,7 +7,7 @@ Executes pending file search calls against an OGX vector store API.
 
 ## Configuration Notes
 
-First-pass streaming requests remain unchanged. A continuation carrying a pending file-search call or citation metadata is rejected when `stream=true`, because citation markers require an incremental SSE transformer. Non-streaming continuations support structured citation annotations.
+First-pass requests remain unchanged until core continuation support can re-enter the request phase with pending file-search calls. Re-entered streaming requests are rejected because citation markers require an incremental SSE transformer.
 
 ## Configuration
 

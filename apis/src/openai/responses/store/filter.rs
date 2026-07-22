@@ -307,12 +307,11 @@ impl ResponseStoreFilter {
         let request_input = ctx
             .remove_filter_state::<ResponseStoreRequestState>()
             .map(|state| state.input);
-        let state_history = ctx
+        let state_messages = ctx
             .extensions
             .get::<ResponsesState>()
-            .filter(|state| !state.persisted_messages.is_empty())
-            .map(StateHistory::from_state);
-        let Some(record) = parse_response_record(bytes, &tenant_id, request_input, state_history) else {
+            .map(|state| state.persisted_messages.clone());
+        let Some(record) = parse_response_record(bytes, &tenant_id, request_input, state_messages) else {
             return Ok(FilterAction::Continue);
         };
 
@@ -331,25 +330,6 @@ struct ResponseStoreRequestState {
     input: Value,
 }
 
-/// State-backed history plus the public output prefix it already contains.
-struct StateHistory {
-    /// Number of response output items already represented in `messages`.
-    continuation_output_count: usize,
-
-    /// Full private history accumulated before the current backend response.
-    messages: Vec<Value>,
-}
-
-impl StateHistory {
-    /// Snapshot persistence-owned state without cloning the public output ledger.
-    fn from_state(state: &ResponsesState) -> Self {
-        Self {
-            continuation_output_count: state.continuation_output_count,
-            messages: state.persisted_messages.clone(),
-        }
-    }
-}
-
 /// Fields extracted from the response JSON for the store record.
 struct ResponseCapture {
     /// Original request input used by rehydration.
@@ -361,15 +341,13 @@ struct ResponseCapture {
 
 impl ResponseCapture {
     /// Extract stored input and output from a Responses API exchange.
-    fn from_response_json(json: &Value, request_input: Option<Value>, state_history: Option<StateHistory>) -> Self {
+    fn from_response_json(json: &Value, request_input: Option<Value>, state_messages: Option<Vec<Value>>) -> Self {
         let input = request_input
             .or_else(|| json.get("input").cloned())
             .unwrap_or(Value::Null);
-        let (history_input, continuation_output_count) = state_history.map_or_else(
-            || (input.clone(), 0),
-            |history| (Value::Array(history.messages), history.continuation_output_count),
-        );
-        let messages = assemble_stored_messages(&history_input, json.get("output"), continuation_output_count);
+        let output = json.get("output").cloned().unwrap_or(Value::Null);
+        let history_input = state_messages.map_or_else(|| input.clone(), Value::Array);
+        let messages = assemble_stored_messages(&history_input, &output);
 
         Self { input, messages }
     }
@@ -389,19 +367,18 @@ fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
     json.get("input").cloned()
 }
 
-/// Build stored history, omitting any output prefix already present in `input`.
-fn assemble_stored_messages(input: &Value, output: Option<&Value>, continuation_output_count: usize) -> Value {
+/// Build the stored conversation history from response input and output.
+fn assemble_stored_messages(input: &Value, output: &Value) -> Value {
     let mut messages = Vec::new();
 
     append_stored_input_items(&mut messages, input.clone());
 
-    match output {
-        Some(Value::Array(items)) => {
-            let suffix_start = continuation_output_count.min(items.len());
-            messages.extend(items.iter().skip(suffix_start).cloned());
-        },
-        Some(output) if !output.is_null() => messages.push(output.clone()),
-        _ => {},
+    if !output.is_null() {
+        if let Some(items) = output.as_array() {
+            messages.extend(items.iter().cloned());
+        } else {
+            messages.push(output.clone());
+        }
     }
 
     Value::Array(messages)
@@ -621,7 +598,7 @@ fn parse_response_record(
     bytes: &[u8],
     tenant_id: &str,
     request_input: Option<Value>,
-    state_history: Option<StateHistory>,
+    state_messages: Option<Vec<Value>>,
 ) -> Option<ResponseRecord> {
     let json: Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
@@ -640,7 +617,7 @@ fn parse_response_record(
         return None;
     };
 
-    let capture = ResponseCapture::from_response_json(&json, request_input, state_history);
+    let capture = ResponseCapture::from_response_json(&json, request_input, state_messages);
 
     Some(ResponseRecord {
         id: id.to_owned(),
@@ -680,8 +657,8 @@ pub(super) fn build_record_from_state(
         return None;
     };
 
-    let state_history = (!state.persisted_messages.is_empty()).then(|| StateHistory::from_state(state));
-    let capture = ResponseCapture::from_response_json(json, request_input, state_history);
+    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
+    let capture = ResponseCapture::from_response_json(json, request_input, state_messages);
 
     Some(ResponseRecord {
         id: id.to_owned(),

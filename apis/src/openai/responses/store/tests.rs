@@ -1043,73 +1043,6 @@ async fn on_response_body_persists_valid_response() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_skips_continuation_output_already_in_state_history() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    run_request_phase(&filter, &mut ctx).await;
-
-    let public_call = json!({
-        "type": "file_search_call",
-        "id": "fs-local",
-        "status": "completed"
-    });
-    let private_call = json!({
-        "type": "file_search_call",
-        "id": "fs-local",
-        "status": "completed",
-        "results": [{"file_id": "file-a", "filename": "a.txt", "text": "private context"}]
-    });
-    let function_call = json!({
-        "type": "function_call",
-        "call_id": "file_search_1_0123456789abcdef",
-        "name": "file_search",
-        "arguments": "{\"query\":\"q\"}",
-        "status": "completed"
-    });
-    let function_output = json!({
-        "type": "function_call_output",
-        "call_id": "file_search_1_0123456789abcdef",
-        "output": "private context"
-    });
-    let final_message = json!({"type": "message", "role": "assistant", "content": "Final answer"});
-    let persisted_history = vec![
-        json!({"role": "user", "content": "Search"}),
-        private_call,
-        function_call,
-        function_output,
-    ];
-    ctx.extensions.insert(ResponsesState {
-        continuation_output_count: 1,
-        persisted_messages: persisted_history.clone(),
-        ..Default::default()
-    });
-
-    let response_json = json!({
-        "id": "resp_continuation",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "input": [{"role": "user", "content": "Search"}],
-        "output": [public_call, final_message.clone()]
-    });
-    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(action, FilterAction::Continue));
-
-    let store = filter.store.get().unwrap().as_ref().unwrap();
-    let record = store
-        .get_response("default", "resp_continuation")
-        .await
-        .unwrap()
-        .expect("continuation response should be persisted");
-    let mut expected_messages = persisted_history;
-    expected_messages.push(final_message);
-    assert_eq!(record.messages, json!(expected_messages));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_persists_string_input_as_message_item() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -1222,54 +1155,6 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn buffered_store_uses_request_input_while_file_search_history_is_deferred() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.current_filter_id = Some(7);
-
-    let request_input = json!([{"role": "user", "content": "Search my files"}]);
-    let request_json = json!({
-        "model": "gpt-4.1",
-        "input": request_input,
-        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}]
-    });
-    let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
-    drop(filter.on_request_body(&mut ctx, &mut request_body, true).await.unwrap());
-    let deferred_state = ResponsesState::from_file_search_request_body(request_json);
-    assert!(deferred_state.has_deferred_history());
-    assert!(deferred_state.persisted_messages.is_empty());
-    ctx.extensions.insert(deferred_state);
-
-    let response_json = json!({
-        "id": "resp_deferred_file_search",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "output": [{"type": "message", "content": "Stored output"}]
-    });
-    let mut response_body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
-    ctx.current_filter_id = Some(7);
-    drop(filter.on_response_body(&mut ctx, &mut response_body, true).unwrap());
-
-    let store = filter.store.get().unwrap().as_ref().unwrap();
-    let record = store
-        .get_response("default", "resp_deferred_file_search")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.input, request_input);
-    assert_eq!(
-        record.messages,
-        json!([
-            {"role": "user", "content": "Search my files"},
-            {"type": "message", "content": "Stored output"}
-        ])
-    );
-}
-
 #[test]
 fn streaming_record_uses_request_input_when_state_messages_are_empty() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -1356,63 +1241,6 @@ fn streaming_record_preserves_mcp_metadata_from_persisted_messages() {
         ]),
         "streaming record should preserve MCP metadata from persisted_messages, not drop it via messages"
     );
-}
-
-#[test]
-fn streaming_record_skips_continuation_output_already_in_state_history() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-
-    let public_call = json!({
-        "type": "file_search_call",
-        "id": "fs-stream-local",
-        "status": "completed"
-    });
-    let private_call = json!({
-        "type": "file_search_call",
-        "id": "fs-stream-local",
-        "status": "completed",
-        "results": [{"file_id": "file-a", "filename": "a.txt", "text": "private context"}]
-    });
-    let function_call = json!({
-        "type": "function_call",
-        "call_id": "file_search_0_fedcba9876543210",
-        "name": "file_search",
-        "arguments": "{\"query\":\"q\"}",
-        "status": "completed"
-    });
-    let function_output = json!({
-        "type": "function_call_output",
-        "call_id": "file_search_0_fedcba9876543210",
-        "output": "private context"
-    });
-    let final_message = json!({"type": "message", "role": "assistant", "content": "Final answer"});
-    let persisted_history = vec![
-        json!({"role": "user", "content": "Search"}),
-        private_call,
-        function_call,
-        function_output,
-    ];
-    let response_json = json!({
-        "id": "resp_stream_continuation",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "output": [public_call, final_message.clone()]
-    });
-    ctx.extensions.insert(ResponsesState {
-        continuation_output_count: 1,
-        persisted_messages: persisted_history.clone(),
-        response_object: response_json,
-        ..Default::default()
-    });
-
-    let record =
-        super::filter::build_record_from_state(&ctx, "default", Some(json!([{"role": "user", "content": "Search"}])))
-            .expect("streaming continuation state should build a record");
-    let mut expected_messages = persisted_history;
-    expected_messages.push(final_message);
-    assert_eq!(record.messages, json!(expected_messages));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
