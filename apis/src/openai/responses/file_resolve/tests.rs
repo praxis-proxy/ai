@@ -767,11 +767,9 @@ fn serve_file_request(mut stream: std::net::TcpStream) {
 
 #[tokio::test]
 async fn file_url_resolved_to_data_uri() {
-    use praxis_core::callout::{CalloutClient, CalloutConfig};
-
     use crate::openai::responses::file_resolve::{
         config::OnMissing,
-        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
+        resolve::resolve_input,
         resolve_url::{FileUrlResolver, NormalizedOrigin},
     };
 
@@ -805,18 +803,7 @@ async fn file_url_resolved_to_data_uri() {
     });
 
     // Create FilesApiClient
-    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
-    let client = FilesApiClient::new(
-        "http://unused:9999",
-        vec![],
-        callout,
-        FilesApiClientOptions {
-            max_file_references: 32,
-            max_resolved_bytes: 64 * 1024 * 1024,
-            timeout_ms: 30_000,
-        },
-    )
-    .unwrap();
+    let client = make_client_for_url_with_max("http://unused:9999", 64 * 1024 * 1024);
 
     // Create FileUrlResolver with allowed private origins (localhost)
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
@@ -942,12 +929,7 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
 
 #[tokio::test]
 async fn file_url_passthrough_when_no_resolver() {
-    use praxis_core::callout::{CalloutClient, CalloutConfig};
-
-    use crate::openai::responses::file_resolve::{
-        config::OnMissing,
-        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
-    };
+    use crate::openai::responses::file_resolve::{config::OnMissing, resolve::resolve_input};
 
     // Build body with file_url
     let mut body = json!({
@@ -963,18 +945,7 @@ async fn file_url_passthrough_when_no_resolver() {
     let original = body.clone();
 
     // Create FilesApiClient
-    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
-    let client = FilesApiClient::new(
-        "http://unused:9999",
-        vec![],
-        callout,
-        FilesApiClientOptions {
-            max_file_references: 32,
-            max_resolved_bytes: 64 * 1024 * 1024,
-            timeout_ms: 30_000,
-        },
-    )
-    .unwrap();
+    let client = make_client_for_url_with_max("http://unused:9999", 64 * 1024 * 1024);
 
     // Call resolve_input without url_resolver (None)
     let count = resolve_input(&mut body, &client, OnMissing::Reject, &http::HeaderMap::new(), None)
@@ -987,11 +958,9 @@ async fn file_url_passthrough_when_no_resolver() {
 
 #[tokio::test]
 async fn file_url_in_shorthand_message_resolved() {
-    use praxis_core::callout::{CalloutClient, CalloutConfig};
-
     use crate::openai::responses::file_resolve::{
         config::OnMissing,
-        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
+        resolve::resolve_input,
         resolve_url::{FileUrlResolver, NormalizedOrigin},
     };
 
@@ -1024,18 +993,7 @@ async fn file_url_in_shorthand_message_resolved() {
         }]
     });
 
-    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
-    let client = FilesApiClient::new(
-        "http://unused:9999",
-        vec![],
-        callout,
-        FilesApiClientOptions {
-            max_file_references: 32,
-            max_resolved_bytes: 64 * 1024 * 1024,
-            timeout_ms: 30_000,
-        },
-    )
-    .unwrap();
+    let client = make_client_for_url_with_max("http://unused:9999", 64 * 1024 * 1024);
 
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
     let resolver = FileUrlResolver {
@@ -1065,11 +1023,9 @@ async fn file_url_in_shorthand_message_resolved() {
 
 #[tokio::test]
 async fn file_url_in_function_call_output_resolved() {
-    use praxis_core::callout::{CalloutClient, CalloutConfig};
-
     use crate::openai::responses::file_resolve::{
         config::OnMissing,
-        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
+        resolve::resolve_input,
         resolve_url::{FileUrlResolver, NormalizedOrigin},
     };
 
@@ -1103,18 +1059,7 @@ async fn file_url_in_function_call_output_resolved() {
         }]
     });
 
-    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
-    let client = FilesApiClient::new(
-        "http://unused:9999",
-        vec![],
-        callout,
-        FilesApiClientOptions {
-            max_file_references: 32,
-            max_resolved_bytes: 64 * 1024 * 1024,
-            timeout_ms: 30_000,
-        },
-    )
-    .unwrap();
+    let client = make_client_for_url_with_max("http://unused:9999", 64 * 1024 * 1024);
 
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
     let resolver = FileUrlResolver {
@@ -1144,12 +1089,8 @@ async fn file_url_in_function_call_output_resolved() {
 
 #[tokio::test]
 async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
-    use praxis_core::callout::{CalloutClient, CalloutConfig};
-
     use crate::openai::responses::file_resolve::{
-        config::OnMissing,
-        resolve::{FilesApiClient, FilesApiClientOptions, resolve_input},
-        resolve_url::FileUrlResolver,
+        config::OnMissing, resolve::resolve_input, resolve_url::FileUrlResolver,
     };
 
     let mut body = json!({
@@ -1163,18 +1104,7 @@ async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
         }]
     });
 
-    let callout = CalloutClient::new(CalloutConfig::default()).unwrap();
-    let client = FilesApiClient::new(
-        "http://unused:9999",
-        vec![],
-        callout,
-        FilesApiClientOptions {
-            max_file_references: 32,
-            max_resolved_bytes: 64 * 1024 * 1024,
-            timeout_ms: 30_000,
-        },
-    )
-    .unwrap();
+    let client = make_client_for_url_with_max("http://unused:9999", 64 * 1024 * 1024);
 
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![],
