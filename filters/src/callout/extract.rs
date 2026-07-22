@@ -29,10 +29,14 @@ impl CompiledExtraction {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the expression is invalid.
+    /// Returns [`FilterError`] if the expression is invalid or if
+    /// `result_key` violates [`FilterResultSet`] key rules.
     pub(crate) fn compile(json_path: &str, result_key: String) -> Result<Self, FilterError> {
         let path = JsonPath::parse(json_path)
             .map_err(|e| -> FilterError { format!("http_callout: invalid JSONPath '{json_path}': {e}").into() })?;
+        FilterResultSet::new()
+            .set(result_key.clone(), "")
+            .map_err(|e| -> FilterError { format!("http_callout: invalid result_key '{result_key}': {e}").into() })?;
         Ok(Self { path, result_key })
     }
 
@@ -180,6 +184,24 @@ mod tests {
         assert!(
             err.to_string().contains("invalid JSONPath"),
             "should report invalid expression: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_invalid_result_key() {
+        let err = CompiledExtraction::compile("$.flagged", "lakera.flagged".into()).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid result_key"),
+            "dotted result_key should be rejected at config time: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_empty_result_key() {
+        let err = CompiledExtraction::compile("$.flagged", String::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid result_key"),
+            "empty result_key should be rejected at config time: {err}"
         );
     }
 

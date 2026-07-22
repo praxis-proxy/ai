@@ -110,6 +110,27 @@ mod filter_tests {
     }
 
     #[test]
+    fn config_rejects_invalid_result_key() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            response:
+              extract:
+                - json_path: "$.flagged"
+                  result_key: "lakera.flagged"
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("invalid result_key"),
+            "dotted result_key should be rejected at config time: {err}"
+        );
+    }
+
+    #[test]
     fn config_env_var_expansion_unset() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
