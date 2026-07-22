@@ -162,7 +162,7 @@ impl ApiClient {
     /// and parse the response body as JSON.
     pub(crate) async fn post_json(
         &self,
-        url: &str,
+        url: String,
         body: &serde_json::Value,
         request_headers: &http::HeaderMap,
     ) -> Result<serde_json::Value, ApiClientError> {
@@ -184,7 +184,7 @@ impl ApiClient {
     /// circuit-breaker, and status handling.
     pub(crate) async fn post_json_bytes(
         &self,
-        url: &str,
+        url: String,
         body: Vec<u8>,
         request_headers: &http::HeaderMap,
     ) -> Result<Vec<u8>, ApiClientError> {
@@ -200,7 +200,7 @@ impl ApiClient {
             depth: 0,
             headers,
             method: http::Method::POST,
-            url: url.to_owned(),
+            url,
         };
 
         let response = execute_callout(&self.client, request).await?;
@@ -311,7 +311,7 @@ async fn execute_callout(
 mod tests {
     use std::{
         io::{Read as _, Write as _},
-        net::{SocketAddr, TcpListener},
+        net::{SocketAddr, TcpListener, TcpStream},
         thread::JoinHandle,
     };
 
@@ -329,15 +329,43 @@ mod tests {
         let body = response_body.to_owned();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0_u8; 4096];
-            let n = stream.read(&mut buf).unwrap();
+            let request = read_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&buf[..n]).into_owned()
+            String::from_utf8(request).unwrap()
         })
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before the complete request arrived");
+            request.extend_from_slice(&buf[..n]);
+
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+
+            if request.len() >= body_start + content_length {
+                return request;
+            }
+        }
     }
 
     fn test_client(base_url: &str) -> ApiClient {
@@ -539,31 +567,14 @@ mod tests {
 
     #[tokio::test]
     async fn post_json_sends_body_and_parses_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let n = stream.read(&mut request).unwrap();
-            let request_str = String::from_utf8_lossy(&request[..n]);
-            assert!(request_str.starts_with("POST"), "should be a POST request");
-            assert!(
-                request_str.contains("content-type: application/json"),
-                "should have JSON content-type: {request_str}"
-            );
-            let body = r#"{"results":[]}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
+        let (listener, address) = bind_test_server();
+        let captured = capture_request(listener, r#"{"results":[]}"#);
         let client = test_client(&format!("http://{address}"));
 
         let request_body = serde_json::json!({"query": "test"});
         let json = client
             .post_json(
-                &format!("http://{address}/v1/vector_stores/vs-123/search"),
+                format!("http://{address}/v1/vector_stores/vs-123/search"),
                 &request_body,
                 &http::HeaderMap::new(),
             )
@@ -571,6 +582,37 @@ mod tests {
             .unwrap();
 
         assert!(json["results"].as_array().unwrap().is_empty());
+
+        let request = captured.join().unwrap();
+        assert!(request.starts_with("POST"), "should be a POST request");
+        assert!(
+            request.contains("content-type: application/json"),
+            "should have JSON content-type: {request}"
+        );
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(body, r#"{"query":"test"}"#, "serialized JSON body should be sent");
+    }
+
+    #[tokio::test]
+    async fn post_json_returns_decode_error_on_invalid_json() {
+        let (listener, address) = bind_test_server();
+        let captured = capture_request(listener, "not-json!!!");
+        let client = test_client(&format!("http://{address}"));
+
+        let err = client
+            .post_json(
+                format!("http://{address}/v1/vector_stores/vs-123/search"),
+                &serde_json::json!({"query": "test"}),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+
+        captured.join().unwrap();
+        assert!(
+            matches!(err, ApiClientError::DecodeFailed { .. }),
+            "invalid JSON should return a decode error"
+        );
     }
 
     #[tokio::test]
@@ -593,7 +635,7 @@ mod tests {
         headers.insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
 
         client
-            .post_json(&format!("http://{address}/v1/search"), &serde_json::json!({}), &headers)
+            .post_json(format!("http://{address}/v1/search"), &serde_json::json!({}), &headers)
             .await
             .unwrap();
 
