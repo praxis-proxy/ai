@@ -70,6 +70,26 @@ fn lakera_guard_passes_clean() {
 }
 
 #[test]
+fn lakera_guard_bypasses_non_post_requests() {
+    // The example scopes the callout with `methods: [POST]`. The mock
+    // flags everything, so a 200 proves the filter never fired.
+    let (mock_lakera_port, _lakera_guard) = start_mock_lakera(true);
+    let backend_guard = start_backend_with_shutdown("upstream ok");
+    let proxy_port = free_port();
+
+    let config = load_lakera_config(proxy_port, mock_lakera_port, backend_guard.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(parse_status(&raw), 200, "GET should bypass the callout and reach upstream");
+    assert!(raw.contains("upstream ok"), "GET should receive upstream body");
+}
+
+#[test]
 fn lakera_guard_rejects_flagged_with_preceding_filter() {
     // Branch evaluation clears `filter_results` after every filter in
     // the headers phase. With a filter preceding the callout in the
