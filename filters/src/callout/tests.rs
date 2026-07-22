@@ -184,6 +184,41 @@ mod filter_tests {
     }
 
     #[test]
+    fn config_rejects_max_body_bytes_one_above_limit() {
+        // 100 MiB + 1 byte should be rejected.
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            request:
+              max_body_bytes: 104857601
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("exceeds limit"),
+            "one byte above 100 MiB should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn config_accepts_default_max_body_bytes() {
+        // Default (1 MiB) should be accepted without specifying max_body_bytes.
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            "#,
+        )
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml);
+        assert!(filter.is_ok(), "default max_body_bytes (1 MiB) should be accepted");
+    }
+
+    #[test]
     fn config_accepts_max_body_bytes_at_limit() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
