@@ -44,12 +44,15 @@ const MAX_BODY_BYTES: usize = 104_857_600; // 100 MiB
 // HttpCalloutFilter
 // -----------------------------------------------------------------------------
 
-/// HTTP callout filter.
-///
 /// Makes an outbound HTTP request during request processing,
 /// optionally forwarding the request body and downstream headers.
+///
 /// Extracts values from the callout response via `JSONPath` and
-/// writes them to [`FilterResultSet`] for branch-chain evaluation.
+/// writes them to [`FilterResultSet`] for branch-chain evaluation,
+/// and optionally injects callout response headers into the upstream
+/// request. Supports per-target timeout, fail-open/fail-closed
+/// behavior, circuit breaking, and loop prevention via callout-depth
+/// tracking.
 ///
 /// [`FilterResultSet`]: praxis_filter::FilterResultSet
 pub struct HttpCalloutFilter {
@@ -325,7 +328,9 @@ fn build_callout_client(cfg: &HttpCalloutConfig) -> Result<CalloutClient, Filter
 #[async_trait]
 impl HttpFilter for HttpCalloutFilter {
     fn name(&self) -> &'static str {
-        FILTER_NAME
+        // Literal required: `cargo xtask filter-docs` discovers filter
+        // anchors by string literal in `name()`.
+        "http_callout"
     }
 
     fn request_body_access(&self) -> BodyAccess {

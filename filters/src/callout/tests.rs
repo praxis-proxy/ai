@@ -45,6 +45,24 @@ mod filter_tests {
     }
 
     #[test]
+    fn name_literal_matches_filter_name_const() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            "#,
+        )
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        assert_eq!(
+            filter.name(),
+            crate::callout::FILTER_NAME,
+            "name() literal and FILTER_NAME must not drift"
+        );
+    }
+
+    #[test]
     fn config_missing_target() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
         let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");

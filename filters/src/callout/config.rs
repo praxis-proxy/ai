@@ -44,6 +44,9 @@ pub(crate) struct HttpCalloutConfig {
     pub circuit_breaker: Option<CircuitBreakerConfig>,
 
     /// Maximum callout depth for loop prevention.
+    ///
+    /// A value of 0 rejects every callout: the depth check
+    /// (`depth >= max_depth`) fails immediately for all requests.
     pub max_depth: Option<u32>,
 }
 
