@@ -21,6 +21,7 @@ mod config;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
+pub(crate) mod file_search_callout;
 pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
 pub(crate) mod openai_mcp_tool_resolve;
