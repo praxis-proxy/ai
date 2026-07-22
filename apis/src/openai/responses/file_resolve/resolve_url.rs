@@ -8,6 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use praxis_core::connectivity::normalize_mapped_ipv4;
 
 use super::resolve::{ResolveError, ResolvedFile, infer_mime_from_filename, max_content_bytes_for_data_url};
+use crate::openai::url_security::{is_cloud_metadata, is_file_url_ssrf_blocked};
 
 /// A validated, normalized origin (scheme + host + port) for allowlist matching.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,126 +99,6 @@ impl NormalizedOrigin {
     }
 }
 
-/// Cloud metadata and credential endpoints that are never permitted.
-fn is_cloud_metadata(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            *v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
-                || *v4 == std::net::Ipv4Addr::new(169, 254, 170, 2)
-                || *v4 == std::net::Ipv4Addr::new(169, 254, 170, 23)
-                || *v4 == std::net::Ipv4Addr::new(169, 254, 0, 23)
-                || *v4 == std::net::Ipv4Addr::new(169, 254, 10, 10)
-                || *v4 == std::net::Ipv4Addr::new(100, 100, 100, 200)
-        },
-        IpAddr::V6(v6) => {
-            const AWS_IMDS_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
-            const AWS_ECS_CREDS_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0023);
-            *v6 == AWS_IMDS_V6 || *v6 == AWS_ECS_CREDS_V6
-        },
-    }
-}
-
-/// IPs that are always blocked regardless of allowlist.
-fn is_unconditionally_blocked(ip: &IpAddr) -> bool {
-    ip.is_unspecified() || ip.is_multicast() || is_cloud_metadata(ip)
-}
-
-/// IPs that are blocked unless the origin is allowlisted.
-fn is_private_range(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.octets()[0] == 0
-                || is_cgnat(*v4)
-                || is_special_use_v4(*v4)
-        },
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unique_local()
-                || is_unicast_link_local_v6(v6)
-                || is_site_local_v6(v6)
-                || is_special_use_v6(*v6)
-        },
-    }
-}
-
-/// Check if an IPv4 address is in the CGNAT range (100.64.0.0/10).
-fn is_cgnat(ip: std::net::Ipv4Addr) -> bool {
-    u32::from(ip) & 0xFFC0_0000 == 0x6440_0000
-}
-
-/// Check if an IPv6 address is in the unicast link-local range (`fe80::/10`).
-fn is_unicast_link_local_v6(v6: &std::net::Ipv6Addr) -> bool {
-    let [a, b, ..] = v6.octets();
-    a == 0xFE && (b & 0xC0) == 0x80
-}
-
-/// Deprecated site-local range (`fec0::/10`, RFC 3879).
-fn is_site_local_v6(v6: &std::net::Ipv6Addr) -> bool {
-    let [a, b, ..] = v6.octets();
-    a == 0xFE && (b & 0xC0) == 0xC0
-}
-
-/// Non-globally-reachable IPv4 special-use ranges per IANA registry.
-fn is_special_use_v4(ip: std::net::Ipv4Addr) -> bool {
-    let o = ip.octets();
-    let n = u32::from(ip);
-    // 192.0.0.0/24 (IETF Protocol Assignments) — 192.0.0.9, 192.0.0.10 are globally reachable
-    (o[0] == 192 && o[1] == 0 && o[2] == 0 && o[3] != 9 && o[3] != 10)
-    // 192.0.2.0/24 — Documentation (TEST-NET-1)
-    || (o[0] == 192 && o[1] == 0 && o[2] == 2)
-    // 192.88.99.0/24 — Deprecated 6to4 relay anycast (RFC 7526)
-    || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-    // 198.18.0.0/15 — Benchmarking
-    || (n & 0xFFFE_0000 == 0xC612_0000)
-    // 198.51.100.0/24 — Documentation (TEST-NET-2)
-    || (o[0] == 198 && o[1] == 51 && o[2] == 100)
-    // 203.0.113.0/24 — Documentation (TEST-NET-3)
-    || (o[0] == 203 && o[1] == 0 && o[2] == 113)
-    // 240.0.0.0/4 — Reserved for future use
-    || o[0] >= 240
-}
-
-/// Non-globally-reachable IPv6 special-use ranges per IANA registry.
-fn is_special_use_v6(v6: std::net::Ipv6Addr) -> bool {
-    let s = v6.segments();
-    // 64:ff9b:1::/48 — Local-use NAT64 (RFC 8215)
-    (s[0] == 0x0064 && s[1] == 0xFF9B && s[2] == 0x0001)
-    // 100::/64 — Discard-Only (RFC 6666)
-    || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-    // 100:0:0:1::/64 — Discard-Only dummy prefix
-    || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 1)
-    // 2001::/23 — IETF Protocol Assignments (block non-global sub-ranges)
-    || is_2001_ietf_non_global(s)
-    // 2001:db8::/32 — Documentation (RFC 3849, standalone IANA entry outside /23)
-    || (s[0] == 0x2001 && s[1] == 0x0DB8)
-    // 2002::/16 — 6to4 (deprecated, RFC 7526)
-    || s[0] == 0x2002
-    // 3fff::/20 — Documentation (RFC 9637): s[0]==0x3FFF, top 4 bits of s[1]==0
-    || (s[0] == 0x3FFF && s[1] & 0xF000 == 0)
-    // 5f00::/16 — Segment Routing SRv6 SID (RFC 9602)
-    || s[0] == 0x5F00
-}
-
-/// Non-globally-reachable sub-ranges within `2001::/23` (IETF Protocol Assignments).
-fn is_2001_ietf_non_global(s: [u16; 8]) -> bool {
-    if s[0] != 0x2001 || s[1] > 0x01FF {
-        return false;
-    }
-    // Globally reachable exceptions per IANA — these pass through:
-    match s[1] {
-        // 2001:1::1 PCP, 2001:1::2 TURN, 2001:1::3 DNS-SD anycast (RFC 6887/8155/8880)
-        0x0001 if s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 && s[6] == 0 && matches!(s[7], 1..=3) => false,
-        0x0003 => false,                   // 2001:3::/32 — AMT (RFC 7450)
-        0x0004 if s[2] == 0x0112 => false, // 2001:4:112::/48 — AS112-v6 (RFC 7535)
-        // 2001:20::/28 ORCHIDv2 (RFC 7343), 2001:30::/28 Drone Remote ID (RFC 9374)
-        v if v & 0xFFF0 == 0x0020 || v & 0xFFF0 == 0x0030 => false,
-        _ => true,
-    }
-}
-
 /// Validate that a string is a well-formed MIME type (`token/token`).
 ///
 /// Uses the RFC 2045 token production but additionally excludes characters
@@ -237,39 +118,6 @@ fn is_valid_mime_type(s: &str) -> bool {
         && !subtype.is_empty()
         && type_part.chars().all(is_data_uri_safe_token)
         && subtype.chars().all(is_data_uri_safe_token)
-}
-
-/// Extract the embedded IPv4 from a NAT64 Well-Known Prefix (`64:ff9b::/96`).
-fn nat64_embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    let s = v6.segments();
-    (s[0] == 0x0064 && s[1] == 0xFF9B && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0).then(|| {
-        let [.., a, b, c, d] = v6.octets();
-        std::net::Ipv4Addr::new(a, b, c, d)
-    })
-}
-
-/// Check if an IP should be blocked for `file_url` fetches.
-pub(crate) fn is_file_url_ssrf_blocked(ip: &IpAddr, allow_private: bool) -> bool {
-    let ip = &normalize_mapped_ipv4(*ip);
-    if is_unconditionally_blocked(ip) {
-        return true;
-    }
-    // RFC 6052: apply IPv4 policy to the embedded address in 64:ff9b::/96
-    if let IpAddr::V6(v6) = ip
-        && let Some(v4) = nat64_embedded_ipv4(v6)
-    {
-        let embedded = IpAddr::V4(v4);
-        if is_unconditionally_blocked(&embedded) {
-            return true;
-        }
-        if !allow_private && is_private_range(&embedded) {
-            return true;
-        }
-    }
-    if !allow_private && is_private_range(ip) {
-        return true;
-    }
-    false
 }
 
 /// Redact sensitive parts of a URL for safe logging.
@@ -679,6 +527,16 @@ async fn resolve_and_pin_url(
         })?
         .collect();
 
+    let validated = validate_resolved_addrs(addrs, allow_private, label)?;
+    Ok((host.to_owned(), validated))
+}
+
+/// Validate and deduplicate every address returned for one DNS lookup.
+fn validate_resolved_addrs(
+    addrs: Vec<SocketAddr>,
+    allow_private: bool,
+    label: &str,
+) -> Result<Vec<SocketAddr>, ResolveError> {
     if addrs.is_empty() {
         return Err(ResolveError::FileUrlFailed {
             label: label.to_owned(),
@@ -701,7 +559,7 @@ async fn resolve_and_pin_url(
         }
     }
 
-    Ok((host.to_owned(), validated))
+    Ok(validated)
 }
 
 /// Check if a hostname is blocked (localhost and *.localhost).
@@ -716,7 +574,17 @@ fn build_pinned_client(
     addrs: &[SocketAddr],
     timeout: std::time::Duration,
 ) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = reqwest::Client::builder()
+    configure_pinned_client(reqwest::Client::builder(), host, addrs, timeout)
+}
+
+/// Apply proxy, redirect, timeout, and DNS-pinning policy to a client builder.
+fn configure_pinned_client(
+    builder: reqwest::ClientBuilder,
+    host: &str,
+    addrs: &[SocketAddr],
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = builder
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout);
@@ -738,6 +606,11 @@ fn build_pinned_client(
     reason = "tests"
 )]
 mod tests {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+    };
+
     use super::*;
 
     #[test]
@@ -1978,6 +1851,146 @@ mod tests {
         assert!(
             validate_file_url("https://localhost/file.pdf").is_ok(),
             "validate_file_url only checks scheme/credentials/fragment, not hostname"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_url_resolver_blocks_legacy_ipv4_loopback() {
+        let resolver = FileUrlResolver {
+            allowed_private_origins: vec![],
+        };
+
+        let result = resolver
+            .resolve_url(
+                "http://0177.0.0.1/file.txt",
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                1024,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ResolveError::FileUrlBlocked { .. })),
+            "URL-parser canonicalization must not let legacy IPv4 loopback bypass SSRF checks"
+        );
+    }
+
+    #[test]
+    fn dns_rebinding_with_mixed_public_and_private_answers_is_blocked() {
+        let addrs = vec!["93.184.216.34:443".parse().unwrap(), "127.0.0.1:443".parse().unwrap()];
+
+        let result = validate_resolved_addrs(addrs, false, "https://files.example/document.pdf");
+
+        assert!(
+            matches!(result, Err(ResolveError::FileUrlBlocked { .. })),
+            "one private DNS answer must reject the entire pinned address set"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_client_uses_only_validated_dns_addresses() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let client = build_pinned_client(
+            "files.example.test",
+            &[target_address],
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let response = client
+            .get(format!("http://files.example.test:{}/file.txt", target_address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
+        server.join().unwrap();
+    }
+
+    fn start_redirect_server(target_address: SocketAddr) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn file_url_resolver_does_not_follow_redirects() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        target_listener.set_nonblocking(true).unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let (redirect_address, server) = start_redirect_server(target_address);
+
+        let resolver = FileUrlResolver {
+            allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{redirect_address}")).unwrap()],
+        };
+        let result = resolver
+            .resolve_url(
+                &format!("http://{redirect_address}/file.txt"),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                1024,
+            )
+            .await;
+        server.join().unwrap();
+
+        match result {
+            Err(ResolveError::FileUrlFailed { detail, .. }) => {
+                assert!(detail.contains("302"), "redirect response should be rejected directly");
+            },
+            Err(other) => panic!("expected URL fetch failure for redirect, got {other}"),
+            Ok(_) => panic!("redirect must not be followed"),
+        }
+        assert!(
+            matches!(target_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "redirect target must not receive a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_client_disables_configured_proxy() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy_listener.set_nonblocking(true).unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let builder = reqwest::Client::builder().proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap());
+        let client = configure_pinned_client(builder, "127.0.0.1", &[], std::time::Duration::from_secs(5)).unwrap();
+        let response = client
+            .get(format!("http://{target_address}/file.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
+        server.join().unwrap();
+
+        assert!(
+            matches!(proxy_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "configured proxy must not receive a connection"
         );
     }
 

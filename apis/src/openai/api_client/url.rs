@@ -19,6 +19,7 @@ use praxis_core::connectivity::normalize_mapped_ipv4;
 use praxis_filter::FilterError;
 
 use super::error::ApiClientError;
+use crate::openai::url_security::is_non_public_ip;
 
 /// Characters that could let a client-supplied resource ID escape
 /// its single URL path segment.
@@ -152,7 +153,7 @@ fn validate_host(filter_name: &str, host: &str, allow_private: bool) -> Result<(
 /// Validate an IP target against SSRF-sensitive ranges.
 fn validate_ip(filter_name: &str, ip: IpAddr, allow_private: bool) -> Result<(), FilterError> {
     let ip = normalize_mapped_ipv4(ip);
-    if !allow_private && is_ssrf_sensitive_ip(&ip) {
+    if !allow_private && is_non_public_ip(&ip) {
         return Err(format!(
             "{filter_name}: base URL targets a local-sensitive address; \
              set the allow-private option to true to allow"
@@ -172,29 +173,6 @@ fn validate_dns(filter_name: &str, host: &str, allow_private: bool) -> Result<()
          use a literal IP address or set the allow-private option to true to allow DNS targets"
     )
     .into())
-}
-
-/// Return whether an IP address is SSRF-sensitive (loopback,
-/// private, link-local, CGNAT/shared, current-network, or
-/// unspecified).
-fn is_ssrf_sensitive_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.octets()[0] == 0
-                || is_cgnat(*v4)
-        },
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local() || v6.is_unspecified(),
-    }
-}
-
-/// Return whether an IPv4 address is in the shared CGNAT range
-/// (`100.64.0.0/10`, RFC 6598).
-fn is_cgnat(ip: Ipv4Addr) -> bool {
-    u32::from(ip) & 0xFFC0_0000 == 0x6440_0000
 }
 
 /// Return whether a host name is a localhost alias.
@@ -446,6 +424,22 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_rejects_shared_special_use_range() {
+        assert!(
+            validate_base_url("test", "http://192.0.2.1:8321", false).is_err(),
+            "documentation ranges should be rejected by shared IP classification"
+        );
+    }
+
+    #[test]
+    fn ssrf_rejects_shared_cloud_metadata_endpoint() {
+        assert!(
+            validate_base_url("test", "http://100.100.100.200:8321", false).is_err(),
+            "cloud metadata endpoints should be rejected by shared IP classification"
+        );
+    }
+
+    #[test]
     fn ssrf_rejects_ipv4_mapped_ipv6_loopback() {
         assert!(
             validate_base_url("test", "http://[::ffff:127.0.0.1]:8321", false).is_err(),
@@ -456,7 +450,7 @@ mod tests {
     #[test]
     fn ssrf_allows_public_ipv4() {
         assert!(
-            validate_base_url("test", "http://203.0.113.1:8321", false).is_ok(),
+            validate_base_url("test", "http://8.8.8.8:8321", false).is_ok(),
             "public IPv4 should be allowed"
         );
     }

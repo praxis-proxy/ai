@@ -496,7 +496,7 @@ allow_private_files_api_url: true
 
     #[test]
     fn ssrf_allows_public_ipv4() {
-        let yaml = r#"files_api_url: "http://203.0.113.1:8321"
+        let yaml = r#"files_api_url: "http://8.8.8.8:8321"
 allow_pre_security_callout: true"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(validate_config(cfg).is_ok(), "public IPv4 should be allowed");
