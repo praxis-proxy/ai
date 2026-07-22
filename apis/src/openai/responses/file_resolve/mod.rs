@@ -62,7 +62,7 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_core::callout::{CalloutConfig, FailureMode};
+use praxis_callout_core::callout::{CalloutConfig, FailureMode};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };

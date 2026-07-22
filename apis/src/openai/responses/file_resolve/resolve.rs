@@ -677,7 +677,7 @@ mod tests {
         net::TcpListener,
     };
 
-    use praxis_core::callout::{CalloutConfig, FailureMode};
+    use praxis_callout_core::callout::{CalloutConfig, FailureMode};
 
     use super::*;
     use crate::openai::api_client::{ApiClient, ApiClientConfig};
