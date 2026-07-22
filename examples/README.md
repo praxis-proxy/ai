@@ -13,6 +13,28 @@ Configs use local ports (`3000`, `3001`, ...) for
 upstreams — start a real backend or stub on those ports
 before sending requests.
 
+## OGX File Search Demo
+
+The file-search callout uses OGX's OpenAI-compatible vector-store search API.
+Start the OGX starter distribution with an Ollama embedding provider:
+
+```console
+cd /path/to/ogx
+ollama pull all-minilm:l6-v2
+OLLAMA_URL=http://127.0.0.1:11434/v1 uv run ogx run starter --insecure
+```
+
+Then run the self-cleaning API demo from this repository:
+
+```console
+examples/scripts/ogx-file-search-demo.sh
+```
+
+The script creates a vector store, uploads and indexes a document, verifies
+unfiltered and metadata-filtered searches, and removes the demo data. This
+tests the OGX side of the callout contract; response-driven Praxis pipeline
+continuation is still required for a complete inference-to-search flow.
+
 ## Configs
 
 ### General
