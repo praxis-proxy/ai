@@ -27,7 +27,8 @@ use praxis_core::callout::{
     CircuitBreakerConfig as CoreCircuitBreakerConfig, DEPTH_HEADER, FailureMode,
 };
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, FilterResultSet, HttpFilter, HttpFilterContext, Rejection,
+    parse_filter_config,
 };
 use tracing::{debug, info, warn};
 
@@ -161,11 +162,25 @@ impl HttpCalloutFilter {
     ) -> Result<FilterAction, FilterError> {
         if !self.extractions.is_empty() {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&response.body) {
-                let results = ctx.filter_results.entry(self.name()).or_default();
+                let mut results = FilterResultSet::new();
                 for extraction in &self.extractions {
-                    extraction.evaluate(&json, results)?;
+                    extraction.evaluate(&json, &mut results)?;
                 }
                 debug!(results = ?results, "extracted callout results");
+                match self.phase {
+                    // Headers phase already runs inside `on_request`, so
+                    // results are published directly for branch evaluation.
+                    Phase::RequestHeaders => {
+                        ctx.filter_results.insert(self.name(), results);
+                    },
+                    // Body phase runs during StreamBuffer pre-read, before the
+                    // headers-phase pipeline. Branch evaluation clears
+                    // `filter_results` after every filter, so results written
+                    // now would be wiped by any preceding filter before this
+                    // filter's own branches are evaluated. Stash them and
+                    // re-publish in `on_request`.
+                    Phase::RequestBody => ctx.insert_filter_state(results),
+                }
             } else {
                 warn!("callout response body is not valid JSON; skipping extraction");
             }
@@ -351,11 +366,16 @@ impl HttpFilter for HttpCalloutFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if self.phase != Phase::RequestHeaders {
-            return Ok(FilterAction::Continue);
+        match self.phase {
+            Phase::RequestHeaders => self.execute_callout(ctx, None).await,
+            Phase::RequestBody => {
+                if let Some(results) = ctx.remove_filter_state::<FilterResultSet>() {
+                    debug!(results = ?results, "publishing stashed callout results");
+                    ctx.filter_results.insert(self.name(), results);
+                }
+                Ok(FilterAction::Continue)
+            },
         }
-
-        self.execute_callout(ctx, None).await
     }
 
     async fn on_request_body(

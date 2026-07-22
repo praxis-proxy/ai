@@ -944,9 +944,14 @@ mod filter_tests {
             headers: http::HeaderMap::new(),
         };
         let mut ctx = make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
         let mut body = Some(bytes::Bytes::from(r#"{"prompt":"hello"}"#));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        // Body-phase results are stashed, then published by on_request.
+        let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue));
 
         let results = ctx.filter_results.get("http_callout").expect("should have results");
@@ -980,6 +985,67 @@ mod filter_tests {
             matches!(action, FilterAction::Continue),
             "should skip non-end-of-stream chunks"
         );
+    }
+
+    #[tokio::test]
+    async fn request_body_results_republished_after_results_cleared() {
+        // Branch evaluation clears `filter_results` after every filter in
+        // the headers phase. Body-phase extractions are stashed and
+        // re-published by `on_request`, so a preceding filter's clearing
+        // cannot wipe them.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"flagged": true})))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_body
+            response:
+              extract:
+                - json_path: "$.flagged"
+                  result_key: "flagged"
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
+        let mut body = Some(bytes::Bytes::from(r#"{"prompt":"hello"}"#));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            !ctx.filter_results.contains_key("http_callout"),
+            "body phase should stash, not publish, results"
+        );
+
+        // A preceding filter's branch evaluation runs first and clears
+        // any leftover results.
+        ctx.filter_results.clear();
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        let results = ctx
+            .filter_results
+            .get("http_callout")
+            .expect("results should be republished");
+        assert_eq!(results.get("flagged"), Some("true"));
     }
 
     // -------------------------------------------------------------------------
@@ -1025,6 +1091,7 @@ mod filter_tests {
             headers: http::HeaderMap::new(),
         };
         let mut ctx = make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
 
         // Downstream body has "model" which Lakera would reject.
         let mut body = Some(bytes::Bytes::from(
@@ -1033,6 +1100,9 @@ mod filter_tests {
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "shaped body should succeed");
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
 
         let results = ctx.filter_results.get("http_callout").expect("should have results");
         assert_eq!(results.get("flagged"), Some("false"));

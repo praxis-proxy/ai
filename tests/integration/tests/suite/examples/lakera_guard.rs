@@ -69,6 +69,57 @@ fn lakera_guard_passes_clean() {
     );
 }
 
+#[test]
+fn lakera_guard_rejects_flagged_with_preceding_filter() {
+    // Branch evaluation clears `filter_results` after every filter in
+    // the headers phase. With a filter preceding the callout in the
+    // chain, body-phase extractions must still reach the callout's
+    // branch evaluation (stashed and re-published by `on_request`).
+    let (mock_lakera_port, _lakera_guard) = start_mock_lakera(true);
+    let backend_guard = start_backend_with_shutdown("upstream ok");
+    let proxy_port = free_port();
+
+    let path = example_config_path("lakera-guard.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml
+        .replace(
+            "https://api.lakera.ai/v2/guard",
+            &format!("http://127.0.0.1:{mock_lakera_port}/v2/guard"),
+        )
+        .replace(
+            "            - name: \"Authorization\"\n              value: \"Bearer ${LAKERA_API_KEY}\"\n",
+            "",
+        )
+        .replace(
+            "      - filter: http_callout",
+            "      - filter: token_usage_headers\n      - filter: http_callout",
+        );
+
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_guard.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse config: {e}"));
+    let proxy = start_proxy(&config);
+
+    let payload = r#"{"model":"test","messages":[{"role":"user","content":"bad"}]}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n\
+             {payload}",
+            payload.len()
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        403,
+        "flagged request should be rejected even with a filter preceding the callout"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
