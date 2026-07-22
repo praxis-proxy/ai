@@ -124,6 +124,32 @@ pub(crate) fn is_responses_create(method: &http::Method, path: &str) -> bool {
     method == http::Method::POST && normalize_trailing_slash(path) == "/v1/responses"
 }
 
+/// Check whether a request is a Responses API `WebSocket` handshake.
+///
+/// The handshake uses `GET /v1/responses` and the standard HTTP/1.1
+/// upgrade headers. `Connection` is token-valued, so matching handles
+/// comma-separated and repeated header lines without allocating.
+pub(crate) fn is_responses_websocket_handshake(method: &http::Method, path: &str, headers: &http::HeaderMap) -> bool {
+    if method != http::Method::GET || normalize_trailing_slash(path) != "/v1/responses" {
+        return false;
+    }
+
+    let connection_upgrades = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    let mut upgrade_values = headers.get_all(http::header::UPGRADE).iter();
+    let upgrades_to_websocket = upgrade_values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("websocket"))
+        && upgrade_values.next().is_none();
+
+    connection_upgrades && upgrades_to_websocket
+}
+
 // -----------------------------------------------------------------------------
 // Body Classification
 // -----------------------------------------------------------------------------
@@ -862,6 +888,120 @@ mod tests {
             !is_responses_path(&http::Method::GET, "/v1/responses/"),
             "GET /v1/responses/ is not a public API endpoint"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Responses WebSocket Handshake Classification
+    // -------------------------------------------------------------------------
+
+    fn websocket_headers(connection: &'static str, upgrade: &'static str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONNECTION, connection.parse().unwrap());
+        headers.insert(http::header::UPGRADE, upgrade.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn responses_websocket_handshake_matches_standard_upgrade() {
+        let headers = websocket_headers("Upgrade", "websocket");
+
+        assert!(is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses",
+            &headers
+        ));
+    }
+
+    #[test]
+    fn responses_websocket_handshake_is_case_insensitive_and_allows_trailing_slash() {
+        let headers = websocket_headers("keep-alive, UpGrAdE", "WebSocket");
+
+        assert!(is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses/",
+            &headers
+        ));
+    }
+
+    #[test]
+    fn responses_websocket_handshake_finds_token_across_repeated_connection_headers() {
+        let mut headers = websocket_headers("keep-alive", "websocket");
+        headers.append(http::header::CONNECTION, "upgrade".parse().unwrap());
+
+        assert!(is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses",
+            &headers
+        ));
+    }
+
+    #[test]
+    fn responses_websocket_handshake_rejects_wrong_method_or_path() {
+        let headers = websocket_headers("upgrade", "websocket");
+
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::POST,
+            "/v1/responses",
+            &headers
+        ));
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses/resp_123",
+            &headers
+        ));
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/chat/completions",
+            &headers
+        ));
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses-other",
+            &headers
+        ));
+    }
+
+    #[test]
+    fn responses_websocket_handshake_requires_both_upgrade_headers() {
+        let mut connection_only = http::HeaderMap::new();
+        connection_only.insert(http::header::CONNECTION, "upgrade".parse().unwrap());
+        let mut upgrade_only = http::HeaderMap::new();
+        upgrade_only.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses",
+            &connection_only
+        ));
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses",
+            &upgrade_only
+        ));
+    }
+
+    #[test]
+    fn responses_websocket_handshake_rejects_non_websocket_upgrade_and_substring_token() {
+        let wrong_upgrade = websocket_headers("upgrade", "h2c");
+        let substring_connection = websocket_headers("upgrader", "websocket");
+        let mut repeated_upgrade = websocket_headers("upgrade", "websocket");
+        repeated_upgrade.append(http::header::UPGRADE, "h2c".parse().unwrap());
+
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses",
+            &wrong_upgrade
+        ));
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses",
+            &substring_connection
+        ));
+        assert!(!is_responses_websocket_handshake(
+            &http::Method::GET,
+            "/v1/responses",
+            &repeated_upgrade
+        ));
     }
 
     #[test]

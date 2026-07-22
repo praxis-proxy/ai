@@ -37,6 +37,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "process"] }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
