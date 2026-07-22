@@ -11,8 +11,8 @@ use std::{
 };
 
 use praxis_test_utils::{
-    free_port, http_send, json_post, load_example_config, parse_body, parse_status, start_backend_with_shutdown,
-    start_capturing_backend, start_proxy,
+    free_port, http_get, http_send, json_post, load_example_config, parse_body, parse_status,
+    start_backend_with_shutdown, start_capturing_backend, start_proxy,
 };
 
 const FILE_METADATA: &str = r#"{"id":"test-file-123","object":"file","bytes":13,"created_at":1750000000,"filename":"test.txt","purpose":"user_data"}"#;
@@ -250,6 +250,63 @@ fn example_config_non_responses_traffic_passes_through() {
         parse_body(&raw),
         "default-backend",
         "non-responses traffic should route to default backend"
+    );
+}
+
+#[test]
+fn example_config_routes_files_api_paths_to_ogx() {
+    let ogx_guard = start_backend_with_shutdown("ogx-files-api");
+    let inference_guard = start_backend_with_shutdown("inference-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "openai/responses/file-resolve.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:9999", ogx_guard.port()),
+            ("127.0.0.1:3001", inference_guard.port()),
+            ("127.0.0.1:3002", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let upload_body = "--test-boundary\r\n\
+        Content-Disposition: form-data; name=\"purpose\"\r\n\r\n\
+        assistants\r\n\
+        --test-boundary\r\n\
+        Content-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\
+        Content-Type: text/plain\r\n\r\n\
+        uploaded file contents\r\n\
+        --test-boundary--\r\n";
+    let upload = format!(
+        "POST /v1/files HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: multipart/form-data; boundary=test-boundary\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {upload_body}",
+        upload_body.len()
+    );
+    let upload_raw = http_send(proxy.addr(), &upload);
+    assert_eq!(parse_status(&upload_raw), 200, "Files API root should be proxied");
+    assert_eq!(
+        parse_body(&upload_raw),
+        "ogx-files-api",
+        "POST /v1/files should route to OGX"
+    );
+    let (content_status, content_body) = http_get(proxy.addr(), "/v1/files/file-123/content", None);
+    assert_eq!(content_status, 200, "Files API subresource should be proxied");
+    assert_eq!(
+        content_body, "ogx-files-api",
+        "Files API subresources should route to OGX"
+    );
+
+    let (non_files_status, non_files_body) = http_get(proxy.addr(), "/v1/filesystem", None);
+    assert_eq!(non_files_status, 200, "non-Files API path should be proxied");
+    assert_eq!(
+        non_files_body, "default-backend",
+        "path-prefix matching must stop at a segment boundary"
     );
 }
 

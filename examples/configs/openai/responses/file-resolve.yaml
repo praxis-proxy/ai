@@ -14,6 +14,11 @@
 # transparently inlines the content so the backend receives
 # a self-contained request.
 #
+# Client-facing Files API requests under /v1/files are routed
+# directly to the same Files API service. The router uses
+# segment-boundary prefix matching, so /v1/files and all of its
+# subresources go to OGX while paths such as /v1/filesystem do not.
+#
 # This filter resolves the file transport reference only. The
 # inference backend must support inline `input_file` / `file_data`
 # or `input_image` / `image_url` content. Backend-specific document
@@ -52,6 +57,8 @@ filter_chains:
 
       - filter: router
         routes:
+          - path_prefix: "/v1/files"
+            cluster: "ogx-files-api"
           - path: "/v1/responses"
             cluster: "inference-backend"
           - path_prefix: "/"
@@ -59,6 +66,9 @@ filter_chains:
 
       - filter: load_balancer
         clusters:
+          - name: "ogx-files-api"
+            endpoints:
+              - "127.0.0.1:9999"
           - name: "inference-backend"
             endpoints:
               - "127.0.0.1:3001"

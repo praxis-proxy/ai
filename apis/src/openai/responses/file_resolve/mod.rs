@@ -88,6 +88,11 @@ use crate::{
 /// part. This filter does not extract documents into backend-specific
 /// representations such as `input_text`.
 ///
+/// This filter resolves references inside Responses requests; it does
+/// not proxy client-facing Files API operations. Route `/v1/files` and
+/// its subresources to the configured Files API with the standard
+/// `router` and `load_balancer` filters.
+///
 /// # YAML
 ///
 /// ```yaml
