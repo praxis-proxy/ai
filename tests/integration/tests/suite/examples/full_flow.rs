@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, TempSqlite, example_config_path, free_port, http_send, json_post, load_example_config, parse_body,
-    parse_status, patch_yaml, start_backend_with_shutdown, start_echo_backend, start_proxy,
+    Backend, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, load_example_config,
+    parse_body, parse_status, patch_yaml, start_backend_with_shutdown, start_echo_backend, start_proxy,
 };
 
 use super::openai_file_resolve::start_files_api_stub;
@@ -191,6 +191,31 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
         parse_status(&raw),
         404,
         "chat completions bodies should not match the Responses-only route"
+    );
+}
+
+#[test]
+fn full_flow_vector_stores_routes_to_dedicated_backend() {
+    let inference = start_backend_with_shutdown("inference-backend");
+    let vs_backend = start_backend_with_shutdown("vector-stores-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "openai/responses/full-flow.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", inference.port()),
+            ("127.0.0.1:3002", vs_backend.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_get(proxy.addr(), "/v1/vector_stores/vs_abc/files", None);
+
+    assert_eq!(status, 200, "vector stores subresource should return 200");
+    assert_eq!(
+        body, "vector-stores-backend",
+        "vector stores traffic should bypass AI filters and route to vector-stores-backend"
     );
 }
 
