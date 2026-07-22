@@ -184,9 +184,14 @@ filter_chains:
             headers:
               x-praxis-ai-format: "openai_responses"
             cluster: "inference-backend"
+          - path_prefix: "/v1/vector_stores"
+            cluster: "vector-stores-backend"
 
       - filter: load_balancer
         clusters:
           - name: "inference-backend"
             endpoints:
               - "127.0.0.1:3001"
+          - name: "vector-stores-backend"
+            endpoints:
+              - "127.0.0.1:3002"
