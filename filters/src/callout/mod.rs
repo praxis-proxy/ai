@@ -16,8 +16,6 @@ mod extract;
 #[cfg(test)]
 mod tests;
 
-use std::borrow::Cow;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{FailureModeConfig, HttpCalloutConfig, Phase, expand_env_vars, validate_callout_url};
@@ -183,11 +181,8 @@ impl HttpCalloutFilter {
         }
 
         for name in &self.inject_headers {
-            if let Some((_, value)) = response.headers.iter().find(|(n, _)| n == name)
-                && let Ok(value_str) = value.to_str()
-            {
-                ctx.extra_request_headers
-                    .push((Cow::Owned(name.to_string()), value_str.to_owned()));
+            if let Some((_, value)) = response.headers.iter().find(|(n, _)| n == name) {
+                ctx.request_headers_to_set.push((name.clone(), value.clone()));
             }
         }
 

@@ -934,11 +934,53 @@ mod filter_tests {
         assert!(matches!(action, FilterAction::Continue));
 
         let injected = ctx
-            .extra_request_headers
+            .request_headers_to_set
             .iter()
-            .find(|(name, _)| name.as_ref() == "x-guard-id");
+            .find(|(name, _)| name.as_str() == "x-guard-id");
         assert!(injected.is_some(), "x-guard-id should be injected");
         assert_eq!(injected.unwrap().1, "abc-123");
+    }
+
+    #[tokio::test]
+    async fn inject_headers_absent_from_response_not_injected() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+            response:
+              inject_headers:
+                - "x-guard-id"
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        assert!(
+            ctx.request_headers_to_set.is_empty(),
+            "absent response header should not be injected"
+        );
     }
 
     // -------------------------------------------------------------------------
