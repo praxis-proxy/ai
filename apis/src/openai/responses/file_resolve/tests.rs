@@ -12,7 +12,10 @@ use bytes::Bytes;
 use serde_json::json;
 
 use super::*;
-use crate::openai::responses::state::ResponsesState;
+use crate::openai::{
+    api_client::{ApiClient, ApiClientConfig},
+    responses::state::ResponsesState,
+};
 
 // -----------------------------------------------------------------------------
 // Config Parsing
@@ -654,19 +657,19 @@ fn make_client() -> FilesApiClient {
 }
 
 fn make_client_for_url_with_max(files_api_url: &str, max_resolved_bytes: usize) -> FilesApiClient {
-    let callout_config = CalloutConfig::default();
-    let callout = CalloutClient::new(callout_config).unwrap();
+    let api = ApiClient::new(ApiClientConfig {
+        api_base_url: files_api_url.to_owned(),
+        callout_config: CalloutConfig::default(),
+        forward_header_names: vec![],
+    })
+    .unwrap();
     FilesApiClient::new(
-        files_api_url,
-        vec![],
-        callout,
+        api,
         FilesApiClientOptions {
             max_file_references: 32,
             max_resolved_bytes,
-            timeout_ms: 30_000,
         },
     )
-    .unwrap()
 }
 
 fn start_files_api_stub() -> String {

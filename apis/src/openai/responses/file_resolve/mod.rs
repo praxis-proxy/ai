@@ -5,8 +5,8 @@
 //!
 //! Walks `message` content arrays and `function_call_output` output
 //! arrays, finds content parts that reference files by ID, fetches
-//! file metadata and content from an external Files API (e.g. OGX)
-//! via [`CalloutClient`], and inlines the content: raw base64 in
+//! file metadata and content from an external Files API
+//! via [`ApiClient`], and inlines the content: raw base64 in
 //! `file_data` for `input_file`, or a `data:` URL in `image_url`
 //! for `input_image`. Forwards configurable headers
 //! (`Authorization`, `X-Tenant-ID`) to the Files API for tenant
@@ -40,7 +40,7 @@
 //! `OpenAI` extension and converts it to portable inline content.
 //!
 //! [#397]: https://github.com/praxis-proxy/ai/issues/397
-//! [`CalloutClient`]: praxis_core::callout::CalloutClient
+//! [`ApiClient`]: crate::openai::api_client::ApiClient
 //! [`ResponsesState`]: super::state::ResponsesState
 
 mod config;
@@ -62,7 +62,7 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_core::callout::{CalloutClient, CalloutConfig, FailureMode};
+use praxis_core::callout::{CalloutConfig, FailureMode};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
@@ -75,10 +75,13 @@ use self::{
     },
 };
 use super::{openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState};
-use crate::classifier::is_responses_create;
+use crate::{
+    classifier::is_responses_create,
+    openai::api_client::{ApiClient, ApiClientConfig},
+};
 
 /// Resolves `file_id` references in Responses API input by fetching
-/// content from a Files API via [`CalloutClient`] and inlining the
+/// content from a Files API via `ApiClient` and inlining the
 /// base64-encoded content in the provider-native field.
 ///
 /// The inference backend must support the resulting inline content
@@ -109,10 +112,8 @@ use crate::classifier::is_responses_create;
 /// max_body_bytes: 67108864
 /// max_file_references: 32
 /// ```
-///
-/// [`CalloutClient`]: praxis_core::callout::CalloutClient
 pub struct FileResolveFilter {
-    /// Files API HTTP client backed by callout.
+    /// Files API HTTP client backed by shared API callout.
     client: FilesApiClient,
     /// Parsed and validated configuration.
     config: FileResolveConfig,
@@ -130,28 +131,25 @@ impl FileResolveFilter {
         let validated = validate_config(cfg)?;
         let forward_header_names = prepare_forward_header_names(&validated.forward_headers)?;
 
-        let callout_config = CalloutConfig {
-            failure_mode: FailureMode::Closed,
-            timeout_ms: validated.timeout_ms,
-            status_on_error: 502,
-            ..CalloutConfig::default()
-        };
-
-        let callout_client = CalloutClient::new(callout_config).map_err(|e| -> FilterError {
-            format!("openai_file_resolve: failed to build callout client: {e}").into()
-        })?;
+        let api_client = ApiClient::new(ApiClientConfig {
+            api_base_url: validated.files_api_url.clone(),
+            callout_config: CalloutConfig {
+                failure_mode: FailureMode::Closed,
+                timeout_ms: validated.timeout_ms,
+                status_on_error: 502,
+                ..CalloutConfig::default()
+            },
+            forward_header_names,
+        })
+        .map_err(|e| -> FilterError { format!("openai_file_resolve: {e}").into() })?;
 
         let client = FilesApiClient::new(
-            &validated.files_api_url,
-            forward_header_names,
-            callout_client,
+            api_client,
             FilesApiClientOptions {
                 max_file_references: validated.max_file_references,
                 max_resolved_bytes: validated.max_body_bytes,
-                timeout_ms: validated.timeout_ms,
             },
-        )
-        .map_err(|e| -> FilterError { format!("openai_file_resolve: failed to build content client: {e}").into() })?;
+        );
 
         Ok(Box::new(Self {
             client,

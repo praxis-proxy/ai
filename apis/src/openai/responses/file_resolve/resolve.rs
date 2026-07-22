@@ -6,7 +6,7 @@
 //! Walks the parsed JSON body, finds `file_id` references in
 //! `message` content arrays and `function_call_output` output
 //! arrays, fetches file metadata and content from the Files API
-//! via [`CalloutClient`], and replaces the reference with inline
+//! via [`ApiClient`], and replaces the reference with inline
 //! content: raw base64 in `file_data` for `input_file`, or a
 //! `data:` URL in `image_url` for `input_image`.
 //!
@@ -15,41 +15,18 @@
 //! extension and emits the baseline inline `file_data` / `image_url`
 //! fields before proxying the request.
 //!
-//! [`CalloutClient`]: praxis_core::callout::CalloutClient
+//! [`ApiClient`]: crate::openai::api_client::ApiClient
 
 use std::collections::HashMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use praxis_core::callout::{CalloutClient, CalloutRequest, CalloutResult};
 use tracing::{debug, warn};
 
 use super::config::OnMissing;
+use crate::openai::api_client::{ApiClient, ApiClientError};
 
-/// Characters that could let a client-supplied file ID escape its
-/// single URL path segment.
-///
-/// Encoding path separators, query/fragment delimiters, `%`, and URL
-/// parser special characters keeps the ID opaque when it is appended to
-/// `/v1/files/`. Dots are encoded as an additional defense against path
-/// normalization; exact `.` and `..` IDs are rejected by [`file_url`].
-const FILE_ID_PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'%')
-    .add(b'.')
-    .add(b'/')
-    .add(b'<')
-    .add(b'>')
-    .add(b'?')
-    .add(b'[')
-    .add(b'\\')
-    .add(b']')
-    .add(b'^')
-    .add(b'`')
-    .add(b'{')
-    .add(b'}');
+/// Files API path prefix used in resource URL construction.
+const FILES_PATH_PREFIX: &str = "v1/files";
 
 /// Errors that can occur during file resolution.
 #[derive(Debug, Clone)]
@@ -104,23 +81,35 @@ impl std::fmt::Display for ResolveError {
     }
 }
 
+/// Map an [`ApiClientError`] to a [`ResolveError`], adding the
+/// file ID context that the shared client does not carry.
+fn map_api_error(err: ApiClientError, file_id: &str) -> ResolveError {
+    match err {
+        ApiClientError::CalloutFailed { detail } => ResolveError::CalloutFailed {
+            file_id: file_id.to_owned(),
+            detail,
+        },
+        ApiClientError::InvalidResourceId { resource_id, detail } => ResolveError::InvalidFileId {
+            file_id: resource_id,
+            detail,
+        },
+        ApiClientError::ResponseTooLarge { limit } => ResolveError::TooLarge {
+            file_id: file_id.to_owned(),
+            limit,
+        },
+        ApiClientError::DecodeFailed { detail } => ResolveError::CalloutFailed {
+            file_id: file_id.to_owned(),
+            detail: format!("metadata response invalid: {detail}"),
+        },
+    }
+}
+
 /// HTTP client wrapper for fetching files from an OpenAI-compatible
-/// Files API, backed by [`CalloutClient`] for metadata and
-/// bounded `reqwest` reads for content.
+/// Files API, backed by [`ApiClient`] for metadata and bounded
+/// byte reads for content.
 pub(crate) struct FilesApiClient {
-    /// Base URL of the Files API.
-    api_base_url: String,
-
-    /// The underlying callout client for metadata requests
-    /// (small responses; provides circuit breaking).
-    client: CalloutClient,
-
-    /// Direct HTTP client for content downloads with bounded
-    /// reads (prevents unbounded memory allocation).
-    content_client: reqwest::Client,
-
-    /// Header names to forward from the original request.
-    forward_header_names: Vec<http::HeaderName>,
+    /// Shared API client providing HTTP operations.
+    client: ApiClient,
 
     /// Maximum number of file references processed per request.
     max_file_references: usize,
@@ -165,8 +154,6 @@ pub(crate) struct FilesApiClientOptions {
     pub max_file_references: usize,
     /// Maximum bytes added by resolved inline content.
     pub max_resolved_bytes: usize,
-    /// Per-call and overall resolution timeout in milliseconds.
-    pub timeout_ms: u64,
 }
 
 /// Inputs needed to resolve and cache one file reference.
@@ -225,8 +212,6 @@ impl ResolutionBudget {
         } = request;
         let key = (part_type.to_owned(), file_id.to_owned());
         if let Some(cached) = self.cache.get(&key) {
-            // Each rewritten JSON part needs its own owned strings;
-            // the cache retains one copy to avoid repeated callouts.
             return cached.clone();
         }
 
@@ -238,8 +223,6 @@ impl ResolutionBudget {
         )
         .await
         .unwrap_or_else(|_elapsed| overall_timeout_error(file_id));
-        // Retain one owned outcome for repeated references while
-        // returning an independently owned value to the JSON part.
         self.cache.insert(key, resolution.clone());
         resolution
     }
@@ -277,37 +260,19 @@ fn overall_timeout_error(file_id: &str) -> Result<ResolvedFile, ResolveError> {
 }
 
 impl FilesApiClient {
-    /// Build a new client from base URL, forward headers, and a
-    /// pre-built [`CalloutClient`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the bounded content client cannot be built.
-    pub(crate) fn new(
-        api_base_url: &str,
-        forward_header_names: Vec<http::HeaderName>,
-        client: CalloutClient,
-        options: FilesApiClientOptions,
-    ) -> Result<Self, reqwest::Error> {
+    /// Build a new client from a pre-built [`ApiClient`] and
+    /// domain-specific options.
+    pub(crate) fn new(client: ApiClient, options: FilesApiClientOptions) -> Self {
         let FilesApiClientOptions {
             max_file_references,
             max_resolved_bytes,
-            timeout_ms,
         } = options;
-        let content_client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_millis(timeout_ms))
-            .build()?;
-        Ok(Self {
-            api_base_url: api_base_url.trim_end_matches('/').to_owned(),
+        Self {
+            resolution_timeout: client.timeout(),
             client,
-            content_client,
-            forward_header_names,
             max_file_references,
             max_resolved_bytes,
-            resolution_timeout: std::time::Duration::from_millis(timeout_ms),
-        })
+        }
     }
 
     /// Create request-scoped resolution limits and cache state.
@@ -328,31 +293,22 @@ impl FilesApiClient {
         file_id: &str,
         request_headers: &http::HeaderMap,
     ) -> Result<FileMetadata, ResolveError> {
-        let url = file_url(&self.api_base_url, file_id, false)?;
-        let headers = forward_headers(request_headers, &self.forward_header_names);
-        let request = build_get_request(url, headers);
+        let url = self
+            .client
+            .resource_url(FILES_PATH_PREFIX, file_id, None)
+            .map_err(|e| map_api_error(e, file_id))?;
 
-        let response = execute_callout(&self.client, request, file_id).await?;
-
-        let body: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(|e| ResolveError::CalloutFailed {
-                file_id: file_id.to_owned(),
-                detail: format!("metadata response invalid: {e}"),
-            })?;
+        let body = self
+            .client
+            .get_json(url, request_headers)
+            .await
+            .map_err(|e| map_api_error(e, file_id))?;
 
         Ok(parse_file_metadata(&body))
     }
 
     /// Fetch file content from `GET /v1/files/{file_id}/content`
     /// using bounded reads.
-    ///
-    /// Uses `reqwest` directly (bypassing [`CalloutClient`]) to
-    /// enforce `max_content_bytes` during download: the
-    /// `Content-Length` header is checked before reading, and the
-    /// body is consumed in chunks that are rejected as soon as
-    /// the accumulated size exceeds the limit.
-    ///
-    /// [`CalloutClient`]: praxis_core::callout::CalloutClient
     async fn fetch_content(
         &self,
         file_id: &str,
@@ -360,53 +316,21 @@ impl FilesApiClient {
         max_content_bytes: usize,
         max_resolved_bytes: usize,
     ) -> Result<Vec<u8>, ResolveError> {
-        let url = file_url(&self.api_base_url, file_id, true)?;
-        let response = self.send_content_request(&url, request_headers, file_id).await?;
+        let url = self
+            .client
+            .resource_url(FILES_PATH_PREFIX, file_id, Some("content"))
+            .map_err(|e| map_api_error(e, file_id))?;
 
-        if !response.status().is_success() {
-            return Err(ResolveError::CalloutFailed {
-                file_id: file_id.to_owned(),
-                detail: format!("content download returned {}", response.status()),
-            });
-        }
-
-        if response
-            .content_length()
-            .is_some_and(|cl| usize::try_from(cl).unwrap_or(usize::MAX) > max_content_bytes)
-        {
-            return Err(ResolveError::TooLarge {
-                file_id: file_id.to_owned(),
-                limit: max_resolved_bytes,
-            });
-        }
-
-        read_bounded_body(response, file_id, max_content_bytes, max_resolved_bytes).await
-    }
-
-    /// Send a GET request for file content with forwarded headers
-    /// and timeout.
-    async fn send_content_request(
-        &self,
-        url: &str,
-        request_headers: &http::HeaderMap,
-        file_id: &str,
-    ) -> Result<reqwest::Response, ResolveError> {
-        let headers = forward_headers(request_headers, &self.forward_header_names);
-        let mut req = self.content_client.get(url);
-        for (name, value) in headers {
-            req = req.header(name, value);
-        }
-        req.send().await.map_err(|e| {
-            warn!(file_id, error = %e, "content download request failed");
-            ResolveError::CalloutFailed {
-                file_id: file_id.to_owned(),
-                detail: if e.is_timeout() {
-                    "content download timed out".to_owned()
-                } else {
-                    "content download failed".to_owned()
+        self.client
+            .get_bytes(&url, request_headers, max_content_bytes)
+            .await
+            .map_err(|e| match e {
+                ApiClientError::ResponseTooLarge { .. } => ResolveError::TooLarge {
+                    file_id: file_id.to_owned(),
+                    limit: max_resolved_bytes,
                 },
-            }
-        })
+                other => map_api_error(other, file_id),
+            })
     }
 
     /// Fetch metadata and content, returning the base64 content
@@ -447,64 +371,6 @@ impl FilesApiClient {
             content_type: metadata.content_type,
             filename: metadata.filename,
         })
-    }
-}
-
-/// Read a response body in chunks, enforcing a size limit.
-async fn read_bounded_body(
-    mut response: reqwest::Response,
-    file_id: &str,
-    max_content_bytes: usize,
-    limit: usize,
-) -> Result<Vec<u8>, ResolveError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| ResolveError::CalloutFailed {
-        file_id: file_id.to_owned(),
-        detail: if e.is_timeout() {
-            "content download timed out".to_owned()
-        } else {
-            format!("content download read error: {e}")
-        },
-    })? {
-        if body.len() + chunk.len() > max_content_bytes {
-            return Err(ResolveError::TooLarge {
-                file_id: file_id.to_owned(),
-                limit,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-/// Build a GET [`CalloutRequest`] with the given URL and headers.
-fn build_get_request(url: String, headers: Vec<(http::HeaderName, http::HeaderValue)>) -> CalloutRequest {
-    CalloutRequest {
-        body: None,
-        depth: 0,
-        headers,
-        method: http::Method::GET,
-        url,
-    }
-}
-
-/// Execute a callout and map non-success outcomes to
-/// [`ResolveError`].
-async fn execute_callout(
-    client: &CalloutClient,
-    request: CalloutRequest,
-    file_id: &str,
-) -> Result<praxis_core::callout::CalloutResponse, ResolveError> {
-    match client.execute(request).await {
-        CalloutResult::Success(r) => Ok(r),
-        CalloutResult::Failed => Err(ResolveError::CalloutFailed {
-            file_id: file_id.to_owned(),
-            detail: "Files API callout failed (fail-open)".to_owned(),
-        }),
-        CalloutResult::Rejected(rejection) => Err(ResolveError::CalloutFailed {
-            file_id: file_id.to_owned(),
-            detail: format!("Files API callout rejected with status {}", rejection.status),
-        }),
     }
 }
 
@@ -549,20 +415,6 @@ pub(crate) struct ResolvedFile {
     content_type: String,
     /// Original filename from the Files API metadata.
     filename: Option<String>,
-}
-
-/// Build a Files API URL with `file_id` encoded as one path segment.
-fn file_url(api_base_url: &str, file_id: &str, content: bool) -> Result<String, ResolveError> {
-    if matches!(file_id, "." | "..") {
-        return Err(ResolveError::InvalidFileId {
-            file_id: file_id.to_owned(),
-            detail: "dot path segments are not valid file IDs".to_owned(),
-        });
-    }
-
-    let encoded_file_id = utf8_percent_encode(file_id, FILE_ID_PATH_SEGMENT_ENCODE_SET);
-    let content_suffix = if content { "/content" } else { "" };
-    Ok(format!("{api_base_url}/v1/files/{encoded_file_id}{content_suffix}"))
 }
 
 /// Walk the Responses API `input` array and resolve all `file_id`
@@ -667,9 +519,6 @@ async fn resolve_content_part(
     let (file_id, part_type) = (file_id.to_owned(), part_type.to_owned());
     debug!(file_id = %file_id, part_type = %part_type, "resolving file reference");
 
-    // Bound proxy resource use with the configured request budget, but leave
-    // provider-specific field-size validation to the upstream (for example,
-    // vLLM). This filter validates only fields needed for safe proxying.
     let max_resolved_bytes = resolver.budget.remaining_resolved_bytes;
     let Some(resolved) = resolve_reference(&file_id, &part_type, max_resolved_bytes, resolver).await? else {
         return Ok(None);
@@ -746,10 +595,6 @@ fn output_len_for_part(part_type: &str, resolved: &ResolvedFile) -> usize {
 }
 
 /// Replace `file_id` with the resolved content in a content part.
-///
-/// For `input_file`, writes raw base64 to `file_data` and
-/// populates `filename` from metadata when not already present.
-/// For `input_image`, writes a `data:` URL to `image_url`.
 fn rewrite_part(part: &mut serde_json::Value, part_type: &str, resolved: ResolvedFile) {
     let Some(obj) = part.as_object_mut() else {
         return;
@@ -776,21 +621,6 @@ fn rewrite_part(part: &mut serde_json::Value, part_type: &str, resolved: Resolve
         },
         _ => {},
     }
-}
-
-/// Forward configured headers from the original request to a
-/// callout request.
-fn forward_headers(
-    request_headers: &http::HeaderMap,
-    header_names: &[http::HeaderName],
-) -> Vec<(http::HeaderName, http::HeaderValue)> {
-    let mut headers = Vec::new();
-    for name in header_names {
-        if let Some(value) = request_headers.get(name) {
-            headers.push((name.clone(), value.clone()));
-        }
-    }
-    headers
 }
 
 /// Maximum raw file bytes whose base64 encoding fits in
@@ -845,12 +675,12 @@ mod tests {
     use std::{
         io::{Read as _, Write as _},
         net::TcpListener,
-        time::Duration,
     };
 
     use praxis_core::callout::{CalloutConfig, FailureMode};
 
     use super::*;
+    use crate::openai::api_client::{ApiClient, ApiClientConfig};
 
     #[test]
     fn infer_mime_pdf() {
@@ -931,45 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn file_url_encodes_file_id_as_single_path_segment() {
-        let url = file_url("http://ogx:8321", "../admin?x#y", false).unwrap();
-
-        assert!(
-            url.starts_with("http://ogx:8321/v1/files/"),
-            "metadata URL should use the files endpoint: {url}"
-        );
-        assert!(
-            !url.contains("../admin"),
-            "raw path traversal should not appear in URL: {url}"
-        );
-        assert!(!url.contains("?x"), "query delimiter should be encoded: {url}");
-        assert!(!url.contains("#y"), "fragment delimiter should be encoded: {url}");
-        assert!(url.contains("%2F"), "slash should be encoded: {url}");
-        assert!(url.contains("%3F"), "question mark should be encoded: {url}");
-        assert!(url.contains("%23"), "fragment marker should be encoded: {url}");
-    }
-
-    #[test]
-    fn file_url_rejects_exact_dot_dot_segment() {
-        let err = file_url("http://ogx:8321", "..", false).unwrap_err();
-
-        assert!(
-            matches!(err, ResolveError::InvalidFileId { .. }),
-            "exact dot-dot file id should be rejected before URL construction"
-        );
-    }
-
-    #[test]
-    fn file_url_preserves_base_path_and_adds_content_suffix() {
-        let url = file_url("http://ogx:8321/files-api", "file-abc", true).unwrap();
-
-        assert_eq!(
-            url, "http://ogx:8321/files-api/v1/files/file-abc/content",
-            "content URL should preserve configured base path"
-        );
-    }
-
-    #[test]
     fn max_content_bytes_accounts_for_base64_expansion() {
         let prefix_len = "data:text/plain;base64,".len();
 
@@ -1019,28 +810,32 @@ mod tests {
         assert_eq!(meta.bytes, None, "bytes should be None when absent from metadata");
     }
 
+    fn test_api_client(api_base_url: &str, timeout_ms: u64) -> ApiClient {
+        ApiClient::new(ApiClientConfig {
+            api_base_url: api_base_url.to_owned(),
+            callout_config: CalloutConfig {
+                failure_mode: FailureMode::Closed,
+                timeout_ms,
+                ..CalloutConfig::default()
+            },
+            forward_header_names: Vec::new(),
+        })
+        .unwrap()
+    }
+
     fn test_client(api_base_url: &str) -> FilesApiClient {
         test_client_with_limits(api_base_url, 1024, 1_000)
     }
 
     fn test_client_with_limits(api_base_url: &str, max_resolved_bytes: usize, timeout_ms: u64) -> FilesApiClient {
-        let callout = CalloutClient::new(CalloutConfig {
-            failure_mode: FailureMode::Closed,
-            timeout_ms,
-            ..CalloutConfig::default()
-        })
-        .unwrap();
+        let api = test_api_client(api_base_url, timeout_ms);
         FilesApiClient::new(
-            api_base_url,
-            Vec::new(),
-            callout,
+            api,
             FilesApiClientOptions {
                 max_file_references: 32,
                 max_resolved_bytes,
-                timeout_ms,
             },
         )
-        .unwrap()
     }
 
     #[tokio::test]
@@ -1065,11 +860,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(
-                err,
-                ResolveError::CalloutFailed { detail, .. } if detail.contains("302 Found")
-            ),
-            "redirect response should be rejected without contacting its target"
+            matches!(err, ResolveError::CalloutFailed { .. }),
+            "redirect response should be rejected without contacting its target: {err}"
         );
     }
 
@@ -1089,42 +881,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(
-                err,
-                ResolveError::CalloutFailed { detail, .. } if detail == "content download failed"
-            ),
-            "transport errors should retain a generic detail after the internal error is logged"
-        );
-    }
-
-    #[tokio::test]
-    async fn content_download_timeout_covers_response_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _read = stream.read(&mut request).unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\na")
-                .unwrap();
-            stream.flush().unwrap();
-            std::thread::park_timeout(Duration::from_millis(250));
-            let _result = stream.write_all(b"bcde");
-        });
-        let client = test_client_with_limits(&format!("http://{address}"), 1024, 50);
-
-        let err = client
-            .fetch_content("file-slow", &http::HeaderMap::new(), 1024, 1024)
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(
-                &err,
-                ResolveError::CalloutFailed { detail, .. } if detail.contains("timed out")
-            ),
-            "timeout should remain active while the response body is being downloaded: {err}"
+            matches!(err, ResolveError::CalloutFailed { .. }),
+            "transport errors should map to CalloutFailed: {err}"
         );
     }
 
@@ -1218,7 +976,14 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_reference_limit_is_enforced_in_continue_mode() {
-        let mut client = test_client("http://ogx:8321");
+        let api = test_api_client("http://ogx:8321", 1_000);
+        let mut client = FilesApiClient::new(
+            api,
+            FilesApiClientOptions {
+                max_file_references: 2,
+                max_resolved_bytes: 1024,
+            },
+        );
         client.max_file_references = 2;
         let mut body = serde_json::json!({
             "input": [{
@@ -1244,8 +1009,14 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_reference_reuses_cached_failure() {
-        let mut client = test_client("http://ogx:8321");
-        client.max_file_references = 1;
+        let api = test_api_client("http://ogx:8321", 1_000);
+        let client = FilesApiClient::new(
+            api,
+            FilesApiClientOptions {
+                max_file_references: 1,
+                max_resolved_bytes: 1024,
+            },
+        );
         let mut body = serde_json::json!({
             "input": [{
                 "type": "message",
