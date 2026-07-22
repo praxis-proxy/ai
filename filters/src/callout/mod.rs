@@ -155,16 +155,12 @@ impl HttpCalloutFilter {
 
     /// Process a successful callout response: extract results and
     /// inject headers.
-    fn handle_success(
-        &self,
-        response: &CalloutResponse,
-        ctx: &mut HttpFilterContext<'_>,
-    ) -> Result<FilterAction, FilterError> {
+    fn handle_success(&self, response: &CalloutResponse, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         if !self.extractions.is_empty() {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&response.body) {
                 let mut results = FilterResultSet::new();
                 for extraction in &self.extractions {
-                    extraction.evaluate(&json, &mut results)?;
+                    extraction.evaluate(&json, &mut results);
                 }
                 debug!(results = ?results, "extracted callout results");
                 match self.phase {
@@ -195,7 +191,7 @@ impl HttpCalloutFilter {
             }
         }
 
-        Ok(FilterAction::Continue)
+        FilterAction::Continue
     }
 
     /// Build a rejection response.
@@ -224,11 +220,7 @@ impl HttpCalloutFilter {
 
     /// Map a [`CalloutResult`] to a [`FilterAction`], logging the
     /// outcome.
-    fn handle_result(
-        &self,
-        result: CalloutResult,
-        ctx: &mut HttpFilterContext<'_>,
-    ) -> Result<FilterAction, FilterError> {
+    fn handle_result(&self, result: CalloutResult, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         match result {
             CalloutResult::Success(response) => {
                 info!(url = %self.url, status = response.status, "callout succeeded");
@@ -236,24 +228,20 @@ impl HttpCalloutFilter {
             },
             CalloutResult::Failed => {
                 warn!(url = %self.url, "callout failed; continuing (fail-open)");
-                Ok(FilterAction::Continue)
+                FilterAction::Continue
             },
             CalloutResult::Rejected(rejection) => {
                 info!(
                     url = %self.url, status = rejection.status,
                     "callout rejected request"
                 );
-                Ok(Self::build_rejection(rejection.status))
+                Self::build_rejection(rejection.status)
             },
         }
     }
 
     /// Execute the callout and process the result.
-    async fn execute_callout(
-        &self,
-        ctx: &mut HttpFilterContext<'_>,
-        body: Option<Vec<u8>>,
-    ) -> Result<FilterAction, FilterError> {
+    async fn execute_callout(&self, ctx: &mut HttpFilterContext<'_>, body: Option<Vec<u8>>) -> FilterAction {
         let body_len = body.as_ref().map_or(0, Vec::len);
         let callout_body = self.shape_body(body);
 
@@ -367,7 +355,7 @@ impl HttpFilter for HttpCalloutFilter {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         match self.phase {
-            Phase::RequestHeaders => self.execute_callout(ctx, None).await,
+            Phase::RequestHeaders => Ok(self.execute_callout(ctx, None).await),
             Phase::RequestBody => {
                 if let Some(results) = ctx.remove_filter_state::<FilterResultSet>() {
                     debug!(results = ?results, "publishing stashed callout results");
@@ -389,6 +377,6 @@ impl HttpFilter for HttpCalloutFilter {
         }
 
         let body_bytes = body.as_ref().map(|b| b.to_vec());
-        self.execute_callout(ctx, body_bytes).await
+        Ok(self.execute_callout(ctx, body_bytes).await)
     }
 }

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use praxis_filter::{FilterError, FilterResultSet};
 use serde_json::Value;
 use serde_json_path::JsonPath;
-use tracing::debug;
+use tracing::{debug, warn};
 
 // -----------------------------------------------------------------------------
 // Compiled Extraction
@@ -46,27 +46,28 @@ impl CompiledExtraction {
     /// - `array` / `object` → compact JSON
     /// - `null` or no match → skip (no entry written)
     ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the result set rejects the
-    /// key or value.
-    pub(crate) fn evaluate(&self, json: &Value, results: &mut FilterResultSet) -> Result<(), FilterError> {
+    /// Values rejected by [`FilterResultSet`] limits (over 256 bytes
+    /// or containing control characters) are skipped with a warning
+    /// rather than failing the request: the key is config-validated,
+    /// so only the untrusted response value can trip validation.
+    pub(crate) fn evaluate(&self, json: &Value, results: &mut FilterResultSet) {
         let node_list = self.path.query(json);
         let nodes: Vec<&Value> = node_list.all();
 
         let Some(first) = nodes.first() else {
             debug!(key = %self.result_key, "JSONPath matched no nodes; skipping");
-            return Ok(());
+            return;
         };
 
         let coerced = coerce_value(first);
         let Some(value) = coerced else {
             debug!(key = %self.result_key, "JSONPath matched null; skipping");
-            return Ok(());
+            return;
         };
 
-        results.set(self.result_key.clone(), value)?;
-        Ok(())
+        if let Err(e) = results.set(self.result_key.clone(), value) {
+            warn!(key = %self.result_key, error = %e, "extracted value rejected by result set limits; skipping");
+        }
     }
 }
 
@@ -187,7 +188,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.flagged", "flagged".into()).unwrap();
         let json = json!({"flagged": true});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("flagged"), Some("true"));
     }
 
@@ -196,7 +197,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.flagged", "flagged".into()).unwrap();
         let json = json!({"flagged": false});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("flagged"), Some("false"));
     }
 
@@ -205,7 +206,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.score", "score".into()).unwrap();
         let json = json!({"score": 0.95});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("score"), Some("0.95"));
     }
 
@@ -214,7 +215,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.label", "label".into()).unwrap();
         let json = json!({"label": "safe"});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("label"), Some("safe"));
     }
 
@@ -223,7 +224,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.tags", "tags".into()).unwrap();
         let json = json!({"tags": ["a", "b"]});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("tags"), Some(r#"["a","b"]"#));
     }
 
@@ -232,7 +233,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.meta", "meta".into()).unwrap();
         let json = json!({"meta": {"k": "v"}});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("meta"), Some(r#"{"k":"v"}"#));
     }
 
@@ -241,7 +242,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.missing", "missing".into()).unwrap();
         let json = json!({"missing": null});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert!(rs.get("missing").is_none(), "null should be skipped");
     }
 
@@ -250,8 +251,32 @@ mod tests {
         let ext = CompiledExtraction::compile("$.nonexistent", "key".into()).unwrap();
         let json = json!({"other": 1});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert!(rs.get("key").is_none(), "no-match should be skipped");
+    }
+
+    #[test]
+    fn evaluate_oversized_value_skips_without_error() {
+        let ext = CompiledExtraction::compile("$.reason", "reason".into()).unwrap();
+        let json = json!({"reason": "x".repeat(300)});
+        let mut rs = FilterResultSet::new();
+        ext.evaluate(&json, &mut rs);
+        assert!(
+            rs.get("reason").is_none(),
+            "value over 256 bytes should be skipped, not error"
+        );
+    }
+
+    #[test]
+    fn evaluate_control_char_value_skips_without_error() {
+        let ext = CompiledExtraction::compile("$.reason", "reason".into()).unwrap();
+        let json = json!({"reason": "line1\nline2"});
+        let mut rs = FilterResultSet::new();
+        ext.evaluate(&json, &mut rs);
+        assert!(
+            rs.get("reason").is_none(),
+            "value with control characters should be skipped, not error"
+        );
     }
 
     // -------------------------------------------------------------------------

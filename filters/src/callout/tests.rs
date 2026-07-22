@@ -1251,4 +1251,100 @@ mod filter_tests {
             .is_some_and(|rs| rs.get("field").is_some());
         assert!(!has_field, "null field should not be written to results");
     }
+
+    #[tokio::test]
+    async fn extraction_oversized_value_skipped_and_continues() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"reason": "x".repeat(300)})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+            response:
+              extract:
+                - json_path: "$.reason"
+                  result_key: "reason"
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "oversized extraction value must not fail the request"
+        );
+        let has_field = ctx
+            .filter_results
+            .get("http_callout")
+            .is_some_and(|rs| rs.get("reason").is_some());
+        assert!(!has_field, "oversized value should be skipped");
+    }
+
+    #[tokio::test]
+    async fn extraction_control_char_value_skipped_and_continues() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"reason": "line1\nline2"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+            response:
+              extract:
+                - json_path: "$.reason"
+                  result_key: "reason"
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "control-char extraction value must not fail the request"
+        );
+        let has_field = ctx
+            .filter_results
+            .get("http_callout")
+            .is_some_and(|rs| rs.get("reason").is_some());
+        assert!(!has_field, "control-char value should be skipped");
+    }
 }
