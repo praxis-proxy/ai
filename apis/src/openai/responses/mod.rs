@@ -190,7 +190,7 @@ impl HttpFilter for ResponsesFormatFilter {
         debug!(
             format = classified.format.as_str(),
             model = ?classified.model,
-            "classified request body"
+            "classified request"
         );
 
         if let Some(action) = handle_invalid_format(classified.format, &self.config) {
@@ -223,6 +223,7 @@ fn classify_request(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> (ClassifiedReq
         debug!(
             method = %ctx.request.method,
             path = ctx.request.uri.path(),
+            websocket_handshake,
             "classified request by method and path"
         );
         (empty_result(AiRequestFormat::Responses), websocket_handshake)
