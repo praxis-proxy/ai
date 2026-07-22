@@ -10,6 +10,11 @@
 # fields like "model" that Lakera rejects. The full
 # downstream body reaches the upstream untouched.
 #
+# Non-JSON request bodies cannot be shaped and are forwarded
+# to Lakera raw; with on_failure: closed a non-2xx from
+# Lakera then rejects the request. Scope the filter with
+# conditions (e.g. content-type) if that matters.
+#
 # Requires the LAKERA_API_KEY environment variable.
 #
 # Usage:

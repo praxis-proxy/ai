@@ -125,6 +125,7 @@ New capabilities require:
 - `apis/src/store/` — ResponseStore trait, SQLite/Postgres
 - `apis/src/token_usage/` — Multi-provider token counting
 - `filters/src/agentic/` — A2A, MCP protocol filters
+- `filters/src/callout/` — Generic HTTP callout filter
 - `filters/src/guardrails/` — AI content safety (NeMo)
 - `filters/src/inference/` — Model-to-header routing
 - `filters/src/prompt_enrich/` — Prompt enrichment

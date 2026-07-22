@@ -3,7 +3,7 @@
 
 //! Serde configuration types for the HTTP callout filter.
 
-use std::{net::IpAddr, time::Duration};
+use std::{collections::HashMap, net::IpAddr, time::Duration};
 
 use praxis_filter::FilterError;
 use serde::Deserialize;
@@ -82,7 +82,7 @@ pub(crate) struct TargetConfig {
     ///
     /// When absent, the downstream body is forwarded verbatim.
     #[serde(default)]
-    pub body: std::collections::HashMap<String, String>,
+    pub body: HashMap<String, String>,
 }
 
 /// A static header entry with optional env-var expansion in the value.
@@ -256,6 +256,11 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 // -----------------------------------------------------------------------------
 
 /// Returns `true` if the address is a private or loopback IP.
+///
+/// Heuristic and warn-only: IPv4-mapped IPv6 (e.g. `::ffff:127.0.0.1`)
+/// and IPv6 ULA/link-local are not covered (`is_unique_local` and
+/// `is_unicast_link_local` are unstable), and hostnames are not
+/// resolved at config time.
 fn is_private_or_loopback(addr: &IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),

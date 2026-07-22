@@ -106,6 +106,10 @@ impl HttpCalloutFilter {
             .into());
         }
 
+        if cfg.request.phase == Phase::RequestHeaders && !cfg.target.body.is_empty() {
+            warn!("http_callout: target.body is ignored with phase 'request_headers' (no body is sent)");
+        }
+
         let body_shaper = BodyShaper::compile(&cfg.target.body)?;
         let headers = parse_static_headers(&cfg)?;
         let forward_headers = parse_header_names(&cfg.target.forward_headers, "forward_header")?;
@@ -125,6 +129,13 @@ impl HttpCalloutFilter {
             phase: cfg.request.phase,
             url: cfg.target.url,
         }))
+    }
+
+    /// Build a rejection response.
+    // TODO: add response headers to `core::callout::Rejection` so
+    // on-denied headers can be forwarded through the callout layer.
+    fn build_rejection(status: u16) -> FilterAction {
+        FilterAction::Reject(Rejection::status(status))
     }
 
     /// Build a [`CalloutRequest`] from the current filter context.
@@ -151,6 +162,40 @@ impl HttpCalloutFilter {
             headers,
             method: http::Method::POST,
             url: self.url.clone(),
+        }
+    }
+
+    /// Execute the callout and process the result.
+    async fn execute_callout(&self, ctx: &mut HttpFilterContext<'_>, body: Option<Vec<u8>>) -> FilterAction {
+        let body_len = body.as_ref().map_or(0, Vec::len);
+        let callout_body = self.shape_body(body);
+
+        debug!(url = %self.url, body_bytes = body_len, "executing callout");
+
+        let request = self.build_request(ctx, callout_body);
+        let result = self.client.execute(request).await;
+        self.handle_result(result, ctx)
+    }
+
+    /// Map a [`CalloutResult`] to a [`FilterAction`], logging the
+    /// outcome.
+    fn handle_result(&self, result: CalloutResult, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+        match result {
+            CalloutResult::Success(response) => {
+                info!(url = %self.url, status = response.status, "callout succeeded");
+                self.handle_success(&response, ctx)
+            },
+            CalloutResult::Failed => {
+                warn!(url = %self.url, "callout failed; continuing (fail-open)");
+                FilterAction::Continue
+            },
+            CalloutResult::Rejected(rejection) => {
+                info!(
+                    url = %self.url, status = rejection.status,
+                    "callout rejected request"
+                );
+                Self::build_rejection(rejection.status)
+            },
         }
     }
 
@@ -192,13 +237,6 @@ impl HttpCalloutFilter {
         FilterAction::Continue
     }
 
-    /// Build a rejection response.
-    // TODO: add response headers to `core::callout::Rejection` so
-    // on-denied headers can be forwarded through the callout layer.
-    fn build_rejection(status: u16) -> FilterAction {
-        FilterAction::Reject(Rejection::status(status))
-    }
-
     /// Apply body shaping if configured, otherwise pass through.
     fn shape_body(&self, body: Option<Vec<u8>>) -> Option<Vec<u8>> {
         match body {
@@ -214,40 +252,6 @@ impl HttpCalloutFilter {
             },
             other => other,
         }
-    }
-
-    /// Map a [`CalloutResult`] to a [`FilterAction`], logging the
-    /// outcome.
-    fn handle_result(&self, result: CalloutResult, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
-        match result {
-            CalloutResult::Success(response) => {
-                info!(url = %self.url, status = response.status, "callout succeeded");
-                self.handle_success(&response, ctx)
-            },
-            CalloutResult::Failed => {
-                warn!(url = %self.url, "callout failed; continuing (fail-open)");
-                FilterAction::Continue
-            },
-            CalloutResult::Rejected(rejection) => {
-                info!(
-                    url = %self.url, status = rejection.status,
-                    "callout rejected request"
-                );
-                Self::build_rejection(rejection.status)
-            },
-        }
-    }
-
-    /// Execute the callout and process the result.
-    async fn execute_callout(&self, ctx: &mut HttpFilterContext<'_>, body: Option<Vec<u8>>) -> FilterAction {
-        let body_len = body.as_ref().map_or(0, Vec::len);
-        let callout_body = self.shape_body(body);
-
-        debug!(url = %self.url, body_bytes = body_len, "executing callout");
-
-        let request = self.build_request(ctx, callout_body);
-        let result = self.client.execute(request).await;
-        self.handle_result(result, ctx)
     }
 }
 
@@ -296,7 +300,7 @@ fn compile_extractions(cfg: &HttpCalloutConfig) -> Result<Vec<CompiledExtraction
 /// Build the [`CalloutClient`] from parsed config.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "durations are bounded by config validation"
+    reason = "truncation requires durations over 500 million years"
 )]
 fn build_callout_client(cfg: &HttpCalloutConfig) -> Result<CalloutClient, FilterError> {
     let failure_mode = match cfg.on_failure {
