@@ -858,3 +858,13 @@ fn ensure_public_file_search_call_id(
     reason = "tests"
 )]
 mod tests;
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket live-test suppressions")]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "live integration test"
+)]
+mod live_tests;
