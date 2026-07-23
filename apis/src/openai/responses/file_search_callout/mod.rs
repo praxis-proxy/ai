@@ -16,7 +16,7 @@ mod config;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
-use praxis_callout_core::callout::FailureMode;
+use praxis_core::callout::FailureMode;
 use praxis_filter::{
     FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };

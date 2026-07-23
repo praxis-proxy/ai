@@ -10,7 +10,7 @@ use std::{
 };
 
 use http::{HeaderMap, HeaderValue};
-use praxis_callout_core::callout::FailureMode;
+use praxis_core::callout::FailureMode;
 use serde::{
     Deserialize, Serialize,
     de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor},
@@ -582,7 +582,7 @@ impl FileSearchClient {
         let headers = self.request_headers();
         tokio::time::timeout(
             remaining,
-            self.api_client.post_json_bytes(&request.url, request.body, &headers),
+            self.api_client.post_json_bytes(request.url, request.body, &headers),
         )
         .await
         .map_err(|_elapsed| execution_deadline_error(store_id))
