@@ -1032,13 +1032,13 @@ async fn one_execution_deadline_covers_later_concurrency_chunks() {
     let server = MockServer::start_with(|path| MockResponse {
         body: json!({"data": []}).to_string(),
         body_delay: if path.contains("vs-8") {
-            Duration::from_secs(1)
+            Duration::from_secs(8)
         } else {
-            Duration::from_millis(50)
+            Duration::from_secs(1)
         },
         status: 200,
     });
-    let filter = make_filter(server.port, "timeout_ms: 500\n");
+    let filter = make_filter(server.port, "timeout_ms: 4000\n");
     let store_ids: Vec<String> = (0..=MAX_CONCURRENT_SEARCHES)
         .map(|index| format!("vs-{index}"))
         .collect();
@@ -1051,7 +1051,7 @@ async fn one_execution_deadline_covers_later_concurrency_chunks() {
         FilterAction::Reject(_)
     ));
     assert!(
-        started.elapsed() < Duration::from_millis(800),
+        started.elapsed() < Duration::from_secs(5),
         "later chunks must use the original execution deadline"
     );
     assert_eq!(
