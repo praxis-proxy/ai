@@ -5,7 +5,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use praxis_core::config::Config;
+use praxis_core::config::{Config, InsecureOptions};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
 
@@ -49,9 +49,7 @@ pub fn resolve_pipelines(
         let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores)?;
 
-        let skip = config.insecure_options.skip_pipeline_validation;
-        let allow_open_security = config.insecure_options.allow_open_security_filters;
-        validate_pipeline(&pipeline, &entries, &listener.name, skip, allow_open_security)?;
+        validate_pipeline(&pipeline, &entries, &listener.name, &config.insecure_options)?;
 
         pipelines.insert(listener.name.clone(), Arc::new(pipeline));
     }
@@ -94,19 +92,15 @@ fn validate_pipeline(
     pipeline: &FilterPipeline,
     entries: &[praxis_core::config::FilterEntry],
     listener_name: &str,
-    skip: bool,
-    allow_open_security: bool,
+    insecure_options: &InsecureOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(feature = "praxis-main")]
     let errors = pipeline.ordering_errors(
         entries,
-        allow_open_security,
-        &praxis_core::config::SkipPipelineChecks::default(),
+        insecure_options.allow_open_security_filters,
+        &insecure_options.effective_pipeline_checks(),
     );
-    #[cfg(not(feature = "praxis-main"))]
-    let errors = pipeline.ordering_errors(entries, allow_open_security);
 
-    if skip {
+    if insecure_options.skip_pipeline_validation {
         for msg in &errors {
             tracing::warn!(listener = %listener_name, "{msg}");
         }

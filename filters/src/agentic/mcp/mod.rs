@@ -200,24 +200,12 @@ fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
         method: None,
     };
 
-    #[cfg(feature = "praxis-main")]
-    {
-        JsonRpcConfig {
-            batch_policy: BatchPolicy::Reject,
-            headers,
-            max_batch_size: 100,
-            max_body_bytes,
-            on_invalid: OnInvalidBehavior::Continue,
-        }
-    }
-    #[cfg(not(feature = "praxis-main"))]
-    {
-        JsonRpcConfig {
-            batch_policy: BatchPolicy::Reject,
-            headers,
-            max_body_bytes,
-            on_invalid: OnInvalidBehavior::Continue,
-        }
+    JsonRpcConfig {
+        batch_policy: BatchPolicy::Reject,
+        headers,
+        max_batch_size: 100,
+        max_body_bytes,
+        on_invalid: OnInvalidBehavior::Continue,
     }
 }
 
