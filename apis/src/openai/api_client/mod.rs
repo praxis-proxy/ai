@@ -5,9 +5,8 @@
 //!
 //! Provides URL construction, SSRF-safe base-URL validation,
 //! resource-ID path-segment encoding, header forwarding, bounded
-//! byte reads, JSON metadata fetches, and normalized error
-//! mapping. Used by [`FilesApiClient`] and (in the future)
-//! vector-store search.
+//! JSON and byte reads, and normalized error mapping. Used by
+//! [`FilesApiClient`] and vector-store search.
 //!
 //! JSON requests route through `praxis_core::callout::CalloutClient`
 //! for circuit breaking, callout-depth protection, and timeout.
@@ -154,10 +153,58 @@ impl ApiClient {
         };
 
         let response = execute_callout(&self.client, request).await?;
-
         serde_json::from_slice(&response.body).map_err(|e| ApiClientError::DecodeFailed {
             detail: format!("JSON decode failed: {e}"),
         })
+    }
+
+    /// Send a POST request with a JSON body via the callout client
+    /// and parse the response body as JSON.
+    pub(crate) async fn post_json(
+        &self,
+        url: String,
+        body: &serde_json::Value,
+        request_headers: &http::HeaderMap,
+    ) -> Result<serde_json::Value, ApiClientError> {
+        let serialized = serde_json::to_vec(body).map_err(|e| ApiClientError::DecodeFailed {
+            detail: format!("request body serialization failed: {e}"),
+        })?;
+
+        let response = self.post_json_bytes(url, serialized, request_headers).await?;
+
+        serde_json::from_slice(&response).map_err(|e| ApiClientError::DecodeFailed {
+            detail: format!("JSON decode failed: {e}"),
+        })
+    }
+
+    /// Send a pre-serialized JSON body and return the bounded raw response.
+    ///
+    /// This supports consumers that enforce domain-specific serialization and
+    /// decode limits while retaining the shared transport, header, timeout,
+    /// circuit-breaker, and status handling.
+    pub(crate) async fn post_json_bytes(
+        &self,
+        url: String,
+        body: Vec<u8>,
+        request_headers: &http::HeaderMap,
+    ) -> Result<Vec<u8>, ApiClientError> {
+        let mut headers = self.forward_headers(request_headers);
+        headers.retain(|(name, _)| name != http::header::CONTENT_TYPE);
+        headers.push((
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        ));
+
+        let request = CalloutRequest {
+            body: Some(body),
+            depth: 0,
+            headers,
+            method: http::Method::POST,
+            url,
+        };
+
+        let response = execute_callout(&self.client, request).await?;
+        Ok(response.body)
     }
 
     /// Send a GET request and return the response body with
@@ -264,7 +311,7 @@ async fn execute_callout(
 mod tests {
     use std::{
         io::{Read as _, Write as _},
-        net::{SocketAddr, TcpListener},
+        net::{SocketAddr, TcpListener, TcpStream},
         thread::JoinHandle,
     };
 
@@ -282,15 +329,43 @@ mod tests {
         let body = response_body.to_owned();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0_u8; 4096];
-            let n = stream.read(&mut buf).unwrap();
+            let request = read_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&buf[..n]).into_owned()
+            String::from_utf8(request).unwrap()
         })
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed before the complete request arrived");
+            request.extend_from_slice(&buf[..n]);
+
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+
+            if request.len() >= body_start + content_length {
+                return request;
+            }
+        }
     }
 
     fn test_client(base_url: &str) -> ApiClient {
@@ -487,6 +562,89 @@ mod tests {
         assert!(
             matches!(err, ApiClientError::DecodeFailed { .. }),
             "invalid JSON should return a decode error"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_json_sends_body_and_parses_response() {
+        let (listener, address) = bind_test_server();
+        let captured = capture_request(listener, r#"{"results":[]}"#);
+        let client = test_client(&format!("http://{address}"));
+
+        let request_body = serde_json::json!({"query": "test"});
+        let json = client
+            .post_json(
+                format!("http://{address}/v1/vector_stores/vs-123/search"),
+                &request_body,
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(json["results"].as_array().unwrap().is_empty());
+
+        let request = captured.join().unwrap();
+        assert!(request.starts_with("POST"), "should be a POST request");
+        assert!(
+            request.contains("content-type: application/json"),
+            "should have JSON content-type: {request}"
+        );
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(body, r#"{"query":"test"}"#, "serialized JSON body should be sent");
+    }
+
+    #[tokio::test]
+    async fn post_json_returns_decode_error_on_invalid_json() {
+        let (listener, address) = bind_test_server();
+        let captured = capture_request(listener, "not-json!!!");
+        let client = test_client(&format!("http://{address}"));
+
+        let err = client
+            .post_json(
+                format!("http://{address}/v1/vector_stores/vs-123/search"),
+                &serde_json::json!({"query": "test"}),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+
+        captured.join().unwrap();
+        assert!(
+            matches!(err, ApiClientError::DecodeFailed { .. }),
+            "invalid JSON should return a decode error"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_json_strips_forwarded_content_type() {
+        let (listener, address) = bind_test_server();
+        let captured = capture_request(listener, r#"{"ok":true}"#);
+
+        let client = ApiClient::new(ApiClientConfig {
+            api_base_url: format!("http://{address}"),
+            callout_config: CalloutConfig {
+                failure_mode: FailureMode::Closed,
+                timeout_ms: 1_000,
+                ..CalloutConfig::default()
+            },
+            forward_header_names: vec![http::header::CONTENT_TYPE],
+        })
+        .unwrap();
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
+
+        client
+            .post_json(format!("http://{address}/v1/search"), &serde_json::json!({}), &headers)
+            .await
+            .unwrap();
+
+        let req = captured.join().unwrap();
+        let ct_count = req.matches("content-type:").count();
+        assert_eq!(ct_count, 1, "exactly one content-type header, got {ct_count}");
+        assert!(
+            req.contains("content-type: application/json"),
+            "should be application/json"
         );
     }
 
