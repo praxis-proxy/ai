@@ -21,8 +21,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::{HeaderMap, Method, StatusCode, Uri};
-use praxis_filter::parse_filter_config;
+use http::{HeaderMap, Method, StatusCode, Uri, header::CONTENT_LENGTH};
+use praxis_filter::{TrustedHeaderMutation, parse_filter_config};
 
 use super::*;
 use crate::{
@@ -37,6 +37,11 @@ use crate::{
     },
     proto_value_to_json,
 };
+
+const _: () = assert!(
+    MAX_COALESCED_BODY_BYTES == praxis_core::config::ABSOLUTE_MAX_BODY_BYTES,
+    "coalesced body limit must match Praxis's absolute body ceiling"
+);
 
 // -----------------------------------------------------------------------------
 // Config Parsing
@@ -1203,23 +1208,21 @@ fn apply_request_header_mutation_records_ordered_pre_read_mutations() {
     assert!(
         matches!(
             &ctx.pre_read_mutations[0],
-            praxis_filter::TrustedHeaderMutation::Add(name, value)
-                if name == header_name && value == "initial"
+            TrustedHeaderMutation::Add(name, value) if name == header_name && value == "initial"
         ),
         "first mutation should be the appended initial value"
     );
     assert!(
         matches!(
             &ctx.pre_read_mutations[1],
-            praxis_filter::TrustedHeaderMutation::Remove(name) if name == header_name
+            TrustedHeaderMutation::Remove(name) if name == header_name
         ),
         "second mutation should remove the destination"
     );
     assert!(
         matches!(
             &ctx.pre_read_mutations[2],
-            praxis_filter::TrustedHeaderMutation::Set(name, value)
-                if name == header_name && value == "final"
+            TrustedHeaderMutation::Set(name, value) if name == header_name && value == "final"
         ),
         "third mutation should set the final destination"
     );
@@ -1275,6 +1278,37 @@ fn apply_response_header_mutation_removes_header() {
     assert!(ctx.response_headers_modified, "should set response_headers_modified");
     let resp = ctx.response_header.unwrap();
     assert!(resp.headers.get("x-remove-me").is_none(), "header should be removed");
+}
+
+#[test]
+fn apply_response_header_mutation_removes_before_sets() {
+    use crate::proto::envoy::service::common::v3::header_value_option::HeaderAppendAction;
+
+    let req = make_request(Method::GET, "/");
+    let mut resp = make_response();
+    resp.headers.insert("x-target", "old".parse().unwrap());
+    let mut ctx = make_ctx(&req);
+    ctx.response_header = Some(&mut resp);
+
+    let mutation = HeaderMutation {
+        set_headers: vec![make_hvo_with_append(
+            "x-target",
+            "new",
+            HeaderAppendAction::OverwriteIfExistsOrAdd as i32,
+            None,
+        )],
+        remove_headers: vec!["x-target".to_owned()],
+    };
+
+    mutations::apply_response_header_mutation(&mutation, &mut ctx);
+
+    assert!(ctx.response_headers_modified, "should set response_headers_modified");
+    let resp = ctx.response_header.unwrap();
+    assert_eq!(
+        resp.headers.get("x-target").unwrap(),
+        "new",
+        "remove plus set should leave the new response header value"
+    );
 }
 
 #[test]
@@ -7700,6 +7734,59 @@ processing_mode:
     assert!(
         matches!(action, FilterAction::Reject(Rejection { status: 503, .. })),
         "oversized coalesced body mutation should use status_on_error, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn full_duplex_body_mutation_removes_content_length() {
+    let (addr, _guard) = start_duplex_processor(DuplexBehavior::StreamedBodyChunks {
+        chunks: vec![b"rewritten".to_vec()],
+    })
+    .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+target: "http://{addr}"
+message_timeout_ms: 2000
+lifecycle_timeout_ms: 5000
+status_on_error: 503
+processing_mode:
+  request_body_mode: full_duplex_streamed
+  response_header_mode: skip
+"#,
+    ))
+    .unwrap();
+    let filter = ExtProcFilter::from_config(&yaml).unwrap();
+
+    let mut req = make_request(Method::POST, "/body-rewrite");
+    req.headers.insert(CONTENT_LENGTH, "8".parse().unwrap());
+    let mut ctx = make_ctx(&req);
+    ctx.current_filter_id = Some(42);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let mut body = Some(Bytes::from_static(b"original"));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "body mutation should complete successfully, got {action:?}"
+    );
+    assert_eq!(
+        body,
+        Some(Bytes::from_static(b"rewritten")),
+        "processor body mutation should replace the request body"
+    );
+    assert!(
+        ctx.request_headers_to_remove.contains(&CONTENT_LENGTH),
+        "body mutation must remove stale Content-Length before forwarding"
+    );
+    assert!(
+        ctx.pre_read_mutations.iter().any(|mutation| matches!(
+            mutation,
+                TrustedHeaderMutation::Remove(name) if name == CONTENT_LENGTH
+        )),
+        "trusted mutation log should also remove stale Content-Length"
     );
 }
 

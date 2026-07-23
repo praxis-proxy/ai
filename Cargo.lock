@@ -3300,6 +3300,7 @@ dependencies = [
  "jsonwebtoken",
  "nix",
  "praxis-ai-apis",
+ "praxis-ai-llmd-ext-proc",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
@@ -3312,7 +3313,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "tokio-tungstenite",
+ "tonic",
  "yaml_serde",
 ]
 

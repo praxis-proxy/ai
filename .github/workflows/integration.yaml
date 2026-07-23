@@ -10,6 +10,7 @@ on:
     paths:
       - "apis/**"
       - "filters/**"
+      - "integrations/**"
       - "server/**"
       - "tests/**"
       - "examples/configs/**"
@@ -23,6 +24,7 @@ on:
     paths:
       - "apis/**"
       - "filters/**"
+      - "integrations/**"
       - "server/**"
       - "tests/**"
       - "examples/configs/**"
@@ -73,6 +75,7 @@ jobs:
                                          "${{ github.event.merge_group.head_sha }}" -- \
             'apis/' \
             'filters/' \
+            'integrations/' \
             'server/' \
             'tests/' \
             'examples/configs/' \
@@ -122,6 +125,9 @@ jobs:
 
       - name: Integration tests
         run: make test-integration
+
+      - name: Environment tests
+        run: make test-environment
 
   # ----------------------------------------------------------------------------
   # Pinned Codex CLI WebSocket acceptance

@@ -1,0 +1,28 @@
+# llm-d ext_proc routing example.
+#
+# A real llm-d EPP or test processor returns the trusted
+# x-gateway-destination-endpoint header. The endpoint_selector filter
+# consumes that trusted header, strips it, and routes to the selected
+# backend endpoint.
+
+listeners:
+  - name: llmd-ext-proc
+    address: "127.0.0.1:8080"
+    filter_chains: [llmd-chain]
+
+filter_chains:
+  - name: llmd-chain
+    filters:
+      - filter: ext_proc
+        target: "http://127.0.0.1:3001"
+        message_timeout_ms: 5000
+        lifecycle_timeout_ms: 10000
+        status_on_error: 503
+        processing_mode:
+          request_body_mode: full_duplex_streamed
+          response_header_mode: skip
+      - filter: endpoint_selector
+        source_header: x-gateway-destination-endpoint
+        required: true
+        status_on_required_failure: 503
+        strip_header: true

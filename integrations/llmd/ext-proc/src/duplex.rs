@@ -512,6 +512,9 @@ impl ExtProcExchange {
             request_body_mode: config.request_body_mode,
             request_output: OutputPhase::None,
             request_send: DirectionSendState::new(),
+            // Keep the sender in the exchange before preloading headers so
+            // future sends use the same stream. The channel is empty here, so
+            // `try_send` can only fail if the receiver has already closed.
             request_tx: Some(tx.clone()),
             response_body_mode: config.response_body_mode,
             response_output: OutputPhase::None,

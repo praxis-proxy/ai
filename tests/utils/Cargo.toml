@@ -8,6 +8,7 @@ readme = "../../README.md"
 publish = false
 
 [features]
+llmd-ext-proc = ["praxis-ai-proxy/llmd-ext-proc"]
 praxis-main = ["praxis-ai-proxy/praxis-main"]
 
 [lints]
