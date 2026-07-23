@@ -150,7 +150,7 @@ impl OgxFixture {
     async fn provision(base_url: String) -> Result<Self, String> {
         let client = Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(300))
             .build()
             .map_err(|error| format!("build OGX client: {error}"))?;
         let mut fixture = Self {
@@ -169,11 +169,11 @@ impl OgxFixture {
 
     async fn create_resources(&mut self) -> Result<(), String> {
         let embedding_model = std::env::var("OGX_EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "sentence-transformers/all-minilm-l6-v2".to_owned());
+            .unwrap_or_else(|_| "sentence-transformers/nomic-ai/nomic-embed-text-v1.5".to_owned());
         let embedding_dimension = std::env::var("OGX_EMBEDDING_DIMENSION")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(384);
+            .unwrap_or(768);
         let store = send_json(
             "create vector store",
             self.client
@@ -225,7 +225,7 @@ impl OgxFixture {
     }
 
     async fn wait_for_indexing(&self) -> Result<(), String> {
-        let deadline = Instant::now() + Duration::from_secs(180);
+        let deadline = Instant::now() + Duration::from_secs(300);
         loop {
             let attachment = send_json(
                 "read vector-store file",
