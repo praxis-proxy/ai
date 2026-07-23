@@ -164,17 +164,6 @@ def openai_client(praxis_proxy):
     )
 
 
-@pytest.fixture(scope="session")
-def ogx_client():
-    """Return an OpenAI client pointed directly at the OGX Files API."""
-    return OpenAI(
-        base_url=f"{OGX_BASE_URL}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=30,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -289,8 +278,8 @@ class TestOpenAIResponsesVLLM:
             f"marker '{marker}'; got: {response.output_text}"
         )
 
-    def test_file_id_resolution_through_ogx(self, openai_client, ogx_client):
-        """End-to-end: upload to OGX, reference by file_id through Praxis,
+    def test_file_id_resolution_through_ogx(self, openai_client):
+        """End-to-end: upload to OGX via Praxis, reference by file_id,
         verify vLLM output contains the file content.
 
         Pipeline: file_resolve (OGX) -> doc_extract -> responses_proxy -> vLLM
@@ -300,7 +289,7 @@ class TestOpenAIResponsesVLLM:
         marker = "PRAXIS-OGX-FILE-4829"
         file_content = f"The secret marker is: {marker}"
 
-        uploaded = ogx_client.files.create(
+        uploaded = openai_client.files.create(
             file=("marker-document.txt", io.BytesIO(file_content.encode())),
             purpose="user_data",
         )
@@ -339,7 +328,7 @@ class TestOpenAIResponsesVLLM:
             )
         finally:
             try:
-                ogx_client.files.delete(file_id)
+                openai_client.files.delete(file_id)
             except Exception:
                 pass
 

@@ -185,6 +185,8 @@ filter_chains:
             cluster: "prompts-api"
           - path_prefix: "/v1/embeddings"
             cluster: "embeddings-api"
+          - path_prefix: "/v1/files"
+            cluster: "files-api"
           - path: "/v1/responses"
             headers:
               x-praxis-ai-format: "openai_responses"
@@ -200,6 +202,9 @@ filter_chains:
           - name: "embeddings-api"
             endpoints:
               - "127.0.0.1:9997"
+          - name: "files-api"
+            endpoints:
+              - "127.0.0.1:9999"
           - name: "inference-backend"
             endpoints:
               - "127.0.0.1:3001"
