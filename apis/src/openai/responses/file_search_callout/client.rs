@@ -1276,15 +1276,34 @@ impl<'de> Visitor<'de> for SearchResultVisitor {
                 },
             }
         }
+        let file_id = canonical_ogx_file_id(&attributes, file_id.ok_or_else(|| A::Error::missing_field("file_id"))?);
         let result = SearchResult {
             attributes,
             content: content.ok_or_else(|| A::Error::missing_field("content"))?,
-            file_id: file_id.ok_or_else(|| A::Error::missing_field("file_id"))?,
+            file_id,
             filename: filename.ok_or_else(|| A::Error::missing_field("filename"))?,
             score: score.ok_or_else(|| A::Error::missing_field("score"))?,
         };
         Ok(result)
     }
+}
+
+/// Select the OpenAI Files API ID from OGX's indexed-document result shape.
+///
+/// OGX may return its internal document UUID as the top-level `file_id` and
+/// retain the source `file-*` identifier in attributes. Canonical responses
+/// already carrying a `file-*` ID remain authoritative.
+fn canonical_ogx_file_id(attributes: &Option<Value>, file_id: String) -> String {
+    if file_id.strip_prefix("file-").is_some_and(|suffix| !suffix.is_empty()) {
+        return file_id;
+    }
+    attributes
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|attributes| attributes.get("file_id"))
+        .and_then(Value::as_str)
+        .filter(|candidate| candidate.strip_prefix("file-").is_some_and(|suffix| !suffix.is_empty()))
+        .map_or(file_id, str::to_owned)
 }
 
 /// Seed for nullable, OpenAI-compatible result attributes.
@@ -2141,6 +2160,33 @@ mod tests {
         assert!(decode(&nested, 10).is_err());
         assert!(decode(&too_many, 10).is_err());
         assert!(decode(&oversized, 10).is_err());
+    }
+
+    #[test]
+    fn bounded_decoder_uses_ogx_source_file_id_for_internal_documents() {
+        let decoded = decode(
+            br#"{"data":[
+                {
+                    "attributes":{"file_id":"file-source"},
+                    "content":[{"type":"text","text":"fallback"}],
+                    "file_id":"83441278-02e0-44bb-b385-892a1d4680c5",
+                    "filename":"report.txt",
+                    "score":0.9
+                },
+                {
+                    "attributes":{"file_id":"file-shadow"},
+                    "content":[{"type":"text","text":"canonical"}],
+                    "file_id":"file-canonical",
+                    "filename":"report.txt",
+                    "score":0.8
+                }
+            ]}"#,
+            10,
+        )
+        .expect("OGX result IDs must decode");
+
+        assert_eq!(decoded[0].file_id, "file-source");
+        assert_eq!(decoded[1].file_id, "file-canonical");
     }
 
     #[test]
