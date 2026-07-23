@@ -164,6 +164,12 @@ jobs:
           done'
           echo "OGX is ready"
 
+      - name: Run OGX file-search integration test
+        env:
+          OGX_BASE_URL: http://127.0.0.1:8321
+        run: |
+          cargo test --locked -p praxis-ai-apis live_ogx_file_search_callout -- --ignored --nocapture
+
       - name: Run vLLM integration tests
         run: |
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s

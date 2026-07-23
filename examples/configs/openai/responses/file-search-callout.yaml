@@ -1,0 +1,60 @@
+# File Search Callout Filter
+#
+# Demonstrates the `openai_file_search_callout` filter configuration.
+# The filter validates its URL, authentication, timeout, response-size,
+# and formatting settings at startup. Live vector-store searches
+# require response-driven pipeline continuation so a completed inference
+# response can re-enter the request pipeline with `file_search_call` items.
+# Until that core capability is available, first-pass requests continue to
+# the inference backend without executing a vector-store callout.
+#
+# Configuration:
+#   vector_store_url:         OGX API base URL
+#   allow_private_url:        Permit local-sensitive targets for development only
+#   allow_insecure_auth_over_http: Permit credentials over HTTP for trusted local development only
+#   auth_type:                bearer or none
+#   api_key:                  Credential required by bearer mode
+#   timeout_ms:               Whole-call timeout in milliseconds
+#   max_response_bytes:       Maximum response bytes retained per callout
+#   max_total_response_bytes: Maximum successful bytes across one fan-out
+#   on_error:                 reject (fail closed) or ignore (fail open)
+#   search_template:          Formats each query before the OGX call
+#   annotation_template:      Formats each returned content chunk
+#   context_template:         Wraps all chunks; requires one {results}
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [file-search-callout-pipeline]
+
+filter_chains:
+  - name: file-search-callout-pipeline
+    filters:
+      - filter: openai_responses_format
+      - filter: openai_responses_validate
+      - filter: openai_tool_parse
+      - filter: openai_file_search_callout
+        vector_store_url: http://127.0.0.1:8001
+        allow_private_url: true
+        allow_insecure_auth_over_http: true
+        auth_type: bearer
+        api_key: ${VECTOR_STORE_API_KEY}
+        timeout_ms: 5000
+        max_response_bytes: 10485760
+        max_total_response_bytes: 67108864
+        on_error: reject
+        search_template: "{query}"
+        annotation_template: "[{index}] {filename} cite as <|{file_id}|>\n{content}\n"
+        context_template: "file_search found {num_chunks} chunks for '{query}':\n{results}"
+      - filter: openai_responses_proxy
+        name: inference
+      - filter: openai_stream_events
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "inference"
+      - filter: load_balancer
+        clusters:
+          - name: "inference"
+            endpoints:
+              - "127.0.0.1:3001"

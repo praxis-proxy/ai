@@ -10,6 +10,7 @@ pub use test_utils::load_example_config;
 mod agentic_routing;
 mod anthropic_messages;
 mod credential_injection;
+mod file_search_callout;
 mod full_flow;
 mod mcp_broker;
 mod model_to_header;

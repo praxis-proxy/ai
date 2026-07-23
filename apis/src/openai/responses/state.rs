@@ -12,6 +12,9 @@
 
 use std::collections::HashMap;
 
+/// Maximum citation file mappings retained during one response execution.
+pub(crate) const MAX_CITATION_FILES: usize = 1_024;
+
 /// Request-scoped state shared across Responses API filters.
 ///
 /// Stored in [`RequestExtensions`] by the validate filter and read
@@ -26,6 +29,9 @@ use std::collections::HashMap;
     expect(dead_code, reason = "fields used incrementally as more filters are ported")
 )]
 pub(crate) struct ResponsesState {
+    /// Maps file IDs to filenames for citation annotation extraction.
+    pub citation_files: HashMap<String, String>,
+
     /// Truncation strategy for managing context window limits.
     ///
     /// Preserves the full object from the request so filters can
@@ -139,6 +145,7 @@ pub(crate) struct ResponsesState {
 impl Default for ResponsesState {
     fn default() -> Self {
         Self {
+            citation_files: HashMap::new(),
             context_management: None,
             conversation: None,
             include: Vec::new(),
@@ -193,7 +200,6 @@ impl ResponsesState {
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
-    #[cfg(test)]
     pub(crate) fn output_items(&self) -> &[serde_json::Value] {
         self.response_object
             .get("output")

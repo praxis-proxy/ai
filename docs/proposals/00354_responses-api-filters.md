@@ -718,7 +718,7 @@ default_context_size: medium  # low | medium | high
 filter: file_search
 vector_store_url: http://localhost:8001
 api_key: ${VECTOR_STORE_API_KEY}
-auth_type: bearer  # bearer | api_key | none
+auth_type: bearer  # bearer | none
 search_template: "..."
 annotation_template: "..."
 context_template: "..."
