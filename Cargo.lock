@@ -2903,6 +2903,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap 6.2.1",
+ "futures",
  "http",
  "percent-encoding",
  "praxis-proxy-core",

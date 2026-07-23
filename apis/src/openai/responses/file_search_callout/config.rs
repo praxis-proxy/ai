@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use http::HeaderValue;
-use praxis_callout_core::callout::{CalloutConfig, FailureMode};
+use praxis_core::callout::{CalloutConfig, FailureMode};
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use reqwest::Url;
 use secrecy::{ExposeSecret as _, SecretString};
