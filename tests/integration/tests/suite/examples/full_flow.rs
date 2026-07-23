@@ -542,25 +542,27 @@ async fn full_flow_websocket_non_101_backend_response_remains_http() {
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
     );
     let _proxy = start_proxy(&config);
-    let url = format!("ws://127.0.0.1:{proxy_port}/v1/responses");
-
-    let error = connect_websocket(url)
-        .await
-        .expect_err("backend should reject the upgrade");
-    let Error::Http(response) = error else {
-        panic!("expected HTTP handshake error, got {error:?}");
-    };
+    let raw = http_send(
+        &format!("127.0.0.1:{proxy_port}"),
+        "GET /v1/responses HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         \r\n",
+    );
     assert_eq!(
-        response.status(),
-        http::StatusCode::UPGRADE_REQUIRED,
+        parse_status(&raw),
+        http::StatusCode::UPGRADE_REQUIRED.as_u16(),
         "the upstream non-101 status should remain an HTTP response"
     );
-    assert_eq!(
-        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
-        "application/json",
+    assert!(
+        raw.to_ascii_lowercase().contains("content-type: application/json"),
         "the normal error filter should format the HTTP rejection as JSON"
     );
-    let body: serde_json::Value = serde_json::from_slice(response.body().as_deref().unwrap()).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("formatted error body should be valid JSON");
     assert_eq!(
         body["error"]["code"], "426",
         "the formatted error should retain the upstream status code"
