@@ -67,10 +67,10 @@
 #      ResponsesState exists.
 #
 #   12. The router sends valid Responses API create requests to the
-#      inference backend and routes /v1/prompts (and subresources) to
-#      a dedicated Prompts API service. The promoted mode remains
-#      available as headers/metadata for downstream filters; it does
-#      not change backend selection in this example.
+#      inference backend and routes /v1/prompts and /v1/embeddings
+#      (and subresources) to dedicated API services. The promoted
+#      mode remains available as headers/metadata for downstream
+#      filters; it does not change backend selection in this example.
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer
@@ -183,6 +183,8 @@ filter_chains:
         routes:
           - path_prefix: "/v1/prompts"
             cluster: "prompts-api"
+          - path_prefix: "/v1/embeddings"
+            cluster: "embeddings-api"
           - path: "/v1/responses"
             headers:
               x-praxis-ai-format: "openai_responses"
@@ -195,6 +197,9 @@ filter_chains:
           - name: "prompts-api"
             endpoints:
               - "127.0.0.1:9998"
+          - name: "embeddings-api"
+            endpoints:
+              - "127.0.0.1:9997"
           - name: "inference-backend"
             endpoints:
               - "127.0.0.1:3001"
