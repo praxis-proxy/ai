@@ -9,6 +9,8 @@ Classifies AI API request bodies and promotes routing facts to headers, metadata
 
 Classification formats: `openai_responses`, `openai_chat_completions`, `unknown_json`, `invalid_json`, `non_json`.
 
+A `GET /v1/responses` request with valid HTTP `WebSocket` upgrade headers is classified as `openai_responses` without inspecting a body. This handshake classification promotes only the format: model, stream, store, and mode facts remain absent. An ordinary bodyless `GET /v1/responses` remains unclassified.
+
 Routing mode for Responses API: `stateful` when the request contains `previous_response_id`, non-empty `tools`, `store=true` (default when omitted), `background=true`, `conversation`, or `prompt.id`; `stateless` when `store=false` with no other stateful markers.
 
 Use with branch chains to route stateful and stateless requests to different clusters.

@@ -3105,6 +3105,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tracing",
  "yaml_serde",
 ]
@@ -3120,6 +3121,7 @@ dependencies = [
  "futures",
  "http",
  "jsonwebtoken",
+ "nix",
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",

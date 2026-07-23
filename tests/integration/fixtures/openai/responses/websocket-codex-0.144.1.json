@@ -1,0 +1,168 @@
+{
+  "metadata": {
+    "fixture_version": 1,
+    "created_at": "2026-07-19",
+    "codex_cli_version": "0.144.1",
+    "wire_protocol_source": "OpenAI Codex rust-v0.144.1 Responses WebSocket test shapes and Responses streaming event schema",
+    "sanitization": [
+      "uses synthetic response and item identifiers",
+      "omits authorization, cookies, account, organization, project, and deployment metadata",
+      "omits timestamps and request identifiers",
+      "normalizes token usage to zero",
+      "replaces the user prompt and model output with fixed test values"
+    ]
+  },
+  "client": {
+    "kind": "text",
+    "type": "response.create",
+    "expected_prompt": "Reply with exactly PONG. Do not call tools."
+  },
+  "server_messages": [
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+          "id": "resp_praxis_fixture",
+          "object": "response",
+          "status": "in_progress"
+        }
+      }
+    },
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.in_progress",
+        "sequence_number": 1,
+        "response": {
+          "id": "resp_praxis_fixture",
+          "object": "response",
+          "status": "in_progress"
+        }
+      }
+    },
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.output_item.added",
+        "sequence_number": 2,
+        "output_index": 0,
+        "item": {
+          "id": "msg_praxis_fixture",
+          "type": "message",
+          "role": "assistant",
+          "status": "in_progress",
+          "content": []
+        }
+      }
+    },
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.content_part.added",
+        "sequence_number": 3,
+        "item_id": "msg_praxis_fixture",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {
+          "type": "output_text",
+          "text": "",
+          "annotations": []
+        }
+      }
+    },
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.output_text.delta",
+        "sequence_number": 4,
+        "item_id": "msg_praxis_fixture",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "PONG"
+      }
+    },
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.output_text.done",
+        "sequence_number": 5,
+        "item_id": "msg_praxis_fixture",
+        "output_index": 0,
+        "content_index": 0,
+        "text": "PONG"
+      }
+    },
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.content_part.done",
+        "sequence_number": 6,
+        "item_id": "msg_praxis_fixture",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {
+          "type": "output_text",
+          "text": "PONG",
+          "annotations": []
+        }
+      }
+    },
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.output_item.done",
+        "sequence_number": 7,
+        "output_index": 0,
+        "item": {
+          "id": "msg_praxis_fixture",
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "PONG",
+              "annotations": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "text",
+      "payload": {
+        "type": "response.completed",
+        "sequence_number": 8,
+        "response": {
+          "id": "resp_praxis_fixture",
+          "object": "response",
+          "status": "completed",
+          "output": [
+            {
+              "id": "msg_praxis_fixture",
+              "type": "message",
+              "role": "assistant",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "PONG",
+                  "annotations": []
+                }
+              ]
+            }
+          ],
+          "usage": {
+            "input_tokens": 0,
+            "input_tokens_details": null,
+            "output_tokens": 0,
+            "output_tokens_details": null,
+            "total_tokens": 0
+          }
+        }
+      }
+    }
+  ]
+}

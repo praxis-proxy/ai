@@ -122,3 +122,73 @@ jobs:
 
       - name: Integration tests
         run: make test-integration
+
+  # ----------------------------------------------------------------------------
+  # Pinned Codex CLI WebSocket acceptance
+  # ----------------------------------------------------------------------------
+
+  codex-websocket:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
+      CODEX_BIN: codex-x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+
+      - name: Cache pinned Codex CLI
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl
+          key: codex-0.144.1-x86_64-unknown-linux-musl-84091ae20c65fcc7d4120db97d1bd57d7ff8df9c7609fb781c78c2ebbd4f5a28
+
+      - name: Download pinned Codex CLI
+        run: |
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          mkdir -p "$codex_cache_dir"
+          if [ ! -f "$codex_cache_dir/$CODEX_ARCHIVE" ]; then
+            curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+              --output "$codex_cache_dir/$CODEX_ARCHIVE" \
+              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"
+          fi
+
+      - name: Verify and extract pinned Codex CLI
+        run: |
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          cd "$codex_cache_dir"
+          sha256sum --check \
+            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+          tar --extract --gzip --file "$CODEX_ARCHIVE"
+          chmod +x "$CODEX_BIN"
+          test -x "$CODEX_BIN"
+          test "$("./$CODEX_BIN" --version)" = "codex-cli 0.144.1"
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-1.96.0-codex-websocket-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.96.0-codex-websocket-cargo-
+          save-always: true
+
+      - name: Run pinned Codex WebSocket acceptance test
+        env:
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+        run: |
+          test -x "$PRAXIS_TEST_CODEX_BIN"
+          cargo test -p praxis-tests-integration --test suite \
+            codex_websocket::pinned_codex_uses_responses_websocket_through_full_flow -- --exact

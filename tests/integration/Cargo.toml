@@ -25,6 +25,7 @@ http = { workspace = true }
 # Used only by the cpex example test to mint HS256 JWTs for the
 # happy-path case (matches the filter crate's signing dependency).
 jsonwebtoken = "10"
+nix = { workspace = true }
 praxis-ai-apis = { path = "../../apis" }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
@@ -37,6 +38,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "process"] }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
