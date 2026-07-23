@@ -460,6 +460,80 @@ async fn sync_state_updates_responses_state() {
 }
 
 #[tokio::test]
+async fn file_url_resolution_updates_responses_state_with_data_uri() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _read = stream.read(&mut request).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nHello World",
+            )
+            .unwrap();
+    });
+
+    let origin = format!("http://{address}");
+    let file_url = format!("{origin}/state.txt");
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"files_api_url: "http://127.0.0.1:1"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+file_url: resolve
+allowed_file_url_origins:
+  - "{origin}"
+on_missing: reject
+timeout_ms: 2000"#
+    ))
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_url": file_url}]
+        }]
+    });
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    server.join().unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    let expected_data_uri = "data:text/plain;base64,SGVsbG8gV29ybGQ=";
+    let rewritten_part = &rewritten["input"][0]["content"][0];
+    assert!(
+        rewritten_part.get("file_url").is_none(),
+        "the buffered body must remove file_url"
+    );
+    assert_eq!(rewritten_part["file_data"], expected_data_uri);
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.request_body, rewritten);
+    for (name, part) in [
+        ("messages", &state.messages[0]["content"][0]),
+        ("persisted_messages", &state.persisted_messages[0]["content"][0]),
+    ] {
+        assert!(part.get("file_url").is_none(), "{name} must remove file_url");
+        assert_eq!(
+            part["file_data"], expected_data_uri,
+            "{name} must retain the resolved data URI"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sync_state_uses_independent_history_offsets() {
     let req = Box::leak(Box::new(crate::test_utils::make_request(
         http::Method::POST,

@@ -609,6 +609,11 @@ mod tests {
     use std::{
         io::{Read as _, Write as _},
         net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
     };
 
     use super::*;
@@ -1855,23 +1860,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_url_resolver_blocks_legacy_ipv4_loopback() {
+    async fn file_url_resolver_blocks_legacy_ipv4_loopback_encodings() {
         let resolver = FileUrlResolver {
             allowed_private_origins: vec![],
         };
 
+        for url in [
+            "http://0177.0.0.1/file.txt",
+            "http://127.1/file.txt",
+            "http://2130706433/file.txt",
+            "http://0x7f000001/file.txt",
+        ] {
+            let result = resolver
+                .resolve_url(
+                    url,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                    1024,
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(ResolveError::FileUrlBlocked { .. })),
+                "URL-parser canonicalization must not let legacy IPv4 loopback bypass SSRF checks: {url}"
+            );
+        }
+    }
+
+    struct StalledBodyServer {
+        address: SocketAddr,
+        headers_sent: Arc<AtomicBool>,
+        release: mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    fn start_stalled_body_server() -> StalledBodyServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let headers_sent = Arc::new(AtomicBool::new(false));
+        let server_headers_sent = Arc::clone(&headers_sent);
+        let (release, release_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            server_headers_sent.store(true, Ordering::Release);
+            let _released = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        StalledBodyServer {
+            address,
+            headers_sent,
+            release,
+            thread,
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_client_times_out_while_response_body_is_stalled() {
+        let server = start_stalled_body_server();
+        let resolver = FileUrlResolver {
+            allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{}", server.address)).unwrap()],
+        };
         let result = resolver
             .resolve_url(
-                "http://0177.0.0.1/file.txt",
-                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                &format!("http://{}/file.txt", server.address),
+                tokio::time::Instant::now() + std::time::Duration::from_millis(500),
                 1024,
             )
             .await;
 
+        server.release.send(()).unwrap();
+        server.thread.join().unwrap();
         assert!(
-            matches!(result, Err(ResolveError::FileUrlBlocked { .. })),
-            "URL-parser canonicalization must not let legacy IPv4 loopback bypass SSRF checks"
+            server.headers_sent.load(Ordering::Acquire),
+            "the response headers must arrive before the body-read timeout"
         );
+        match result {
+            Err(ResolveError::FileUrlFailed { detail, .. }) => {
+                assert!(
+                    detail.contains("timed out"),
+                    "a body that stalls after headers must report a timeout"
+                );
+            },
+            Err(other) => panic!("expected URL timeout for a stalled body, got {other}"),
+            Ok(_) => panic!("a body that stalls after headers must fail at the shared deadline"),
+        }
     }
 
     #[test]

@@ -816,7 +816,7 @@ filter_chains:
     );
 }
 
-fn start_file_url_stub() -> u16 {
+pub(super) fn start_file_url_stub() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
