@@ -2185,8 +2185,15 @@ mod tests {
         )
         .expect("OGX result IDs must decode");
 
-        assert_eq!(decoded[0].file_id, "file-source");
-        assert_eq!(decoded[1].file_id, "file-canonical");
+        let mut decoded = decoded.into_iter();
+        assert_eq!(
+            decoded.next().map(|result| result.file_id).as_deref(),
+            Some("file-source")
+        );
+        assert_eq!(
+            decoded.next().map(|result| result.file_id).as_deref(),
+            Some("file-canonical")
+        );
     }
 
     #[test]
