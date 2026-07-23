@@ -695,6 +695,7 @@ async fn post_v1_responses_classifies_body_normally() {
     );
 }
 
+/// Promote only the format fact for a Responses `WebSocket` handshake.
 #[tokio::test]
 async fn responses_websocket_handshake_promotes_only_format() {
     let ctx = run_filter_with_request_headers(
@@ -711,14 +712,23 @@ async fn responses_websocket_handshake_promotes_only_format() {
     let headers = collect_headers(&ctx);
     let results = ctx.filter_results.get("openai_responses_format").unwrap();
 
-    assert_eq!(headers.get("x-praxis-ai-format"), Some(&"openai_responses"));
+    assert_eq!(
+        headers.get("x-praxis-ai-format"),
+        Some(&"openai_responses"),
+        "the handshake should promote the Responses format header"
+    );
     assert_eq!(
         ctx.filter_metadata
             .get("openai_responses_format.format")
             .map(String::as_str),
-        Some("openai_responses")
+        Some("openai_responses"),
+        "the handshake should write the Responses format metadata"
     );
-    assert_eq!(results.get("format"), Some("openai_responses"));
+    assert_eq!(
+        results.get("format"),
+        Some("openai_responses"),
+        "the handshake should publish the Responses format result"
+    );
 
     for header in ["x-praxis-ai-model", "x-praxis-ai-stream", "x-praxis-responses-mode"] {
         assert!(!headers.contains_key(header), "handshake should not promote {header}");
@@ -747,6 +757,7 @@ async fn responses_websocket_handshake_promotes_only_format() {
     }
 }
 
+/// Leave an ordinary bodyless Responses GET on the normal body path.
 #[tokio::test]
 async fn get_responses_without_websocket_headers_classifies_body_normally() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses").await;

@@ -33,55 +33,22 @@ use praxis_test_utils::{
 use serde::Deserialize;
 use tokio::io::AsyncReadExt as _;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Maximum time allowed for process and pipe cleanup after termination.
+const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Required output from the pinned executable.
+const CODEX_VERSION: &str = "codex-cli 0.144.1";
 /// Fixed prompt shared by the fixture and child process.
 const PROMPT: &str = "Reply with exactly PONG. Do not call tools.";
 /// Synthetic credential that must reach the test backend.
 const TEST_API_KEY: &str = "praxis-websocket-test-key";
-/// Required output from the pinned executable.
-const CODEX_VERSION: &str = "codex-cli 0.144.1";
-/// Maximum time allowed for process and pipe cleanup after termination.
-const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Codex output item types that would indicate an attempted tool call.
+const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
 
-/// Typed subset of the deterministic protocol fixture.
-#[derive(Debug, Deserialize)]
-struct CodexWsFixture {
-    /// Fixture provenance and sanitization metadata.
-    metadata: FixtureMetadata,
-    /// Expected client request facts.
-    client: FixtureClient,
-    /// Ordered server messages.
-    server_messages: Vec<FixtureServerMessage>,
-}
-
-/// Metadata that makes fixture pin updates reviewable.
-#[derive(Debug, Deserialize)]
-struct FixtureMetadata {
-    /// Fixture schema revision.
-    fixture_version: u64,
-    /// Pinned Codex version.
-    codex_cli_version: String,
-}
-
-/// Expected facts in the Codex request frame.
-#[derive(Debug, Deserialize)]
-struct FixtureClient {
-    /// WebSocket frame kind.
-    kind: String,
-    /// Responses request type.
-    r#type: String,
-    /// Exact synthetic prompt.
-    expected_prompt: String,
-}
-
-/// One server-side fixture frame.
-#[derive(Debug, Deserialize)]
-struct FixtureServerMessage {
-    /// WebSocket frame kind.
-    kind: String,
-    /// Responses event JSON.
-    payload: serde_json::Value,
-}
-
+/// Prove the pinned Codex client completes an offline turn over WebSocket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_codex_uses_responses_websocket_through_full_flow() {
     let Some(codex_bin) = std::env::var_os("PRAXIS_TEST_CODEX_BIN") else {
@@ -91,11 +58,26 @@ async fn pinned_codex_uses_responses_websocket_through_full_flow() {
     assert_pinned_codex_version(&codex_bin).await;
 
     let fixture = load_fixture();
-    assert_eq!(fixture.metadata.fixture_version, 1);
-    assert_eq!(fixture.metadata.codex_cli_version, "0.144.1");
-    assert_eq!(fixture.client.kind, "text");
-    assert_eq!(fixture.client.r#type, "response.create");
-    assert_eq!(fixture.client.expected_prompt, PROMPT);
+    assert_eq!(
+        fixture.metadata.fixture_version, 1,
+        "the fixture schema version should match the harness"
+    );
+    assert_eq!(
+        fixture.metadata.codex_cli_version, "0.144.1",
+        "the fixture should identify the pinned Codex version"
+    );
+    assert_eq!(
+        fixture.client.kind, "text",
+        "the pinned request fixture should use a text frame"
+    );
+    assert_eq!(
+        fixture.client.r#type, "response.create",
+        "the pinned request fixture should describe a response.create frame"
+    );
+    assert_eq!(
+        fixture.client.expected_prompt, PROMPT,
+        "the fixture prompt should match the child-process prompt"
+    );
 
     let mut script: Vec<_> = fixture
         .server_messages
@@ -143,10 +125,22 @@ async fn pinned_codex_uses_responses_websocket_through_full_flow() {
 
     let requests = observe_codex_requests(&mut backend).await;
     assert_eq!(requests.len(), 2, "Codex should send prewarm and turn requests");
-    assert_eq!(requests[0]["type"], "response.create");
-    assert_eq!(requests[0]["generate"], false);
-    assert_eq!(requests[1]["type"], "response.create");
-    assert_ne!(requests[1]["generate"], false);
+    assert_eq!(
+        requests[0]["type"], "response.create",
+        "the prewarm frame should create a response"
+    );
+    assert_eq!(
+        requests[0]["generate"], false,
+        "the first frame should be Codex's non-generating prewarm request"
+    );
+    assert_eq!(
+        requests[1]["type"], "response.create",
+        "the turn frame should create a response"
+    );
+    assert_ne!(
+        requests[1]["generate"], false,
+        "the turn frame should request generation"
+    );
     assert!(
         value_contains_exact_string(&requests[1], PROMPT),
         "the generating response.create frame should contain the exact fixed prompt"
@@ -154,26 +148,96 @@ async fn pinned_codex_uses_responses_websocket_through_full_flow() {
     assert_no_unexpected_http(&mut backend).await;
 }
 
+/// A timed-out child must not leave descendants holding its captured pipes.
+#[cfg(unix)]
+#[tokio::test]
+async fn timed_out_child_kills_process_group_and_closes_inherited_pipes() {
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("sleep 30 & wait")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    configure_isolated_process_group(&mut command);
+    let child = command.spawn().expect("shell fixture should start");
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        capture_child_output(child, Duration::from_millis(25)),
+    )
+    .await
+    .expect("process-group cleanup and pipe collection should be bounded");
+
+    assert!(output.timed_out, "shell fixture should hit the test timeout");
+    assert!(!output.status.success(), "terminated shell fixture should fail");
+}
+
+// -----------------------------------------------------------------------------
+// Test Utilities
+// -----------------------------------------------------------------------------
+
+/// Typed subset of the deterministic protocol fixture.
+#[derive(Debug, Deserialize)]
+struct CodexWsFixture {
+    /// Expected client request facts.
+    client: FixtureClient,
+    /// Fixture provenance and sanitization metadata.
+    metadata: FixtureMetadata,
+    /// Ordered server messages.
+    server_messages: Vec<FixtureServerMessage>,
+}
+
 /// Captured child-process result with decoded output.
 struct CodexOutput {
     /// Exit status.
     status: std::process::ExitStatus,
-    /// UTF-8-lossy standard output.
-    stdout: String,
     /// UTF-8-lossy standard error.
     stderr: String,
+    /// UTF-8-lossy standard output.
+    stdout: String,
 }
 
 /// Raw child-process output plus timeout state.
 struct CapturedChildOutput {
     /// Child exit status.
     status: std::process::ExitStatus,
-    /// Captured standard output.
-    stdout: Vec<u8>,
     /// Captured standard error.
     stderr: Vec<u8>,
+    /// Captured standard output.
+    stdout: Vec<u8>,
     /// Whether the child exceeded its execution timeout.
     timed_out: bool,
+}
+
+/// Expected facts in the Codex request frame.
+#[derive(Debug, Deserialize)]
+struct FixtureClient {
+    /// Exact synthetic prompt.
+    expected_prompt: String,
+    /// WebSocket frame kind.
+    kind: String,
+    /// Responses request type.
+    r#type: String,
+}
+
+/// Metadata that makes fixture pin updates reviewable.
+#[derive(Debug, Deserialize)]
+struct FixtureMetadata {
+    /// Pinned Codex version.
+    codex_cli_version: String,
+    /// Fixture schema revision.
+    fixture_version: u64,
+}
+
+/// One server-side fixture frame.
+#[derive(Debug, Deserialize)]
+struct FixtureServerMessage {
+    /// WebSocket frame kind.
+    kind: String,
+    /// Responses event JSON.
+    payload: serde_json::Value,
 }
 
 /// Confirm that the explicitly provided binary matches the fixture pin.
@@ -236,8 +300,8 @@ env_key = "PRAXIS_TEST_API_KEY"
 
     let output = CodexOutput {
         status: captured.status,
-        stdout: String::from_utf8_lossy(&captured.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&captured.stderr).into_owned(),
+        stdout: String::from_utf8_lossy(&captured.stdout).into_owned(),
     };
     assert!(
         !captured.timed_out,
@@ -290,8 +354,8 @@ async fn capture_child_output(mut child: tokio::process::Child, execution_timeou
     let stderr = collect_pipe(&mut stderr_task, process_group_id, "stderr").await;
     CapturedChildOutput {
         status,
-        stdout,
         stderr,
+        stdout,
         timed_out,
     }
 }
@@ -357,7 +421,7 @@ async fn observe_codex_requests(backend: &mut praxis_test_utils::WsBackendGuard)
             .expect("backend observation should not time out")
             .expect("backend observation channel should remain open");
         match event {
-            WsBackendEvent::Handshake { path, headers, .. } => {
+            WsBackendEvent::Handshake { headers, path, .. } => {
                 assert!(!saw_handshake, "acceptance turn should use one WebSocket connection");
                 saw_handshake = true;
                 assert_eq!(
@@ -408,7 +472,6 @@ fn value_contains_exact_string(value: &serde_json::Value, expected: &str) -> boo
 
 /// Validate the completed output and ensure Codex attempted no tool.
 fn assert_codex_jsonl(stdout: &str) {
-    const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
     let mut saw_final_message = false;
     let mut saw_completed_turn = false;
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
@@ -428,30 +491,4 @@ fn assert_codex_jsonl(stdout: &str) {
         "Codex should complete an agent message whose exact text is PONG"
     );
     assert!(saw_completed_turn, "Codex should report a completed turn");
-}
-
-/// A timed-out child must not leave descendants holding its captured pipes.
-#[cfg(unix)]
-#[tokio::test]
-async fn timed_out_child_kills_process_group_and_closes_inherited_pipes() {
-    let mut command = tokio::process::Command::new("/bin/sh");
-    command
-        .arg("-c")
-        .arg("sleep 30 & wait")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    configure_isolated_process_group(&mut command);
-    let child = command.spawn().expect("shell fixture should start");
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(2),
-        capture_child_output(child, Duration::from_millis(25)),
-    )
-    .await
-    .expect("process-group cleanup and pipe collection should be bounded");
-
-    assert!(output.timed_out, "shell fixture should hit the test timeout");
-    assert!(!output.status.success(), "terminated shell fixture should fail");
 }

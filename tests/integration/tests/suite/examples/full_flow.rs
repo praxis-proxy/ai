@@ -33,9 +33,6 @@ const FIRST_RESPONSE_JSON: &str = r#"{"id":"resp_first","created_at":1000,"model
 /// Maximum time allowed for a test client to complete a WebSocket handshake.
 const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Successful WebSocket client connection and handshake response.
-type WebSocketConnectResult = Result<(WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Response), Error>;
-
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -286,6 +283,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     drop(proxy2);
 }
 
+/// Bound a stalled opening handshake so the integration suite cannot hang.
 #[tokio::test]
 async fn websocket_handshake_timeout_is_bounded() {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -309,6 +307,7 @@ async fn websocket_handshake_timeout_is_bounded() {
     stalled_server.abort();
 }
 
+/// Preserve handshake metadata, ordered text frames, and the close frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_flow_websocket_upgrade_preserves_handshake_and_ordered_text() {
     let first = r#"{"type":"response.created","sequence_number":0}"#;
@@ -339,32 +338,100 @@ async fn full_flow_websocket_upgrade_preserves_handshake_and_ordered_text() {
     let (mut socket, response) = connect_websocket(request)
         .await
         .expect("WebSocket handshake should succeed");
-    assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        response.status(),
+        http::StatusCode::SWITCHING_PROTOCOLS,
+        "the full-flow backend should accept the opening handshake"
+    );
 
     let create = r#"{"type":"response.create","response":{"input":"PING"}}"#;
     socket.send(Message::Text(create.into())).await.unwrap();
-    assert_eq!(next_ws_message(&mut socket).await.into_text().unwrap(), first);
-    assert_eq!(next_ws_message(&mut socket).await.into_text().unwrap(), second);
+    assert_eq!(
+        next_ws_message(&mut socket).await.into_text().unwrap(),
+        first,
+        "the first server frame should preserve its payload and order"
+    );
+    assert_eq!(
+        next_ws_message(&mut socket).await.into_text().unwrap(),
+        second,
+        "the second server frame should preserve its payload and order"
+    );
     let close = next_ws_message(&mut socket).await;
     let Message::Close(Some(frame)) = close else {
         panic!("expected close frame, got {close:?}");
     };
-    assert_eq!(u16::from(frame.code), 1000);
-    assert_eq!(frame.reason, "complete");
+    assert_eq!(
+        u16::from(frame.code),
+        1000,
+        "the close status should pass through unchanged"
+    );
+    assert_eq!(
+        frame.reason, "complete",
+        "the close reason should pass through unchanged"
+    );
 
     let handshake = next_backend_event(&mut backend).await;
-    let WsBackendEvent::Handshake { method, path, headers } = handshake else {
+    let WsBackendEvent::Handshake { headers, method, path } = handshake else {
         panic!("expected handshake event, got {handshake:?}");
     };
-    assert_eq!(method, http::Method::GET);
-    assert_eq!(path, "/v1/responses");
-    assert_eq!(headers.get(http::header::AUTHORIZATION).unwrap(), "Bearer test-token");
+    assert_eq!(method, http::Method::GET, "the backend should receive the opening GET");
+    assert_eq!(
+        path, "/v1/responses",
+        "the backend should receive the Responses endpoint"
+    );
+    assert_eq!(
+        headers.get(http::header::AUTHORIZATION).unwrap(),
+        "Bearer test-token",
+        "the authorization header should reach the backend"
+    );
     assert_eq!(
         next_backend_event(&mut backend).await,
-        WsBackendEvent::ClientMessage(CapturedWsMessage::Text(create.to_owned()))
+        WsBackendEvent::ClientMessage(CapturedWsMessage::Text(create.to_owned())),
+        "the client text frame should pass through unchanged"
     );
 }
 
+/// Preserve arbitrary binary payloads in both tunnel directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_flow_websocket_preserves_binary_frames_bidirectionally() {
+    let server_payload = bytes::Bytes::from_static(&[0x00, 0x7F, 0x80, 0xFF]);
+    let mut backend = start_scripted_websocket_backend(vec![WsServerAction::Binary(server_payload.clone())]).await;
+    let proxy_port = free_port();
+    let (config, _db) = isolated_full_flow_config(
+        "websocket_binary",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let _proxy = start_proxy(&config);
+    let url = format!("ws://127.0.0.1:{proxy_port}/v1/responses");
+    let (mut socket, _) = connect_websocket(url)
+        .await
+        .expect("binary-frame WebSocket handshake should succeed");
+    let client_payload = bytes::Bytes::from_static(&[0xFF, 0x80, 0x7F, 0x00]);
+
+    socket
+        .send(Message::Binary(client_payload.clone()))
+        .await
+        .expect("client binary frame should be sent");
+
+    assert_eq!(
+        next_ws_message(&mut socket).await,
+        Message::Binary(server_payload),
+        "server binary payload should pass through unchanged"
+    );
+    let handshake = next_backend_event(&mut backend).await;
+    assert!(
+        matches!(handshake, WsBackendEvent::Handshake { .. }),
+        "backend should observe the WebSocket handshake before data frames"
+    );
+    assert_eq!(
+        next_backend_event(&mut backend).await,
+        WsBackendEvent::ClientMessage(CapturedWsMessage::Binary(client_payload)),
+        "client binary payload should pass through unchanged"
+    );
+}
+
+/// Keep an idle upgraded connection alive while relaying control frames.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_flow_websocket_survives_idle_and_relays_ping_pong() {
     let mut backend = start_scripted_websocket_backend(vec![
@@ -384,14 +451,22 @@ async fn full_flow_websocket_survives_idle_and_relays_ping_pong() {
     let (mut socket, _) = connect_websocket(url).await.unwrap();
 
     socket.send(Message::Text("start".into())).await.unwrap();
-    assert_eq!(next_ws_message(&mut socket).await, Message::Ping(vec![7, 8, 9].into()));
+    assert_eq!(
+        next_ws_message(&mut socket).await,
+        Message::Ping(vec![7, 8, 9].into()),
+        "the server ping should pass through unchanged"
+    );
     socket.flush().await.unwrap();
     let after_idle = tokio::time::timeout(Duration::from_secs(5), socket.next())
         .await
         .expect("connection should remain alive during the idle window")
         .unwrap()
         .unwrap();
-    assert_eq!(after_idle.into_text().unwrap(), "after-idle");
+    assert_eq!(
+        after_idle.into_text().unwrap(),
+        "after-idle",
+        "the connection should carry data after the idle interval"
+    );
 
     let mut saw_pong = false;
     for _ in 0..3 {
@@ -417,10 +492,12 @@ async fn full_flow_websocket_survives_idle_and_relays_ping_pong() {
         WsBackendEvent::ClientMessage(CapturedWsMessage::Close {
             code: Some(1001),
             reason: Some("client done".to_owned()),
-        })
+        }),
+        "the client close frame should pass through unchanged"
     );
 }
 
+/// Propagate an abrupt upstream disconnect within the test timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_flow_websocket_early_backend_disconnect_is_bounded() {
     let backend = start_scripted_websocket_backend(vec![WsServerAction::Disconnect]).await;
@@ -446,10 +523,15 @@ async fn full_flow_websocket_early_backend_disconnect_is_bounded() {
     let (second, response) = connect_websocket(&url)
         .await
         .expect("backend listener should remain healthy");
-    assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        response.status(),
+        http::StatusCode::SWITCHING_PROTOCOLS,
+        "an abrupt connection must not terminate the backend listener"
+    );
     drop(second);
 }
 
+/// Preserve an upstream HTTP rejection instead of entering tunnel mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_flow_websocket_non_101_backend_response_remains_http() {
     let backend = Backend::status(426, "upgrade rejected").start_with_shutdown();
@@ -468,16 +550,28 @@ async fn full_flow_websocket_non_101_backend_response_remains_http() {
     let Error::Http(response) = error else {
         panic!("expected HTTP handshake error, got {error:?}");
     };
-    assert_eq!(response.status(), http::StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(
+        response.status(),
+        http::StatusCode::UPGRADE_REQUIRED,
+        "the upstream non-101 status should remain an HTTP response"
+    );
     assert_eq!(
         response.headers().get(http::header::CONTENT_TYPE).unwrap(),
-        "application/json"
+        "application/json",
+        "the normal error filter should format the HTTP rejection as JSON"
     );
     let body: serde_json::Value = serde_json::from_slice(response.body().as_deref().unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "426");
-    assert_eq!(body["error"]["message"], "upstream error (HTTP 426)");
+    assert_eq!(
+        body["error"]["code"], "426",
+        "the formatted error should retain the upstream status code"
+    );
+    assert_eq!(
+        body["error"]["message"], "upstream error (HTTP 426)",
+        "the formatted error should describe the upstream rejection"
+    );
 }
 
+/// Keep the bodyless handshake out of the HTTP stateful branch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_flow_websocket_handshake_does_not_take_stateful_route() {
     let ws_backend = start_scripted_websocket_backend(vec![WsServerAction::Text("native".to_owned())]).await;
@@ -515,10 +609,25 @@ async fn full_flow_websocket_handshake_does_not_take_stateful_route() {
 
     let url = format!("ws://127.0.0.1:{proxy_port}/v1/responses");
     let (mut socket, response) = connect_websocket(url).await.expect("handshake should use native route");
-    assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        response.status(),
+        http::StatusCode::SWITCHING_PROTOCOLS,
+        "the handshake should reach the format-only inference route"
+    );
     socket.send(Message::Text("start".into())).await.unwrap();
-    assert_eq!(next_ws_message(&mut socket).await.into_text().unwrap(), "native");
+    assert_eq!(
+        next_ws_message(&mut socket).await.into_text().unwrap(),
+        "native",
+        "the handshake should not enter the stateful HTTP route"
+    );
 }
+
+// -----------------------------------------------------------------------------
+// Test Utilities
+// -----------------------------------------------------------------------------
+
+/// Successful WebSocket client connection and handshake response.
+type WebSocketConnectResult = Result<(WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Response), Error>;
 
 /// Receive one proxied `WebSocket` message with the plan's test bound.
 async fn next_ws_message<S>(socket: &mut WebSocketStream<S>) -> Message

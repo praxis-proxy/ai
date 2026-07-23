@@ -20,8 +20,17 @@ use tokio_tungstenite::{
 };
 use tracing::debug;
 
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Maximum HTTP request-head size accepted by the scripted backend.
+const MAX_HEAD_BYTES: usize = 16_384; // 16 KiB
+/// Maximum unexpected HTTP request-body size drained before rejection.
+const MAX_UNEXPECTED_BODY_BYTES: usize = 16_777_216; // 16 MiB
+
 /// A message captured from a test client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CapturedWsMessage {
     /// UTF-8 text message.
     Text(String),
@@ -41,16 +50,16 @@ pub enum CapturedWsMessage {
 }
 
 /// An observation emitted by the scripted backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WsBackendEvent {
     /// A completed `WebSocket` HTTP handshake.
     Handshake {
+        /// Request headers observed by the backend.
+        headers: HeaderMap,
         /// Request method observed by the backend.
         method: Method,
         /// Path and query observed by the backend.
         path: String,
-        /// Request headers observed by the backend.
-        headers: HeaderMap,
     },
     /// A message received from the connected client.
     ClientMessage(CapturedWsMessage),
@@ -64,8 +73,10 @@ pub enum WsBackendEvent {
 }
 
 /// A deterministic action performed after the first client data message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WsServerAction {
+    /// Send a binary message.
+    Binary(Bytes),
     /// Send a UTF-8 text message.
     Text(String),
     /// Send a ping control message.
@@ -87,25 +98,25 @@ pub enum WsServerAction {
 ///
 /// Dropping the guard stops the listener and aborts all connection tasks.
 pub struct WsBackendGuard {
-    /// Port allocated by the operating system.
-    port: u16,
     /// Stream of backend observations.
     events: mpsc::Receiver<WsBackendEvent>,
-    /// Listener shutdown signal.
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     /// Listener task, which owns all connection tasks.
     handle: Option<tokio::task::JoinHandle<()>>,
+    /// Port allocated by the operating system.
+    port: u16,
+    /// Listener shutdown signal.
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl WsBackendGuard {
-    /// Return the allocated port.
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
     /// Wait for the next handshake or client-message observation.
     pub async fn next_event(&mut self) -> Option<WsBackendEvent> {
         self.events.recv().await
+    }
+
+    /// Return the allocated port.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 }
 
@@ -160,10 +171,10 @@ pub async fn start_scripted_websocket_backend_turns(turns: Vec<Vec<WsServerActio
     debug!(port, "scripted WebSocket backend listening");
 
     WsBackendGuard {
-        port,
         events: event_rx,
-        shutdown: Some(shutdown_tx),
         handle: Some(handle),
+        port,
+        shutdown: Some(shutdown_tx),
     }
 }
 
@@ -265,9 +276,9 @@ async fn accept_connection(
         // The callback borrows its request. Owning the header map is required
         // because test assertions run after the handshake completes.
         let event = WsBackendEvent::Handshake {
+            headers: request.headers().clone(),
             method: request.method().clone(),
             path: request.uri().to_string(),
-            headers: request.headers().clone(),
         };
         let _queued = handshake_events.try_send(event);
         Ok(response)
@@ -277,16 +288,16 @@ async fn accept_connection(
 
 /// Parsed facts needed before handing the stream to Tungstenite.
 struct PeekedHttpRequest {
+    /// Declared request body length.
+    body_bytes: usize,
+    /// Number of bytes through the terminating blank header line.
+    head_bytes: usize,
     /// Request method.
     method: String,
     /// Request target.
     path: String,
     /// Whether the request declares a `WebSocket` upgrade.
     websocket_upgrade: bool,
-    /// Number of bytes through the terminating blank header line.
-    head_bytes: usize,
-    /// Declared request body length.
-    body_bytes: usize,
 }
 
 /// Inspect an HTTP head without consuming bytes from the TCP stream.
@@ -295,7 +306,6 @@ struct PeekedHttpRequest {
     reason = "the bounded parser keeps all unexpected-request checks together"
 )]
 async fn peek_http_request(stream: &tokio::net::TcpStream) -> Option<PeekedHttpRequest> {
-    const MAX_HEAD_BYTES: usize = 16_384;
     let mut buffer = vec![0_u8; MAX_HEAD_BYTES];
     let head_bytes = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -337,13 +347,14 @@ async fn peek_http_request(stream: &tokio::net::TcpStream) -> Option<PeekedHttpR
             body_bytes = value.trim().parse().ok()?;
         }
     }
+    let websocket_upgrade = method == "GET" && connection_upgrade && websocket_upgrade;
 
     Some(PeekedHttpRequest {
-        websocket_upgrade: method == "GET" && connection_upgrade && websocket_upgrade,
+        body_bytes,
+        head_bytes,
         method,
         path,
-        head_bytes,
-        body_bytes,
+        websocket_upgrade,
     })
 }
 
@@ -353,7 +364,6 @@ async fn drain_unexpected_request(
     head_bytes: usize,
     mut body_bytes: usize,
 ) -> bool {
-    const MAX_UNEXPECTED_BODY_BYTES: usize = 16 * 1024 * 1024;
     if body_bytes > MAX_UNEXPECTED_BODY_BYTES {
         return false;
     }
@@ -385,6 +395,11 @@ async fn run_script(
 ) -> bool {
     for action in script {
         match action {
+            WsServerAction::Binary(data) => {
+                if socket.send(Message::Binary(data.clone())).await.is_err() {
+                    return false;
+                }
+            },
             WsServerAction::Text(text) => {
                 if socket.send(Message::Text(text.as_str().into())).await.is_err() {
                     return false;
@@ -484,26 +499,7 @@ mod tests {
 
     use super::*;
 
-    /// Receive one message without allowing a broken test backend to hang.
-    async fn next_message<S>(socket: &mut WebSocketStream<S>) -> Message
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        tokio::time::timeout(Duration::from_secs(5), socket.next())
-            .await
-            .expect("WebSocket receive should complete within five seconds")
-            .expect("WebSocket stream should remain open")
-            .expect("WebSocket message should be valid")
-    }
-
-    /// Receive one observation without allowing a broken listener to hang.
-    async fn next_event(backend: &mut WsBackendGuard) -> WsBackendEvent {
-        tokio::time::timeout(Duration::from_secs(5), backend.next_event())
-            .await
-            .expect("backend observation should arrive within five seconds")
-            .expect("backend observation channel should remain open")
-    }
-
+    /// Capture the opening handshake and the first client data message.
     #[tokio::test]
     async fn scripted_backend_captures_handshake_and_client_text() {
         let mut backend = start_scripted_websocket_backend(vec![
@@ -517,7 +513,11 @@ mod tests {
 
         let url = format!("ws://127.0.0.1:{}/v1/responses?model=gpt-5", backend.port());
         let (mut socket, response) = connect_async(&url).await.unwrap();
-        assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            response.status(),
+            http::StatusCode::SWITCHING_PROTOCOLS,
+            "the scripted backend should accept a valid opening handshake"
+        );
 
         socket
             .send(Message::Text(r#"{"type":"response.create"}"#.into()))
@@ -525,23 +525,36 @@ mod tests {
             .unwrap();
         assert_eq!(
             next_message(&mut socket).await.into_text().unwrap(),
-            r#"{"type":"response.created"}"#
+            r#"{"type":"response.created"}"#,
+            "the backend should replay its scripted text frame"
         );
-        assert!(next_message(&mut socket).await.is_close());
+        assert!(
+            next_message(&mut socket).await.is_close(),
+            "the backend should replay its scripted close frame"
+        );
 
         let handshake = next_event(&mut backend).await;
-        let WsBackendEvent::Handshake { method, path, headers } = handshake else {
+        let WsBackendEvent::Handshake { headers, method, path } = handshake else {
             panic!("expected handshake event, got {handshake:?}");
         };
-        assert_eq!(method, Method::GET);
-        assert_eq!(path, "/v1/responses?model=gpt-5");
-        assert_eq!(headers.get(http::header::UPGRADE).unwrap(), "websocket");
+        assert_eq!(method, Method::GET, "the backend should observe the GET method");
+        assert_eq!(
+            path, "/v1/responses?model=gpt-5",
+            "the backend should preserve the request target"
+        );
+        assert_eq!(
+            headers.get(http::header::UPGRADE).unwrap(),
+            "websocket",
+            "the backend should observe the WebSocket upgrade protocol"
+        );
         assert_eq!(
             next_event(&mut backend).await,
-            WsBackendEvent::ClientMessage(CapturedWsMessage::Text(r#"{"type":"response.create"}"#.to_owned()))
+            WsBackendEvent::ClientMessage(CapturedWsMessage::Text(r#"{"type":"response.create"}"#.to_owned())),
+            "the backend should capture the client text frame"
         );
     }
 
+    /// Service client control traffic while a scripted turn is delayed.
     #[tokio::test]
     async fn scripted_backend_services_ping_during_delay() {
         let backend = start_scripted_websocket_backend(vec![
@@ -555,10 +568,19 @@ mod tests {
         socket.send(Message::Text("start".into())).await.unwrap();
         socket.send(Message::Ping(vec![1, 2, 3].into())).await.unwrap();
 
-        assert_eq!(next_message(&mut socket).await, Message::Pong(vec![1, 2, 3].into()));
-        assert_eq!(next_message(&mut socket).await.into_text().unwrap(), "ready");
+        assert_eq!(
+            next_message(&mut socket).await,
+            Message::Pong(vec![1, 2, 3].into()),
+            "the backend should answer a ping during a delay"
+        );
+        assert_eq!(
+            next_message(&mut socket).await.into_text().unwrap(),
+            "ready",
+            "the script should resume after the delay"
+        );
     }
 
+    /// Reject non-upgrade HTTP traffic without leaving the client hanging.
     #[tokio::test]
     async fn scripted_backend_records_and_rejects_unexpected_http_request() {
         let mut backend = start_scripted_websocket_backend(Vec::new()).await;
@@ -576,13 +598,41 @@ mod tests {
             .expect("HTTP rejection should complete within five seconds")
             .unwrap();
 
-        assert!(String::from_utf8(response).unwrap().starts_with("HTTP/1.1 400"));
+        assert!(
+            String::from_utf8(response).unwrap().starts_with("HTTP/1.1 400"),
+            "the backend should return a bounded HTTP rejection"
+        );
         assert_eq!(
             next_event(&mut backend).await,
             WsBackendEvent::UnexpectedHttpRequest {
                 method: "POST".to_owned(),
                 path: "/v1/responses".to_owned(),
-            }
+            },
+            "the backend should report the rejected method and path"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    /// Receive one observation without allowing a broken listener to hang.
+    async fn next_event(backend: &mut WsBackendGuard) -> WsBackendEvent {
+        tokio::time::timeout(Duration::from_secs(5), backend.next_event())
+            .await
+            .expect("backend observation should arrive within five seconds")
+            .expect("backend observation channel should remain open")
+    }
+
+    /// Receive one message without allowing a broken test backend to hang.
+    async fn next_message<S>(socket: &mut WebSocketStream<S>) -> Message
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("WebSocket receive should complete within five seconds")
+            .expect("WebSocket stream should remain open")
+            .expect("WebSocket message should be valid")
     }
 }

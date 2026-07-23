@@ -126,9 +126,13 @@ pub(crate) fn is_responses_create(method: &http::Method, path: &str) -> bool {
 
 /// Check whether a request is a Responses API `WebSocket` handshake.
 ///
-/// The handshake uses `GET /v1/responses` and the standard HTTP/1.1
-/// upgrade headers. `Connection` is token-valued, so matching handles
-/// comma-separated and repeated header lines without allocating.
+/// The handshake uses `GET /v1/responses` and the opening handshake from
+/// [RFC 6455 Section 4.1]. `Connection` options follow the token-list
+/// semantics in [RFC 9110 Section 7.6.1], including comma-separated and
+/// repeated field lines.
+///
+/// [RFC 6455 Section 4.1]: https://datatracker.ietf.org/doc/html/rfc6455#section-4.1
+/// [RFC 9110 Section 7.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.1
 pub(crate) fn is_responses_websocket_handshake(method: &http::Method, path: &str, headers: &http::HeaderMap) -> bool {
     if method != http::Method::GET || normalize_trailing_slash(path) != "/v1/responses" {
         return false;
@@ -894,73 +898,64 @@ mod tests {
     // Responses WebSocket Handshake Classification
     // -------------------------------------------------------------------------
 
-    fn websocket_headers(connection: &'static str, upgrade: &'static str) -> http::HeaderMap {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONNECTION, connection.parse().unwrap());
-        headers.insert(http::header::UPGRADE, upgrade.parse().unwrap());
-        headers
-    }
-
+    /// Accept the canonical Responses opening handshake.
     #[test]
     fn responses_websocket_handshake_matches_standard_upgrade() {
         let headers = websocket_headers("Upgrade", "websocket");
 
-        assert!(is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses",
-            &headers
-        ));
+        assert!(
+            is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &headers),
+            "the canonical Responses WebSocket handshake should match"
+        );
     }
 
+    /// Treat protocol tokens case-insensitively and normalize a trailing slash.
     #[test]
     fn responses_websocket_handshake_is_case_insensitive_and_allows_trailing_slash() {
         let headers = websocket_headers("keep-alive, UpGrAdE", "WebSocket");
 
-        assert!(is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses/",
-            &headers
-        ));
+        assert!(
+            is_responses_websocket_handshake(&http::Method::GET, "/v1/responses/", &headers),
+            "field tokens should ignore case and the endpoint should allow a trailing slash"
+        );
     }
 
+    /// Find an upgrade token across repeated `Connection` field lines.
     #[test]
     fn responses_websocket_handshake_finds_token_across_repeated_connection_headers() {
         let mut headers = websocket_headers("keep-alive", "websocket");
         headers.append(http::header::CONNECTION, "upgrade".parse().unwrap());
 
-        assert!(is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses",
-            &headers
-        ));
+        assert!(
+            is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &headers),
+            "a repeated Connection field should contribute its upgrade token"
+        );
     }
 
+    /// Limit handshake classification to the exact Responses endpoint and method.
     #[test]
     fn responses_websocket_handshake_rejects_wrong_method_or_path() {
         let headers = websocket_headers("upgrade", "websocket");
 
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::POST,
-            "/v1/responses",
-            &headers
-        ));
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses/resp_123",
-            &headers
-        ));
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/chat/completions",
-            &headers
-        ));
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses-other",
-            &headers
-        ));
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::POST, "/v1/responses", &headers),
+            "a POST request is not a WebSocket opening handshake"
+        );
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses/resp_123", &headers),
+            "a response subresource must not match the opening endpoint"
+        );
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/chat/completions", &headers),
+            "an unrelated API endpoint must not match"
+        );
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses-other", &headers),
+            "a path that merely shares the Responses prefix must not match"
+        );
     }
 
+    /// Require both HTTP upgrade fields before classifying a handshake.
     #[test]
     fn responses_websocket_handshake_requires_both_upgrade_headers() {
         let mut connection_only = http::HeaderMap::new();
@@ -968,18 +963,17 @@ mod tests {
         let mut upgrade_only = http::HeaderMap::new();
         upgrade_only.insert(http::header::UPGRADE, "websocket".parse().unwrap());
 
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses",
-            &connection_only
-        ));
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses",
-            &upgrade_only
-        ));
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &connection_only),
+            "Connection alone must not classify a WebSocket handshake"
+        );
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &upgrade_only),
+            "Upgrade alone must not classify a WebSocket handshake"
+        );
     }
 
+    /// Reject lookalike tokens, other protocols, and ambiguous upgrade fields.
     #[test]
     fn responses_websocket_handshake_rejects_non_websocket_upgrade_and_substring_token() {
         let wrong_upgrade = websocket_headers("upgrade", "h2c");
@@ -987,21 +981,39 @@ mod tests {
         let mut repeated_upgrade = websocket_headers("upgrade", "websocket");
         repeated_upgrade.append(http::header::UPGRADE, "h2c".parse().unwrap());
 
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses",
-            &wrong_upgrade
-        ));
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses",
-            &substring_connection
-        ));
-        assert!(!is_responses_websocket_handshake(
-            &http::Method::GET,
-            "/v1/responses",
-            &repeated_upgrade
-        ));
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &wrong_upgrade),
+            "an h2c upgrade must not classify as WebSocket"
+        );
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &substring_connection),
+            "an upgrade substring must not match the Connection token"
+        );
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &repeated_upgrade),
+            "multiple Upgrade field lines are ambiguous and must not match"
+        );
+    }
+
+    /// Reject field values that cannot contain valid UTF-8 protocol tokens.
+    #[test]
+    fn responses_websocket_handshake_rejects_non_utf8_upgrade_headers() {
+        let mut invalid_connection = websocket_headers("upgrade", "websocket");
+        invalid_connection.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_bytes(&[0xFF]).unwrap(),
+        );
+        let mut invalid_upgrade = websocket_headers("upgrade", "websocket");
+        invalid_upgrade.insert(http::header::UPGRADE, http::HeaderValue::from_bytes(&[0xFF]).unwrap());
+
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &invalid_connection),
+            "a non-UTF-8 Connection value cannot contain a valid upgrade token"
+        );
+        assert!(
+            !is_responses_websocket_handshake(&http::Method::GET, "/v1/responses", &invalid_upgrade),
+            "a non-UTF-8 Upgrade value cannot identify the WebSocket protocol"
+        );
     }
 
     #[test]
@@ -1163,5 +1175,16 @@ mod tests {
             Some("bad\nmodel"),
             "model with control chars should still be extracted by classifier"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    fn websocket_headers(connection: &'static str, upgrade: &'static str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONNECTION, connection.parse().unwrap());
+        headers.insert(http::header::UPGRADE, upgrade.parse().unwrap());
+        headers
     }
 }
