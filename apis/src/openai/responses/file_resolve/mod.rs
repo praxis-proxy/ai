@@ -396,10 +396,6 @@ fn rewrite_body(
 /// `messages` / `persisted_messages` with the resolved items.
 /// History messages prepended by rehydrate are also walked so
 /// that any `file_id` references in them are resolved.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "ResolveError enum size increased by file_url variants"
-)]
 #[expect(clippy::too_many_arguments, reason = "threading resolver through state sync")]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
@@ -452,10 +448,6 @@ async fn sync_state(
 
 /// Resolve file references in rehydrated history when the
 /// current input did not require a body rewrite.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "ResolveError enum size increased by file_url variants"
-)]
 async fn resolve_state_history(
     ctx: &mut HttpFilterContext<'_>,
     client: &FilesApiClient,
