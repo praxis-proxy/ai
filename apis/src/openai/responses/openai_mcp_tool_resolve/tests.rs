@@ -341,6 +341,7 @@ fn filter_writable_only_excludes_read_only_tools() {
 // Pipeline Regression: no spurious ResponsesState creation
 // =========================================================================
 
+/// Build a minimal MCP request body targeting `server_url`.
 fn mcp_body(server_url: &str) -> serde_json::Value {
     serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -497,10 +498,10 @@ async fn defer_loading_true_skips_eager_resolution() {
     );
 }
 
-/// `write_tool_map` creates `ResponsesState` from body when none
+/// `write_state` creates `ResponsesState` from body when none
 /// exists, preserving `request_body` and populating `mcp_tool_map`.
 #[test]
-fn write_tool_map_creates_state_when_missing() {
+fn write_state_creates_state_when_missing() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let body_json = mcp_body("http://10.0.0.5/mcp");
@@ -511,7 +512,7 @@ fn write_tool_map_creates_state_when_missing() {
         ("weather".to_owned(), "get_weather".to_owned()),
         serde_json::json!({"tool": true}),
     );
-    write_tool_map(&mut ctx, &body_bytes, map);
+    write_state(&mut ctx, &body_bytes, map);
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should be created");
     assert!(
@@ -527,9 +528,9 @@ fn write_tool_map_creates_state_when_missing() {
     assert!(!state.request_body.is_null(), "request_body must not be null");
 }
 
-/// `write_tool_map` updates existing state without replacing it.
+/// `write_state` updates existing state without replacing it.
 #[test]
-fn write_tool_map_updates_existing_state() {
+fn write_state_updates_existing_state() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let body_json = mcp_body("http://10.0.0.5/mcp");
@@ -544,7 +545,7 @@ fn write_tool_map_updates_existing_state() {
         ("weather".to_owned(), "get_weather".to_owned()),
         serde_json::json!({"tool": true}),
     );
-    write_tool_map(&mut ctx, &body_bytes, map);
+    write_state(&mut ctx, &body_bytes, map);
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
     assert!(
@@ -711,10 +712,10 @@ fn duplicate_tool_name_across_servers_accepted() {
     let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
 
     let entry_a = serde_json::json!({"server_label": "server_a", "server_url": "http://10.0.0.1/mcp"});
-    insert_tools(&tools, &entry_a, &mut tool_map);
+    insert_tools(tools.clone(), &entry_a, &mut tool_map);
 
     let entry_b = serde_json::json!({"server_label": "server_b", "server_url": "http://10.0.0.2/mcp"});
-    insert_tools(&tools, &entry_b, &mut tool_map);
+    insert_tools(tools, &entry_b, &mut tool_map);
 
     assert_eq!(
         tool_map.len(),
@@ -779,7 +780,7 @@ fn insert_tools_preserves_authorization_and_require_approval() {
         "headers": {"x-custom": "val"}
     });
     let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
-    insert_tools(&tools, &entry, &mut tool_map);
+    insert_tools(tools, &entry, &mut tool_map);
 
     let val = &tool_map[&("db".to_owned(), "run_query".to_owned())];
     assert_eq!(
@@ -858,13 +859,15 @@ fn count_distinct_servers_excludes_connector_and_deferred() {
     );
 }
 
+/// Apply `allowed_tools` filtering and insert results into the
+/// tool map — mirrors the per-entry flow in `resolve_all_entries`.
 fn filter_and_insert(
     tools: Vec<serde_json::Value>,
     entry: &serde_json::Value,
     tool_map: &mut HashMap<(String, String), serde_json::Value>,
 ) {
     let allowed = extract_allowed_tools(entry);
-    insert_tools(&apply_allowed_tools_filter(tools, &allowed), entry, tool_map);
+    insert_tools(apply_allowed_tools_filter(tools, &allowed), entry, tool_map);
 }
 
 #[test]
@@ -981,7 +984,7 @@ async fn deferred_entries_not_counted_against_max_servers() {
 // =========================================================================
 
 #[test]
-fn write_tool_map_creates_state_with_previous_response_id() {
+fn write_state_skips_state_creation_with_previous_response_id() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let body_json = serde_json::json!({
@@ -996,7 +999,7 @@ fn write_tool_map_creates_state_with_previous_response_id() {
         ("w".to_owned(), "get_weather".to_owned()),
         serde_json::json!({"tool": true}),
     );
-    write_tool_map(&mut ctx, &body_bytes, map);
+    write_state(&mut ctx, &body_bytes, map);
 
     let state = ctx
         .extensions
@@ -1009,6 +1012,7 @@ fn write_tool_map_creates_state_with_previous_response_id() {
 // Body Rewrite: MCP to Function
 // =========================================================================
 
+/// Build a tool map with a single `(weather, get_weather)` entry.
 fn weather_tool_map() -> HashMap<(String, String), serde_json::Value> {
     let mut map = HashMap::new();
     map.insert(
@@ -1025,22 +1029,68 @@ fn weather_tool_map() -> HashMap<(String, String), serde_json::Value> {
     map
 }
 
+/// Build a [`Resolution`] from raw MCP definitions, pre-building
+/// function tools for `per_entry` and dispatch entries for
+/// `tool_map`, using `"weather"` as the server label.
+fn make_resolution(raw_per_entry: &[Vec<serde_json::Value>]) -> Resolution {
+    let label = "weather";
+    let mut tool_map = HashMap::new();
+    let mut per_entry = Vec::new();
+    for raw_tools in raw_per_entry {
+        let function_tools: Vec<serde_json::Value> = raw_tools
+            .iter()
+            .map(|def| mcp_tool_to_function_tool(label, def))
+            .collect();
+        for tool in raw_tools {
+            let name = tool
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            tool_map.insert(
+                (label.to_owned(), name.to_owned()),
+                serde_json::json!({"server_label": label, "tool_definition": tool}),
+            );
+        }
+        per_entry.push(function_tools);
+    }
+    Resolution { per_entry, tool_map }
+}
+
+/// Pre-built function tools in `per_entry` are moved into the
+/// rewritten array; non-MCP tools pass through unchanged.
 #[test]
 fn rewrite_tools_array_converts_mcp_to_function() {
     let tools = vec![
         serde_json::json!({"type": "function", "name": "calc"}),
         serde_json::json!({"type": "mcp", "server_label": "weather"}),
     ];
-    let rewritten = rewrite_tools_array(&tools, &weather_tool_map());
+    let raw = vec![vec![serde_json::json!({
+        "name": "get_weather",
+        "description": "Get current weather",
+        "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
+    })]];
+    let resolution = make_resolution(&raw);
+    let (rewritten, generated) = rewrite_tools_array(tools, resolution.per_entry);
 
     assert_eq!(rewritten.len(), 2, "should have 2 tools");
     assert_eq!(rewritten[0]["name"], "calc", "first tool unchanged");
     assert_eq!(rewritten[1]["type"], "function", "MCP converted to function");
     assert_eq!(rewritten[1]["name"], "weather__get_weather", "prefixed name");
-    assert_eq!(rewritten[1]["description"], "Get current weather");
-    assert!(rewritten[1]["parameters"]["properties"]["city"].is_object());
+    assert_eq!(
+        rewritten[1]["description"], "Get current weather",
+        "description preserved from MCP definition"
+    );
+    assert!(
+        rewritten[1]["parameters"]["properties"]["city"].is_object(),
+        "inputSchema mapped to parameters"
+    );
+    assert!(
+        generated.contains("weather__get_weather"),
+        "generated names should track rewritten tools"
+    );
 }
 
+/// Unresolved MCP entries (empty `per_entry`) are left unchanged.
 #[test]
 fn rewrite_tools_array_preserves_unresolved_mcp() {
     let tools = vec![serde_json::json!({
@@ -1049,56 +1099,589 @@ fn rewrite_tools_array_preserves_unresolved_mcp() {
         "server_url": "http://10.0.0.99/mcp"
     })];
 
-    let tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
-    let rewritten = rewrite_tools_array(&tools, &tool_map);
+    let (rewritten, generated) = rewrite_tools_array(tools, vec![Vec::new()]);
 
     assert_eq!(rewritten.len(), 1, "should preserve unresolved entry");
     assert_eq!(rewritten[0]["type"], "mcp", "unresolved MCP left unchanged");
+    assert!(generated.is_empty(), "no generated names for unresolved");
 }
 
+/// Missing `inputSchema` defaults to `{"type":"object"}`.
 #[test]
 fn mcp_tool_to_function_tool_adds_default_parameters() {
     let definition = serde_json::json!({"name": "simple_tool", "description": "Does something"});
 
-    let function_tool = mcp_tool_to_function_tool("srv", "simple_tool", &definition, &serde_json::json!({}));
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
 
-    assert_eq!(function_tool["type"], "function");
-    assert_eq!(function_tool["name"], "srv__simple_tool");
-    assert_eq!(function_tool["description"], "Does something");
+    assert_eq!(function_tool["type"], "function", "type set to function");
+    assert_eq!(
+        function_tool["name"], "srv__simple_tool",
+        "name encoded with label prefix"
+    );
+    assert_eq!(function_tool["description"], "Does something", "description preserved");
     assert_eq!(
         function_tool["parameters"]["type"], "object",
         "default parameters when inputSchema absent"
     );
 }
 
+/// A single MCP entry resolving to multiple tools expands into
+/// multiple function tools in the output.
 #[test]
-fn rewrite_tools_array_expands_multiple_tools_from_one_server() {
+fn rewrite_tools_array_expands_multiple_tools() {
     let tools = vec![serde_json::json!({
         "type": "mcp",
         "server_label": "math",
         "server_url": "http://10.0.0.5/mcp"
     })];
 
-    let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
-    tool_map.insert(
-        ("math".to_owned(), "add".to_owned()),
-        serde_json::json!({
-            "server_label": "math",
-            "tool_definition": {"name": "add", "description": "Add numbers"}
-        }),
-    );
-    tool_map.insert(
-        ("math".to_owned(), "subtract".to_owned()),
-        serde_json::json!({
-            "server_label": "math",
-            "tool_definition": {"name": "subtract", "description": "Subtract numbers"}
-        }),
-    );
+    let per_entry = vec![vec![
+        mcp_tool_to_function_tool(
+            "math",
+            &serde_json::json!({"name": "add", "description": "Add numbers"}),
+        ),
+        mcp_tool_to_function_tool(
+            "math",
+            &serde_json::json!({"name": "subtract", "description": "Subtract numbers"}),
+        ),
+    ]];
 
-    let rewritten = rewrite_tools_array(&tools, &tool_map);
+    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
 
     assert_eq!(rewritten.len(), 2, "one MCP entry expands to multiple function tools");
     let names: Vec<&str> = rewritten.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"math__add"), "should have add tool");
     assert!(names.contains(&"math__subtract"), "should have subtract tool");
+    assert_eq!(generated.len(), 2, "both names tracked as generated");
+}
+
+// =========================================================================
+// Body Rewrite: input_schema fallback (cached tool format)
+// =========================================================================
+
+/// Falls back to `input_schema` when `inputSchema` is absent
+/// (cached API listing format).
+#[test]
+fn mcp_tool_to_function_tool_reads_input_schema_snake_case() {
+    let definition = serde_json::json!({
+        "name": "cached_tool",
+        "description": "Cached from API",
+        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert_eq!(function_tool["type"], "function", "type set to function");
+    assert_eq!(function_tool["name"], "srv__cached_tool", "name encoded");
+    assert_eq!(
+        function_tool["parameters"]["properties"]["q"]["type"], "string",
+        "should read input_schema when inputSchema is absent"
+    );
+}
+
+/// `inputSchema` takes precedence over `input_schema` when both
+/// fields are present.
+#[test]
+fn mcp_tool_to_function_tool_prefers_input_schema_camel_case() {
+    let definition = serde_json::json!({
+        "name": "both_schemas",
+        "inputSchema": {"type": "object", "properties": {"a": {"type": "string"}}},
+        "input_schema": {"type": "object", "properties": {"b": {"type": "string"}}}
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert!(
+        function_tool["parameters"]["properties"]["a"].is_object(),
+        "inputSchema (camelCase) should take precedence"
+    );
+}
+
+// =========================================================================
+// Function Name Encoding
+// =========================================================================
+
+/// Invalid characters (dots, slashes) are replaced with
+/// underscores to satisfy the `^[a-zA-Z0-9_-]+$` schema.
+#[test]
+fn encode_function_name_sanitizes_invalid_chars() {
+    let name = encode_function_name("my.server", "get/weather");
+    assert_eq!(name, "my_server__get_weather", "dots and slashes replaced with _");
+}
+
+/// Combined label + tool name exceeding 64 characters is truncated
+/// to the `MAX_FUNCTION_NAME_LEN` limit.
+#[test]
+fn encode_function_name_truncates_long_names() {
+    let long_label = "a".repeat(40);
+    let long_tool = "b".repeat(40);
+    let name = encode_function_name(&long_label, &long_tool);
+    assert!(
+        name.len() <= MAX_FUNCTION_NAME_LEN,
+        "name should be truncated to {} chars, got {}",
+        MAX_FUNCTION_NAME_LEN,
+        name.len()
+    );
+}
+
+/// Alphanumeric characters, hyphens, and underscores pass through
+/// without sanitization.
+#[test]
+fn encode_function_name_preserves_valid_chars() {
+    let name = encode_function_name("label-1", "tool_2");
+    assert_eq!(name, "label-1__tool_2", "valid chars preserved");
+}
+
+// =========================================================================
+// tool_choice Rewrite
+// =========================================================================
+
+/// Named MCP `tool_choice` is translated to a function-typed
+/// choice with the encoded name.
+#[test]
+fn rewrite_tool_choice_translates_mcp_to_function() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "weather", "name": "get_weather"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    let choice = &obj["tool_choice"];
+    assert_eq!(choice["type"], "function", "type rewritten to function");
+    assert_eq!(choice["name"], "weather__get_weather", "name encoded");
+}
+
+/// Non-object `tool_choice` values (like `"auto"`) are left
+/// unchanged.
+#[test]
+fn rewrite_tool_choice_ignores_non_mcp() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert("tool_choice".to_owned(), serde_json::json!("auto"));
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    assert_eq!(obj["tool_choice"], "auto", "non-MCP tool_choice unchanged");
+}
+
+/// Missing `tool_choice` field is a no-op.
+#[test]
+fn rewrite_tool_choice_ignores_missing() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    assert!(obj.get("tool_choice").is_none(), "no tool_choice inserted");
+}
+
+/// Named MCP `tool_choice` referencing a tool not in `tool_map`
+/// is left unchanged.
+#[test]
+fn rewrite_tool_choice_skips_unknown_mcp_tool() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "weather", "name": "nonexistent"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    assert_eq!(
+        obj["tool_choice"]["type"], "mcp",
+        "unknown MCP tool_choice left unchanged"
+    );
+}
+
+// =========================================================================
+// State Sync: write_state synchronizes request_body and tools
+// =========================================================================
+
+/// Build a rewritten body with function tools and `tool_choice`
+/// already translated from MCP form.
+fn rewritten_body_json() -> serde_json::Value {
+    serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "function", "name": "weather__get_weather", "parameters": {"type": "object"}}],
+        "tool_choice": {"type": "function", "name": "weather__get_weather"}
+    })
+}
+
+/// `write_state` synchronizes `request_body`, `tools`, and
+/// `tool_choice` on an existing `ResponsesState`.
+#[test]
+fn write_state_syncs_request_body_and_tools_on_existing_state() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let original_body = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "weather"}],
+        "tool_choice": {"type": "mcp", "server_label": "weather", "name": "get_weather"}
+    });
+    ctx.extensions.insert(ResponsesState::from_request_body(original_body));
+
+    let body_bytes = serde_json::to_vec(&rewritten_body_json()).unwrap();
+    write_state(&mut ctx, &body_bytes, weather_tool_map());
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
+    assert_eq!(state.tools.len(), 1, "tools synced from rewritten body");
+    assert_eq!(state.tools[0]["type"], "function", "synced tool is function type");
+    assert_eq!(state.tool_choice["type"], "function", "tool_choice synced");
+    assert_eq!(
+        state.request_body["tools"][0]["type"], "function",
+        "request_body rewritten"
+    );
+}
+
+// =========================================================================
+// Per-entry expansion respects allowed_tools
+// =========================================================================
+
+/// Per-entry `per_entry` lists are consumed independently,
+/// respecting per-entry `allowed_tools` filtering.
+#[test]
+fn rewrite_per_entry_respects_allowed_tools_filter() {
+    let tools = vec![
+        serde_json::json!({"type": "mcp", "server_label": "s", "allowed_tools": ["tool_a"]}),
+        serde_json::json!({"type": "mcp", "server_label": "s", "allowed_tools": ["tool_b"]}),
+    ];
+
+    let per_entry = vec![
+        vec![mcp_tool_to_function_tool(
+            "s",
+            &serde_json::json!({"name": "tool_a", "description": "A"}),
+        )],
+        vec![mcp_tool_to_function_tool(
+            "s",
+            &serde_json::json!({"name": "tool_b", "description": "B"}),
+        )],
+    ];
+
+    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+
+    assert_eq!(rewritten.len(), 2, "each entry expands independently");
+    assert_eq!(rewritten[0]["name"], "s__tool_a", "first entry only has tool_a");
+    assert_eq!(rewritten[1]["name"], "s__tool_b", "second entry only has tool_b");
+}
+
+// =========================================================================
+// Server-level MCP tool_choice → allowed_tools
+// =========================================================================
+
+/// Server-level MCP `tool_choice` `{"type":"mcp","server_label":"X"}`
+/// (without `name`) rewrites to an `allowed_tools` form scoped to
+/// that server's generated functions.
+#[test]
+fn rewrite_tool_choice_server_level_becomes_allowed_tools() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "weather"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    let choice = &obj["tool_choice"];
+    assert_eq!(
+        choice["type"], "allowed_tools",
+        "server-level MCP tool_choice should become allowed_tools"
+    );
+    assert_eq!(choice["mode"], "required", "mode should be required");
+    let tool_refs = choice["tools"].as_array().expect("tools should be array");
+    assert!(
+        tool_refs.iter().all(|t| t["type"] == "function"),
+        "all entries should be function type"
+    );
+    assert!(
+        tool_refs.iter().any(|t| t["name"] == "weather__get_weather"),
+        "should include weather server's function"
+    );
+}
+
+/// Server-level MCP `tool_choice` for an unknown server is left
+/// unchanged when no tools from that server exist.
+#[test]
+fn rewrite_tool_choice_server_level_unknown_label_unchanged() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "nonexistent"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    assert_eq!(
+        obj["tool_choice"]["type"], "mcp",
+        "unknown server-level MCP tool_choice left unchanged"
+    );
+}
+
+// =========================================================================
+// MCP selectors inside allowed_tools tool_choice
+// =========================================================================
+
+/// MCP selectors inside an `allowed_tools` `tool_choice` are
+/// expanded to their generated function equivalents.
+#[test]
+fn rewrite_tool_choice_expands_mcp_selectors_in_allowed_tools() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "weather"},
+                {"type": "function", "name": "calc"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    let choice = &obj["tool_choice"];
+    assert_eq!(choice["type"], "allowed_tools", "type preserved");
+    assert_eq!(choice["mode"], "auto", "mode preserved");
+    let tool_refs = choice["tools"].as_array().expect("tools should be array");
+    let names: Vec<&str> = tool_refs.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"calc"), "non-MCP selector preserved");
+    assert!(
+        names.contains(&"weather__get_weather"),
+        "MCP selector expanded to function"
+    );
+}
+
+/// Named MCP selectors inside `allowed_tools` are translated to
+/// their specific function equivalent.
+#[test]
+fn rewrite_tool_choice_translates_named_mcp_selector_in_allowed_tools() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [
+                {"type": "mcp", "server_label": "weather", "name": "get_weather"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert_eq!(tool_refs.len(), 1, "one selector → one function ref");
+    assert_eq!(tool_refs[0]["type"], "function", "translated to function");
+    assert_eq!(tool_refs[0]["name"], "weather__get_weather", "name encoded");
+}
+
+/// `allowed_tools` `tool_choice` without MCP selectors is left
+/// unchanged.
+#[test]
+fn rewrite_tool_choice_allowed_tools_without_mcp_unchanged() {
+    let tool_map = weather_tool_map();
+    let original = serde_json::json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "function", "name": "calc"}]
+    });
+    let mut obj = serde_json::Map::new();
+    obj.insert("tool_choice".to_owned(), original.clone());
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    assert_eq!(obj["tool_choice"], original, "no MCP selectors → unchanged");
+}
+
+/// An unresolved named MCP selector inside `allowed_tools` is
+/// preserved when no matching entry exists in `tool_map`.
+#[test]
+fn rewrite_tool_choice_preserves_unresolved_named_mcp_selector() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "weather", "name": "nonexistent"},
+                {"type": "function", "name": "calc"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert_eq!(tool_refs.len(), 2, "unresolved selector preserved alongside function");
+    let mcp_ref = tool_refs.iter().find(|t| t["type"] == "mcp");
+    assert!(mcp_ref.is_some(), "unresolved MCP selector should be preserved");
+    assert_eq!(
+        mcp_ref.unwrap()["name"],
+        "nonexistent",
+        "original selector fields preserved"
+    );
+}
+
+/// An unresolved server-level MCP selector inside `allowed_tools`
+/// is preserved when no tools from that server exist in `tool_map`.
+#[test]
+fn rewrite_tool_choice_preserves_unresolved_server_mcp_selector() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [
+                {"type": "mcp", "server_label": "unknown_server"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert_eq!(tool_refs.len(), 1, "unresolved server selector preserved");
+    assert_eq!(tool_refs[0]["type"], "mcp", "original MCP type preserved");
+    assert_eq!(
+        tool_refs[0]["server_label"], "unknown_server",
+        "original server_label preserved"
+    );
+}
+
+/// Mixed resolved and unresolved MCP selectors: resolved ones
+/// expand, unresolved ones are preserved.
+#[test]
+fn rewrite_tool_choice_mixed_resolved_and_unresolved_selectors() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "weather"},
+                {"type": "mcp", "server_label": "deferred_server"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map);
+
+    let choice = &obj["tool_choice"];
+    let tool_refs = choice["tools"].as_array().expect("tools array");
+    let has_expanded = tool_refs
+        .iter()
+        .any(|t| t["type"] == "function" && t["name"].as_str().is_some_and(|n| n.starts_with("weather__")));
+    assert!(has_expanded, "resolved MCP selector should expand");
+    let has_preserved = tool_refs
+        .iter()
+        .any(|t| t["type"] == "mcp" && t["server_label"] == "deferred_server");
+    assert!(has_preserved, "unresolved MCP selector should be preserved");
+}
+
+// =========================================================================
+// Name Collision Detection
+// =========================================================================
+
+/// Duplicate generated function names are detected and rejected.
+#[test]
+fn detect_name_collisions_rejects_generated_duplicates() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "my_server__get"}),
+        serde_json::json!({"type": "function", "name": "my_server__get"}),
+    ];
+    let generated = HashSet::from(["my_server__get".to_owned()]);
+
+    let result = detect_name_collisions(&tools, &generated);
+    assert!(result.is_err(), "duplicate generated names should be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("my_server__get"),
+        "error should identify the colliding name"
+    );
+}
+
+/// Distinct function names pass collision detection.
+#[test]
+fn detect_name_collisions_accepts_distinct_names() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "server_a__tool"}),
+        serde_json::json!({"type": "function", "name": "server_b__tool"}),
+    ];
+    let generated = HashSet::from(["server_a__tool".to_owned(), "server_b__tool".to_owned()]);
+
+    assert!(
+        detect_name_collisions(&tools, &generated).is_ok(),
+        "distinct names should pass collision check"
+    );
+}
+
+/// Non-function tools are skipped during collision detection.
+#[test]
+fn detect_name_collisions_ignores_non_function_tools() {
+    let tools = vec![
+        serde_json::json!({"type": "mcp", "server_label": "x"}),
+        serde_json::json!({"type": "function", "name": "only_one"}),
+    ];
+    let generated = HashSet::from(["only_one".to_owned()]);
+
+    assert!(
+        detect_name_collisions(&tools, &generated).is_ok(),
+        "non-function tools should be skipped"
+    );
+}
+
+/// Client-supplied duplicate function names are not rejected when
+/// no generated name is involved.
+#[test]
+fn detect_name_collisions_ignores_client_duplicates() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "client_func"}),
+        serde_json::json!({"type": "function", "name": "client_func"}),
+    ];
+    let generated = HashSet::new();
+
+    assert!(
+        detect_name_collisions(&tools, &generated).is_ok(),
+        "client-only duplicates should pass — backend validates these"
+    );
+}
+
+/// A generated name colliding with a client-supplied name is
+/// rejected.
+#[test]
+fn detect_name_collisions_rejects_generated_vs_client_collision() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "my_func"}),
+        serde_json::json!({"type": "function", "name": "my_func"}),
+    ];
+    let generated = HashSet::from(["my_func".to_owned()]);
+
+    assert!(
+        detect_name_collisions(&tools, &generated).is_err(),
+        "generated name colliding with client name should be rejected"
+    );
+}
+
+/// Lossy sanitization can cause collisions when special characters
+/// in labels map to the same encoded name.
+#[test]
+fn encode_function_name_lossy_collision_example() {
+    let name_a = encode_function_name("my.server", "get");
+    let name_b = encode_function_name("my_server", "get");
+    assert_eq!(name_a, name_b, "dots sanitized to underscores create identical names");
 }

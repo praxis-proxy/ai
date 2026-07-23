@@ -406,6 +406,8 @@ fn mcp_mock_server_echoes_resolved_body() {
     );
 }
 
+/// Verify end-to-end that `type: "mcp"` tools are rewritten to
+/// `type: "function"` before being forwarded upstream.
 #[test]
 fn mcp_tools_rewritten_to_function_type() {
     let mcp_config = McpMockConfig {
