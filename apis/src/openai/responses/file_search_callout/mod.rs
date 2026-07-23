@@ -865,6 +865,7 @@ mod tests;
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     reason = "live integration test"
 )]
 mod live_tests;
