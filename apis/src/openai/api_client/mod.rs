@@ -8,7 +8,7 @@
 //! JSON and byte reads, and normalized error mapping. Used by
 //! [`FilesApiClient`] and vector-store search.
 //!
-//! JSON requests route through `praxis_callout_core::callout::CalloutClient`
+//! JSON requests route through `praxis_core::callout::CalloutClient`
 //! for circuit breaking, callout-depth protection, and timeout.
 //! Content downloads use a direct `reqwest::Client` with
 //! chunk-by-chunk bounded reads so oversized responses are rejected
@@ -27,7 +27,7 @@ pub(crate) mod url;
 
 use std::time::Duration;
 
-use praxis_callout_core::callout::{CalloutClient, CalloutConfig, CalloutRequest, CalloutResult};
+use praxis_core::callout::{CalloutClient, CalloutConfig, CalloutRequest, CalloutResult};
 use reqwest::redirect;
 
 pub(crate) use self::{
@@ -287,7 +287,7 @@ async fn read_bounded_body(mut response: reqwest::Response, max_bytes: usize) ->
 async fn execute_callout(
     client: &CalloutClient,
     request: CalloutRequest,
-) -> Result<praxis_callout_core::callout::CalloutResponse, ApiClientError> {
+) -> Result<praxis_core::callout::CalloutResponse, ApiClientError> {
     match client.execute(request).await {
         CalloutResult::Success(r) => Ok(r),
         CalloutResult::Failed => Err(ApiClientError::CalloutFailed {
@@ -315,7 +315,7 @@ mod tests {
         thread::JoinHandle,
     };
 
-    use praxis_callout_core::callout::{CalloutConfig, FailureMode};
+    use praxis_core::callout::{CalloutConfig, FailureMode};
 
     use super::*;
 
