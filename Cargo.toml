@@ -83,7 +83,7 @@ praxis = { version = "0.5.1", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
 
 # AI-owned llm-d ext_proc compatibility layer
-praxis-ai-llmd-ext-proc = { version = "0.1.0", path = "integrations/llmd/ext-proc" }
+praxis-ai-llmd-ext-proc = { version = "0.2.0", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
 praxis-ai-proxy = { version = "0.2.0", path = "server" }

@@ -3145,7 +3145,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-llmd-ext-proc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-environment"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3365,6 +3365,7 @@ dependencies = [
  "futures",
  "http",
  "nix",
+ "praxis-ai-llmd-ext-proc",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-test-utils",
@@ -3373,7 +3374,9 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite",
+ "tonic",
 ]
 
 [[package]]
@@ -5409,7 +5412,7 @@ checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "h2",
  "http",

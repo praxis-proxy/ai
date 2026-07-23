@@ -206,8 +206,8 @@ pub(crate) fn apply_response_header_mutation(mutation: &HeaderMutation, ctx: &mu
         return;
     };
 
-    let sets = set_response_headers(&mutation.set_headers, resp);
     let removes = remove_response_headers(&mutation.remove_headers, resp);
+    let sets = set_response_headers(&mutation.set_headers, resp);
 
     if sets || removes {
         ctx.response_headers_modified = true;

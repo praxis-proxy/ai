@@ -36,7 +36,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 [package.metadata.cargo-machete]
-ignored = ["prost", "prost-types", "prost-wkt-types", "tonic-prost"]
+ignored = ["prost", "prost-build", "protox", "tonic-prost", "tonic-prost-build"]
 
 [build-dependencies]
 prost-build = { workspace = true }

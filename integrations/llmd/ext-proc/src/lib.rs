@@ -69,8 +69,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::header::CONTENT_LENGTH;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, TrustedHeaderMutation,
+    parse_filter_config,
 };
 use serde::Deserialize;
 use tonic::transport::{Channel, Endpoint};
@@ -1002,6 +1004,9 @@ impl ExtProcFilter {
             } else {
                 Some(Bytes::from(coalesced))
             };
+            ctx.request_headers_to_remove.push(CONTENT_LENGTH);
+            ctx.pre_read_mutations
+                .push(TrustedHeaderMutation::Remove(CONTENT_LENGTH));
         }
         Ok(FilterAction::Continue)
     }

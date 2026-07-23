@@ -203,7 +203,9 @@ filter_chains:
     );
 
     let config = praxis_core::config::Config::from_yaml(&config_yaml).expect("sim env config should parse");
-    let registry = praxis_ai::build_full_registry();
+    let subrequest_client =
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None));
+    let registry = praxis_ai::build_full_registry(&subrequest_client);
     praxis_test_utils::start_proxy_with_registry(&config, &registry)
 }
 

@@ -13,7 +13,7 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit test-schema test-integration \
+	test test-unit test-schema test-integration test-environment \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
@@ -83,6 +83,11 @@ check-openai-conformance-reference:
 	cargo xtask openai-conformance-reference --check
 
 test-openai-conformance: openai-conformance
+
+test-environment:
+	cargo test -p praxis-ai-llmd-ext-proc $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features llmd-ext-proc llmd_ext_proc $(_NOCAPTURE)
+	cargo test -p praxis-tests-environment --features llmd-ext-proc $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
 # Quality
@@ -181,6 +186,7 @@ help:
 	@echo "  test-unit            unit tests (providers, filters, server)"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
+	@echo "  test-environment     llm-d ext_proc environment tests"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
 	@echo ""

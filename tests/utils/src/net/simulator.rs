@@ -154,7 +154,7 @@ fn run_container(engine: &str, port: u16, model: &str) -> String {
             "-d",
             "--rm",
             "-p",
-            &format!("{port}:8000"),
+            &format!("127.0.0.1:{port}:8000"),
             SIM_IMAGE,
             &format!("--model={model}"),
             &format!("--served-model-name={model}"),
