@@ -14,7 +14,7 @@ a general-purpose Envoy `ext_proc` extension point.
 - **Crate path:** `integrations/llmd/ext-proc/`
 - **Package name:** `praxis-ai-llmd-ext-proc`
 - **Feature name:** `llmd-ext-proc`
-- **`publish = false`** — not available on crates.io.
+- **`publish = false`** - not available on crates.io.
 
 Default `praxis-ai-proxy` builds do not link, register, or
 expose the `ext_proc` filter. The filter is registered only
@@ -73,28 +73,8 @@ The six environment tests:
 | `simulator_metrics_endpoint_reachable` | Simulator `/metrics` returns 200 with content |
 | `simulator_processor_failure_returns_status_on_error` | Unreachable processor returns 503, no bypass |
 
-## Current limitations
-
-- Mock EPP only — not real Go `llm-d` scheduler.
-- No `InferencePool` or `InferenceModel` validation.
-- No cache-aware or prefill/decode routing.
-- No GPU-backed inference.
-- Response-header lifecycle is available (Praxis PR #776)
-  but not exercised by these tests
-  (`response_header_mode: skip`).
-
 ## Dependency and build notes
 
-- Praxis dependency is temporarily git-pinned to
-  `546871d8fdb85a6b0260e77ee4a63083c1c097fb` until the next
-  Praxis release includes the required support APIs
-  (`TrustedHeaderMutation`, `pre_read_mutations`,
-  `set_structured_metadata`, `MetricsConfig`).
-- `cargo deny check` currently exits 2 due to pre-existing
-  duplicate-version bans on AI main (transitive dependency
-  splits in the Praxis/Pingora tree). The Praxis git source
-  check passes (`sources ok`).
-- Default container build (`make container`) passes in this
-  branch because an unrelated `COPY examples` issue was
-  fixed. This fix may be split or dropped before the final
-  PR if the standalone container fix lands independently.
+- The AI workspace depends on the published Praxis `0.4.1`
+  crates from crates.io. These include the support APIs needed
+  by the `llm-d` `ext_proc` compatibility layer.

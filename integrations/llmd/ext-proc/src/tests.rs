@@ -6263,7 +6263,7 @@ async fn open_with_request_headers_commits_state_and_receives() {
     let event = exchange.receive().await.unwrap();
     assert!(
         matches!(event, ExchangeEvent::RequestHeaders { .. }),
-        "should receive RequestHeaders response immediately — state was committed at construction"
+        "should receive RequestHeaders response immediately - state was committed at construction"
     );
 }
 
@@ -7907,7 +7907,7 @@ async fn response_header_timeout_rejects_with_status_on_error() {
                 };
                 drop(tx.send(Ok(resp)).await);
                 let _response_headers = stream.message().await;
-                // Never respond to ResponseHeaders — simulate timeout
+                // Never respond to ResponseHeaders - simulate timeout
                 futures::future::pending::<()>().await;
             });
 

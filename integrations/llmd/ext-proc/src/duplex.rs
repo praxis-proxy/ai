@@ -17,22 +17,22 @@
 //!
 //! The exchange tracks six orthogonal state domains:
 //!
-//! 1. **`terminal`** — shared terminal flag.
-//! 2. **`request_send`** — outbound send phase for the request direction.
-//! 3. **`response_send`** — outbound send phase for the response direction.
-//! 4. **`request_output`** — processor-output phase for the request direction.
-//! 5. **`response_output`** — processor-output phase for the response direction.
-//! 6. **`active_processing`** — optional per-message processing state with deadline and override tracking.
+//! 1. **`terminal`** - shared terminal flag.
+//! 2. **`request_send`** - outbound send phase for the request direction.
+//! 3. **`response_send`** - outbound send phase for the response direction.
+//! 4. **`request_output`** - processor-output phase for the request direction.
+//! 5. **`response_output`** - processor-output phase for the response direction.
+//! 6. **`active_processing`** - optional per-message processing state with deadline and override tracking.
 //!
 //! # Non-Full-Duplex vs Full-Duplex
 //!
 //! In non-full-duplex modes, every sent message (including every
 //! body chunk) creates an [`ActiveProcessingState`] with a
-//! deadline. At most one may be outstanding — a second send while
+//! deadline. At most one may be outstanding - a second send while
 //! one is active fails with [`ExchangeError::OrderingViolation`].
 //!
 //! In full-duplex mode (`FULL_DUPLEX_STREAMED`), no messages in
-//! the direction — headers, body chunks, or trailers — create
+//! the direction - headers, body chunks, or trailers - create
 //! active processing state. The entire direction operates without
 //! per-message timeouts.
 //!
@@ -180,7 +180,7 @@ pub(crate) enum ExchangeEvent {
         /// Structured dynamic metadata from the envelope.
         metadata: Option<prost_wkt_types::Struct>,
     },
-    /// Immediate response — terminal event.
+    /// Immediate response - terminal event.
     Immediate {
         /// Processor immediate response payload.
         response: ImmediateResponse,
@@ -312,7 +312,7 @@ enum Direction {
 
 /// Proposed state transition computed by [`ExtProcExchange::compute_send_transition`].
 ///
-/// Pure value — applying it is the only mutation step.
+/// Pure value - applying it is the only mutation step.
 struct SendTransition {
     /// Which direction to advance.
     direction: Direction,
@@ -427,7 +427,7 @@ pub(crate) struct ExtProcExchange {
 impl ExtProcExchange {
     /// Open a new exchange on the given channel.
     ///
-    /// Synchronous — constructs the Process future without polling
+    /// Synchronous - constructs the Process future without polling
     /// it. The gRPC stream is established when [`send`] or
     /// [`receive`] first drives the pending future.
     ///
@@ -472,7 +472,7 @@ impl ExtProcExchange {
     /// The returned exchange is immediately in the `Headers` send
     /// phase with `first_sent = true`.
     ///
-    /// Restricted to full-duplex request mode — non-full-duplex
+    /// Restricted to full-duplex request mode - non-full-duplex
     /// callers must use [`open`] followed by [`send`].
     ///
     /// [`open`]: Self::open
@@ -602,7 +602,7 @@ impl ExtProcExchange {
     /// without timeout otherwise. The override loop handles
     /// `override_message_timeout` envelopes before classification.
     ///
-    /// Takes no arguments — timeout behavior is fully internal.
+    /// Takes no arguments - timeout behavior is fully internal.
     pub(crate) async fn receive(&mut self) -> Result<ExchangeEvent, ExchangeError> {
         if self.terminal {
             return Err(ExchangeError::Closed);
@@ -717,7 +717,7 @@ impl ExtProcExchange {
     }
 
     // -------------------------------------------------------------------------
-    // Send Transition — Computation
+    // Send Transition - Computation
     // -------------------------------------------------------------------------
 
     /// Compute the proposed send transition without mutating state.
@@ -726,8 +726,8 @@ impl ExtProcExchange {
     /// exclusivity. Returns a pure [`SendTransition`] value.
     ///
     /// Full-duplex directions (`FULL_DUPLEX_STREAMED`) never create
-    /// active processing state for any message type — headers, body,
-    /// or trailers — because full-duplex processing has no
+    /// active processing state for any message type - headers, body,
+    /// or trailers - because full-duplex processing has no
     /// per-message timeout.
     #[expect(
         clippy::too_many_lines,
@@ -867,7 +867,7 @@ impl ExtProcExchange {
     }
 
     // -------------------------------------------------------------------------
-    // Send Transition — Application
+    // Send Transition - Application
     // -------------------------------------------------------------------------
 
     /// Apply the committed transition atomically (no await).
@@ -950,7 +950,7 @@ impl ExtProcExchange {
             let resp = read_with_optional_deadline(stream, deadline).await?;
 
             // If override_message_timeout is present, this is an
-            // override envelope — it never reaches classification.
+            // override envelope - it never reaches classification.
             if resp.override_message_timeout.is_some() {
                 // Try to apply it; whether accepted or rejected,
                 // the envelope is consumed and we read the next one.
@@ -967,7 +967,7 @@ impl ExtProcExchange {
     /// Returns `true` if the override was accepted and the active
     /// deadline was replaced. Returns `false` if the override is
     /// invalid or not applicable. In both cases, the caller
-    /// consumes the entire envelope and continues reading —
+    /// consumes the entire envelope and continues reading -
     /// invalid override envelopes are never classified as
     /// ordinary responses.
     ///

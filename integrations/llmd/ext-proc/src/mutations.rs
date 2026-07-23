@@ -26,7 +26,7 @@ use crate::{
 };
 
 // -----------------------------------------------------------------------------
-// Request → Proto
+// Request -> Proto
 // -----------------------------------------------------------------------------
 
 /// Build [`HttpHeaders`] from the current request context.
@@ -86,7 +86,7 @@ pub(crate) fn response_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHead
 }
 
 // -----------------------------------------------------------------------------
-// Proto → Praxis mutations
+// Proto -> Praxis mutations
 // -----------------------------------------------------------------------------
 
 /// Apply a [`HeadersResponse`] to the filter context.
@@ -112,10 +112,10 @@ pub(crate) fn apply_headers_response(hr: &HeadersResponse, ctx: &mut HttpFilterC
 /// Maps each [`HeaderAppendAction`] variant to the appropriate
 /// context queue:
 ///
-/// - `AppendIfExistsOrAdd` (default) → [`extra_request_headers`]
-/// - `OverwriteIfExistsOrAdd` → [`request_headers_to_set`]
-/// - `OverwriteIfExists` → [`request_headers_to_set`] (only if present)
-/// - `AddIfAbsent` → [`extra_request_headers`] (only if absent)
+/// - `AppendIfExistsOrAdd` (default) -> [`extra_request_headers`]
+/// - `OverwriteIfExistsOrAdd` -> [`request_headers_to_set`]
+/// - `OverwriteIfExists` -> [`request_headers_to_set`] (only if present)
+/// - `AddIfAbsent` -> [`extra_request_headers`] (only if absent)
 ///
 /// Pseudo-headers (`:` prefix) are skipped because Praxis sets
 /// method, path, scheme, and authority through dedicated fields.

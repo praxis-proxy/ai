@@ -191,7 +191,7 @@ fn detect_container_engine() -> String {
         }
     }
 
-    panic!("no container engine found — install podman or docker, or set CONTAINER_ENGINE");
+    panic!("no container engine found - install podman or docker, or set CONTAINER_ENGINE");
 }
 
 /// Poll until the simulator's health endpoint returns HTTP 200.

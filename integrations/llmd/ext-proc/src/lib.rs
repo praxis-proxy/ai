@@ -9,7 +9,7 @@
 //! [`llm-d`] integration. It is **not** general-purpose Envoy
 //! `ext_proc` support.
 //!
-//! - `publish = false` — not available on crates.io.
+//! - `publish = false` - not available on crates.io.
 //! - Native Praxis filters are preferred for general extension work.
 //! - No compatibility or support is promised for non-`llm-d` use cases.
 //! - APIs, configuration, and protobuf types may change or be removed.
@@ -19,8 +19,8 @@
 //!
 //! External processing adds a gRPC hop to every request, introducing
 //! latency, operational complexity, and a new failure domain.
-//! Praxis's native filter system — in-process, zero-copy, with
-//! body streaming — handles most use cases with less overhead and
+//! Praxis's native filter system - in-process, zero-copy, with
+//! body streaming - handles most use cases with less overhead and
 //! no network boundary. This crate exists solely because `llm-d`'s
 //! current EPP protocol is Envoy `ext_proc`.
 //!
@@ -160,13 +160,13 @@ impl std::fmt::Display for Phase {
 /// because they are tied to Envoy-internal subsystems with no Praxis
 /// equivalent:
 ///
-/// - `grpc_service` / `http_service` — Envoy service discovery config; use `target` URI instead
-/// - `request_attributes` / `response_attributes` — Envoy attribute system
-/// - `stat_prefix` — Envoy stats scoping
-/// - `filter_metadata` — Envoy filter state for access logging
-/// - `metadata_options` — Envoy dynamic metadata namespace forwarding/receiving
-/// - `disable_clear_route_cache` / `route_cache_action` — Envoy route cache management
-/// - `processing_request_modifier` / `on_processing_response` — Envoy extension point decorators (alpha)
+/// - `grpc_service` / `http_service` - Envoy service discovery config; use `target` URI instead
+/// - `request_attributes` / `response_attributes` - Envoy attribute system
+/// - `stat_prefix` - Envoy stats scoping
+/// - `filter_metadata` - Envoy filter state for access logging
+/// - `metadata_options` - Envoy dynamic metadata namespace forwarding/receiving
+/// - `disable_clear_route_cache` / `route_cache_action` - Envoy route cache management
+/// - `processing_request_modifier` / `on_processing_response` - Envoy extension point decorators (alpha)
 ///
 /// [`FilterEntry`]: praxis_filter::FilterEntry
 /// [`ExternalProcessor`]: https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/ext_proc/v3/ext_proc.proto
@@ -702,7 +702,7 @@ impl ExtProcFilter {
     /// processor failure is logged and a [`FilterAction::Reject`] is
     /// returned with the configured status code, matching Envoy's
     /// error-handling behaviour. Because the error is consumed here,
-    /// the pipeline always sees `Ok(Reject(...))` — the pipeline-level
+    /// the pipeline always sees `Ok(Reject(...))` - the pipeline-level
     /// `failure_mode` does not apply to `ext_proc` processor errors.
     ///
     /// [`status_on_error`]: ExtProcConfig::status_on_error
@@ -770,7 +770,7 @@ impl ExtProcFilter {
     }
 
     /// Ensure the per-request exchange is open and request headers
-    /// have been sent. Idempotent — returns immediately if headers
+    /// have been sent. Idempotent - returns immediately if headers
     /// were already sent.
     ///
     /// Stores [`ExtProcState`] in [`HttpFilterContext::filter_state`]
@@ -868,7 +868,7 @@ impl ExtProcFilter {
     /// [`FilterAction::Reject`].
     ///
     /// The exchange is temporarily removed from `filter_state` to
-    /// satisfy the borrow checker — `receive()` needs `&mut exchange`
+    /// satisfy the borrow checker - `receive()` needs `&mut exchange`
     /// while mutation helpers need `&mut ctx`. The exchange is
     /// reinserted before returning.
     ///
@@ -1142,7 +1142,7 @@ pub(crate) fn proto_value_to_json(value: &prost_wkt_types::Value) -> serde_json:
 /// Extract the body bytes and EOS flag from a
 /// [`BodyResponse`] containing a [`StreamedBodyResponse`].
 ///
-/// Returns `None` when no body mutation is present — the caller
+/// Returns `None` when no body mutation is present - the caller
 /// must preserve the original body. Returns `Some((bytes, eos))`
 /// when a streamed body replacement is provided.
 ///
@@ -1204,7 +1204,7 @@ impl HttpFilter for ExtProcFilter {
             return Ok(FilterAction::Continue);
         }
 
-        // Idempotent bootstrap — handles the case where
+        // Idempotent bootstrap - handles the case where
         // StreamBuffer pre-read invokes on_request_body before
         // on_request.
         let bootstrap_result = self.ensure_exchange_and_send_headers(ctx);
