@@ -1558,7 +1558,7 @@ impl MockServer {
                     let response = responder(&path);
                     let reason = if response.status == 200 { "OK" } else { "Error" };
                     let headers = format!(
-                        "HTTP/1.1 {} {reason}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                        "HTTP/1.1 {} {reason}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
                         response.status,
                         response.body.len()
                     );
