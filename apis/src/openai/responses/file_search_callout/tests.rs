@@ -1038,7 +1038,10 @@ async fn one_execution_deadline_covers_later_concurrency_chunks() {
         },
         status: 200,
     });
-    let filter = make_filter(server.port, "timeout_ms: 4000\n");
+    let filter = make_filter(
+        server.port,
+        "timeout_ms: 4000\nmax_response_bytes: 1024\nmax_total_response_bytes: 9216\n",
+    );
     let store_ids: Vec<String> = (0..=MAX_CONCURRENT_SEARCHES)
         .map(|index| format!("vs-{index}"))
         .collect();
