@@ -47,3 +47,6 @@ headers:
   stream: x-praxis-ai-stream
   mode: x-praxis-responses-mode
 ```
+
+## Related examples
+- [responses-routing.yaml](../../examples/configs/openai/responses/responses-routing.yaml)

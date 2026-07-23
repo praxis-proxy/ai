@@ -24,7 +24,7 @@ Build consensus with community members.
 > what you're bringing up is a real concern that needs to
 > be addressed, regardless of "How?" it is addressed.
 
-[GitHub Discussion]: https://github.com/praxis-proxy/praxis/discussions
+[GitHub Discussion]: https://github.com/praxis-proxy/ai/discussions
 
 ### 2. Sign-off
 

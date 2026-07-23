@@ -1431,7 +1431,7 @@ fn render_map_type(segment: &syn::PathSegment, enums: &BTreeMap<String, EnumInfo
         .first()
         .map_or_else(|| "string".to_owned(), |t| render_type(t, enums));
     let value = args.get(1).map_or_else(|| "any".to_owned(), |t| render_type(t, enums));
-    format!("object<{key}, {value}>")
+    format!("`object<{key}, {value}>`")
 }
 
 /// Render the inner type argument or a fallback.
@@ -1545,12 +1545,12 @@ fn config_notes(doc: &str) -> Vec<String> {
 
 /// Normalize one config doc paragraph into prose, dropping fenced code.
 fn normalize_config_note(paragraph: &str) -> Option<String> {
-    normalize_doc_prose(paragraph)
+    normalize_doc_prose(paragraph).map(|note| fix_broken_md_links(&note))
 }
 
 /// Normalize one field doc comment into safe table-cell prose.
 fn normalize_field_doc(doc: &str) -> String {
-    normalize_doc_prose(doc).unwrap_or_default().replace('|', "\\|")
+    fix_broken_md_links(&normalize_doc_prose(doc).unwrap_or_default()).replace('|', "\\|")
 }
 
 /// Normalize doc comment prose, dropping fenced code and reference definitions.
@@ -1588,17 +1588,113 @@ fn render_filter_doc(entry: &FilterEntry) -> String {
     writeln!(out).unwrap();
 
     if !entry.filter.description.is_empty() {
-        writeln!(out, "{}", entry.filter.description).unwrap();
+        writeln!(out, "{}", fix_broken_md_links(&entry.filter.description)).unwrap();
     }
     for description in &entry.filter.extra_descriptions {
         writeln!(out).unwrap();
-        writeln!(out, "{description}").unwrap();
+        writeln!(out, "{}", fix_broken_md_links(description)).unwrap();
     }
 
     render_config_notes(&mut out, &entry.filter.config_notes);
     render_config_table(&mut out, &entry.filter.fields);
     render_yaml_examples(&mut out, &entry.filter.yaml_examples);
+    render_related_examples(&mut out, &workspace_root(), &entry.filter.name);
     out
+}
+
+/// Return a markdown link for rustdoc intradoc symbols that have a
+/// stable docs target. Unmapped symbols fall back to inline code.
+fn intradoc_link_target(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        "filter_metadata" => Some("[filter_metadata](extensions.md#filter_metadata)"),
+        _ => None,
+    }
+}
+
+/// Replace broken intradoc links like `` [`Name`] `` with inline code
+/// or a mapped markdown link when a stable target exists.
+fn fix_broken_md_links(text: &str) -> String {
+    let mut result = text.to_owned();
+    let mut search_from = 0;
+    while let Some(tail) = result.get(search_from..)
+        && let Some(rel_start) = tail.find("[`")
+    {
+        let start = search_from + rel_start;
+        let Some(end_tail) = result.get(start..) else {
+            break;
+        };
+        let Some(rel_end) = end_tail.find("`]") else {
+            break;
+        };
+        let end = start + rel_end + 2;
+        if result.get(end..).is_some_and(|rest| rest.starts_with('(')) {
+            search_from = end;
+            continue;
+        }
+        let Some(inner) = result.get(start + 2..end.saturating_sub(2)) else {
+            break;
+        };
+        let inner = inner.to_owned();
+        let suffix = result.get(end..).unwrap_or("").to_owned();
+        let prefix = result.get(..start).unwrap_or("");
+        let replacement = intradoc_link_target(&inner).map_or_else(|| format!("`{inner}`"), str::to_owned);
+        result = format!("{prefix}{replacement}{suffix}");
+        search_from = start.saturating_add(replacement.len());
+    }
+    result
+}
+
+/// List example config paths that reference the given filter.
+fn discover_example_paths(root: &Path, filter_name: &str) -> Vec<String> {
+    let examples_dir = root.join("examples/configs");
+    let mut yaml_files = Vec::new();
+    collect_yaml_files(&examples_dir, &mut yaml_files);
+    let mut matches = Vec::new();
+    for path in yaml_files {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let matches_filter = content.lines().any(|line| {
+            line.trim()
+                .strip_prefix("filter:")
+                .is_some_and(|rest| rest.trim() == filter_name)
+        });
+        if matches_filter && let Ok(rel) = path.strip_prefix(root) {
+            matches.push(rel.display().to_string().replace('\\', "/"));
+        }
+    }
+    matches.sort();
+    matches
+}
+
+/// Recursively collect `.yaml` files under `dir`.
+fn collect_yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_yaml_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "yaml") {
+            out.push(path);
+        }
+    }
+}
+
+/// Append links to example configs that use this filter.
+fn render_related_examples(out: &mut String, root: &Path, filter_name: &str) {
+    let examples = discover_example_paths(root, filter_name);
+    if examples.is_empty() {
+        return;
+    }
+    writeln!(out).unwrap();
+    writeln!(out, "## Related examples").unwrap();
+    for path in examples {
+        let link = format!("../../{path}");
+        let label = path.rsplit('/').next().unwrap_or(&path);
+        writeln!(out, "- [{label}]({link})").unwrap();
+    }
 }
 
 /// Render configuration notes if present.
@@ -1727,7 +1823,8 @@ fn render_category_section(out: &mut String, category: &str, filters: &[&FilterE
     writeln!(out, "|--------|-------------|").unwrap();
     for f in filters {
         let link = format!("{}.md", f.filter.name);
-        writeln!(out, "| [`{}`]({link}) | {} |", f.filter.name, f.filter.description).unwrap();
+        let description = fix_broken_md_links(&f.filter.description);
+        writeln!(out, "| [`{}`]({link}) | {description} |", f.filter.name).unwrap();
     }
 }
 
@@ -1987,7 +2084,7 @@ mod tests {
         let doc = "Protocol versions accepted during negotiation.\nEvery entry must be implemented by this build (present in\n[`protocol::SUPPORTED_VERSIONS`]). Defaults to the versions\nthis build implements.";
         assert_eq!(
             normalize_field_doc(doc),
-            "Protocol versions accepted during negotiation. Every entry must be implemented by this build (present in [`protocol::SUPPORTED_VERSIONS`]). Defaults to the versions this build implements."
+            "Protocol versions accepted during negotiation. Every entry must be implemented by this build (present in `protocol::SUPPORTED_VERSIONS`). Defaults to the versions this build implements."
         );
     }
 
@@ -1996,8 +2093,27 @@ mod tests {
         let doc = "Uses [`Thing`] for validation.\n\n[`Thing`]: crate::Thing";
         assert_eq!(
             normalize_field_doc(doc),
-            "Uses [`Thing`] for validation.",
+            "Uses `Thing` for validation.",
             "reference definitions should not render inside table cells"
+        );
+    }
+
+    #[test]
+    fn fix_broken_md_links_maps_filter_metadata() {
+        let text = "Writes counts to [`filter_metadata`] for downstream filters.";
+        assert_eq!(
+            fix_broken_md_links(text),
+            "Writes counts to [filter_metadata](extensions.md#filter_metadata) for downstream filters."
+        );
+    }
+
+    #[test]
+    fn fix_broken_md_links_preserves_existing_links() {
+        let text = "See [`Thing`](https://example.com) for details.";
+        assert_eq!(
+            fix_broken_md_links(text),
+            "See [`Thing`](https://example.com) for details.",
+            "already-linked references must not be rewritten"
         );
     }
 
@@ -2126,7 +2242,7 @@ mod tests {
         let ty: syn::Type = syn::parse_str("BTreeMap<String, String>").unwrap();
         assert_eq!(
             render_type(&ty, &BTreeMap::new()),
-            "object<string, string>",
+            "`object<string, string>`",
             "maps should render as YAML object shapes"
         );
     }

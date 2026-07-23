@@ -3,6 +3,7 @@
 
 //! AI guardrails filter: calls external content safety providers
 //! (e.g. `NeMo` Guardrails) to evaluate request and response bodies.
+//! Request-side evaluation is not wired yet.
 
 mod config;
 mod filter;

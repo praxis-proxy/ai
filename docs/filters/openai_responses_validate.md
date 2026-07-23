@@ -7,7 +7,7 @@ Validates and enriches Responses API requests.
 
 ## Configuration Notes
 
-Reads classifier metadata for parameter-combination checks, then parses the body as [`serde_json::Value`] for targeted field extraction. Does not deserialize the full body into a typed struct.
+Reads classifier metadata for parameter-combination checks, then parses the body as `serde_json::Value` for targeted field extraction. Does not deserialize the full body into a typed struct.
 
 Must be placed after `openai_responses_format` in the filter chain. Skips non-Responses API requests (those not classified as `openai_responses`).
 

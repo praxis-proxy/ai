@@ -25,3 +25,6 @@ filter: openai_tool_parse
 filter: openai_tool_parse
 max_body_bytes: 67108864
 ```
+
+## Related examples
+- [tool-routing.yaml](../../examples/configs/openai/responses/tool-routing.yaml)

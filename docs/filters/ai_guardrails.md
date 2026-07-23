@@ -5,6 +5,10 @@
 
 Calls an external AI guardrail provider to evaluate request (and eventually response) bodies. The provider determines whether content should be passed, blocked, or redacted.
 
+## Configuration Notes
+
+**Implementation status:** Request-side evaluation is not wired yet; bodies are buffered via `StreamBuffer` but `on_request_body` returns `Continue` unconditionally. Response-side evaluation is tracked in <https://github.com/praxis-proxy/ai/issues/50>.
+
 ## Configuration
 
 | Field | Type | Required | Description |

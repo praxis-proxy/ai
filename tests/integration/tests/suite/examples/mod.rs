@@ -8,6 +8,7 @@ mod test_utils;
 pub use test_utils::load_example_config;
 
 mod agentic_routing;
+mod ai_guardrails;
 mod anthropic_messages;
 mod credential_injection;
 mod full_flow;

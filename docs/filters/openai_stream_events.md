@@ -7,7 +7,7 @@ Accumulates state from native Responses API SSE event streams.
 
 ## Configuration Notes
 
-All fields are optional; omitted values fall back to [`SseParserConfig`] defaults.
+All fields are optional; omitted values fall back to `SseParserConfig` defaults.
 
 ## Configuration
 

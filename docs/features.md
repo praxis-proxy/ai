@@ -1,14 +1,11 @@
 # Features
 
-Praxis AI extends the [Praxis proxy framework][praxis]
-with AI-specific filters for inference routing, provider
-APIs, token counting, guardrails, agentic protocols,
-response storage, and prompt enrichment.
+Praxis AI adds provider, agentic, and observability filters
+on the [Praxis proxy framework][praxis]. See the
+[AI Gateway overview](overview.md) for how they fit together.
 
-For base proxy features (TLS, HTTP/2, TCP, WebSocket,
-load balancing, rate limiting, compression, CORS,
-health checks, etc.), see the
-[Praxis core documentation][praxis].
+For TLS, routing, load balancing, rate limits, and other core
+filters, see [Praxis core documentation][praxis].
 
 [praxis]: https://github.com/praxis-proxy/praxis
 
@@ -20,7 +17,7 @@ health checks, etc.), see the
   header-based routing to provider-specific clusters.
   Uses StreamBuffer to inspect the body before upstream
   selection.
-- **Credential injection** (`credential_injection`):
+- **Credential injection** (`credential_injection`, core):
   per-cluster API key injection with client credential
   stripping. Supports inline values and environment
   variable sources. Pair with a source discriminator
@@ -65,6 +62,11 @@ health checks, etc.), see the
   `/v1/conversations` endpoints locally.
 - **Responses proxy** (`openai_responses_proxy`): rebuilds
   the request body from `ResponsesState` when present.
+- **Stream events** (`openai_stream_events`): accumulates
+  native Responses API SSE events for downstream filters.
+- **Tool routing** (`openai_tool_parse`): parses `tools` and
+  `tool_choice` for branch-chain routing without mutating
+  the body.
 
 ## Anthropic Messages API
 
@@ -89,22 +91,24 @@ health checks, etc.), see the
 
 ## AI Agentic
 
-- **JSON-RPC 2.0 foundation** (`json_rpc`): request
-  envelope parsing and method/id extraction for HTTP
-  POST bodies, enabling method-based routing for
-  MCP/A2A-style traffic.
-- **MCP proxying** (`mcp`): Model Context Protocol
-  broker with tool discovery and routing via the
-  filter pipeline.
-- **A2A proxying** (`a2a`): Agent-to-Agent protocol
-  support with task routing via the filter pipeline.
+- **JSON-RPC 2.0 foundation** (`json_rpc`, core): request
+  envelope parsing for MCP/A2A-style traffic.
+- **MCP proxying** (`mcp`): MCP broker with catalog and
+  session metadata; `tools/call` is not forwarded by the
+  stateless broker profile.
+- **A2A proxying** (`a2a`): task routing and SSE detection
+  for Agent-to-Agent traffic.
 
 ## Security and Observability
 
-- **AI guardrails** (`ai_guardrails`): calls an
-  external AI guardrail provider to evaluate request
-  bodies. The provider determines whether content
-  should be passed, blocked, or redacted.
+- **AI guardrails** (`ai_guardrails`): calls an external AI
+  guardrail provider to evaluate request (and eventually response)
+  bodies. The provider determines whether content should be passed,
+  blocked, or redacted. Request-side evaluation is not wired yet;
+  response-side work is tracked in
+  [#50](https://github.com/praxis-proxy/ai/issues/50).
+- **Token counting** (`token_count`): extracts usage from
+  provider responses (JSON and SSE) into filter metadata.
 - **Token usage headers** (`token_usage_headers`):
   injects `Praxis-Token-Input`, `Praxis-Token-Output`,
   and `Praxis-Token-Total` headers into downstream

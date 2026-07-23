@@ -132,20 +132,13 @@ pass-through traffic is not held.
 
 ## Key Files
 
-- `filter/src/builtins/http/ai/openai/responses/store/filter.rs`:
-  filter implementation and lifecycle
-- `filter/src/builtins/http/ai/openai/responses/store/config.rs`:
-  configuration, SSRF validation
-- `filter/src/builtins/http/ai/store/trait_def.rs`:
-  `ResponseStore` trait
-- `filter/src/builtins/http/ai/store/types.rs`:
-  `ResponseRecord`, `StoreError`
-- `filter/src/builtins/http/ai/store/sqlite.rs`:
-  SQLite backend
-- `filter/src/builtins/http/ai/store/postgres.rs`:
-  PostgreSQL backend
-- `filter/src/builtins/http/ai/store/schemas.rs`:
-  DDL generation and identifier validation
+- `apis/src/openai/responses/store/filter.rs`: store filter lifecycle
+- `apis/src/openai/responses/store/config.rs`: configuration, SSRF validation
+- `apis/src/store/mod.rs`: `ResponseStore` trait, `ResponseStoreRegistry`
+- `apis/src/store/types.rs`: `ResponseRecord`, `StoreError`
+- `apis/src/store/sqlite.rs`: SQLite backend
+- `apis/src/store/postgres.rs`: PostgreSQL backend
+- `server/src/pipelines.rs`: injects `ResponseStoreRegistry` per pipeline
 
 ## Related
 

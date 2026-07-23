@@ -14,30 +14,10 @@ use clap::Parser;
 /// requirement. Each entry must have a justification. Shrink this list over
 /// time by adding tests.
 const SKIP: &[&str] = &[
-    // TODO(migration): add integration tests for all AI example configs.
-    // All configs are skipped until tests/integration is re-enabled.
-    "a2a-classifier-routing.yaml",
-    "a2a-task-routing.yaml",
+    // Uses core `json_body_field`; covered by praxis core examples/tests.
     "ai-inference-body-based-routing.yaml",
-    "anthropic/messages-protocol.yaml",
-    "anthropic/messages-to-openai.yaml",
-    "anthropic/request-validate.yaml",
-    "anthropic/unified-gateway.yaml",
-    "credential-injection.yaml",
-    "json-rpc-routing.yaml",
-    "mcp-classifier-routing.yaml",
+    // Integration test uses inline YAML; example uses multi-chain X-AI-Model routing.
     "model-to-header-routing.yaml",
-    "openai/conversations/conversations.yaml",
-    "openai/responses/format-routing.yaml",
-    "openai/responses/full-flow.yaml",
-    "openai/responses/model-rewrite.yaml",
-    "openai/responses/rehydrate.yaml",
-    "openai/responses/request-validate.yaml",
-    "openai/responses/response-store.yaml",
-    "openai/responses/responses-proxy.yaml",
-    "openai/responses/responses-routing.yaml",
-    "prompt-enrichment.yaml",
-    "token-usage-headers.yaml",
 ];
 
 // -----------------------------------------------------------------------------

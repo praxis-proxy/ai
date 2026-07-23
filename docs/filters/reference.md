@@ -71,10 +71,10 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`token_count`](token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`]. |
+| [`token_count`](token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [filter_metadata](extensions.md#filter_metadata). |
 
 ### Token Usage
 
 | Filter | Description |
 |--------|-------------|
-| [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. |
+| [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [filter_metadata](extensions.md#filter_metadata). |
