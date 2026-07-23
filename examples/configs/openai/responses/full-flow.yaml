@@ -66,11 +66,12 @@
 #      (already resolved by rehydrate). Passthrough when no
 #      ResponsesState exists.
 #
-#   12. The router sends valid Responses API create requests to the
-#      inference backend and routes /v1/prompts and /v1/embeddings
-#      (and subresources) to dedicated API services. The promoted
-#      mode remains available as headers/metadata for downstream
-#      filters; it does not change backend selection in this example.
+#   12. The router sends all valid Responses API create requests and
+#      GET /v1/responses WebSocket upgrades to the same inference
+#      backend, while /v1/prompts, /v1/embeddings, and
+#      /v1/vector_stores use dedicated services. The promoted mode
+#      remains available for HTTP create requests; WebSocket
+#      handshakes are format-only and have no mode.
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer
@@ -117,6 +118,42 @@
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"test","stream":true,"background":true}'
+#
+#   # Responses WebSocket (requires a WebSocket-capable backend)
+#   websocat -H="Authorization: Bearer $OPENAI_API_KEY" \
+#     ws://localhost:8080/v1/responses
+#
+# Listener and cluster transport timeouts are intentionally omitted.
+# Configured downstream read and upstream idle/read/write timeouts remain
+# active after a 101 upgrade and can terminate long-lived WebSockets.
+#
+# Direct OpenAI upstream variant:
+#   - Replace the local inference-backend endpoint with api.openai.com:443 and
+#     configure tls.sni: api.openai.com.
+#   - Add this headers filter after the router to replace the downstream Host:
+#
+#       - filter: headers
+#         request_set:
+#           - name: Host
+#             value: api.openai.com
+#
+#   - Either pass through the client's Authorization header or add this filter
+#     after the router to inject a server-owned credential:
+#
+#       - filter: credential_injection
+#         clusters:
+#           - name: inference-backend
+#             header: Authorization
+#             env_var: OPENAI_API_KEY
+#             header_prefix: "Bearer "
+#
+#   - Configure the inference cluster as:
+#
+#       - name: "inference-backend"
+#         endpoints:
+#           - "api.openai.com:443"
+#         tls:
+#           sni: api.openai.com
 #
 # Build:
 #   cargo build -p praxis-ai-proxy

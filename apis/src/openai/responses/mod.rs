@@ -9,7 +9,9 @@
 //! `/v1/responses/{id}/input_items`, `/v1/responses/{id}/cancel`,
 //! `/v1/responses/input_tokens`, `/v1/responses/compact`) are
 //! classified by method and path without inspecting the body.
-//! `POST /v1/responses` (create) is classified by body content.
+//! `POST /v1/responses` (create) is classified by body content. A
+//! `GET /v1/responses` `WebSocket` upgrade is classified from the method,
+//! path, and upgrade headers without inferring body-derived facts.
 //! Promotes classification facts to configurable headers, durable
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
@@ -64,7 +66,10 @@ use praxis_filter::{
 use tracing::{debug, trace};
 
 use self::config::{ResponsesFormatConfig, build_config};
-use crate::classifier::{AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path};
+use crate::classifier::{
+    AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path,
+    is_responses_websocket_handshake,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -92,6 +97,12 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 ///
 /// Classification formats: `openai_responses`, `openai_chat_completions`,
 /// `unknown_json`, `invalid_json`, `non_json`.
+///
+/// A `GET /v1/responses` request with valid HTTP `WebSocket` upgrade headers
+/// is classified as `openai_responses` without inspecting a body. This
+/// handshake classification promotes only the format: model, stream, store,
+/// and mode facts remain absent. An ordinary bodyless `GET /v1/responses`
+/// remains unclassified.
 ///
 /// Routing mode for Responses API: `stateful` when the request contains
 /// `previous_response_id`, non-empty `tools`, `store=true` (default when
@@ -174,28 +185,23 @@ impl HttpFilter for ResponsesFormatFilter {
             None => &[],
         };
 
-        let classified = if is_responses_path(&ctx.request.method, ctx.request.uri.path()) {
-            debug!(
-                method = %ctx.request.method,
-                path = ctx.request.uri.path(),
-                "classified request by method and path"
-            );
-            empty_result(AiRequestFormat::Responses)
-        } else {
-            classify_request_body(bytes)
-        };
+        let (classified, websocket_handshake) = classify_request(ctx, bytes);
 
         debug!(
             format = classified.format.as_str(),
             model = ?classified.model,
-            "classified request body"
+            "classified request"
         );
 
         if let Some(action) = handle_invalid_format(classified.format, &self.config) {
             return Ok(action);
         }
 
-        let mode = compute_mode(&classified);
+        let mode = if websocket_handshake {
+            None
+        } else {
+            compute_mode(&classified)
+        };
 
         write_metadata(ctx, &classified, mode);
         promote_headers(ctx, &classified, &self.config, mode);
@@ -208,6 +214,23 @@ impl HttpFilter for ResponsesFormatFilter {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Classify a request from a recognized path/handshake or its body.
+fn classify_request(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> (ClassifiedRequest, bool) {
+    let websocket_handshake =
+        is_responses_websocket_handshake(&ctx.request.method, ctx.request.uri.path(), &ctx.request.headers);
+    if websocket_handshake || is_responses_path(&ctx.request.method, ctx.request.uri.path()) {
+        debug!(
+            method = %ctx.request.method,
+            path = ctx.request.uri.path(),
+            websocket_handshake,
+            "classified request by method and path"
+        );
+        (empty_result(AiRequestFormat::Responses), websocket_handshake)
+    } else {
+        (classify_request_body(bytes), false)
+    }
+}
 
 /// Check whether the format requires rejection.
 fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig) -> Option<FilterAction> {
