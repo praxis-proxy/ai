@@ -2163,6 +2163,80 @@ mod tests {
     }
 
     #[test]
+    fn bounded_decoder_accepts_primitive_attribute_values() {
+        let decoded = decode(
+            br#"{"data":[{
+                "attributes":{"boolean":true,"negative":-1,"positive":1,"float":1.5,"string":"value"},
+                "content":[{"type":"text","text":"result"}],
+                "file_id":"file-a","filename":"a.txt","score":0.9
+            }]}"#,
+            10,
+        )
+        .expect("primitive attributes must decode");
+        let attributes = decoded
+            .first()
+            .and_then(|result| result.attributes.as_ref())
+            .expect("attributes must be retained");
+
+        assert_eq!(attributes.get("boolean"), Some(&json!(true)));
+        assert_eq!(attributes.get("negative"), Some(&json!(-1)));
+        assert_eq!(attributes.get("positive"), Some(&json!(1)));
+        assert_eq!(attributes.get("float"), Some(&json!(1.5)));
+        assert_eq!(attributes.get("string"), Some(&json!("value")));
+    }
+
+    #[test]
+    fn bounded_decoder_rejects_invalid_container_shapes() {
+        let cases: &[&[u8]] = &[
+            b"[]",
+            br#"{"data":{}}"#,
+            br#"{"data":[1]}"#,
+            br#"{"data":[{"content":1}]}"#,
+            br#"{"data":[{"content":[1]}]}"#,
+            br#"{"data":[{"content":[{"type":1,"text":"x"}]}]}"#,
+            br#"{"data":[{"attributes":[]}]}"#,
+            br#"{"search_query":"query","data":[]}"#,
+        ];
+
+        for body in cases {
+            assert!(decode(body, 10).is_err(), "invalid shape must be rejected");
+        }
+    }
+
+    #[test]
+    fn bounded_decoder_rejects_duplicate_and_bounded_fields() {
+        let cases: &[&[u8]] = &[
+            br#"{"data":[],"data":[]}"#,
+            br#"{"object":"wrong","data":[]}"#,
+            br#"{"data":[{"attributes":null,"attributes":null}]}"#,
+            br#"{"data":[{"content":[],"content":[]}]}"#,
+            br#"{"data":[{"unknown":null}]}"#,
+            br#"{"data":[{"file_id":"file-a","file_id":"file-b"}]}"#,
+        ];
+        for body in cases {
+            assert!(decode(body, 10).is_err(), "invalid field must be rejected");
+        }
+
+        let oversized_page = serde_json::to_vec(&json!({
+            "next_page":"x".repeat(super::MAX_NEXT_PAGE_BYTES + 1),
+            "data":[],
+        }))
+        .expect("test response must serialize");
+        assert!(decode(&oversized_page, 10).is_err());
+
+        let oversized_attribute_key = "x".repeat(super::MAX_ATTRIBUTE_KEY_CHARS + 1);
+        let oversized_attribute = serde_json::to_vec(&json!({
+            "data":[{
+                "attributes":{oversized_attribute_key:null},
+                "content":[{"type":"text","text":"x"}],
+                "file_id":"file-a","filename":"a.txt","score":0.9
+            }]
+        }))
+        .expect("test response must serialize");
+        assert!(decode(&oversized_attribute, 10).is_err());
+    }
+
+    #[test]
     fn bounded_decoder_uses_ogx_source_file_id_for_internal_documents() {
         let decoded = decode(
             br#"{"data":[
