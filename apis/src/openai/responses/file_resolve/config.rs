@@ -6,6 +6,7 @@
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
+use super::resolve_url::NormalizedOrigin;
 use crate::openai::api_client;
 
 /// Default HTTP timeout for Files API callout requests (30 000 ms).
@@ -30,6 +31,18 @@ pub(crate) enum OnMissing {
 
     /// Return an error response to the client.
     Reject,
+}
+
+/// Mode for handling `file_url` content parts.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileUrlMode {
+    /// Fetch the URL and inline content as `file_data` (data URI).
+    #[default]
+    Resolve,
+
+    /// Leave `file_url` unchanged for native-compatible backends.
+    Passthrough,
 }
 
 /// YAML configuration for the [`FileResolveFilter`].
@@ -82,6 +95,15 @@ pub(crate) struct FileResolveConfig {
     /// HTTP timeout in milliseconds for Files API callout requests.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+
+    /// Mode for `file_url` content parts in `input_file`.
+    #[serde(default)]
+    pub file_url: FileUrlMode,
+
+    /// Exact origins allowed to resolve to private addresses.
+    /// Cloud metadata, unspecified, and multicast remain blocked.
+    #[serde(default)]
+    pub allowed_file_url_origins: Vec<String>,
 }
 
 /// Default max body bytes.
@@ -117,6 +139,7 @@ pub(crate) fn validate_config(mut cfg: FileResolveConfig) -> Result<FileResolveC
     api_client::validate_forward_headers("openai_file_resolve", &mut cfg.forward_headers)?;
     validate_limits(&cfg)?;
     validate_pre_security_callout(&cfg)?;
+    validate_file_url_config(&cfg)?;
 
     Ok(cfg)
 }
@@ -173,6 +196,28 @@ fn validate_resolution_limits(cfg: &FileResolveConfig) -> Result<(), FilterError
             cfg.timeout_ms
         )
         .into());
+    }
+
+    Ok(())
+}
+
+/// Validate `file_url` mode and `allowed_file_url_origins`.
+fn validate_file_url_config(cfg: &FileResolveConfig) -> Result<(), FilterError> {
+    if cfg.file_url == FileUrlMode::Passthrough && !cfg.allowed_file_url_origins.is_empty() {
+        return Err(
+            "openai_file_resolve: 'allowed_file_url_origins' cannot be set when 'file_url' is 'passthrough'".into(),
+        );
+    }
+
+    let mut seen = Vec::new();
+    for raw in &cfg.allowed_file_url_origins {
+        let origin = NormalizedOrigin::parse(raw).map_err(|e| -> FilterError {
+            format!("openai_file_resolve: invalid 'allowed_file_url_origins' entry '{raw}': {e}").into()
+        })?;
+        if seen.contains(&origin) {
+            return Err(format!("openai_file_resolve: duplicate 'allowed_file_url_origins' entry '{raw}'").into());
+        }
+        seen.push(origin);
     }
 
     Ok(())
@@ -345,6 +390,8 @@ timeout_ms: 300001"#;
             max_file_references: DEFAULT_MAX_FILE_REFERENCES,
             on_missing: OnMissing::Continue,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            file_url: FileUrlMode::Resolve,
+            allowed_file_url_origins: Vec::new(),
         };
         assert!(validate_config(cfg).is_ok(), "valid config should pass validation");
     }
@@ -449,7 +496,7 @@ allow_private_files_api_url: true
 
     #[test]
     fn ssrf_allows_public_ipv4() {
-        let yaml = r#"files_api_url: "http://203.0.113.1:8321"
+        let yaml = r#"files_api_url: "http://8.8.8.8:8321"
 allow_pre_security_callout: true"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(validate_config(cfg).is_ok(), "public IPv4 should be allowed");
@@ -512,6 +559,100 @@ allow_private_files_api_url: true
         assert!(
             validate_config(cfg).is_err(),
             "fragments would hide appended Files API paths from the HTTP request"
+        );
+    }
+
+    #[test]
+    fn file_url_defaults_to_resolve() {
+        let cfg: FileResolveConfig = serde_yaml::from_str(MINIMAL_YAML).unwrap();
+        assert_eq!(cfg.file_url, FileUrlMode::Resolve, "file_url should default to resolve");
+    }
+
+    #[test]
+    fn file_url_passthrough_accepted() {
+        let yaml = r#"
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+file_url: passthrough
+"#;
+        let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
+        let validated = validate_config(cfg).unwrap();
+        assert_eq!(validated.file_url, FileUrlMode::Passthrough);
+    }
+
+    #[test]
+    fn allowed_origins_with_passthrough_rejected() {
+        let yaml = r#"
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+file_url: passthrough
+allowed_file_url_origins:
+  - "https://files.internal:8443"
+"#;
+        let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            validate_config(cfg).is_err(),
+            "allowed_file_url_origins should be rejected with passthrough mode"
+        );
+    }
+
+    #[test]
+    fn valid_allowed_origins_accepted() {
+        let yaml = r#"
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+file_url: resolve
+allowed_file_url_origins:
+  - "https://files.internal:8443"
+  - "http://10.0.0.1:9000"
+"#;
+        let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(validate_config(cfg).is_ok(), "valid origins should be accepted");
+    }
+
+    #[test]
+    fn duplicate_origins_rejected() {
+        let yaml = r#"
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+allowed_file_url_origins:
+  - "https://files.example.com"
+  - "https://files.example.com"
+"#;
+        let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(validate_config(cfg).is_err(), "duplicate origins should be rejected");
+    }
+
+    #[test]
+    fn origin_with_path_rejected() {
+        let yaml = r#"
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+allowed_file_url_origins:
+  - "https://files.example.com/api"
+"#;
+        let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(validate_config(cfg).is_err(), "origins with paths should be rejected");
+    }
+
+    #[test]
+    fn origin_cloud_metadata_rejected() {
+        let yaml = r#"
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+allowed_file_url_origins:
+  - "http://169.254.169.254"
+"#;
+        let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            validate_config(cfg).is_err(),
+            "cloud metadata origins should be rejected"
         );
     }
 }

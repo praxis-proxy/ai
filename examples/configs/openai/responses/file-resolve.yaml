@@ -1,13 +1,16 @@
 # Responses File Resolve
 #
-# Resolves `file_id` references in Responses API input by fetching
-# file metadata and content from a Files API, then inlining base64
-# content as `file_data` or `image_url` before forwarding.
+# Resolves `file_id` and `file_url` references in Responses API
+# input by fetching file metadata and content, then inlining
+# base64 content as `file_data` or `image_url` before forwarding.
 #
-# This pipeline uses `openai_responses_format` to classify the
-# request, then `openai_file_resolve` to resolve any
-# `input_file` or `input_image` content parts that reference
-# files by ID.
+# file_url: resolve (default)
+#   Fetches the URL and inlines content as a data URI in file_data.
+#   Use for backends that do not consume file_url directly.
+#
+# file_url: passthrough
+#   Leaves file_url unchanged. Use for native OpenAI-compatible
+#   backends that handle file_url natively.
 #
 # Use case: Codex or other Responses API clients send file
 # references (`file_id: "file-abc123"`) and the proxy
@@ -44,11 +47,11 @@ filter_chains:
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
         allow_private_files_api_url: true
-        # StreamBuffer body filters run before this listener's
-        # header-phase security filters. Enable only when an outer
-        # trust boundary has already authenticated and authorized
-        # requests reaching this listener.
         allow_pre_security_callout: true
+        # file_url: resolve is the default — fetches remote URLs
+        # and inlines content as data URIs. Set to 'passthrough'
+        # for native OpenAI-compatible backends.
+        file_url: resolve
         forward_headers:
           - authorization
           - x-tenant-id

@@ -3,7 +3,7 @@
 
 # `openai_file_resolve`
 
-Resolves `file_id` references in Responses API input by fetching content from a Files API via `ApiClient` and inlining the base64-encoded content in the provider-native field.
+Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field.
 
 ## Configuration Notes
 
@@ -23,6 +23,8 @@ This filter resolves references inside Responses requests; it does not proxy cli
 | `max_file_references` | integer | no | Maximum number of distinct content-part / `file_id` pairs to resolve in one request, including rehydrated history. |
 | `on_missing` | `continue` \| `reject` | no | Behavior when a referenced file cannot be fetched. |
 | `timeout_ms` | integer | no | HTTP timeout in milliseconds for Files API callout requests. |
+| `file_url` | `resolve` \| `passthrough` | no | Mode for `file_url` content parts in `input_file`. |
+| `allowed_file_url_origins` | string[] | no | Exact origins allowed to resolve to private addresses. Cloud metadata, unspecified, and multicast remain blocked. |
 
 ## Examples
 
@@ -49,4 +51,16 @@ on_missing: continue
 timeout_ms: 30000
 max_body_bytes: 67108864
 max_file_references: 32
+```
+
+### Example 3
+
+```yaml
+filter: openai_file_resolve
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+file_url: resolve
+allowed_file_url_origins:
+  - "https://files.internal:8443"
 ```

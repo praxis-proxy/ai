@@ -16,7 +16,7 @@ use praxis_test_utils::{
     start_capturing_backend, start_proxy,
 };
 
-use super::openai_file_resolve::start_files_api_stub;
+use super::openai_file_resolve::{start_file_url_stub, start_files_api_stub};
 
 fn text_file_data(text: &str) -> String {
     format!("data:text/plain;base64,{}", BASE64.encode(text.as_bytes()))
@@ -42,6 +42,28 @@ fn setup_proxy(files_api_port: u16, inference_port: u16, default_port: u16) -> p
             ("127.0.0.1:3002", default_port),
         ]),
     );
+    start_proxy(&config)
+}
+
+fn setup_proxy_with_file_url(
+    files_api_port: u16,
+    file_url_port: u16,
+    inference_port: u16,
+    default_port: u16,
+) -> praxis_test_utils::ProxyGuard {
+    let proxy_port = free_port();
+    let path = praxis_test_utils::example_config_path("openai/responses/doc-extract.yaml");
+    let yaml = std::fs::read_to_string(path).expect("doc-extract example should be readable");
+    let file_url_policy = format!(
+        "        file_url: resolve\n        allowed_file_url_origins:\n          - \"http://127.0.0.1:{file_url_port}\""
+    );
+    let yaml = yaml
+        .replace("127.0.0.1:8080", &format!("127.0.0.1:{proxy_port}"))
+        .replace("127.0.0.1:9999", &format!("127.0.0.1:{files_api_port}"))
+        .replace("127.0.0.1:3001", &format!("127.0.0.1:{inference_port}"))
+        .replace("127.0.0.1:3002", &format!("127.0.0.1:{default_port}"))
+        .replace("        file_url: passthrough", &file_url_policy);
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("patched doc-extract config should parse");
     start_proxy(&config)
 }
 
@@ -178,6 +200,56 @@ fn resolved_file_id_extracted_to_input_text() {
             }]
         }),
         "file_id should be resolved by file_resolve, then extracted to input_text by doc_extract"
+    );
+}
+
+#[test]
+fn resolved_file_url_extracted_to_input_text() {
+    let files_api_port = start_files_api_stub();
+    let file_url_port = start_file_url_stub();
+    let inference_guard = start_capturing_backend("{}");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy = setup_proxy_with_file_url(
+        files_api_port,
+        file_url_port,
+        inference_guard.port(),
+        default_guard.port(),
+    );
+
+    let body = serde_json::json!({
+        "model": "test",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": format!("http://127.0.0.1:{file_url_port}/document.txt")
+            }]
+        }]
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "file_url should resolve and extract before reaching the backend"
+    );
+    let captured: serde_json::Value =
+        serde_json::from_str(&inference_guard.body()).expect("captured body should be valid JSON");
+    assert_eq!(
+        captured,
+        serde_json::json!({
+            "model": "test",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "[Source: document.txt]\nHello, world!"
+                }]
+            }]
+        }),
+        "backend should receive input_text produced from fetched file_url content"
     );
 }
 

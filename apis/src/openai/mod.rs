@@ -18,6 +18,7 @@ pub(crate) mod sse;
     reason = "Responses translation helpers are wired into the HTTP filter in a later stack entry"
 )]
 pub(crate) mod translation;
+pub(crate) mod url_security;
 
 pub use conversations::OpenaiConversationsFilter;
 pub use responses::{

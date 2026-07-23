@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Resolves `file_id` references in `OpenAI` Responses API requests.
+//! Resolves `file_id` and `file_url` references in `OpenAI` Responses API requests.
 //!
 //! Walks `message` content arrays and `function_call_output` output
-//! arrays, finds content parts that reference files by ID, fetches
-//! file metadata and content from an external Files API
-//! via [`ApiClient`], and inlines the content: raw base64 in
-//! `file_data` for `input_file`, or a `data:` URL in `image_url`
-//! for `input_image`. Forwards configurable headers
-//! (`Authorization`, `X-Tenant-ID`) to the Files API for tenant
-//! isolation.
+//! arrays, finds content parts that reference files by ID or URL, fetches
+//! file metadata and content from an external Files API (e.g. OGX) or
+//! remote URL via [`ApiClient`], and inlines the content: raw base64
+//! in `file_data` for `input_file`, or a `data:` URL in `image_url` for
+//! `input_image`. Forwards configurable headers (`Authorization`,
+//! `X-Tenant-ID`) to the Files API for tenant isolation.
 //!
 //! Praxis runs `StreamBuffer` body hooks before header-phase request
 //! filters. Configuration therefore requires an explicit
@@ -24,9 +23,11 @@
 //! `state.messages`, and `state.persisted_messages` so that
 //! `responses_proxy` does not overwrite the rewritten body.
 //!
-//! Content parts with `file_data`, `file_url`, or `image_url`
-//! pass through unchanged. No content-part validation — the
-//! inference backend handles that.
+//! Content parts with `file_data` or `image_url` pass through unchanged.
+//! Content parts with `file_url` are resolved to `file_data` when
+//! `file_url: resolve` (default), or passed through when `file_url:
+//! passthrough`. No content-part validation — the inference backend
+//! handles that.
 //!
 //! This filter resolves the file transport reference but does not
 //! interpret document contents. The inference backend must already
@@ -45,6 +46,7 @@
 
 mod config;
 pub(crate) mod resolve;
+pub(crate) mod resolve_url;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -69,10 +71,11 @@ use praxis_filter::{
 use tracing::{debug, trace, warn};
 
 use self::{
-    config::{FileResolveConfig, OnMissing, validate_config},
+    config::{FileResolveConfig, FileUrlMode, OnMissing, validate_config},
     resolve::{
         FilesApiClient, FilesApiClientOptions, ResolutionBudget, ResolveError, resolve_input_with_budget, resolve_items,
     },
+    resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState};
 use crate::{
@@ -80,9 +83,10 @@ use crate::{
     openai::api_client::{ApiClient, ApiClientConfig},
 };
 
-/// Resolves `file_id` references in Responses API input by fetching
-/// content from a Files API via `ApiClient` and inlining the
-/// base64-encoded content in the provider-native field.
+/// Resolves `file_id` and `file_url` references in Responses API input
+/// by fetching content from a Files API or remote URL via
+/// `ApiClient` and inlining the base64-encoded content in the
+/// provider-native field.
 ///
 /// The inference backend must support the resulting inline content
 /// part. This filter does not extract documents into backend-specific
@@ -117,11 +121,25 @@ use crate::{
 /// max_body_bytes: 67108864
 /// max_file_references: 32
 /// ```
+///
+/// # File URL Resolution YAML
+///
+/// ```yaml
+/// filter: openai_file_resolve
+/// files_api_url: "http://ogx:8321"
+/// allow_private_files_api_url: true
+/// allow_pre_security_callout: true
+/// file_url: resolve
+/// allowed_file_url_origins:
+///   - "https://files.internal:8443"
+/// ```
 pub struct FileResolveFilter {
     /// Files API HTTP client backed by shared API callout.
     client: FilesApiClient,
     /// Parsed and validated configuration.
     config: FileResolveConfig,
+    /// URL resolver for `file_url` references.
+    url_resolver: Option<FileUrlResolver>,
 }
 
 impl FileResolveFilter {
@@ -131,6 +149,7 @@ impl FileResolveFilter {
     ///
     /// Returns [`FilterError`] if the YAML config is invalid or the
     /// callout client cannot be constructed.
+    #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
         let validated = validate_config(cfg)?;
@@ -157,9 +176,24 @@ impl FileResolveFilter {
             },
         );
 
+        let url_resolver = if validated.file_url == FileUrlMode::Resolve {
+            let origins = validated
+                .allowed_file_url_origins
+                .iter()
+                .map(|raw| NormalizedOrigin::parse(raw))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| -> FilterError { format!("openai_file_resolve: {e}").into() })?;
+            Some(FileUrlResolver {
+                allowed_private_origins: origins,
+            })
+        } else {
+            None
+        };
+
         Ok(Box::new(Self {
             client,
             config: validated,
+            url_resolver,
         }))
     }
 }
@@ -298,6 +332,7 @@ async fn resolve_current_input(
         &filter.client,
         filter.config.on_missing,
         &ctx.request.headers,
+        filter.url_resolver.as_ref(),
         budget,
     ))
     .await
@@ -317,6 +352,7 @@ async fn update_state(
                 body,
                 &filter.client,
                 filter.config.on_missing,
+                filter.url_resolver.as_ref(),
                 budget,
             ))
             .await
@@ -326,6 +362,7 @@ async fn update_state(
                 ctx,
                 &filter.client,
                 filter.config.on_missing,
+                filter.url_resolver.as_ref(),
                 budget,
             ))
             .await
@@ -360,11 +397,13 @@ fn rewrite_body(
 /// `messages` / `persisted_messages` with the resolved items.
 /// History messages prepended by rehydrate are also walked so
 /// that any `file_id` references in them are resolved.
+#[expect(clippy::too_many_arguments, reason = "threading resolver through state sync")]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: &serde_json::Value,
     client: &FilesApiClient,
     on_missing: OnMissing,
+    url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -382,6 +421,7 @@ async fn sync_state_with_budget(
         client,
         on_missing,
         request_headers: &ctx.request.headers,
+        url_resolver,
     };
 
     sync_message_history(&mut state.messages, input_len, Some(resolved_input), resolver, budget).await?;
@@ -404,15 +444,16 @@ async fn sync_state(
     on_missing: OnMissing,
 ) -> Result<(), ResolveError> {
     let mut budget = client.resolution_budget();
-    sync_state_with_budget(ctx, resolved_body, client, on_missing, &mut budget).await
+    sync_state_with_budget(ctx, resolved_body, client, on_missing, None, &mut budget).await
 }
 
-/// Resolve `file_id` references in rehydrated history when the
+/// Resolve file references in rehydrated history when the
 /// current input did not require a body rewrite.
 async fn resolve_state_history(
     ctx: &mut HttpFilterContext<'_>,
     client: &FilesApiClient,
     on_missing: OnMissing,
+    url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -424,6 +465,7 @@ async fn resolve_state_history(
         client,
         on_missing,
         request_headers: &ctx.request.headers,
+        url_resolver,
     };
 
     sync_message_history(&mut state.messages, input_len, None, resolver, budget).await?;
@@ -439,6 +481,8 @@ struct HistoryResolver<'a> {
     on_missing: OnMissing,
     /// Original request headers available for configured forwarding.
     request_headers: &'a http::HeaderMap,
+    /// URL resolver for `file_url` references.
+    url_resolver: Option<&'a FileUrlResolver>,
 }
 
 /// Resolve the persistence mirror with independent count and byte
@@ -484,7 +528,7 @@ fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved
     }
 }
 
-/// Resolve `file_id` references in history messages (the prefix
+/// Resolve file references in history messages (the prefix
 /// before the current input).
 async fn resolve_history(
     messages: &mut [serde_json::Value],
@@ -503,6 +547,7 @@ async fn resolve_history(
         resolver.client,
         resolver.on_missing,
         resolver.request_headers,
+        resolver.url_resolver,
         budget,
     )
     .await
@@ -515,7 +560,9 @@ fn resolve_error_response(err: &ResolveError) -> (u16, String) {
         ResolveError::CalloutFailed { file_id, detail } => callout_error_response(file_id, detail),
         ResolveError::InvalidFileId { file_id, detail } => invalid_id_error_response(file_id, detail),
         ResolveError::TooManyReferences { limit } => too_many_error_response(*limit),
-        ResolveError::TooLarge { file_id, limit } => too_large_error_response(file_id, *limit),
+        ResolveError::TooLarge { reference, limit } => too_large_error_response(reference, *limit),
+        ResolveError::FileUrlBlocked { label } => file_url_blocked_response(label),
+        ResolveError::FileUrlFailed { label, detail } => file_url_failed_response(label, detail),
     }
 }
 
@@ -541,12 +588,24 @@ fn too_many_error_response(limit: usize) -> (u16, String) {
 }
 
 /// Report an exceeded resolved-body size cap to the caller.
-fn too_large_error_response(file_id: &str, limit: usize) -> (u16, String) {
-    warn!(file_id, limit, "resolved file exceeds configured limit");
+fn too_large_error_response(reference: &str, limit: usize) -> (u16, String) {
+    warn!(reference, limit, "resolved file exceeds configured limit");
     (
         413,
-        format!("failed to resolve file '{file_id}': resolved content exceeds {limit} bytes"),
+        format!("failed to resolve file reference '{reference}': resolved content exceeds {limit} bytes"),
     )
+}
+
+/// Report a file URL blocked by SSRF policy to the caller.
+fn file_url_blocked_response(label: &str) -> (u16, String) {
+    warn!(url = %label, "file URL blocked by security policy");
+    (403, format!("file URL '{label}' blocked by security policy"))
+}
+
+/// Report a file URL fetch failure to the caller.
+fn file_url_failed_response(label: &str, detail: &str) -> (u16, String) {
+    warn!(url = %label, detail, "file URL fetch failed");
+    (502, format!("failed to fetch file URL '{label}': request failed"))
 }
 
 /// Build a rejection response from a resolution error.
