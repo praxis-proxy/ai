@@ -36,6 +36,19 @@ fn register_ai_filters(registry: &mut praxis_filter::FilterRegistry) {
     register_general_ai_filters(registry);
     register_anthropic_filters(registry);
     register_openai_filters(registry);
+    register_grid_filters(registry);
+}
+
+/// Register Grid gateway-to-gateway routing filters.
+///
+/// `grid_route` belongs in the AI proxy (not Praxis core) because it
+/// encodes AI/Grid-specific semantics: candidate freshness preference,
+/// local-site scoring, and MCP tool-call routing.
+fn register_grid_filters(registry: &mut praxis_filter::FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "grid_route" => praxis_ai_filters::GridRouteFilter::from_config
+    );
 }
 
 /// Register agentic protocol filters (A2A, MCP).
