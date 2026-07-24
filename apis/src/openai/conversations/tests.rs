@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use http::Method;
 use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter, parse_filter_config};
@@ -9,6 +11,7 @@ use serde_json::Value;
 use super::{
     config::{ConversationsConfig, revalidate_postgres_host, validate_config},
     filter::OpenaiConversationsFilter,
+    routes::{self, ConversationOperation, ConversationOperationSpec, operation_specs},
     validate::validate_metadata,
 };
 use crate::{
@@ -1825,6 +1828,24 @@ async fn create_items_non_array_items_returns_400() {
 }
 
 #[tokio::test]
+async fn create_items_null_items_returns_400() {
+    let filter = build_test_filter();
+    let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
+
+    let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(Bytes::from_static(br#"{"items":null}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for null items, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400, "null items should return 400");
+}
+
+#[tokio::test]
 async fn create_items_too_many_returns_400() {
     let filter = build_test_filter();
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
@@ -2377,6 +2398,23 @@ async fn create_conversation_with_non_array_items_returns_400() {
         panic!("expected Reject, got {action:?}");
     };
     assert_eq!(rejection.status, 400, "non-array items should return 400");
+}
+
+#[tokio::test]
+async fn create_conversation_with_null_items_returns_400() {
+    let filter = build_test_filter();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(Bytes::from_static(br#"{"items":null}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for null items, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400, "null items should return 400");
 }
 
 #[tokio::test]
@@ -3043,6 +3081,77 @@ async fn on_response_body_appends_completed_response() {
     assert_eq!(items.len(), 2, "append-back should persist both input and output items");
 }
 
+#[test]
+fn conformance_conversations_routes_match_runtime_registry() {
+    let spec = generated_openapi_spec();
+    assert_eq!(
+        generated_operation_keys(&spec),
+        route_operation_keys(),
+        "generated OpenAPI paths must exactly match Conversations operation_specs()"
+    );
+
+    for operation in operation_specs() {
+        let path = runtime_path(operation, Some("conv_sync"), Some("item_sync"));
+        let matched = routes::match_route(operation.method, &path)
+            .unwrap_or_else(|| panic!("runtime route table did not match {} {path}", operation.method));
+        assert_eq!(
+            matched.spec.operation, operation.operation,
+            "runtime route table matched the wrong operation for {} {path}",
+            operation.method,
+        );
+        assert_eq!(
+            OperationKey::new(matched.spec.method, matched.spec.spec_path),
+            OperationKey::new(operation.method, operation.spec_path),
+            "runtime route metadata drifted from operation_specs() for {} {path}",
+            operation.method,
+        );
+    }
+    println!("PRAXIS_CONFORMANCE_OK conversations route_dispatch");
+}
+
+#[tokio::test]
+async fn conformance_conversations_success_payloads_match_generated_response_schemas() {
+    let filter = build_test_filter();
+    let spec = generated_openapi_spec();
+    let schemas = generated_response_schemas(&spec);
+    let payloads = successful_conversation_payloads(filter.as_ref()).await;
+
+    let schema_operations: Vec<_> = schemas.keys().collect();
+    let payload_operations: Vec<_> = payloads.keys().collect();
+    assert_eq!(
+        payload_operations, schema_operations,
+        "runtime success fixtures should cover every generated Conversations response schema"
+    );
+
+    for (operation, schema) in schemas {
+        let payload = payloads
+            .get(&operation)
+            .unwrap_or_else(|| panic!("missing runtime success payload for {}", operation.label()));
+        assert_matches_schema(&spec, &format!("{} response", operation.label()), &schema, payload);
+    }
+    println!("PRAXIS_CONFORMANCE_OK conversations success_response_contract");
+}
+
+#[test]
+fn conformance_conversations_generated_schema_check_rejects_wrong_discriminator() {
+    let spec = generated_openapi_spec();
+    let schema = spec
+        .pointer("/components/schemas/ConversationResource")
+        .unwrap_or_else(|| panic!("generated OpenAPI missing ConversationResource"));
+    let invalid = serde_json::json!({
+        "id": "conv_invalid",
+        "object": "wrong",
+        "created_at": 1,
+        "metadata": {},
+    });
+
+    assert!(
+        !schema_matches_value(&spec, schema, &invalid),
+        "schema check must reject a response with the wrong object discriminator"
+    );
+    println!("PRAXIS_CONFORMANCE_OK conversations schema_check_sensitivity");
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -3074,6 +3183,412 @@ async fn create_test_conversation(filter: &dyn HttpFilter, metadata: Value) -> S
     };
     let resp = rejection_body(&rejection);
     resp["id"].as_str().unwrap().to_owned()
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OperationKey {
+    method: String,
+    path: String,
+}
+
+impl OperationKey {
+    fn new(method: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+        }
+    }
+
+    fn label(&self) -> String {
+        format!("{} {}", self.method, self.path)
+    }
+}
+
+async fn successful_conversation_payloads(filter: &dyn HttpFilter) -> BTreeMap<OperationKey, Value> {
+    let mut payloads = BTreeMap::new();
+    let create_spec = operation_spec(ConversationOperation::CreateConversation);
+
+    let create = successful_post_json(
+        filter,
+        &runtime_path(create_spec, None, None),
+        serde_json::json!({"metadata": {"project": "schema-test"}}),
+    )
+    .await;
+    let conv_id = create["id"].as_str().unwrap().to_owned();
+    insert_payload(&mut payloads, create_spec, create);
+
+    let get_spec = operation_spec(ConversationOperation::GetConversation);
+    let get = successful_request_json(filter, Method::GET, &runtime_path(get_spec, Some(&conv_id), None)).await;
+    insert_payload(&mut payloads, get_spec, get);
+
+    let update_spec = operation_spec(ConversationOperation::UpdateConversation);
+    let update = successful_post_json(
+        filter,
+        &runtime_path(update_spec, Some(&conv_id), None),
+        serde_json::json!({"metadata": {"project": "updated"}}),
+    )
+    .await;
+    insert_payload(&mut payloads, update_spec, update);
+
+    let create_items_spec = operation_spec(ConversationOperation::CreateConversationItems);
+    let create_items = successful_post_json(
+        filter,
+        &runtime_path(create_items_spec, Some(&conv_id), None),
+        serde_json::json!({
+            "items": [
+                {"id": "item_schema", "type": "message", "role": "user", "content": "hello"}
+            ]
+        }),
+    )
+    .await;
+    insert_payload(&mut payloads, create_items_spec, create_items);
+
+    let list_spec = operation_spec(ConversationOperation::ListConversationItems);
+    let list = successful_request_json(filter, Method::GET, &runtime_path(list_spec, Some(&conv_id), None)).await;
+    insert_payload(&mut payloads, list_spec, list);
+
+    let get_item_spec = operation_spec(ConversationOperation::GetConversationItem);
+    let item = successful_request_json(
+        filter,
+        Method::GET,
+        &runtime_path(get_item_spec, Some(&conv_id), Some("item_schema")),
+    )
+    .await;
+    insert_payload(&mut payloads, get_item_spec, item);
+
+    let delete_item_spec = operation_spec(ConversationOperation::DeleteConversationItem);
+    let delete_item = successful_request_json(
+        filter,
+        Method::DELETE,
+        &runtime_path(delete_item_spec, Some(&conv_id), Some("item_schema")),
+    )
+    .await;
+    insert_payload(&mut payloads, delete_item_spec, delete_item);
+
+    let delete_spec = operation_spec(ConversationOperation::DeleteConversation);
+    let delete =
+        successful_request_json(filter, Method::DELETE, &runtime_path(delete_spec, Some(&conv_id), None)).await;
+    insert_payload(&mut payloads, delete_spec, delete);
+
+    payloads
+}
+
+fn operation_spec(operation: ConversationOperation) -> &'static ConversationOperationSpec {
+    operation_specs()
+        .iter()
+        .find(|spec| spec.operation == operation)
+        .unwrap_or_else(|| panic!("missing operation spec for {operation:?}"))
+}
+
+fn runtime_path(spec: &ConversationOperationSpec, conversation_id: Option<&str>, item_id: Option<&str>) -> String {
+    spec.runtime_path
+        .replace("{conversation_id}", conversation_id.unwrap_or_default())
+        .replace("{item_id}", item_id.unwrap_or_default())
+}
+
+fn insert_payload(payloads: &mut BTreeMap<OperationKey, Value>, spec: &ConversationOperationSpec, payload: Value) {
+    let previous = payloads.insert(OperationKey::new(spec.method, spec.spec_path), payload);
+    assert!(
+        previous.is_none(),
+        "duplicate runtime success fixture for {} {}",
+        spec.method,
+        spec.spec_path
+    );
+}
+
+async fn successful_post_json(filter: &dyn HttpFilter, path: &str, body_json: Value) -> Value {
+    let req = make_request(Method::POST, path);
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 200);
+    rejection_body(&rejection)
+}
+
+async fn successful_request_json(filter: &dyn HttpFilter, method: Method, path: &str) -> Value {
+    let req = make_request(method, path);
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 200);
+    rejection_body(&rejection)
+}
+
+fn generated_openapi_spec() -> Value {
+    serde_json::from_str(&super::implementation_openapi_json().unwrap()).unwrap()
+}
+
+fn route_operation_keys() -> Vec<OperationKey> {
+    let mut keys = operation_specs()
+        .iter()
+        .map(|spec| OperationKey::new(spec.method, spec.spec_path))
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+fn generated_operation_keys(spec: &Value) -> Vec<OperationKey> {
+    let mut keys = Vec::new();
+    let paths = spec
+        .get("paths")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("generated OpenAPI spec missing paths object"));
+
+    for (path, path_item) in paths {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("generated path item {path} should be an object"));
+        for (method, _operation) in path_item {
+            if matches!(method.as_str(), "delete" | "get" | "post") {
+                keys.push(OperationKey::new(method.to_uppercase(), path));
+            }
+        }
+    }
+
+    keys.sort();
+    keys
+}
+
+fn generated_response_schemas(spec: &Value) -> BTreeMap<OperationKey, Value> {
+    let mut schemas = BTreeMap::new();
+    let paths = spec
+        .get("paths")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("generated OpenAPI spec missing paths object"));
+
+    for (path, path_item) in paths {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("generated path item {path} should be an object"));
+        for (method, operation) in path_item {
+            if !matches!(method.as_str(), "delete" | "get" | "post") {
+                continue;
+            }
+
+            let schema = operation
+                .pointer("/responses/200/content/application~1json/schema")
+                .unwrap_or_else(|| panic!("generated operation {method} {path} missing 200 JSON response schema"));
+            let previous = schemas.insert(OperationKey::new(method.to_uppercase(), path), schema.clone());
+            assert!(previous.is_none(), "duplicate generated operation {method} {path}");
+        }
+    }
+
+    let schema_operations = schemas.keys().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        schema_operations,
+        route_operation_keys(),
+        "generated OpenAPI operations should match Conversations operation_specs()"
+    );
+
+    schemas
+}
+
+fn assert_matches_schema(spec: &Value, path: &str, schema: &Value, value: &Value) {
+    assert!(
+        schema_matches_value(spec, schema, value),
+        "{path} does not match generated schema: {value}"
+    );
+    let schema = resolve_schema_ref(spec, schema);
+
+    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
+        assert!(
+            enum_values.contains(value),
+            "{path} should be one of {enum_values:?}, got {value}"
+        );
+    }
+
+    if let Some(schema_type) = schema.get("type").and_then(Value::as_str) {
+        assert_schema_type(path, schema_type, value);
+    } else if schema.get("properties").is_some() || schema.get("required").is_some() {
+        assert_schema_type(path, "object", value);
+    }
+
+    if let Some(items_schema) = schema.get("items") {
+        for (idx, item) in value
+            .as_array()
+            .unwrap_or_else(|| panic!("{path} should be an array"))
+            .iter()
+            .enumerate()
+        {
+            assert_matches_schema(spec, &format!("{path}[{idx}]"), items_schema, item);
+        }
+    }
+
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for required_name in required {
+            let required_name = required_name.as_str().unwrap();
+            assert!(
+                obj.contains_key(required_name),
+                "{path} missing required property {required_name}"
+            );
+        }
+    }
+
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (property_name, property_schema) in properties {
+            if let Some(property_value) = obj.get(property_name) {
+                assert_matches_schema(
+                    spec,
+                    &format!("{path}.{property_name}"),
+                    property_schema,
+                    property_value,
+                );
+            }
+        }
+    }
+
+    if let Some(additional_schema) = schema.get("additionalProperties").filter(|schema| schema.is_object()) {
+        let properties = schema.get("properties").and_then(Value::as_object);
+        for (property_name, property_value) in obj {
+            if properties.is_none_or(|properties| !properties.contains_key(property_name)) {
+                assert_matches_schema(
+                    spec,
+                    &format!("{path}.{property_name}"),
+                    additional_schema,
+                    property_value,
+                );
+            }
+        }
+    }
+}
+
+fn schema_matches_value(spec: &Value, schema: &Value, value: &Value) -> bool {
+    let schema = resolve_schema_ref(spec, schema);
+
+    if value.is_null() && schema.get("nullable").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array)
+        && variants
+            .iter()
+            .filter(|variant| schema_matches_value(spec, variant, value))
+            .count()
+            != 1
+    {
+        return false;
+    }
+    if let Some(variants) = schema.get("anyOf").and_then(Value::as_array)
+        && !variants
+            .iter()
+            .any(|variant| schema_matches_value(spec, variant, value))
+    {
+        return false;
+    }
+    if let Some(variants) = schema.get("allOf").and_then(Value::as_array)
+        && !variants
+            .iter()
+            .all(|variant| schema_matches_value(spec, variant, value))
+    {
+        return false;
+    }
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(value))
+    {
+        return false;
+    }
+    if let Some(schema_type) = schema.get("type") {
+        let matches_type = schema_type.as_str().map_or_else(
+            || {
+                schema_type.as_array().is_some_and(|types| {
+                    types
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|kind| value_has_type(value, kind))
+                })
+            },
+            |kind| value_has_type(value, kind),
+        );
+        if !matches_type {
+            return false;
+        }
+    }
+
+    if let Some(items_schema) = schema.get("items") {
+        let Some(items) = value.as_array() else {
+            return false;
+        };
+        if !items.iter().all(|item| schema_matches_value(spec, items_schema, item)) {
+            return false;
+        }
+    }
+
+    let Some(object) = value.as_object() else {
+        return schema.get("properties").is_none() && schema.get("required").is_none();
+    };
+    if schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|name| !object.contains_key(name))
+        })
+    {
+        return false;
+    }
+
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if let Some(properties) = properties
+        && properties.iter().any(|(name, property_schema)| {
+            object
+                .get(name)
+                .is_some_and(|property| !schema_matches_value(spec, property_schema, property))
+        })
+    {
+        return false;
+    }
+
+    match schema.get("additionalProperties") {
+        Some(Value::Bool(false)) => {
+            properties.is_none_or(|properties| object.keys().all(|name| properties.contains_key(name)))
+        },
+        Some(additional_schema @ Value::Object(_)) => object.iter().all(|(name, property)| {
+            properties.is_some_and(|properties| properties.contains_key(name))
+                || schema_matches_value(spec, additional_schema, property)
+        }),
+        _ => true,
+    }
+}
+
+fn resolve_schema_ref<'a>(spec: &'a Value, schema: &'a Value) -> &'a Value {
+    let Some(ref_path) = schema.get("$ref").and_then(Value::as_str) else {
+        return schema;
+    };
+    let pointer = ref_path.strip_prefix('#').unwrap_or(ref_path);
+    spec.pointer(pointer)
+        .unwrap_or_else(|| panic!("missing generated schema ref {ref_path}"))
+}
+
+fn assert_schema_type(path: &str, schema_type: &str, value: &Value) {
+    let matches = value_has_type(value, schema_type);
+    assert!(matches, "{path} should be {schema_type}, got {value}");
+}
+
+fn value_has_type(value: &Value, schema_type: &str) -> bool {
+    match schema_type {
+        "array" => value.is_array(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "null" => value.is_null(),
+        "number" => value.as_f64().is_some(),
+        "object" => value.is_object(),
+        "string" => value.is_string(),
+        _ => false,
+    }
 }
 
 #[tokio::test]

@@ -3,14 +3,25 @@
 
 //! Request handlers for the `/v1/conversations` endpoints.
 
-use std::{borrow::Cow, collections::HashSet};
+use std::{borrow::Cow, collections::HashSet, fmt, marker::PhantomData};
 
 use percent_encoding::percent_decode_str;
 use praxis_filter::{FilterAction, FilterError, HttpFilterContext, Rejection};
+use serde::{
+    Deserializer as _, Serialize,
+    de::{DeserializeOwned, MapAccess, Visitor, value::MapAccessDeserializer},
+};
 use serde_json::{Map, Value};
 use tracing::debug;
 
-use super::validate::validate_metadata;
+use super::{
+    contracts::{
+        ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
+        CreateConversationRequest, DeletedConversationResource, ItemOrder, MAX_ITEMS_PER_REQUEST, Metadata,
+        MetadataUpdate, UpdateConversationRequest,
+    },
+    validate::validate_metadata,
+};
 use crate::{
     openai::responses::{
         DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
@@ -18,16 +29,6 @@ use crate::{
     },
     store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
 };
-
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Maximum number of items accepted by a single create request.
-///
-/// This is not a cumulative per-conversation limit. The OpenAI contract does
-/// not define a total item-count or byte-size ceiling for a conversation.
-const MAX_ITEMS_PER_REQUEST: usize = 20;
 
 // -----------------------------------------------------------------------------
 // ItemListParams
@@ -41,8 +42,8 @@ struct ItemListParams {
     /// Maximum number of items to return.
     limit: u32,
 
-    /// Whether results should be oldest-first.
-    ascending: bool,
+    /// Result ordering.
+    order: ItemOrder,
 }
 
 impl Default for ItemListParams {
@@ -50,7 +51,7 @@ impl Default for ItemListParams {
         Self {
             after_item_id: None,
             limit: DEFAULT_PAGE_LIMIT,
-            ascending: false,
+            order: ItemOrder::default(),
         }
     }
 }
@@ -74,27 +75,27 @@ pub(super) async fn handle_create_conversation(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let input = match parse_json_object_body(body) {
+    let input: CreateConversationRequest = match parse_json_body(body) {
         Ok(v) => v,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let metadata = input.get("metadata").cloned().unwrap_or(Value::Null);
-    if let Err(msg) = validate_metadata(&metadata) {
-        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
-    }
-    let metadata = if metadata.is_null() {
-        Value::Object(Map::new())
-    } else {
-        metadata
+    let metadata = match input.metadata {
+        Some(metadata) => {
+            if let Err(msg) = validate_metadata(metadata.as_value()) {
+                return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+            }
+            metadata.into_value()
+        },
+        None => Value::Object(Map::new()),
     };
 
     let raw_id = ctx.id_generator.generate(ctx.time_source);
     let conversation_id = format!("conv_{raw_id}");
     let created_at = current_timestamp(ctx);
-    let item_values = match parse_items_field(input.get("items"), false) {
-        Ok(items) => items,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
-    };
+    if let Err(msg) = validate_item_count(input.items.len()) {
+        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+    }
+    let item_values = input.items.into_iter().map(ConversationItem::into_value);
     let item_records = match build_item_records(ctx, tenant_id, &conversation_id, created_at, 1, item_values) {
         Ok(records) => records,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
@@ -110,7 +111,7 @@ pub(super) async fn handle_create_conversation(
         conversation_id: conversation_id.clone(),
         tenant_id: tenant_id.to_owned(),
         created_at,
-        metadata: metadata.clone(),
+        metadata,
         messages,
     };
 
@@ -124,7 +125,7 @@ pub(super) async fn handle_create_conversation(
     }
     debug!(conversation_id, tenant_id, "conversation created");
 
-    let body = conversation_to_json(&record);
+    let body = conversation_response(record);
     Ok(FilterAction::Reject(json_response(200, &body)?))
 }
 
@@ -138,7 +139,7 @@ pub(super) async fn handle_get_conversation(
 
     match store.get_conversation(tenant_id, conversation_id).await {
         Ok(Some(record)) => {
-            let body = conversation_to_json(&record);
+            let body = conversation_response(record);
             Ok(FilterAction::Reject(json_response(200, &body)?))
         },
         Ok(None) => {
@@ -160,13 +161,12 @@ pub(super) async fn handle_update_conversation(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let input = match parse_json_object_body(body) {
+    let input: UpdateConversationRequest = match parse_json_body(body) {
         Ok(v) => v,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let metadata_update = input.get("metadata").cloned();
-    if let Some(metadata) = &metadata_update
-        && let Err(msg) = validate_metadata(metadata)
+    if let MetadataUpdate::Replace(metadata) = &input.metadata
+        && let Err(msg) = validate_metadata(metadata.as_value())
     {
         return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
@@ -182,22 +182,17 @@ pub(super) async fn handle_update_conversation(
         ))?));
     };
 
-    let metadata = metadata_update.map_or_else(
-        || existing.metadata.clone(),
-        |metadata| {
-            if metadata.is_null() {
-                Value::Object(Map::new())
-            } else {
-                metadata
-            }
-        },
-    );
+    let metadata = match input.metadata {
+        MetadataUpdate::Missing => existing.metadata,
+        MetadataUpdate::Clear => Value::Object(Map::new()),
+        MetadataUpdate::Replace(metadata) => metadata.into_value(),
+    };
 
     let record = ConversationRecord {
         conversation_id: conversation_id.to_owned(),
         tenant_id: tenant_id.to_owned(),
         created_at: existing.created_at,
-        metadata: metadata.clone(),
+        metadata,
         messages: existing.messages,
     };
 
@@ -206,7 +201,7 @@ pub(super) async fn handle_update_conversation(
     }
     debug!(conversation_id, tenant_id, "conversation updated");
 
-    let body = conversation_to_json(&record);
+    let body = conversation_response(record);
     Ok(FilterAction::Reject(json_response(200, &body)?))
 }
 
@@ -226,11 +221,7 @@ pub(super) async fn handle_delete_conversation(
     match store.delete_conversation(tenant_id, conversation_id).await {
         Ok(true) => {
             debug!(conversation_id, tenant_id, "conversation deleted");
-            let body = serde_json::json!({
-                "id": conversation_id,
-                "object": "conversation.deleted",
-                "deleted": true,
-            });
+            let body = DeletedConversationResource::deleted(conversation_id);
             Ok(FilterAction::Reject(json_response(200, &body)?))
         },
         Ok(false) => {
@@ -256,7 +247,7 @@ pub(super) async fn handle_create_items(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let input = match parse_json_object_body(body) {
+    let input: CreateConversationItemsRequest = match parse_json_body(body) {
         Ok(v) => v,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
@@ -271,10 +262,13 @@ pub(super) async fn handle_create_items(
         )?));
     };
 
-    let item_values = match parse_items_field(input.get("items"), true) {
-        Ok(items) => items,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+    let Some(items) = input.items else {
+        return Ok(FilterAction::Reject(invalid_input_response("'items' is required")?));
     };
+    if let Err(msg) = validate_item_count(items.len()) {
+        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+    }
+    let item_values = items.into_iter().map(ConversationItem::into_value);
     let start_position = match store.max_item_position(tenant_id, conversation_id).await {
         Ok(pos) => pos.saturating_add(1),
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
@@ -317,7 +311,7 @@ pub(super) async fn handle_create_items(
         "conversation items created"
     );
 
-    let body = conversation_items_to_json(&item_records, false);
+    let body = conversation_items_response(item_records, false);
     Ok(FilterAction::Reject(json_response(200, &body)?))
 }
 
@@ -348,7 +342,7 @@ pub(super) async fn handle_list_items(
             conversation_id,
             params.after_item_id.as_deref(),
             limit.saturating_add(1),
-            params.ascending,
+            params.order.is_ascending(),
         )
         .await
     {
@@ -359,7 +353,7 @@ pub(super) async fn handle_list_items(
     let has_more = rows.len() > take_limit;
     let data: Vec<_> = rows.into_iter().take(take_limit).collect();
 
-    let body = conversation_items_to_json(&data, has_more);
+    let body = conversation_items_response(data, has_more);
     Ok(FilterAction::Reject(json_response(200, &body)?))
 }
 
@@ -377,7 +371,10 @@ pub(super) async fn handle_get_item(
     };
     let item_id = item_id.as_ref();
     match store.get_conversation_item(tenant_id, conversation_id, item_id).await {
-        Ok(Some(record)) => Ok(FilterAction::Reject(json_response(200, &record.item_data)?)),
+        Ok(Some(record)) => {
+            let item = ConversationItem::from_value(record.item_data);
+            Ok(FilterAction::Reject(json_response(200, &item)?))
+        },
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation item not found");
             Ok(FilterAction::Reject(not_found_response(&item_not_found_message(
@@ -424,10 +421,10 @@ pub(super) async fn handle_delete_item(
             }
             debug!(conversation_id, item_id, tenant_id, "conversation item deleted");
             match store.get_conversation(tenant_id, conversation_id).await {
-                Ok(Some(record)) => Ok(FilterAction::Reject(json_response(
-                    200,
-                    &conversation_to_json(&record),
-                )?)),
+                Ok(Some(record)) => {
+                    let body = conversation_response(record);
+                    Ok(FilterAction::Reject(json_response(200, &body)?))
+                },
                 Ok(None) => Ok(FilterAction::Reject(not_found_response(
                     &conversation_not_found_message(conversation_id),
                 )?)),
@@ -448,35 +445,37 @@ pub(super) async fn handle_delete_item(
 // JSON Helpers
 // -----------------------------------------------------------------------------
 
-/// Parse request body as JSON.
-fn parse_json_body(body: &[u8]) -> Result<Value, String> {
-    serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))
+/// Parse a request body into its runtime contract.
+fn parse_json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let value = deserializer
+        .deserialize_map(JsonObjectVisitor(PhantomData))
+        .map_err(|e| format!("invalid JSON body: {e}"))?;
+    deserializer.end().map_err(|e| format!("invalid JSON body: {e}"))?;
+    Ok(value)
 }
 
-/// Parse request body as a JSON object.
-fn parse_json_object_body(body: &[u8]) -> Result<Map<String, Value>, String> {
-    match parse_json_body(body)? {
-        Value::Object(map) => Ok(map),
-        _ => Err("request body must be a JSON object".to_owned()),
+/// Deserialize a typed contract only from a top-level JSON object.
+struct JsonObjectVisitor<T>(PhantomData<T>);
+
+impl<'de, T: DeserializeOwned> Visitor<'de> for JsonObjectVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        T::deserialize(MapAccessDeserializer::new(map))
     }
 }
 
-/// Parse the optional or required `items` body field.
-fn parse_items_field(field: Option<&Value>, required: bool) -> Result<Vec<Value>, String> {
-    let Some(value) = field else {
-        return if required {
-            Err("'items' is required".to_owned())
-        } else {
-            Ok(Vec::new())
-        };
-    };
-    let Value::Array(items) = value else {
-        return Err("items must be a JSON array".to_owned());
-    };
-    if items.len() > MAX_ITEMS_PER_REQUEST {
+/// Validate the shared item-count bound after deserialization.
+fn validate_item_count(item_count: usize) -> Result<(), String> {
+    if item_count > MAX_ITEMS_PER_REQUEST {
         return Err(format!("items may contain at most {MAX_ITEMS_PER_REQUEST} entries"));
     }
-    Ok(items.clone())
+    Ok(())
 }
 
 /// Return the first duplicate item ID in a create request.
@@ -498,7 +497,7 @@ pub(super) fn build_item_records(
     conversation_id: &str,
     created_at: i64,
     start_position: i64,
-    items: Vec<Value>,
+    items: impl IntoIterator<Item = Value>,
 ) -> Result<Vec<ConversationItemRecord>, String> {
     items
         .into_iter()
@@ -593,29 +592,35 @@ fn decode_item_id_path_segment(item_id: &str) -> Result<Cow<'_, str>, String> {
         .map_err(|e| format!("item id path segment must be valid UTF-8: {e}"))
 }
 
-/// Convert a `ConversationRecord` to a JSON response object.
-fn conversation_to_json(record: &ConversationRecord) -> Value {
-    serde_json::json!({
-        "id": record.conversation_id,
-        "object": "conversation",
-        "created_at": record.created_at,
-        "metadata": record.metadata,
-    })
+/// Move a stored conversation into its public response contract.
+fn conversation_response(record: ConversationRecord) -> ConversationResource {
+    ConversationResource::new(
+        record.conversation_id,
+        record.created_at,
+        Metadata::from_value(record.metadata),
+    )
 }
 
-/// Convert item records to an `OpenAI` list response object.
-fn conversation_items_to_json(records: &[ConversationItemRecord], has_more: bool) -> Value {
-    let first_id = records.first().map_or("", |record| record.item_id.as_str());
-    let last_id = records.last().map_or("", |record| record.item_id.as_str());
-    let data: Vec<Value> = records.iter().map(|record| record.item_data.clone()).collect();
+/// Move item records into an `OpenAI` list response without copying item JSON.
+fn conversation_items_response(records: Vec<ConversationItemRecord>, has_more: bool) -> ConversationItemList {
+    let record_count = records.len();
+    let mut first_id = String::new();
+    let mut last_id = String::new();
+    let mut data = Vec::with_capacity(record_count);
 
-    serde_json::json!({
-        "object": "list",
-        "data": data,
-        "has_more": has_more,
-        "first_id": first_id,
-        "last_id": last_id,
-    })
+    for (index, record) in records.into_iter().enumerate() {
+        if record_count == 1 {
+            first_id.clone_from(&record.item_id);
+            last_id = record.item_id;
+        } else if index == 0 {
+            first_id = record.item_id;
+        } else if index + 1 == record_count {
+            last_id = record.item_id;
+        }
+        data.push(ConversationItem::from_value(record.item_data));
+    }
+
+    ConversationItemList::new(data, has_more, first_id, last_id)
 }
 
 /// Parse cursor-based pagination parameters from a query string.
@@ -639,8 +644,8 @@ fn parse_item_list_params(query: Option<&str>) -> ItemListParams {
                 }
             },
             "order" => match value {
-                "asc" => params.ascending = true,
-                "desc" => params.ascending = false,
+                "asc" => params.order = ItemOrder::Asc,
+                "desc" => params.order = ItemOrder::Desc,
                 _ => {},
             },
             _ => {},
@@ -661,7 +666,7 @@ pub(super) fn current_timestamp(ctx: &HttpFilterContext<'_>) -> i64 {
 }
 
 /// Build a JSON response with the given status code.
-fn json_response(status: u16, body: &Value) -> Result<Rejection, FilterError> {
+fn json_response<T: Serialize + ?Sized>(status: u16, body: &T) -> Result<Rejection, FilterError> {
     let bytes = serde_json::to_vec(body)
         .map_err(|e| FilterError::from(format!("openai_conversations: serialize failed: {e}")))?;
     Ok(Rejection::status(status)
@@ -836,7 +841,10 @@ mod tests {
     #[test]
     fn parse_params_unknown_order_stays_default() {
         let params = parse_item_list_params(Some("order=random"));
-        assert!(!params.ascending, "unknown order should keep default descending");
+        assert!(
+            !params.order.is_ascending(),
+            "unknown order should keep default descending"
+        );
     }
 
     #[test]
@@ -931,7 +939,7 @@ mod tests {
     fn parse_params_none_query_returns_defaults() {
         let params = parse_item_list_params(None);
         assert_eq!(params.limit, DEFAULT_PAGE_LIMIT);
-        assert!(!params.ascending);
+        assert!(!params.order.is_ascending());
         assert!(params.after_item_id.is_none());
     }
 
@@ -945,13 +953,13 @@ mod tests {
     #[test]
     fn parse_params_asc_order() {
         let params = parse_item_list_params(Some("order=asc"));
-        assert!(params.ascending, "order=asc should set ascending");
+        assert!(params.order.is_ascending(), "order=asc should set ascending");
     }
 
     #[test]
     fn parse_params_desc_order() {
         let params = parse_item_list_params(Some("order=desc"));
-        assert!(!params.ascending, "order=desc should set descending");
+        assert!(!params.order.is_ascending(), "order=desc should set descending");
     }
 
     #[test]

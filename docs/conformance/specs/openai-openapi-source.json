@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/openai/openai-openapi",
+  "revision": "db3e53198a66732cfe161339ea63bf36fc0137ad",
+  "path": "openapi.yaml",
+  "source_sha256": "0bf136e5f8e135a04f4b4bda93c13e75d83e98954da48ccb1e3b4b080b47b068"
+}

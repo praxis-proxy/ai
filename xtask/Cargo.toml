@@ -19,10 +19,14 @@ nix = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 praxis-ai = { path = "../server", package = "praxis-ai-proxy" }
+praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 praxis-test-utils = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "net", "io-util"] }
 tracing = { workspace = true }

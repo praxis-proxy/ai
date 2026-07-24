@@ -22,6 +22,7 @@ use tracing::{debug, trace, warn};
 use super::{
     config::{ConversationsConfig, StorageBackend, revalidate_postgres_host, validate_config},
     handlers,
+    routes::{self, ConversationOperation, MatchedConversationRoute},
 };
 use crate::{
     openai::responses::{DEFAULT_TENANT_ID, TENANT_METADATA_KEY, state::ResponsesState},
@@ -69,19 +70,6 @@ struct ConversationRequestState {
 struct ConversationResponseState {
     /// Whether response body buffering is armed for append-back.
     armed: bool,
-}
-
-/// Matched POST route variants handled locally.
-#[derive(Clone, Copy)]
-enum PostRoute<'a> {
-    /// `POST /v1/conversations`.
-    CreateConversation,
-
-    /// `POST /v1/conversations/{id}`.
-    UpdateConversation(&'a str),
-
-    /// `POST /v1/conversations/{id}/items`.
-    CreateItems(&'a str),
 }
 
 impl OpenaiConversationsFilter {
@@ -246,13 +234,28 @@ impl OpenaiConversationsFilter {
     async fn handle_post_route(
         ctx: &HttpFilterContext<'_>,
         store: &dyn ConversationItemStore,
-        route: PostRoute<'_>,
+        route: &MatchedConversationRoute<'_>,
         body: &[u8],
     ) -> Result<FilterAction, FilterError> {
-        match route {
-            PostRoute::CreateConversation => handlers::handle_create_conversation(ctx, store, body).await,
-            PostRoute::UpdateConversation(id) => handlers::handle_update_conversation(ctx, store, id, body).await,
-            PostRoute::CreateItems(id) => handlers::handle_create_items(ctx, store, id, body).await,
+        match route.spec.operation {
+            ConversationOperation::CreateConversation => handlers::handle_create_conversation(ctx, store, body).await,
+            ConversationOperation::UpdateConversation => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched update route missing id"))?;
+                handlers::handle_update_conversation(ctx, store, id, body).await
+            },
+            ConversationOperation::CreateConversationItems => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched item create route missing id"))?;
+                handlers::handle_create_items(ctx, store, id, body).await
+            },
+            ConversationOperation::GetConversation
+            | ConversationOperation::DeleteConversation
+            | ConversationOperation::ListConversationItems
+            | ConversationOperation::GetConversationItem
+            | ConversationOperation::DeleteConversationItem => Ok(FilterAction::Continue),
         }
     }
 
@@ -311,41 +314,60 @@ impl HttpFilter for OpenaiConversationsFilter {
         true
     }
 
-    #[expect(
-        clippy::large_stack_frames,
-        clippy::too_many_lines,
-        reason = "dispatcher with one arm per endpoint"
-    )]
+    #[expect(clippy::too_many_lines, reason = "dispatcher with one arm per endpoint")]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let path = ctx.request.uri.path();
-        let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
-        let segments: Vec<&str> = path.split('/').collect();
+        let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
+            if should_append_back(ctx) {
+                drop(self.get_or_init_store().await);
+            }
+            return Ok(FilterAction::Continue);
+        };
 
-        match (ctx.request.method.as_str(), segments.as_slice()) {
-            ("GET", ["", "v1", "conversations", id]) if !id.is_empty() => {
+        match route.spec.operation {
+            ConversationOperation::GetConversation => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get route missing id"))?;
                 let store = self.require_store().await?;
                 handlers::handle_get_conversation(ctx, store.as_ref(), id).await
             },
-            ("GET", ["", "v1", "conversations", id, "items"]) if !id.is_empty() => {
+            ConversationOperation::ListConversationItems => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched list route missing id"))?;
                 let store = self.require_store().await?;
                 handlers::handle_list_items(ctx, store.as_ref(), id).await
             },
-            ("GET", ["", "v1", "conversations", id, "items", item_id]) if !id.is_empty() && !item_id.is_empty() => {
+            ConversationOperation::GetConversationItem => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing id"))?;
+                let item_id = route
+                    .item_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing item id"))?;
                 let store = self.require_store().await?;
                 handlers::handle_get_item(ctx, store.as_ref(), id, item_id).await
             },
-            ("DELETE", ["", "v1", "conversations", id]) if !id.is_empty() => {
+            ConversationOperation::DeleteConversation => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete route missing id"))?;
                 let store = self.require_store().await?;
                 handlers::handle_delete_conversation(ctx, store.as_ref(), id).await
             },
-            ("DELETE", ["", "v1", "conversations", id, "items", item_id]) if !id.is_empty() && !item_id.is_empty() => {
+            ConversationOperation::DeleteConversationItem => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete item route missing id"))?;
+                let item_id = route.item_id().ok_or_else(|| {
+                    FilterError::from("openai_conversations: matched delete item route missing item id")
+                })?;
                 let store = self.require_store().await?;
                 handlers::handle_delete_item(ctx, store.as_ref(), id, item_id).await
             },
-            ("POST", _) => {
-                let Some(route) = post_route(segments.as_slice()) else {
-                    return Ok(FilterAction::Continue);
-                };
+            ConversationOperation::CreateConversation
+            | ConversationOperation::UpdateConversation
+            | ConversationOperation::CreateConversationItems => {
                 ctx.set_request_body_mode(BodyMode::StreamBuffer {
                     max_bytes: Some(MAX_JSON_BODY_BYTES),
                 });
@@ -356,13 +378,7 @@ impl HttpFilter for OpenaiConversationsFilter {
                 let Some(store) = self.get_or_init_store().await else {
                     return Ok(FilterAction::Reject(reject_store_unavailable()));
                 };
-                Box::pin(Self::handle_post_route(ctx, store.as_ref(), route, &body)).await
-            },
-            _ => {
-                if should_append_back(ctx) {
-                    drop(self.get_or_init_store().await);
-                }
-                Ok(FilterAction::Continue)
+                Box::pin(Self::handle_post_route(ctx, store.as_ref(), &route, &body)).await
             },
         }
     }
@@ -377,16 +393,15 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let path = ctx.request.uri.path();
-        let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
-        let segments: Vec<&str> = path.split('/').collect();
-
         let empty: &[u8] = &[];
         let bytes = body.as_ref().map_or(empty, |b| b.as_ref());
 
-        let Some(route) = post_route(segments.as_slice()) else {
+        let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
             return Ok(FilterAction::Continue);
         };
+        if !route.spec.has_request_body() {
+            return Ok(FilterAction::Continue);
+        }
 
         if !Self::request_filters_ran(ctx) {
             return Ok(Self::defer_body_until_request_filters(ctx, body.as_ref()));
@@ -395,7 +410,7 @@ impl HttpFilter for OpenaiConversationsFilter {
         let Some(store) = self.get_or_init_store().await else {
             return Ok(FilterAction::Reject(reject_store_unavailable()));
         };
-        Box::pin(Self::handle_post_route(ctx, store.as_ref(), route, bytes)).await
+        Box::pin(Self::handle_post_route(ctx, store.as_ref(), &route, bytes)).await
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -609,16 +624,6 @@ fn reject_store_unavailable() -> Rejection {
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
 
-/// Parse a normalized path into a locally handled POST route.
-fn post_route<'a>(segments: &'a [&'a str]) -> Option<PostRoute<'a>> {
-    match segments {
-        ["", "v1", "conversations"] => Some(PostRoute::CreateConversation),
-        ["", "v1", "conversations", id] if !id.is_empty() => Some(PostRoute::UpdateConversation(id)),
-        ["", "v1", "conversations", id, "items"] if !id.is_empty() => Some(PostRoute::CreateItems(id)),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
@@ -643,44 +648,5 @@ mod tests {
             .find(|(k, _)| k == "content-type")
             .map(|(_, v)| v.as_str());
         assert_eq!(ct, Some("application/json"), "should set application/json content-type");
-    }
-
-    #[test]
-    fn post_route_create_conversation() {
-        let segments = ["", "v1", "conversations"];
-        assert!(matches!(post_route(&segments), Some(PostRoute::CreateConversation)));
-    }
-
-    #[test]
-    fn post_route_update_conversation() {
-        let segments = ["", "v1", "conversations", "conv_123"];
-        assert!(matches!(
-            post_route(&segments),
-            Some(PostRoute::UpdateConversation("conv_123"))
-        ));
-    }
-
-    #[test]
-    fn post_route_create_items() {
-        let segments = ["", "v1", "conversations", "conv_123", "items"];
-        assert!(matches!(
-            post_route(&segments),
-            Some(PostRoute::CreateItems("conv_123"))
-        ));
-    }
-
-    #[test]
-    fn post_route_unmatched_returns_none() {
-        let segments = ["", "v1", "models"];
-        assert!(post_route(&segments).is_none());
-    }
-
-    #[test]
-    fn post_route_empty_id_returns_none() {
-        let segments = ["", "v1", "conversations", ""];
-        assert!(
-            post_route(&segments).is_none(),
-            "empty conversation ID should not match"
-        );
     }
 }
