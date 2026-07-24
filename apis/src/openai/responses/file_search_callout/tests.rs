@@ -36,15 +36,12 @@ fn minimal_config_uses_safe_defaults() {
         "#,
     )
     .unwrap();
-    let config = build_config(raw).unwrap();
+    let config = build_config(&raw).unwrap();
 
     assert_eq!(config.api_client.api_base_url(), "https://8.8.8.8/ogx");
     assert!(config.authorization.is_none());
     assert_eq!(config.max_response_bytes, 10_485_760);
     assert_eq!(config.max_total_response_bytes, 67_108_864);
-    assert_eq!(config.search_template, "{query}");
-    assert!(config.annotation_template.ends_with('\n'));
-    assert!(config.context_template.contains("{results}"));
     assert_eq!(config.failure_mode, FailureMode::Closed);
 }
 
@@ -53,6 +50,9 @@ fn config_rejects_unknown_and_removed_circuit_breaker_fields() {
     for yaml in [
         "vector_store_url: https://8.8.8.8\nunknown: true\n",
         "vector_store_url: https://8.8.8.8\ncircuit_breaker: {}\n",
+        "vector_store_url: https://8.8.8.8\nsearch_template: '{query}'\n",
+        "vector_store_url: https://8.8.8.8\nannotation_template: '{content}'\n",
+        "vector_store_url: https://8.8.8.8\ncontext_template: '{results}'\n",
     ] {
         assert!(
             serde_yaml::from_str::<FileSearchFilterConfig>(yaml).is_err(),
@@ -164,7 +164,7 @@ fn config_keeps_api_keys_out_of_debug_output() {
     assert!(raw_debug.contains("[REDACTED]"));
     assert!(!raw_debug.contains("do-not-log-this-key"));
 
-    let validated = build_config(raw).unwrap();
+    let validated = build_config(&raw).unwrap();
     let authorization = validated.authorization.unwrap();
     assert!(authorization.is_sensitive());
     let header_debug = format!("{authorization:?}");
@@ -172,14 +172,12 @@ fn config_keeps_api_keys_out_of_debug_output() {
 }
 
 #[test]
-fn config_validates_timeouts_budgets_and_context_placeholder() {
+fn config_validates_timeouts_and_budgets() {
     for yaml in [
         "vector_store_url: https://8.8.8.8\ntimeout_ms: 0\n",
         "vector_store_url: https://8.8.8.8\nmax_response_bytes: 0\n",
         "vector_store_url: https://8.8.8.8\nmax_total_response_bytes: 0\n",
         "vector_store_url: https://8.8.8.8\nmax_response_bytes: 100\nmax_total_response_bytes: 99\n",
-        "vector_store_url: https://8.8.8.8\ncontext_template: no-results-placeholder\n",
-        "vector_store_url: https://8.8.8.8\ncontext_template: '{results} and {results}'\n",
     ] {
         assert!(parse_config(yaml).is_err(), "invalid bound must fail: {yaml}");
     }
@@ -518,10 +516,7 @@ async fn first_pass_streaming_declaration_is_not_rejected() {
 #[tokio::test]
 async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     let server = MockServer::json(200, &one_result("file-a", "report.pdf", 0.95, "Revenue grew."));
-    let filter = make_filter(
-        server.port,
-        "annotation_template: '[{index}] {filename} <|{file_id}|> {content} '\ncontext_template: 'BEGIN {query} ({num_chunks}) {results}END'\n",
-    );
+    let filter = make_filter(server.port, "");
     let output = vec![
         json!({"type":"reasoning","id":"rs-1","summary":[]}),
         json!({"type":"file_search_call","id":"fs-1","status":"searching","queries":["revenue"]}),
@@ -559,9 +554,9 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
         .find(|item| item["type"] == "function_call_output")
         .and_then(|item| item["output"].as_str())
         .unwrap();
-    assert!(model_output.starts_with("BEGIN revenue (1)"));
+    assert!(model_output.starts_with("file_search found 1 chunks for \"revenue\":"));
     assert!(model_output.contains("<|file-a|>"));
-    assert!(model_output.ends_with("END"));
+    assert!(model_output.ends_with("Revenue grew.\n"));
     let message_len = state.messages.len();
 
     assert!(matches!(
@@ -636,7 +631,9 @@ async fn mixed_valid_and_empty_calls_are_both_terminalized() {
 
 #[tokio::test]
 async fn model_context_budget_is_shared_across_calls() {
-    let chunks: Vec<Value> = (0..128).map(|_| json!({"type":"text","text":"a"})).collect();
+    let chunks: Vec<Value> = (0..128)
+        .map(|_| json!({"type":"text","text":"a".repeat(12_000)}))
+        .collect();
     let server = MockServer::json(
         200,
         &json!({
@@ -649,11 +646,7 @@ async fn model_context_budget_is_shared_across_calls() {
             }]
         }),
     );
-    let annotation_template = format!("{}{{content}}", "x".repeat(12_000));
-    let filter = make_filter(
-        server.port,
-        &format!("annotation_template: '{annotation_template}'\ncontext_template: '{{results}}'\n"),
-    );
+    let filter = make_filter(server.port, "");
     let state = state_with(
         &["vs-a"],
         vec![
@@ -831,9 +824,9 @@ async fn no_store_ids_terminalizes_calls_and_replays_siblings() {
 }
 
 #[tokio::test]
-async fn zero_match_search_completes_with_an_empty_function_output() {
+async fn zero_match_search_completes_with_bounded_context() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "context_template: '{results}'\n");
+    let filter = make_filter(server.port, "");
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
 
     assert!(matches!(
@@ -848,7 +841,7 @@ async fn zero_match_search_completes_with_an_empty_function_output() {
         .iter()
         .find(|item| item["type"] == "function_call_output")
         .and_then(|item| item["output"].as_str());
-    assert_eq!(output, Some(""));
+    assert_eq!(output, Some("file_search found 0 chunks for \"query\":\n"));
 }
 
 #[tokio::test]
@@ -881,10 +874,7 @@ async fn query_cap_marks_the_call_incomplete() {
 #[tokio::test]
 async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_ogx() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(
-        server.port,
-        "search_template: 'prefix: {query}'\nauth_type: bearer\napi_key: secret\n",
-    );
+    let filter = make_filter(server.port, "auth_type: bearer\napi_key: secret\n");
     let mut state = state_with(
         &["vs_../../etc/passwd"],
         vec![json!({"type":"file_search_call","id":"fs-1","status":"searching","queries":["raw"]})],
@@ -912,7 +902,7 @@ async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_ogx() {
     );
     assert!(requests[0].contains("authorization: Bearer secret"));
     let body = request_json(&requests[0]);
-    assert_eq!(body["query"], "prefix: raw");
+    assert_eq!(body["query"], "raw");
     assert_eq!(body["rewrite_query"], false);
     assert_eq!(body["max_num_results"], 7);
     assert_eq!(body["filters"]["value"], "infra");
@@ -1278,25 +1268,6 @@ async fn fail_open_isolates_a_malformed_pending_call() {
     assert_eq!(server.requests().len(), 1);
 }
 
-#[tokio::test]
-async fn rendered_query_expansion_is_bounded_before_allocation() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let template = format!("{}{{query}}", "prefix".repeat(2_000));
-    let filter = make_filter(
-        server.port,
-        &format!("on_error: ignore\nsearch_template: '{template}'\n"),
-    );
-    let mut state = one_pending_state(&["vs-a"]);
-    state.output_items_mut()[0]["queries"] = json!(["q".repeat(MAX_QUERY_BYTES - 8_000)]);
-    let mut ctx = make_context(Some(state));
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    assert!(server.requests().is_empty());
-}
-
 // -----------------------------------------------------------------------------
 // Test helpers
 // -----------------------------------------------------------------------------
@@ -1304,7 +1275,7 @@ async fn rendered_query_expansion_is_bounded_before_allocation() {
 fn parse_config(yaml: &str) -> Result<config::ValidatedConfig, FilterError> {
     let raw: FileSearchFilterConfig =
         serde_yaml::from_str(yaml).map_err(|error| -> FilterError { error.to_string().into() })?;
-    build_config(raw)
+    build_config(&raw)
 }
 
 fn make_filter(port: u16, extra: &str) -> Box<dyn HttpFilter> {
@@ -1316,20 +1287,17 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
         "vector_store_url: 'http://127.0.0.1:{port}/ogx'\nallow_private_url: true\nallow_insecure_auth_over_http: true\n{extra}"
     );
     let raw: FileSearchFilterConfig = serde_yaml::from_str(&yaml).unwrap();
-    let validated = build_config(raw).unwrap();
+    let validated = build_config(&raw).unwrap();
     let client = FileSearchClient::new(FileSearchClientConfig {
         api_client: validated.api_client,
         authorization: validated.authorization,
         failure_mode: validated.failure_mode,
         max_response_bytes: validated.max_response_bytes,
         max_total_response_bytes: validated.max_total_response_bytes,
-        search_template: validated.search_template,
         timeout: validated.timeout,
     });
     FileSearchCalloutFilter {
-        annotation_template: validated.annotation_template,
         client,
-        context_template: validated.context_template,
         failure_mode: validated.failure_mode,
     }
 }

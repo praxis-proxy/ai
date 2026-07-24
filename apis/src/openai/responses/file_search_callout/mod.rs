@@ -24,7 +24,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::{
-    citations::{FormatLimits, FormatTemplates, format_search_results},
+    citations::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
     client::{
         FileSearchClient, FileSearchClientConfig, MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES,
         SearchBatch, SearchFailure, SearchSpec, request_error,
@@ -58,16 +58,11 @@ const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 /// First-pass requests remain unchanged until core continuation support can
 /// re-enter the request phase with pending file-search calls. Re-entered
 /// streaming requests are rejected because citation markers require an
-/// incremental SSE transformer.
+/// incremental SSE transformer. Search queries are forwarded to OGX unchanged;
+/// continuation context and citation marker formatting are internal.
 pub struct FileSearchCalloutFilter {
-    /// Per-result formatting template.
-    annotation_template: String,
-
     /// Callout client for the vector store API.
     client: FileSearchClient,
-
-    /// Model-facing context template.
-    context_template: String,
 
     /// Whether a failed callout rejects or produces an incomplete result.
     failure_mode: FailureMode,
@@ -82,39 +77,27 @@ impl FileSearchCalloutFilter {
     /// construction fails.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_callout", config)?;
-        let validated = build_config(cfg)?;
+        let validated = build_config(&cfg)?;
         let client = FileSearchClient::new(FileSearchClientConfig {
             api_client: validated.api_client,
             authorization: validated.authorization,
             failure_mode: validated.failure_mode,
             max_response_bytes: validated.max_response_bytes,
             max_total_response_bytes: validated.max_total_response_bytes,
-            search_template: validated.search_template,
             timeout: validated.timeout,
         });
 
         Ok(Box::new(Self {
-            annotation_template: validated.annotation_template,
             client,
-            context_template: validated.context_template,
             failure_mode: validated.failure_mode,
         }))
     }
 
     /// Apply one completed search batch to request-scoped response state.
     #[expect(clippy::too_many_lines, reason = "sequential result formatting and state commit")]
-    fn apply_batch(
-        &self,
-        state: &mut ResponsesState,
-        plan: &SearchPlan,
-        batch: &SearchBatch,
-    ) -> Result<(), FilterAction> {
+    fn apply_batch(state: &mut ResponsesState, plan: &SearchPlan, batch: &SearchBatch) -> Result<(), FilterAction> {
         let failed_calls: HashSet<usize> = batch.failures.iter().map(|failure| failure.call_index).collect();
         let expose_results = state.include.iter().any(|value| value == "file_search_call.results");
-        let templates = FormatTemplates {
-            annotation: &self.annotation_template,
-            context: &self.context_template,
-        };
         let mut model_messages = Vec::with_capacity(plan.calls.len().saturating_mul(2));
         let mut remaining_model_bytes = MAX_TOTAL_MODEL_CONTEXT_BYTES;
         let response_identity_hash = state
@@ -144,7 +127,7 @@ impl FileSearchCalloutFilter {
                 output_index: call.output_index,
                 query: &query,
                 response_identity_hash,
-                templates: &templates,
+                templates: &MODEL_CONTEXT_TEMPLATES,
             }
             .format(results, expose_results);
             remaining_model_bytes = remaining_model_bytes.saturating_sub(serialized_bytes);
@@ -289,7 +272,7 @@ impl HttpFilter for FileSearchCalloutFilter {
             .extensions
             .get_mut::<ResponsesState>()
             .ok_or_else(|| -> FilterError { "openai_file_search_callout: ResponsesState disappeared".into() })?;
-        if let Err(rejection) = self.apply_batch(state, &plan, &batch) {
+        if let Err(rejection) = Self::apply_batch(state, &plan, &batch) {
             return Ok(rejection);
         }
 

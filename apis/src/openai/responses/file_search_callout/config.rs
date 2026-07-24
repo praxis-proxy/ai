@@ -13,18 +13,12 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::{citations::count_template_placeholders, client::MAX_CONCURRENT_SEARCHES};
+use super::client::MAX_CONCURRENT_SEARCHES;
 use crate::openai::api_client::{self, ApiClient, ApiClientConfig};
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Default per-result formatting template.
-const DEFAULT_ANNOTATION_TEMPLATE: &str = "[{index}] {filename} (score: {score}) cite as <|{file_id}|>\n{content}\n";
-
-/// Default model-facing search context template.
-const DEFAULT_CONTEXT_TEMPLATE: &str = "file_search found {num_chunks} chunks for \"{query}\":\n{results}";
 
 /// Default maximum response body size: 10 MiB.
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 10_485_760; // 10 MiB
@@ -35,14 +29,8 @@ const MAX_RESPONSE_BYTES: usize = MAX_JSON_BODY_BYTES;
 /// Maximum successful wire bytes retained across one execution: 64 MiB.
 const MAX_TOTAL_RESPONSE_BYTES: usize = MAX_JSON_BODY_BYTES;
 
-/// Maximum size of one formatting template: 16 `KiB`.
-const MAX_TEMPLATE_BYTES: usize = 16_384;
-
 /// Maximum callout timeout: 60 seconds.
 const MAX_TIMEOUT_MS: u64 = 60_000;
-
-/// Default query formatting template.
-const DEFAULT_SEARCH_TEMPLATE: &str = "{query}";
 
 /// Default callout timeout in milliseconds (5 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -79,10 +67,6 @@ pub(crate) struct FileSearchFilterConfig {
     #[serde(default)]
     pub allow_private_url: bool,
 
-    /// Per-result formatting template.
-    #[serde(default = "default_annotation_template")]
-    pub annotation_template: String,
-
     /// Optional Bearer credential (supports `${ENV_VAR}`).
     ///
     /// Wrapped in [`SecretString`] to prevent accidental logging.
@@ -96,10 +80,6 @@ pub(crate) struct FileSearchFilterConfig {
     #[serde(default)]
     pub auth_type: Option<AuthType>,
 
-    /// Model-facing search context template.
-    #[serde(default = "default_context_template")]
-    pub context_template: String,
-
     /// Maximum response body size in bytes per callout.
     pub max_response_bytes: Option<usize>,
 
@@ -111,10 +91,6 @@ pub(crate) struct FileSearchFilterConfig {
     /// Named `on_error` because `parse_filter_config` strips
     /// `failure_mode` as a pipeline-structural key.
     pub on_error: Option<OnErrorDef>,
-
-    /// Query formatting template.
-    #[serde(default = "default_search_template")]
-    pub search_template: String,
 
     /// Whole-call timeout in milliseconds.
     pub timeout_ms: Option<u64>,
@@ -145,17 +121,11 @@ impl OnErrorDef {
 
 /// Validated configuration.
 pub(crate) struct ValidatedConfig {
-    /// Per-result formatting template.
-    pub annotation_template: String,
-
     /// Prevalidated authorization header value.
     pub authorization: Option<HeaderValue>,
 
     /// Shared OpenAI-compatible API client.
     pub api_client: ApiClient,
-
-    /// Model-facing search context template.
-    pub context_template: String,
 
     /// Failure mode.
     pub failure_mode: FailureMode,
@@ -166,16 +136,13 @@ pub(crate) struct ValidatedConfig {
     /// Maximum cumulative successful response bytes.
     pub max_total_response_bytes: usize,
 
-    /// Query formatting template.
-    pub search_template: String,
-
     /// Whole-call timeout.
     pub timeout: Duration,
 }
 
 /// Build validated config from filter config.
 #[expect(clippy::too_many_lines, reason = "linear security and resource validation")]
-pub(crate) fn build_config(cfg: FileSearchFilterConfig) -> Result<ValidatedConfig, FilterError> {
+pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConfig, FilterError> {
     let vector_store_url = parse_vector_store_url(&cfg.vector_store_url, cfg.allow_private_url)?;
     let api_key = cfg
         .api_key
@@ -194,7 +161,6 @@ pub(crate) fn build_config(cfg: FileSearchFilterConfig) -> Result<ValidatedConfi
         response_limits(cfg.max_response_bytes, cfg.max_total_response_bytes)?;
     let timeout_ms = validated_timeout(cfg.timeout_ms)?;
 
-    validate_templates(&cfg.search_template, &cfg.annotation_template, &cfg.context_template)?;
     let api_client = build_api_client(
         &vector_store_url,
         authorization.is_some(),
@@ -204,14 +170,11 @@ pub(crate) fn build_config(cfg: FileSearchFilterConfig) -> Result<ValidatedConfi
     )?;
 
     Ok(ValidatedConfig {
-        annotation_template: cfg.annotation_template,
         api_client,
         authorization,
-        context_template: cfg.context_template,
         failure_mode,
         max_response_bytes,
         max_total_response_bytes,
-        search_template: cfg.search_template,
         timeout: Duration::from_millis(timeout_ms),
     })
 }
@@ -251,33 +214,6 @@ fn build_api_client(
     .map_err(|error| -> FilterError {
         format!("openai_file_search_callout: failed to create API client: {error}").into()
     })
-}
-
-/// Validate the required context insertion point.
-fn validate_context_template(template: &str) -> Result<(), FilterError> {
-    if count_template_placeholders(template, "results") != 1 {
-        return Err(
-            "openai_file_search_callout: context_template must contain exactly one {results} placeholder".into(),
-        );
-    }
-    Ok(())
-}
-
-/// Validate all configured formatting templates and their insertion points.
-fn validate_templates(search: &str, annotation: &str, context: &str) -> Result<(), FilterError> {
-    for (name, template) in [
-        ("search_template", search),
-        ("annotation_template", annotation),
-        ("context_template", context),
-    ] {
-        if template.len() > MAX_TEMPLATE_BYTES {
-            return Err(format!("openai_file_search_callout: {name} exceeds {MAX_TEMPLATE_BYTES} byte limit").into());
-        }
-    }
-    if count_template_placeholders(search, "query") != 1 {
-        return Err("openai_file_search_callout: search_template must contain exactly one {query} placeholder".into());
-    }
-    validate_context_template(context)
 }
 
 /// Resolve and validate the per-call and total response limits.
@@ -407,21 +343,6 @@ fn parse_vector_store_url(raw: &str, allow_private: bool) -> Result<Url, FilterE
     Ok(url)
 }
 
-/// Default per-result formatting template.
-fn default_annotation_template() -> String {
-    DEFAULT_ANNOTATION_TEMPLATE.to_owned()
-}
-
-/// Default model-facing search context template.
-fn default_context_template() -> String {
-    DEFAULT_CONTEXT_TEMPLATE.to_owned()
-}
-
-/// Default query formatting template.
-fn default_search_template() -> String {
-    DEFAULT_SEARCH_TEMPLATE.to_owned()
-}
-
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
@@ -447,28 +368,6 @@ mod tests {
         assert!(response_limits(Some(MAX_RESPONSE_BYTES.saturating_add(1)), None).is_err());
         assert!(response_limits(None, Some(MAX_TOTAL_RESPONSE_BYTES.saturating_add(1))).is_err());
         assert!(validated_timeout(Some(MAX_TIMEOUT_MS.saturating_add(1))).is_err());
-
-        let oversized = "x".repeat(MAX_TEMPLATE_BYTES.saturating_add(1));
-        assert!(validate_templates(&oversized, "{content}", "{results}").is_err());
-        assert!(validate_templates("{query}{query}", "{content}", "{results}").is_err());
-        assert!(validate_templates("{{query}}", "{content}", "{results}").is_err());
-        assert!(validate_templates("{query}", "{content}", "{results}").is_ok());
-    }
-
-    #[test]
-    fn context_template_requires_one_renderable_results_placeholder() {
-        assert!(
-            validate_context_template("{{results}}").is_err(),
-            "nested braces must not satisfy the results insertion point"
-        );
-        assert!(
-            validate_context_template("before {results} after").is_ok(),
-            "one exact parsed placeholder must be accepted"
-        );
-        assert!(
-            validate_context_template("{results} and {results}").is_err(),
-            "multiple parsed insertion points must be rejected"
-        );
     }
 
     #[test]

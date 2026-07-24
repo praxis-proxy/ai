@@ -1,8 +1,8 @@
 # File Search Callout Filter
 #
 # Demonstrates the `openai_file_search_callout` filter configuration.
-# The filter validates its URL, authentication, timeout, response-size,
-# and formatting settings at startup. Live vector-store searches
+# The filter validates its URL, authentication, timeout, and response-size
+# settings at startup. Live vector-store searches
 # require response-driven pipeline continuation so a completed inference
 # response can re-enter the request pipeline with `file_search_call` items.
 # Until that core capability is available, first-pass requests continue to
@@ -18,9 +18,6 @@
 #   max_response_bytes:       Maximum response bytes retained per callout
 #   max_total_response_bytes: Maximum successful bytes across one fan-out
 #   on_error:                 reject (fail closed) or ignore (fail open)
-#   search_template:          Formats each query before the OGX call
-#   annotation_template:      Formats each returned content chunk
-#   context_template:         Wraps all chunks; requires one {results}
 
 listeners:
   - name: ai-gateway
@@ -43,9 +40,6 @@ filter_chains:
         max_response_bytes: 10485760
         max_total_response_bytes: 67108864
         on_error: reject
-        search_template: "{query}"
-        annotation_template: "[{index}] {filename} cite as <|{file_id}|>\n{content}\n"
-        context_template: "file_search found {num_chunks} chunks for '{query}':\n{results}"
       - filter: openai_responses_proxy
         name: inference
       - filter: openai_stream_events

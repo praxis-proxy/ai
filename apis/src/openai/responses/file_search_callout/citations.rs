@@ -31,6 +31,12 @@ const MAX_FILENAME_BYTES: usize = 1_024;
 /// Maximum complete citation marker length, including delimiters.
 const MAX_CITATION_MARKER_BYTES: usize = MAX_FILE_ID_BYTES + "<||>".len();
 
+/// Fixed per-chunk format used by the private continuation bridge.
+const ANNOTATION_TEMPLATE: &str = "[{index}] {filename} (score: {score}) cite as <|{file_id}|>\n{content}\n";
+
+/// Fixed wrapper used by the private continuation bridge.
+const CONTEXT_TEMPLATE: &str = "file_search found {num_chunks} chunks for \"{query}\":\n{results}";
+
 /// A bounded citation rewrite could not be completed.
 #[derive(Debug)]
 pub(crate) struct CitationRewriteError {
@@ -110,6 +116,12 @@ pub(super) struct FormatTemplates<'a> {
     /// Template wrapped around all rendered chunks.
     pub context: &'a str,
 }
+
+/// Internal continuation format; this is not part of the filter's YAML API.
+pub(super) const MODEL_CONTEXT_TEMPLATES: FormatTemplates<'static> = FormatTemplates {
+    annotation: ANNOTATION_TEMPLATE,
+    context: CONTEXT_TEMPLATE,
+};
 
 /// Per-continuation limits and already-owned citation metadata.
 pub(super) struct FormatLimits<'a> {

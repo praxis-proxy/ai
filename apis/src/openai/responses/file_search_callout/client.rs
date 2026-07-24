@@ -74,9 +74,6 @@ pub(super) const MAX_SEARCH_REQUEST_BYTES: usize = 1_048_576;
 /// Maximum vector store identifier size accepted for one URL segment.
 pub(super) const MAX_VECTOR_STORE_ID_BYTES: usize = 512;
 
-/// Query insertion point supported by the search template.
-const QUERY_PLACEHOLDER: &str = "{query}";
-
 /// Allocation unit used by global collected-response admission.
 const RESPONSE_BODY_BUDGET_UNIT_BYTES: usize = 1_048_576; // 1 MiB
 
@@ -388,9 +385,6 @@ pub(crate) struct FileSearchClientConfig {
     /// Maximum successful response bytes retained across the fan-out.
     pub max_total_response_bytes: usize,
 
-    /// Query formatting template.
-    pub search_template: String,
-
     /// Whole-call timeout, including response body collection.
     pub timeout: Duration,
 }
@@ -412,9 +406,6 @@ pub(crate) struct FileSearchClient {
     /// Maximum successful response bytes retained across the fan-out.
     max_total_response_bytes: usize,
 
-    /// Query formatting template.
-    search_template: String,
-
     /// Whole-call timeout, including response body collection.
     timeout: Duration,
 }
@@ -428,7 +419,6 @@ impl FileSearchClient {
             failure_mode: config.failure_mode,
             max_response_bytes: config.max_response_bytes,
             max_total_response_bytes: config.max_total_response_bytes,
-            search_template: config.search_template,
             timeout: config.timeout,
         }
     }
@@ -562,9 +552,15 @@ impl FileSearchClient {
         execution_started: Instant,
     ) -> Result<PreparedSearchRequest, FileSearchError> {
         let url = self.search_url(spec.store_id)?;
-        let query = self.render_query(spec.query, spec.store_id, execution_started)?;
+        if spec.query.len() > MAX_QUERY_BYTES {
+            return Err(request_error(
+                spec.store_id,
+                format!("search query exceeds {MAX_QUERY_BYTES} byte limit"),
+            ));
+        }
+        deadline_remaining(self.timeout, execution_started, spec.store_id)?;
         let request_body =
-            VectorStoreSearchRequest::new(spec.filters, spec.max_num_results, &query, spec.ranking_options)
+            VectorStoreSearchRequest::new(spec.filters, spec.max_num_results, spec.query, spec.ranking_options)
                 .map_err(|message| request_error(spec.store_id, message))?;
         let body = serialize_bounded_request(&request_body, spec.store_id, execution_started, self.timeout)?;
 
@@ -587,36 +583,6 @@ impl FileSearchClient {
         .await
         .map_err(|_elapsed| execution_deadline_error(store_id))
         .and_then(|result| result.map_err(|error| request_error(store_id, error.to_string())))
-    }
-
-    /// Render the configured query template without allocating beyond the cap.
-    fn render_query(&self, query: &str, store_id: &str, execution_started: Instant) -> Result<String, FileSearchError> {
-        if query.len() > MAX_QUERY_BYTES {
-            return Err(request_error(
-                store_id,
-                format!("search query exceeds {MAX_QUERY_BYTES} byte limit"),
-            ));
-        }
-
-        let rendered_bytes = rendered_query_len(&self.search_template, query)
-            .filter(|length| *length <= MAX_QUERY_BYTES)
-            .ok_or_else(|| {
-                request_error(
-                    store_id,
-                    format!("rendered search query exceeds {MAX_QUERY_BYTES} byte limit"),
-                )
-            })?;
-
-        let mut rendered = String::with_capacity(rendered_bytes);
-        let mut remainder = self.search_template.as_str();
-        while let Some((prefix, suffix)) = remainder.split_once(QUERY_PLACEHOLDER) {
-            deadline_remaining(self.timeout, execution_started, store_id)?;
-            rendered.push_str(prefix);
-            rendered.push_str(query);
-            remainder = suffix;
-        }
-        rendered.push_str(remainder);
-        Ok(rendered)
     }
 
     /// Build owned headers required by one callout request.
@@ -828,17 +794,6 @@ fn normalized_hybrid_alpha(hybrid: &serde_json::Map<String, Value>) -> Result<f6
         .is_finite()
         .then_some(alpha)
         .ok_or("ranking_options.hybrid_search weights cannot be normalized")
-}
-
-/// Calculate rendered query bytes without constructing the rendered string.
-fn rendered_query_len(template: &str, query: &str) -> Option<usize> {
-    let placeholder_count = template.matches(QUERY_PLACEHOLDER).count();
-    let literal_bytes = template
-        .len()
-        .saturating_sub(placeholder_count.saturating_mul(QUERY_PLACEHOLDER.len()));
-    placeholder_count
-        .checked_mul(query.len())
-        .and_then(|query_bytes| literal_bytes.checked_add(query_bytes))
 }
 
 /// Calculate the one-time aggregate admission needed by an execution.

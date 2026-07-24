@@ -704,10 +704,8 @@ default_context_size: medium  # low | medium | high
 - Fan out across all configured vector stores in parallel
 - Preserve `filters`, `ranking_options`, `max_num_results` from tool call
 - Force `rewrite_query=false`
-- Use config-driven templates:
-  - Search template: formats the search query
-  - Annotation template: formats each result chunk
-  - Context template: wraps all results for model consumption
+- Forward the model-generated query unchanged
+- Use a fixed internal format for result chunks, citation markers, and model context
 - Build model-facing context prompt from results
 - Extract citation markers `<|file-xxx|>` from model text → `OpenAIResponseAnnotationFileCitation` annotations
 - Track `citation_files` mapping: file_id → filename
@@ -719,9 +717,6 @@ filter: file_search
 vector_store_url: http://localhost:8001
 api_key: ${VECTOR_STORE_API_KEY}
 auth_type: bearer  # bearer | none
-search_template: "..."
-annotation_template: "..."
-context_template: "..."
 ```
 
 **Dependencies:** Vector store API (HTTP, authenticated)
