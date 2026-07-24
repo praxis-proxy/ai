@@ -13,12 +13,17 @@ Configs use local ports (`3000`, `3001`, ...) for
 upstreams — start a real backend or stub on those ports
 before sending requests.
 
+**Model routing:** `model-to-header-routing.yaml` uses the
+AI `model_to_header` filter. `ai-inference-body-based-routing.yaml`
+uses the core `json_body_field` filter for the same pattern.
+
 ## Configs
 
 ### General
 
 | File | Description |
 | ------ | ------------- |
+| [ai-guardrails.yaml](configs/ai-guardrails.yaml) | ai_guardrails filter with NeMo provider config (request evaluation not yet wired) |
 | [a2a-agent-card-routing.yaml](configs/a2a-agent-card-routing.yaml) | Routes agent card discovery requests to dedicated backends |
 | [a2a-classifier-routing.yaml](configs/a2a-classifier-routing.yaml) | Routes A2A requests by body-derived method, family, context ID, task ID, and streaming detection |
 | [a2a-task-routing.yaml](configs/a2a-task-routing.yaml) | Captures task and context ownership from SendMessage JSON responses and SendStreamingMessage / SubscribeToTask SSE responses, then routes follow-up requests back to the backend cluster that created the task or owns the context |
@@ -39,7 +44,7 @@ before sending requests.
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
-| [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
+| [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Unified AI API Gateway: one listener routes Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses by classifier-promoted headers |
 
 ### OpenAI
 

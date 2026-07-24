@@ -5,7 +5,9 @@
 [![MSRV: 1.96](https://img.shields.io/badge/MSRV-1.96-brightgreen.svg)](https://blog.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-AI features and capabilities for [Praxis](https://github.com/praxis-proxy/praxis).
+AI-native proxy server and **AI Gateway** built on the
+[Praxis](https://github.com/praxis-proxy/praxis) composable
+filter pipeline. Documentation: [docs/overview.md](docs/overview.md).
 
 ## Contributing
 

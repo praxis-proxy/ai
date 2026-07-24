@@ -3,7 +3,7 @@
 
 # `token_count`
 
-Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`].
+Extracts token usage from AI inference responses and writes unified counts to [filter_metadata](extensions.md#filter_metadata).
 
 ## Configuration Notes
 

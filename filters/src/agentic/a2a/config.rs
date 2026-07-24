@@ -264,7 +264,7 @@ pub(crate) struct A2aConfig {
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
 
-    /// Method aliases for compatibility (slash-delimited → `PascalCase`).
+    /// Method aliases for compatibility (slash-delimited to `PascalCase`).
     #[serde(default)]
     pub method_aliases: BTreeMap<String, String>,
 

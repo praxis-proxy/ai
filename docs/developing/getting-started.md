@@ -61,7 +61,7 @@ binding or protocol registration. If you need to
 bind ports below 1024, prefer one of these approaches:
 
 - Grant `CAP_NET_BIND_SERVICE` to the binary:
-  `sudo setcap cap_net_bind_service=+ep ./target/release/praxis`
+  `sudo setcap cap_net_bind_service=+ep ./target/release/praxis-ai`
 - Run behind a reverse proxy or load balancer that
   handles port 80/443.
 - Use socket activation (systemd) to pass pre-bound

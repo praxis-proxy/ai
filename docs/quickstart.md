@@ -66,12 +66,18 @@ curl http://127.0.0.1:8080/v1/responses \
   -d '{"model": "gpt-4o", "input": "Hello"}'
 ```
 
+## Deployment
+
+The same YAML serves ingress, egress, or in-cluster
+placements; change listener address, TLS, and upstream
+clusters per environment. Filter chains stay the same.
+See [AI Gateway overview](overview.md) for use-cases.
+
 ## Next steps
 
-- [Example configs](../examples/README.md): working YAML
-  for every feature.
-- [Filters](filters/README.md): AI filters and how to
-  write your own.
-- [Praxis core](https://github.com/praxis-proxy/praxis):
-  listener, filter-chain, routing, and load-balancer
-  configuration.
+- [AI Gateway overview](overview.md)
+- [OpenAI Responses](openai-responses.md) and
+  [Anthropic Messages](anthropic-messages.md) guides
+- [Example configs](../examples/README.md)
+- [Filters](filters/README.md)
+- [Praxis core](https://github.com/praxis-proxy/praxis)

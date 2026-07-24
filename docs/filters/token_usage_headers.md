@@ -3,7 +3,7 @@
 
 # `token_usage_headers`
 
-Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`].
+Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [filter_metadata](extensions.md#filter_metadata).
 
 ## Configuration Notes
 

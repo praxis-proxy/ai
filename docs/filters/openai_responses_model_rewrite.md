@@ -18,7 +18,7 @@ Quote wildcard alias keys in YAML, such as `"gpt-4.1-*"`, so `*` is parsed as a 
 | `headers.effective_model` | string | no | Header name for the effective (post-rewrite) model value. |
 | `headers.original_model` | string | no | Header name for the original (pre-rewrite) model value. |
 | `max_body_bytes` | integer | no | Maximum request body size to buffer before parsing. |
-| `model_aliases` | object<string, string> | no | Map from client-facing model names or single-wildcard patterns to backend model names. Quote wildcard keys in YAML. Exact aliases win before wildcard aliases; wildcard aliases are matched by literal specificity. |
+| `model_aliases` | `object<string, string>` | no | Map from client-facing model names or single-wildcard patterns to backend model names. Quote wildcard keys in YAML. Exact aliases win before wildcard aliases; wildcard aliases are matched by literal specificity. |
 | `on_invalid` | `continue` \| `reject` | no | Behavior when the body is not valid JSON. |
 
 ## Examples

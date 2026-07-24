@@ -25,6 +25,11 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// eventually response) bodies. The provider determines whether
 /// content should be passed, blocked, or redacted.
 ///
+/// **Implementation status:** Request-side evaluation is not wired
+/// yet; bodies are buffered via `StreamBuffer` but `on_request_body`
+/// returns `Continue` unconditionally. Response-side evaluation is
+/// tracked in <https://github.com/praxis-proxy/ai/issues/50>.
+///
 /// # YAML configuration
 ///
 /// ```yaml

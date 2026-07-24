@@ -7,6 +7,32 @@ register into the shared `FilterRegistry`.
 
 [praxis]: https://github.com/praxis-proxy/praxis
 
+## filter_metadata
+
+Praxis attaches a per-request `filter_metadata` map to
+[`HttpFilterContext`][http-filter-context] from Praxis
+core. Filters store flat string key-value pairs that
+persist across all HTTP lifecycle phases on the same
+request (request, request-body, response,
+response-body).
+
+Keys use dot-prefix namespacing by convention (for
+example `token.input`, `token.output`, `a2a.method`).
+Upstream filters write values; downstream filters read
+them in later phases without coupling to each other's
+internals. Note the phase-ordering constraint: `token_count`
+writes body-derived counts in `on_response_body`, while
+`token_usage_headers` reads metadata in `on_response`, so
+those two filters cannot chain into response headers in one
+pass (see [token-counting](../token-counting.md) and
+[proposal 00214](../proposals/00214_token-usage-response-headers.md)).
+
+Custom filters can read and write `filter_metadata` via
+`ctx.filter_metadata` in `on_request`, `on_response`,
+and body hooks.
+
+[http-filter-context]: https://github.com/praxis-proxy/praxis/blob/main/filter/src/context.rs
+
 ## Auto-Discovery (Recommended)
 
 External filter crates can self-register into Praxis AI
@@ -41,7 +67,7 @@ version = "0.1.0"
 
 [dependencies]
 async-trait = "0.1"
-praxis-proxy-filter = "0.3"
+praxis-proxy-filter = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = { package = "yaml_serde", version = "0.10" }
 ```
@@ -294,3 +320,18 @@ filter with `FilterFactory::Http(Arc::new(factory))`,
 build a minimal YAML config, and assert on status codes
 and response bodies. See `tests/integration/` for
 examples.
+
+Built-in filter reference pages are generated from source.
+After changing a filter config struct, run:
+
+```console
+cargo xtask generate-filter-docs
+```
+
+CI runs `cargo xtask lint-filter-docs` as part of `make lint`.
+Every example under `examples/configs/` must have an
+integration test (or an entry in the SKIP allowlist):
+
+```console
+cargo xtask lint-example-tests
+```

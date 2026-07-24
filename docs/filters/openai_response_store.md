@@ -10,7 +10,7 @@ Persists Responses API responses to the configured response store backend.
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `backend` | `sqlite` \| `postgres` | yes | Storage backend to use. |
-| `database_url` | string (secret) | yes | Database connection URL. Wrapped in [`SecretString`] to prevent accidental logging of credentials. |
+| `database_url` | string (secret) | yes | Database connection URL. Wrapped in `SecretString` to prevent accidental logging of credentials. |
 | `responses_table` | string | yes | Table name for response records. |
 | `conversations_table` | string | yes | Table name for conversation message records. |
 | `ssl_mode` | SslMode | no | TLS mode for `PostgreSQL` connections. Only valid when `backend` is `postgres`. Overrides any `sslmode` parameter in the connection URL. |
