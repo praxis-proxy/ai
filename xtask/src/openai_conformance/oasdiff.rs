@@ -121,11 +121,11 @@ fn checked_oasdiff_version() -> Result<String, String> {
                  expected {OASDIFF_VERSION} — proceeding on the assumption the \
                  correct tag was installed"
             );
-        } else {
-            return Err(format!(
-                "unsupported oasdiff version {actual}; install exactly {OASDIFF_VERSION}"
-            ));
+            return Ok(OASDIFF_VERSION.to_owned());
         }
+        return Err(format!(
+            "unsupported oasdiff version {actual}; install exactly {OASDIFF_VERSION}"
+        ));
     }
     Ok(actual)
 }
