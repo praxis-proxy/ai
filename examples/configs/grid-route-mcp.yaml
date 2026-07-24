@@ -1,0 +1,61 @@
+# Grid Route: MCP Tool Routing
+#
+# Routes MCP `tools/call` requests to the cluster that owns the
+# requested tool, using the `mcp.name` metadata set by the `mcp` filter.
+#
+# Routing precedence: MCP tool metadata always takes priority over the
+# model header.  This prevents a client-supplied model name from
+# hijacking structured MCP tool routing.
+#
+# Other MCP methods (`initialize`, `notifications/*`, etc.) pass through
+# without routing; only `tools/call` triggers `mcp_tool` matching.
+#
+# This filter is registered by praxis-ai-proxy, not Praxis core, because
+# it encodes AI/Grid-specific routing semantics.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/grid-route-mcp.yaml
+
+listeners:
+  - name: proxy
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      # Classify the MCP request and promote mcp.method + mcp.name
+      # to filter metadata.
+      - filter: mcp
+
+      # Route tools/call requests to the cluster that owns the tool.
+      # Other MCP methods pass through without routing.
+      - filter: grid_route
+        local_site: site-a
+        candidates:
+          - kind: mcp_tool
+            name: weather-lookup
+            site: site-b
+            cluster: tools-site-b
+            fresh: true
+
+          - kind: mcp_tool
+            name: code-search
+            site: site-a
+            cluster: tools-site-a
+            fresh: true
+
+      # Forward to whichever cluster grid_route selected.
+      - filter: load_balancer
+        clusters:
+          - name: tools-site-a
+            endpoints:
+              - "127.0.0.1:8001"
+          - name: tools-site-b
+            endpoints:
+              - "127.0.0.1:8002"
+
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5

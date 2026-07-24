@@ -36,6 +36,24 @@ fn register_ai_filters(registry: &mut praxis_filter::FilterRegistry) {
     register_general_ai_filters(registry);
     register_anthropic_filters(registry);
     register_openai_filters(registry);
+    register_grid_filters(registry);
+}
+
+/// Register Grid gateway-to-gateway routing filters.
+///
+/// `grid_route` selects the upstream candidate and writes credential
+/// reference metadata.  `grid_credential_inject` reads that metadata and
+/// injects the bearer token into the upstream request.  Both filters
+/// belong in the AI proxy because they encode AI/Grid-specific semantics.
+fn register_grid_filters(registry: &mut praxis_filter::FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "grid_route" => praxis_ai_filters::GridRouteFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "grid_credential_inject" => praxis_ai_filters::GridCredentialInjectFilter::from_config
+    );
 }
 
 /// Register agentic protocol filters (A2A, MCP).
@@ -166,4 +184,21 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
         @register registry,
         http "openai_mcp_dispatch" => praxis_ai_apis::openai::McpDispatchFilter::from_config
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn full_registry_includes_grid_credential_inject_without_duplicate_grid_route() {
+        let registry = crate::build_full_registry();
+        let names = registry.available_filters();
+        assert!(
+            names.contains(&"grid_route"),
+            "full registry must contain a grid_route filter"
+        );
+        assert!(
+            names.contains(&"grid_credential_inject"),
+            "full registry must contain grid_credential_inject"
+        );
+    }
 }
