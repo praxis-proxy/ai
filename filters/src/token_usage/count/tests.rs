@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Unit tests for the `token_count` filter.
+//! Boundary tests for the `token_count` filter.
 
 use bytes::Bytes;
 use http::header::HeaderValue;
@@ -69,7 +69,7 @@ fn from_config_rejects_unknown_fields() {
 
 #[tokio::test]
 async fn on_response_sets_sse_mode_for_event_stream() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -87,7 +87,7 @@ async fn on_response_sets_sse_mode_for_event_stream() {
 
 #[tokio::test]
 async fn on_response_sets_json_mode_for_application_json() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -105,7 +105,7 @@ async fn on_response_sets_json_mode_for_application_json() {
 
 #[tokio::test]
 async fn on_response_handles_content_type_with_charset() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -123,7 +123,7 @@ async fn on_response_handles_content_type_with_charset() {
 
 #[tokio::test]
 async fn on_response_handles_case_insensitive_content_type() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -141,7 +141,7 @@ async fn on_response_handles_case_insensitive_content_type() {
 
 #[tokio::test]
 async fn on_response_skips_non_success_status() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -158,7 +158,7 @@ async fn on_response_skips_non_success_status() {
 
 #[tokio::test]
 async fn on_response_skips_unknown_content_type() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -175,7 +175,7 @@ async fn on_response_skips_unknown_content_type() {
 
 #[tokio::test]
 async fn on_response_skips_missing_content_type() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -198,7 +198,7 @@ async fn on_response_skips_missing_content_type() {
 async fn json_openai_extracts_tokens() {
     let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"total_tokens":57}}"#;
 
-    let (input, output, total) = run_json_extraction(TokenUsageProvider::OpenAi, json).await;
+    let (input, output, total) = run_json_extraction(ProviderKind::OpenAi, json).await;
 
     assert_eq!(input.as_deref(), Some("15"), "OpenAI input tokens");
     assert_eq!(output.as_deref(), Some("42"), "OpenAI output tokens");
@@ -209,7 +209,7 @@ async fn json_openai_extracts_tokens() {
 async fn json_anthropic_extracts_tokens() {
     let json = br#"{"usage":{"input_tokens":15,"output_tokens":42}}"#;
 
-    let (input, output, total) = run_json_extraction(TokenUsageProvider::Anthropic, json).await;
+    let (input, output, total) = run_json_extraction(ProviderKind::Anthropic, json).await;
 
     assert_eq!(input.as_deref(), Some("15"), "Anthropic input tokens");
     assert_eq!(output.as_deref(), Some("42"), "Anthropic output tokens");
@@ -217,10 +217,44 @@ async fn json_anthropic_extracts_tokens() {
 }
 
 #[tokio::test]
+async fn json_anthropic_includes_prompt_cache_tokens() {
+    let json = br#"{"usage":{"input_tokens":50,"output_tokens":100,"cache_creation_input_tokens":1000,"cache_read_input_tokens":5000}}"#;
+
+    let (input, output, total) = run_json_extraction(ProviderKind::Anthropic, json).await;
+
+    assert_eq!(input.as_deref(), Some("6050"), "all Anthropic input token classes");
+    assert_eq!(output.as_deref(), Some("100"), "Anthropic output tokens");
+    assert_eq!(total.as_deref(), Some("6150"), "Anthropic total tokens");
+}
+
+#[tokio::test]
+async fn json_anthropic_saturates_token_totals() {
+    let json = format!(
+        r#"{{"usage":{{"input_tokens":{},"output_tokens":1,"cache_creation_input_tokens":1}}}}"#,
+        u64::MAX
+    );
+
+    let (input, output, total) = run_json_extraction(ProviderKind::Anthropic, json.as_bytes()).await;
+    let max = u64::MAX.to_string();
+
+    assert_eq!(
+        input.as_deref(),
+        Some(max.as_str()),
+        "input token addition must saturate"
+    );
+    assert_eq!(output.as_deref(), Some("1"), "Anthropic output tokens");
+    assert_eq!(
+        total.as_deref(),
+        Some(max.as_str()),
+        "total token addition must saturate"
+    );
+}
+
+#[tokio::test]
 async fn json_google_extracts_tokens() {
     let json = br#"{"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":42,"totalTokenCount":57}}"#;
 
-    let (input, output, total) = run_json_extraction(TokenUsageProvider::Google, json).await;
+    let (input, output, total) = run_json_extraction(ProviderKind::Google, json).await;
 
     assert_eq!(input.as_deref(), Some("15"), "Google input tokens");
     assert_eq!(output.as_deref(), Some("42"), "Google output tokens");
@@ -231,7 +265,7 @@ async fn json_google_extracts_tokens() {
 async fn json_bedrock_converse_extracts_tokens() {
     let json = br#"{"usage":{"inputTokens":15,"outputTokens":42,"totalTokens":57}}"#;
 
-    let (input, output, total) = run_json_extraction(TokenUsageProvider::Bedrock, json).await;
+    let (input, output, total) = run_json_extraction(ProviderKind::Bedrock, json).await;
 
     assert_eq!(input.as_deref(), Some("15"), "Bedrock input tokens");
     assert_eq!(output.as_deref(), Some("42"), "Bedrock output tokens");
@@ -242,7 +276,7 @@ async fn json_bedrock_converse_extracts_tokens() {
 async fn json_azure_extracts_tokens() {
     let json = br#"{"usage":{"prompt_tokens":5,"completion_tokens":10,"total_tokens":15}}"#;
 
-    let (input, output, total) = run_json_extraction(TokenUsageProvider::Azure, json).await;
+    let (input, output, total) = run_json_extraction(ProviderKind::Azure, json).await;
 
     assert_eq!(input.as_deref(), Some("5"), "Azure input tokens");
     assert_eq!(output.as_deref(), Some("10"), "Azure output tokens");
@@ -253,7 +287,7 @@ async fn json_azure_extracts_tokens() {
 async fn json_missing_usage_sets_nothing() {
     let json = br#"{"id":"abc","choices":[]}"#;
 
-    let (input, output, total) = run_json_extraction(TokenUsageProvider::OpenAi, json).await;
+    let (input, output, total) = run_json_extraction(ProviderKind::OpenAi, json).await;
 
     assert!(input.is_none(), "missing usage should not set input");
     assert!(output.is_none(), "missing usage should not set output");
@@ -262,7 +296,7 @@ async fn json_missing_usage_sets_nothing() {
 
 #[tokio::test]
 async fn json_malformed_sets_nothing() {
-    let (input, output, total) = run_json_extraction(TokenUsageProvider::OpenAi, b"not json").await;
+    let (input, output, total) = run_json_extraction(ProviderKind::OpenAi, b"not json").await;
 
     assert!(input.is_none(), "malformed JSON should not set input");
     assert!(output.is_none(), "malformed JSON should not set output");
@@ -271,7 +305,7 @@ async fn json_malformed_sets_nothing() {
 
 #[tokio::test]
 async fn json_empty_body_sets_nothing() {
-    let (input, output, total) = run_json_extraction(TokenUsageProvider::OpenAi, b"").await;
+    let (input, output, total) = run_json_extraction(ProviderKind::OpenAi, b"").await;
 
     assert!(input.is_none(), "empty body should not set input");
     assert!(output.is_none(), "empty body should not set output");
@@ -280,7 +314,7 @@ async fn json_empty_body_sets_nothing() {
 
 #[tokio::test]
 async fn json_chunked_body_reassembled() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -306,7 +340,7 @@ async fn json_chunked_body_reassembled() {
 #[tokio::test]
 async fn json_clears_working_metadata() {
     let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"total_tokens":57}}"#;
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -338,7 +372,7 @@ async fn json_clears_working_metadata() {
 async fn sse_openai_final_usage_event() {
     let events = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\ndata: [DONE]\n\n";
 
-    let (input, output, total) = run_sse_extraction(TokenUsageProvider::OpenAi, events).await;
+    let (input, output, total) = run_sse_extraction(ProviderKind::OpenAi, events).await;
 
     assert_eq!(input.as_deref(), Some("10"), "OpenAI SSE input tokens");
     assert_eq!(output.as_deref(), Some("20"), "OpenAI SSE output tokens");
@@ -353,7 +387,7 @@ async fn sse_anthropic_accumulated_events() {
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
     );
 
-    let (input, output, total) = run_sse_extraction(TokenUsageProvider::Anthropic, events.as_bytes()).await;
+    let (input, output, total) = run_sse_extraction(ProviderKind::Anthropic, events.as_bytes()).await;
 
     assert_eq!(
         input.as_deref(),
@@ -369,10 +403,24 @@ async fn sse_anthropic_accumulated_events() {
 }
 
 #[tokio::test]
+async fn sse_anthropic_includes_prompt_cache_tokens() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":500}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+    );
+
+    let (input, output, total) = run_sse_extraction(ProviderKind::Anthropic, events.as_bytes()).await;
+
+    assert_eq!(input.as_deref(), Some("610"), "all Anthropic SSE input token classes");
+    assert_eq!(output.as_deref(), Some("42"), "Anthropic SSE output tokens");
+    assert_eq!(total.as_deref(), Some("652"), "Anthropic SSE total tokens");
+}
+
+#[tokio::test]
 async fn sse_google_final_usage_event() {
     let events = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\ndata: {\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":42,\"totalTokenCount\":57}}\n\n";
 
-    let (input, output, total) = run_sse_extraction(TokenUsageProvider::Google, events).await;
+    let (input, output, total) = run_sse_extraction(ProviderKind::Google, events).await;
 
     assert_eq!(input.as_deref(), Some("15"), "Google SSE input tokens");
     assert_eq!(output.as_deref(), Some("42"), "Google SSE output tokens");
@@ -384,7 +432,7 @@ async fn sse_done_sentinel_ignored() {
     let events =
         b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\ndata: [DONE]\n\n";
 
-    let (input, output, _) = run_sse_extraction(TokenUsageProvider::OpenAi, events).await;
+    let (input, output, _) = run_sse_extraction(ProviderKind::OpenAi, events).await;
 
     assert_eq!(input.as_deref(), Some("10"), "[DONE] should not overwrite usage data");
     assert_eq!(output.as_deref(), Some("20"), "[DONE] should not overwrite usage data");
@@ -392,7 +440,7 @@ async fn sse_done_sentinel_ignored() {
 
 #[tokio::test]
 async fn sse_chunks_split_across_calls() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -423,7 +471,7 @@ async fn sse_chunks_split_across_calls() {
 async fn sse_no_usage_events_sets_nothing() {
     let events = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
 
-    let (input, output, total) = run_sse_extraction(TokenUsageProvider::OpenAi, events).await;
+    let (input, output, total) = run_sse_extraction(ProviderKind::OpenAi, events).await;
 
     assert!(input.is_none(), "no usage events should not set input");
     assert!(output.is_none(), "no usage events should not set output");
@@ -433,7 +481,7 @@ async fn sse_no_usage_events_sets_nothing() {
 #[tokio::test]
 async fn sse_clears_working_metadata() {
     let events = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\n";
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -456,7 +504,7 @@ async fn sse_clears_working_metadata() {
 async fn sse_bedrock_metadata_event() {
     let events = b"data: {\"contentBlockDelta\":{\"delta\":{\"text\":\"Hi\"},\"contentBlockIndex\":0}}\n\ndata: {\"metadata\":{\"usage\":{\"inputTokens\":30,\"outputTokens\":18}}}\n\n";
 
-    let (input, output, total) = run_sse_extraction(TokenUsageProvider::Bedrock, events).await;
+    let (input, output, total) = run_sse_extraction(ProviderKind::Bedrock, events).await;
 
     assert_eq!(input.as_deref(), Some("30"), "Bedrock SSE input tokens");
     assert_eq!(output.as_deref(), Some("18"), "Bedrock SSE output tokens");
@@ -467,7 +515,7 @@ async fn sse_bedrock_metadata_event() {
 async fn sse_zero_token_counts_are_written() {
     let events = b"data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n";
 
-    let (input, output, total) = run_sse_extraction(TokenUsageProvider::OpenAi, events).await;
+    let (input, output, total) = run_sse_extraction(ProviderKind::OpenAi, events).await;
 
     assert_eq!(input.as_deref(), Some("0"), "zero input tokens should be written");
     assert_eq!(output.as_deref(), Some("0"), "zero output tokens should be written");
@@ -479,7 +527,7 @@ async fn sse_final_event_without_trailing_blank_line() {
     let events =
         b"data: {\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":34,\"totalTokenCount\":46}}";
 
-    let (input, output, total) = run_sse_extraction(TokenUsageProvider::Google, events).await;
+    let (input, output, total) = run_sse_extraction(ProviderKind::Google, events).await;
 
     assert_eq!(input.as_deref(), Some("12"), "Google EOF usage should be extracted");
     assert_eq!(output.as_deref(), Some("34"), "Google EOF usage should be extracted");
@@ -492,7 +540,7 @@ async fn sse_final_event_without_trailing_blank_line() {
 
 #[tokio::test]
 async fn sse_overflow_finalizes_partial_counts() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -522,7 +570,7 @@ async fn sse_overflow_finalizes_partial_counts() {
 
 #[test]
 fn on_response_body_noop_without_mode() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::GET, "/health");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -545,7 +593,7 @@ fn on_response_body_noop_without_mode() {
 
 #[tokio::test]
 async fn json_overflow_sets_nothing() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -629,7 +677,7 @@ fn decode_hex_rejects_invalid_chars() {
 
 #[tokio::test]
 async fn bedrock_invoke_model_extracts_headers_on_response() {
-    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -659,7 +707,7 @@ async fn bedrock_invoke_model_extracts_headers_on_response() {
 
 #[tokio::test]
 async fn bedrock_invoke_model_headers_absent_is_noop() {
-    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -680,7 +728,7 @@ async fn bedrock_invoke_model_headers_absent_is_noop() {
 
 #[tokio::test]
 async fn bedrock_invoke_model_partial_headers_is_noop() {
-    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -698,7 +746,7 @@ async fn bedrock_invoke_model_partial_headers_is_noop() {
 
 #[tokio::test]
 async fn bedrock_invoke_model_non_numeric_headers_is_noop() {
-    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -721,7 +769,7 @@ async fn bedrock_invoke_model_non_numeric_headers_is_noop() {
 
 #[tokio::test]
 async fn bedrock_invoke_model_skips_non_success_status() {
-    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -745,7 +793,7 @@ async fn bedrock_invoke_model_skips_non_success_status() {
 
 #[tokio::test]
 async fn bedrock_invoke_model_does_not_set_content_type_mode() {
-    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -764,19 +812,19 @@ async fn bedrock_invoke_model_does_not_set_content_type_mode() {
 
 #[test]
 fn bedrock_invoke_model_response_body_access_is_none() {
-    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
     assert_eq!(filter.response_body_access(), BodyAccess::None);
 }
 
 #[test]
 fn other_providers_response_body_access_is_read_only() {
-    let filter = make_filter(TokenUsageProvider::OpenAi);
+    let filter = make_filter(ProviderKind::OpenAi);
     assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
 }
 
 #[test]
 fn on_response_body_noop_for_bedrock_invoke_model() {
-    let filter = make_filter_kind(ProviderKind::BedrockInvokeModel);
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -793,13 +841,7 @@ fn on_response_body_noop_for_bedrock_invoke_model() {
 
 use std::fmt::Write as _;
 
-fn make_filter(provider: TokenUsageProvider) -> TokenCountFilter {
-    TokenCountFilter {
-        provider: provider.into(),
-    }
-}
-
-fn make_filter_kind(provider: ProviderKind) -> TokenCountFilter {
+fn make_filter(provider: ProviderKind) -> TokenCountFilter {
     TokenCountFilter { provider }
 }
 
@@ -832,7 +874,7 @@ fn assert_no_working_metadata(ctx: &HttpFilterContext<'_>) {
 
 /// Run a full `on_response` -> `on_response_body` cycle for JSON extraction.
 async fn run_json_extraction(
-    provider: TokenUsageProvider,
+    provider: ProviderKind,
     body_bytes: &[u8],
 ) -> (Option<String>, Option<String>, Option<String>) {
     let filter = make_filter(provider);
@@ -856,7 +898,7 @@ async fn run_json_extraction(
 
 /// Run a full `on_response` -> `on_response_body` cycle for SSE extraction.
 async fn run_sse_extraction(
-    provider: TokenUsageProvider,
+    provider: ProviderKind,
     sse_bytes: &[u8],
 ) -> (Option<String>, Option<String>, Option<String>) {
     let filter = make_filter(provider);

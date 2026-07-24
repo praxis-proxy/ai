@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024 Praxis Contributors
 
-//! Provider-specific JSON parsing for token usage extraction.
+//! Provider-specific JSON parsing for the token usage filters.
 
 use serde::Deserialize;
 

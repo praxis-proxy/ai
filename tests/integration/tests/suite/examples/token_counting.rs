@@ -41,7 +41,7 @@
 //! `tests/integration/tests/suite/examples/token_count.rs`.
 //!
 //! Actual extracted-value correctness for every provider is covered by
-//! unit tests in `filters/src/token_count/tests.rs`.
+//! boundary tests in `filters/src/token_usage/count/tests.rs`.
 
 use std::collections::HashMap;
 

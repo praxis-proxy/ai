@@ -19,7 +19,7 @@ A filter that extracts token usage from AI provider response bodies
 and writes the counts to filter metadata for downstream consumers.
 
 The filter reads the upstream response body, identifies the provider,
-and delegates JSON parsing to the provider mapping library ([#216]).
+and delegates JSON parsing to private provider-specific parsers.
 Once token counts are resolved, they are written to `FilterContext`
 ([#212]) so that downstream filters (rate limiting, logging, cost
 tracking, header injection) can consume them without coupling to
@@ -43,14 +43,14 @@ Provider extraction sources:
 > **Note:** Bedrock InvokeModel is the only provider that does not return token counts
 > in the response body. Counts are delivered as HTTP response headers instead, making
 > its extraction path fundamentally different from all other providers. This distinction
-> must be reflected in both the [#216] mapping library and the How? design here.
+> is reflected in the filter's private provider strategy and the How? design here.
 
 ### Goals
 
 - Extract token usage from non-streaming provider responses
 - Extract token usage from streaming (SSE) provider responses
 - Write `token_input`, `token_output`, and `token_total` to `FilterContext`
-- Delegate all provider-specific JSON parsing to [#216]
+- Keep all provider-specific parsing private to the token usage filter subsystem
 - Avoid CPU-bound client-side estimation when provider counts are available
 
 ### Non-Goals
@@ -157,7 +157,7 @@ contains the total.
 
 ### Requirements
 
-1. A new `token_count` filter in `filter/src/builtins/http/ai/token_count.rs`.
+1. A `token_count` filter in `filters/src/token_usage/count.rs`.
 2. The filter accepts a single required YAML key `provider` that selects
    the extraction strategy.
 3. For non-streaming responses the full body is buffered and parsed once
@@ -166,11 +166,11 @@ contains the total.
    event stream is scanned for token fields once the stream closes.
 5. For Bedrock InvokeModel, token counts are read from HTTP response
    headers in `on_response`; no body parsing is performed.
-6. Counts are written to `FilterContext` via `ctx.set_token_usage(input,
-   output, total)` so that downstream filters (header injection, logging,
+6. Counts are written to filter metadata via the subsystem's private
+   `set_token_usage` helper so that downstream filters (header injection, logging,
    rate limiting) can read them without parsing provider JSON themselves.
-7. The filter delegates all provider-specific JSON parsing to the existing
-   `token_usage` library (`filter/src/builtins/http/ai/token_usage/`).
+7. The filter delegates all provider-specific JSON and SSE parsing to private
+   modules within `filters/src/token_usage/`.
 
 ### Answering the Open Questions
 
@@ -206,9 +206,9 @@ authoritative trigger, which correctly handles both providers that emit
 Handled directly by this filter in `on_response`. When `provider:
 bedrock_invoke_model` is configured, the filter reads
 `x-amzn-bedrock-input-token-count` and `x-amzn-bedrock-output-token-count`
-from the upstream response headers and calls `ctx.set_token_usage` there.
+from the upstream response headers and stores normalized token metadata there.
 `response_body_access` returns `BodyAccess::None` for this provider so no
-body buffering occurs. No changes are required to the `token_usage` library.
+body buffering occurs.
 
 #### Partial usage data
 
@@ -219,13 +219,14 @@ relevant event is read exactly once, not summed.
 
 ### File Layout
 
-```
-filter/src/builtins/http/ai/
-  token_count.rs          ← new: TokenCountFilter
-  token_usage/            ← existing: TokenUsage, TokenUsageProvider, extract_token_usage
-    mod.rs
-    providers.rs
-    tests.rs
+```text
+filters/src/token_usage/
+  mod.rs                  # normalized usage type and metadata contract
+  count.rs                # TokenCountFilter and private provider strategy
+  count/tests.rs          # filter-boundary tests
+  headers.rs              # TokenUsageHeadersFilter
+  providers.rs            # provider JSON parsers
+  streaming.rs            # provider SSE event parsers
 ```
 
 ### Filter Struct and Config
@@ -240,10 +241,6 @@ struct TokenCountConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProviderKind {
-    /// Variant name matches YAML `snake_case` via serde. Note that
-    /// `TokenUsageProvider` in `token_usage/mod.rs` uses `OpenAi`
-    /// (capital I). A private `to_library_provider` conversion function
-    /// maps `ProviderKind → TokenUsageProvider` at the call site.
     OpenAi,
     Anthropic,
     Google,
@@ -262,10 +259,10 @@ pub struct TokenCountFilter {
 | Hook | Behaviour |
 |---|---|
 | `on_request` | No-op; returns `Continue` |
-| `on_response` | Detects `text/event-stream` content type and stores an `is_sse` flag in `FilterContext` metadata. For `bedrock_invoke_model`, reads token headers and calls `ctx.set_token_usage` |
+| `on_response` | Detects `text/event-stream` content type and stores an `is_sse` flag in `FilterContext` metadata. For `bedrock_invoke_model`, reads token headers and stores normalized usage metadata |
 | `response_body_access` | `BodyAccess::None` for `bedrock_invoke_model`; `BodyAccess::ReadOnly` for all others |
 | `response_body_mode` | `BodyMode::Stream` for `bedrock_invoke_model` (no buffering needed); `BodyMode::StreamBuffer { max_bytes: Some(8 MiB) }` for all others |
-| `on_response_body` | Triggered once at `end_of_stream`. Reads the `is_sse` flag; calls `extract_from_sse` for SSE or `extract_token_usage` for JSON; writes result via `ctx.set_token_usage` |
+| `on_response_body` | Processes streaming SSE frames incrementally or assembles bounded JSON; writes normalized usage metadata at completion |
 
 ### SSE Extraction Detail
 
@@ -289,7 +286,7 @@ Token counts are stored under three keys accessible to downstream filters:
 | `token.output` | Output/completion token count as `u64` |
 | `token.total` | Sum (or provider-supplied total) as `u64` |
 
-Written via `ctx.set_token_usage(input, output, total)`.
+Written via the token usage subsystem's private metadata helper.
 
 ### Module Registration
 
