@@ -48,7 +48,7 @@ impl OpenAiHandlingMode {
     }
 }
 
-/// Type-erased access to one concrete [`ToSchema`] implementation.
+/// Type-erased access to one concrete `ToSchema` implementation.
 #[derive(Clone, Copy)]
 pub(crate) struct SchemaBinding {
     /// Return the component name.
