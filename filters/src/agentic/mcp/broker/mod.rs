@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! MCP static catalog filter: static tool catalog, prefix management, and broker
-//! behavior for `initialize`, `tools/list`, `ping`, and `notifications`.
+//! MCP static catalog filter: static tool catalog, prefix management, broker
+//! behavior for `initialize`, `tools/list`, `ping`, `notifications`, and
+//! stateless-profile `tools/call` routing.
 
 pub(crate) mod config;
 
@@ -20,7 +21,10 @@ pub(crate) mod config;
 )]
 mod tests;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
@@ -54,6 +58,9 @@ const ERR_HEADER_MISMATCH: i32 = -32020;
 /// JSON-RPC error code for unsupported protocol version.
 const ERR_UNSUPPORTED_VERSION: i32 = -32022;
 
+/// JSON-RPC error code for invalid params.
+const ERR_INVALID_PARAMS: i32 = -32602;
+
 /// MCP `=?base64?` sentinel prefix.
 const BASE64_SENTINEL_PREFIX: &str = "=?base64?";
 
@@ -66,11 +73,14 @@ const BASE64_SENTINEL_SUFFIX: &str = "?=";
 
 /// MCP static catalog filter that aggregates tool catalogs from multiple backend
 /// MCP servers and handles `initialize`, `tools/list`, `tools/call`, `ping`,
-/// and `notifications/initialized` directly as a static broker.
+/// and `notifications/initialized` as a static broker.
 ///
-/// The broker serves configured catalog operations locally while backend tool
-/// routing is not implemented. It deliberately returns `-32601` for
-/// `tools/call` rather than forwarding a request whose target is unresolved.
+/// In the stateless profile, `tools/call` routes to the configured backend
+/// cluster by exposed tool name, stripping the public prefix from `params.name`
+/// and repairing the forwarded `Mcp-Name` header before forwarding.
+///
+/// In the current profile, `tools/call` returns `-32601` because current-profile
+/// routing requires session infrastructure not implemented here.
 ///
 /// # YAML
 ///
@@ -151,16 +161,18 @@ impl McpBrokerFilter {
     // -------------------------------------------------------------------------
 
     /// Maps a JSON-RPC method to the MCP handler that owns it.
+    #[expect(clippy::too_many_arguments, reason = "body reference needed for tools/call mutation")]
     fn dispatch_method(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         value: &serde_json::Value,
         envelope: &JsonRpcEnvelope,
         method_str: &str,
+        body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
         match self.protocol_profile {
             ProtocolProfile::Current => self.dispatch_current(ctx, value, envelope, method_str),
-            ProtocolProfile::Stateless => Ok(self.dispatch_stateless(ctx, value, envelope, method_str)),
+            ProtocolProfile::Stateless => Ok(self.dispatch_stateless(ctx, value, envelope, method_str, body)),
         }
     }
 
@@ -195,16 +207,15 @@ impl McpBrokerFilter {
     }
 
     /// Stateless-profile dispatch: validates stateless headers, then dispatches.
-    #[expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "signature matches dispatch_current for consistent dispatch_method call"
-    )]
+    #[expect(clippy::too_many_arguments, reason = "body reference needed for tools/call mutation")]
+    #[expect(clippy::too_many_lines, reason = "linear dispatch with early returns")]
     fn dispatch_stateless(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         value: &serde_json::Value,
         envelope: &JsonRpcEnvelope,
         method_str: &str,
+        body: &mut Option<Bytes>,
     ) -> FilterAction {
         let is_notification = method_str.starts_with("notifications/");
         if is_notification {
@@ -219,6 +230,12 @@ impl McpBrokerFilter {
             return invalid_request_action(envelope);
         }
 
+        if method_str == "tools/call"
+            && let Err(detail) = extract_tool_name(value)
+        {
+            return invalid_params_action(envelope, detail);
+        }
+
         if let Some(action) = self.validate_stateless_headers(value, &ctx.request.headers, envelope, method_str) {
             return action;
         }
@@ -226,7 +243,7 @@ impl McpBrokerFilter {
         match method_str {
             "server/discover" => self.handle_server_discover(envelope),
             "tools/list" => self.handle_stateless_tools_list(envelope),
-            "tools/call" => json_rpc_error_action_with_status(envelope, 404, -32601, "method not yet supported"),
+            "tools/call" => self.handle_stateless_tools_call(ctx, value, envelope, body),
             "ping" => handle_ping(envelope),
             "initialize" => json_rpc_error_action_with_status(
                 envelope,
@@ -357,6 +374,48 @@ impl McpBrokerFilter {
         )
     }
 
+    /// Route a stateless `tools/call` to the configured backend cluster.
+    fn handle_stateless_tools_call(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        value: &serde_json::Value,
+        envelope: &JsonRpcEnvelope,
+        body: &mut Option<Bytes>,
+    ) -> FilterAction {
+        let tool_name = match extract_tool_name(value) {
+            Ok(name) => name,
+            Err(detail) => return invalid_params_action(envelope, detail),
+        };
+
+        let Some(tool) = self.catalog.iter().find(|t| t.exposed_name == tool_name) else {
+            return invalid_params_action(envelope, "unknown tool");
+        };
+
+        ctx.cluster = Some(Arc::from(tool.cluster.as_str()));
+        ctx.rewritten_path = Some(tool.backend_path.clone());
+
+        let mut mutated = value.clone();
+        if let Some(p) = mutated.get_mut("params").and_then(|p| p.as_object_mut()) {
+            p.insert("name".to_owned(), serde_json::Value::String(tool.original_name.clone()));
+        }
+        *body = Some(Bytes::from(mutated.to_string()));
+
+        ctx.request_headers_to_set.push((
+            http::header::HeaderName::from_static("mcp-name"),
+            encode_mcp_name(&tool.original_name),
+        ));
+
+        trace!(
+            exposed = tool_name,
+            original = tool.original_name,
+            cluster = tool.cluster,
+            server = tool.server_name,
+            "routing stateless tools/call"
+        );
+
+        FilterAction::Release
+    }
+
     /// `tools/list` response for the stateless profile with cache metadata.
     fn handle_stateless_tools_list(&self, envelope: &JsonRpcEnvelope) -> FilterAction {
         let tools: Vec<serde_json::Value> = self.catalog.iter().map(catalog_tool_to_json).collect();
@@ -449,13 +508,46 @@ impl HttpFilter for McpBrokerFilter {
             ctx.set_metadata("mcp.method", method_str.clone());
         }
 
-        self.dispatch_method(ctx, &value, &envelope, method_str)
+        self.dispatch_method(ctx, &value, &envelope, method_str, body)
     }
 }
 
 // -----------------------------------------------------------------------------
 // Stateless Helpers
 // -----------------------------------------------------------------------------
+
+/// Extracts and validates the tool name from `params.name`.
+fn extract_tool_name(value: &serde_json::Value) -> Result<&str, &'static str> {
+    let Some(params) = value.get("params") else {
+        return Err("missing params");
+    };
+    if params.is_null() {
+        return Err("params is null");
+    }
+    let Some(params_obj) = params.as_object() else {
+        return Err("params must be an object");
+    };
+    let Some(name) = params_obj.get("name") else {
+        return Err("missing params.name");
+    };
+    name.as_str().ok_or("params.name must be a string")
+}
+
+/// Encode a tool name as an HTTP header value, using the MCP `=?base64?`
+/// sentinel for values that contain non-visible-ASCII bytes.
+#[expect(clippy::expect_used, reason = "base64 sentinel is always valid ASCII")]
+fn encode_mcp_name(name: &str) -> http::header::HeaderValue {
+    if name.is_ascii()
+        && !name.bytes().any(|b| b < 0x20 || b == 0x7F)
+        && let Ok(hv) = http::header::HeaderValue::from_str(name)
+    {
+        return hv;
+    }
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(name);
+    let sentinel = format!("{BASE64_SENTINEL_PREFIX}{encoded}{BASE64_SENTINEL_SUFFIX}");
+    http::header::HeaderValue::from_str(&sentinel).expect("base64 sentinel is valid ASCII")
+}
 
 /// Validates the `Mcp-Name` header for stateless requests.
 #[expect(clippy::too_many_lines, reason = "linear validation with early returns")]
@@ -602,8 +694,6 @@ enum McpNameDecodeError {
 /// Returns `Ok(Some(decoded))` for valid sentinels, `Ok(None)` for
 /// non-sentinel values, and `Err` for malformed sentinels.
 fn decode_mcp_name(value: &str) -> Result<Option<String>, McpNameDecodeError> {
-    use base64::Engine as _;
-
     let Some(inner) = value
         .strip_prefix(BASE64_SENTINEL_PREFIX)
         .and_then(|rest| rest.strip_suffix(BASE64_SENTINEL_SUFFIX))
@@ -628,6 +718,21 @@ fn header_str<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
 // -----------------------------------------------------------------------------
 // Error Response Builders
 // -----------------------------------------------------------------------------
+
+/// Builds an invalid-params error response (HTTP 400, JSON-RPC -32602).
+fn invalid_params_action(envelope: &JsonRpcEnvelope, detail: &str) -> FilterAction {
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": { "code": ERR_INVALID_PARAMS, "message": detail },
+        "id": id_value(envelope),
+    });
+
+    FilterAction::Reject(
+        Rejection::status(400)
+            .with_header("content-type", "application/json")
+            .with_body(Bytes::from(response.to_string())),
+    )
+}
 
 /// Builds a header-mismatch error response (HTTP 400, JSON-RPC -32020).
 fn header_mismatch_action(envelope: &JsonRpcEnvelope, message: &str) -> FilterAction {

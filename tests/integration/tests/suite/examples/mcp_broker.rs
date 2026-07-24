@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    free_port, http_send, load_example_config, parse_body, parse_status, start_backend_with_shutdown, start_proxy,
+    free_port, http_send, load_example_config, parse_body, parse_status, start_backend_with_shutdown,
+    start_echo_backend, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -136,6 +137,43 @@ fn mcp_stateless_broker_example_serves_tools_list() {
     assert!(!raw.contains("mcp-session-id:"), "should not include session header");
 }
 
+#[test]
+fn mcp_stateless_broker_example_routes_tools_call() {
+    let weather_guard = start_echo_backend();
+    let calendar_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "mcp-stateless-broker.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", weather_guard.port()),
+            ("127.0.0.1:3002", calendar_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let body_str = stateless_rpc_body_with_params(
+        3,
+        "tools/call",
+        r#""name":"weather_get_weather","arguments":{"city":"NYC"}"#,
+    );
+    let request = stateless_post("/mcp", &body_str, "tools/call", Some("weather_get_weather"));
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "routed tools/call should return 200");
+    let body = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        parsed["params"]["name"], "get_weather",
+        "backend should receive stripped params.name"
+    );
+    assert_eq!(
+        parsed["params"]["arguments"]["city"], "NYC",
+        "arguments should be preserved"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -143,6 +181,12 @@ fn mcp_stateless_broker_example_serves_tools_list() {
 fn stateless_rpc_body(id: u64, method: &str) -> String {
     format!(
         r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{{"name":"test","version":"1.0"}},"io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#,
+    )
+}
+
+fn stateless_rpc_body_with_params(id: u64, method: &str, extra_params: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{{"name":"test","version":"1.0"}},"io.modelcontextprotocol/clientCapabilities":{{}}}},{extra_params}}}}}"#,
     )
 }
 

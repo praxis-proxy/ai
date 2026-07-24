@@ -5,7 +5,7 @@
 
 Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata.
 
-MCP static catalog filter that aggregates tool catalogs from multiple backend MCP servers and handles `initialize`, `tools/list`, `tools/call`, `ping`, and `notifications/initialized` directly as a static broker.
+MCP static catalog filter that aggregates tool catalogs from multiple backend MCP servers and handles `initialize`, `tools/list`, `tools/call`, `ping`, and `notifications/initialized` as a static broker.
 
 ## Configuration Notes
 
@@ -15,7 +15,9 @@ Methods requiring a name selector (`tools/call`, `resources/read`, `prompts/get`
 
 Writes `mcp.*` and `json_rpc.*` entries to the filter result set for branch chain conditions.
 
-The broker serves configured catalog operations locally while backend tool routing is not implemented. It deliberately returns `-32601` for `tools/call` rather than forwarding a request whose target is unresolved.
+In the stateless profile, `tools/call` routes to the configured backend cluster by exposed tool name, stripping the public prefix from `params.name` and repairing the forwarded `Mcp-Name` header before forwarding.
+
+In the current profile, `tools/call` returns `-32601` because current-profile routing requires session infrastructure not implemented here.
 
 Supports two protocol profiles: `current` (session-based, default) and `stateless` (MCP 2026-07-28, configurable). Version and cache fields are derived from the selected profile when omitted.
 
