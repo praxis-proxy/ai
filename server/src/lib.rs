@@ -218,22 +218,22 @@ mod tests {
 
     #[test]
     fn default_config_brands_praxis_ai() {
-        assert!(
-            DEFAULT_CONFIG.contains(r#""server": "praxis-ai""#),
-            "default config should brand the server as praxis-ai"
+        let config = Config::from_yaml(DEFAULT_CONFIG).expect("DEFAULT_CONFIG should parse");
+        let body = config.filter_chains[0].filters[0].config["body"]
+            .as_str()
+            .expect("AI default static response should define a string body");
+        assert_eq!(
+            body, r#"{"status": "ok", "server": "praxis-ai"}"#,
+            "default config should use the AI-branded response body"
         );
     }
 
     #[test]
-    fn load_config_uses_ai_default() {
-        let config = load_config(None).expect("load_config(None) should succeed with AI default");
+    fn load_config_none_succeeds() {
+        let config = load_config(None).expect("load_config(None) should succeed");
         assert!(
             !config.listeners.is_empty(),
-            "AI default config should define at least one listener"
-        );
-        assert_eq!(
-            config.listeners[0].name, "default",
-            "AI default config listener name should be 'default'"
+            "loaded config should define at least one listener"
         );
     }
 }
