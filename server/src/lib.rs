@@ -8,7 +8,26 @@ pub(crate) mod reload;
 mod server;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
-pub use praxis_core::{config::load_config, logging::init_tracing};
+pub use praxis_core::logging::init_tracing;
+
+/// Built-in fallback configuration branded for praxis-ai.
+const DEFAULT_CONFIG: &str = include_str!("default.yaml");
+
+/// Load configuration from an explicit path, falling back to
+/// `praxis.yaml` in the working directory, then the praxis-ai
+/// built-in default.
+///
+/// # Errors
+///
+/// Returns [`ProxyError::Config`] if the resolved config source
+/// cannot be loaded or is invalid.
+///
+/// [`ProxyError::Config`]: praxis_core::errors::ProxyError::Config
+pub fn load_config(
+    explicit_path: Option<&str>,
+) -> Result<praxis_core::config::Config, praxis_core::errors::ProxyError> {
+    praxis_core::config::Config::load(explicit_path, DEFAULT_CONFIG)
+}
 pub use server::{check_root_privilege, fatal, resolve_config_path, run_server, run_server_with_registry};
 
 // -----------------------------------------------------------------------------
@@ -166,4 +185,43 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
         @register registry,
         http "openai_mcp_dispatch" => praxis_ai_apis::openai::McpDispatchFilter::from_config
     );
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
+mod tests {
+    use praxis_core::config::Config;
+
+    use super::*;
+
+    #[test]
+    fn default_config_parses_successfully() {
+        let config = Config::from_yaml(DEFAULT_CONFIG).expect("DEFAULT_CONFIG should parse");
+        assert!(
+            !config.listeners.is_empty(),
+            "default config should define at least one listener"
+        );
+    }
+
+    #[test]
+    fn default_config_brands_praxis_ai() {
+        assert!(
+            DEFAULT_CONFIG.contains(r#""server": "praxis-ai""#),
+            "default config should brand the server as praxis-ai"
+        );
+    }
+
+    #[test]
+    fn load_config_uses_ai_default() {
+        let config = load_config(None).expect("load_config(None) should succeed with AI default");
+        assert!(
+            !config.listeners.is_empty(),
+            "AI default config should define at least one listener"
+        );
+    }
 }
