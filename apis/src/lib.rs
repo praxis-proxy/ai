@@ -6,8 +6,7 @@
 //! AI provider API types and persistence for Praxis.
 //!
 //! Contains provider-specific protocol types (OpenAI, Anthropic),
-//! request classification, response storage backends, and token
-//! usage extraction.
+//! request classification, and response storage backends.
 
 pub mod anthropic;
 pub mod classifier;
@@ -15,7 +14,6 @@ pub(crate) mod mcp_client;
 pub mod openai;
 #[cfg(feature = "store")]
 pub mod store;
-pub mod token_usage;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.

@@ -1,7 +1,7 @@
 ---
 issue: https://github.com/praxis-proxy/praxis/issues/211
 discussion: https://github.com/praxis-proxy/praxis/issues/20
-status: proposed
+status: superseded
 authors:
   - szedan-rh
 graduation_criteria:
@@ -15,6 +15,13 @@ stakeholders:
 ---
 
 # Streaming Token Counting — Implementation Design
+
+> **Superseded.** The design described here was implemented and then
+> consolidated into the private `filters/src/token_usage/` subsystem.
+> The public `TokenUsageProvider` enum and `extract_streaming_tokens`
+> function no longer exist; streaming parsing is handled by private
+> functions in `filters/src/token_usage/streaming.rs`. See proposal
+> [#210] for the current design.
 
 ## Overview
 

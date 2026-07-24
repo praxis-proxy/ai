@@ -8,6 +8,8 @@ use http::header::{HeaderName, HeaderValue};
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext};
 use tracing::trace;
 
+use super::{META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_TOTAL};
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -20,15 +22,6 @@ const HEADER_TOKEN_OUTPUT: HeaderName = HeaderName::from_static("praxis-token-ou
 
 /// Response header carrying the total token count.
 const HEADER_TOKEN_TOTAL: HeaderName = HeaderName::from_static("praxis-token-total");
-
-/// Metadata key for the input token count.
-const META_TOKEN_INPUT: &str = "token.input";
-
-/// Metadata key for the output token count.
-const META_TOKEN_OUTPUT: &str = "token.output";
-
-/// Metadata key for the total token count.
-const META_TOKEN_TOTAL: &str = "token.total";
 
 // -----------------------------------------------------------------------------
 // TokenUsageHeadersFilter

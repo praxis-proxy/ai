@@ -134,12 +134,11 @@ New capabilities require:
   SSE, model rewrite, store, rehydrate, validate, proxy
 - `apis/src/classifier/` — AI request format detection
 - `apis/src/store/` — ResponseStore trait, SQLite/Postgres
-- `apis/src/token_usage/` — Multi-provider token counting
 - `filters/src/agentic/` — A2A, MCP protocol filters
 - `filters/src/guardrails/` — AI content safety (NeMo)
 - `filters/src/inference/` — Model-to-header routing
 - `filters/src/prompt_enrich/` — Prompt enrichment
-- `filters/src/token_usage_headers.rs` — Token headers
+- `filters/src/token_usage/` — Multi-provider token counting and token headers
 
 ## Dynamic Config Reload
 
