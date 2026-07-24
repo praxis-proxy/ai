@@ -336,7 +336,7 @@ fn synthetic_bridge_call_ids_are_bounded_and_response_specific() {
 fn bridge_budget_retains_ascii_context_near_the_execution_cap() {
     let result = SearchResult {
         attributes: None,
-        content: (0..citations::MAX_FORMATTED_CHUNKS)
+        content: (0..model_context::MAX_FORMATTED_CHUNKS)
             .map(|_| ContentChunk {
                 _chunk_type: ContentChunkType::Text,
                 text: "a".repeat(512),

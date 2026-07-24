@@ -12,6 +12,7 @@
 pub(crate) mod citations;
 pub(crate) mod client;
 mod config;
+mod model_context;
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,12 +25,12 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::{
-    citations::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
     client::{
         FileSearchClient, FileSearchClientConfig, MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES,
         SearchBatch, SearchFailure, SearchSpec, request_error,
     },
     config::{FileSearchFilterConfig, build_config},
+    model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::openai::responses::{
     bounded_json_size,
