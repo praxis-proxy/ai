@@ -159,6 +159,7 @@ impl FileResolveFilter {
             api_base_url: validated.files_api_url.clone(),
             callout_config: CalloutConfig {
                 failure_mode: FailureMode::Closed,
+                max_response_bytes: validated.max_body_bytes,
                 timeout_ms: validated.timeout_ms,
                 status_on_error: 502,
                 ..CalloutConfig::default()
@@ -396,7 +397,11 @@ fn rewrite_body(
 /// `messages` / `persisted_messages` with the resolved items.
 /// History messages prepended by rehydrate are also walked so
 /// that any `file_id` references in them are resolved.
-#[expect(clippy::too_many_arguments, reason = "threading resolver through state sync")]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "threading resolver through state sync"
+)]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: &serde_json::Value,
@@ -423,14 +428,21 @@ async fn sync_state_with_budget(
         url_resolver,
     };
 
-    sync_message_history(&mut state.messages, input_len, Some(resolved_input), resolver, budget).await?;
-    sync_persisted_history(
+    Box::pin(sync_message_history(
+        &mut state.messages,
+        input_len,
+        Some(resolved_input),
+        resolver,
+        budget,
+    ))
+    .await?;
+    Box::pin(sync_persisted_history(
         &mut state.persisted_messages,
         input_len,
         Some(resolved_input),
         resolver,
         budget,
-    )
+    ))
     .await
 }
 
@@ -467,8 +479,22 @@ async fn resolve_state_history(
         url_resolver,
     };
 
-    sync_message_history(&mut state.messages, input_len, None, resolver, budget).await?;
-    sync_persisted_history(&mut state.persisted_messages, input_len, None, resolver, budget).await
+    Box::pin(sync_message_history(
+        &mut state.messages,
+        input_len,
+        None,
+        resolver,
+        budget,
+    ))
+    .await?;
+    Box::pin(sync_persisted_history(
+        &mut state.persisted_messages,
+        input_len,
+        None,
+        resolver,
+        budget,
+    ))
+    .await
 }
 
 /// Shared dependencies for resolving one state history vector.

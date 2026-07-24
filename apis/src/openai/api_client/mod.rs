@@ -8,17 +8,14 @@
 //! JSON and byte reads, and normalized error mapping. Used by
 //! [`FilesApiClient`] and vector-store search.
 //!
-//! JSON requests route through `praxis_core::callout::CalloutClient`
-//! for circuit breaking, callout-depth protection, and timeout.
-//! Content downloads use a direct `reqwest::Client` with
-//! chunk-by-chunk bounded reads so oversized responses are rejected
-//! during collection. Unifying both paths behind `CalloutClient`
-//! is tracked in [#454].
+//! All requests route through `praxis_core::callout::CalloutClient`
+//! for circuit breaking, callout-depth protection, timeout, and
+//! bounded reads via `CalloutConfig::max_response_bytes`. Content
+//! downloads (`get_bytes`) apply a tighter per-request `max_bytes`
+//! check post-collection so callers can enforce file-level budgets.
 //!
 //! Each consuming filter retains its own [`ApiClient`] instance so
 //! circuit-breaker state is isolated per filter.
-//!
-//! [#454]: https://github.com/praxis-proxy/ai/issues/454
 //!
 //! [`FilesApiClient`]: super::responses::file_resolve
 
@@ -28,7 +25,6 @@ pub(crate) mod url;
 use std::time::Duration;
 
 use praxis_core::callout::{CalloutClient, CalloutConfig, CalloutRequest, CalloutResult};
-use reqwest::redirect;
 
 pub(crate) use self::{
     error::ApiClientError,
@@ -51,25 +47,22 @@ pub(crate) struct ApiClientConfig {
 
 /// Shared HTTP client for OpenAI-compatible API callouts.
 ///
-/// JSON requests (`get_json`) route through [`CalloutClient`]
-/// for circuit breaking and callout-depth protection. Content
-/// downloads (`get_bytes`) use a direct
-/// `reqwest::Client` with chunk-by-chunk bounded reads so
-/// oversized responses are rejected during collection without
-/// unbounded memory consumption. Unifying both paths behind
-/// `CalloutClient` is tracked in [#454] and requires
-/// `CalloutConfig::max_response_bytes` (praxis-core post-0.4.0).
+/// All requests route through [`CalloutClient`] for circuit
+/// breaking, callout-depth protection, and bounded reads via
+/// [`CalloutConfig::max_response_bytes`].
 ///
-/// [#454]: https://github.com/praxis-proxy/ai/issues/454
+/// Content downloads (`get_bytes`) apply a tighter per-request
+/// `max_bytes` check after collection to return
+/// [`ApiClientError::ResponseTooLarge`]. The client-wide
+/// `max_response_bytes` caps memory during collection; the
+/// per-request limit lets callers enforce stricter file-level
+/// budgets.
 pub(crate) struct ApiClient {
     /// Base URL of the API endpoint (trailing slash stripped).
     api_base_url: String,
-    /// Callout client for JSON metadata requests.
+    /// Callout client shared by all request paths.
     client: CalloutClient,
-    /// Direct HTTP client for bounded content downloads.
-    content_client: reqwest::Client,
-    /// Header names to forward from the original downstream
-    /// request.
+    /// Header names to forward from the original downstream request.
     forward_header_names: Vec<http::HeaderName>,
     /// Per-request timeout (from the callout config).
     timeout: Duration,
@@ -97,17 +90,9 @@ impl ApiClient {
 
         let client = CalloutClient::new(callout_config).map_err(|e| format!("failed to build callout client: {e}"))?;
 
-        let content_client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(redirect::Policy::none())
-            .timeout(timeout)
-            .build()
-            .map_err(|e| format!("failed to build content client: {e}"))?;
-
         Ok(Self {
             api_base_url: api_base_url.trim_end_matches('/').to_owned(),
             client,
-            content_client,
             forward_header_names,
             timeout,
         })
@@ -207,42 +192,44 @@ impl ApiClient {
         Ok(response.body)
     }
 
-    /// Send a GET request and return the response body with
-    /// chunk-by-chunk bounded reads.
+    /// Send a GET request via the callout client and return the
+    /// response body, rejecting it when it exceeds `max_bytes`.
     ///
-    /// Uses a direct `reqwest::Client` so the `max_bytes` limit
-    /// is enforced during collection — oversized responses are
-    /// rejected without unbounded memory consumption. Redirects
-    /// are rejected, and the configured timeout spans the full
-    /// request including body transfer.
+    /// Memory during collection is bounded by
+    /// [`CalloutConfig::max_response_bytes`] (the client-wide
+    /// limit). The per-request `max_bytes` is checked
+    /// post-collection so callers can enforce tighter file-level
+    /// budgets while still returning
+    /// [`ApiClientError::ResponseTooLarge`].
     ///
-    /// This path does not share the [`CalloutClient`]'s circuit
-    /// breaker or callout-depth accounting. Unifying both behind
-    /// `CalloutClient` is tracked in [#454].
-    ///
-    /// [#454]: https://github.com/praxis-proxy/ai/issues/454
+    /// The configured timeout spans the full request including
+    /// body transfer.
     pub(crate) async fn get_bytes(
         &self,
         url: &str,
         request_headers: &http::HeaderMap,
         max_bytes: usize,
     ) -> Result<Vec<u8>, ApiClientError> {
-        let mut builder = self.content_client.get(url);
-        for (name, value) in self.forward_headers(request_headers) {
-            builder = builder.header(name, value);
+        let headers = self.forward_headers(request_headers);
+        let request = CalloutRequest {
+            body: None,
+            depth: 0,
+            headers,
+            method: http::Method::GET,
+            url: url.to_owned(),
+        };
+
+        let response = tokio::time::timeout(self.timeout, execute_callout(&self.client, request))
+            .await
+            .map_err(|_elapsed| ApiClientError::CalloutFailed {
+                detail: "content download timed out".to_owned(),
+            })??;
+
+        if response.body.len() > max_bytes {
+            return Err(ApiClientError::ResponseTooLarge { limit: max_bytes });
         }
 
-        let response = builder.send().await.map_err(|e| ApiClientError::CalloutFailed {
-            detail: format!("content download failed: {e}"),
-        })?;
-
-        if !response.status().is_success() {
-            return Err(ApiClientError::CalloutFailed {
-                detail: format!("content download failed: {}", response.status()),
-            });
-        }
-
-        read_bounded_body(response, max_bytes).await
+        Ok(response.body)
     }
 
     /// Copy configured headers from the original downstream
@@ -259,27 +246,6 @@ impl ApiClient {
         }
         headers
     }
-}
-
-/// Read a response body chunk-by-chunk, rejecting it as soon as
-/// accumulated bytes exceed `max_bytes`.
-async fn read_bounded_body(mut response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, ApiClientError> {
-    if let Some(len) = response.content_length()
-        && len > max_bytes as u64
-    {
-        return Err(ApiClientError::ResponseTooLarge { limit: max_bytes });
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| ApiClientError::CalloutFailed {
-        detail: format!("content download failed: {e}"),
-    })? {
-        if body.len() + chunk.len() > max_bytes {
-            return Err(ApiClientError::ResponseTooLarge { limit: max_bytes });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 /// Execute a callout and map non-success outcomes to
@@ -369,11 +335,16 @@ mod tests {
     }
 
     fn test_client(base_url: &str) -> ApiClient {
+        test_client_with_limits(base_url, CalloutConfig::default().max_response_bytes, 1_000)
+    }
+
+    fn test_client_with_limits(base_url: &str, max_response_bytes: usize, timeout_ms: u64) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: base_url.to_owned(),
             callout_config: CalloutConfig {
                 failure_mode: FailureMode::Closed,
-                timeout_ms: 1_000,
+                max_response_bytes,
+                timeout_ms,
                 ..CalloutConfig::default()
             },
             forward_header_names: Vec::new(),
@@ -738,19 +709,18 @@ mod tests {
 
     #[tokio::test]
     async fn get_bytes_above_one_mib_succeeds() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let (listener, address) = bind_test_server();
         let payload_size: usize = 1_200_000;
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _read = stream.read(&mut request).unwrap();
+            let mut buf = [0_u8; 4096];
+            let _read = stream.read(&mut buf).unwrap();
             let body = vec![0x42_u8; payload_size];
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {payload_size}\r\nConnection: close\r\n\r\n");
-            stream.write_all(response.as_bytes()).unwrap();
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {payload_size}\r\nConnection: close\r\n\r\n");
+            stream.write_all(header.as_bytes()).unwrap();
             stream.write_all(&body).unwrap();
         });
-        let client = test_client(&format!("http://{address}"));
+        let client = test_client_with_limits(&format!("http://{address}"), 2_000_000, 5_000);
 
         let bytes = client
             .get_bytes(
@@ -762,6 +732,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(bytes.len(), payload_size, "should receive full >1 MiB payload");
+    }
+
+    #[tokio::test]
+    async fn get_bytes_client_wide_limit_rejects_oversized_chunked_response() {
+        let (listener, address) = bind_test_server();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 4096];
+            let _read = stream.read(&mut buf).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.write_all(&vec![0x41_u8; 256]).unwrap();
+        });
+        let client = test_client_with_limits(&format!("http://{address}"), 64, 1_000);
+
+        let err = client
+            .get_bytes(
+                &format!("http://{address}/v1/files/huge/content"),
+                &http::HeaderMap::new(),
+                1024,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ApiClientError::CalloutFailed { .. }),
+            "response exceeding client-wide max_response_bytes should be rejected by callout client"
+        );
     }
 
     fn slow_body_server(listener: TcpListener) {
@@ -782,17 +781,7 @@ mod tests {
     async fn get_bytes_timeout_covers_response_body() {
         let (listener, addr) = bind_test_server();
         slow_body_server(listener);
-
-        let client = ApiClient::new(ApiClientConfig {
-            api_base_url: format!("http://{addr}"),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms: 50,
-                ..CalloutConfig::default()
-            },
-            forward_header_names: Vec::new(),
-        })
-        .unwrap();
+        let client = test_client_with_limits(&format!("http://{addr}"), 1024, 50);
 
         let err = client
             .get_bytes(
