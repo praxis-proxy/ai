@@ -1,7 +1,7 @@
 ---
 issue: https://github.com/praxis-proxy/praxis/issues/216
 discussion: https://github.com/praxis-proxy/praxis/issues/216#issuecomment-4563373566
-status: proposed
+status: superseded
 authors:
   - yehuditkerido
 stakeholders:
@@ -10,6 +10,13 @@ stakeholders:
 ---
 
 # Provider-Specific Token Usage Mapping
+
+> **Superseded.** The public API described here (`TokenUsageProvider`,
+> `extract_token_usage`, `TokenUsage`) was consolidated into the private
+> `filters/src/token_usage/` subsystem. Provider parsing is now handled
+> by private modules (`providers.rs`, `streaming.rs`) with no public
+> exports beyond the two filter types. See proposal [#210] for the
+> current design.
 
 ## What?
 
