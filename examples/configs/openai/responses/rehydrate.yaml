@@ -8,7 +8,7 @@
 #
 # Pipeline ordering:
 #   1. openai_responses_format — classifies body, promotes metadata
-#   2. openai_responses_validate — validates parameters, generates IDs
+#   2. openai_responses_validate — parses JSON, enriches metadata, generates IDs
 #   3. openai_response_store — initializes store, registers in ctx
 #   4. openai_responses_rehydrate — validates previous response, sets metadata
 #
