@@ -1,6 +1,9 @@
 # Cargo build output
 target
 
+# Default rustc output
+rust_out
+
 # Test artifacts
 **/*.db
 **/postgres.rs.tmp*
