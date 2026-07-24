@@ -23,7 +23,10 @@ use crate::{
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Maximum number of items accepted by create endpoints.
+/// Maximum number of items accepted by a single create request.
+///
+/// This is not a cumulative per-conversation limit. The OpenAI contract does
+/// not define a total item-count or byte-size ceiling for a conversation.
 const MAX_ITEMS_PER_REQUEST: usize = 20;
 
 // -----------------------------------------------------------------------------
@@ -741,9 +744,10 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
 
 /// Refresh the denormalized conversation message cache from item rows.
 ///
-/// Re-reads all items on every mutation rather than patching the JSON
-/// array incrementally. Acceptable because conversations hold a small
-/// number of items; incremental updates would risk drift.
+/// This currently re-reads all items on every mutation. Conversations are not
+/// assumed to be small: the OpenAI contract has no cumulative item or byte
+/// ceiling. Replace this full-history rebuild with incremental processing; do
+/// not add a non-spec conversation limit as a workaround. Tracked in #532.
 pub(super) async fn sync_conversation_messages(
     store: &dyn ConversationItemStore,
     record: ConversationRecord,
