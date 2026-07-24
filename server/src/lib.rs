@@ -8,8 +8,35 @@ pub(crate) mod reload;
 mod server;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
-pub use praxis_core::{config::load_config, logging::init_tracing};
+pub use praxis_core::logging::init_tracing;
 pub use server::{check_root_privilege, fatal, resolve_config_path, run_server, run_server_with_registry};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Built-in fallback configuration branded for praxis-ai.
+const DEFAULT_CONFIG: &str = include_str!("default.yaml");
+
+// -----------------------------------------------------------------------------
+// Configuration Loading
+// -----------------------------------------------------------------------------
+
+/// Load configuration from an explicit path, falling back to
+/// `praxis.yaml` in the working directory, then the praxis-ai
+/// built-in default.
+///
+/// # Errors
+///
+/// Returns [`ProxyError::Config`] if the resolved config source
+/// cannot be loaded or is invalid.
+///
+/// [`ProxyError::Config`]: praxis_core::errors::ProxyError::Config
+pub fn load_config(
+    explicit_path: Option<&str>,
+) -> Result<praxis_core::config::Config, praxis_core::errors::ProxyError> {
+    praxis_core::config::Config::load(explicit_path, DEFAULT_CONFIG)
+}
 
 // -----------------------------------------------------------------------------
 // External Filter Discovery
@@ -166,4 +193,47 @@ fn register_openai_response_filters(registry: &mut praxis_filter::FilterRegistry
         @register registry,
         http "openai_mcp_dispatch" => praxis_ai_apis::openai::McpDispatchFilter::from_config
     );
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
+mod tests {
+    use praxis_core::config::Config;
+
+    use super::*;
+
+    #[test]
+    fn default_config_parses_successfully() {
+        let config = Config::from_yaml(DEFAULT_CONFIG).expect("DEFAULT_CONFIG should parse");
+        assert!(
+            !config.listeners.is_empty(),
+            "default config should define at least one listener"
+        );
+    }
+
+    #[test]
+    fn default_config_brands_praxis_ai() {
+        let config = Config::from_yaml(DEFAULT_CONFIG).expect("DEFAULT_CONFIG should parse");
+        let body = config.filter_chains[0].filters[0].config["body"]
+            .as_str()
+            .expect("AI default static response should define a string body");
+        assert_eq!(
+            body, r#"{"status": "ok", "server": "praxis-ai"}"#,
+            "default config should use the AI-branded response body"
+        );
+    }
+
+    #[test]
+    fn load_config_none_succeeds() {
+        let config = load_config(None).expect("load_config(None) should succeed");
+        assert!(
+            !config.listeners.is_empty(),
+            "loaded config should define at least one listener"
+        );
+    }
 }
