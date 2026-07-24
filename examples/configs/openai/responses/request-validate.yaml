@@ -1,7 +1,6 @@
 # Responses API Request Validation
 #
-# Validates Responses API requests and rejects invalid parameter
-# combinations.
+# Validates Responses API JSON and enriches request metadata.
 #
 # Build:
 #   cargo build -p praxis-ai-proxy
@@ -9,16 +8,15 @@
 # The openai_responses_format classifier must run before openai_responses_validate.
 # It buffers the body, classifies the request as Responses API, and
 # promotes model/stream/store/background to openai_responses_format.*
-# metadata that openai_responses_validate reads for parameter-combination
-# validation.
+# metadata that openai_responses_validate copies into responses.* metadata.
 #
 # openai_responses_validate then extracts conversation.id when present,
 # generates response and conversation IDs, and writes responses.*
 # metadata for downstream pipeline filters.
 #
-# Valid requests are forwarded to the upstream backend with the
-# original body unchanged. Invalid requests receive a 400 JSON
-# error response.
+# Valid JSON requests are forwarded to the upstream backend with the
+# original body unchanged. Invalid JSON requests receive a 400 error
+# response. Provider-supported parameter combinations are not rejected.
 #
 # Example valid request:
 #
@@ -26,11 +24,17 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
 #
-# Example rejected request (stream + background conflict):
+# Example background streaming request (forwarded to a capable backend):
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"test","stream":true,"background":true}'
+#
+# Example background request without durable storage:
+#
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"test","background":true,"store":false}'
 
 listeners:
   - name: responses-gateway

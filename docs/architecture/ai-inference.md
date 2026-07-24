@@ -23,7 +23,7 @@ Classifier (pure function)
 Format Filter (promotes facts to headers/metadata/results)
   |
   v
-Validate Filter (parameter checks, ID generation)
+Validate Filter (JSON parsing, metadata enrichment, ID generation)
   |
   v
 Branch Chains / Router (routing decisions)
@@ -133,10 +133,10 @@ headers, metadata, and filter results.
 
 ### `openai_responses_validate`
 
-Validates Responses API parameter combinations
-(e.g. stream + background conflicts) and generates
-cryptographically random response and conversation
-IDs with `resp_` and `conv_` prefixes.
+Parses Responses API request JSON, enriches filter metadata,
+and generates cryptographically random response and
+conversation IDs with `resp_` and `conv_` prefixes.
+Provider-owned parameter combinations pass through unchanged.
 
 ### `anthropic_messages_format`
 
