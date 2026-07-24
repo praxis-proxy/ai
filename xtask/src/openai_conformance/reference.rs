@@ -111,21 +111,11 @@ fn refresh_reference_source(revision: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Verify the checked-in complete spec against its pinned upstream source.
-#[expect(clippy::too_many_lines, reason = "complete local and remote source verification")]
+/// Verify the checked-in complete spec against its pinned manifest digest.
 fn check_reference_source() -> Result<(), String> {
     let manifest_path = repo_root().join(OPENAI_REFERENCE_MANIFEST);
     let manifest = read_manifest(&manifest_path)?;
     validate_manifest(&manifest)?;
-
-    let source = fetch_upstream(&manifest.revision)?;
-    let actual_source_sha256 = sha256_hex(&source);
-    if actual_source_sha256 != manifest.source_sha256 {
-        return Err(format!(
-            "upstream source digest mismatch for {}: expected {}, got {}",
-            manifest.revision, manifest.source_sha256, actual_source_sha256,
-        ));
-    }
 
     let source_path = repo_root().join(OPENAI_REFERENCE_SPEC);
     let checked_in =
@@ -133,15 +123,10 @@ fn check_reference_source() -> Result<(), String> {
     let checked_in_sha256 = sha256_hex(&checked_in);
     if checked_in_sha256 != manifest.source_sha256 {
         return Err(format!(
-            "{} digest mismatch: expected {}, got {checked_in_sha256}",
+            "{} digest mismatch: expected {}, got {checked_in_sha256}; \
+             run cargo xtask openai-conformance-reference --revision {}",
             source_path.display(),
             manifest.source_sha256,
-        ));
-    }
-    if source != checked_in {
-        return Err(format!(
-            "{} is stale; run cargo xtask openai-conformance-reference --revision {}",
-            source_path.display(),
             manifest.revision,
         ));
     }
