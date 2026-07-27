@@ -828,6 +828,66 @@ async fn connector_id_entry_preserves_body() {
 }
 
 // =========================================================================
+// Entry Deduplication
+// =========================================================================
+
+#[test]
+fn dedup_entries_groups_same_label_url() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["x"]}),
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["y"]}),
+        serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    let (mapping, tasks) = dedup_entries(&entries);
+
+    assert_eq!(tasks.len(), 2, "two unique servers → two tasks");
+    assert_eq!(
+        mapping[0], mapping[1],
+        "entries sharing (label, url) should map to the same task"
+    );
+    assert_ne!(
+        mapping[0], mapping[2],
+        "different servers should map to different tasks"
+    );
+}
+
+#[test]
+fn dedup_entries_keeps_credentialed_independent() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_a"}),
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_b"}),
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp"}),
+    ];
+    let (mapping, tasks) = dedup_entries(&entries);
+
+    assert_eq!(
+        tasks.len(),
+        3,
+        "each credentialed entry + one non-credentialed = three tasks"
+    );
+    assert_ne!(mapping[0], mapping[1], "different credentials → different tasks");
+    assert_ne!(
+        mapping[0], mapping[2],
+        "credentialed vs non-credentialed → different tasks"
+    );
+}
+
+#[test]
+fn dedup_entries_skips_non_resolvable() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "connector_id": "conn_1"}),
+        serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.1/mcp", "defer_loading": true}),
+        serde_json::json!({"server_label": "c", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    let (mapping, tasks) = dedup_entries(&entries);
+
+    assert_eq!(tasks.len(), 1, "only one resolvable entry");
+    assert!(mapping[0].is_none(), "connector_id entry not resolvable");
+    assert!(mapping[1].is_none(), "deferred entry not resolvable");
+    assert_eq!(mapping[2], Some(0), "resolvable entry maps to task 0");
+}
+
+// =========================================================================
 // Distinct Server Counting
 // =========================================================================
 
