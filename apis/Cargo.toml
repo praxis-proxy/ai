@@ -28,7 +28,6 @@ http = { workspace = true }
 percent-encoding = { workspace = true }
 praxis-core = { workspace = true, features = ["callout"] }
 praxis-filter = { workspace = true }
-regex = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
 secrecy = { workspace = true }
@@ -44,7 +43,6 @@ utoipa = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-chrono = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = { workspace = true }
 tempfile = { workspace = true }
