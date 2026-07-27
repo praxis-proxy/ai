@@ -1301,6 +1301,25 @@ async fn conversation_item_methods_fail_without_items_table() {
         matches!(err, StoreError::Unavailable(_)),
         "max_position should return Unavailable"
     );
+
+    let sync_item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
+    let err = store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &[sync_item])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Unavailable(_)),
+        "create_items_and_sync_messages should return Unavailable"
+    );
+
+    let err = store
+        .delete_item_and_sync_messages("tenant_a", "conv_1", "item_1")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Unavailable(_)),
+        "delete_item_and_sync_messages should return Unavailable"
+    );
 }
 
 // -----------------------------------------------------------------------------
