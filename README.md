@@ -79,6 +79,22 @@ Praxis AI handles the AI-specific layer. For listeners, TLS, load balancing,
 rate limiting, health checks, and other core proxy features, visit the
 [Praxis repository](https://github.com/praxis-proxy/praxis).
 
+> [!IMPORTANT]
+> Praxis AI is alpha software. APIs, configuration, and operational
+> behavior may change before `v1.0.0`. See the [security policy]
+> for the supported release line.
+
+Released container images are available from
+[`ghcr.io/praxis-proxy/ai`][container images]. Source builds and local
+development instructions are in the [development guide].
+
+```console
+docker pull ghcr.io/praxis-proxy/ai:0.1
+```
+
+Podman can pull the same OCI image. See the [quickstart] for a source build
+and the [release documentation] for image contents and tagging.
+
 ## Contributing
 
 Contributions are welcome, from bug reports and documentation fixes to new
@@ -95,3 +111,8 @@ For larger changes, start a [discussion] and follow the
 [issues]: https://github.com/praxis-proxy/ai/issues/new
 [pull requests]: https://github.com/praxis-proxy/ai/compare
 [discussion]: https://github.com/praxis-proxy/ai/discussions
+[container images]: https://github.com/praxis-proxy/ai/pkgs/container/ai
+[development guide]: docs/developing/getting-started.md
+[quickstart]: docs/quickstart.md
+[release documentation]: docs/release.md
+[security policy]: SECURITY.md

@@ -2,14 +2,13 @@
 
 ## Supported Versions
 
-| Version   | Supported   |
-| --------- | ----------- |
-| 0.1.x     | No (Alpha)  |
-| 0.2.x     | No (Alpha)  |
-| 0.3.x     | No (Alpha)  |
+| Version | Supported |
+| ------- | --------- |
+| 0.1.x   | Yes (Alpha) |
 
-Only the latest patch release of each minor version
-receives security updates.
+Praxis AI is pre-`1.0.0`. Only the latest patch release of the current
+minor line receives security updates. Older pre-release lines become
+unsupported when a new minor line is released.
 
 ## Reporting a Vulnerability
 
@@ -25,8 +24,9 @@ Include:
 
 ## Response Timeline
 
-Prior to `v1.0.0` we will work with researchers individually on
-timelines. After `v1.0.0` we will have a standardized response timeline.
+Prior to `v1.0.0`, we coordinate disclosure and remediation timelines
+with researchers individually. We will publish a standardized response
+timeline before the first stable release.
 
 ## Severity Classification
 

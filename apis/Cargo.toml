@@ -7,6 +7,7 @@ authors.workspace = true
 description = "AI provider API types and persistence for Praxis"
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [lib]
 name = "praxis_ai_apis"

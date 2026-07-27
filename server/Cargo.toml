@@ -8,6 +8,7 @@ description = "AI-native proxy server built on Praxis"
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
+publish = false
 
 [package.metadata.cargo-machete]
 ignored = ["cargo_metadata"]
