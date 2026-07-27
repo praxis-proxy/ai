@@ -34,7 +34,7 @@ make setup-hooks    # install git pre-commit hook
 make build          # workspace build
 make test           # all tests
 make fmt            # format with nightly rustfmt
-make lint           # clippy + nightly fmt check
+make lint           # clippy, fmt, dependency, docs, and example checks
 make doc            # rustdoc with -D warnings
 make audit          # cargo audit + cargo deny check
 make container      # build praxis-ai container image
@@ -103,6 +103,7 @@ New capabilities require:
 2. Integration tests
 3. Example config in `examples/configs/`
 4. Functional integration test for the example config
+5. Generated example and filter documentation kept in sync
 
 ## Adding a Filter
 

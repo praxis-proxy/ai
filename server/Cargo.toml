@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 readme = "../README.md"
 
+[package.metadata.cargo-machete]
+ignored = ["cargo_metadata"]
+
 [lib]
 name = "praxis_ai"
 path = "src/lib.rs"

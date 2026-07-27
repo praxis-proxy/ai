@@ -91,8 +91,12 @@ test-openai-conformance: openai-conformance
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo +nightly fmt --all -- --check
+	cargo machete --with-metadata .
+	cargo xtask lint-deps
 	cargo xtask lint-separators
 	cargo xtask lint-filter-docs
+	cargo xtask lint-example-tests
+	cargo xtask sync-example-readme
 
 fmt:
 	cargo +nightly fmt --all
@@ -179,7 +183,7 @@ help:
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
 	@echo ""
 	@echo "Quality:"
-	@echo "  lint                 clippy + rustfmt + separator width + filter docs check"
+	@echo "  lint                 clippy + rustfmt + dependency, docs, and example checks"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"

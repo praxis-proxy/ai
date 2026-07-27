@@ -15,7 +15,6 @@ workspace = true
 
 [dependencies]
 clap = { workspace = true }
-nix = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 praxis-ai = { path = "../server", package = "praxis-ai-proxy" }
@@ -28,6 +27,5 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "net", "io-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

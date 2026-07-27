@@ -2923,7 +2923,6 @@ dependencies = [
  "url",
  "utoipa",
  "yaml_serde",
- "zeroize",
 ]
 
 [[package]]
@@ -2933,12 +2932,10 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
- "dashmap 6.2.1",
  "http",
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
- "rand 0.10.2",
  "serde",
  "serde_json",
  "tokio",
@@ -3115,43 +3112,30 @@ dependencies = [
 name = "praxis-tests-integration"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "async-trait",
  "base64",
  "bytes",
  "futures",
  "http",
- "jsonwebtoken",
  "nix",
- "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
- "praxis-proxy-protocol",
  "praxis-test-utils",
- "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
- "tokio-rustls",
  "tokio-tungstenite",
- "yaml_serde",
 ]
 
 [[package]]
 name = "praxis-tests-schema"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bytes",
  "praxis-proxy-core",
  "praxis-proxy-filter",
- "praxis-proxy-tls",
  "praxis-test-utils",
- "serde",
- "serde_json",
  "yaml_serde",
 ]
 
@@ -5775,7 +5759,6 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
- "nix",
  "praxis-ai-apis",
  "praxis-ai-proxy",
  "praxis-proxy-core",
@@ -5787,7 +5770,6 @@ dependencies = [
  "sha2 0.10.9",
  "syn 3.0.3",
  "tempfile",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "yaml_serde",
