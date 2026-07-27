@@ -255,7 +255,7 @@
           "exact": 1,
           "missing": 0,
           "drifted": 7,
-          "request_drifted": 5,
+          "request_drifted": 4,
           "response_drifted": 7,
           "other_drifted": 0,
           "exact_percent": 12.5,
@@ -305,7 +305,6 @@
               "has_response_drift": true,
               "has_other_drift": false,
               "request_details": [
-                "parameters.deleted.query",
                 "parameters.query.limit.schema.format.from",
                 "parameters.query.limit.schema.format.to",
                 "parameters.query.limit.schema.default.from",
@@ -326,12 +325,10 @@
                 "path": "/conversations/{conversation_id}/items/{item_id}",
                 "operation": "GET /conversations/{conversation_id}/items/{item_id}"
               },
-              "has_request_drift": true,
+              "has_request_drift": false,
               "has_response_drift": true,
               "has_other_drift": false,
-              "request_details": [
-                "parameters.deleted.query"
-              ],
+              "request_details": [],
               "response_details": [
                 "responses.200.content.application/json.schema.oneOf.deleted",
                 "responses.200.content.application/json.schema.type.added",
@@ -400,7 +397,6 @@
               "has_response_drift": true,
               "has_other_drift": false,
               "request_details": [
-                "parameters.deleted.query",
                 "requestBody.content.application/json.schema.type.added",
                 "requestBody.content.application/json.schema.properties.items.items.oneOf.deleted",
                 "requestBody.content.application/json.schema.properties.items.items.type.added",
@@ -430,7 +426,7 @@
       "exact": 1,
       "missing": 0,
       "drifted": 7,
-      "request_drifted": 5,
+      "request_drifted": 4,
       "response_drifted": 7,
       "other_drifted": 0,
       "exact_percent": 12.5,
@@ -441,7 +437,7 @@
           "conformant": 1,
           "missing": 0,
           "drifted": 7,
-          "request_drifted": 5,
+          "request_drifted": 4,
           "response_drifted": 7,
           "other_drifted": 0,
           "conformance_percent": 12.5
@@ -464,7 +460,7 @@
         "operations_to_fix": 7,
         "area_contracts_to_fix": 1,
         "missing_operations": 0,
-        "request_drift_operations": 5,
+        "request_drift_operations": 4,
         "response_drift_operations": 7,
         "other_drift_operations": 0
       },
@@ -519,7 +515,6 @@
               "kind": "request_parameters",
               "summary": "Add or align OpenAI request parameters in the implementation spec and handler behavior.",
               "detail_paths": [
-                "parameters.deleted.query",
                 "parameters.query.limit.schema.format.from",
                 "parameters.query.limit.schema.format.to",
                 "parameters.query.limit.schema.default.from",
@@ -547,14 +542,6 @@
             "operation": "GET /conversations/{conversation_id}/items/{item_id}"
           },
           "fixes": [
-            {
-              "area": "request",
-              "kind": "request_parameters",
-              "summary": "Add or align OpenAI request parameters in the implementation spec and handler behavior.",
-              "detail_paths": [
-                "parameters.deleted.query"
-              ]
-            },
             {
               "area": "response",
               "kind": "response_schema",
@@ -641,14 +628,6 @@
             "operation": "POST /conversations/{conversation_id}/items"
           },
           "fixes": [
-            {
-              "area": "request",
-              "kind": "request_parameters",
-              "summary": "Add or align OpenAI request parameters in the implementation spec and handler behavior.",
-              "detail_paths": [
-                "parameters.deleted.query"
-              ]
-            },
             {
               "area": "request",
               "kind": "request_body_schema",

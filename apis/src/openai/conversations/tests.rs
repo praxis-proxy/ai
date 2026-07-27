@@ -1539,6 +1539,122 @@ async fn create_and_delete_item_endpoints_are_local() {
 }
 
 #[tokio::test]
+async fn item_endpoints_apply_include_projection_without_changing_stored_items() {
+    let filter = build_test_filter();
+    let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
+
+    let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let body_json = serde_json::json!({
+        "items": [{
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "stored-secret"
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create items");
+    };
+    assert_eq!(rejection.status, 200);
+    let response = rejection_body(&rejection);
+    assert!(
+        response["data"][0].get("encrypted_content").is_none(),
+        "create response must omit unrequested encrypted reasoning"
+    );
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conv_id}/items/reasoning_1?include%5B%5D=reasoning.encrypted_content"),
+    );
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from get item");
+    };
+    assert_eq!(rejection.status, 200);
+    let response = rejection_body(&rejection);
+    assert_eq!(
+        response["encrypted_content"], "stored-secret",
+        "Node SDK bracket encoding should reveal the requested stored field"
+    );
+
+    let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items"));
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from list items");
+    };
+    let response = rejection_body(&rejection);
+    assert!(
+        response["data"][0].get("encrypted_content").is_none(),
+        "list response must omit unrequested encrypted reasoning"
+    );
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conv_id}/items?include=reasoning.encrypted_content"),
+    );
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from list items with include");
+    };
+    let response = rejection_body(&rejection);
+    assert_eq!(
+        response["data"][0]["encrypted_content"], "stored-secret",
+        "Python SDK repeated-key encoding should reveal the requested stored field"
+    );
+}
+
+#[tokio::test]
+async fn item_endpoints_reject_unknown_include_values() {
+    let filter = build_test_filter();
+    let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
+
+    let req = make_request(
+        Method::POST,
+        &format!("/v1/conversations/{conv_id}/items?include=future.secret_field"),
+    );
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(
+        br#"{"items":[{"id":"reasoning_2","type":"reasoning","summary":[]}]}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create items with unknown include");
+    };
+    assert_eq!(rejection.status, 400);
+    assert_eq!(rejection_body(&rejection)["error"]["type"], "invalid_request_error");
+
+    for path in [
+        format!("/v1/conversations/{conv_id}/items?include=future.secret_field"),
+        format!("/v1/conversations/{conv_id}/items/missing?include=future.secret_field"),
+    ] {
+        let req = make_request(Method::GET, &path);
+        let mut ctx = make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected Reject from {path}");
+        };
+        assert_eq!(rejection.status, 400);
+        let response = rejection_body(&rejection);
+        assert_eq!(response["error"]["type"], "invalid_request_error");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported include"),
+            "unknown include response should explain the unsupported value"
+        );
+    }
+}
+
+#[tokio::test]
 async fn item_subresource_routes_do_not_fall_through_upstream() {
     let filter = build_test_filter();
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;

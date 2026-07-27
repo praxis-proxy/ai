@@ -9,7 +9,7 @@ use utoipa::PartialSchema;
 
 use super::contracts::{
     ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
-    CreateConversationRequest, DeletedConversationResource, ItemOrder, UpdateConversationRequest,
+    CreateConversationRequest, DeletedConversationResource, IncludeField, ItemOrder, UpdateConversationRequest,
 };
 use crate::openai::operation::{
     MediaTypeSpec, OpenAiHandlingMode, OpenAiHttpMethod, OpenAiOperationSpec, OwnedOperationContract,
@@ -204,10 +204,17 @@ conversation_operations! {
         path: "/conversations/{conversation_id}/items",
         mode: Local,
         contract: owned {
-            parameters: [path_parameter!(
-                "conversation_id",
-                "The ID of the conversation to add the items to."
-            )],
+            parameters: [
+                path_parameter!(
+                    "conversation_id",
+                    "The ID of the conversation to add the items to."
+                ),
+                query_parameter!(
+                    "include",
+                    Vec<IncludeField>,
+                    "Additional fields to include in the response."
+                ),
+            ],
             request: CreateConversationItemsRequest,
             response: ConversationItemList,
         },
@@ -226,6 +233,11 @@ conversation_operations! {
                 query_parameter!("limit", u32, "Maximum number of items to return."),
                 query_parameter!("order", ItemOrder, "Sort order for returned items."),
                 query_parameter!("after", String, "Item ID to list after."),
+                query_parameter!(
+                    "include",
+                    Vec<IncludeField>,
+                    "Additional fields to include in the response."
+                ),
             ],
             request: none,
             response: ConversationItemList,
@@ -243,6 +255,11 @@ conversation_operations! {
                     "The ID of the conversation that contains the item."
                 ),
                 path_parameter!("item_id", "The ID of the item to retrieve."),
+                query_parameter!(
+                    "include",
+                    Vec<IncludeField>,
+                    "Additional fields to include in the response."
+                ),
             ],
             request: none,
             response: ConversationItem,

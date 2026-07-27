@@ -114,6 +114,45 @@ mod tests {
         );
     }
 
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "checks all three operations and eight enum values")]
+    fn generated_item_operations_share_the_official_include_enum() {
+        let document = serde_json::to_value(implementation_openapi()).unwrap();
+        let expected = [
+            "file_search_call.results",
+            "web_search_call.results",
+            "web_search_call.action.sources",
+            "message.input_image.image_url",
+            "computer_call_output.output.image_url",
+            "code_interpreter_call.outputs",
+            "reasoning.encrypted_content",
+            "message.output_text.logprobs",
+        ]
+        .map(Value::from)
+        .to_vec();
+        for pointer in [
+            "/paths/~1conversations~1{conversation_id}~1items/post/parameters",
+            "/paths/~1conversations~1{conversation_id}~1items/get/parameters",
+            "/paths/~1conversations~1{conversation_id}~1items~1{item_id}/get/parameters",
+        ] {
+            let parameters = document.pointer(pointer).and_then(Value::as_array).unwrap();
+            let include = parameters
+                .iter()
+                .find(|parameter| parameter.get("name") == Some(&Value::String("include".to_owned())))
+                .unwrap();
+            assert_eq!(include["in"], "query");
+            assert_eq!(include["required"], false);
+            assert_eq!(
+                include.pointer("/schema/type"),
+                Some(&Value::String("array".to_owned()))
+            );
+            assert_eq!(
+                include.pointer("/schema/items/enum"),
+                Some(&Value::Array(expected.clone()))
+            );
+        }
+    }
+
     fn collect_component_references<'a>(value: &'a Value, references: &mut Vec<&'a str>) {
         match value {
             Value::Object(object) => {
