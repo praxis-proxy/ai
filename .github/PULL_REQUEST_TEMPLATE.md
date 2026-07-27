@@ -1,17 +1,27 @@
-### What does this PR do?
+## Summary
 
-### Which issue(s) does this relate to?
+<!-- What changed, and why is this the smallest complete change? -->
 
-Fixes #
+## Related issue
 
-### Checklist
+<!-- Contributors must be assigned to the issue before opening a PR. -->
 
-- [ ] Signed off all commits (`git commit -s`)
-- [ ] Tests added or updated
-- [ ] Documentation updated (if applicable)
-- [ ] `make lint && make test` passes locally
+Closes #
 
-### Does this introduce a breaking change?
+## Validation
 
-<!-- If yes, describe the impact and migration
-path. -->
+<!-- List exact commands and results, including manual or backend-backed proof.
+Explain any checks that were not run. -->
+
+## Checklist
+
+- [ ] I reviewed every changed line and can explain the change.
+- [ ] Tests are added or updated when behavior changes.
+- [ ] New capabilities include an example config and functional example test.
+- [ ] User-facing behavior and generated documentation are updated.
+- [ ] Performance-sensitive changes include appropriate benchmark or load-test evidence.
+- [ ] Commits are signed and include a `Signed-off-by` trailer.
+
+## Breaking changes
+
+<!-- If applicable, describe the impact and migration path. -->

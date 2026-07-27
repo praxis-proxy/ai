@@ -36,6 +36,7 @@ jobs:
               echo "Container is healthy"
               exit 0
             fi
+            echo "Waiting for container health (${i}/30): ${status}"
             sleep 2
           done
           echo "Container failed to become healthy"

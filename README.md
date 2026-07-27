@@ -110,7 +110,7 @@ For larger changes, start a [discussion] and follow the
 
 [issues]: https://github.com/praxis-proxy/ai/issues/new
 [pull requests]: https://github.com/praxis-proxy/ai/compare
-[discussion]: https://github.com/praxis-proxy/ai/discussions
+[discussion]: https://github.com/praxis-proxy/praxis/discussions
 [container images]: https://github.com/praxis-proxy/ai/pkgs/container/ai
 [development guide]: docs/developing/getting-started.md
 [quickstart]: docs/quickstart.md

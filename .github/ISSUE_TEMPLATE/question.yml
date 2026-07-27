@@ -1,0 +1,22 @@
+name: Question
+description: Ask for help using or configuring Praxis AI
+labels: ["question"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you tried?
+      description: Include relevant configuration, commands, and errors.
+  - type: input
+    id: version
+    attributes:
+      label: Praxis AI Version
+      description: Release tag, container tag, or commit SHA, if relevant
+      placeholder: "v0.1.0"

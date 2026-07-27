@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Discussions
-    url: https://github.com/praxis-proxy/ai/discussions
-    about: Ask questions or start a discussion
+  - name: Praxis Discussions
+    url: https://github.com/praxis-proxy/praxis/discussions
+    about: Ask questions or start a discussion with the Praxis community
