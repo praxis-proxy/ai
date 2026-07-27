@@ -118,7 +118,9 @@ pub(super) async fn handle_create_conversation(
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     if !item_records.is_empty()
-        && let Err(e) = store.create_items_and_sync_messages(&item_records).await
+        && let Err(e) = store
+            .create_items_and_sync_messages(tenant_id, &conversation_id, &item_records)
+            .await
     {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
@@ -292,7 +294,10 @@ pub(super) async fn handle_create_items(
         )?));
     }
 
-    if let Err(e) = store.create_items_and_sync_messages(&item_records).await {
+    if let Err(e) = store
+        .create_items_and_sync_messages(tenant_id, conversation_id, &item_records)
+        .await
+    {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     debug!(

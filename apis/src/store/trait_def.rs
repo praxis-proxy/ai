@@ -271,16 +271,16 @@ pub trait ConversationItemStore: Send + Sync {
     /// The `position` field in each input record is **ignored**; positions
     /// are assigned within the transaction to prevent collisions.
     ///
-    /// # Panics
-    ///
-    /// Debug-asserts that every item shares the same `tenant_id` and
-    /// `conversation_id` as the first element.
-    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the items table is not configured
     /// or a database operation fails.
-    async fn create_items_and_sync_messages(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError>;
+    async fn create_items_and_sync_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError>;
 
     /// Atomically delete an item and rebuild the conversation message cache.
     ///

@@ -578,7 +578,7 @@ async fn persist_items(
 
     let count = records.len();
     store
-        .create_items_and_sync_messages(&records)
+        .create_items_and_sync_messages(tenant_id, conversation_id, &records)
         .await
         .map_err(|e| -> FilterError { Box::new(e) })?;
 

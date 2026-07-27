@@ -562,10 +562,15 @@ impl ConversationItemStore for SqliteResponseStore {
         row.try_get("max_pos").map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    async fn create_items_and_sync_messages(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
-        let Some(first) = items.first() else {
+    async fn create_items_and_sync_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        if items.is_empty() {
             return Ok(());
-        };
+        }
 
         let items_table = self
             .tables
@@ -573,14 +578,6 @@ impl ConversationItemStore for SqliteResponseStore {
             .as_deref()
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
         let conv_table = &self.tables.conversations;
-        let tenant_id = &first.tenant_id;
-        let conversation_id = &first.conversation_id;
-        debug_assert!(
-            items
-                .iter()
-                .all(|i| i.tenant_id == *tenant_id && i.conversation_id == *conversation_id),
-            "all items must belong to the same tenant and conversation"
-        );
 
         let mut tx = self
             .pool

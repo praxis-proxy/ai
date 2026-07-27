@@ -1324,7 +1324,7 @@ async fn create_items_and_sync_messages_assigns_positions() {
         make_conversation_item("item_b", "tenant_a", "conv_1", 0),
     ];
     store
-        .create_items_and_sync_messages(&items)
+        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
         .await
         .expect("create_items_and_sync should succeed");
 
@@ -1358,7 +1358,7 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
 
     let first_batch = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
     store
-        .create_items_and_sync_messages(&first_batch)
+        .create_items_and_sync_messages("tenant_a", "conv_1", &first_batch)
         .await
         .expect("first batch should succeed");
 
@@ -1367,7 +1367,7 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
         make_conversation_item("item_c", "tenant_a", "conv_1", 0),
     ];
     store
-        .create_items_and_sync_messages(&second_batch)
+        .create_items_and_sync_messages("tenant_a", "conv_1", &second_batch)
         .await
         .expect("second batch should succeed");
 
@@ -1393,7 +1393,7 @@ async fn create_items_and_sync_messages_empty_batch_is_noop() {
     let store = make_store_with_items().await;
     let empty: [ConversationItemRecord; 0] = [];
     store
-        .create_items_and_sync_messages(&empty)
+        .create_items_and_sync_messages("tenant_a", "conv_1", &empty)
         .await
         .expect("empty batch should succeed");
 }
@@ -1419,7 +1419,7 @@ async fn delete_item_and_sync_messages_updates_cache() {
         make_conversation_item("item_b", "tenant_a", "conv_1", 0),
     ];
     store
-        .create_items_and_sync_messages(&items)
+        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
         .await
         .expect("create should succeed");
 
@@ -1644,7 +1644,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
     let handle_a = tokio::spawn(async move {
         let items = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
         store_a
-            .create_items_and_sync_messages(&items)
+            .create_items_and_sync_messages("tenant_a", "conv_1", &items)
             .await
             .expect("task A should succeed");
     });
@@ -1652,7 +1652,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
     let handle_b = tokio::spawn(async move {
         let items = [make_conversation_item("item_b", "tenant_a", "conv_1", 0)];
         store_b
-            .create_items_and_sync_messages(&items)
+            .create_items_and_sync_messages("tenant_a", "conv_1", &items)
             .await
             .expect("task B should succeed");
     });
@@ -2539,7 +2539,7 @@ async fn pg_create_items_and_sync_messages_assigns_positions() {
         make_conversation_item("item_b", "tenant_a", "conv_sync", 0),
     ];
     store
-        .create_items_and_sync_messages(&items)
+        .create_items_and_sync_messages("tenant_a", "conv_sync", &items)
         .await
         .expect("create_items_and_sync should succeed");
 
@@ -2581,7 +2581,7 @@ async fn pg_delete_item_and_sync_messages_updates_cache() {
         make_conversation_item("item_b", "tenant_a", "conv_del_sync", 0),
     ];
     store
-        .create_items_and_sync_messages(&items)
+        .create_items_and_sync_messages("tenant_a", "conv_del_sync", &items)
         .await
         .expect("create should succeed");
 
