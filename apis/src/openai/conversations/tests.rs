@@ -3092,18 +3092,19 @@ fn conformance_conversations_routes_match_runtime_registry() {
 
     for operation in operation_specs() {
         let path = runtime_path(operation, Some("conv_sync"), Some("item_sync"));
-        let matched = routes::match_route(operation.method, &path)
-            .unwrap_or_else(|| panic!("runtime route table did not match {} {path}", operation.method));
+        let matched = routes::match_route(operation.method.as_str(), &path)
+            .unwrap_or_else(|| panic!("runtime route table did not match {} {path}", operation.method.as_str()));
         assert_eq!(
-            matched.spec.operation, operation.operation,
+            matched.spec.operation,
+            operation.operation,
             "runtime route table matched the wrong operation for {} {path}",
-            operation.method,
+            operation.method.as_str(),
         );
         assert_eq!(
-            OperationKey::new(matched.spec.method, matched.spec.spec_path),
-            OperationKey::new(operation.method, operation.spec_path),
+            OperationKey::new(matched.spec.method.as_str(), matched.spec.spec_path),
+            OperationKey::new(operation.method.as_str(), operation.spec_path),
             "runtime route metadata drifted from operation_specs() for {} {path}",
-            operation.method,
+            operation.method.as_str(),
         );
     }
     println!("PRAXIS_CONFORMANCE_OK conversations route_dispatch");
@@ -3287,11 +3288,11 @@ fn runtime_path(spec: &ConversationOperationSpec, conversation_id: Option<&str>,
 }
 
 fn insert_payload(payloads: &mut BTreeMap<OperationKey, Value>, spec: &ConversationOperationSpec, payload: Value) {
-    let previous = payloads.insert(OperationKey::new(spec.method, spec.spec_path), payload);
+    let previous = payloads.insert(OperationKey::new(spec.method.as_str(), spec.spec_path), payload);
     assert!(
         previous.is_none(),
         "duplicate runtime success fixture for {} {}",
-        spec.method,
+        spec.method.as_str(),
         spec.spec_path
     );
 }
@@ -3328,7 +3329,7 @@ fn generated_openapi_spec() -> Value {
 fn route_operation_keys() -> Vec<OperationKey> {
     let mut keys = operation_specs()
         .iter()
-        .map(|spec| OperationKey::new(spec.method, spec.spec_path))
+        .map(|spec| OperationKey::new(spec.method.as_str(), spec.spec_path))
         .collect::<Vec<_>>();
     keys.sort();
     keys

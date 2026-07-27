@@ -12,8 +12,8 @@ use super::contracts::{
     CreateConversationRequest, DeletedConversationResource, ItemOrder, UpdateConversationRequest,
 };
 use crate::openai::operation::{
-    MediaTypeSpec, OpenAiHandlingMode, OpenAiOperationSpec, OwnedOperationContract, ParameterLocation, ParameterSpec,
-    RequestBodySpec, ResponseSpec, schema_binding,
+    MediaTypeSpec, OpenAiHandlingMode, OpenAiHttpMethod, OpenAiOperationSpec, OwnedOperationContract,
+    ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec, schema_binding,
 };
 
 /// JSON media type used by all Conversations bodies.
@@ -77,19 +77,6 @@ macro_rules! operation_contract {
     };
 }
 
-/// Convert a typed registry method token into its stable HTTP spelling.
-macro_rules! method_name {
-    (Get) => {
-        "GET"
-    };
-    (Post) => {
-        "POST"
-    };
-    (Delete) => {
-        "DELETE"
-    };
-}
-
 /// Declare a required string path parameter.
 macro_rules! path_parameter {
     ($name:literal, $description:literal) => {
@@ -145,7 +132,7 @@ macro_rules! conversation_operations {
                     operation: ConversationOperation::$operation,
                     definition: OpenAiOperationSpec {
                         operation_id: $operation_id,
-                        method: method_name!($method),
+                        method: OpenAiHttpMethod::$method,
                         spec_path: $path,
                         runtime_path: concat!("/v1", $path),
                         mode: OpenAiHandlingMode::$mode,
@@ -336,7 +323,7 @@ pub(crate) fn match_route<'a>(method: &str, path: &'a str) -> Option<MatchedConv
     let path = path.strip_suffix('/').filter(|path| !path.is_empty()).unwrap_or(path);
     OPERATION_SPECS
         .iter()
-        .filter(|spec| spec.method == method)
+        .filter(|spec| spec.method.as_str() == method)
         .find_map(|spec| {
             match_path_template(spec.runtime_path, path).map(|params| MatchedConversationRoute { spec, params })
         })
@@ -426,7 +413,7 @@ mod tests {
                 .runtime_path
                 .replace("{conversation_id}", "conv_test")
                 .replace("{item_id}", "item_test");
-            let route = match_route(spec.method, &path).unwrap();
+            let route = match_route(spec.method.as_str(), &path).unwrap();
             assert_eq!(route.spec.operation, spec.operation);
         }
     }

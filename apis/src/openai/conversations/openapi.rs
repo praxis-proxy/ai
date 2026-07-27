@@ -60,7 +60,7 @@ mod tests {
         let expected = operation_specs()
             .iter()
             .filter(|spec| spec.owned_contract().is_some() && spec.mode.owns_contract())
-            .map(|spec| (spec.method, spec.spec_path))
+            .map(|spec| (spec.method.as_str(), spec.spec_path))
             .collect::<BTreeSet<_>>();
 
         assert_eq!(generated, expected);

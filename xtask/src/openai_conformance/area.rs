@@ -85,7 +85,7 @@ fn conversations_supported_operations() -> Vec<SupportedOperation> {
     praxis_ai_apis::openai::conversations_operation_specs()
         .iter()
         .map(|spec| SupportedOperation {
-            method: spec.method.to_owned(),
+            method: spec.method.as_str().to_owned(),
             path: spec.spec_path.to_owned(),
             area: "Conversations".to_owned(),
             mode: coverage_mode(spec.mode),

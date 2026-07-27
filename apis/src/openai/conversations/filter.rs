@@ -255,7 +255,10 @@ impl OpenaiConversationsFilter {
             | ConversationOperation::DeleteConversation
             | ConversationOperation::ListConversationItems
             | ConversationOperation::GetConversationItem
-            | ConversationOperation::DeleteConversationItem => Ok(FilterAction::Continue),
+            | ConversationOperation::DeleteConversationItem => Err(FilterError::from(format!(
+                "openai_conversations: handle_post_route called for non-body operation {:?}",
+                route.spec.operation
+            ))),
         }
     }
 

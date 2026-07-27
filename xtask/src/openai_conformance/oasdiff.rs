@@ -3,8 +3,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     io::Write as _,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -22,6 +23,8 @@ use super::{
 
 /// Exact supported `oasdiff` release.
 pub(super) const OASDIFF_VERSION: &str = "1.23.0";
+/// Go module embedded in `oasdiff` binaries installed from source.
+const OASDIFF_MODULE: &str = "github.com/oasdiff/oasdiff";
 /// Documentation-only elements excluded by `oasdiff` itself, context-aware.
 const EXCLUDED_ELEMENTS: &str = "description,examples,extensions,summary,title";
 
@@ -116,12 +119,7 @@ fn checked_oasdiff_version() -> Result<String, String> {
     let actual = parse_oasdiff_version(&String::from_utf8_lossy(&output.stdout))?;
     if actual != OASDIFF_VERSION {
         if actual == "main" {
-            eprintln!(
-                "warning: oasdiff reports version '{actual}' (go-install build); \
-                 expected {OASDIFF_VERSION} — proceeding on the assumption the \
-                 correct tag was installed"
-            );
-            return Ok(OASDIFF_VERSION.to_owned());
+            return checked_oasdiff_module_version();
         }
         return Err(format!(
             "unsupported oasdiff version {actual}; install exactly {OASDIFF_VERSION}"
@@ -138,6 +136,62 @@ pub(super) fn parse_oasdiff_version(output: &str) -> Result<String, String> {
         .filter(|version| !version.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| format!("unexpected oasdiff --version output: {output:?}"))
+}
+
+/// Verify the module version embedded by `go install` when the CLI reports `main`.
+fn checked_oasdiff_module_version() -> Result<String, String> {
+    let binary = resolve_executable(&oasdiff_binary())?;
+    let output = Command::new("go")
+        .arg("version")
+        .arg("-m")
+        .arg(&binary)
+        .output()
+        .map_err(|e| format!("failed to inspect oasdiff Go module version: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "go version -m failed for {}: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+
+    let actual = parse_oasdiff_module_version(&String::from_utf8_lossy(&output.stdout))?;
+    let expected = format!("v{OASDIFF_VERSION}");
+    if actual != expected {
+        return Err(format!(
+            "unsupported oasdiff module version {actual}; install exactly {OASDIFF_VERSION}"
+        ));
+    }
+    Ok(OASDIFF_VERSION.to_owned())
+}
+
+/// Parse the root module version from `go version -m` output.
+pub(super) fn parse_oasdiff_module_version(output: &str) -> Result<String, String> {
+    output
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some("mod"), Some(OASDIFF_MODULE), Some(version)) => Some(version.to_owned()),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| format!("oasdiff module metadata missing from go version -m output: {output:?}"))
+}
+
+/// Resolve a command through `PATH` so `go version -m` inspects the selected binary.
+fn resolve_executable(command: &OsStr) -> Result<PathBuf, String> {
+    let path = PathBuf::from(command);
+    if path.components().count() > 1 {
+        return Ok(path);
+    }
+
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(&path))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| format!("could not resolve oasdiff binary {command:?} through PATH"))
 }
 
 /// Materialized spec plus a stable report source label.
@@ -227,7 +281,12 @@ fn run_oasdiff_diff(reference: &Path, implementation: &Path, area: &str) -> Resu
 
 /// Build an `oasdiff` command, allowing an explicit checked binary path.
 fn oasdiff_command() -> Command {
-    Command::new(std::env::var_os("OASDIFF_BIN").unwrap_or_else(|| "oasdiff".into()))
+    Command::new(oasdiff_binary())
+}
+
+/// Return the configured `oasdiff` command name or path.
+fn oasdiff_binary() -> OsString {
+    std::env::var_os("OASDIFF_BIN").unwrap_or_else(|| "oasdiff".into())
 }
 
 /// Extract missing and drifted operation keys from `oasdiff` JSON.

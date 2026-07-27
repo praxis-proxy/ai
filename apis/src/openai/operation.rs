@@ -29,6 +29,58 @@ pub enum OpenAiHandlingMode {
     Local,
 }
 
+/// HTTP method recognized by an OpenAI operation registry.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum OpenAiHttpMethod {
+    /// `GET`.
+    Get,
+    /// `POST`.
+    Post,
+    /// `PUT`.
+    Put,
+    /// `DELETE`.
+    Delete,
+    /// `PATCH`.
+    Patch,
+    /// `HEAD`.
+    Head,
+    /// `OPTIONS`.
+    Options,
+    /// `TRACE`.
+    Trace,
+}
+
+impl OpenAiHttpMethod {
+    /// Stable uppercase spelling used by runtime matching and reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Patch => "PATCH",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Trace => "TRACE",
+        }
+    }
+
+    /// Convert to Utoipa's `OpenAPI` method representation.
+    const fn as_openapi(self) -> HttpMethod {
+        match self {
+            Self::Get => HttpMethod::Get,
+            Self::Post => HttpMethod::Post,
+            Self::Put => HttpMethod::Put,
+            Self::Delete => HttpMethod::Delete,
+            Self::Patch => HttpMethod::Patch,
+            Self::Head => HttpMethod::Head,
+            Self::Options => HttpMethod::Options,
+            Self::Trace => HttpMethod::Trace,
+        }
+    }
+}
+
 impl OpenAiHandlingMode {
     /// Stable label used by conformance reports.
     #[must_use]
@@ -202,8 +254,8 @@ pub(crate) struct OwnedOperationContract {
 pub struct OpenAiOperationSpec {
     /// Stable `OpenAPI` operation ID.
     pub operation_id: &'static str,
-    /// Uppercase HTTP method.
-    pub method: &'static str,
+    /// Typed HTTP method.
+    pub method: OpenAiHttpMethod,
     /// Path as it appears in the OpenAI spec, without `/v1`.
     pub spec_path: &'static str,
     /// Runtime path template handled by Praxis.
@@ -251,7 +303,7 @@ where
         register_contract_schemas(&mut components, contract);
         openapi.paths.add_path_operation(
             spec.spec_path,
-            vec![openapi_method(spec.method)],
+            vec![spec.method.as_openapi()],
             build_operation(spec, contract, tag),
         );
     }
@@ -333,21 +385,6 @@ const fn required(value: bool) -> Required {
     if value { Required::True } else { Required::False }
 }
 
-/// Convert a stable uppercase method into Utoipa's method enum.
-fn openapi_method(method: &str) -> HttpMethod {
-    match method {
-        "GET" => HttpMethod::Get,
-        "POST" => HttpMethod::Post,
-        "PUT" => HttpMethod::Put,
-        "DELETE" => HttpMethod::Delete,
-        "PATCH" => HttpMethod::Patch,
-        "HEAD" => HttpMethod::Head,
-        "OPTIONS" => HttpMethod::Options,
-        "TRACE" => HttpMethod::Trace,
-        method => unreachable!("unsupported OpenAI operation method: {method}"),
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, reason = "tests")]
@@ -376,7 +413,7 @@ mod tests {
     /// Files-like operation exercising non-JSON and multiple response shapes.
     const FILE_OPERATION: OpenAiOperationSpec = OpenAiOperationSpec {
         operation_id: "createFile",
-        method: "POST",
+        method: OpenAiHttpMethod::Post,
         spec_path: "/files",
         runtime_path: "/v1/files",
         mode: OpenAiHandlingMode::Local,

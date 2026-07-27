@@ -17,7 +17,7 @@ use super::{
     },
     oasdiff::{
         OASDIFF_VERSION, build_oasdiff_report, collect_oasdiff_operation_status, operation_drift_from_diff,
-        parse_oasdiff_version,
+        parse_oasdiff_module_version, parse_oasdiff_version,
     },
     parse_percent,
     reference::build_reference_projection,
@@ -610,6 +610,18 @@ fn parses_only_the_pinned_oasdiff_version_shape() {
         OASDIFF_VERSION
     );
     assert!(parse_oasdiff_version("1.23.0").is_err());
+}
+
+#[test]
+fn parses_oasdiff_go_module_version() {
+    let build_info = concat!(
+        "/tmp/oasdiff: go1.26.0\n",
+        "\tpath\tgithub.com/oasdiff/oasdiff\n",
+        "\tmod\tgithub.com/oasdiff/oasdiff\tv1.23.0\th1:example\n",
+        "\tdep\tgithub.com/spf13/cobra\tv1.10.2\th1:example\n",
+    );
+    assert_eq!(parse_oasdiff_module_version(build_info).unwrap(), "v1.23.0");
+    assert!(parse_oasdiff_module_version("/tmp/oasdiff: go1.26.0\n").is_err());
 }
 
 #[test]
