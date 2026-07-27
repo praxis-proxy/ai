@@ -416,7 +416,7 @@ fn classify_src_entries(src_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             let name = dir_file_name(&path);
-            if name != "store" && name != "classifier" && name != "token_usage" {
+            if name != "store" && name != "classifier" {
                 category_dirs.push(path);
             }
         } else if path.extension().is_some_and(|e| e == "rs")

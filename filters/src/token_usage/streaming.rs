@@ -126,3 +126,72 @@ pub(super) fn parse_bedrock_event(data: &[u8]) -> (Option<u64>, Option<u64>) {
     };
     (Some(usage.input_tokens), Some(usage.output_tokens))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Anthropic: Malformed / Null
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn anthropic_missing_type_field_returns_none() {
+        let event = br#"{"message":{"usage":{"input_tokens":25}}}"#;
+        assert_eq!(parse_anthropic_event(event), (None, None));
+    }
+
+    #[test]
+    fn anthropic_wrong_type_with_usage_returns_none() {
+        let event = br#"{"type":"message_stop","message":{"usage":{"input_tokens":25}}}"#;
+        assert_eq!(parse_anthropic_event(event), (None, None));
+    }
+
+    #[test]
+    fn anthropic_message_start_with_null_message() {
+        let event = br#"{"type":"message_start","message":null}"#;
+        assert_eq!(parse_anthropic_event(event), (None, None));
+    }
+
+    #[test]
+    fn anthropic_message_start_with_null_usage() {
+        let event = br#"{"type":"message_start","message":{"usage":null}}"#;
+        assert_eq!(parse_anthropic_event(event), (None, None));
+    }
+
+    #[test]
+    fn anthropic_invalid_json_returns_none() {
+        assert_eq!(parse_anthropic_event(b"not json"), (None, None));
+    }
+
+    #[test]
+    fn anthropic_empty_returns_none() {
+        assert_eq!(parse_anthropic_event(b""), (None, None));
+    }
+
+    // -------------------------------------------------------------------------
+    // Bedrock: Malformed / Null
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn bedrock_null_metadata() {
+        let event = br#"{"metadata":null}"#;
+        assert_eq!(parse_bedrock_event(event), (None, None));
+    }
+
+    #[test]
+    fn bedrock_null_usage_inside_metadata() {
+        let event = br#"{"metadata":{"usage":null}}"#;
+        assert_eq!(parse_bedrock_event(event), (None, None));
+    }
+
+    #[test]
+    fn bedrock_invalid_json_returns_none() {
+        assert_eq!(parse_bedrock_event(b"not json"), (None, None));
+    }
+
+    #[test]
+    fn bedrock_empty_returns_none() {
+        assert_eq!(parse_bedrock_event(b""), (None, None));
+    }
+}

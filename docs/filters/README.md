@@ -18,13 +18,13 @@ apis/src/                 Provider API filters
   openai/                 OpenAI Responses/Chat API
   classifier/             Request classification
   store/                  Response persistence
-  token_usage/            Token counting
 
 filters/src/              Cross-provider filters
   agentic/                MCP, A2A, JSON-RPC
   guardrails/             AI content guardrails
   inference/              Model routing, credentials
   prompt_enrich/          Prompt injection
+  token_usage/            Token counting and token headers
 ```
 
 ### Provider APIs (`praxis-ai-apis`)
@@ -54,6 +54,7 @@ filters/src/              Cross-provider filters
 | `ai_guardrails` | External guardrail provider integration |
 | `model_to_header` | Promotes `model` body field to header |
 | `prompt_enrich` | Injects messages into chat completions |
+| `token_count` | Extracts token counts from provider responses |
 | `token_usage_headers` | Token count response headers |
 
 ## Registration

@@ -9,6 +9,12 @@ All workspace crates inherit this version.
 
 [semver]: https://semver.org/
 
+## Distribution
+
+The supported release artifact is the Praxis AI container image on GHCR.
+Workspace crates are implementation packages and are not published to
+crates.io independently.
+
 ## Pre-release Checklist
 
 Before tagging a release:
@@ -21,7 +27,7 @@ Before tagging a release:
 - [ ] Version in root `Cargo.toml` is bumped
 - [ ] `Cargo.lock` is regenerated with the new version
 - [ ] `SECURITY.md` lists the new minor version
-- [ ] GitHub Release changelog is drafted (see below)
+- [ ] Pull request labels produce useful generated release notes
 
 ## Tagging a Release
 
@@ -38,35 +44,34 @@ git push origin v0.1.0
 Container images are published to
 [GitHub Container Registry][ghcr] (GHCR).
 
-After pushing a tag, manually trigger the **Publish**
-workflow via the GitHub Actions UI
-(`workflow_dispatch`). The workflow builds a multi-stage
-Alpine image from the `Containerfile` and pushes it to
-`ghcr.io/praxis-proxy/ai`.
+Pushing a valid release tag triggers the **Release** workflow. It verifies
+that the tag matches `workspace.package.version`, runs the test suite,
+builds the multi-stage Alpine image, pushes it to
+`ghcr.io/praxis-proxy/ai`, and creates the GitHub Release.
+
+Maintainers can manually dispatch the **Publish** workflow when a container
+image is needed without creating a tagged GitHub Release.
 
 [ghcr]: https://ghcr.io/praxis-proxy/ai
 
 ### Image Tags
 
-The publish workflow produces these tags per run:
+The release workflow produces these tags per run:
 
 | Pattern | Example | Description |
 | --------- | --------- | ------------- |
 | `sha-<hash>` | `sha-abc1234` | Git commit SHA |
-| `<branch>` | `main` | Branch name |
 | `<version>` | `0.1.0` | Full semver (from git tag) |
 | `<major>.<minor>` | `0.1` | Major.minor shorthand |
 
-Semver tags are only generated when the workflow runs
-against a semver git tag.
+The workflow also publishes a `sha-<hash>` tag for traceability.
 
 ## Changelog
 
-Praxis AI uses [GitHub Releases][gh-releases] for
-changelogs. Each release is created through the GitHub
-UI after pushing a tag. Use GitHub's "Generate release
-notes" feature to auto-populate from merged PRs, then
-edit for clarity. There is no separate CHANGELOG file.
+Praxis AI uses [GitHub Releases][gh-releases] for changelogs. The release
+workflow creates each release with generated notes. Review pull request
+labels before tagging so entries fall into the categories configured in
+`.github/release.yml`. There is no separate `CHANGELOG.md` file.
 
 [gh-releases]: https://github.com/praxis-proxy/ai/releases
 
@@ -76,9 +81,8 @@ Release branches are optional and created from tags when
 backports are needed. The naming convention is
 `release/v<MAJOR>.<MINOR>.x` (e.g. `release/v0.1.x`).
 
-Fixes are cherry-picked onto the release branch, a new
-patch tag is created from it, and the publish workflow is
-triggered as usual.
+Fixes are cherry-picked onto the release branch and a new patch tag is
+created from it. The tag triggers the release workflow as usual.
 
 ## Container Details
 
@@ -86,10 +90,10 @@ The production image is a minimal Alpine container:
 
 - Static musl build with LTO, single codegen unit,
   and stripped symbols
-- Runs as non-root user (`praxis-ai`)
+- Runs as non-root user (`praxis`)
 - Exposes ports `8080` (proxy) and `9901` (admin)
 - Built-in health check at
   `http://127.0.0.1:9901/healthy`
-- Config directory: `/etc/praxis-ai`
+- Config directory and working directory: `/etc/praxis`
 
 > **Note**: This is subject to change.

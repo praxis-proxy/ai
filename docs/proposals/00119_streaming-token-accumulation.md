@@ -39,8 +39,7 @@ through unchanged. Only metadata is produced.
   sentinel or stream close)
 - Handle provider-specific streaming formats: OpenAI, Anthropic,
   Bedrock, and Vertex AI (Google)
-- Reuse the unified `TokenUsage` representation from the provider
-  mapping library ([#87]) where possible
+- Reuse the subsystem's private unified `TokenUsage` representation
 - Write final counts to filter metadata ([#71]) via
   `set_token_usage()`
 
@@ -132,15 +131,15 @@ counts without provider-specific SSE logic.
 
 ### Requirements
 
-1. A `token_count` filter at `filters/src/token_count/` registered as
+1. A `token_count` filter at `filters/src/token_usage/count.rs` registered as
    `"token_count"` in the server filter registry.
 2. Single required YAML key `provider` selecting the extraction strategy.
 3. For SSE responses (`text/event-stream`), parse `data:` payloads
    incrementally without buffering the full stream (`BodyMode::Stream`).
 4. Accumulate token counts across SSE events with provider-correct
    merge semantics and emit final counts on `end_of_stream`.
-5. Delegate complete-usage parsing to `extract_token_usage` ([#87])
-   and partial-event parsing to `extract_streaming_tokens`.
+5. Delegate complete-usage and partial-event parsing to private methods on
+   the configured provider strategy.
 6. Write final counts via `set_token_usage()` to `token.input`,
    `token.output`, and `token.total` ([#71]).
 7. Response bodies and status codes pass through unchanged.
@@ -150,14 +149,13 @@ counts without provider-specific SSE logic.
 #### Module layout
 
 ```text
-filters/src/token_count/
-├── mod.rs       # TokenCountFilter, SSE/JSON paths, metadata state
-└── tests.rs     # Unit tests (streaming + non-streaming)
-
-apis/src/token_usage/
-├── mod.rs       # TokenUsage, extract_token_usage, set_token_usage
-├── providers.rs # Non-streaming JSON parsers per provider
-└── streaming.rs # extract_streaming_tokens (Anthropic partial events; Bedrock metadata JSON)
+filters/src/token_usage/
+├── mod.rs          # normalized usage type and metadata contract
+├── count.rs        # TokenCountFilter, provider strategy, SSE/JSON paths
+├── count/tests.rs  # boundary tests (streaming + non-streaming)
+├── headers.rs      # TokenUsageHeadersFilter
+├── providers.rs    # non-streaming JSON parsers per provider
+└── streaming.rs    # Anthropic partial events and Bedrock metadata JSON
 ```
 
 The filter reuses the A2A SSE scanner at
@@ -170,7 +168,7 @@ The filter reuses the A2A SSE scanner at
   provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure
 ```
 
-`TokenUsageProvider` implements `Deserialize` for YAML parsing ([#261]).
+The private `ProviderKind` enum implements `Deserialize` for YAML parsing.
 
 #### HttpFilter hooks (streaming path)
 
@@ -272,17 +270,15 @@ See [`examples/configs/token-counting.yaml`](../../examples/configs/token-counti
 
 #### Test plan
 
-**Unit tests** (`filters/src/token_count/tests.rs`):
+**Boundary tests** (`filters/src/token_usage/count/tests.rs`):
 
 - SSE extraction for OpenAI, Anthropic, and Google
 - Chunk boundaries splitting SSE frames
 - `data: [DONE]` handling, overflow finalization, metadata cleanup
 
-**Unit tests** (`apis/src/token_usage/tests.rs`, [#321]):
+**Parser edge tests** (`filters/src/token_usage/providers.rs`, [#321]):
 
-- `extract_streaming_tokens` for Anthropic `message_start` /
-  `message_delta` and Bedrock metadata JSON (unit tests use synthetic
-  `text/event-stream` fixtures; not production Bedrock Converse wire format)
+- Provider-specific malformed, optional-field, overflow, and fallback behavior
 
 **Integration tests** (`tests/integration/tests/suite/examples/token_count.rs`):
 

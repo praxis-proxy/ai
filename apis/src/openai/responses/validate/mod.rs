@@ -9,18 +9,16 @@
 //! routing facts (`model`, `stream`, `store`, `background`) to
 //! `openai_responses_format.*` metadata.
 //!
-//! This filter reads classifier metadata for parameter-combination
-//! validation, then does targeted JSON field extraction for
-//! `conversation.id`. It does **not** deserialize the full body into a
-//! typed struct.
+//! This filter validates that the body is JSON, then does targeted field
+//! extraction for `conversation.id`. It does **not** deserialize the full
+//! body into a typed struct or validate provider-owned parameter
+//! combinations.
 //!
 //! # YAML
 //!
 //! ```yaml
 //! filter: openai_responses_validate
 //! ```
-
-mod rules;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +30,6 @@ use praxis_filter::{
 };
 use tracing::{debug, trace};
 
-use self::rules::validate_request;
 use super::error::responses_error_rejection;
 use crate::is_event_stream_content_type;
 
@@ -42,17 +39,13 @@ use crate::is_event_stream_content_type;
 
 /// Validates and enriches Responses API requests.
 ///
-/// Reads classifier metadata for parameter-combination checks, then
-/// parses the body as [`serde_json::Value`] for targeted field
-/// extraction. Does not deserialize the full body into a typed struct.
+/// Parses the body as [`serde_json::Value`] for targeted field extraction.
+/// Does not deserialize the full body into a typed struct or reject
+/// provider-supported combinations such as background streaming.
 ///
 /// Must be placed after `openai_responses_format` in the filter chain.
 /// Skips non-Responses API requests (those not classified as
 /// `openai_responses`).
-///
-/// Validation rules: rejects `stream=true` combined with
-/// `background=true` (400), rejects `background=true` combined with
-/// `store=false` (400).
 ///
 /// Generates metadata: `responses.response_id` (format: `resp_` + 32
 /// hex chars, CSPRNG), `responses.conversation_id`, `responses.store`,
@@ -129,7 +122,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
             return Ok(FilterAction::Release);
         }
 
-        let parsed = match parse_and_validate(ctx, body) {
+        let parsed = match parse_request_body(ctx, body) {
             Ok(v) => v,
             Err(action) => return Ok(action),
         };
@@ -263,8 +256,8 @@ fn reformat_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>, en
     FilterAction::Continue
 }
 
-/// Parse the request body and run validation checks.
-fn parse_and_validate(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> Result<serde_json::Value, FilterAction> {
+/// Parse the request body as JSON.
+fn parse_request_body(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> Result<serde_json::Value, FilterAction> {
     let streaming = ctx
         .get_metadata("openai_responses_format.stream")
         .is_some_and(|v| v == "true");
@@ -273,20 +266,13 @@ fn parse_and_validate(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> Resu
         return Err(reject_invalid("request body is required", streaming));
     };
 
-    let parsed: serde_json::Value = match serde_json::from_slice(chunk) {
-        Ok(v) => v,
+    match serde_json::from_slice(chunk) {
+        Ok(v) => Ok(v),
         Err(e) => {
             debug!(error = %e, "failed to parse request body");
-            return Err(reject_invalid(&format!("invalid request body: {e}"), streaming));
+            Err(reject_invalid(&format!("invalid request body: {e}"), streaming))
         },
-    };
-
-    if let Err(e) = validate_request(ctx) {
-        debug!(error = %e, "request validation failed");
-        return Err(reject_invalid(&e.to_string(), streaming));
     }
-
-    Ok(parsed)
 }
 
 /// Check whether a Responses endpoint has no JSON request body to validate.
@@ -698,8 +684,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_and_background_rejected() {
-        let action = run_filter_raw(
+    async fn stream_and_background_accepted() {
+        let ctx = run_filter(
             r#"{"input": "test"}"#,
             &[
                 ("openai_responses_format.stream", "true"),
@@ -707,15 +693,21 @@ mod tests {
             ],
         )
         .await;
-        assert!(
-            matches!(action, FilterAction::Reject(_)),
-            "stream=true + background=true should be rejected"
+        assert_eq!(
+            ctx.get_metadata("responses.stream"),
+            Some("true"),
+            "stream=true should be preserved"
+        );
+        assert_eq!(
+            ctx.get_metadata("responses.background"),
+            Some("true"),
+            "background=true should be preserved"
         );
     }
 
     #[tokio::test]
-    async fn background_without_store_rejected() {
-        let action = run_filter_raw(
+    async fn background_without_store_accepted() {
+        let ctx = run_filter(
             r#"{"input": "test"}"#,
             &[
                 ("openai_responses_format.background", "true"),
@@ -723,22 +715,21 @@ mod tests {
             ],
         )
         .await;
-        assert!(
-            matches!(action, FilterAction::Reject(_)),
-            "background=true + store=false should be rejected"
+        assert_eq!(
+            ctx.get_metadata("responses.background"),
+            Some("true"),
+            "background=true should be preserved"
+        );
+        assert_eq!(
+            ctx.get_metadata("responses.store"),
+            Some("false"),
+            "store=false should be preserved"
         );
     }
 
     #[tokio::test]
     async fn streaming_rejection_has_sse_content_type() {
-        let action = run_filter_raw(
-            r#"{"input": "test"}"#,
-            &[
-                ("openai_responses_format.stream", "true"),
-                ("openai_responses_format.background", "true"),
-            ],
-        )
-        .await;
+        let action = run_filter_raw("not valid json", &[("openai_responses_format.stream", "true")]).await;
         if let FilterAction::Reject(rejection) = action {
             let has_content_type = rejection
                 .headers
@@ -755,14 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_rejection_has_json_content_type() {
-        let action = run_filter_raw(
-            r#"{"input": "test"}"#,
-            &[
-                ("openai_responses_format.background", "true"),
-                ("openai_responses_format.store", "false"),
-            ],
-        )
-        .await;
+        let action = run_filter_raw("not valid json", &[]).await;
         if let FilterAction::Reject(rejection) = action {
             let has_content_type = rejection
                 .headers
@@ -779,14 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejection_body_uses_responses_error_format() {
-        let action = run_filter_raw(
-            r#"{"input": "test"}"#,
-            &[
-                ("openai_responses_format.background", "true"),
-                ("openai_responses_format.store", "false"),
-            ],
-        )
-        .await;
+        let action = run_filter_raw("not valid json", &[]).await;
         if let FilterAction::Reject(rejection) = action {
             let body = rejection.body.unwrap();
             let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();

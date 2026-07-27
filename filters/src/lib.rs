@@ -6,22 +6,19 @@
 //! AI filter implementations for Praxis.
 //!
 //! Contains agentic protocol filters (A2A, MCP), guardrails,
-//! inference routing, prompt enrichment, and token usage
-//! header injection.
+//! inference routing, prompt enrichment, and token usage handling.
 
 pub mod agentic;
 pub mod guardrails;
 pub mod inference;
 pub mod prompt_enrich;
-mod token_count;
-mod token_usage_headers;
+mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
-pub use token_count::TokenCountFilter;
-pub use token_usage_headers::TokenUsageHeadersFilter;
+pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
 
 // -----------------------------------------------------------------------------
 // Test Utilities

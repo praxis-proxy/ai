@@ -17,10 +17,9 @@
 #      Conversations API traffic is not rejected before the
 #      conversations filter can handle it in the body phase.
 #
-#   3. openai_responses_validate checks parameter combinations
-#      (stream+background, background+store), generates response
-#      and conversation IDs, and writes responses.* metadata for
-#      downstream filters. Skips non-Responses requests gracefully.
+#   3. openai_responses_validate checks JSON syntax, generates response
+#      and conversation IDs, and writes responses.* metadata for downstream
+#      filters. Provider-owned parameter combinations pass through.
 #
 #   4. openai_tool_parse parses the tools array and tool_choice from
 #      Responses API requests and promotes summary facts (has_tools,
@@ -114,7 +113,7 @@
 #     -H "Authorization: Bearer token" \
 #     -d '{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":[{"type":"input_file","file_id":"file_abc"}]}]}'
 #
-#   # Rejected (stream + background conflict)
+#   # Background streaming (forwarded to a capable backend)
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"test","stream":true,"background":true}'

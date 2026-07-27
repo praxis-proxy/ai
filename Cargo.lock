@@ -2895,19 +2895,17 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
  "base64",
  "bytes",
- "chrono",
  "dashmap 6.2.1",
  "http",
  "percent-encoding",
  "praxis-proxy-core",
  "praxis-proxy-filter",
- "regex",
  "reqwest 0.13.4",
  "rmcp",
  "schemars 1.2.1",
@@ -2921,23 +2919,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "utoipa",
  "yaml_serde",
- "zeroize",
 ]
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
- "dashmap 6.2.1",
  "http",
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
- "rand 0.10.2",
  "serde",
  "serde_json",
  "tokio",
@@ -2947,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3081,7 +3077,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-test-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3112,45 +3108,32 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-integration"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "arc-swap",
  "async-trait",
  "base64",
  "bytes",
  "futures",
  "http",
- "jsonwebtoken",
  "nix",
- "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
- "praxis-proxy-protocol",
  "praxis-test-utils",
- "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
- "tokio-rustls",
  "tokio-tungstenite",
- "yaml_serde",
 ]
 
 [[package]]
 name = "praxis-tests-schema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "async-trait",
- "bytes",
  "praxis-proxy-core",
  "praxis-proxy-filter",
- "praxis-proxy-tls",
  "praxis-test-utils",
- "serde",
- "serde_json",
  "yaml_serde",
 ]
 
@@ -3772,6 +3755,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -5262,6 +5246,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "utoipa"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bde15df68e80b16c7d16b9616e80770ad158988daa56a27dccd1e55558b0160"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde",
+ "serde_json",
+ "utoipa-gen",
+]
+
+[[package]]
+name = "utoipa-gen"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "uuid"
 version = "1.23.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5747,18 +5754,20 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
- "nix",
+ "praxis-ai-apis",
  "praxis-ai-proxy",
  "praxis-proxy-core",
  "praxis-test-utils",
  "quote",
+ "reqwest 0.13.4",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "syn 3.0.3",
  "tempfile",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "yaml_serde",

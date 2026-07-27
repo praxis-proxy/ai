@@ -29,13 +29,17 @@ use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::token_usage::{TokenUsageProvider, set_token_usage};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
 use serde::Deserialize;
 use tracing::{debug, trace};
 
+use super::{
+    TokenUsage,
+    providers::{parse_anthropic, parse_bedrock, parse_google, parse_openai},
+    set_token_usage, streaming,
+};
 use crate::agentic::a2a::sse;
 
 // -----------------------------------------------------------------------------
@@ -99,11 +103,7 @@ struct TokenCountConfig {
     provider: ProviderKind,
 }
 
-/// AI provider selecting the token extraction strategy.
-///
-/// Distinct from [`TokenUsageProvider`] because Bedrock `InvokeModel` has no
-/// body format to parse — its counts live in response headers — so it needs
-/// a variant that [`TokenUsageProvider`] intentionally has no equivalent for.
+/// Provider and transport shape selected by the `token_count` configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProviderKind {
@@ -114,39 +114,32 @@ enum ProviderKind {
     Anthropic,
     /// Google Gemini API.
     Google,
-    /// AWS Bedrock Converse API (JSON body / SSE, like other providers).
+    /// AWS Bedrock Converse API.
     Bedrock,
-    /// AWS Bedrock `InvokeModel` API (token counts in response headers only).
+    /// AWS Bedrock `InvokeModel` token headers.
     BedrockInvokeModel,
-    /// Azure OpenAI (same JSON schema as OpenAI).
+    /// Azure OpenAI, which uses the OpenAI response schema.
     Azure,
 }
 
 impl ProviderKind {
-    /// Maps to the shared library provider used for body-based extraction.
-    ///
-    /// Returns `None` for `BedrockInvokeModel`, which has no body format
-    /// and is instead handled directly via response headers.
-    fn to_library_provider(self) -> Option<TokenUsageProvider> {
+    /// Extract complete usage from a JSON response or final SSE payload.
+    fn extract_token_usage(self, body: &[u8]) -> Option<TokenUsage> {
         match self {
-            Self::OpenAi => Some(TokenUsageProvider::OpenAi),
-            Self::Anthropic => Some(TokenUsageProvider::Anthropic),
-            Self::Google => Some(TokenUsageProvider::Google),
-            Self::Bedrock => Some(TokenUsageProvider::Bedrock),
-            Self::Azure => Some(TokenUsageProvider::Azure),
+            Self::OpenAi | Self::Azure => parse_openai(body),
+            Self::Anthropic => parse_anthropic(body),
+            Self::Google => parse_google(body),
+            Self::Bedrock => parse_bedrock(body),
             Self::BedrockInvokeModel => None,
         }
     }
-}
 
-impl From<TokenUsageProvider> for ProviderKind {
-    fn from(provider: TokenUsageProvider) -> Self {
-        match provider {
-            TokenUsageProvider::OpenAi => Self::OpenAi,
-            TokenUsageProvider::Anthropic => Self::Anthropic,
-            TokenUsageProvider::Google => Self::Google,
-            TokenUsageProvider::Bedrock => Self::Bedrock,
-            TokenUsageProvider::Azure => Self::Azure,
+    /// Extract partial usage from providers that split counts across events.
+    fn extract_streaming_tokens(self, event_data: &[u8]) -> (Option<u64>, Option<u64>) {
+        match self {
+            Self::Anthropic => streaming::parse_anthropic_event(event_data),
+            Self::Bedrock => streaming::parse_bedrock_event(event_data),
+            Self::OpenAi | Self::Azure | Self::Google | Self::BedrockInvokeModel => (None, None),
         }
     }
 }
@@ -255,15 +248,15 @@ impl HttpFilter for TokenCountFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        let Some(provider) = self.provider.to_library_provider() else {
+        if self.provider == ProviderKind::BedrockInvokeModel {
             return Ok(FilterAction::Continue);
-        };
+        }
 
         let mode = ctx.get_metadata(META_MODE).map(str::to_owned);
 
         match mode.as_deref() {
-            Some("sse") => handle_sse_body(ctx, body, end_of_stream, &provider),
-            Some("json") => handle_json_body(ctx, body, end_of_stream, &provider),
+            Some("sse") => handle_sse_body(ctx, body, end_of_stream, self.provider),
+            Some("json") => handle_json_body(ctx, body, end_of_stream, self.provider),
             _ => {},
         }
 
@@ -314,7 +307,7 @@ fn handle_json_body(
     ctx: &mut HttpFilterContext<'_>,
     body: &Option<Bytes>,
     end_of_stream: bool,
-    provider: &TokenUsageProvider,
+    provider: ProviderKind,
 ) {
     if let Some(chunk) = body.as_ref()
         && !accumulate_response_hex(ctx, chunk, DEFAULT_MAX_BODY_BYTES)
@@ -352,12 +345,7 @@ fn handle_json_body(
 // -----------------------------------------------------------------------------
 
 /// Process SSE body chunks and extract token usage incrementally.
-fn handle_sse_body(
-    ctx: &mut HttpFilterContext<'_>,
-    body: &Option<Bytes>,
-    end_of_stream: bool,
-    provider: &TokenUsageProvider,
-) {
+fn handle_sse_body(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>, end_of_stream: bool, provider: ProviderKind) {
     if let Some(chunk) = body.as_ref() {
         let mut state = load_sse_scan_state(ctx);
 
@@ -394,7 +382,7 @@ fn handle_sse_body(
 }
 
 /// Try to extract token usage from a single SSE data payload.
-fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) {
+fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: ProviderKind) {
     if payload == b"[DONE]" {
         return;
     }
@@ -407,7 +395,7 @@ fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider
 }
 
 /// Try complete usage extraction (OpenAI, Google, Azure final events).
-fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) -> bool {
+fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: ProviderKind) -> bool {
     let Some(usage) = provider.extract_token_usage(payload) else {
         return false;
     };
@@ -425,7 +413,7 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
 }
 
 /// Try partial extraction (Anthropic, Bedrock streaming).
-fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: &TokenUsageProvider) {
+fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: ProviderKind) {
     let (input, output) = provider.extract_streaming_tokens(payload);
 
     if let Some(inp) = input {
