@@ -60,7 +60,7 @@ jobs:
         id: strict-conformance
         continue-on-error: true
         run: >-
-          cargo xtask openai-conformance-gate
+          target/debug/xtask openai-conformance-gate
           --report docs/conformance/openai-conformance-report.json
 
       - name: Evaluate pull request acknowledgement
@@ -82,7 +82,7 @@ jobs:
           if [[ "$ALLOW_NEW_FAILURES" == "true" ]]; then
             args+=(--allow-new-failures)
           fi
-          cargo xtask openai-conformance-gate "${args[@]}"
+          target/debug/xtask openai-conformance-gate "${args[@]}"
           echo "::warning title=OpenAI conformance failure acknowledged::Strict conformance failed; the generated report carries the reviewed failure set."
           {
             echo "### OpenAI conformance failure acknowledged"
@@ -96,7 +96,7 @@ jobs:
           github.event_name != 'pull_request' &&
           steps.strict-conformance.outcome == 'failure'
         run: |
-          cargo xtask openai-conformance-gate \
+          target/debug/xtask openai-conformance-gate \
             --report docs/conformance/openai-conformance-report.json \
             --acknowledge \
             --allow-new-failures
