@@ -576,37 +576,22 @@ impl ConversationItemStore for SqliteResponseStore {
         let tenant_id = &first.tenant_id;
         let conversation_id = &first.conversation_id;
         debug_assert!(
-            items.iter().all(|i| i.tenant_id == *tenant_id && i.conversation_id == *conversation_id),
+            items
+                .iter()
+                .all(|i| i.tenant_id == *tenant_id && i.conversation_id == *conversation_id),
             "all items must belong to the same tenant and conversation"
         );
 
-        let mut conn = self
+        let mut tx = self
             .pool
-            .acquire()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        sqlite_create_items_and_sync(&mut tx, items_table, conv_table, tenant_id, conversation_id, items).await?;
 
-        let result =
-            sqlite_create_items_and_sync(&mut conn, items_table, conv_table, tenant_id, conversation_id, items).await;
-
-        match result {
-            Ok(()) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| StoreError::Database(e.to_string()))?;
-                Ok(())
-            },
-            Err(e) => {
-                drop(sqlx::query("ROLLBACK").execute(&mut *conn).await);
-                Err(e)
-            },
-        }
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
     }
 
     async fn delete_item_and_sync_messages(
@@ -622,33 +607,17 @@ impl ConversationItemStore for SqliteResponseStore {
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
         let conv_table = &self.tables.conversations;
 
-        let mut conn = self
+        let mut tx = self
             .pool
-            .acquire()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let deleted =
+            sqlite_delete_item_and_sync(&mut tx, items_table, conv_table, tenant_id, conversation_id, item_id).await?;
 
-        let result =
-            sqlite_delete_item_and_sync(&mut conn, items_table, conv_table, tenant_id, conversation_id, item_id).await;
-
-        match &result {
-            Ok(_) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| StoreError::Database(e.to_string()))?;
-            },
-            Err(_) => {
-                drop(sqlx::query("ROLLBACK").execute(&mut *conn).await);
-            },
-        }
-
-        result
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(deleted)
     }
 }
 
@@ -658,15 +627,14 @@ impl ConversationItemStore for SqliteResponseStore {
 
 /// Body of [`SqliteResponseStore::create_items_and_sync_messages`].
 ///
-/// Runs inside a `BEGIN IMMEDIATE` transaction. The caller is responsible
-/// for `COMMIT` / `ROLLBACK`.
+/// Runs inside a `BEGIN IMMEDIATE` transaction managed by the caller.
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "transactional helper that threads table names and scope identifiers"
 )]
 async fn sqlite_create_items_and_sync(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     items_table: &str,
     conv_table: &str,
     tenant_id: &str,
@@ -681,7 +649,7 @@ async fn sqlite_create_items_and_sync(
     let max_row = sqlx::query(AssertSqlSafe(max_sql.as_str()))
         .bind(tenant_id)
         .bind(conversation_id)
-        .fetch_one(&mut **conn)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
     let max_pos: i64 = max_row
@@ -705,12 +673,12 @@ async fn sqlite_create_items_and_sync(
             .bind(&item_data)
             .bind(item.created_at)
             .bind(position)
-            .execute(&mut **conn)
+            .execute(&mut **tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
     }
 
-    sqlite_rebuild_messages(conn, items_table, conv_table, tenant_id, conversation_id).await
+    sqlite_rebuild_messages(tx, items_table, conv_table, tenant_id, conversation_id).await
 }
 
 /// Body of [`SqliteResponseStore::delete_item_and_sync_messages`].
@@ -719,7 +687,7 @@ async fn sqlite_create_items_and_sync(
     reason = "transactional helper that threads table names and scope identifiers"
 )]
 async fn sqlite_delete_item_and_sync(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     items_table: &str,
     conv_table: &str,
     tenant_id: &str,
@@ -731,7 +699,7 @@ async fn sqlite_delete_item_and_sync(
         .bind(item_id)
         .bind(tenant_id)
         .bind(conversation_id)
-        .execute(&mut **conn)
+        .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
@@ -739,14 +707,14 @@ async fn sqlite_delete_item_and_sync(
         return Ok(false);
     }
 
-    sqlite_rebuild_messages(conn, items_table, conv_table, tenant_id, conversation_id).await?;
+    sqlite_rebuild_messages(tx, items_table, conv_table, tenant_id, conversation_id).await?;
     Ok(true)
 }
 
 /// Read all item JSON values and overwrite the conversation message cache.
 #[expect(clippy::too_many_lines, reason = "sequential query pipeline within a transaction")]
 async fn sqlite_rebuild_messages(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     items_table: &str,
     conv_table: &str,
     tenant_id: &str,
@@ -760,7 +728,7 @@ async fn sqlite_rebuild_messages(
     let rows = sqlx::query(AssertSqlSafe(select_sql.as_str()))
         .bind(tenant_id)
         .bind(conversation_id)
-        .fetch_all(&mut **conn)
+        .fetch_all(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
@@ -785,7 +753,7 @@ async fn sqlite_rebuild_messages(
         .bind(&messages_json)
         .bind(conversation_id)
         .bind(tenant_id)
-        .execute(&mut **conn)
+        .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
