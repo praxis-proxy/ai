@@ -11,9 +11,10 @@ use serde_json::{Value, json};
 use super::{
     Args,
     model::{
-        AreaStats, CoverageMode, CoverageReport, CoveredOperation, OasdiffAreaDrift, OasdiffAreaReport,
-        OasdiffAreaStats, OasdiffOperationDrift, OasdiffReport, OperationKey, RuntimeVerificationArea,
-        RuntimeVerificationStatus, SpecOperation, SpecSourceReport, SupportedOperation, percent,
+        AppliedContractException, AreaStats, CoverageMode, CoverageReport, CoveredOperation, OasdiffAreaDrift,
+        OasdiffAreaReport, OasdiffAreaStats, OasdiffOperationDrift, OasdiffReport, OperationKey,
+        RuntimeVerificationArea, RuntimeVerificationStatus, SpecOperation, SpecSourceReport, SupportedOperation,
+        percent,
     },
 };
 
@@ -236,7 +237,19 @@ fn oasdiff_area_report_json(area: &OasdiffAreaReport) -> Value {
             "exact": area.inherited_details.is_empty(),
             "details": &area.inherited_details,
         },
+        "upstream_spec_exceptions": area.exceptions.iter().map(contract_exception_json).collect::<Vec<_>>(),
         "all_exact": area.all_exact(),
+    })
+}
+
+/// Serialize one applied upstream-spec exception.
+fn contract_exception_json(exception: &AppliedContractException) -> Value {
+    json!({
+        "kind": exception.kind.as_str(),
+        "operation": exception.operation.as_ref().map(operation_key_json),
+        "detail": exception.detail,
+        "rationale": exception.rationale,
+        "evidence": exception.evidence,
     })
 }
 
