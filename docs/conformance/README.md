@@ -143,6 +143,32 @@ global security mismatch.
 Use `owned_contract_conformance.fixes_required` as the actionable contract
 backlog.
 
+## CI Enforcement
+
+CI always runs strict capability and owned-contract conformance after the
+reference, runtime checks, and generated-artifact verification have passed.
+Strict conformance records a failed step while known failures remain.
+
+On pull requests, the gate compares normalized failure fingerprints with the
+base branch's checked-in report. Existing failures and fixes need no label.
+New missing operations or drift details fail the workflow unless a maintainer
+applies `conformance-failure-acknowledged`. Adding or removing that label
+reruns the workflow.
+
+The label does not skip conformance. It acknowledges the exact new failure set
+written to the generated report. Reference integrity, runtime verification,
+and stale generated artifacts remain hard failures and cannot be acknowledged.
+
+Merge queue and `main` runs do not have pull-request labels. They regenerate
+the report and acknowledge strict failure only when it is byte-identical to
+the checked-in report reviewed on the pull request. Any combined merge-queue
+change that alters conformance therefore fails until its report is updated and
+reviewed.
+
+Follow-up fixes remove their fingerprints from the report without needing the
+label. When no failures remain, the strict gate passes and no acknowledgement
+step runs.
+
 ## Change Workflow
 
 When OpenAI-compatible behavior changes:
