@@ -170,8 +170,7 @@ pub(super) struct ValidatedBrokerConfig {
 
 /// Entry in the pre-built tool catalog.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "fields used by follow-up tools/call routing"))]
-pub(super) struct CatalogTool {
+pub(crate) struct CatalogTool {
     /// Optional tool annotations.
     pub annotations: Option<serde_json::Value>,
     /// Backend MCP endpoint path.

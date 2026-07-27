@@ -92,8 +92,9 @@ Client --> MCP Broker Filter
              +-- tools/list:  aggregated catalog
              |                from all servers
              +-- ping:        local response
-             +-- tools/call:  not yet supported
-             |                (returns -32601)
+             +-- tools/call:  stateless routes by
+             |                configured catalog tool
+             |                current profile returns -32601
              +-- DELETE:      session termination
 ```
 
