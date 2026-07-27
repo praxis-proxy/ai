@@ -2615,10 +2615,7 @@ async fn make_store() -> SqliteResponseStore {
         .expect("store creation should succeed")
 }
 
-async fn make_file_store(
-    dir: &tempfile::TempDir,
-    items_table: Option<&str>,
-) -> SqliteResponseStore {
+async fn make_file_store(dir: &tempfile::TempDir, items_table: Option<&str>) -> SqliteResponseStore {
     let db_path = dir.path().join("concurrent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
     SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", items_table)
