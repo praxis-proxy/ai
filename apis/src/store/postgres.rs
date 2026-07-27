@@ -629,6 +629,10 @@ impl ConversationItemStore for PostgresResponseStore {
         let conv_table = &self.tables.conversations;
         let tenant_id = &first.tenant_id;
         let conversation_id = &first.conversation_id;
+        debug_assert!(
+            items.iter().all(|i| i.tenant_id == *tenant_id && i.conversation_id == *conversation_id),
+            "all items must belong to the same tenant and conversation"
+        );
 
         let mut tx = Box::pin(self.pool.begin())
             .await
