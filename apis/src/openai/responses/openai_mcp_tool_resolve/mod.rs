@@ -167,17 +167,26 @@ impl McpToolResolveFilter {
 
     /// Resolve all MCP entries, building both the global dispatch
     /// map and pre-built function tools for body rewriting.
+    ///
+    /// Server resolutions run concurrently via
+    /// [`futures::future::try_join_all`], bounded by the
+    /// `max_servers` cap checked before this method is called.
     async fn resolve_all_entries(
         &self,
         entries: &[serde_json::Value],
         previous_tools: Option<&Vec<serde_json::Value>>,
     ) -> Result<Resolution, ResolveError> {
+        let futures: Vec<_> = entries
+            .iter()
+            .map(|entry| self.resolve_entry(entry, previous_tools))
+            .collect();
+        let resolved = futures::future::try_join_all(futures).await?;
+
         let mut tool_map = HashMap::new();
         let mut per_entry = Vec::with_capacity(entries.len());
-        let mut fetched: HashMap<(&str, &str), Vec<serde_json::Value>> = HashMap::new();
 
-        for entry in entries {
-            let Some(tools) = self.resolve_entry(entry, previous_tools, &mut fetched).await? else {
+        for (entry, tools_opt) in entries.iter().zip(resolved) {
+            let Some(tools) = tools_opt else {
                 per_entry.push(Vec::new());
                 continue;
             };
@@ -195,36 +204,27 @@ impl McpToolResolveFilter {
         Ok(Resolution { per_entry, tool_map })
     }
 
-    /// Resolve tools for a single entry, reusing within-request
-    /// cached results for the same `(label, url)`.
-    async fn resolve_entry<'a>(
+    /// Resolve tools for a single MCP entry independently.
+    async fn resolve_entry(
         &self,
-        entry: &'a serde_json::Value,
+        entry: &serde_json::Value,
         previous_tools: Option<&Vec<serde_json::Value>>,
-        fetched: &mut HashMap<(&'a str, &'a str), Vec<serde_json::Value>>,
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
         let Some(server_url) = resolvable_server_url(entry) else {
             return Ok(None);
         };
         let label = server_label(entry);
-        let has_credentials = has_entry_credentials(entry);
-        if !has_credentials && let Some(cached) = fetched.get(&(label, server_url)) {
-            return Ok(Some(cached.clone()));
-        }
         mcp_client::validate_mcp_url(server_url, self.timeout, self.allow_loopback)
             .await
             .map_err(ResolveError::Client)?;
         let allowed = extract_allowed_tools(entry);
-        if !has_credentials
+        if !has_entry_credentials(entry)
             && let Some(cached) = find_cached_listing(previous_tools, label, server_url, allowed.as_names())
         {
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
         let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools, self.allow_loopback).await?;
-        if !has_credentials {
-            fetched.insert((label, server_url), tools.clone());
-        }
         Ok(Some(tools))
     }
 }
