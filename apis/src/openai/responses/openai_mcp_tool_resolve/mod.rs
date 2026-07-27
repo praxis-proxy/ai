@@ -169,23 +169,28 @@ impl McpToolResolveFilter {
     /// map and pre-built function tools for body rewriting.
     ///
     /// Server resolutions run concurrently via
-    /// [`futures::future::try_join_all`], bounded by the
-    /// `max_servers` cap checked before this method is called.
+    /// [`futures::future::try_join_all`]. Non-credentialed entries
+    /// sharing the same `(server_label, server_url)` are
+    /// deduplicated to a single resolution task; credentialed
+    /// entries always resolve independently.
     async fn resolve_all_entries(
         &self,
         entries: &[serde_json::Value],
         previous_tools: Option<&Vec<serde_json::Value>>,
     ) -> Result<Resolution, ResolveError> {
-        let futures: Vec<_> = entries
+        let (entry_to_task, task_entries) = dedup_entries(entries);
+
+        let futures: Vec<_> = task_entries
             .iter()
             .map(|entry| self.resolve_entry(entry, previous_tools))
             .collect();
-        let resolved = futures::future::try_join_all(futures).await?;
+        let task_results = futures::future::try_join_all(futures).await?;
 
         let mut tool_map = HashMap::new();
         let mut per_entry = Vec::with_capacity(entries.len());
 
-        for (entry, tools_opt) in entries.iter().zip(resolved) {
+        for (entry, task_idx) in entries.iter().zip(&entry_to_task) {
+            let tools_opt = task_idx.and_then(|idx| task_results.get(idx)?.clone());
             let Some(tools) = tools_opt else {
                 per_entry.push(Vec::new());
                 continue;
@@ -377,6 +382,40 @@ fn check_duplicate_labels(entries: &[serde_json::Value]) -> Result<(), ResolveEr
         }
     }
     Ok(())
+}
+
+/// Deduplicate MCP entries into resolution tasks. Non-credentialed
+/// entries sharing the same `(label, url)` map to a single task;
+/// credentialed entries always get their own task.
+///
+/// Returns `(entry_to_task, task_entries)` where `entry_to_task[i]`
+/// is the task index for entry `i` (or `None` if non-resolvable),
+/// and `task_entries` holds the representative entry for each task.
+fn dedup_entries(entries: &[serde_json::Value]) -> (Vec<Option<usize>>, Vec<&serde_json::Value>) {
+    let mut entry_to_task: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut task_entries: Vec<&serde_json::Value> = Vec::new();
+    let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
+
+    for (slot, entry) in entry_to_task.iter_mut().zip(entries) {
+        let Some(url) = resolvable_server_url(entry) else {
+            continue;
+        };
+        if has_entry_credentials(entry) {
+            let task_idx = task_entries.len();
+            task_entries.push(entry);
+            *slot = Some(task_idx);
+        } else {
+            let label = server_label(entry);
+            let task_idx = *seen.entry((label, url)).or_insert_with(|| {
+                let idx = task_entries.len();
+                task_entries.push(entry);
+                idx
+            });
+            *slot = Some(task_idx);
+        }
+    }
+
+    (entry_to_task, task_entries)
 }
 
 /// Count distinct resolvable `(server_label, server_url)` pairs.
