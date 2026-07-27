@@ -89,7 +89,7 @@ impl IncludeField {
     }
 }
 
-/// Allocation-free set of requested optional item fields.
+/// Set of requested optional item fields.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct IncludeFields(u8);
 

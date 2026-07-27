@@ -645,8 +645,8 @@ fn conversation_items_response(
 
 /// Remove optional fields that were not requested through `include`.
 ///
-/// The item is already owned by the response path, so projection mutates it in
-/// place without copying provider payloads or the stored representation.
+/// Projection changes only the response-owned value after the complete item
+/// representation has crossed the storage boundary.
 fn project_conversation_item(item: &mut Value, includes: IncludeFields) {
     let Some(object) = item.as_object_mut() else {
         return;
@@ -1163,21 +1163,39 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(includes.contains(IncludeField::ReasoningEncryptedContent));
-        assert!(includes.contains(IncludeField::MessageOutputTextLogprobs));
-        assert!(!includes.contains(IncludeField::FileSearchCallResults));
+        assert!(
+            includes.contains(IncludeField::ReasoningEncryptedContent),
+            "repeated-key encoding should parse reasoning encrypted content"
+        );
+        assert!(
+            includes.contains(IncludeField::MessageOutputTextLogprobs),
+            "bracket encoding should parse output-text log probabilities"
+        );
+        assert!(
+            !includes.contains(IncludeField::FileSearchCallResults),
+            "unrequested include values must remain absent"
+        );
     }
 
     #[test]
     fn parse_include_fields_rejects_unknown_or_malformed_values() {
         let unknown = parse_include_fields(Some("include=future.secret_field")).unwrap_err();
-        assert!(unknown.contains("unsupported include value"));
+        assert!(
+            unknown.contains("unsupported include value"),
+            "unknown values should produce an unsupported-value diagnostic: {unknown}"
+        );
 
         let missing = parse_include_fields(Some("include")).unwrap_err();
-        assert!(missing.contains("requires a value"));
+        assert!(
+            missing.contains("requires a value"),
+            "missing include values should identify the required value: {missing}"
+        );
 
         let invalid_utf8 = parse_include_fields(Some("include=%FF")).unwrap_err();
-        assert!(invalid_utf8.contains("valid UTF-8"));
+        assert!(
+            invalid_utf8.contains("valid UTF-8"),
+            "invalid encoding should identify the UTF-8 requirement: {invalid_utf8}"
+        );
     }
 
     #[test]
@@ -1225,14 +1243,38 @@ mod tests {
             project_conversation_item(item, IncludeFields::default());
         }
 
-        assert!(items[0].get("encrypted_content").is_none());
-        assert!(items[1].get("results").is_none());
-        assert!(items[2].get("results").is_none());
-        assert!(items[2]["action"].get("sources").is_none());
-        assert!(items[3].get("outputs").is_none());
-        assert!(items[4]["output"].get("image_url").is_none());
-        assert!(items[5]["content"][0].get("image_url").is_none());
-        assert!(items[5]["content"][1].get("logprobs").is_none());
+        assert!(
+            items[0].get("encrypted_content").is_none(),
+            "reasoning encrypted content should be omitted"
+        );
+        assert!(
+            items[1].get("results").is_none(),
+            "file-search results should be omitted"
+        );
+        assert!(
+            items[2].get("results").is_none(),
+            "web-search results should be omitted"
+        );
+        assert!(
+            items[2]["action"].get("sources").is_none(),
+            "web-search action sources should be omitted"
+        );
+        assert!(
+            items[3].get("outputs").is_none(),
+            "code-interpreter outputs should be omitted"
+        );
+        assert!(
+            items[4]["output"].get("image_url").is_none(),
+            "computer-output image URLs should be omitted"
+        );
+        assert!(
+            items[5]["content"][0].get("image_url").is_none(),
+            "message input-image URLs should be omitted"
+        );
+        assert!(
+            items[5]["content"][1].get("logprobs").is_none(),
+            "message output-text log probabilities should be omitted"
+        );
         assert_eq!(items[5]["content"][2]["text"], "keep me");
     }
 

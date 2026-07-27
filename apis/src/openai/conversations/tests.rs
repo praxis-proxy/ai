@@ -1589,7 +1589,10 @@ async fn item_endpoints_apply_include_projection_without_changing_stored_items()
         panic!("expected Reject from list items");
     };
     let response = rejection_body(&rejection);
-    assert!(response["data"][0].get("encrypted_content").is_none());
+    assert!(
+        response["data"][0].get("encrypted_content").is_none(),
+        "list response must omit unrequested encrypted reasoning"
+    );
 
     let req = make_request(
         Method::GET,
@@ -1645,7 +1648,8 @@ async fn item_endpoints_reject_unknown_include_values() {
             response["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("unsupported include")
+                .contains("unsupported include"),
+            "unknown include response should explain the unsupported value"
         );
     }
 }
