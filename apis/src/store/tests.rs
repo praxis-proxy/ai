@@ -1557,7 +1557,7 @@ async fn schema_migration_is_idempotent() {
 #[tokio::test]
 async fn concurrent_upserts_do_not_lose_data() {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let store = Arc::new(make_file_store(&dir).await);
+    let store = Arc::new(make_file_store(&dir, None).await);
     let mut handles = Vec::new();
 
     for i in 0..20 {
@@ -1586,7 +1586,7 @@ async fn concurrent_upserts_do_not_lose_data() {
 #[tokio::test]
 async fn concurrent_reads_and_writes() {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let store = Arc::new(make_file_store(&dir).await);
+    let store = Arc::new(make_file_store(&dir, None).await);
 
     let record = make_response_record("resp_rw", "tenant_a", 1000);
     store
@@ -1622,6 +1622,64 @@ async fn concurrent_reads_and_writes() {
     for handle in handles {
         handle.await.expect("task should not panic");
     }
+}
+
+#[tokio::test]
+async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let store = Arc::new(make_file_store(&dir, Some("test_conversation_items")).await);
+
+    let conv = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let store_a = Arc::clone(&store);
+    let store_b = Arc::clone(&store);
+
+    let handle_a = tokio::spawn(async move {
+        let items = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
+        store_a
+            .create_items_and_sync_messages(&items)
+            .await
+            .expect("task A should succeed");
+    });
+
+    let handle_b = tokio::spawn(async move {
+        let items = [make_conversation_item("item_b", "tenant_a", "conv_1", 0)];
+        store_b
+            .create_items_and_sync_messages(&items)
+            .await
+            .expect("task B should succeed");
+    });
+
+    handle_a.await.expect("task A should not panic");
+    handle_b.await.expect("task B should not panic");
+
+    let items = store
+        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .await
+        .expect("list should succeed");
+
+    assert_eq!(items.len(), 2, "both items should be present");
+
+    let positions: Vec<i64> = items.iter().map(|i| i.position).collect();
+    assert_ne!(positions[0], positions[1], "positions must be distinct");
+    assert!(
+        positions.contains(&1) && positions.contains(&2),
+        "positions should be 1 and 2, got {positions:?}",
+    );
+
+    let conv_record = ConversationItemStore::get_conversation(&*store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    let messages = conv_record.messages.as_array().expect("messages should be an array");
+    assert_eq!(messages.len(), 2, "messages cache should include both items");
 }
 
 // -----------------------------------------------------------------------------
@@ -2557,10 +2615,13 @@ async fn make_store() -> SqliteResponseStore {
         .expect("store creation should succeed")
 }
 
-async fn make_file_store(dir: &tempfile::TempDir) -> SqliteResponseStore {
+async fn make_file_store(
+    dir: &tempfile::TempDir,
+    items_table: Option<&str>,
+) -> SqliteResponseStore {
     let db_path = dir.path().join("concurrent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None)
+    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", items_table)
         .await
         .expect("file-backed store creation should succeed")
 }
