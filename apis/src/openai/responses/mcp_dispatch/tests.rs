@@ -12,7 +12,7 @@ use serde_json::json;
 use super::{
     McpDispatchFilter, build_error_result, build_success_result, content_blocks_to_text, execute_mcp_calls,
     execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_approval_required,
-    is_mcp_tool_call, parse_call_arguments, process_call_result, resolve_tool_entry,
+    find_by_encoded_name, is_mcp_tool_call, parse_call_arguments, process_call_result, resolve_tool_entry,
 };
 use crate::{
     openai::responses::{
@@ -226,11 +226,46 @@ fn sample_tool_map() -> HashMap<(String, String), serde_json::Value> {
     map
 }
 
+fn lossy_collision_tool_map() -> HashMap<(String, String), serde_json::Value> {
+    let mut map = HashMap::new();
+    map.insert(
+        ("my.server".to_owned(), "get".to_owned()),
+        json!({
+            "server_label": "my.server",
+            "server_url": "http://a.example.com/mcp",
+            "headers": null, "authorization": null,
+            "tool_definition": {"name": "get"},
+            "require_approval": "never",
+        }),
+    );
+    map.insert(
+        ("my_server".to_owned(), "get".to_owned()),
+        json!({
+            "server_label": "my_server",
+            "server_url": "http://b.example.com/mcp",
+            "headers": null, "authorization": null,
+            "tool_definition": {"name": "get"},
+            "require_approval": "never",
+        }),
+    );
+    map
+}
+
 #[test]
 fn is_mcp_tool_call_matches_known_tool() {
     let tool_map = sample_tool_map();
-    let tc = json!({"name": "get_weather", "call_id": "call_1"});
+    let tc = json!({"name": "weather__get_weather", "call_id": "call_1"});
     assert!(is_mcp_tool_call(&tc, &tool_map));
+}
+
+#[test]
+fn is_mcp_tool_call_rejects_raw_tool_name() {
+    let tool_map = sample_tool_map();
+    let tc = json!({"name": "get_weather", "call_id": "call_1"});
+    assert!(
+        !is_mcp_tool_call(&tc, &tool_map),
+        "raw tool name should not match; inference returns encoded names"
+    );
 }
 
 #[test]
@@ -251,14 +286,38 @@ fn is_mcp_tool_call_rejects_missing_name() {
 fn extract_mcp_tool_calls_filters_correctly() {
     let tool_map = sample_tool_map();
     let tool_calls = vec![
-        json!({"name": "get_weather", "call_id": "call_1"}),
+        json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "my_function", "call_id": "call_2"}),
-        json!({"name": "search_docs", "call_id": "call_3"}),
+        json!({"name": "docs__search_docs", "call_id": "call_3"}),
     ];
     let mcp_calls = extract_mcp_tool_calls(&tool_calls, &tool_map);
     assert_eq!(mcp_calls.len(), 2, "should extract only MCP tool calls");
-    assert_eq!(mcp_calls[0]["name"], "get_weather");
-    assert_eq!(mcp_calls[1]["name"], "search_docs");
+    assert_eq!(mcp_calls[0]["name"], "weather__get_weather");
+    assert_eq!(mcp_calls[1]["name"], "docs__search_docs");
+}
+
+// =========================================================================
+// find_by_encoded_name
+// =========================================================================
+
+#[test]
+fn find_by_encoded_name_matches_via_encoding() {
+    let map = sample_tool_map();
+    let result = find_by_encoded_name(&map, "weather__get_weather");
+    assert!(result.is_some(), "should find entry by encoded name");
+    let (key, entry) = result.unwrap();
+    assert_eq!(key.0, "weather", "key should have original label");
+    assert_eq!(key.1, "get_weather", "key should have original tool name");
+    assert_eq!(entry["server_label"], "weather");
+}
+
+#[test]
+fn find_by_encoded_name_rejects_raw_name() {
+    let map = sample_tool_map();
+    assert!(
+        find_by_encoded_name(&map, "get_weather").is_none(),
+        "raw tool name should not match; lookup is by encoded name"
+    );
 }
 
 #[test]
@@ -280,8 +339,8 @@ fn find_approval_required_returns_none_when_all_never() {
         entry["require_approval"] = json!("never");
     }
     let calls = vec![
-        json!({"name": "get_weather", "call_id": "call_1"}),
-        json!({"name": "search_docs", "call_id": "call_2"}),
+        json!({"name": "weather__get_weather", "call_id": "call_1"}),
+        json!({"name": "docs__search_docs", "call_id": "call_2"}),
     ];
     assert!(find_approval_required(&calls, &tool_map).is_none());
 }
@@ -290,8 +349,8 @@ fn find_approval_required_returns_none_when_all_never() {
 fn find_approval_required_returns_first_when_absent() {
     let tool_map = sample_tool_map();
     let calls = vec![
-        json!({"name": "get_weather", "call_id": "call_1"}),
-        json!({"name": "search_docs", "call_id": "call_2"}),
+        json!({"name": "weather__get_weather", "call_id": "call_1"}),
+        json!({"name": "docs__search_docs", "call_id": "call_2"}),
     ];
     let pending = find_approval_required(&calls, &tool_map).unwrap();
     assert_eq!(pending.tool_name, "get_weather");
@@ -308,8 +367,8 @@ fn find_approval_required_returns_first_requiring() {
         .unwrap()["require_approval"] = json!("always");
 
     let calls = vec![
-        json!({"name": "get_weather", "call_id": "call_1"}),
-        json!({"name": "search_docs", "call_id": "call_2", "arguments": {"query": "rust"}}),
+        json!({"name": "weather__get_weather", "call_id": "call_1"}),
+        json!({"name": "docs__search_docs", "call_id": "call_2", "arguments": {"query": "rust"}}),
     ];
     let pending = find_approval_required(&calls, &tool_map).unwrap();
     assert_eq!(pending.tool_name, "search_docs");
@@ -320,7 +379,7 @@ fn find_approval_required_returns_first_requiring() {
 #[test]
 fn find_approval_required_defaults_to_approval_when_absent() {
     let tool_map = sample_tool_map();
-    let calls = vec![json!({"name": "get_weather", "call_id": "call_1"})];
+    let calls = vec![json!({"name": "weather__get_weather", "call_id": "call_1"})];
     assert!(
         find_approval_required(&calls, &tool_map).is_some(),
         "absent require_approval should default to requiring approval"
@@ -329,29 +388,15 @@ fn find_approval_required_defaults_to_approval_when_absent() {
 
 #[test]
 fn find_approval_required_ambiguous_tool_requires_approval() {
-    let mut tool_map = sample_tool_map();
-    tool_map.insert(
-        ("other_weather".to_owned(), "get_weather".to_owned()),
-        json!({
-            "server_label": "other_weather",
-            "server_url": "http://other.example.com/mcp",
-            "headers": null,
-            "authorization": null,
-            "tool_definition": {"name": "get_weather"},
-            "require_approval": "never",
-        }),
-    );
-    for entry in tool_map.values_mut() {
-        entry["require_approval"] = json!("never");
-    }
-    let calls = vec![json!({"name": "get_weather", "call_id": "call_1"})];
+    let tool_map = lossy_collision_tool_map();
+    let calls = vec![json!({"name": "my_server__get", "call_id": "call_1"})];
     let pending = find_approval_required(&calls, &tool_map);
     assert!(
         pending.is_some(),
-        "ambiguous tool name should require approval even when all servers say never"
+        "ambiguous encoded name should require approval even when all servers say never"
     );
     let pending = pending.unwrap();
-    assert_eq!(pending.tool_name, "get_weather");
+    assert_eq!(pending.tool_name, "my_server__get");
     assert_eq!(pending.server_label, "unknown");
 }
 
@@ -510,8 +555,9 @@ fn content_blocks_to_text_skips_non_text() {
 #[test]
 fn resolve_tool_entry_returns_entry_for_unique_tool() {
     let map = sample_tool_map();
-    let entry = resolve_tool_entry(&map, "get_weather", "call_1").unwrap();
+    let (key, entry) = resolve_tool_entry(&map, "weather__get_weather", "call_1").unwrap();
     assert_eq!(entry.get("server_label").unwrap(), "weather");
+    assert_eq!(key.1, "get_weather", "key should contain the original tool name");
 }
 
 #[test]
@@ -523,12 +569,8 @@ fn resolve_tool_entry_returns_none_for_unknown_tool() {
 
 #[test]
 fn resolve_tool_entry_returns_error_for_ambiguous_tool() {
-    let mut map = sample_tool_map();
-    map.insert(
-        ("other-server".to_owned(), "get_weather".to_owned()),
-        serde_json::json!({"server_label": "other", "server_url": "http://other/mcp"}),
-    );
-    let result = resolve_tool_entry(&map, "get_weather", "call_1");
+    let map = lossy_collision_tool_map();
+    let result = resolve_tool_entry(&map, "my_server__get", "call_1");
     let err = result.unwrap_err().expect("should return error result for ambiguity");
     assert!(
         err.output_item["error"].as_str().unwrap().contains("ambiguous"),
@@ -692,15 +734,8 @@ async fn execute_single_call_unknown_tool_returns_none() {
 
 #[tokio::test]
 async fn execute_single_call_ambiguous_returns_error() {
-    let mut map = sample_tool_map();
-    map.insert(
-        ("other".to_owned(), "get_weather".to_owned()),
-        json!({
-            "server_label": "other",
-            "server_url": "http://other.example.com/mcp",
-        }),
-    );
-    let tc = json!({"name": "get_weather", "call_id": "c1"});
+    let map = lossy_collision_tool_map();
+    let tc = json!({"name": "my_server__get", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
     let result = execute_single_call(&tc, &map, timeout, true).await.unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("ambiguous"));
@@ -709,7 +744,7 @@ async fn execute_single_call_ambiguous_returns_error() {
 #[tokio::test]
 async fn execute_single_call_malformed_args_returns_error() {
     let map = sample_tool_map();
-    let tc = json!({"name": "get_weather", "call_id": "c1", "arguments": "not-json"});
+    let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "not-json"});
     let timeout = std::time::Duration::from_millis(100);
     let result = execute_single_call(&tc, &map, timeout, true).await.unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("malformed"));
@@ -718,7 +753,7 @@ async fn execute_single_call_malformed_args_returns_error() {
 #[tokio::test]
 async fn execute_single_call_connection_error() {
     let map = sample_tool_map();
-    let tc = json!({"name": "get_weather", "call_id": "c1", "arguments": {"city": "Paris"}});
+    let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": "Paris"}});
     let timeout = std::time::Duration::from_millis(200);
     let result = execute_single_call(&tc, &map, timeout, true).await.unwrap();
     assert!(
@@ -743,7 +778,7 @@ async fn execute_mcp_calls_empty_input() {
 #[tokio::test]
 async fn execute_mcp_calls_sequential() {
     let map = std::sync::Arc::new(sample_tool_map());
-    let calls = vec![json!({"name": "get_weather", "call_id": "c1", "arguments": {}})];
+    let calls = vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
     let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
     assert_eq!(results.len(), 1);
@@ -753,7 +788,7 @@ async fn execute_mcp_calls_sequential() {
 #[tokio::test]
 async fn execute_mcp_calls_parallel() {
     let map = std::sync::Arc::new(sample_tool_map());
-    let calls = vec![json!({"name": "get_weather", "call_id": "c1", "arguments": {}})];
+    let calls = vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
     let results = execute_mcp_calls(&calls, &map, true, timeout, true).await;
     assert_eq!(results.len(), 1);
@@ -853,7 +888,7 @@ fn on_response_body_with_mcp_calls_sets_execute_metadata() {
     }
     let state = ResponsesState {
         mcp_tool_map: tool_map,
-        tool_calls: vec![json!({"name": "get_weather", "call_id": "c1"})],
+        tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "c1"})],
         ..ResponsesState::default()
     };
     ctx.extensions.insert(state);
@@ -873,7 +908,7 @@ fn on_response_body_approval_required_sets_done_metadata() {
     let mut ctx = make_filter_context(&req);
     let state = ResponsesState {
         mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![json!({"name": "get_weather", "call_id": "c1"})],
+        tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "c1"})],
         ..ResponsesState::default()
     };
     ctx.extensions.insert(state);
@@ -916,7 +951,7 @@ async fn on_request_executes_and_appends_results() {
     let mut ctx = make_filter_context(&req);
     let state = ResponsesState {
         mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![json!({"name": "get_weather", "call_id": "c1", "arguments": {}})],
+        tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})],
         ..ResponsesState::default()
     };
     ctx.extensions.insert(state);
