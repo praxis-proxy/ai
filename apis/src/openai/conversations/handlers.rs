@@ -95,7 +95,7 @@ pub(super) async fn handle_create_conversation(
         Ok(items) => items,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let item_records = match build_item_records(ctx, tenant_id, &conversation_id, created_at, 1, item_values) {
+    let item_records = match build_item_records(ctx, tenant_id, &conversation_id, created_at, 0, item_values) {
         Ok(records) => records,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
@@ -104,26 +104,33 @@ pub(super) async fn handle_create_conversation(
             &duplicate_item_id_message(item_id),
         )?));
     }
-    let messages = Value::Array(item_records.iter().map(|item| item.item_data.clone()).collect());
 
     let record = ConversationRecord {
         conversation_id: conversation_id.clone(),
         tenant_id: tenant_id.to_owned(),
         created_at,
         metadata: metadata.clone(),
-        messages,
+        messages: Value::Array(Vec::new()),
     };
 
     if let Err(e) = store.upsert_conversation(&record).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     if !item_records.is_empty()
-        && let Err(e) = store.create_conversation_items(&item_records).await
+        && let Err(e) = store.create_items_and_sync_messages(&item_records).await
     {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     debug!(conversation_id, tenant_id, "conversation created");
 
+    let record = if item_records.is_empty() {
+        record
+    } else {
+        match store.get_conversation(tenant_id, &conversation_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) | Err(_) => record,
+        }
+    };
     let body = conversation_to_json(&record);
     Ok(FilterAction::Reject(json_response(200, &body)?))
 }
@@ -260,31 +267,26 @@ pub(super) async fn handle_create_items(
         Ok(v) => v,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let existing = match store.get_conversation(tenant_id, conversation_id).await {
-        Ok(record) => record,
+    match store.get_conversation(tenant_id, conversation_id).await {
+        Ok(Some(_)) => {},
+        Ok(None) => {
+            debug!(conversation_id, "conversation not found for item create");
+            return Ok(FilterAction::Reject(not_found_response(
+                &conversation_not_found_message(conversation_id),
+            )?));
+        },
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
-    };
-    let Some(existing) = existing else {
-        debug!(conversation_id, "conversation not found for item create");
-        return Ok(FilterAction::Reject(not_found_response(
-            &conversation_not_found_message(conversation_id),
-        )?));
     };
 
     let item_values = match parse_items_field(input.get("items"), true) {
         Ok(items) => items,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let start_position = match store.max_item_position(tenant_id, conversation_id).await {
-        Ok(pos) => pos.saturating_add(1),
-        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
-    };
     let created_at = current_timestamp(ctx);
-    let item_records =
-        match build_item_records(ctx, tenant_id, conversation_id, created_at, start_position, item_values) {
-            Ok(records) => records,
-            Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
-        };
+    let item_records = match build_item_records(ctx, tenant_id, conversation_id, created_at, 0, item_values) {
+        Ok(records) => records,
+        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+    };
     if let Some(item_id) = duplicate_item_id(&item_records) {
         return Ok(FilterAction::Reject(invalid_input_response(
             &duplicate_item_id_message(item_id),
@@ -304,10 +306,7 @@ pub(super) async fn handle_create_items(
         )?));
     }
 
-    if let Err(e) = store.create_conversation_items(&item_records).await {
-        return Ok(FilterAction::Reject(store_error_response(&e)?));
-    }
-    if let Err(e) = sync_conversation_messages(store, existing).await {
+    if let Err(e) = store.create_items_and_sync_messages(&item_records).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     debug!(
@@ -403,8 +402,8 @@ pub(super) async fn handle_delete_item(
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
     let item_id = item_id.as_ref();
-    let existing = match store.get_conversation(tenant_id, conversation_id).await {
-        Ok(Some(record)) => record,
+    match store.get_conversation(tenant_id, conversation_id).await {
+        Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation not found for item delete");
             return Ok(FilterAction::Reject(not_found_response(
@@ -415,13 +414,10 @@ pub(super) async fn handle_delete_item(
     };
 
     match store
-        .delete_conversation_item(tenant_id, conversation_id, item_id)
+        .delete_item_and_sync_messages(tenant_id, conversation_id, item_id)
         .await
     {
         Ok(true) => {
-            if let Err(e) = sync_conversation_messages(store, existing).await {
-                return Ok(FilterAction::Reject(store_error_response(&e)?));
-            }
             debug!(conversation_id, item_id, tenant_id, "conversation item deleted");
             match store.get_conversation(tenant_id, conversation_id).await {
                 Ok(Some(record)) => Ok(FilterAction::Reject(json_response(
@@ -740,56 +736,6 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
             }
         }),
     )
-}
-
-/// Refresh the denormalized conversation message cache from item rows.
-///
-/// This currently re-reads all items on every mutation. Conversations are not
-/// assumed to be small: the OpenAI contract has no cumulative item or byte
-/// ceiling. Replace this full-history rebuild with incremental processing; do
-/// not add a non-spec conversation limit as a workaround. Tracked in #532.
-pub(super) async fn sync_conversation_messages(
-    store: &dyn ConversationItemStore,
-    record: ConversationRecord,
-) -> Result<(), StoreError> {
-    let messages =
-        Value::Array(collect_conversation_messages(store, &record.tenant_id, &record.conversation_id).await?);
-    let updated = store
-        .update_conversation_messages(&record.tenant_id, &record.conversation_id, &messages)
-        .await?;
-    if updated {
-        Ok(())
-    } else {
-        Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {}",
-            record.conversation_id
-        )))
-    }
-}
-
-/// Collect all item JSON values for a conversation in ascending order.
-async fn collect_conversation_messages(
-    store: &dyn ConversationItemStore,
-    tenant_id: &str,
-    conversation_id: &str,
-) -> Result<Vec<Value>, StoreError> {
-    let mut after = None;
-    let mut messages = Vec::new();
-    loop {
-        let rows = store
-            .list_conversation_items(tenant_id, conversation_id, after.as_deref(), MAX_PAGE_LIMIT, true)
-            .await?;
-        if rows.is_empty() {
-            break;
-        }
-        after = rows.last().map(|record| record.item_id.clone());
-        let row_count = rows.len();
-        messages.extend(rows.into_iter().map(|record| record.item_data));
-        if row_count < usize::try_from(MAX_PAGE_LIMIT).unwrap_or(usize::MAX) {
-            break;
-        }
-    }
-    Ok(messages)
 }
 
 #[cfg(test)]

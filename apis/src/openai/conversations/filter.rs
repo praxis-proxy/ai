@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     openai::responses::{DEFAULT_TENANT_ID, TENANT_METADATA_KEY, state::ResponsesState},
-    store::{ConversationItemStore, ConversationRecord, PostgresResponseStore, SqliteResponseStore, StoreError},
+    store::{ConversationItemStore, PostgresResponseStore, SqliteResponseStore, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -311,11 +311,7 @@ impl HttpFilter for OpenaiConversationsFilter {
         true
     }
 
-    #[expect(
-        clippy::large_stack_frames,
-        clippy::too_many_lines,
-        reason = "dispatcher with one arm per endpoint"
-    )]
+    #[expect(clippy::too_many_lines, reason = "dispatcher with one arm per endpoint")]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let path = ctx.request.uri.path();
         let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
@@ -549,14 +545,9 @@ async fn persist_items(
     ctx: &HttpFilterContext<'_>,
     items: Vec<Value>,
 ) -> Result<(), FilterError> {
-    let max_pos = store
-        .max_item_position(tenant_id, conversation_id)
-        .await
-        .map_err(|e| -> FilterError { Box::new(e) })?;
-    let start_position = max_pos.saturating_add(1);
     let created_at = handlers::current_timestamp(ctx);
 
-    let records = handlers::build_item_records(ctx, tenant_id, conversation_id, created_at, start_position, items)
+    let records = handlers::build_item_records(ctx, tenant_id, conversation_id, created_at, 0, items)
         .map_err(|e| -> FilterError { e.into() })?;
 
     if records.is_empty() {
@@ -565,31 +556,16 @@ async fn persist_items(
 
     let count = records.len();
     store
-        .create_conversation_items(&records)
+        .create_items_and_sync_messages(&records)
         .await
         .map_err(|e| -> FilterError { Box::new(e) })?;
 
-    refresh_message_cache(store, tenant_id, conversation_id).await;
     debug!(
         conversation_id,
         tenant_id, count, "conversation items appended from response"
     );
 
     Ok(())
-}
-
-/// Refresh the denormalized conversation message cache after item mutation.
-async fn refresh_message_cache(store: &dyn ConversationItemStore, tenant_id: &str, conversation_id: &str) {
-    let record = ConversationRecord {
-        conversation_id: conversation_id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
-        created_at: 0,
-        metadata: Value::Object(serde_json::Map::default()),
-        messages: Value::Null,
-    };
-    if let Err(e) = handlers::sync_conversation_messages(store, record).await {
-        warn!(error = %e, conversation_id, "conversation message sync failed after append-back");
-    }
 }
 
 // -----------------------------------------------------------------------------
