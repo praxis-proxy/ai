@@ -144,6 +144,9 @@ pub(super) struct SpecSourceReport {
 
     /// SHA-256 of the deterministic area projection.
     pub(super) projection_sha256: String,
+
+    /// Whether inherited global security is part of the area contract.
+    pub(super) include_inherited_security: bool,
 }
 
 /// Complete OpenAI source used by every area in one report.
@@ -554,6 +557,9 @@ pub(super) struct OperationScope {
 
     /// Segment-aware path prefixes belonging to the area.
     pub(super) path_prefixes: &'static [&'static str],
+
+    /// Whether global security belongs to this area's owned contract.
+    pub(super) include_inherited_security: bool,
 }
 
 impl OperationScope {
@@ -563,7 +569,14 @@ impl OperationScope {
             id,
             label,
             path_prefixes,
+            include_inherited_security: true,
         }
+    }
+
+    /// Exclude deployment-owned global security from this area's projection.
+    pub(super) const fn without_inherited_security(mut self) -> Self {
+        self.include_inherited_security = false;
+        self
     }
 
     /// Return whether the operation path is in this scope.

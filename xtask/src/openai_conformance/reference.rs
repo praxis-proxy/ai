@@ -183,7 +183,9 @@ impl ReferenceDocument {
         copy_root_field(root, &mut bundle, "openapi");
         copy_root_field(root, &mut bundle, "jsonSchemaDialect");
         copy_root_field(root, &mut bundle, "info");
-        copy_root_field(root, &mut bundle, "security");
+        if scope.include_inherited_security {
+            copy_root_field(root, &mut bundle, "security");
+        }
 
         let source_paths = root
             .get(&YamlValue::String("paths".to_owned()))

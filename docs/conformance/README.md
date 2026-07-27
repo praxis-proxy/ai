@@ -72,6 +72,19 @@ Every operation has one proxy-boundary mode:
 Only `transform` and `local` operations enter owned-contract OpenAPI
 comparison. All eight current Conversations operations are `local`.
 
+### Authentication ownership
+
+The `openai_conversations` filter terminates matching requests but does not
+authenticate clients. Authentication and authorization are deployment-owned:
+operators must place the required security filter or trusted ingress boundary
+before Conversations. The generated implementation document therefore does
+not claim OpenAI bearer authentication.
+
+Area projections exclude only inherited global security when an area declares
+it deployment-owned. Operation-specific security remains in scope. The report
+records this choice as `inherited_security: "deployment"`, so the comparison
+boundary is explicit without hiding operation contracts.
+
 ## Tooling
 
 The report requires exactly `oasdiff` 1.23.0. Install the pinned release with:

@@ -76,6 +76,7 @@ pub(super) fn project_reference(reference: &ReferenceSource, scope: OperationSco
         area: scope.label,
         operations: operations.len(),
         projection_sha256: sha256_hex(content.as_bytes()),
+        include_inherited_security: scope.include_inherited_security,
     };
     Ok(AreaReference {
         report,
