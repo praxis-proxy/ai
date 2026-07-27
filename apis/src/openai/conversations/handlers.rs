@@ -123,13 +123,9 @@ pub(super) async fn handle_create_conversation(
     }
     debug!(conversation_id, tenant_id, "conversation created");
 
-    let record = if item_records.is_empty() {
-        record
-    } else {
-        match store.get_conversation(tenant_id, &conversation_id).await {
-            Ok(Some(r)) => r,
-            Ok(None) | Err(_) => record,
-        }
+    let record = ConversationRecord {
+        messages: Value::Array(item_records.iter().map(|r| r.item_data.clone()).collect()),
+        ..record
     };
     let body = conversation_to_json(&record);
     Ok(FilterAction::Reject(json_response(200, &body)?))
