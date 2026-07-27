@@ -18,7 +18,7 @@ use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
         CreateConversationRequest, DeletedConversationResource, IncludeField, IncludeFields, ItemOrder,
-        MAX_ITEMS_PER_REQUEST, Metadata, MetadataUpdate, UpdateConversationRequest,
+        MAX_ITEMS_PER_REQUEST, Metadata, UpdateConversationRequest,
     },
     validate::validate_metadata,
 };
@@ -70,9 +70,13 @@ pub(super) async fn handle_create_conversation(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let input: CreateConversationRequest = match parse_json_body(body) {
-        Ok(v) => v,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+    let input = if body.is_empty() {
+        CreateConversationRequest::default()
+    } else {
+        match parse_json_body(body) {
+            Ok(v) => v,
+            Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        }
     };
     let metadata = match input.metadata {
         Some(metadata) => {
@@ -87,10 +91,11 @@ pub(super) async fn handle_create_conversation(
     let raw_id = ctx.id_generator.generate(ctx.time_source);
     let conversation_id = format!("conv_{raw_id}");
     let created_at = current_timestamp(ctx);
-    if let Err(msg) = validate_item_count(input.items.len()) {
+    let items = input.items.unwrap_or_default();
+    if let Err(msg) = validate_item_count(items.len()) {
         return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
-    let item_values = input.items.into_iter().map(ConversationItem::into_value);
+    let item_values = items.into_iter().map(ConversationItem::into_value);
     let item_records = match build_item_records(ctx, tenant_id, &conversation_id, created_at, 1, item_values) {
         Ok(records) => records,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
@@ -160,9 +165,7 @@ pub(super) async fn handle_update_conversation(
         Ok(v) => v,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    if let MetadataUpdate::Replace(metadata) = &input.metadata
-        && let Err(msg) = validate_metadata(metadata.as_value())
-    {
+    if let Err(msg) = validate_metadata(input.metadata.as_value()) {
         return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
 
@@ -177,11 +180,7 @@ pub(super) async fn handle_update_conversation(
         ))?));
     };
 
-    let metadata = match input.metadata {
-        MetadataUpdate::Missing => existing.metadata,
-        MetadataUpdate::Clear => Value::Object(Map::new()),
-        MetadataUpdate::Replace(metadata) => metadata.into_value(),
-    };
+    let metadata = input.metadata.into_value();
 
     let record = ConversationRecord {
         conversation_id: conversation_id.to_owned(),
