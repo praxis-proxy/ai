@@ -96,6 +96,7 @@ lint:
 	cargo xtask lint-separators
 	cargo xtask lint-filter-docs
 	cargo xtask lint-example-tests
+	cargo xtask lint-markdown-links
 	cargo xtask sync-example-readme
 
 fmt:

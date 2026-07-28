@@ -19,6 +19,7 @@ mod echo;
 mod filter_docs;
 mod lint_deps;
 mod lint_example_tests;
+mod lint_markdown_links;
 mod lint_separators;
 mod make_replay_fixture;
 mod openai_conformance;
@@ -60,6 +61,9 @@ enum Command {
     /// integration test.
     LintExampleTests(lint_example_tests::Args),
 
+    /// Check that local Markdown link targets exist.
+    LintMarkdownLinks(lint_markdown_links::Args),
+
     /// Check that separator comments total exactly 80 columns.
     LintSeparators(lint_separators::Args),
 
@@ -98,6 +102,7 @@ fn main() {
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),
         Command::LintExampleTests(args) => lint_example_tests::run(args),
+        Command::LintMarkdownLinks(args) => lint_markdown_links::run(args),
         Command::LintSeparators(args) => lint_separators::run(args),
         Command::MakeReplayFixture(args) => make_replay_fixture::run(args),
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
