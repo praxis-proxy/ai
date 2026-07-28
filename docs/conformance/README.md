@@ -131,15 +131,20 @@ byte-compare it with the complete vendored document:
 cargo xtask openai-conformance-reference --check
 ```
 
-Area projection keeps selected path items, inherited security, path-level
-parameters, referenced security schemes, and the recursive closure of local
-component references. Remote and non-component `$ref` values are rejected.
+Area projection keeps selected path items, path-level parameters, and the
+recursive closure of local component references. Inherited global security
+and referenced security schemes are included by default but excluded when
+an area declares authentication as deployment-owned via
+`without_inherited_security()`. Remote and non-component `$ref` values are
+rejected.
 
 ## Reading the Report
 
 Report schema version 3 records the complete reference once, gives every area
-its own projection digest and implementation source, and keeps three
-independent dimensions:
+its own projection digest, implementation source, and `inherited_security`
+ownership (`"owned"` when the area includes global security in its contract,
+`"deployment"` when authentication is declared as deployment-owned and
+excluded from comparison), and keeps three independent dimensions:
 
 1. `capability_coverage` groups selected operations by handling mode and shows
    missing or stale support claims.
