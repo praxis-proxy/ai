@@ -40,6 +40,7 @@
 mod a2a;
 mod agentic_mocks;
 mod anthropic_messages;
+mod codex_websocket;
 mod conversations_rehydrate;
 mod examples;
 mod failure_mode;

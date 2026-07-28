@@ -44,8 +44,8 @@ Why this change is needed.
 
 ### Implementation
 
-- [#NNN](link) — brief description
-- [#NNN](link) — brief description
+- [#NNN](https://github.com/praxis-proxy/ai/pull/NNN) — brief description
+- [#NNN](https://github.com/praxis-proxy/ai/pull/NNN) — brief description
 
 <!-- Option B: full design (always accepted) -->
 

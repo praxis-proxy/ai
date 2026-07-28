@@ -695,6 +695,82 @@ async fn post_v1_responses_classifies_body_normally() {
     );
 }
 
+/// Promote only the format fact for a Responses `WebSocket` handshake.
+#[tokio::test]
+async fn responses_websocket_handshake_promotes_only_format() {
+    let ctx = run_filter_with_request_headers(
+        "{}",
+        "",
+        http::Method::GET,
+        "/v1/responses",
+        &[
+            (http::header::CONNECTION, "keep-alive, Upgrade"),
+            (http::header::UPGRADE, "websocket"),
+        ],
+    )
+    .await;
+    let headers = collect_headers(&ctx);
+    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+
+    assert_eq!(
+        headers.get("x-praxis-ai-format"),
+        Some(&"openai_responses"),
+        "the handshake should promote the Responses format header"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str),
+        Some("openai_responses"),
+        "the handshake should write the Responses format metadata"
+    );
+    assert_eq!(
+        results.get("format"),
+        Some("openai_responses"),
+        "the handshake should publish the Responses format result"
+    );
+
+    for header in ["x-praxis-ai-model", "x-praxis-ai-stream", "x-praxis-responses-mode"] {
+        assert!(!headers.contains_key(header), "handshake should not promote {header}");
+    }
+    for fact in [
+        "model",
+        "stream",
+        "store",
+        "background",
+        "max_output_tokens",
+        "has_previous_response_id",
+        "has_conversation",
+        "has_tools",
+        "has_prompt_id",
+        "mode",
+    ] {
+        assert!(
+            !ctx.filter_metadata
+                .contains_key(&format!("openai_responses_format.{fact}")),
+            "handshake should not write {fact} metadata"
+        );
+        assert!(
+            results.get(fact).is_none(),
+            "handshake should not promote {fact} result"
+        );
+    }
+}
+
+/// Leave an ordinary bodyless Responses GET on the normal body path.
+#[tokio::test]
+async fn get_responses_without_websocket_headers_classifies_body_normally() {
+    let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses").await;
+
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str),
+        Some("non_json"),
+        "an ordinary GET list request must not be promoted as a WebSocket handshake"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Mode Computation
 // -----------------------------------------------------------------------------
@@ -893,6 +969,29 @@ async fn run_filter_with_method(
 ) -> HttpFilterContext<'static> {
     let filter = make_filter(config_yaml);
     let req = crate::test_utils::make_request(method, path);
+
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    let mut body = Some(Bytes::from(body_str.to_owned()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "filter should release");
+    ctx
+}
+
+/// Run the filter with custom request headers.
+async fn run_filter_with_request_headers(
+    config_yaml: &str,
+    body_str: &str,
+    method: http::Method,
+    path: &str,
+    headers: &[(http::header::HeaderName, &'static str)],
+) -> HttpFilterContext<'static> {
+    let filter = make_filter(config_yaml);
+    let mut req = crate::test_utils::make_request(method, path);
+    for (name, value) in headers {
+        req.headers.append(name, value.parse().unwrap());
+    }
 
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
     let mut ctx = crate::test_utils::make_filter_context(req);

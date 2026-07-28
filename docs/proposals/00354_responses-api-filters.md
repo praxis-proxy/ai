@@ -256,19 +256,19 @@ struct ResponsesState {
 
 Filters access the orchestrator state via a well-known handle. Since filters run sequentially within a request, a full `Mutex` may not be necessary — simpler interior mutability (e.g., `RefCell` or just `&mut` access) could suffice. The exact synchronization primitive can be determined during implementation.
 
-**Relationship to #372 (`openai_responses_format` classifier):** The #372 classifier runs upstream of our filter chain. It uses `StreamBuffer` in read-only mode to classify the request format (Responses vs Chat Completions) and promotes routing facts to metadata/headers/filter_results, but does NOT retain the parsed body. Our `request_validate` filter parses the body independently via its own `StreamBuffer`, creates `ResponsesState`, and makes it available to the rest of the chain. This means the JSON body is parsed twice (once by #372 for classification, once by `request_validate` for validation) — sub-millisecond cost, clean separation of concerns.
+**Relationship to #372 (`openai_responses_format` classifier):** The #372 classifier runs upstream of our filter chain. It uses `StreamBuffer` in read-only mode to classify the request format (Responses vs Chat Completions) and promotes routing facts to metadata/headers/filter_results, but does NOT retain the parsed body. Our `request_validate` filter parses the body independently via its own `StreamBuffer`, creates `ResponsesState`, and makes it available to the rest of the chain. This means the JSON body is parsed twice (once by #372 for classification, once by `request_validate` for metadata enrichment) — sub-millisecond cost, clean separation of concerns.
 
 ### Filter Specifications
 
 #### Filter 0: `request_validate`
 
-**Purpose:** Parse the incoming Responses API request. Extract fields the proxy needs for its own operation. Create `ResponsesState` and make it available to downstream filters. Forward all parameters to the inference server — do not validate what the proxy doesn't need.
+**Purpose:** Parse the incoming Responses API request. Extract fields the proxy needs for its own operation. Create `ResponsesState` and make it available to downstream filters. Forward all parameters to the inference server without enforcing provider-owned semantics.
 
-**Validation principle:** Only validate parameters the proxy must act upon. Let the inference server handle all other validation. Different inference servers have different validation rules — if the proxy validates beyond its own needs, it either blocks valid requests (too strict) or allows invalid ones that fail downstream anyway (too loose). Unknown fields are expected and must be forwarded, never filtered.
+**Boundary principle:** Check JSON syntax and extract only the fields the proxy must act upon. Let the inference server validate request parameters. Different inference servers have different validation rules, so proxy-side semantic checks can block valid requests or duplicate checks that still fail downstream. Unknown fields are expected and must be forwarded, never filtered.
 
-The proxy validates:
+The proxy checks or extracts:
 - HTTP/JSON correctness (valid JSON syntax, correct content types)
-- Parameters the proxy needs to read for its own operation (see below)
+- Fields the proxy needs to read for its own operation (see below)
 
 The proxy does NOT:
 - Validate inference server requirements (required fields, parameter types, ranges)
@@ -287,8 +287,8 @@ Proxy-needed fields (read and act upon):
 - `stream` — determines response delivery mode (SSE vs JSON). If `stream=false`: run the full filter chain synchronously, collect all events internally, return the final `ResponseResource` as a single JSON response.
 - `store` — determines whether to persist the response
 - `background` — determines whether to enqueue for async processing
-- `stream` + `background` — reject `stream=true && background=true`
-- `store` + `background` — reject `background=true && store=false`
+- `stream` + `background` — supported; background streams may be resumed using event sequence numbers
+- `store` + `background` — supported; temporary operational state is retained for polling even when durable storage is disabled
 - `model` — read for routing decisions (use default if null/omitted)
 - `previous_response_id` — triggers rehydration in downstream filters
 - `conversation` — triggers conversation context loading
@@ -492,7 +492,7 @@ Response lifecycle:
 - `response.completed` — terminal success, carries final response snapshot
 - `response.incomplete` — terminal, carries `incomplete_details.reason`
 - `response.failed` — terminal, carries `error` object
-- `response.queued` — for background jobs, returned as JSON response (not SSE — since `stream=true && background=true` is rejected, this event only appears in the non-streaming JSON response body)
+- `response.queued` — for background jobs; returned in the initial JSON response or emitted in the lifecycle of a background stream
 
 Output items:
 - `response.output_item.added` — new output item started

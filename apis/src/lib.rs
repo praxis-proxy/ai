@@ -6,8 +6,7 @@
 //! AI provider API types and persistence for Praxis.
 //!
 //! Contains provider-specific protocol types (OpenAI, Anthropic),
-//! request classification, response storage backends, and token
-//! usage extraction.
+//! request classification, and response storage backends.
 
 pub mod anthropic;
 pub mod classifier;
@@ -15,7 +14,6 @@ pub(crate) mod mcp_client;
 pub mod openai;
 #[cfg(feature = "store")]
 pub mod store;
-pub mod token_usage;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -74,11 +72,14 @@ pub(crate) mod test_utils {
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),
             filter_metadata: std::collections::HashMap::new(),
+            pre_read_mutations: Vec::new(),
+            structured_metadata: std::collections::HashMap::new(),
             filter_results: std::collections::HashMap::new(),
             filter_state: std::collections::HashMap::new(),
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            peer_identity: None,
             request: req,
             request_body_bytes: 0,
             request_body_mode: praxis_filter::BodyMode::Stream,
@@ -91,12 +92,6 @@ pub(crate) mod test_utils {
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,
             upstream: None,
-            #[cfg(feature = "praxis-main")]
-            peer_identity: None,
-            #[cfg(feature = "praxis-main")]
-            pre_read_mutations: Vec::new(),
-            #[cfg(feature = "praxis-main")]
-            structured_metadata: std::collections::HashMap::new(),
         }
     }
 

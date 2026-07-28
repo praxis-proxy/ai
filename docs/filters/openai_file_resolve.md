@@ -3,11 +3,13 @@
 
 # `openai_file_resolve`
 
-Resolves `file_id` references in Responses API input by fetching content from a Files API via [`CalloutClient`] and inlining the base64-encoded content in the provider-native field.
+Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field.
 
 ## Configuration Notes
 
 The inference backend must support the resulting inline content part. This filter does not extract documents into backend-specific representations such as `input_text`.
+
+This filter resolves references inside Responses requests; it does not proxy client-facing Files API operations. Route `/v1/files` and its subresources to the configured Files API with the standard `router` and `load_balancer` filters.
 
 ## Configuration
 
@@ -15,12 +17,14 @@ The inference backend must support the resulting inline content part. This filte
 |-------|------|---------|-------------|
 | `allow_private_files_api_url` | bool | no | Allow `files_api_url` to target private, loopback, link-local, or DNS-name hosts.  Default `false` rejects SSRF-sensitive targets; set to `true` in development or when the Files API is an internal service on a private network. |
 | `allow_pre_security_callout` | bool | no | Allow Files API callouts from the `StreamBuffer` pre-read phase, before header-phase security filters execute. This must be explicitly enabled only when an outer trust boundary authenticates and authorizes requests before they reach this listener. Forwarded headers are the original downstream values, not mutations from request filters. |
-| `files_api_url` | string | yes | Base URL of the Files API (OGX) endpoint. Example: `http://ogx:8321` |
+| `files_api_url` | string | yes | Base URL of the Files API endpoint. Example: `http://files-api:8321` |
 | `forward_headers` | string[] | no | Headers to forward from the original request to the Files API for authentication and tenant isolation. No downstream headers are forwarded by default. |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 | `max_file_references` | integer | no | Maximum number of distinct content-part / `file_id` pairs to resolve in one request, including rehydrated history. |
 | `on_missing` | `continue` \| `reject` | no | Behavior when a referenced file cannot be fetched. |
 | `timeout_ms` | integer | no | HTTP timeout in milliseconds for Files API callout requests. |
+| `file_url` | `resolve` \| `passthrough` | no | Mode for `file_url` content parts in `input_file`. |
+| `allowed_file_url_origins` | string[] | no | Exact origins allowed to resolve to private addresses. Cloud metadata, unspecified, and multicast remain blocked. |
 
 ## Examples
 
@@ -28,7 +32,7 @@ The inference backend must support the resulting inline content part. This filte
 
 ```yaml
 filter: openai_file_resolve
-files_api_url: "http://ogx:8321"
+files_api_url: "http://files-api:8321"
 allow_private_files_api_url: true
 allow_pre_security_callout: true
 ```
@@ -37,7 +41,7 @@ allow_pre_security_callout: true
 
 ```yaml
 filter: openai_file_resolve
-files_api_url: "http://ogx:8321"
+files_api_url: "http://files-api:8321"
 allow_private_files_api_url: true
 allow_pre_security_callout: true
 forward_headers:
@@ -47,4 +51,16 @@ on_missing: continue
 timeout_ms: 30000
 max_body_bytes: 67108864
 max_file_references: 32
+```
+
+### Example 3
+
+```yaml
+filter: openai_file_resolve
+files_api_url: "http://ogx:8321"
+allow_private_files_api_url: true
+allow_pre_security_callout: true
+file_url: resolve
+allowed_file_url_origins:
+  - "https://files.internal:8443"
 ```

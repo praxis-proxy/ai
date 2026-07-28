@@ -4,7 +4,7 @@
 # Stage 1: Build
 # ------------------------------------------------------------------------------
 
-FROM rust:1.96-alpine AS builder
+FROM rust:1.97-alpine AS builder
 
 ENV OPENSSL_STATIC=1
 
@@ -70,7 +70,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Stage 2: Runtime
 # ------------------------------------------------------------------------------
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/ai" \
     org.opencontainers.image.description="Praxis AI proxy server" \

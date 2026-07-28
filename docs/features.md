@@ -43,11 +43,10 @@ health checks, etc.), see the
   for downstream routing via branch chains.
 - **Responses API validation**
   (`openai_responses_validate`): validates Responses
-  API parameter combinations (stream/background,
-  background/store conflicts), extracts conversation
-  IDs, and generates cryptographically random response
-  and conversation IDs with `resp_` and `conv_`
-  prefixes.
+  API JSON syntax, extracts conversation IDs, and
+  generates cryptographically random response and
+  conversation IDs with `resp_` and `conv_` prefixes.
+  Provider-owned parameter combinations pass through.
 - **Model rewrite**
   (`openai_responses_model_rewrite`): rewrites the
   `model` field in Responses API request bodies.

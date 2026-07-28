@@ -1,0 +1,38 @@
+# Embeddings API Routing
+#
+# Routes OpenAI Embeddings API requests to a dedicated Embeddings API
+# backend. The router uses segment-boundary prefix matching, so
+# /v1/embeddings and all of its subresources are routed to the
+# embeddings-api cluster, while paths such as /v1/embeddingsomething
+# do not match and fall through to the default backend.
+#
+# Example requests:
+#
+#   # Create embeddings
+#   curl http://localhost:8080/v1/embeddings \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"text-embedding-3-small","input":"Hello, world!"}'
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [embeddings-routing]
+
+filter_chains:
+  - name: embeddings-routing
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/v1/embeddings"
+            cluster: "embeddings-api"
+          - path_prefix: "/"
+            cluster: "default-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "embeddings-api"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "default-backend"
+            endpoints:
+              - "127.0.0.1:3002"

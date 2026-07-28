@@ -7,6 +7,7 @@ authors.workspace = true
 description = "AI provider API types and persistence for Praxis"
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [lib]
 name = "praxis_ai_apis"
@@ -28,7 +29,6 @@ http = { workspace = true }
 percent-encoding = { workspace = true }
 praxis-core = { workspace = true, features = ["callout"] }
 praxis-filter = { workspace = true }
-regex = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
 secrecy = { workspace = true }
@@ -39,11 +39,11 @@ sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "net"] }
 tracing = { workspace = true }
-zeroize = { workspace = true }
+url = { workspace = true }
+utoipa = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-chrono = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = { workspace = true }
 tempfile = { workspace = true }

@@ -1,0 +1,108 @@
+name: OpenAI Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
+        with:
+          go-version: "1.26.x"
+
+      - name: Install pinned oasdiff
+        run: go install github.com/oasdiff/oasdiff@v1.23.0
+
+      - name: Verify pinned OpenAI reference
+        run: cargo xtask openai-conformance-reference --check
+
+      - name: Regenerate conformance report
+        run: >-
+          cargo xtask openai-conformance
+          --output-json docs/conformance/openai-conformance-report.json
+
+      - name: Check generated artifacts
+        run: >-
+          git diff --exit-code --
+          docs/conformance/openai-conformance-report.json
+          docs/conformance/specs/openai-openapi.yaml
+          docs/conformance/specs/openai-openapi-source.json
+
+      - name: Enforce strict OpenAI conformance
+        id: strict-conformance
+        continue-on-error: true
+        run: >-
+          target/debug/xtask openai-conformance-gate
+          --report docs/conformance/openai-conformance-report.json
+
+      - name: Evaluate pull request acknowledgement
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.strict-conformance.outcome == 'failure'
+        env:
+          ALLOW_NEW_FAILURES: ${{ contains(github.event.pull_request.labels.*.name, 'conformance-failure-acknowledged') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPORT: docs/conformance/openai-conformance-report.json
+        run: |
+          args=(--report "$REPORT" --acknowledge)
+          base_report="$RUNNER_TEMP/openai-conformance-base-report.json"
+          if git cat-file -e "$BASE_SHA:$REPORT" 2>/dev/null; then
+            git show "$BASE_SHA:$REPORT" > "$base_report"
+            args+=(--base-report "$base_report")
+          fi
+          if [[ "$ALLOW_NEW_FAILURES" == "true" ]]; then
+            args+=(--allow-new-failures)
+          fi
+          target/debug/xtask openai-conformance-gate "${args[@]}"
+          echo "::warning title=OpenAI conformance failure acknowledged::Strict conformance failed; the generated report carries the reviewed failure set."
+          {
+            echo "### OpenAI conformance failure acknowledged"
+            echo
+            echo "Strict conformance failed, but its exact failure set is recorded in the generated report."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Honor checked-in acknowledgement
+        if: >-
+          always() &&
+          github.event_name != 'pull_request' &&
+          steps.strict-conformance.outcome == 'failure'
+        run: |
+          target/debug/xtask openai-conformance-gate \
+            --report docs/conformance/openai-conformance-report.json \
+            --acknowledge \
+            --allow-new-failures
+          echo "::warning title=OpenAI conformance failure acknowledged::Strict conformance failed; the regenerated report matches the checked-in reviewed failure set."
+          {
+            echo "### OpenAI conformance failure acknowledged"
+            echo
+            echo "Strict conformance failed, but the regenerated report matches the checked-in reviewed failure set."
+          } >> "$GITHUB_STEP_SUMMARY"

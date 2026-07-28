@@ -36,6 +36,7 @@ from openai import OpenAI
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
+OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
 
@@ -72,12 +73,20 @@ def _vllm_endpoint() -> str:
     return f"{host}:{port}"
 
 
+def _ogx_endpoint() -> str:
+    parsed = urlparse(OGX_BASE_URL)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8321
+    return f"{host}:{port}"
+
+
 def _write_config(praxis_port: int, db_path: str) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+    config = config.replace("127.0.0.1:9999", _ogx_endpoint())
     config = config.replace(
         "sqlite://responses.db?mode=rwc",
         f"sqlite://{db_path}?mode=rwc",
@@ -268,6 +277,60 @@ class TestOpenAIResponsesVLLM:
             f"vLLM should produce output containing the document "
             f"marker '{marker}'; got: {response.output_text}"
         )
+
+    def test_file_id_resolution_through_ogx(self, openai_client):
+        """End-to-end: upload to OGX via Praxis, reference by file_id,
+        verify vLLM output contains the file content.
+
+        Pipeline: file_resolve (OGX) -> doc_extract -> responses_proxy -> vLLM
+        """
+        import io
+
+        marker = "PRAXIS-OGX-FILE-4829"
+        file_content = f"The secret marker is: {marker}"
+
+        uploaded = openai_client.files.create(
+            file=("marker-document.txt", io.BytesIO(file_content.encode())),
+            purpose="user_data",
+        )
+        file_id = uploaded.id
+
+        try:
+            response = openai_client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "file_id": file_id,
+                            },
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "What marker appears in the document? "
+                                    "Repeat it exactly. /no_think"
+                                ),
+                            },
+                        ],
+                    }
+                ],
+                store=False,
+                max_output_tokens=128,
+            )
+
+            assert response.status == "completed"
+            assert marker in response.output_text, (
+                f"vLLM should produce output containing the file marker "
+                f"'{marker}'; got: {response.output_text}"
+            )
+        finally:
+            try:
+                openai_client.files.delete(file_id)
+            except Exception:
+                pass
 
     def test_streaming(self, openai_client):
         stream = openai_client.responses.create(

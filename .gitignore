@@ -1,6 +1,9 @@
 # Cargo build output
 target
 
+# Default rustc output
+rust_out
+
 # Test artifacts
 **/*.db
 **/postgres.rs.tmp*
@@ -40,6 +43,9 @@ coverage.json
 docs/**/
 !docs/
 !docs/architecture/
+!docs/conformance/
+!docs/conformance/**/
+!docs/conformance/**
 !docs/developing/
 !docs/filters/
 !docs/filters/http/
