@@ -25,8 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
+    parse_filter_config,
 };
 use tracing::{debug, trace};
 
@@ -59,17 +60,13 @@ pub struct OpenaiResponsesValidateFilter;
 impl OpenaiResponsesValidateFilter {
     /// Create a filter from YAML config.
     ///
-    /// This filter has no configuration fields. The config parameter
-    /// is accepted but ignored.
-    ///
     /// # Errors
     ///
-    /// This function does not return errors; the `Result` return type
-    /// is required by the [`FilterFactory`] signature.
+    /// Returns [`FilterError`] if the YAML config contains unknown fields.
     ///
-    /// [`FilterFactory`]: praxis_filter::FilterFactory
-    #[expect(clippy::unnecessary_wraps, reason = "signature required by FilterFactory")]
-    pub fn from_config(_config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+    /// [`FilterError`]: praxis_filter::FilterError
+    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let _: EmptyFilterConfig = parse_filter_config("openai_responses_validate", config)?;
         Ok(Box::new(Self))
     }
 }
@@ -571,6 +568,13 @@ mod tests {
             "openai_responses_validate",
             "filter name should be openai_responses_validate"
         );
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_fields() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("bogus: true").unwrap();
+        let result = OpenaiResponsesValidateFilter::from_config(&yaml);
+        assert!(result.is_err(), "unknown fields should be rejected");
     }
 
     #[test]
