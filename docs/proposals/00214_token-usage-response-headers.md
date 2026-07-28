@@ -115,7 +115,7 @@ consumption.
 #### Module Location
 
 The filter lives at
-`filter/src/builtins/http/ai/token_usage_headers.rs`
+`filters/src/token_usage/headers.rs`
 alongside the existing token counting and inference
 filters, since it is only applicable to AI workloads.
 
@@ -241,4 +241,3 @@ resolved during implementation.
 [#462]: https://github.com/praxis-proxy/praxis/pull/462
 [#471]: https://github.com/praxis-proxy/praxis/pull/471
 [#474]: https://github.com/praxis-proxy/praxis/pull/474
-

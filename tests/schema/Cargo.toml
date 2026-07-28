@@ -14,12 +14,7 @@ praxis-main = ["praxis-test-utils/praxis-main"]
 workspace = true
 
 [dev-dependencies]
-async-trait = { workspace = true }
-bytes = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-test-utils = { workspace = true }
-praxis-tls = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 serde_yaml = { workspace = true }

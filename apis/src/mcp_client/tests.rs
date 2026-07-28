@@ -258,6 +258,10 @@ fn url_bearing_errors_only_format_sanitized_urls() {
     let errors = [
         McpClientError::Connection { url: url.clone() },
         McpClientError::ListTools { url: url.clone() },
+        McpClientError::CallTool {
+            url: url.clone(),
+            tool_name: "test_tool".to_owned(),
+        },
         McpClientError::Timeout {
             url: url.clone(),
             timeout: Duration::from_secs(5),
@@ -579,14 +583,14 @@ async fn allow_loopback_still_blocks_unspecified() {
 #[test]
 fn call_tool_error_display() {
     let err = McpClientError::CallTool {
-        url: "http://example.com/mcp".to_owned(),
+        url: display_url("http://example.com/mcp?api_key=TOPSECRET"),
         tool_name: "get_weather".to_owned(),
-        source: Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused")),
     };
     let msg = err.to_string();
     assert!(msg.contains("tools/call failed"), "should mention tools/call: {msg}");
     assert!(msg.contains("get_weather"), "should mention tool name: {msg}");
     assert!(msg.contains("example.com"), "should mention URL: {msg}");
+    assert!(!msg.contains("TOPSECRET"), "error must redact query credentials: {msg}");
 }
 
 // =========================================================================

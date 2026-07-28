@@ -654,7 +654,7 @@ fn mcp_tool_to_function_tool(label: &str, definition: &serde_json::Value) -> ser
 /// within [`MAX_FUNCTION_NAME_LEN`]. Lossy: distinct inputs can
 /// produce the same output. Use [`detect_name_collisions`] after
 /// building the full tools array to catch this.
-fn encode_function_name(label: &str, tool_name: &str) -> String {
+pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
     let raw = format!("{label}__{tool_name}");
     let sanitized: String = raw
         .chars()

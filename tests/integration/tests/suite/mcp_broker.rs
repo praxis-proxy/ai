@@ -7,7 +7,8 @@ use std::collections::HashMap;
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    free_port, http_send, load_example_config, parse_body, parse_status, start_backend_with_shutdown, start_proxy,
+    free_port, http_send, load_example_config, parse_body, parse_status, start_backend_with_shutdown,
+    start_echo_backend, start_header_echo_backend, start_proxy, start_uri_echo_backend,
 };
 
 // -----------------------------------------------------------------------------
@@ -260,7 +261,7 @@ fn mcp_broker_unsupported_method_returns_method_not_found() {
 }
 
 #[test]
-fn mcp_broker_tools_call_not_forwarded_before_routing() {
+fn mcp_current_tools_call_returns_unsupported() {
     let backend_guard = start_backend_with_shutdown("not-reachable-backend");
     let proxy_port = free_port();
 
@@ -276,17 +277,14 @@ fn mcp_broker_tools_call_not_forwarded_before_routing() {
     let status = parse_status(&raw);
     let response_body = parse_body(&raw);
 
-    assert_eq!(
-        status, 200,
-        "tools/call should return a JSON-RPC error response before backend routing is added"
-    );
+    assert_eq!(status, 200, "current-profile tools/call must return -32601");
     assert!(
         response_body.contains("-32601"),
-        "tools/call should return -32601 before backend routing is added: {response_body}"
+        "current-profile tools/call must return -32601: {response_body}"
     );
     assert!(
         !response_body.contains("not-reachable-backend"),
-        "tools/call must not reach the backend before routing is added"
+        "current-profile tools/call must not reach the backend"
     );
 }
 
@@ -431,7 +429,107 @@ fn mcp_stateless_tools_list_returns_catalog_with_cache_metadata() {
 }
 
 #[test]
-fn mcp_stateless_tools_call_returns_unsupported_after_header_validation() {
+fn mcp_stateless_tools_call_routes_to_weather_backend() {
+    let weather_guard = start_echo_backend();
+    let calendar_guard = start_backend_with_shutdown("calendar-backend");
+    let proxy_port = free_port();
+
+    let yaml = stateless_two_backend_yaml(proxy_port, weather_guard.port(), calendar_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body_str = &stateless_rpc_body(
+        3,
+        "tools/call",
+        Some(r#""name":"weather_get_weather","arguments":{"city":"NYC"}"#),
+    );
+    let request = stateless_post("/mcp", body_str, "tools/call", Some("weather_get_weather"));
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "routed tools/call should return 200");
+    let body = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        parsed["params"]["name"], "get_weather",
+        "backend should receive stripped params.name"
+    );
+    assert!(
+        !body.contains("calendar-backend"),
+        "weather tool must not reach calendar backend"
+    );
+}
+
+#[test]
+fn mcp_stateless_tools_call_routes_to_calendar_backend() {
+    let weather_guard = start_backend_with_shutdown("weather-backend");
+    let calendar_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let yaml = stateless_two_backend_yaml(proxy_port, weather_guard.port(), calendar_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body_str = &stateless_rpc_body(4, "tools/call", Some(r#""name":"cal_create_event","arguments":{}"#));
+    let request = stateless_post("/mcp", body_str, "tools/call", Some("cal_create_event"));
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "routed tools/call should return 200");
+    let body = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        parsed["params"]["name"], "create_event",
+        "backend should receive stripped params.name"
+    );
+    assert!(
+        !body.contains("weather-backend"),
+        "calendar tool must not reach weather backend"
+    );
+}
+
+#[test]
+fn mcp_stateless_tools_call_backend_receives_rewritten_path() {
+    let backend_guard = start_uri_echo_backend();
+    let proxy_port = free_port();
+
+    let yaml = stateless_custom_path_yaml(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body_str = &stateless_rpc_body(5, "tools/call", Some(r#""name":"weather_get_weather","arguments":{}"#));
+    let request = stateless_post("/mcp", body_str, "tools/call", Some("weather_get_weather"));
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "routed tools/call should return 200");
+    let body = parse_body(&raw);
+    assert_eq!(
+        body, "/backend/v1/mcp",
+        "backend should receive configured backend path"
+    );
+}
+
+#[test]
+fn mcp_stateless_tools_call_backend_sees_rewritten_mcp_name() {
+    let backend_guard = start_header_echo_backend();
+    let proxy_port = free_port();
+
+    let yaml = stateless_broker_yaml(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body_str = &stateless_rpc_body(6, "tools/call", Some(r#""name":"weather_get_weather","arguments":{}"#));
+    let request = stateless_post("/mcp", body_str, "tools/call", Some("weather_get_weather"));
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "routed tools/call should return 200");
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("mcp-name: get_weather"),
+        "backend should see rewritten mcp-name header: {body}"
+    );
+}
+
+#[test]
+fn mcp_stateless_tools_call_unknown_tool_returns_400() {
     let backend_guard = start_backend_with_shutdown("not-reachable-backend");
     let proxy_port = free_port();
 
@@ -439,24 +537,98 @@ fn mcp_stateless_tools_call_returns_unsupported_after_header_validation() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body_str = &stateless_rpc_body(3, "tools/call", Some(r#""name":"weather_get_weather","arguments":{}"#));
+    let body_str = &stateless_rpc_body(7, "tools/call", Some(r#""name":"nonexistent_tool","arguments":{}"#));
+    let request = stateless_post("/mcp", body_str, "tools/call", Some("nonexistent_tool"));
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 400, "unknown tool should return 400");
+    let body = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], -32602, "should return -32602 InvalidParams");
+    assert!(
+        !body.contains("not-reachable-backend"),
+        "unknown tool must not reach backend"
+    );
+}
+
+#[test]
+fn mcp_stateless_tools_call_malformed_params_returns_400() {
+    let backend_guard = start_backend_with_shutdown("not-reachable-backend");
+    let proxy_port = free_port();
+
+    let yaml = stateless_broker_yaml(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body_str = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call"}"#;
     let request = stateless_post("/mcp", body_str, "tools/call", Some("weather_get_weather"));
     let raw = http_send(proxy.addr(), &request);
 
-    assert_eq!(
-        parse_status(&raw),
-        404,
-        "stateless tools/call should return 404 per draft Streamable HTTP"
-    );
+    assert_eq!(parse_status(&raw), 400, "missing params should return 400");
     let body = parse_body(&raw);
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        parsed["error"]["code"], -32601,
-        "should return method not yet supported"
-    );
+    assert_eq!(parsed["error"]["code"], -32602, "should return -32602 InvalidParams");
     assert!(
         !body.contains("not-reachable-backend"),
-        "tools/call must not hit backend"
+        "malformed params must not reach backend"
+    );
+}
+
+#[test]
+fn mcp_stateless_tools_call_backend_sees_repaired_content_length() {
+    let body_str = &stateless_rpc_body(
+        9,
+        "tools/call",
+        Some(r#""name":"weather_get_weather","arguments":{"city":"NYC"}"#),
+    );
+    let request = stateless_post("/mcp", body_str, "tools/call", Some("weather_get_weather"));
+
+    let echo_guard = start_echo_backend();
+    let echo_proxy_port = free_port();
+    let echo_config = Config::from_yaml(&stateless_single_backend_yaml(echo_proxy_port, echo_guard.port())).unwrap();
+    let echo_proxy = start_proxy(&echo_config);
+
+    let echo_raw = http_send(echo_proxy.addr(), &request);
+    assert_eq!(parse_status(&echo_raw), 200, "echo route should return 200");
+    let mutated_body = parse_body(&echo_raw);
+    assert!(
+        mutated_body.contains("\"get_weather\""),
+        "mutated body should contain stripped tool name: {mutated_body}"
+    );
+    assert!(
+        !mutated_body.contains("weather_get_weather"),
+        "mutated body must not contain prefixed tool name: {mutated_body}"
+    );
+    let expected_len = mutated_body.len();
+
+    let header_guard = start_header_echo_backend();
+    let header_proxy_port = free_port();
+    let header_config =
+        Config::from_yaml(&stateless_single_backend_yaml(header_proxy_port, header_guard.port())).unwrap();
+    let header_proxy = start_proxy(&header_config);
+
+    let header_raw = http_send(header_proxy.addr(), &request);
+    assert_eq!(parse_status(&header_raw), 200, "header route should return 200");
+    let headers_body = parse_body(&header_raw);
+
+    let cl_values: Vec<&str> = headers_body
+        .lines()
+        .filter(|line| line.to_lowercase().starts_with("content-length:"))
+        .collect();
+    assert_eq!(
+        cl_values.len(),
+        1,
+        "backend should receive exactly one content-length header: {headers_body}"
+    );
+    let cl: usize = cl_values[0]
+        .split_once(':')
+        .map(|(_, v)| v.trim())
+        .unwrap()
+        .parse()
+        .expect("content-length should be numeric");
+    assert_eq!(
+        cl, expected_len,
+        "content-length ({cl}) must equal mutated body length ({expected_len})"
     );
 }
 
@@ -695,6 +867,10 @@ filter_chains:
 }
 
 fn stateless_broker_yaml(proxy_port: u16, backend_port: u16) -> String {
+    stateless_two_backend_yaml(proxy_port, backend_port, backend_port)
+}
+
+fn stateless_two_backend_yaml(proxy_port: u16, weather_port: u16, calendar_port: u16) -> String {
     format!(
         r#"
 listeners:
@@ -727,8 +903,70 @@ filter_chains:
         clusters:
           - name: weather-mcp
             endpoints:
-              - "127.0.0.1:{backend_port}"
+              - "127.0.0.1:{weather_port}"
           - name: calendar-mcp
+            endpoints:
+              - "127.0.0.1:{calendar_port}"
+"#,
+    )
+}
+
+fn stateless_single_backend_yaml(proxy_port: u16, backend_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: mcp
+        path: /mcp
+        max_body_bytes: 65536
+        protocol_profile: stateless
+        servers:
+          - name: weather
+            cluster: weather-mcp
+            path: /mcp
+            tool_prefix: "weather_"
+            tools:
+              - name: get_weather
+                description: Get current weather
+      - filter: load_balancer
+        clusters:
+          - name: weather-mcp
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+"#,
+    )
+}
+
+fn stateless_custom_path_yaml(proxy_port: u16, backend_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: mcp
+        path: /mcp
+        max_body_bytes: 65536
+        protocol_profile: stateless
+        servers:
+          - name: weather
+            cluster: weather-mcp
+            path: /backend/v1/mcp
+            tool_prefix: "weather_"
+            tools:
+              - name: get_weather
+                description: Get current weather
+      - filter: load_balancer
+        clusters:
+          - name: weather-mcp
             endpoints:
               - "127.0.0.1:{backend_port}"
 "#,

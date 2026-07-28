@@ -1,0 +1,23 @@
+name: Install actionlint
+description: Install the pinned actionlint release with checksum verification
+
+runs:
+  using: composite
+  steps:
+    - name: Download actionlint
+      shell: bash
+      env:
+        ACTIONLINT_VERSION: "1.7.12"
+        ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+      run: |
+        set -euo pipefail
+        archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+        base_url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+
+        curl -fsSL "${base_url}/${archive}" -o "/tmp/${archive}"
+        echo "${ACTIONLINT_SHA256}  /tmp/${archive}" | sha256sum --check --strict
+
+        mkdir -p /tmp/actionlint-bin
+        tar -xzf "/tmp/${archive}" -C /tmp/actionlint-bin actionlint
+        chmod +x /tmp/actionlint-bin/actionlint
+        echo "/tmp/actionlint-bin" >> "$GITHUB_PATH"

@@ -23,8 +23,11 @@ body:
   - type: input
     id: version
     attributes:
-      label: Praxis Version
-      placeholder: "v0.4.0"
+      label: Praxis AI Version
+      description: Release tag, container tag, or commit SHA
+      placeholder: "v0.1.0"
+    validations:
+      required: true
   - type: dropdown
     id: area
     attributes:

@@ -21,6 +21,8 @@ mod lint_deps;
 mod lint_example_tests;
 mod lint_separators;
 mod make_replay_fixture;
+mod openai_conformance;
+mod openai_conformance_gate;
 mod port;
 mod sync_example_readme;
 
@@ -73,6 +75,15 @@ enum Command {
 
     /// Check that filter doc files are up to date.
     LintFilterDocs(filter_docs::LintArgs),
+
+    /// Compare registered API areas with OpenAI's `OpenAPI` spec.
+    OpenaiConformance(openai_conformance::Args),
+
+    /// Refresh or verify the pinned complete OpenAI reference.
+    OpenaiConformanceReference(openai_conformance::ReferenceArgs),
+
+    /// Enforce or acknowledge failures in a generated conformance report.
+    OpenaiConformanceGate(openai_conformance_gate::Args),
 }
 
 // -----------------------------------------------------------------------------
@@ -92,6 +103,9 @@ fn main() {
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),
+        Command::OpenaiConformance(args) => openai_conformance::run(&args),
+        Command::OpenaiConformanceReference(args) => openai_conformance::run_reference(&args),
+        Command::OpenaiConformanceGate(args) => openai_conformance_gate::run(&args),
     }
 }
 

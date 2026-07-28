@@ -54,7 +54,7 @@ pub(crate) struct McpDisplayUrl(String);
 
 impl McpDisplayUrl {
     /// Build a safe display URL from an already-parsed URI.
-    fn from_uri(uri: &http::Uri) -> Self {
+    pub(crate) fn from_uri(uri: &http::Uri) -> Self {
         let mut value = String::new();
 
         if let Some(scheme) = uri.scheme_str() {
@@ -120,17 +120,16 @@ pub(crate) enum McpClientError {
     },
 
     /// The `tools/call` request failed.
-    #[error("mcp tools/call failed for {url} tool {tool_name}: {source}")]
+    ///
+    /// The third-party source error is intentionally discarded because it may
+    /// retain and format the original credential-bearing URL.
+    #[error("mcp tools/call failed for {url} tool {tool_name}")]
     CallTool {
         /// URL of the MCP server.
-        url: String,
+        url: McpDisplayUrl,
 
         /// Name of the tool that was called.
         tool_name: String,
-
-        /// Underlying error.
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Timed out waiting for the MCP server.
@@ -277,10 +276,9 @@ pub(crate) async fn call_tool(
             url: display_url.clone(),
             timeout,
         })?
-        .map_err(|e| McpClientError::CallTool {
-            url: server_url.to_owned(),
+        .map_err(|_source| McpClientError::CallTool {
+            url: display_url.clone(),
             tool_name: tool_name.to_owned(),
-            source: Box::new(e),
         })
 }
 

@@ -3,6 +3,7 @@
 
 //! Unit tests for MCP static catalog filter.
 
+use base64::Engine as _;
 use bytes::Bytes;
 
 use super::{
@@ -930,7 +931,7 @@ async fn tools_list_returns_prefixed_catalog() {
 }
 
 #[tokio::test]
-async fn tools_call_returns_unsupported() {
+async fn current_profile_tools_call_returns_unsupported() {
     let filter = make_broker_filter();
     let body_str =
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"weather_get_weather","arguments":{}}}"#;
@@ -942,17 +943,14 @@ async fn tools_call_returns_unsupported() {
 
     match &action {
         FilterAction::Reject(rejection) => {
-            assert_eq!(
-                rejection.status, 200,
-                "tools/call should return a JSON-RPC error response before backend routing is added"
-            );
+            assert_eq!(rejection.status, 200, "current-profile tools/call must return -32601");
             let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
             assert!(
                 body_str.contains("-32601"),
-                "tools/call should return -32601 before backend routing is added: {body_str}"
+                "current-profile tools/call must return -32601: {body_str}"
             );
         },
-        FilterAction::Release => panic!("tools/call must not return Release before backend routing is added"),
+        FilterAction::Release => panic!("current-profile tools/call must not return Release"),
         _ => panic!("expected Reject with JSON-RPC error"),
     }
 }
@@ -2154,8 +2152,6 @@ async fn stateless_tools_call_mcp_name_mismatch_rejected() {
 
 #[tokio::test]
 async fn stateless_tools_call_base64_mcp_name_matches_body() {
-    use base64::Engine as _;
-
     let filter = make_stateless_broker_filter();
     let tool_name = "weather_get_weather";
     let encoded = base64::engine::general_purpose::STANDARD.encode(tool_name);
@@ -2168,20 +2164,15 @@ async fn stateless_tools_call_base64_mcp_name_matches_body() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    match &action {
-        FilterAction::Reject(rejection) => {
-            assert_eq!(
-                rejection.status, 404,
-                "base64-encoded Mcp-Name matching body should pass validation but tools/call returns 404"
-            );
-            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
-            assert!(
-                body_str.contains("-32601"),
-                "tools/call should still return unsupported: {body_str}"
-            );
-        },
-        _ => panic!("expected Reject with JSON-RPC error (tools/call unsupported)"),
-    }
+    assert!(
+        matches!(action, FilterAction::Release),
+        "base64-encoded Mcp-Name matching body should pass validation and route to backend"
+    );
+    assert_eq!(
+        ctx.cluster.as_deref(),
+        Some("weather-mcp"),
+        "should select weather-mcp cluster"
+    );
 }
 
 #[tokio::test]
@@ -2448,6 +2439,322 @@ async fn stateless_array_client_capabilities_rejected() {
             let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
             let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
             assert_eq!(parsed["error"]["code"], ERR_HEADER_MISMATCH);
+        },
+        _ => panic!("expected Reject with 400"),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Stateless Tools/Call Routing Tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stateless_tools_call_known_tool_releases_with_cluster() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""name":"weather_get_weather","arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "known stateless tool should return Release for forwarding"
+    );
+    assert_eq!(
+        ctx.cluster.as_deref(),
+        Some("weather-mcp"),
+        "should select weather-mcp cluster"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tools_call_sets_rewritten_path() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""name":"weather_get_weather","arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert_eq!(
+        ctx.rewritten_path.as_deref(),
+        Some("/mcp"),
+        "should rewrite path to backend MCP path"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tools_call_strips_prefix_in_body() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""name":"weather_get_weather","arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let mutated: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        mutated["params"]["name"], "get_weather",
+        "body params.name should be stripped to original tool name"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tools_call_rewrites_forwarded_mcp_name() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""name":"weather_get_weather","arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let mcp_name_header = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(k, _)| k.as_str() == "mcp-name")
+        .map(|(_, v)| v.to_str().unwrap().to_owned());
+    assert_eq!(
+        mcp_name_header.as_deref(),
+        Some("get_weather"),
+        "forwarded Mcp-Name should match stripped backend tool name"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tools_call_preserves_arguments() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params(
+        "tools/call",
+        1,
+        r#""name":"weather_get_weather","arguments":{"city":"NYC"}"#,
+    );
+    let mut body = Some(Bytes::from(body_str));
+
+    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let mutated: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        mutated["params"]["arguments"]["city"], "NYC",
+        "arguments should be preserved after body mutation"
+    );
+    assert_eq!(mutated["id"], 1, "JSON-RPC id should be preserved after body mutation");
+    assert_eq!(
+        mutated["method"], "tools/call",
+        "method should be preserved after body mutation"
+    );
+}
+
+#[test]
+fn encode_mcp_name_ascii_returns_plain_value() {
+    let hv = encode_mcp_name("get_weather");
+    assert_eq!(hv.to_str().unwrap(), "get_weather", "ASCII name should pass through");
+}
+
+#[test]
+fn encode_mcp_name_non_ascii_uses_base64_sentinel() {
+    let hv = encode_mcp_name("wëäthér_tøøl");
+    let sentinel = std::str::from_utf8(hv.as_bytes()).expect("sentinel should be valid UTF-8");
+    assert!(
+        sentinel.starts_with("=?base64?"),
+        "non-ASCII name should use base64 sentinel prefix: {sentinel}"
+    );
+    assert!(
+        sentinel.ends_with("?="),
+        "non-ASCII name should use base64 sentinel suffix: {sentinel}"
+    );
+
+    let inner = sentinel
+        .strip_prefix("=?base64?")
+        .and_then(|s| s.strip_suffix("?="))
+        .unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(inner).unwrap();
+    let decoded_str = String::from_utf8(decoded).unwrap();
+    assert_eq!(
+        decoded_str, "wëäthér_tøøl",
+        "decoded sentinel should match original name"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tools_call_routes_second_server() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("cal_create_event"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""name":"cal_create_event","arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "cal_create_event should return Release"
+    );
+    assert_eq!(
+        ctx.cluster.as_deref(),
+        Some("calendar-mcp"),
+        "should select calendar-mcp cluster"
+    );
+
+    let mutated: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        mutated["params"]["name"], "create_event",
+        "body params.name should be stripped to original tool name"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tools_call_unknown_tool_rejects_invalid_params() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("nonexistent_tool"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""name":"nonexistent_tool","arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "unknown tool should return HTTP 400");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32602, "should return -32602 InvalidParams");
+        },
+        _ => panic!("expected Reject with 400"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_tools_call_missing_params_rejects() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#;
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "missing params should return 400");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32602, "should return -32602");
+        },
+        _ => panic!("expected Reject with 400"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_tools_call_null_params_rejects() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":null}"#;
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "null params should return 400");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32602, "should return -32602");
+        },
+        _ => panic!("expected Reject with 400"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_tools_call_array_params_rejects() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[1,2]}"#;
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "array params should return 400");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32602, "should return -32602");
+        },
+        _ => panic!("expected Reject with 400"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_tools_call_missing_name_rejects() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "missing name should return 400");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32602, "should return -32602");
+        },
+        _ => panic!("expected Reject with 400"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_tools_call_non_string_name_rejects() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("tools/call", Some("weather_get_weather"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""name":42,"arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "non-string name should return 400");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32602, "should return -32602");
+        },
+        _ => panic!("expected Reject with 400"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_header_body_mismatch_still_returns_32020() {
+    let filter = make_stateless_broker_filter();
+    let mut req = make_stateless_mcp_request("tools/call", Some("wrong_name"));
+    req.headers.insert("mcp-method", "tools/call".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""name":"weather_get_weather","arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "header/body mismatch should return 400");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(
+                parsed["error"]["code"], ERR_HEADER_MISMATCH,
+                "header/body mismatch must return -32020, not -32602"
+            );
         },
         _ => panic!("expected Reject with 400"),
     }

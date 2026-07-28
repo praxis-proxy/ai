@@ -19,4 +19,5 @@ API integrations built on
 ## Reference
 
 - [Example configs](../examples/README.md)
+- [Migrating to 0.2.0](migrating-to-0.2.md)
 - [Proposals](proposals/)

@@ -11,8 +11,9 @@
 //! persist?" decision as new information becomes available:
 //!
 //! - **`on_request`**: reads classifier metadata to decide whether the request needs the store (persistable POST or
-//!   `previous_response_id`). Lazily initializes the store backend when needed. Sets `responses.skip_persist` metadata
-//!   on store init failure for requests that would otherwise persist.
+//!   `previous_response_id`). Lazily initializes the store backend when needed. Rejects with a 500 response on store
+//!   init failure for any request that requires the store (persistence or rehydration). `GET` and `DELETE` endpoints
+//!   owned by the store also reject rather than falling through to the upstream.
 //!
 //! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
 //!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
@@ -66,6 +67,7 @@ use super::{
     list_input_items,
 };
 use crate::{
+    classifier::is_responses_create,
     is_event_stream_content_type,
     store::{
         PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
@@ -212,7 +214,7 @@ impl ResponseStoreFilter {
     /// Handle `DELETE /v1/responses/{id}` by deleting from the store.
     async fn handle_delete(&self, tenant_id: &str, id: &str) -> Result<FilterAction, FilterError> {
         let Some(store) = self.ensure_store().await else {
-            return Ok(FilterAction::Continue);
+            return Ok(FilterAction::Reject(reject_store_error()));
         };
 
         let deleted = store
@@ -474,7 +476,10 @@ fn delete_not_found_rejection(id: &str) -> Rejection {
 
 /// Check whether this request should skip persistence entirely.
 fn should_skip(ctx: &HttpFilterContext<'_>) -> bool {
-    is_non_post_request(ctx) || is_non_responses_format(ctx) || is_store_disabled(ctx)
+    is_non_post_request(ctx)
+        || is_non_responses_format(ctx)
+        || is_store_disabled(ctx)
+        || !is_responses_create(&ctx.request.method, ctx.request.uri.path())
 }
 
 /// Check whether this request should initialize the store.
@@ -484,7 +489,9 @@ fn should_init_store_for_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Check whether this request can persist the eventual response.
 fn request_will_persist_response(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.request.method == http::Method::POST && is_responses_format(ctx) && !is_store_disabled(ctx)
+    is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && is_responses_format(ctx)
+        && !is_store_disabled(ctx)
 }
 
 /// Check whether rehydrate needs the store before the request phase.
@@ -738,11 +745,9 @@ impl HttpFilter for ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let will_persist = request_will_persist_response(ctx);
         match &self.get_or_init_store().await {
             Some(store) => register_store_in_context(ctx, store),
-            None if will_persist => ctx.set_metadata("responses.skip_persist", "true"),
-            None => {},
+            None => return Ok(FilterAction::Reject(reject_store_error())),
         }
 
         Ok(FilterAction::Continue)
@@ -766,11 +771,9 @@ impl HttpFilter for ResponseStoreFilter {
             ctx.insert_filter_state(ResponseStoreRequestState { input });
         }
         if should_init_store_for_request(ctx) {
-            let will_persist = request_will_persist_response(ctx);
             match &self.get_or_init_store().await {
                 Some(store) => register_store_in_context(ctx, store),
-                None if will_persist => ctx.set_metadata("responses.skip_persist", "true"),
-                None => {},
+                None => return Ok(FilterAction::Reject(reject_store_error())),
             }
         }
         Ok(FilterAction::Continue)
@@ -786,9 +789,7 @@ impl HttpFilter for ResponseStoreFilter {
         }
 
         if self.get_or_init_store().await.is_none() {
-            trace!("skipping persistence because response store is unavailable");
-            ctx.set_metadata("responses.skip_persist", "true");
-            return Ok(FilterAction::Continue);
+            return Ok(FilterAction::Reject(reject_store_error()));
         }
 
         trace!("response body persistence armed");
