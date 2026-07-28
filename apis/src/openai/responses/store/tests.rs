@@ -623,7 +623,7 @@ async fn on_response_continues_for_event_stream_200() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_does_not_buffer_when_store_unavailable() {
+async fn on_request_rejects_when_store_unavailable_for_persist() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: sqlite
@@ -639,27 +639,12 @@ conversations_table: conversations
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    run_request_phase(&filter, &mut ctx).await;
 
-    let mut resp = crate::test_utils::make_response();
-    resp.headers
-        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
-    ctx.response_header = Some(&mut resp);
-
-    let action = filter.on_response(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue when store init fails"
-    );
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
     assert_eq!(
-        ctx.response_body_mode,
-        BodyMode::Stream,
-        "body mode should remain Stream when store is unavailable"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "should mark persistence skipped when store is unavailable"
+        rejection.status, 500,
+        "should reject with 500 when store is unavailable for a persistable request"
     );
 }
 
@@ -1835,7 +1820,9 @@ conversations_table: conversations
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 500, "first request should reject with 500");
 
     let store_opt = filter
         .store
@@ -1846,7 +1833,9 @@ conversations_table: conversations
     let mut ctx2 = crate::test_utils::make_filter_context(&req);
     ctx2.set_metadata("openai_responses_format.format", "openai_responses");
 
-    drop(filter.on_request(&mut ctx2).await.unwrap());
+    let action2 = filter.on_request(&mut ctx2).await.unwrap();
+    let rejection2 = expect_reject(action2);
+    assert_eq!(rejection2.status, 500, "second request should also reject with 500");
 
     let store_opt2 = filter.store.get().expect("store OnceCell should still be initialized");
     assert!(
@@ -1884,16 +1873,15 @@ allow_private_database_url: true
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
-
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(
+        rejection.status, 500,
+        "failed postgres initialization should reject with 500"
+    );
     assert!(
         filter.store.get().is_none(),
         "failed postgres initialization should leave OnceCell unset for retry"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "current request should still skip persistence after failed init"
     );
 }
 
@@ -1961,8 +1949,12 @@ allow_private_database_url: true
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_test123");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    drop(filter.on_request(&mut ctx).await.unwrap());
-
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(
+        rejection.status, 500,
+        "DELETE with failed postgres init should reject with 500"
+    );
     assert!(
         filter.store.get().is_none(),
         "failed postgres initialization on DELETE should leave OnceCell unset for retry"
@@ -3295,7 +3287,7 @@ async fn delete_uses_tenant_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_continues_when_store_unavailable() {
+async fn delete_rejects_when_store_unavailable() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: sqlite
@@ -3313,9 +3305,121 @@ conversations_table: conversations
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(
+        rejection.status, 500,
+        "DELETE should reject with 500 when store is unavailable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_continues_when_store_unavailable() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite:///nonexistent/path/that/will/fail.db"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+    let filter = ResponseStoreFilter::new(cfg);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_abc/cancel");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "DELETE should continue when store is unavailable"
+        "POST /cancel should continue on_request when store is unavailable"
+    );
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "POST /cancel should continue on_response when store is unavailable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_tokens_continues_when_store_unavailable() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite:///nonexistent/path/that/will/fail.db"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+    let filter = ResponseStoreFilter::new(cfg);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "POST /input_tokens should continue on_request when store is unavailable"
+    );
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "POST /input_tokens should continue on_response when store is unavailable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_continues_when_store_unavailable() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite:///nonexistent/path/that/will/fail.db"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+    let filter = ResponseStoreFilter::new(cfg);
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "POST /compact should continue on_request when store is unavailable"
+    );
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "POST /compact should continue on_response when store is unavailable"
     );
 }
 

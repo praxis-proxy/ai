@@ -15,8 +15,8 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use super::{
     area::ApiArea,
     model::{
-        OasdiffAreaDrift, OasdiffAreaReport, OasdiffAreaStats, OasdiffOperationDrift, OasdiffReport, OperationKey,
-        OperationScope, SpecOperation,
+        AppliedContractException, ContractDriftKind, ContractException, OasdiffAreaDrift, OasdiffAreaReport,
+        OasdiffAreaStats, OasdiffOperationDrift, OasdiffReport, OperationKey, OperationScope, SpecOperation,
     },
     spec::read_spec,
 };
@@ -61,6 +61,12 @@ pub(super) fn run_scoped_oasdiff(
             &mut area_drifted,
             &mut inherited_details,
         );
+        let exceptions = apply_contract_exceptions(
+            area.scope.label,
+            area.contract_exceptions,
+            &mut area_drifted,
+            &mut inherited_details,
+        )?;
         let area_considered = considered
             .iter()
             .filter(|operation| operation.area == area.scope.label)
@@ -81,6 +87,7 @@ pub(super) fn run_scoped_oasdiff(
             missing: area_missing_vec,
             drifted: area_drifted_vec,
             inherited_details: inherited_details.clone(),
+            exceptions,
         });
         missing.extend(area_missing);
         for drift in area_drifted.into_values() {
@@ -102,6 +109,80 @@ pub(super) fn run_scoped_oasdiff(
         area_drift,
         area_reports,
     ))
+}
+
+/// Remove only declared discrepancies that match the current pinned diff.
+pub(super) fn apply_contract_exceptions(
+    area: &str,
+    declared: &[ContractException],
+    drifted: &mut BTreeMap<OperationKey, OasdiffOperationDrift>,
+    inherited_details: &mut Vec<String>,
+) -> Result<Vec<AppliedContractException>, String> {
+    let mut applied = Vec::with_capacity(declared.len());
+    for exception in declared {
+        let operation = exception_operation(area, exception)?;
+        if !remove_exception_detail(exception, operation.as_ref(), drifted, inherited_details) {
+            return Err(format!(
+                "stale contract exception for {area}: {} {}",
+                operation
+                    .as_ref()
+                    .map_or_else(|| "inherited".to_owned(), ToString::to_string),
+                exception.detail,
+            ));
+        }
+        applied.push(AppliedContractException {
+            kind: exception.kind,
+            operation,
+            detail: exception.detail,
+            rationale: exception.rationale,
+            evidence: exception.evidence,
+        });
+    }
+    drifted.retain(|_key, drift| drift.has_any_drift());
+    Ok(applied)
+}
+
+/// Resolve and validate an exception's optional operation selector.
+fn exception_operation(area: &str, exception: &ContractException) -> Result<Option<OperationKey>, String> {
+    match (exception.method, exception.path) {
+        (Some(method), Some(path)) => Ok(Some(OperationKey::new(method, path))),
+        (None, None) => Ok(None),
+        _ => Err(format!(
+            "invalid contract exception declaration for {area}: {}",
+            exception.detail
+        )),
+    }
+}
+
+/// Remove an exception from its declared drift channel.
+fn remove_exception_detail(
+    exception: &ContractException,
+    operation: Option<&OperationKey>,
+    drifted: &mut BTreeMap<OperationKey, OasdiffOperationDrift>,
+    inherited_details: &mut Vec<String>,
+) -> bool {
+    match (operation, exception.kind) {
+        (Some(key), ContractDriftKind::Request) => drifted
+            .get_mut(key)
+            .is_some_and(|drift| remove_detail(&mut drift.request_details, exception.detail)),
+        (Some(key), ContractDriftKind::Response) => drifted
+            .get_mut(key)
+            .is_some_and(|drift| remove_detail(&mut drift.response_details, exception.detail)),
+        (Some(key), ContractDriftKind::Other) => drifted
+            .get_mut(key)
+            .is_some_and(|drift| remove_detail(&mut drift.other_details, exception.detail)),
+        (None, ContractDriftKind::Inherited) => remove_detail(inherited_details, exception.detail),
+        _ => false,
+    }
+}
+
+/// Remove one exact drift detail and report whether it was present.
+fn remove_detail(details: &mut Vec<String>, expected: &str) -> bool {
+    let Some(index) = details.iter().position(|detail| detail == expected) else {
+        return false;
+    };
+    details.remove(index);
+    true
 }
 
 /// Require a stable `oasdiff` output schema before invoking the tool.

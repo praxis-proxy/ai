@@ -40,8 +40,11 @@ the persistence decision as new information arrives:
   directly from the store.
 - Handles `DELETE /v1/responses/{id}` locally.
 - Lazily initializes the store backend.
-- Sets `responses.skip_persist` metadata on init
-  failure.
+- Rejects with a 500 response on store init failure
+  for any request that requires the store
+  (persistence, rehydration, GET retrieval, or
+  DELETE). Locally owned endpoints never fall through
+  to the upstream when the backend is unavailable.
 
 ### `on_response`
 

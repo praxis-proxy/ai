@@ -252,49 +252,15 @@
         "implementation_source": "generated:praxis-ai-apis/openai/conversations",
         "operation_contracts": {
           "total": 8,
-          "exact": 1,
+          "exact": 3,
           "missing": 0,
-          "drifted": 7,
+          "drifted": 5,
           "request_drifted": 4,
-          "response_drifted": 7,
+          "response_drifted": 3,
           "other_drifted": 0,
-          "exact_percent": 12.5,
+          "exact_percent": 37.5,
           "missing_operations": [],
           "drifted_operations": [
-            {
-              "operation": {
-                "method": "DELETE",
-                "path": "/conversations/{conversation_id}/items/{item_id}",
-                "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/conversations/{conversation_id}",
-                "operation": "GET /conversations/{conversation_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-              ],
-              "other_details": []
-            },
             {
               "operation": {
                 "method": "GET",
@@ -343,7 +309,7 @@
                 "operation": "POST /conversations"
               },
               "has_request_drift": true,
-              "has_response_drift": true,
+              "has_response_drift": false,
               "has_other_drift": false,
               "request_details": [
                 "requestBody.required.from",
@@ -357,11 +323,7 @@
                 "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
                 "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
               ],
-              "response_details": [
-                "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-              ],
+              "response_details": [],
               "other_details": []
             },
             {
@@ -371,7 +333,7 @@
                 "operation": "POST /conversations/{conversation_id}"
               },
               "has_request_drift": true,
-              "has_response_drift": true,
+              "has_response_drift": false,
               "has_other_drift": false,
               "request_details": [
                 "requestBody.required.from",
@@ -380,11 +342,7 @@
                 "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
                 "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
               ],
-              "response_details": [
-                "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-              ],
+              "response_details": [],
               "other_details": []
             },
             {
@@ -418,29 +376,163 @@
             "components.securitySchemes.deleted"
           ]
         },
+        "upstream_spec_exceptions": [
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/conversations",
+              "operation": "POST /conversations"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.type.added",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/conversations",
+              "operation": "POST /conversations"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/conversations",
+              "operation": "POST /conversations"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/conversations/{conversation_id}",
+              "operation": "GET /conversations/{conversation_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.type.added",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/conversations/{conversation_id}",
+              "operation": "GET /conversations/{conversation_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/conversations/{conversation_id}",
+              "operation": "GET /conversations/{conversation_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/conversations/{conversation_id}",
+              "operation": "POST /conversations/{conversation_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.type.added",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/conversations/{conversation_id}",
+              "operation": "POST /conversations/{conversation_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/conversations/{conversation_id}",
+              "operation": "POST /conversations/{conversation_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "DELETE",
+              "path": "/conversations/{conversation_id}/items/{item_id}",
+              "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.type.added",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "DELETE",
+              "path": "/conversations/{conversation_id}/items/{item_id}",
+              "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "DELETE",
+              "path": "/conversations/{conversation_id}/items/{item_id}",
+              "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+          }
+        ],
         "all_exact": false
       }
     ],
     "operation_contracts": {
       "total": 8,
-      "exact": 1,
+      "exact": 3,
       "missing": 0,
-      "drifted": 7,
+      "drifted": 5,
       "request_drifted": 4,
-      "response_drifted": 7,
+      "response_drifted": 3,
       "other_drifted": 0,
-      "exact_percent": 12.5,
+      "exact_percent": 37.5,
       "by_area": [
         {
           "area": "Conversations",
           "total": 8,
-          "conformant": 1,
+          "conformant": 3,
           "missing": 0,
-          "drifted": 7,
+          "drifted": 5,
           "request_drifted": 4,
-          "response_drifted": 7,
+          "response_drifted": 3,
           "other_drifted": 0,
-          "conformance_percent": 12.5
+          "conformance_percent": 37.5
         }
       ]
     },
@@ -457,52 +549,14 @@
     "all_exact": false,
     "fixes_required": {
       "summary": {
-        "operations_to_fix": 7,
+        "operations_to_fix": 5,
         "area_contracts_to_fix": 1,
         "missing_operations": 0,
         "request_drift_operations": 4,
-        "response_drift_operations": 7,
+        "response_drift_operations": 3,
         "other_drift_operations": 0
       },
       "by_operation": [
-        {
-          "operation": {
-            "method": "DELETE",
-            "path": "/conversations/{conversation_id}/items/{item_id}",
-            "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/conversations/{conversation_id}",
-            "operation": "GET /conversations/{conversation_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-              ]
-            }
-          ]
-        },
         {
           "operation": {
             "method": "GET",
@@ -577,16 +631,6 @@
                 "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
                 "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
               ]
-            },
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
-              ]
             }
           ]
         },
@@ -607,16 +651,6 @@
                 "requestBody.content.application/json.schema.required.deleted",
                 "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
                 "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
-              ]
-            },
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.200.content.application/json.schema.properties.metadata.type.added",
-                "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-                "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded"
               ]
             }
           ]

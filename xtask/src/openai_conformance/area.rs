@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-use super::model::{CoverageMode, OperationScope, RuntimeVerificationCheck, SupportedOperation};
+use super::model::{ContractException, CoverageMode, OperationScope, RuntimeVerificationCheck, SupportedOperation};
 
 /// Vendored OpenAI `OpenAPI` reference used by default.
 pub(super) const OPENAI_REFERENCE_SPEC: &str = "docs/conformance/specs/openai-openapi.yaml";
@@ -31,6 +31,70 @@ const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
     },
 ];
 
+/// Response metadata discrepancies caused by the incomplete upstream property.
+const CONVERSATIONS_CONTRACT_EXCEPTIONS: &[ContractException] = &[
+    metadata_response_exception(
+        "POST",
+        "/conversations",
+        "responses.200.content.application/json.schema.properties.metadata.type.added",
+    ),
+    metadata_response_exception(
+        "POST",
+        "/conversations",
+        "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+    ),
+    metadata_response_exception(
+        "POST",
+        "/conversations",
+        "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+    ),
+    metadata_response_exception(
+        "GET",
+        "/conversations/{conversation_id}",
+        "responses.200.content.application/json.schema.properties.metadata.type.added",
+    ),
+    metadata_response_exception(
+        "GET",
+        "/conversations/{conversation_id}",
+        "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+    ),
+    metadata_response_exception(
+        "GET",
+        "/conversations/{conversation_id}",
+        "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+    ),
+    metadata_response_exception(
+        "POST",
+        "/conversations/{conversation_id}",
+        "responses.200.content.application/json.schema.properties.metadata.type.added",
+    ),
+    metadata_response_exception(
+        "POST",
+        "/conversations/{conversation_id}",
+        "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+    ),
+    metadata_response_exception(
+        "POST",
+        "/conversations/{conversation_id}",
+        "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+    ),
+    metadata_response_exception(
+        "DELETE",
+        "/conversations/{conversation_id}/items/{item_id}",
+        "responses.200.content.application/json.schema.properties.metadata.type.added",
+    ),
+    metadata_response_exception(
+        "DELETE",
+        "/conversations/{conversation_id}/items/{item_id}",
+        "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+    ),
+    metadata_response_exception(
+        "DELETE",
+        "/conversations/{conversation_id}/items/{item_id}",
+        "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+    ),
+];
+
 /// One conformance area checked by `cargo xtask openai-conformance`.
 pub(super) struct ApiArea {
     /// Operation scope loaded from the reference spec.
@@ -53,6 +117,25 @@ pub(super) struct ApiArea {
 
     /// Runtime checks selected by the focused command.
     pub(super) runtime_checks: &'static [RuntimeVerificationCheck],
+
+    /// Evidence-backed differences in the pinned upstream contract.
+    pub(super) contract_exceptions: &'static [ContractException],
+}
+
+/// Declare one live-verified response metadata exception.
+const fn metadata_response_exception(
+    method: &'static str,
+    path: &'static str,
+    detail: &'static str,
+) -> ContractException {
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some(method),
+        path: Some(path),
+        detail,
+        rationale: "OpenAI returns metadata as a string map, while the upstream response property has no schema",
+        evidence: "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map",
+    }
 }
 
 /// Areas included in the current OpenAI conformance suite.
@@ -72,6 +155,7 @@ pub(super) const CONFORMANCE_AREAS: &[ApiArea] = &[ApiArea {
         "--show-output",
     ],
     runtime_checks: CONVERSATIONS_RUNTIME_CHECKS,
+    contract_exceptions: CONVERSATIONS_CONTRACT_EXCEPTIONS,
 }];
 
 /// Generate the Conversations implementation spec from crate code.

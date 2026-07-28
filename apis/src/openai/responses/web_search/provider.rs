@@ -3,18 +3,26 @@
 
 //! Search provider abstraction and implementations.
 //!
-//! Uses [`CalloutClient`] from praxis-core for HTTP callouts with
-//! circuit breaking, timeout, and loop prevention.
+//! Uses Pingora-native [`SubRequestConnector`] for HTTP callouts
+//! with connection pooling, HTTP/2, and TLS.
+//!
+//! [`SubRequestConnector`]: praxis_core::subrequest::SubRequestConnector
 
-use praxis_core::callout::{
-    CalloutClient, CalloutConfig, CalloutRequest, CalloutResult, CircuitBreakerConfig, FailureMode as CoreFailureMode,
-};
+use std::time::Duration;
+
+use bytes::Bytes;
+use http::HeaderMap;
 use praxis_filter::FilterError;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::config::{FailureMode, SearchContextSize, SearchProvider, ValidatedConfig};
+use crate::subrequest::{self, SubRequest, SubRequestConnector, SubResponse};
+
+/// Response body cap for search callouts (1 MiB). Distinct from
+/// `max_body_bytes` which governs inbound request buffering.
+const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
 
 // -----------------------------------------------------------------------------
 // SearchResult
@@ -53,17 +61,21 @@ pub(crate) enum SearchOutcome {
 // SearchClient
 // -----------------------------------------------------------------------------
 
-/// HTTP search client wrapping a [`CalloutClient`].
+/// HTTP search client using Pingora-native [`SubRequestConnector`].
+///
+/// [`SubRequestConnector`]: praxis_core::subrequest::SubRequestConnector
 pub(crate) struct SearchClient {
-    /// The underlying HTTP callout client.
-    client: CalloutClient,
+    /// Shared HTTP connector for search callouts.
+    connector: SubRequestConnector,
+    /// Per-request timeout.
+    timeout: Duration,
     /// Search backend provider.
     provider: SearchProvider,
     /// API key for the search provider.
     api_key: SecretString,
     /// Default search context size.
     default_context_size: SearchContextSize,
-    /// Failure mode governing what happens on parse errors.
+    /// Failure mode governing what happens on errors.
     failure_mode: FailureMode,
     /// HTTP status to return on rejection.
     status_on_error: u16,
@@ -72,7 +84,8 @@ pub(crate) struct SearchClient {
 impl std::fmt::Debug for SearchClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearchClient")
-            .field("client", &self.client)
+            .field("connector", &self.connector)
+            .field("timeout", &self.timeout)
             .field("provider", &self.provider)
             .field("api_key", &"[REDACTED]")
             .field("default_context_size", &self.default_context_size)
@@ -82,36 +95,19 @@ impl std::fmt::Debug for SearchClient {
     }
 }
 
-/// Build a [`CalloutConfig`] from validated filter config.
-fn build_callout_config(config: &ValidatedConfig) -> CalloutConfig {
-    let failure_mode = match config.failure_mode {
-        FailureMode::Closed => CoreFailureMode::Closed,
-        FailureMode::Open => CoreFailureMode::Open,
-    };
-    CalloutConfig {
-        circuit_breaker: Some(CircuitBreakerConfig {
-            consecutive_failures: 5,
-            recovery_window_ms: 30_000,
-        }),
-        failure_mode,
-        status_on_error: config.status_on_error,
-        timeout_ms: config.timeout_ms,
-        ..CalloutConfig::default()
-    }
-}
-
 impl SearchClient {
     /// Build a search client from validated filter config.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the underlying [`CalloutClient`]
-    /// cannot be constructed.
+    /// Returns [`FilterError`] if the API key header value is
+    /// not valid ASCII.
     pub(crate) fn from_config(config: &ValidatedConfig) -> Result<Self, FilterError> {
-        let callout_config = build_callout_config(config);
-        let client = CalloutClient::new(callout_config).map_err(|e| FilterError::from(e.to_string()))?;
+        http::HeaderValue::from_str(config.api_key.expose_secret())
+            .map_err(|e| FilterError::from(format!("invalid API key header value: {e}")))?;
         Ok(Self {
-            client,
+            connector: SubRequestConnector::new(4, None),
+            timeout: Duration::from_millis(config.timeout_ms),
             provider: config.provider,
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
@@ -125,58 +121,95 @@ impl SearchClient {
         let size = context_size.unwrap_or(self.default_context_size);
         let count = size.result_count();
         debug!(provider = self.provider.as_str(), query, count, "executing web search");
-        let request = match self.provider {
+        let (url, request) = match self.provider {
             SearchProvider::Brave => self.build_brave_request(query, count),
             SearchProvider::Tavily => self.build_tavily_request(query, size),
             SearchProvider::You => self.build_you_request(query, count),
         };
-        self.handle_callout_result(self.client.execute(request).await)
+        self.execute_search(&url, request).await
     }
 
-    /// Map a [`CalloutResult`] to a [`SearchOutcome`].
-    fn handle_callout_result(&self, result: CalloutResult) -> SearchOutcome {
-        match result {
-            CalloutResult::Success(response) => self.parse_response(&response.body),
-            CalloutResult::Failed => {
-                warn!(provider = self.provider.as_str(), "search callout failed (open mode)");
-                SearchOutcome::Skipped
+    /// Execute a search request and map the result to a
+    /// [`SearchOutcome`].
+    async fn execute_search(&self, url: &str, mut request: SubRequest) -> SearchOutcome {
+        let (target, uri) = match subrequest::parse_url(url) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(provider = self.provider.as_str(), error = %e, "search URL parse failed");
+                return self.transport_failure_outcome();
             },
-            CalloutResult::Rejected(rejection) => {
+        };
+
+        request.uri = uri;
+
+        let result = subrequest::execute(
+            &self.connector,
+            &target,
+            &request,
+            MAX_SEARCH_RESPONSE_BYTES,
+            self.timeout,
+        )
+        .await;
+        self.map_search_result(result)
+    }
+
+    /// Map a sub-request result to a [`SearchOutcome`].
+    fn map_search_result(&self, result: Result<SubResponse, subrequest::SubRequestError>) -> SearchOutcome {
+        match result {
+            Ok(response) if (200..300).contains(&(response.status as usize)) => self.parse_response(&response.body),
+            Ok(response) => {
                 warn!(
                     provider = self.provider.as_str(),
-                    status = rejection.status,
-                    "search callout rejected"
+                    status = response.status,
+                    "search callout returned non-2xx"
                 );
-                SearchOutcome::Rejected {
-                    status: rejection.status,
-                }
+                self.transport_failure_outcome()
             },
+            Err(e) => {
+                warn!(provider = self.provider.as_str(), error = %e, "search callout failed");
+                self.transport_failure_outcome()
+            },
+        }
+    }
+
+    /// Outcome for a transport or non-2xx failure. Under closed
+    /// mode this is a rejection; under open mode search is silently
+    /// skipped.
+    fn transport_failure_outcome(&self) -> SearchOutcome {
+        match self.failure_mode {
+            FailureMode::Closed => SearchOutcome::Rejected {
+                status: self.status_on_error,
+            },
+            FailureMode::Open => SearchOutcome::Skipped,
         }
     }
 
     /// Build a Brave Search API request.
-    fn build_brave_request(&self, query: &str, count: u32) -> CalloutRequest {
+    fn build_brave_request(&self, query: &str, count: u32) -> (String, SubRequest) {
         let encoded_query = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
         let url = format!("https://api.search.brave.com/res/v1/web/search?q={encoded_query}&count={count}");
 
-        CalloutRequest {
-            method: http::Method::GET,
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
+        headers.insert(
+            http::HeaderName::from_static("x-subscription-token"),
+            http::HeaderValue::from_str(self.api_key.expose_secret())
+                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+        );
+
+        (
             url,
-            headers: vec![
-                (http::header::ACCEPT, http::HeaderValue::from_static("application/json")),
-                (
-                    http::HeaderName::from_static("x-subscription-token"),
-                    http::HeaderValue::from_str(self.api_key.expose_secret())
-                        .unwrap_or_else(|_| http::HeaderValue::from_static("")),
-                ),
-            ],
-            body: None,
-            depth: 0,
-        }
+            SubRequest {
+                method: http::Method::GET,
+                uri: "/".parse().unwrap_or_default(),
+                headers,
+                body: Bytes::new(),
+            },
+        )
     }
 
     /// Build a Tavily Search API request.
-    fn build_tavily_request(&self, query: &str, context_size: SearchContextSize) -> CalloutRequest {
+    fn build_tavily_request(&self, query: &str, context_size: SearchContextSize) -> (String, SubRequest) {
         let search_depth = match context_size {
             SearchContextSize::Low | SearchContextSize::Medium => "basic",
             SearchContextSize::High => "advanced",
@@ -190,46 +223,54 @@ impl SearchClient {
             "max_results": max_results,
         });
 
-        CalloutRequest {
-            method: http::Method::POST,
-            url: "https://api.tavily.com/search".to_owned(),
-            headers: vec![
-                (
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("application/json"),
-                ),
-                (http::header::ACCEPT, http::HeaderValue::from_static("application/json")),
-            ],
-            body: Some(serde_json::to_vec(&body).unwrap_or_default()),
-            depth: 0,
-        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
+
+        let url = "https://api.tavily.com/search".to_owned();
+        (
+            url,
+            SubRequest {
+                method: http::Method::POST,
+                uri: "/".parse().unwrap_or_default(),
+                headers,
+                body: Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+            },
+        )
     }
 
     /// Build a You.com Search API request.
-    fn build_you_request(&self, query: &str, count: u32) -> CalloutRequest {
+    fn build_you_request(&self, query: &str, count: u32) -> (String, SubRequest) {
         let body = serde_json::json!({
             "query": query,
             "count": count,
         });
 
-        CalloutRequest {
-            method: http::Method::POST,
-            url: "https://api.you.com/v1/search".to_owned(),
-            headers: vec![
-                (
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("application/json"),
-                ),
-                (http::header::ACCEPT, http::HeaderValue::from_static("application/json")),
-                (
-                    http::HeaderName::from_static("x-api-key"),
-                    http::HeaderValue::from_str(self.api_key.expose_secret())
-                        .unwrap_or_else(|_| http::HeaderValue::from_static("")),
-                ),
-            ],
-            body: Some(serde_json::to_vec(&body).unwrap_or_default()),
-            depth: 0,
-        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
+        headers.insert(
+            http::HeaderName::from_static("x-api-key"),
+            http::HeaderValue::from_str(self.api_key.expose_secret())
+                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+        );
+
+        let url = "https://api.you.com/v1/search".to_owned();
+        (
+            url,
+            SubRequest {
+                method: http::Method::POST,
+                uri: "/".parse().unwrap_or_default(),
+                headers,
+                body: Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+            },
+        )
     }
 
     /// Parse search results from the provider's JSON response.
@@ -357,6 +398,11 @@ fn parse_you_results(json: &Value) -> Vec<SearchResult> {
     reason = "tests"
 )]
 mod tests {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+    };
+
     use secrecy::SecretString;
     use serde_json::json;
 
@@ -446,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn build_you_request_uses_callout_client_contract() {
+    fn build_you_request_sends_api_key_and_body() {
         let config = ValidatedConfig {
             provider: SearchProvider::You,
             api_key: SecretString::from("test-key".to_owned()),
@@ -458,19 +504,16 @@ mod tests {
         };
         let client = SearchClient::from_config(&config).unwrap();
 
-        let request = client.build_you_request("Praxis proxy", 5);
+        let (url, request) = client.build_you_request("Praxis proxy", 5);
 
+        assert_eq!(url, "https://api.you.com/v1/search");
         assert_eq!(request.method, http::Method::POST);
-        assert_eq!(request.url, "https://api.you.com/v1/search");
         assert!(
-            request
-                .headers
-                .iter()
-                .any(|(name, value)| name == "x-api-key" && value == "test-key"),
-            "You.com requests must send X-API-Key through the Praxis callout"
+            request.headers.get("x-api-key").is_some_and(|v| v == "test-key"),
+            "You.com requests must send X-API-Key"
         );
         assert_eq!(
-            serde_json::from_slice::<Value>(request.body.as_deref().unwrap()).unwrap(),
+            serde_json::from_slice::<Value>(&request.body).unwrap(),
             json!({"query": "Praxis proxy", "count": 5})
         );
     }
@@ -552,6 +595,190 @@ mod tests {
         assert!(
             matches!(outcome, SearchOutcome::Skipped),
             "open mode should skip on parse failure"
+        );
+    }
+
+    fn test_search_client(failure_mode: FailureMode) -> SearchClient {
+        let config = ValidatedConfig {
+            provider: SearchProvider::Brave,
+            api_key: SecretString::from("test-key".to_owned()),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 1000,
+            max_body_bytes: 64 * 1024 * 1024,
+            failure_mode,
+            status_on_error: 502,
+        };
+        SearchClient::from_config(&config).unwrap()
+    }
+
+    fn spawn_http_server(listener: TcpListener, status: u16, body: &str) {
+        let body = body.to_owned();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 4096];
+            let _n = stream.read(&mut buf).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn search_2xx_with_valid_json_returns_results() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_http_server(
+            listener,
+            200,
+            &json!({
+                "web": {"results": [{"title": "Hit", "url": "https://hit.example", "description": "found"}]}
+            })
+            .to_string(),
+        );
+
+        let client = test_search_client(FailureMode::Closed);
+        let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        let outcome = client.execute_search(&url, request).await;
+        assert!(
+            matches!(&outcome, SearchOutcome::Results(r) if r.len() == 1),
+            "2xx with valid JSON should return results: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_non_2xx_closed_rejects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_http_server(listener, 500, "internal error");
+
+        let client = test_search_client(FailureMode::Closed);
+        let url = format!("http://{addr}/search");
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        let outcome = client.execute_search(&url, request).await;
+        assert!(
+            matches!(outcome, SearchOutcome::Rejected { status: 502 }),
+            "non-2xx under closed mode should reject: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_non_2xx_open_skips() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_http_server(listener, 429, "rate limited");
+
+        let client = test_search_client(FailureMode::Open);
+        let url = format!("http://{addr}/search");
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        let outcome = client.execute_search(&url, request).await;
+        assert!(
+            matches!(outcome, SearchOutcome::Skipped),
+            "non-2xx under open mode should skip: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_connection_failure_closed_rejects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+
+        let client = test_search_client(FailureMode::Closed);
+        let url = format!("http://{addr}/search");
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        let outcome = client.execute_search(&url, request).await;
+        assert!(
+            matches!(outcome, SearchOutcome::Rejected { status: 502 }),
+            "connection failure under closed mode should reject: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_timeout_open_skips() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut client = test_search_client(FailureMode::Open);
+        client.timeout = Duration::from_millis(50);
+        let url = format!("http://{addr}/search");
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        let outcome = client.execute_search(&url, request).await;
+        assert!(
+            matches!(outcome, SearchOutcome::Skipped),
+            "timeout under open mode should skip: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_oversized_response_closed_rejects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 4096];
+            let _n = stream.read(&mut buf).unwrap();
+            let body = vec![b'x'; MAX_SEARCH_RESPONSE_BYTES + 1];
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let client = test_search_client(FailureMode::Closed);
+        let url = format!("http://{addr}/search");
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        let outcome = client.execute_search(&url, request).await;
+        assert!(
+            matches!(outcome, SearchOutcome::Rejected { status: 502 }),
+            "oversized response under closed mode should reject: {outcome:?}"
         );
     }
 }
