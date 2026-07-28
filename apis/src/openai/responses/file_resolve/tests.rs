@@ -13,9 +13,12 @@ use bytes::Bytes;
 use serde_json::json;
 
 use super::*;
-use crate::openai::{
-    api_client::{ApiClient, ApiClientConfig},
-    responses::state::ResponsesState,
+use crate::{
+    openai::{
+        api_client::{ApiClient, ApiClientConfig},
+        responses::state::ResponsesState,
+    },
+    subrequest::SubRequestConnector,
 };
 
 // -----------------------------------------------------------------------------
@@ -783,10 +786,11 @@ fn make_client() -> FilesApiClient {
 fn make_client_for_url_with_max(files_api_url: &str, max_resolved_bytes: usize) -> FilesApiClient {
     let api = ApiClient::new(ApiClientConfig {
         api_base_url: files_api_url.to_owned(),
-        callout_config: CalloutConfig::default(),
+        connector: SubRequestConnector::new(4, None),
+        timeout: Duration::from_secs(5),
+        max_response_bytes: 1_048_576,
         forward_header_names: vec![],
-    })
-    .unwrap();
+    });
     FilesApiClient::new(
         api,
         FilesApiClientOptions {

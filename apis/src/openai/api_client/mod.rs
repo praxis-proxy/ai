@@ -8,32 +8,27 @@
 //! JSON and byte reads, and normalized error mapping. Used by
 //! [`FilesApiClient`] and vector-store search.
 //!
-//! JSON requests route through `praxis_core::callout::CalloutClient`
-//! for circuit breaking, callout-depth protection, and timeout.
-//! Content downloads use a direct `reqwest::Client` with
-//! chunk-by-chunk bounded reads so oversized responses are rejected
-//! during collection. Unifying both paths behind `CalloutClient`
-//! is tracked in [#454].
+//! All requests route through the Pingora-native
+//! [`SubRequestConnector`] for connection pooling and TLS.
 //!
-//! Each consuming filter retains its own [`ApiClient`] instance so
-//! circuit-breaker state is isolated per filter.
-//!
-//! [#454]: https://github.com/praxis-proxy/ai/issues/454
+//! Each consuming filter retains its own [`ApiClient`] instance.
 //!
 //! [`FilesApiClient`]: super::responses::file_resolve
+//! [`SubRequestConnector`]: praxis_core::subrequest::SubRequestConnector
 
 pub(crate) mod error;
 pub(crate) mod url;
 
 use std::time::Duration;
 
-use praxis_core::callout::{CalloutClient, CalloutConfig, CalloutRequest, CalloutResult};
-use reqwest::redirect;
+use bytes::Bytes;
+use http::HeaderMap;
 
 pub(crate) use self::{
     error::ApiClientError,
     url::{resource_url, validate_base_url, validate_forward_headers},
 };
+use crate::subrequest::{self, SubRequest, SubRequestConnector, SubRequestError, SubResponse};
 
 /// Configuration for constructing an [`ApiClient`].
 ///
@@ -42,75 +37,77 @@ pub(crate) use self::{
 pub(crate) struct ApiClientConfig {
     /// Base URL of the API endpoint (trailing slash stripped).
     pub api_base_url: String,
-    /// Transport configuration for the underlying
-    /// [`CalloutClient`].
-    pub callout_config: CalloutConfig,
+    /// Pingora-native HTTP connector.
+    pub connector: SubRequestConnector,
+    /// Per-request timeout.
+    pub timeout: Duration,
+    /// Maximum response body bytes.
+    pub max_response_bytes: usize,
     /// Header names to forward from the original request.
     pub forward_header_names: Vec<http::HeaderName>,
 }
 
 /// Shared HTTP client for OpenAI-compatible API callouts.
 ///
-/// JSON requests (`get_json`) route through [`CalloutClient`]
-/// for circuit breaking and callout-depth protection. Content
-/// downloads (`get_bytes`) use a direct
-/// `reqwest::Client` with chunk-by-chunk bounded reads so
-/// oversized responses are rejected during collection without
-/// unbounded memory consumption. Unifying both paths behind
-/// `CalloutClient` is tracked in [#454] and requires
-/// `CalloutConfig::max_response_bytes` (praxis-core post-0.4.0).
+/// All requests route through the Pingora-native
+/// [`SubRequestConnector`] for connection pooling and TLS.
 ///
-/// [#454]: https://github.com/praxis-proxy/ai/issues/454
+/// [`SubRequestConnector`]: praxis_core::subrequest::SubRequestConnector
 pub(crate) struct ApiClient {
     /// Base URL of the API endpoint (trailing slash stripped).
     api_base_url: String,
-    /// Callout client for JSON metadata requests.
-    client: CalloutClient,
-    /// Direct HTTP client for bounded content downloads.
-    content_client: reqwest::Client,
+    /// Pingora-native HTTP connector.
+    connector: SubRequestConnector,
+    /// Per-request timeout.
+    timeout: Duration,
+    /// Maximum response body bytes for JSON requests.
+    max_response_bytes: usize,
     /// Header names to forward from the original downstream
     /// request.
     forward_header_names: Vec<http::HeaderName>,
-    /// Per-request timeout (from the callout config).
-    timeout: Duration,
+}
+
+/// Map a [`SubRequestError`] to an [`ApiClientError`], preserving
+/// the `ResponseTooLarge` variant for 2xx responses so callers can
+/// distinguish genuine size violations from backend failures.
+///
+/// Non-2xx oversized responses map to `CalloutFailed` — the
+/// backend error takes precedence over the size limit.
+fn map_subrequest_error(err: SubRequestError) -> ApiClientError {
+    match err {
+        SubRequestError::ResponseTooLarge { status, .. } if !(200..300).contains(&(status as usize)) => {
+            ApiClientError::CalloutFailed {
+                detail: format!("callout rejected with status {status} (response body exceeded limit)"),
+            }
+        },
+        SubRequestError::ResponseTooLarge { limit, .. } => ApiClientError::ResponseTooLarge { limit },
+        other => ApiClientError::CalloutFailed {
+            detail: other.to_string(),
+        },
+    }
 }
 
 impl ApiClient {
     /// Build a new client from validated configuration.
     ///
     /// The base URL should already be validated with
-    /// [`validate_base_url`]. This constructor strips trailing
-    /// slashes and builds the transport client.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the callout client cannot be
-    /// constructed.
-    pub(crate) fn new(config: ApiClientConfig) -> Result<Self, String> {
+    /// [`validate_base_url`].
+    pub(crate) fn new(config: ApiClientConfig) -> Self {
         let ApiClientConfig {
             api_base_url,
-            callout_config,
+            connector,
+            timeout,
+            max_response_bytes,
             forward_header_names,
         } = config;
 
-        let timeout = Duration::from_millis(callout_config.timeout_ms);
-
-        let client = CalloutClient::new(callout_config).map_err(|e| format!("failed to build callout client: {e}"))?;
-
-        let content_client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(redirect::Policy::none())
-            .timeout(timeout)
-            .build()
-            .map_err(|e| format!("failed to build content client: {e}"))?;
-
-        Ok(Self {
+        Self {
             api_base_url: api_base_url.trim_end_matches('/').to_owned(),
-            client,
-            content_client,
-            forward_header_names,
+            connector,
             timeout,
-        })
+            max_response_bytes,
+            forward_header_names,
+        }
     }
 
     /// Return the validated base URL.
@@ -136,35 +133,26 @@ impl ApiClient {
         resource_url(&self.api_base_url, path_prefix, resource_id, suffix)
     }
 
-    /// Send a GET request via the callout client and parse the
-    /// response body as JSON.
+    /// Send a GET request and parse the response body as JSON.
     pub(crate) async fn get_json(
         &self,
         url: String,
-        request_headers: &http::HeaderMap,
+        request_headers: &HeaderMap,
     ) -> Result<serde_json::Value, ApiClientError> {
-        let headers = self.forward_headers(request_headers);
-        let request = CalloutRequest {
-            body: None,
-            depth: 0,
-            headers,
-            method: http::Method::GET,
-            url,
-        };
-
-        let response = execute_callout(&self.client, request).await?;
+        let headers = self.build_header_map(request_headers);
+        let response = self.execute_url(&url, http::Method::GET, headers, Bytes::new()).await?;
         serde_json::from_slice(&response.body).map_err(|e| ApiClientError::DecodeFailed {
             detail: format!("JSON decode failed: {e}"),
         })
     }
 
-    /// Send a POST request with a JSON body via the callout client
-    /// and parse the response body as JSON.
+    /// Send a POST request with a JSON body and parse the response
+    /// body as JSON.
     pub(crate) async fn post_json(
         &self,
         url: String,
         body: &serde_json::Value,
-        request_headers: &http::HeaderMap,
+        request_headers: &HeaderMap,
     ) -> Result<serde_json::Value, ApiClientError> {
         let serialized = serde_json::to_vec(body).map_err(|e| ApiClientError::DecodeFailed {
             detail: format!("request body serialization failed: {e}"),
@@ -177,80 +165,68 @@ impl ApiClient {
         })
     }
 
-    /// Send a pre-serialized JSON body and return the bounded raw response.
-    ///
-    /// This supports consumers that enforce domain-specific serialization and
-    /// decode limits while retaining the shared transport, header, timeout,
-    /// circuit-breaker, and status handling.
+    /// Send a pre-serialized JSON body and return the bounded raw
+    /// response.
     pub(crate) async fn post_json_bytes(
         &self,
         url: String,
         body: Vec<u8>,
-        request_headers: &http::HeaderMap,
-    ) -> Result<Vec<u8>, ApiClientError> {
-        let mut headers = self.forward_headers(request_headers);
-        headers.retain(|(name, _)| name != http::header::CONTENT_TYPE);
-        headers.push((
+        request_headers: &HeaderMap,
+    ) -> Result<Bytes, ApiClientError> {
+        let mut headers = self.build_header_map(request_headers);
+        headers.remove(http::header::CONTENT_TYPE);
+        headers.insert(
             http::header::CONTENT_TYPE,
             http::HeaderValue::from_static("application/json"),
-        ));
+        );
 
-        let request = CalloutRequest {
-            body: Some(body),
-            depth: 0,
-            headers,
-            method: http::Method::POST,
-            url,
-        };
-
-        let response = execute_callout(&self.client, request).await?;
+        let response = self
+            .execute_url(&url, http::Method::POST, headers, Bytes::from(body))
+            .await?;
         Ok(response.body)
     }
 
     /// Send a GET request and return the response body with
-    /// chunk-by-chunk bounded reads.
+    /// bounded reads.
     ///
-    /// Uses a direct `reqwest::Client` so the `max_bytes` limit
-    /// is enforced during collection — oversized responses are
-    /// rejected without unbounded memory consumption. Redirects
-    /// are rejected, and the configured timeout spans the full
-    /// request including body transfer.
-    ///
-    /// This path does not share the [`CalloutClient`]'s circuit
-    /// breaker or callout-depth accounting. Unifying both behind
-    /// `CalloutClient` is tracked in [#454].
-    ///
-    /// [#454]: https://github.com/praxis-proxy/ai/issues/454
+    /// The Pingora connector does not follow redirects (it
+    /// connects to a specific peer), matching the redirect-
+    /// rejection behavior of the previous `reqwest` path.
     pub(crate) async fn get_bytes(
         &self,
         url: &str,
-        request_headers: &http::HeaderMap,
+        request_headers: &HeaderMap,
         max_bytes: usize,
-    ) -> Result<Vec<u8>, ApiClientError> {
-        let mut builder = self.content_client.get(url);
-        for (name, value) in self.forward_headers(request_headers) {
-            builder = builder.header(name, value);
-        }
+    ) -> Result<Bytes, ApiClientError> {
+        let headers = self.build_header_map(request_headers);
 
-        let response = builder.send().await.map_err(|e| ApiClientError::CalloutFailed {
+        let (target, uri) = subrequest::parse_url(url).map_err(|e| ApiClientError::CalloutFailed {
             detail: format!("content download failed: {e}"),
         })?;
 
-        if !response.status().is_success() {
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri,
+            headers,
+            body: Bytes::new(),
+        };
+
+        let response = subrequest::execute(&self.connector, &target, &request, max_bytes, self.timeout)
+            .await
+            .map_err(map_subrequest_error)?;
+
+        if response.status < 200 || response.status >= 300 {
             return Err(ApiClientError::CalloutFailed {
-                detail: format!("content download failed: {}", response.status()),
+                detail: format!("content download failed: {}", response.status),
             });
         }
 
-        read_bounded_body(response, max_bytes).await
+        Ok(response.body)
     }
 
     /// Copy configured headers from the original downstream
-    /// request for forwarding to the external API.
-    pub(crate) fn forward_headers(
-        &self,
-        request_headers: &http::HeaderMap,
-    ) -> Vec<(http::HeaderName, http::HeaderValue)> {
+    /// request into a [`HeaderMap`] for forwarding.
+    pub(crate) fn forward_headers(&self, request_headers: &HeaderMap) -> Vec<(http::HeaderName, http::HeaderValue)> {
         let mut headers = Vec::new();
         for name in &self.forward_header_names {
             if let Some(value) = request_headers.get(name) {
@@ -259,43 +235,54 @@ impl ApiClient {
         }
         headers
     }
-}
 
-/// Read a response body chunk-by-chunk, rejecting it as soon as
-/// accumulated bytes exceed `max_bytes`.
-async fn read_bounded_body(mut response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, ApiClientError> {
-    if let Some(len) = response.content_length()
-        && len > max_bytes as u64
-    {
-        return Err(ApiClientError::ResponseTooLarge { limit: max_bytes });
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| ApiClientError::CalloutFailed {
-        detail: format!("content download failed: {e}"),
-    })? {
-        if body.len() + chunk.len() > max_bytes {
-            return Err(ApiClientError::ResponseTooLarge { limit: max_bytes });
+    /// Build a [`HeaderMap`] from forwarded headers.
+    fn build_header_map(&self, request_headers: &HeaderMap) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for name in &self.forward_header_names {
+            if let Some(value) = request_headers.get(name) {
+                map.insert(name.clone(), value.clone());
+            }
         }
-        body.extend_from_slice(&chunk);
+        map
     }
-    Ok(body)
-}
 
-/// Execute a callout and map non-success outcomes to
-/// [`ApiClientError`].
-async fn execute_callout(
-    client: &CalloutClient,
-    request: CalloutRequest,
-) -> Result<praxis_core::callout::CalloutResponse, ApiClientError> {
-    match client.execute(request).await {
-        CalloutResult::Success(r) => Ok(r),
-        CalloutResult::Failed => Err(ApiClientError::CalloutFailed {
-            detail: "callout failed (fail-open)".to_owned(),
-        }),
-        CalloutResult::Rejected(rejection) => Err(ApiClientError::CalloutFailed {
-            detail: format!("callout rejected with status {}", rejection.status),
-        }),
+    /// Parse the URL, build a [`SubRequest`], execute via the
+    /// connector, and check for non-2xx status.
+    async fn execute_url(
+        &self,
+        url: &str,
+        method: http::Method,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<SubResponse, ApiClientError> {
+        let (target, uri) =
+            subrequest::parse_url(url).map_err(|e| ApiClientError::CalloutFailed { detail: e.to_string() })?;
+
+        let request = SubRequest {
+            method,
+            uri,
+            headers,
+            body,
+        };
+
+        let response = subrequest::execute(
+            &self.connector,
+            &target,
+            &request,
+            self.max_response_bytes,
+            self.timeout,
+        )
+        .await
+        .map_err(map_subrequest_error)?;
+
+        if response.status < 200 || response.status >= 300 {
+            return Err(ApiClientError::CalloutFailed {
+                detail: format!("callout rejected with status {}", response.status),
+            });
+        }
+
+        Ok(response)
     }
 }
 
@@ -314,8 +301,6 @@ mod tests {
         net::{SocketAddr, TcpListener, TcpStream},
         thread::JoinHandle,
     };
-
-    use praxis_core::callout::{CalloutConfig, FailureMode};
 
     use super::*;
 
@@ -371,14 +356,11 @@ mod tests {
     fn test_client(base_url: &str) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: base_url.to_owned(),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms: 1_000,
-                ..CalloutConfig::default()
-            },
+            connector: SubRequestConnector::new(4, None),
+            timeout: Duration::from_millis(1_000),
+            max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
         })
-        .unwrap()
     }
 
     #[test]
@@ -391,18 +373,16 @@ mod tests {
     fn forward_headers_copies_configured_headers() {
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: "http://ogx:8321".to_owned(),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                ..CalloutConfig::default()
-            },
+            connector: SubRequestConnector::new(4, None),
+            timeout: Duration::from_millis(1_000),
+            max_response_bytes: 1_048_576,
             forward_header_names: vec![
                 http::header::AUTHORIZATION,
                 http::HeaderName::from_static("x-tenant-id"),
             ],
-        })
-        .unwrap();
+        });
 
-        let mut request_headers = http::HeaderMap::new();
+        let mut request_headers = HeaderMap::new();
         request_headers.insert(http::header::AUTHORIZATION, "Bearer token".parse().unwrap());
         request_headers.insert("x-tenant-id", "tenant-1".parse().unwrap());
         request_headers.insert("x-unrelated", "ignored".parse().unwrap());
@@ -448,7 +428,7 @@ mod tests {
         let err = client
             .get_bytes(
                 &format!("http://{address}/v1/files/test/content"),
-                &http::HeaderMap::new(),
+                &HeaderMap::new(),
                 1024,
             )
             .await
@@ -473,7 +453,7 @@ mod tests {
         let err = client
             .get_bytes(
                 &format!("http://{address}/v1/files/test/content"),
-                &http::HeaderMap::new(),
+                &HeaderMap::new(),
                 1024,
             )
             .await
@@ -500,17 +480,42 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let err = client
-            .get_bytes(
-                &format!("http://{address}/v1/files/test/content"),
-                &http::HeaderMap::new(),
-                8,
-            )
+            .get_bytes(&format!("http://{address}/v1/files/test/content"), &HeaderMap::new(), 8)
             .await
             .unwrap_err();
 
         assert!(
             matches!(err, ApiClientError::ResponseTooLarge { .. }),
-            "responses exceeding per-request max_bytes should be rejected"
+            "responses exceeding per-request max_bytes should be rejected as ResponseTooLarge: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_bytes_oversized_non_2xx_is_callout_failed_not_too_large() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).unwrap();
+            let body = vec![b'x'; 64];
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let client = test_client(&format!("http://{address}"));
+
+        let err = client
+            .get_bytes(&format!("http://{address}/v1/files/test/content"), &HeaderMap::new(), 8)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ApiClientError::CalloutFailed { .. }),
+            "non-2xx oversized response should be CalloutFailed, not ResponseTooLarge: {err:?}"
         );
     }
 
@@ -532,7 +537,7 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let json = client
-            .get_json(format!("http://{address}/v1/files/file-abc"), &http::HeaderMap::new())
+            .get_json(format!("http://{address}/v1/files/file-abc"), &HeaderMap::new())
             .await
             .unwrap();
 
@@ -555,7 +560,7 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let err = client
-            .get_json(format!("http://{address}/v1/files/file-abc"), &http::HeaderMap::new())
+            .get_json(format!("http://{address}/v1/files/file-abc"), &HeaderMap::new())
             .await
             .unwrap_err();
 
@@ -576,7 +581,7 @@ mod tests {
             .post_json(
                 format!("http://{address}/v1/vector_stores/vs-123/search"),
                 &request_body,
-                &http::HeaderMap::new(),
+                &HeaderMap::new(),
             )
             .await
             .unwrap();
@@ -584,9 +589,10 @@ mod tests {
         assert!(json["results"].as_array().unwrap().is_empty());
 
         let request = captured.join().unwrap();
+        let request_lower = request.to_lowercase();
         assert!(request.starts_with("POST"), "should be a POST request");
         assert!(
-            request.contains("content-type: application/json"),
+            request_lower.contains("content-type: application/json"),
             "should have JSON content-type: {request}"
         );
         let (_, body) = request.split_once("\r\n\r\n").unwrap();
@@ -603,7 +609,7 @@ mod tests {
             .post_json(
                 format!("http://{address}/v1/vector_stores/vs-123/search"),
                 &serde_json::json!({"query": "test"}),
-                &http::HeaderMap::new(),
+                &HeaderMap::new(),
             )
             .await
             .unwrap_err();
@@ -622,16 +628,13 @@ mod tests {
 
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: format!("http://{address}"),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms: 1_000,
-                ..CalloutConfig::default()
-            },
+            connector: SubRequestConnector::new(4, None),
+            timeout: Duration::from_millis(1_000),
+            max_response_bytes: 1_048_576,
             forward_header_names: vec![http::header::CONTENT_TYPE],
-        })
-        .unwrap();
+        });
 
-        let mut headers = http::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         headers.insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
 
         client
@@ -640,11 +643,12 @@ mod tests {
             .unwrap();
 
         let req = captured.join().unwrap();
-        let ct_count = req.matches("content-type:").count();
+        let req_lower = req.to_lowercase();
+        let ct_count = req_lower.matches("content-type:").count();
         assert_eq!(ct_count, 1, "exactly one content-type header, got {ct_count}");
         assert!(
-            req.contains("content-type: application/json"),
-            "should be application/json"
+            req_lower.contains("content-type: application/json"),
+            "should be application/json: {req}"
         );
     }
 
@@ -666,7 +670,7 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let err = client
-            .get_json(format!("http://{address}/v1/files/missing"), &http::HeaderMap::new())
+            .get_json(format!("http://{address}/v1/files/missing"), &HeaderMap::new())
             .await
             .unwrap_err();
 
@@ -693,7 +697,7 @@ mod tests {
         let err = client
             .get_bytes(
                 &format!("http://{address}/v1/files/test/content"),
-                &http::HeaderMap::new(),
+                &HeaderMap::new(),
                 1024,
             )
             .await
@@ -755,7 +759,7 @@ mod tests {
         let bytes = client
             .get_bytes(
                 &format!("http://{address}/v1/files/big/content"),
-                &http::HeaderMap::new(),
+                &HeaderMap::new(),
                 2_000_000,
             )
             .await
@@ -785,21 +789,14 @@ mod tests {
 
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: format!("http://{addr}"),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms: 50,
-                ..CalloutConfig::default()
-            },
+            connector: SubRequestConnector::new(4, None),
+            timeout: Duration::from_millis(50),
+            max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
-        })
-        .unwrap();
+        });
 
         let err = client
-            .get_bytes(
-                &format!("http://{addr}/v1/files/slow/content"),
-                &http::HeaderMap::new(),
-                1024,
-            )
+            .get_bytes(&format!("http://{addr}/v1/files/slow/content"), &HeaderMap::new(), 1024)
             .await
             .unwrap_err();
 

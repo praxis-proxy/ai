@@ -875,6 +875,7 @@ dependencies = [
  "cpex-pdp-cel",
  "cpex-plugin-audit-logger",
  "cpex-plugin-delegator-oauth",
+ "cpex-plugin-elicitation-ciba",
  "cpex-plugin-identity-jwt",
  "cpex-plugin-pii-scanner",
  "cpex-session-valkey",
@@ -963,6 +964,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da8c0ce5ae33679beaeb582b6348b9f3ad4762a33dc503a7f872f269bf4804c7"
 dependencies = [
  "async-trait",
+ "chrono",
+ "cpex-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "cpex-plugin-elicitation-ciba"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9f0d6fbd8a25ede8544c528184d317691a543b52df1962a6d92d79ba58c172d"
+dependencies = [
+ "async-trait",
+ "base64",
  "chrono",
  "cpex-core",
  "reqwest 0.12.28",
@@ -2906,6 +2924,8 @@ dependencies = [
  "percent-encoding",
  "praxis-proxy-core",
  "praxis-proxy-filter",
+ "quixotic-plecostomus-core",
+ "quixotic-plecostomus-http",
  "reqwest 0.13.4",
  "rmcp",
  "schemars 1.2.1",
@@ -2965,9 +2985,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "130643048a6f3a94b1b48c361479a8f2833bf9d3a926cff9a9071bdcaa352552"
+checksum = "34121bbb48d49496e6d61c11c6362037b691663051791bad543d118e06e82222"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -2986,17 +3006,17 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71a30c54be1367e63135c5b3b05f7365ab7d8940c3d5fdac9d97a316c04568c9"
+checksum = "58aeccce4246f7b3d83508bfd71880d1b9261cf7aca1a1cf67e8ff38e5ba655f"
 dependencies = [
+ "bytes",
  "dashmap 6.2.1",
  "http",
  "praxis-proxy-tls",
  "quixotic-plecostomus-core",
  "rand 0.10.2",
  "regex",
- "reqwest 0.13.4",
  "serde",
  "thiserror 2.0.19",
  "tokio",
@@ -3007,9 +3027,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b775e4c9673c53e967cce25e8e8959a9ff01cf18a17a90448f6601c77e8f050"
+checksum = "2af983f07e1ba5cfcdbf08437b481038a438f708cf760b3563c2388ad2dd437c"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3020,6 +3040,8 @@ dependencies = [
  "percent-encoding",
  "praxis-proxy-core",
  "praxis-proxy-tls",
+ "quixotic-plecostomus-core",
+ "quixotic-plecostomus-http",
  "rand 0.10.2",
  "regex",
  "secrecy",
@@ -3035,9 +3057,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3919b20d58ab7cf5af8ba6dc380641f217430061436511fb7b83e21646d3adb9"
+checksum = "763b0190ee99a5d4962ba717c7d8d9edf095336ece5769bc7f66d693d005d3d0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3060,9 +3082,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93fcb6f2aad1284d40edf3ec7eb41f010ce48244c2caa74abd12b55f94edcad5"
+checksum = "fb39ec61f84dd83eb3131743f13a75a9f7c250160adbdf935e73bffa5d0f495b"
 dependencies = [
  "arc-swap",
  "notify",
