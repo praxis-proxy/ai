@@ -227,7 +227,17 @@ fn unknown_json_continues_in_continue_mode() {
 
 #[tokio::test]
 async fn on_request_body_rejects_unknown_json() {
-    let action = run_filter_raw("on_invalid: reject", r#"{"prompt":"hello"}"#).await;
+    // On a non-create path the endpoint is not authoritative, so a body with
+    // no recognizable format signals classifies as unknown_json and is
+    // rejected. (On POST /v1/responses the same body is a Responses create
+    // request — see `post_v1_responses_create_without_discriminator_*`.)
+    let action = run_filter_raw_with_method(
+        "on_invalid: reject",
+        r#"{"prompt":"hello"}"#,
+        http::Method::POST,
+        "/v1/chat/completions",
+    )
+    .await;
     assert!(
         matches!(action, FilterAction::Reject(_)),
         "unknown JSON should be rejected"
@@ -695,6 +705,78 @@ async fn post_v1_responses_classifies_body_normally() {
     );
 }
 
+/// A valid Responses create body that omits the
+/// discriminator fields (`input`, `prompt` object, `previous_response_id`,
+/// `conversation`) must still classify as `openai_responses` because the
+/// endpoint is authoritative — not fall through to `unknown_json`.
+#[tokio::test]
+async fn post_v1_responses_create_without_discriminator_classifies_as_responses() {
+    let ctx = run_filter_with_method("{}", r#"{"model":"gpt-5"}"#, http::Method::POST, "/v1/responses").await;
+
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str),
+        Some("openai_responses"),
+        "create body without discriminator fields should classify as responses"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.model")
+            .map(String::as_str),
+        Some("gpt-5"),
+        "model should still be extracted from the create body"
+    );
+}
+
+/// The create endpoint is authoritative even when the body still carries
+/// facts: body-derived fields must survive the forced format assignment.
+#[tokio::test]
+async fn post_v1_responses_create_preserves_body_facts() {
+    let ctx = run_filter_with_method(
+        "{}",
+        r#"{"model":"gpt-5","stream":true,"store":false}"#,
+        http::Method::POST,
+        "/v1/responses",
+    )
+    .await;
+
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str),
+        Some("openai_responses"),
+        "create endpoint should classify as responses"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.stream")
+            .map(String::as_str),
+        Some("true"),
+        "stream fact should be preserved"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.store")
+            .map(String::as_str),
+        Some("false"),
+        "store fact should be preserved"
+    );
+}
+
+/// A genuinely broken body on the create endpoint must not be masked as a
+/// valid Responses request: parse failures are preserved so they can be
+/// rejected when `on_invalid` is configured to reject.
+#[tokio::test]
+async fn post_v1_responses_create_preserves_invalid_json() {
+    let action = run_filter_raw("on_invalid: reject", r#"{"model":"gpt-5""#).await;
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "invalid JSON on the create endpoint should still be rejected, not forced to responses"
+    );
+}
+
 /// Promote only the format fact for a Responses `WebSocket` handshake.
 #[tokio::test]
 async fn responses_websocket_handshake_promotes_only_format() {
@@ -949,9 +1031,23 @@ fn collect_headers<'a>(ctx: &'a HttpFilterContext<'_>) -> std::collections::Hash
 }
 
 /// Run the filter's `on_request_body` and return the raw action.
+///
+/// Uses `POST /v1/responses`. For other methods or paths, see
+/// [`run_filter_raw_with_method`].
 async fn run_filter_raw(config_yaml: &str, body_str: &str) -> FilterAction {
+    run_filter_raw_with_method(config_yaml, body_str, http::Method::POST, "/v1/responses").await
+}
+
+/// Run the filter's `on_request_body` with a custom method and path and
+/// return the raw action.
+async fn run_filter_raw_with_method(
+    config_yaml: &str,
+    body_str: &str,
+    method: http::Method,
+    path: &str,
+) -> FilterAction {
     let filter = make_filter(config_yaml);
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let req = crate::test_utils::make_request(method, path);
 
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
     let mut ctx = crate::test_utils::make_filter_context(req);
