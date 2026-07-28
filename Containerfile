@@ -25,19 +25,22 @@ COPY Cargo.toml Cargo.lock ./
 COPY apis/Cargo.toml ./apis/Cargo.toml
 COPY filters/Cargo.toml ./filters/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
+COPY server/build_support/Cargo.toml ./server/build_support/Cargo.toml
 
 # The server crate has a build.rs that discovers external filter
-# crates via cargo metadata for build-time auto-registration.
+# crates via cargo metadata for build-time auto-registration,
+# backed by the praxis-ai-build-support crate.
 COPY server/build.rs ./server/build.rs
 
 # Strip workspace members not needed for the binary.
 RUN sed -i '/xtask/d; /tests\//d' Cargo.toml
 
 # Create stub source files for all crates.
-RUN mkdir -p apis/src filters/src server/src \
+RUN mkdir -p apis/src filters/src server/src server/build_support/src \
     && echo '//! stub' > apis/src/lib.rs \
     && echo '//! stub' > filters/src/lib.rs \
     && echo '//! stub' > server/src/lib.rs \
+    && echo '//! stub' > server/build_support/src/lib.rs \
     && printf '//! stub\nfn main() {}\n' > server/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -53,8 +56,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY apis/src ./apis/src
 COPY filters/src ./filters/src
 COPY server/src ./server/src
+COPY server/build_support/src ./server/build_support/src
 
-RUN find apis/src filters/src server/src \
+RUN find apis/src filters/src server/src server/build_support/src \
     -name '*.rs' -exec touch {} +
 
 # ------------------------------------------------------------------------------

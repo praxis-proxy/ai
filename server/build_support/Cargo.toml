@@ -1,0 +1,24 @@
+[package]
+name = "praxis-ai-build-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Testable dependency-graph and marker-scanning logic for praxis-ai-proxy's build script"
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+publish = false
+
+[lib]
+name = "build_support"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+cargo_metadata = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
