@@ -27,7 +27,9 @@ bytes = { workspace = true }
 dashmap = { workspace = true, optional = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
-praxis-core = { workspace = true, features = ["callout"] }
+pingora-core = { workspace = true }
+pingora-http = { workspace = true }
+praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }

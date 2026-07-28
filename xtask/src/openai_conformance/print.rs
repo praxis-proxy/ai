@@ -97,17 +97,24 @@ fn print_oasdiff_summary(report: &OasdiffReport, args: &Args) {
     for area in &report.area_drift {
         println!("    {}: {} drift details", area.area, area.details.len());
     }
+    let exception_count = report
+        .area_reports
+        .iter()
+        .map(|area| area.exceptions.len())
+        .sum::<usize>();
+    println!("  upstream spec exceptions applied: {exception_count}");
 
     println!("oasdiff by area:");
     for area in &report.area_reports {
         println!(
-            "  {}: {}/{} ({:.2}%), missing {}, drifted {}, implementation {}",
+            "  {}: {}/{} ({:.2}%), missing {}, drifted {}, exceptions {}, implementation {}",
             area.area,
             area.conformant,
             area.total,
             area.conformance_percent(),
             area.missing.len(),
             area.drifted.len(),
+            area.exceptions.len(),
             area.implementation_source,
         );
     }

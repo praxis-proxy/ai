@@ -58,7 +58,7 @@ filter_chains:
         #   responses_table: openai_responses
         #   conversations_table: openai_conversations
         #   allow_private_database_url: true  # required for DNS, local, or private DB targets
-        #   ssl_mode: prefer          # disable, prefer, require, verify-ca, verify-full
+        #   ssl_mode: verify-full      # disable, prefer, require, verify-ca, verify-full (default: verify-full)
         #   ssl_root_cert: /path/to/ca.pem  # optional, for verify-ca / verify-full
 
       - filter: router

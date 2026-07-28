@@ -12,12 +12,13 @@ use super::{
     find_missing_sentinels,
     json_report::report_json,
     model::{
-        CoverageMode, OasdiffAreaDrift, OasdiffAreaReport, OasdiffOperationDrift, OperationKey, ReferenceSourceReport,
-        RuntimeVerificationCheck, SpecOperation, SpecSourceReport, SupportedOperation, percent,
+        AppliedContractException, ContractDriftKind, ContractException, CoverageMode, OasdiffAreaDrift,
+        OasdiffAreaReport, OasdiffOperationDrift, OperationKey, ReferenceSourceReport, RuntimeVerificationCheck,
+        SpecOperation, SpecSourceReport, SupportedOperation, percent,
     },
     oasdiff::{
-        OASDIFF_VERSION, build_oasdiff_report, collect_oasdiff_operation_status, operation_drift_from_diff,
-        parse_oasdiff_module_version, parse_oasdiff_version,
+        OASDIFF_VERSION, apply_contract_exceptions, build_oasdiff_report, collect_oasdiff_operation_status,
+        operation_drift_from_diff, parse_oasdiff_module_version, parse_oasdiff_version,
     },
     parse_percent,
     reference::build_reference_projection,
@@ -458,6 +459,13 @@ fn json_report_includes_oasdiff_missing_and_response_drift() {
         missing: missing.iter().cloned().collect(),
         drifted: drifted.values().cloned().collect(),
         inherited_details: vec!["security.deleted.ApiKeyAuth".to_owned()],
+        exceptions: vec![AppliedContractException {
+            kind: ContractDriftKind::Response,
+            operation: Some(OperationKey::new("POST", "/conversations")),
+            detail: "responses.200.content.application/json.schema.properties.metadata.type.added",
+            rationale: "live response is stricter than the incomplete property",
+            evidence: "live probe",
+        }],
     };
     report.oasdiff = Some(build_oasdiff_report(
         OASDIFF_VERSION,
@@ -540,6 +548,12 @@ fn json_report_includes_oasdiff_missing_and_response_drift() {
             .pointer("/owned_contract_conformance/areas/0/implementation_source")
             .and_then(Value::as_str),
         Some("implementation-spec")
+    );
+    assert_eq!(
+        value
+            .pointer("/owned_contract_conformance/areas/0/upstream_spec_exceptions/0/detail")
+            .and_then(Value::as_str),
+        Some("responses.200.content.application/json.schema.properties.metadata.type.added")
     );
     assert_eq!(
         value
@@ -660,6 +674,48 @@ fn reports_global_security_and_path_level_parameter_drift() {
         .get(&OperationKey::new("GET", "/conversations/{conversation_id}"))
         .expect("path-level parameter drift should apply to GET");
     assert!(get.has_request_drift());
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "covers applied, unrelated, and stale exception states"
+)]
+fn contract_exceptions_remove_only_exact_current_fingerprints() {
+    let key = OperationKey::new("POST", "/conversations");
+    let mut drift = OasdiffOperationDrift::new(key.clone());
+    drift.response_details = vec![
+        "responses.200.content.application/json.schema.properties.metadata.type.added".to_owned(),
+        "responses.200.content.application/json.schema.properties.id.type.added".to_owned(),
+    ];
+    let mut drifted = BTreeMap::from([(key, drift)]);
+    let mut inherited = Vec::new();
+    let exception = ContractException {
+        kind: ContractDriftKind::Response,
+        method: Some("POST"),
+        path: Some("/conversations"),
+        detail: "responses.200.content.application/json.schema.properties.metadata.type.added",
+        rationale: "live responses always return an object",
+        evidence: "live probe",
+    };
+
+    let applied = apply_contract_exceptions("Conversations", &[exception], &mut drifted, &mut inherited).unwrap();
+
+    assert_eq!(applied.len(), 1);
+    assert_eq!(
+        drifted
+            .values()
+            .next()
+            .expect("unrelated drift should remain")
+            .response_details,
+        ["responses.200.content.application/json.schema.properties.id.type.added"]
+    );
+
+    let error = apply_contract_exceptions("Conversations", &[exception], &mut drifted, &mut inherited).unwrap_err();
+    assert!(
+        error.contains("stale contract exception"),
+        "a stale exception should fail closed: {error}"
+    );
 }
 
 #[test]

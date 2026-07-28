@@ -14,6 +14,7 @@ pub(crate) mod mcp_client;
 pub mod openai;
 #[cfg(feature = "store")]
 pub mod store;
+pub(crate) mod subrequest;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -60,6 +61,7 @@ pub(crate) mod test_utils {
     )]
     pub(crate) fn make_filter_context(req: &Request) -> HttpFilterContext<'_> {
         HttpFilterContext {
+            buffered_request_body: None,
             body_done_indices: Vec::new(),
             branch_iterations: std::collections::HashMap::new(),
             client_addr: None,
@@ -88,6 +90,7 @@ pub(crate) mod test_utils {
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
             response_headers_modified: false,
+            subrequest_connector: None,
             rewritten_path: None,
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,

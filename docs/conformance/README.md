@@ -143,6 +143,22 @@ global security mismatch.
 Use `owned_contract_conformance.fixes_required` as the actionable contract
 backlog.
 
+### Upstream specification exceptions
+
+An area may remove an exact drift fingerprint from the actionable backlog only
+when authoritative or live evidence shows the pinned upstream schema is
+incomplete. Every exception records its operation, drift channel, exact detail,
+rationale, and evidence under `upstream_spec_exceptions`. Generation fails when
+a declared fingerprint no longer appears, so an upstream correction cannot be
+masked by a stale exception. Unrelated drift on the same operation remains
+active.
+
+OpenAI Conversations responses were checked against `api.openai.com` on
+2026-07-27. Omitted and explicitly null create metadata returned `{}`, while a
+populated string map round-tripped unchanged. Praxis therefore retains its
+string-map response schema and records the 12 missing upstream metadata
+constraints as explicit exceptions.
+
 ## CI Enforcement
 
 CI always runs strict capability and owned-contract conformance after the

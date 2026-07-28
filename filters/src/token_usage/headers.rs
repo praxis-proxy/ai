@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext};
+use praxis_filter::{EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
 use tracing::trace;
 
 use super::{META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_TOTAL};
@@ -61,9 +61,9 @@ impl TokenUsageHeadersFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the YAML config is malformed.
-    #[expect(clippy::unnecessary_wraps, reason = "signature required by registry")]
-    pub fn from_config(_config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+    /// Returns [`FilterError`] if the YAML config contains unknown fields.
+    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let _: EmptyFilterConfig = parse_filter_config("token_usage_headers", config)?;
         Ok(Box::new(Self))
     }
 }
@@ -288,5 +288,18 @@ mod tests {
         let config = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
         let filter = TokenUsageHeadersFilter::from_config(&config).unwrap();
         assert_eq!(filter.name(), "token_usage_headers", "filter name should match");
+    }
+
+    #[test]
+    fn from_config_succeeds_with_null() {
+        let filter = TokenUsageHeadersFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        assert_eq!(filter.name(), "token_usage_headers", "filter name should match");
+    }
+
+    #[test]
+    fn from_config_rejects_unknown_fields() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("bogus: true").unwrap();
+        let result = TokenUsageHeadersFilter::from_config(&yaml);
+        assert!(result.is_err(), "unknown fields should be rejected");
     }
 }

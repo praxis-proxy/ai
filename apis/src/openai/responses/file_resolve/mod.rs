@@ -64,7 +64,6 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_core::callout::{CalloutConfig, FailureMode};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
@@ -81,6 +80,7 @@ use super::{openai_responses_proxy::serialized_outbound_body_len, state::Respons
 use crate::{
     classifier::is_responses_create,
     openai::api_client::{ApiClient, ApiClientConfig},
+    subrequest::SubRequestConnector,
 };
 
 /// Resolves `file_id` and `file_url` references in Responses API input
@@ -157,15 +157,11 @@ impl FileResolveFilter {
 
         let api_client = ApiClient::new(ApiClientConfig {
             api_base_url: validated.files_api_url.clone(),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms: validated.timeout_ms,
-                status_on_error: 502,
-                ..CalloutConfig::default()
-            },
+            connector: SubRequestConnector::new(4, None),
+            timeout: std::time::Duration::from_millis(validated.timeout_ms),
+            max_response_bytes: 1_048_576,
             forward_header_names,
-        })
-        .map_err(|e| -> FilterError { format!("openai_file_resolve: {e}").into() })?;
+        });
 
         let client = FilesApiClient::new(
             api_client,

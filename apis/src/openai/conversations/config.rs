@@ -396,13 +396,17 @@ fn has_postgres_ssl_root_cert(cfg: &ConversationsConfig, database_url: &str) -> 
 }
 
 /// Return whether the effective `PostgreSQL` SSL mode verifies certificates.
+///
+/// When no explicit `ssl_mode` is set, the runtime default is
+/// [`SslMode::VerifyFull`], so the `None` case is considered verified
+/// unless the URL carries a non-verifying `sslmode`.
 fn has_verified_postgres_ssl_mode(cfg: &ConversationsConfig, database_url: &str) -> bool {
     match cfg.ssl_mode {
         Some(SslMode::VerifyCa | SslMode::VerifyFull) => true,
         Some(SslMode::Disable | SslMode::Prefer | SslMode::Require) => false,
         None => postgres_url_sslmode(database_url)
             .as_deref()
-            .is_some_and(is_verified_postgres_sslmode),
+            .is_none_or(is_verified_postgres_sslmode),
     }
 }
 

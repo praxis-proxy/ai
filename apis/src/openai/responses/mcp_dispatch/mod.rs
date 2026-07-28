@@ -54,7 +54,7 @@ use self::{
     approval::{parse_approval_policy, requires_approval},
     config::{McpDispatchConfig, build_config},
 };
-use super::state::ResponsesState;
+use super::{openai_mcp_tool_resolve::encode_function_name, state::ResponsesState};
 use crate::mcp_client;
 
 // -----------------------------------------------------------------------------
@@ -240,32 +240,36 @@ fn extract_mcp_tool_calls(
         .collect()
 }
 
-/// Check whether a tool call is an MCP tool call.
+/// Check whether a tool call is an MCP tool call by matching the
+/// encoded function name against the tool map.
 fn is_mcp_tool_call(tool_call: &serde_json::Value, tool_map: &HashMap<(String, String), serde_json::Value>) -> bool {
     tool_call
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|name| find_by_tool_name(tool_map, name).is_some())
+        .is_some_and(|name| find_by_encoded_name(tool_map, name).is_some())
 }
 
-/// Find an entry in the tool map by tool name (second element of
-/// the `(server_label, tool_name)` key). Returns the first match.
+/// Find an entry in the tool map by encoded function name.
 ///
-/// Warns when multiple servers expose the same tool name, since
-/// routing is first-match and may be nondeterministic.
-fn find_by_tool_name<'a>(
+/// Computes `encode_function_name(label, tool_name)` for each key
+/// and returns the first match along with its key. Warns when
+/// multiple entries produce the same encoded name, since routing
+/// is first-match and may be nondeterministic.
+fn find_by_encoded_name<'a>(
     tool_map: &'a HashMap<(String, String), serde_json::Value>,
-    tool_name: &str,
-) -> Option<&'a serde_json::Value> {
-    let mut matches = tool_map.iter().filter(|((_, name), _)| name == tool_name);
+    encoded_name: &str,
+) -> Option<(&'a (String, String), &'a serde_json::Value)> {
+    let mut matches = tool_map
+        .iter()
+        .filter(|((label, name), _)| encode_function_name(label, name) == encoded_name);
     let first = matches.next()?;
     if matches.next().is_some() {
         warn!(
-            tool_name,
-            "multiple servers expose the same tool name; routing to first match"
+            encoded_name,
+            "multiple entries produce the same encoded tool name; routing to first match"
         );
     }
-    Some(first.1)
+    Some((first.0, first.1))
 }
 
 // -----------------------------------------------------------------------------
@@ -299,30 +303,35 @@ fn extract_arguments(tc: &serde_json::Value) -> String {
 /// Check a single tool call for approval requirement.
 ///
 /// Returns `Some` with approval details if approval is required,
-/// or if the tool name is ambiguous across servers.
+/// or if the encoded tool name is ambiguous across servers.
+#[expect(clippy::too_many_lines, reason = "linear validation with clear structure")]
 fn check_single_approval(
     tc: &serde_json::Value,
     tool_map: &HashMap<(String, String), serde_json::Value>,
 ) -> Option<PendingApproval> {
-    let tool_name = tc.get("name").and_then(serde_json::Value::as_str)?;
+    let encoded_name = tc.get("name").and_then(serde_json::Value::as_str)?;
 
-    let match_count = tool_map.keys().filter(|(_, name)| name == tool_name).count();
+    let match_count = tool_map
+        .keys()
+        .filter(|(label, name)| encode_function_name(label, name) == encoded_name)
+        .count();
     if match_count > 1 {
         warn!(
-            tool_name,
+            encoded_name,
             server_count = match_count,
-            "ambiguous tool name in approval check; requiring approval"
+            "ambiguous encoded tool name in approval check; requiring approval"
         );
         return Some(PendingApproval {
             call_id: extract_call_id(tc),
             server_label: "unknown".to_owned(),
-            tool_name: tool_name.to_owned(),
+            tool_name: encoded_name.to_owned(),
             arguments: extract_arguments(tc),
         });
     }
 
-    let entry = find_by_tool_name(tool_map, tool_name)?;
-    if !requires_approval(&parse_approval_policy(entry), tool_name) {
+    let (key, entry) = find_by_encoded_name(tool_map, encoded_name)?;
+    let original_tool_name = &key.1;
+    if !requires_approval(&parse_approval_policy(entry), original_tool_name) {
         return None;
     }
 
@@ -335,7 +344,7 @@ fn check_single_approval(
     Some(PendingApproval {
         call_id: extract_call_id(tc),
         server_label,
-        tool_name: tool_name.to_owned(),
+        tool_name: original_tool_name.to_owned(),
         arguments: extract_arguments(tc),
     })
 }
@@ -428,32 +437,37 @@ async fn execute_sequential(
     results
 }
 
-/// Resolve a tool name to its unique entry, rejecting ambiguity.
+/// Resolve an encoded function name to its unique entry, rejecting
+/// ambiguity.
+#[expect(clippy::type_complexity, reason = "key+value pair needed by callers")]
 fn resolve_tool_entry<'a>(
     tool_map: &'a HashMap<(String, String), serde_json::Value>,
-    tool_name: &str,
+    encoded_name: &str,
     call_id: &str,
-) -> Result<&'a serde_json::Value, Option<Box<McpCallResult>>> {
-    let match_count = tool_map.keys().filter(|(_, name)| name == tool_name).count();
+) -> Result<(&'a (String, String), &'a serde_json::Value), Option<Box<McpCallResult>>> {
+    let match_count = tool_map
+        .keys()
+        .filter(|(label, name)| encode_function_name(label, name) == encoded_name)
+        .count();
     if match_count == 0 {
-        warn!(tool_name, "tool not found in mcp_tool_map, skipping");
+        warn!(encoded_name, "tool not found in mcp_tool_map, skipping");
         return Err(None);
     }
     if match_count > 1 {
         warn!(
-            tool_name,
+            encoded_name,
             server_count = match_count,
-            "ambiguous MCP tool name: multiple servers expose this tool"
+            "ambiguous MCP tool name: multiple entries produce this encoded name"
         );
         return Err(Some(Box::new(build_error_result(
             call_id,
             "unknown",
-            tool_name,
+            encoded_name,
             "",
-            &format!("ambiguous tool name: {match_count} servers expose '{tool_name}'"),
+            &format!("ambiguous tool name: {match_count} servers expose '{encoded_name}'"),
         ))));
     }
-    find_by_tool_name(tool_map, tool_name).ok_or(None)
+    find_by_encoded_name(tool_map, encoded_name).ok_or(None)
 }
 
 /// Parse tool call arguments, handling JSON-string encoding.
@@ -542,17 +556,18 @@ async fn execute_single_call(
     timeout: Duration,
     allow_loopback: bool,
 ) -> Option<McpCallResult> {
-    let tool_name = tool_call.get("name").and_then(serde_json::Value::as_str)?;
+    let encoded_name = tool_call.get("name").and_then(serde_json::Value::as_str)?;
     let call_id = tool_call
         .get("call_id")
         .or_else(|| tool_call.get("id"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
 
-    let entry = match resolve_tool_entry(tool_map, tool_name, call_id) {
-        Ok(e) => e,
+    let (key, entry) = match resolve_tool_entry(tool_map, encoded_name, call_id) {
+        Ok(r) => r,
         Err(opt) => return opt.map(|b| *b),
     };
+    let original_tool_name = &key.1;
     let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
     let server_label = entry
         .get("server_label")
@@ -560,18 +575,22 @@ async fn execute_single_call(
         .unwrap_or("unknown");
     let headers = entry.get("headers");
     let authorization = entry.get("authorization").and_then(serde_json::Value::as_str);
-    let (arguments, arguments_string) = match parse_call_arguments(tool_call, call_id, server_label, tool_name) {
+    let (arguments, arguments_string) = match parse_call_arguments(tool_call, call_id, server_label, original_tool_name)
+    {
         Ok(r) => r,
         Err(r) => return Some(*r),
     };
 
-    debug!(tool_name, server_label, call_id, "executing MCP tool call");
+    debug!(
+        tool_name = original_tool_name,
+        server_label, call_id, "executing MCP tool call"
+    );
 
     let result = mcp_client::call_tool(
         server_url,
         headers,
         authorization,
-        tool_name,
+        original_tool_name,
         arguments,
         timeout,
         allow_loopback,
@@ -581,7 +600,7 @@ async fn execute_single_call(
         result,
         call_id,
         server_label,
-        tool_name,
+        original_tool_name,
         &arguments_string,
     ))
 }

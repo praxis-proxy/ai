@@ -33,7 +33,7 @@ filter_chains:
         #   backend: postgres
         #   database_url: "postgres://user:pass@db.example.com:5432/praxis"
         #   allow_private_database_url: true
-        #   ssl_mode: prefer
+        #   ssl_mode: verify-full      # default: verify-full
         #   ssl_root_cert: /path/to/ca.pem
 
       - filter: router

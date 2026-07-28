@@ -630,6 +630,22 @@ fn reject_ssl_root_cert_without_verify_mode() {
 }
 
 #[test]
+fn accept_ssl_root_cert_without_explicit_ssl_mode() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_root_cert: "/path/to/ca.pem"
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+}
+
+#[test]
 fn accept_ssl_root_cert_with_verify_ca() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
