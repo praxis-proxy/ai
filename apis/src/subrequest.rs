@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Sub-request execution through Pingora's native connector.
+//! **Temporary** sub-request execution — to be replaced by
+//! [praxis-core#826](https://github.com/praxis-proxy/praxis/issues/826).
 //!
 //! Provides URL-to-peer parsing and an HTTP execution function
 //! that replaces `praxis_core::callout::CalloutClient` with
 //! Pingora-native transport — getting connection pooling and TLS
 //! without a separate HTTP stack.
+//!
+//! Once praxis-core exposes the executor and typed errors through
+//! `SubRequestConnector`, this module should shrink to URL
+//! validation, `TargetPeer` construction, and domain error
+//! mapping.
 //!
 //! Types ([`SubRequestConnector`], [`SubRequest`], [`SubResponse`])
 //! are re-exported from [`praxis_core::subrequest`].
