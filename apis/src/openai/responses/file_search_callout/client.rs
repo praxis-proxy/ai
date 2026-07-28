@@ -9,14 +9,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
-use praxis_core::callout::FailureMode;
 use serde::{
     Deserialize, Serialize,
     de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::Value;
 
+use super::config::OnError;
 use crate::openai::api_client::ApiClient;
 
 // -----------------------------------------------------------------------------
@@ -377,7 +378,7 @@ pub(crate) struct FileSearchClientConfig {
     pub authorization: Option<HeaderValue>,
 
     /// Whether one failed chunk stops scheduling later callouts.
-    pub failure_mode: FailureMode,
+    pub on_error: OnError,
 
     /// Maximum response body size enforced by the core client.
     pub max_response_bytes: usize,
@@ -398,7 +399,7 @@ pub(crate) struct FileSearchClient {
     authorization: Option<HeaderValue>,
 
     /// Whether one failed chunk stops scheduling later callouts.
-    failure_mode: FailureMode,
+    on_error: OnError,
 
     /// Maximum response body size enforced by the core client.
     max_response_bytes: usize,
@@ -416,7 +417,7 @@ impl FileSearchClient {
         Self {
             api_client: config.api_client,
             authorization: config.authorization,
-            failure_mode: config.failure_mode,
+            on_error: config.on_error,
             max_response_bytes: config.max_response_bytes,
             max_total_response_bytes: config.max_total_response_bytes,
             timeout: config.timeout,
@@ -483,7 +484,7 @@ impl FileSearchClient {
                 deadline_recorded = true;
                 break;
             }
-            if chunk_failed && self.failure_mode == FailureMode::Closed {
+            if chunk_failed && self.on_error == OnError::Reject {
                 if let Some(remaining_specs) = specs.get(next_spec..) {
                     append_fail_closed_failures(&mut batch.failures, remaining_specs);
                 }
@@ -573,7 +574,7 @@ impl FileSearchClient {
         request: PreparedSearchRequest,
         store_id: &str,
         execution_started: Instant,
-    ) -> Result<Vec<u8>, FileSearchError> {
+    ) -> Result<Bytes, FileSearchError> {
         let remaining = deadline_remaining(self.timeout, execution_started, store_id)?;
         let headers = self.request_headers();
         tokio::time::timeout(
@@ -878,7 +879,7 @@ fn deadline_remaining(
     reason = "keeps one response's deadline and admission ownership explicit"
 )]
 async fn parse_response_body_with_deadline(
-    body: Vec<u8>,
+    body: Bytes,
     store_id: &str,
     result_limit: usize,
     execution_started: Instant,

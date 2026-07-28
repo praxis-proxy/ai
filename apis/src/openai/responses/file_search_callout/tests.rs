@@ -42,7 +42,7 @@ fn minimal_config_uses_safe_defaults() {
     assert!(config.authorization.is_none());
     assert_eq!(config.max_response_bytes, 10_485_760);
     assert_eq!(config.max_total_response_bytes, 67_108_864);
-    assert_eq!(config.failure_mode, FailureMode::Closed);
+    assert_eq!(config.on_error, OnError::Reject);
 }
 
 #[test]
@@ -915,7 +915,7 @@ async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_ogx() {
 }
 
 #[tokio::test]
-async fn open_and_closed_failure_modes_are_distinct() {
+async fn ignore_and_reject_error_modes_are_distinct() {
     let closed_server = MockServer::json(500, &json!({"error":"failed"}));
     let closed = make_filter(closed_server.port, "on_error: reject\n");
     let mut closed_ctx = make_context(Some(one_pending_state(&["vs-a"])));
@@ -1291,14 +1291,14 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
     let client = FileSearchClient::new(FileSearchClientConfig {
         api_client: validated.api_client,
         authorization: validated.authorization,
-        failure_mode: validated.failure_mode,
+        on_error: validated.on_error,
         max_response_bytes: validated.max_response_bytes,
         max_total_response_bytes: validated.max_total_response_bytes,
         timeout: validated.timeout,
     });
     FileSearchCalloutFilter {
         client,
-        failure_mode: validated.failure_mode,
+        on_error: validated.on_error,
     }
 }
 

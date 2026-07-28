@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use http::HeaderValue;
-use praxis_core::callout::{CalloutConfig, FailureMode};
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use reqwest::Url;
 use secrecy::{ExposeSecret as _, SecretString};
@@ -14,7 +13,10 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use super::client::MAX_CONCURRENT_SEARCHES;
-use crate::openai::api_client::{self, ApiClient, ApiClientConfig};
+use crate::{
+    openai::api_client::{self, ApiClient, ApiClientConfig},
+    subrequest::SubRequestConnector,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -90,7 +92,7 @@ pub(crate) struct FileSearchFilterConfig {
     ///
     /// Named `on_error` because `parse_filter_config` strips
     /// `failure_mode` as a pipeline-structural key.
-    pub on_error: Option<OnErrorDef>,
+    pub on_error: Option<OnError>,
 
     /// Whole-call timeout in milliseconds.
     pub timeout_ms: Option<u64>,
@@ -100,23 +102,13 @@ pub(crate) struct FileSearchFilterConfig {
 }
 
 /// Callout error handling policy.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum OnErrorDef {
+pub(crate) enum OnError {
     /// Log and continue with partial or empty results.
     Ignore,
     /// Return a 502 error to the client.
     Reject,
-}
-
-impl OnErrorDef {
-    /// Convert to the core failure mode.
-    pub fn to_core(self) -> FailureMode {
-        match self {
-            Self::Ignore => FailureMode::Open,
-            Self::Reject => FailureMode::Closed,
-        }
-    }
 }
 
 /// Validated configuration.
@@ -127,8 +119,8 @@ pub(crate) struct ValidatedConfig {
     /// Shared OpenAI-compatible API client.
     pub api_client: ApiClient,
 
-    /// Failure mode.
-    pub failure_mode: FailureMode,
+    /// Search failure handling policy.
+    pub on_error: OnError,
 
     /// Maximum response body size per callout.
     pub max_response_bytes: usize,
@@ -156,7 +148,7 @@ pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConf
         cfg.allow_insecure_auth_over_http,
     )?;
     let authorization = build_authorization(auth_type, api_key.as_ref())?;
-    let failure_mode = cfg.on_error.unwrap_or(OnErrorDef::Reject).to_core();
+    let on_error = cfg.on_error.unwrap_or(OnError::Reject);
     let (max_response_bytes, max_total_response_bytes) =
         response_limits(cfg.max_response_bytes, cfg.max_total_response_bytes)?;
     let timeout_ms = validated_timeout(cfg.timeout_ms)?;
@@ -164,15 +156,14 @@ pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConf
     let api_client = build_api_client(
         &vector_store_url,
         authorization.is_some(),
-        failure_mode,
         max_response_bytes,
         timeout_ms,
-    )?;
+    );
 
     Ok(ValidatedConfig {
         api_client,
         authorization,
-        failure_mode,
+        on_error,
         max_response_bytes,
         max_total_response_bytes,
         timeout: Duration::from_millis(timeout_ms),
@@ -183,36 +174,23 @@ pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConf
 // Private helpers
 // -----------------------------------------------------------------------------
 
-/// Build the shared API client with breaker behavior disabled.
+/// Build the shared API client with a dedicated Pingora connector.
 fn build_api_client(
     vector_store_url: &Url,
     has_authorization: bool,
-    failure_mode: FailureMode,
     max_response_bytes: usize,
     timeout_ms: u64,
-) -> Result<ApiClient, FilterError> {
-    // Core currently counts all non-2xx statuses as breaker failures. Leaving
-    // the breaker disabled prevents caller-controlled 4xx responses from
-    // disabling vector search for unrelated requests.
+) -> ApiClient {
     ApiClient::new(ApiClientConfig {
         api_base_url: vector_store_url.as_str().to_owned(),
-        callout_config: CalloutConfig {
-            circuit_breaker: None,
-            failure_mode,
-            max_depth: 1,
-            max_response_bytes,
-            pool_max_idle_per_host: 4,
-            status_on_error: 502,
-            timeout_ms,
-        },
+        connector: SubRequestConnector::new(4, None),
+        timeout: Duration::from_millis(timeout_ms),
+        max_response_bytes,
         forward_header_names: if has_authorization {
             vec![http::header::AUTHORIZATION]
         } else {
             Vec::new()
         },
-    })
-    .map_err(|error| -> FilterError {
-        format!("openai_file_search_callout: failed to create API client: {error}").into()
     })
 }
 

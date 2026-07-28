@@ -17,7 +17,6 @@ mod model_context;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
-use praxis_core::callout::FailureMode;
 use praxis_filter::{
     FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
@@ -29,7 +28,7 @@ use self::{
         FileSearchClient, FileSearchClientConfig, MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES,
         SearchBatch, SearchFailure, SearchSpec, request_error,
     },
-    config::{FileSearchFilterConfig, build_config},
+    config::{FileSearchFilterConfig, OnError, build_config},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::openai::responses::{
@@ -66,7 +65,7 @@ pub struct FileSearchCalloutFilter {
     client: FileSearchClient,
 
     /// Whether a failed callout rejects or produces an incomplete result.
-    failure_mode: FailureMode,
+    on_error: OnError,
 }
 
 impl FileSearchCalloutFilter {
@@ -82,7 +81,7 @@ impl FileSearchCalloutFilter {
         let client = FileSearchClient::new(FileSearchClientConfig {
             api_client: validated.api_client,
             authorization: validated.authorization,
-            failure_mode: validated.failure_mode,
+            on_error: validated.on_error,
             max_response_bytes: validated.max_response_bytes,
             max_total_response_bytes: validated.max_total_response_bytes,
             timeout: validated.timeout,
@@ -90,7 +89,7 @@ impl FileSearchCalloutFilter {
 
         Ok(Box::new(Self {
             client,
-            failure_mode: validated.failure_mode,
+            on_error: validated.on_error,
         }))
     }
 
@@ -226,7 +225,7 @@ impl FileSearchCalloutFilter {
                 "vector store search failed"
             );
         }
-        let failure = (self.failure_mode == FailureMode::Closed)
+        let failure = (self.on_error == OnError::Reject)
             .then(|| batch.failures.first())
             .flatten()?;
         Some(FilterAction::Reject(responses_error_rejection(
