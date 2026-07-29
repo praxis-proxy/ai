@@ -409,7 +409,13 @@ fn validate_sha256(digest: &str) -> Result<(), String> {
 
 /// Compute a lowercase SHA-256 digest.
 pub(super) fn sha256_hex(content: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(content))
+    let digest = Sha256::digest(content);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(hex, "{byte:02x}").unwrap();
+    }
+    hex
 }
 
 /// Normalize generated text to one final newline.

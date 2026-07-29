@@ -67,6 +67,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`prompt_enrich`](prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
 
+### Time To First Token
+
+| Filter | Description |
+|--------|-------------|
+| [`time_to_first_token`](time_to_first_token.md) | Measures time-to-first-token for streaming AI responses. |
+
 ### Token Usage
 
 | Filter | Description |

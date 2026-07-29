@@ -485,6 +485,49 @@ fn mcp_invalid_authorization_rejected() {
 }
 
 // =============================================================================
+// Duplicate server_label Rejection
+// =============================================================================
+
+#[test]
+fn duplicate_server_label_rejected_before_callout() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dup","server_url":"{mcp_url}","authorization":"tok_a","allowed_tools":["tool_a"]}},{{"type":"mcp","server_label":"dup","server_url":"{mcp_url}","authorization":"tok_b","allowed_tools":["tool_a"]}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 400, "duplicate server_label must produce 400");
+    let response_body = parse_body(&raw);
+    assert!(
+        response_body.contains("duplicate server_label"),
+        "rejection should mention duplicate server_label: {response_body}"
+    );
+
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        0,
+        "no tools/list calls should be made for duplicate labels"
+    );
+    assert_eq!(
+        mcp_server.method_count("initialize"),
+        0,
+        "no initialize calls should be made for duplicate labels"
+    );
+}
+
+// =============================================================================
 // YAML Helpers
 // =============================================================================
 
