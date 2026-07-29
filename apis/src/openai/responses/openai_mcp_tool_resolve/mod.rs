@@ -69,6 +69,10 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// into concrete tool definitions by calling `tools/list` on each
 /// upstream MCP server.
 ///
+/// Rejects the request with HTTP 400 before any callouts if two or
+/// more resolvable MCP entries share the same `server_label`
+/// (including entries that differ only by credentials).
+///
 /// # YAML
 ///
 /// ```yaml
@@ -140,6 +144,8 @@ impl McpToolResolveFilter {
                 max: self.max_servers,
             });
         }
+
+        check_duplicate_labels(&mcp_entries)?;
 
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
 
@@ -290,6 +296,10 @@ enum ResolveError {
     #[error("failed to serialize rewritten request body: {0}")]
     Serialization(serde_json::Error),
 
+    /// Duplicate `server_label` among resolvable MCP entries.
+    #[error("duplicate server_label \"{0}\" in MCP tools array")]
+    DuplicateLabel(String),
+
     /// Too many distinct MCP servers in one request.
     #[error("too many MCP servers: {count} exceeds limit of {max}")]
     TooManyServers {
@@ -316,7 +326,9 @@ struct Resolution {
 /// Map a [`ResolveError`] to an appropriate rejection response.
 fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction {
     let (status, error_type) = match err {
-        ResolveError::TooManyServers { .. } | ResolveError::NameCollision(_) => (400, "invalid_request_error"),
+        ResolveError::DuplicateLabel(_) | ResolveError::TooManyServers { .. } | ResolveError::NameCollision(_) => {
+            (400, "invalid_request_error")
+        },
         ResolveError::Client(_) => (502, "server_error"),
         ResolveError::Serialization(_) => (500, "server_error"),
     };
@@ -343,6 +355,28 @@ fn resolvable_server_url(entry: &serde_json::Value) -> Option<&str> {
         return None;
     }
     Some(server_url)
+}
+
+/// Reject requests containing more than one resolvable MCP entry
+/// with the same `server_label`.
+///
+/// Without this check, duplicate credentialed entries bypass the
+/// within-request cache (which is keyed on `(label, url)` and
+/// skipped when the entry carries `authorization` or `headers`),
+/// causing one `tools/list` callout per duplicate regardless of
+/// the `max_servers` bound.
+fn check_duplicate_labels(entries: &[serde_json::Value]) -> Result<(), ResolveError> {
+    let mut seen = HashSet::new();
+    for entry in entries {
+        if resolvable_server_url(entry).is_none() {
+            continue;
+        }
+        let label = server_label(entry);
+        if !seen.insert(label) {
+            return Err(ResolveError::DuplicateLabel(label.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 /// Count distinct resolvable `(server_label, server_url)` pairs.
