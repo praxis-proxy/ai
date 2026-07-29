@@ -408,6 +408,7 @@ impl FilesApiClient {
 
     /// Fetch metadata and content, returning the base64 content
     /// and MIME type for the caller to format per the schema.
+    #[expect(clippy::large_stack_frames, reason = "Pingora context types are large")]
     async fn resolve_file(
         &self,
         file_id: &str,
@@ -837,7 +838,7 @@ mod tests {
     use super::*;
     use crate::{
         openai::api_client::{ApiClient, ApiClientConfig},
-        subrequest::SubRequestConnector,
+        subrequest::SubRequestClient,
     };
 
     #[test]
@@ -971,7 +972,7 @@ mod tests {
     fn test_api_client(api_base_url: &str, timeout_ms: u64) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: api_base_url.to_owned(),
-            connector: SubRequestConnector::new(4, None),
+            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
             timeout: std::time::Duration::from_millis(timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),

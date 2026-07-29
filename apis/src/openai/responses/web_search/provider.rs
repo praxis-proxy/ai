@@ -3,10 +3,10 @@
 
 //! Search provider abstraction and implementations.
 //!
-//! Uses Pingora-native [`SubRequestConnector`] for HTTP callouts
-//! with connection pooling, HTTP/2, and TLS.
+//! Uses [`SubRequestClient`] from praxis-core for HTTP callouts
+//! with connection pooling, admission control, and TLS.
 //!
-//! [`SubRequestConnector`]: praxis_core::subrequest::SubRequestConnector
+//! [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::config::{FailureMode, SearchContextSize, SearchProvider, ValidatedConfig};
-use crate::subrequest::{self, SubRequest, SubRequestConnector, SubResponse};
+use crate::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
@@ -61,12 +61,12 @@ pub(crate) enum SearchOutcome {
 // SearchClient
 // -----------------------------------------------------------------------------
 
-/// HTTP search client using Pingora-native [`SubRequestConnector`].
+/// HTTP search client using [`SubRequestClient`] from praxis-core.
 ///
-/// [`SubRequestConnector`]: praxis_core::subrequest::SubRequestConnector
+/// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 pub(crate) struct SearchClient {
-    /// Shared HTTP connector for search callouts.
-    connector: SubRequestConnector,
+    /// Sub-request client for bounded search callouts.
+    client: SubRequestClient,
     /// Per-request timeout.
     timeout: Duration,
     /// Search backend provider.
@@ -84,7 +84,7 @@ pub(crate) struct SearchClient {
 impl std::fmt::Debug for SearchClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearchClient")
-            .field("connector", &self.connector)
+            .field("client", &self.client)
             .field("timeout", &self.timeout)
             .field("provider", &self.provider)
             .field("api_key", &"[REDACTED]")
@@ -106,7 +106,7 @@ impl SearchClient {
         http::HeaderValue::from_str(config.api_key.expose_secret())
             .map_err(|e| FilterError::from(format!("invalid API key header value: {e}")))?;
         Ok(Self {
-            connector: SubRequestConnector::new(4, None),
+            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
             timeout: Duration::from_millis(config.timeout_ms),
             provider: config.provider,
             api_key: config.api_key.clone(),
@@ -132,7 +132,7 @@ impl SearchClient {
     /// Execute a search request and map the result to a
     /// [`SearchOutcome`].
     async fn execute_search(&self, url: &str, mut request: SubRequest) -> SearchOutcome {
-        let (target, uri) = match subrequest::parse_url(url) {
+        let (peer, uri) = match subrequest::resolve_url(url).await {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(provider = self.provider.as_str(), error = %e, "search URL parse failed");
@@ -142,19 +142,15 @@ impl SearchClient {
 
         request.uri = uri;
 
-        let result = subrequest::execute(
-            &self.connector,
-            &target,
-            &request,
-            MAX_SEARCH_RESPONSE_BYTES,
-            self.timeout,
-        )
-        .await;
+        let result = self
+            .client
+            .execute(&peer, &request, MAX_SEARCH_RESPONSE_BYTES, self.timeout, None)
+            .await;
         self.map_search_result(result)
     }
 
     /// Map a sub-request result to a [`SearchOutcome`].
-    fn map_search_result(&self, result: Result<SubResponse, subrequest::SubRequestError>) -> SearchOutcome {
+    fn map_search_result(&self, result: Result<SubResponse, SubRequestError>) -> SearchOutcome {
         match result {
             Ok(response) if (200..300).contains(&(response.status as usize)) => self.parse_response(&response.body),
             Ok(response) => {

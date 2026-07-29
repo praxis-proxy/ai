@@ -85,7 +85,7 @@ pub(crate) mod test_utils {
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
             response_headers_modified: false,
-            subrequest_connector: None,
+            subrequest_client: None,
             rewritten_path: None,
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,
