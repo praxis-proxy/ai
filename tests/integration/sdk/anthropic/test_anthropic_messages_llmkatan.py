@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "anthropic>=0.40",
+#     "httpx>=0.27",
 #     "pytest>=8.0",
 # ]
 # ///
@@ -18,7 +19,7 @@ Usage:
     uv run tests/integration/sdk/anthropic/test_anthropic_messages_llmkatan.py -s -v
 
 Environment variables:
-    LLM_KATAN_BASE_URL  llm-katan base URL (default: https://3-147-232-199.sslip.io)
+    LLM_KATAN_BASE_URL  llm-katan base URL (required; skips when unset)
     LLM_KATAN_API_KEY   llm-katan Anthropic API key (default: llm-katan-anthropic-key)
     LLM_KATAN_MODEL     model name (default: llm-katan-echo)
     PRAXIS_AI_BIN       path to praxis-ai binary (auto-detected if unset)
@@ -40,9 +41,7 @@ from anthropic import Anthropic
 # Configuration
 # ---------------------------------------------------------------------------
 
-LLM_KATAN_BASE_URL = os.environ.get(
-    "LLM_KATAN_BASE_URL", "https://3-147-232-199.sslip.io"
-)
+LLM_KATAN_BASE_URL = os.environ.get("LLM_KATAN_BASE_URL")
 LLM_KATAN_API_KEY = os.environ.get(
     "LLM_KATAN_API_KEY", "llm-katan-anthropic-key"
 )
@@ -75,23 +74,20 @@ def _find_binary() -> str:
     )
 
 
-def _llm_katan_endpoint() -> str:
+def _parse_llm_katan_url() -> tuple[str, int, bool]:
+    """Parse LLM_KATAN_BASE_URL into (host, port, uses_tls)."""
     parsed = urlparse(LLM_KATAN_BASE_URL)
-    host = parsed.hostname or "3-147-232-199.sslip.io"
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    return f"{host}:{port}"
-
-
-def _llm_katan_host() -> str:
-    parsed = urlparse(LLM_KATAN_BASE_URL)
-    return parsed.hostname or "3-147-232-199.sslip.io"
+    tls = parsed.scheme == "https"
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if tls else 80)
+    return host, port, tls
 
 
 def _llm_katan_reachable() -> bool:
+    if not LLM_KATAN_BASE_URL:
+        return False
     try:
-        parsed = urlparse(LLM_KATAN_BASE_URL)
-        host = parsed.hostname or "3-147-232-199.sslip.io"
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        host, port, _ = _parse_llm_katan_url()
         with socket.create_connection((host, port), timeout=5):
             return True
     except OSError:
@@ -99,6 +95,12 @@ def _llm_katan_reachable() -> bool:
 
 
 def _write_config(proxy_port: int) -> str:
+    host, port, tls = _parse_llm_katan_url()
+    tls_block = f"""
+            tls:
+              sni: "{host}" """ if tls else ""
+    # Inline config: no matching example config exists for the
+    # format+validate+protocol+token_count pipeline used here.
     config = f"""\
 listeners:
   - name: test
@@ -124,9 +126,7 @@ filter_chains:
         clusters:
           - name: llm-katan
             endpoints:
-              - "{_llm_katan_endpoint()}"
-            tls:
-              sni: "{_llm_katan_host()}"
+              - "{host}:{port}"{tls_block}
 """
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
@@ -153,6 +153,8 @@ def _wait_for_proxy(port: int, timeout: float = 30.0) -> None:
 @pytest.fixture(scope="session")
 def praxis_proxy(tmp_path_factory, request):
     """Start a Praxis proxy backed by llm-katan for the test session."""
+    if not LLM_KATAN_BASE_URL:
+        pytest.skip("LLM_KATAN_BASE_URL not set — skipping")
     if not _llm_katan_reachable():
         pytest.skip(
             f"llm-katan not reachable at {LLM_KATAN_BASE_URL} — skipping"
@@ -304,6 +306,30 @@ class TestAnthropicMessagesLLMKatan:
         )
         assert response.usage.output_tokens > 0, (
             f"output_tokens should be > 0; got {response.usage.output_tokens}"
+        )
+
+
+    def test_malformed_json_rejected(self, anthropic_client, praxis_proxy):
+        """Verify anthropic_validate rejects malformed JSON end-to-end."""
+        import httpx
+
+        resp = httpx.post(
+            f"http://127.0.0.1:{praxis_proxy}/v1/messages",
+            content=b"not json {{{",
+            headers={
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": LLM_KATAN_API_KEY,
+            },
+            timeout=30,
+        )
+
+        assert resp.status_code == 400, (
+            f"malformed JSON should be rejected with 400; got {resp.status_code}"
+        )
+        body = resp.json()
+        assert body["error"]["type"] == "invalid_request_error", (
+            f"error type should be invalid_request_error; got {body}"
         )
 
 
