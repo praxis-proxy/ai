@@ -145,7 +145,7 @@ impl HttpFilter for AiGuardrailsFilter {
 // -----------------------------------------------------------------------------
 
 /// Record the provider verdict in `ctx.filter_results`
-// and map it to the corresponding [`FilterAction`].
+/// and map it to the corresponding [`FilterAction`].
 fn record_verdict(ctx: &mut HttpFilterContext<'_>, result: GuardResult) -> Result<FilterAction, FilterError> {
     // Capture label before consuming `result` in the match.
     let verdict = result.status_label();

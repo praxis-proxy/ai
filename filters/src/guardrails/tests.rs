@@ -31,7 +31,8 @@ fn as_rejection(action: praxis_filter::FilterAction) -> praxis_filter::Rejection
         praxis_filter::FilterAction::Reject(rejection) => Some(rejection),
         praxis_filter::FilterAction::Continue
         | praxis_filter::FilterAction::Release
-        | praxis_filter::FilterAction::BodyDone => None,
+        | praxis_filter::FilterAction::BodyDone
+        | praxis_filter::FilterAction::TerminalResponse(_) => None,
     }
     .unwrap()
 }

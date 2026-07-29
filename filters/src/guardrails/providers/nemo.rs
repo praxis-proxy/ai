@@ -159,8 +159,8 @@ fn ensure_success_status(response: &reqwest::Response) -> Result<(), FilterError
     Ok(())
 }
 
-/// Read the response body incrementally, aborting as soon as the running total exceeds [`MAX_RESPONSE_SIZE`],
-///  before any body bytes are read.
+/// Read the response body incrementally, aborting as soon as the
+/// running total exceeds [`MAX_RESPONSE_SIZE`].
 async fn read_response_body(response: reqwest::Response) -> Result<Bytes, FilterError> {
     let mut stream = response.bytes_stream();
     let mut body = BytesMut::new();
