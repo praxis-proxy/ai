@@ -134,6 +134,8 @@ New capabilities require:
 - `apis/src/openai/` — OpenAI Responses, Conversations,
   SSE, model rewrite, store, rehydrate, validate, proxy
 - `apis/src/classifier/` — AI request format detection
+- `apis/src/json_body.rs` — Shared JSON body mutation
+  helper (serialize, replace, Content-Length fixup)
 - `apis/src/store/` — ResponseStore trait, SQLite/Postgres
 - `filters/src/agentic/` — A2A, MCP protocol filters
 - `filters/src/guardrails/` — AI content safety (NeMo)
