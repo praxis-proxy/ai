@@ -35,7 +35,7 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 | `headers.protocol_version` | string | no | Header name for the MCP protocol version (e.g. `x-praxis-mcp-protocol-version`). |
 | `headers.session_present` | string | no | Header name for MCP session presence (e.g. `x-praxis-mcp-session-present`). |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer`. |
-| `on_invalid` | `continue` \| `reject` \| `error` | no | Invalid input handling behavior. |
+| `on_invalid` | OnInvalidBehavior | no | Invalid input handling behavior. |
 | `cache_scope` | `public` \| `private` | no | Cache scope for stateless responses. Requires `protocol_profile: stateless`. |
 | `cache_ttl_ms` | integer | no | Cache TTL in milliseconds for stateless responses. Requires `protocol_profile: stateless`. |
 | `default_version` | string | no | Fallback MCP protocol version. When omitted, derived from the profile. |

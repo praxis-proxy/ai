@@ -23,7 +23,7 @@ When `task_routing.enabled` is true, the filter captures task and context owners
 | `headers.version` | string | no | Header name for A2A version (e.g. `x-praxis-a2a-version`). |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer`. |
 | `method_aliases` | object<string, string> | no | Method aliases for compatibility (slash-delimited → `PascalCase`). |
-| `on_invalid` | `continue` \| `reject` \| `error` | no | Invalid input handling behavior. |
+| `on_invalid` | OnInvalidBehavior | no | Invalid input handling behavior. |
 | `task_routing` | TaskRoutingConfig | no | Task-ownership routing configuration. |
 | `task_routing.enabled` | bool | no | Whether task routing is enabled. |
 | `task_routing.max_response_body_bytes` | integer | no | Maximum response body bytes to buffer for task route capture. |
