@@ -412,7 +412,7 @@ pub(super) fn sha256_hex(content: &[u8]) -> String {
     let digest = Sha256::digest(content);
     let mut hex = String::with_capacity(64);
     for byte in digest {
-        use std::fmt::Write;
+        use std::fmt::Write as _;
         write!(hex, "{byte:02x}").unwrap();
     }
     hex
