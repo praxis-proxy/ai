@@ -25,10 +25,13 @@ use super::{
 
 /// TLS mode for `PostgreSQL` connections.
 ///
-/// Maps to [`PgSslMode`] from sqlx. Defaults to [`Prefer`] which
-/// attempts TLS but falls back to plaintext if the server does not
-/// support it.
+/// Maps to [`PgSslMode`] from sqlx. Defaults to [`VerifyFull`] which
+/// requires TLS and verifies both the server certificate chain and
+/// hostname. Use [`Disable`] or [`Prefer`] only for local development
+/// with an explicit opt-in.
 ///
+/// [`VerifyFull`]: SslMode::VerifyFull
+/// [`Disable`]: SslMode::Disable
 /// [`Prefer`]: SslMode::Prefer
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -37,7 +40,6 @@ pub enum SslMode {
     Disable,
 
     /// Attempt TLS, fall back to plaintext.
-    #[default]
     Prefer,
 
     /// Require TLS (reject plaintext).
@@ -47,6 +49,7 @@ pub enum SslMode {
     VerifyCa,
 
     /// Require TLS and verify both certificate chain and hostname.
+    #[default]
     VerifyFull,
 }
 
@@ -91,8 +94,9 @@ impl PostgresResponseStore {
     /// `items_table`, when provided, enables the conversation items
     /// table for storing individual conversation entries.
     ///
-    /// `ssl_mode`, when provided, overrides any `sslmode` in the
-    /// URL. Use [`SslMode::VerifyCa`] or [`SslMode::VerifyFull`]
+    /// `ssl_mode` always overrides any `sslmode` in the URL —
+    /// explicitly when provided, or with the [`SslMode::VerifyFull`]
+    /// default when omitted. Use [`SslMode::VerifyCa`] or [`SslMode::VerifyFull`]
     /// with `ssl_root_cert` to verify the server against a custom
     /// CA. Certificate path existence is validated at connection
     /// time, not at construction.
@@ -212,6 +216,10 @@ impl PostgresResponseStore {
 }
 
 /// Build `PostgreSQL` connection options from URL and optional TLS overrides.
+///
+/// Always applies an SSL mode: the explicit override when provided,
+/// otherwise [`SslMode::VerifyFull`]. This overrides any `sslmode`
+/// embedded in the URL to ensure TLS-verified connections by default.
 fn pg_connect_options(
     database_url: &str,
     ssl_mode: Option<SslMode>,
@@ -221,9 +229,8 @@ fn pg_connect_options(
         .parse()
         .map_err(|e: sqlx::Error| StoreError::Database(e.to_string()))?;
 
-    if let Some(mode) = ssl_mode {
-        options = options.ssl_mode(PgSslMode::from(mode));
-    }
+    let effective_mode = ssl_mode.unwrap_or_default();
+    options = options.ssl_mode(PgSslMode::from(effective_mode));
 
     if let Some(cert_path) = ssl_root_cert {
         options = options.ssl_root_cert(Path::new(cert_path));
@@ -708,13 +715,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connect_options_preserves_url_sslmode_without_override() {
-        let options = pg_connect_options("postgres://user:pass@example.com/db?sslmode=verify-full", None, None)
+    fn connect_options_defaults_to_verify_full() {
+        let options = pg_connect_options("postgres://user:pass@example.com/db", None, None)
+            .expect("URL without sslmode should parse");
+
+        assert!(
+            matches!(options.get_ssl_mode(), PgSslMode::VerifyFull),
+            "default ssl_mode should be VerifyFull"
+        );
+    }
+
+    #[test]
+    fn connect_options_default_overrides_url_sslmode() {
+        let options = pg_connect_options("postgres://user:pass@example.com/db?sslmode=prefer", None, None)
             .expect("URL with sslmode should parse");
 
         assert!(
             matches!(options.get_ssl_mode(), PgSslMode::VerifyFull),
-            "URL sslmode should be preserved"
+            "default VerifyFull should override URL sslmode"
         );
     }
 

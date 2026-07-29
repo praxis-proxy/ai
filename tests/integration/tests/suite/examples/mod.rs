@@ -32,6 +32,7 @@ mod prompt_enrichment;
 mod rehydrate;
 mod responses_routing;
 mod session_replay;
+mod time_to_first_token;
 mod token_count;
 mod token_counting;
 mod token_usage_headers;

@@ -388,7 +388,7 @@ impl FilesApiClient {
         request_headers: &http::HeaderMap,
         max_content_bytes: usize,
         max_resolved_bytes: usize,
-    ) -> Result<Vec<u8>, ResolveError> {
+    ) -> Result<bytes::Bytes, ResolveError> {
         let url = self
             .client
             .resource_url(FILES_PATH_PREFIX, file_id, Some("content"))
@@ -834,10 +834,11 @@ mod tests {
         net::TcpListener,
     };
 
-    use praxis_core::callout::{CalloutConfig, FailureMode};
-
     use super::*;
-    use crate::openai::api_client::{ApiClient, ApiClientConfig};
+    use crate::{
+        openai::api_client::{ApiClient, ApiClientConfig},
+        subrequest::SubRequestConnector,
+    };
 
     #[test]
     fn infer_mime_pdf() {
@@ -970,14 +971,11 @@ mod tests {
     fn test_api_client(api_base_url: &str, timeout_ms: u64) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: api_base_url.to_owned(),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms,
-                ..CalloutConfig::default()
-            },
+            connector: SubRequestConnector::new(4, None),
+            timeout: std::time::Duration::from_millis(timeout_ms),
+            max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
         })
-        .unwrap()
     }
 
     fn test_client(api_base_url: &str) -> FilesApiClient {

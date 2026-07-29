@@ -1563,6 +1563,15 @@ fn pg_unique_suffix() -> String {
 }
 
 #[test]
+fn pg_ssl_mode_defaults_to_verify_full() {
+    let mode = SslMode::default();
+    assert!(
+        matches!(mode, SslMode::VerifyFull),
+        "SslMode should default to VerifyFull"
+    );
+}
+
+#[test]
 fn pg_ssl_mode_deserializes_verified_modes() {
     let verify_ca: SslMode = serde_json::from_str("\"verify-ca\"").expect("verify-ca should deserialize");
     let verify_full: SslMode = serde_json::from_str("\"verify-full\"").expect("verify-full should deserialize");

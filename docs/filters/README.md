@@ -1,85 +1,57 @@
 # Filters
 
 Praxis AI registers AI-specific filters into the
-[Praxis filter pipeline][praxis-filters]. For the base
-filter system architecture (pipeline execution, filter
-traits, body access, conditional execution, filter
-chains), see the Praxis core filter documentation.
+[Praxis filter pipeline][praxis-filters]. The generated
+[filter reference](reference.md) is the authoritative inventory of filter
+names, descriptions, and configuration documentation.
 
-[praxis-filters]: https://github.com/praxis-proxy/praxis/tree/main/docs/filters
+For pipeline execution, filter traits, body access, conditional execution,
+filter chains, and core filters, see the Praxis core filter documentation.
 
-## AI Filter Categories
+## Organization
 
 AI filters are organized across two crates:
 
 ```text
-apis/src/                 Provider API filters
+apis/src/                 Provider API integrations
   anthropic/              Anthropic Messages API
-  openai/                 OpenAI Responses/Chat API
-  classifier/             Request classification
-  store/                  Response persistence
+  openai/                 OpenAI Responses and Conversations APIs
+  classifier/             Shared request classification
+  store/                  Response and conversation persistence
+  token_usage/            Provider token-usage parsing
 
-filters/src/              Cross-provider filters
-  agentic/                MCP, A2A, JSON-RPC
+filters/src/              Cross-provider behavior
+  agentic/                MCP and A2A
   guardrails/             AI content guardrails
-  inference/              Model routing, credentials
+  inference/              Model routing
   prompt_enrich/          Prompt injection
-  token_usage/            Token counting and token headers
+  token_usage/            Token counting and headers
 ```
 
-### Provider APIs (`praxis-ai-apis`)
-
-| Filter | Description |
-|--------|-------------|
-| `anthropic_messages_format` | Classifies Anthropic Messages API requests |
-| `anthropic_messages_protocol` | Normalizes Anthropic protocol headers |
-| `anthropic_stream_events` | SSE format translation (OpenAI / Anthropic) |
-| `anthropic_to_openai` | Anthropic-to-Chat Completions body translation |
-| `anthropic_validate` | Anthropic request envelope validation |
-| `openai_responses_format` | Classifies Responses/Chat Completions requests |
-| `openai_responses_model_rewrite` | Rewrites `model` field in request bodies |
-| `openai_responses_validate` | Validates and enriches Responses API requests |
-| `openai_responses_rehydrate` | Fetches stored responses for conversation context |
-| `openai_response_store` | Persists responses to storage backend |
-| `openai_conversations` | Handles `/v1/conversations` endpoints |
-| `openai_responses_proxy` | Rebuilds request body from `ResponsesState` |
-
-### Cross-Provider Filters (`praxis-ai-filters`)
-
-| Filter | Description |
-|--------|-------------|
-| `a2a` | A2A protocol metadata extraction |
-| `mcp` | MCP protocol broker and routing |
-| `json_rpc` | JSON-RPC 2.0 envelope parsing |
-| `ai_guardrails` | External guardrail provider integration |
-| `model_to_header` | Promotes `model` body field to header |
-| `prompt_enrich` | Injects messages into chat completions |
-| `token_count` | Extracts token counts from provider responses |
-| `token_usage_headers` | Token count response headers |
+Praxis AI also inherits all base proxy filters from Praxis core through
+`FilterRegistry::with_builtins()`. This includes routing, load balancing,
+headers, credential injection, JSON-RPC parsing, CORS, compression, IP ACLs,
+and other general proxy behavior. Those filters are intentionally documented
+in the [Praxis core filter reference][praxis-filters], not duplicated here.
 
 ## Registration
 
-AI filters are registered at startup in
-`server/src/lib.rs` via the `register_ai_filters`
-function. This adds them to the base `FilterRegistry`
-alongside Praxis core builtins:
+`server/src/lib.rs` builds the registry in three steps:
 
 ```rust
 let mut registry = FilterRegistry::with_builtins();
 register_ai_filters(&mut registry);
+register_external_filters(&mut registry);
 ```
 
-## Base Proxy Filters
+This keeps core filters, in-tree AI filters, and auto-discovered extensions at
+clear ownership boundaries.
 
-Praxis AI inherits all base proxy filters from Praxis
-core (router, load balancer, rate limiter, headers,
-CORS, IP ACL, guardrails, compression, etc.). These are
-included via `FilterRegistry::with_builtins()`. See the
-[Praxis core filter reference][praxis-filters] for their
-configuration.
+## Related documentation
 
-## Related
+- [Generated filter reference](reference.md)
+- [Feature overview](../features.md)
+- [Example configurations](../../examples/README.md)
+- [Writing extensions](extensions.md)
 
-- [Filter Reference](reference.md):
-  configuration for all AI filters
-- [Extensions](extensions.md): writing custom filters
+[praxis-filters]: https://github.com/praxis-proxy/praxis/tree/main/docs/filters

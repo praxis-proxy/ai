@@ -290,6 +290,79 @@ pub(super) struct OasdiffAreaReport {
 
     /// Global or inherited contract drift for this area.
     pub(super) inherited_details: Vec<String>,
+
+    /// Evidence-backed upstream discrepancies removed from actionable drift.
+    pub(super) exceptions: Vec<AppliedContractException>,
+}
+
+/// Contract-drift channel for one declared upstream exception.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(dead_code, reason = "the exception model supports every oasdiff drift channel")]
+pub(super) enum ContractDriftKind {
+    /// Global or inherited area drift.
+    Inherited,
+
+    /// Other operation-level drift.
+    Other,
+
+    /// Request parameter or body drift.
+    Request,
+
+    /// Response contract drift.
+    Response,
+}
+
+impl ContractDriftKind {
+    /// Stable report label.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+            Self::Other => "other",
+            Self::Inherited => "inherited",
+        }
+    }
+}
+
+/// Evidence-backed discrepancy declared by one API area.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ContractException {
+    /// Exact normalized `oasdiff` detail path.
+    pub(super) detail: &'static str,
+
+    /// Authoritative or live evidence for the discrepancy.
+    pub(super) evidence: &'static str,
+
+    /// Drift channel containing the exact detail.
+    pub(super) kind: ContractDriftKind,
+
+    /// Uppercase HTTP method for operation exceptions.
+    pub(super) method: Option<&'static str>,
+
+    /// `OpenAPI` operation path for operation exceptions.
+    pub(super) path: Option<&'static str>,
+
+    /// Why Praxis intentionally preserves the runtime contract.
+    pub(super) rationale: &'static str,
+}
+
+/// Exception that matched the current pinned comparison.
+#[derive(Clone, Debug)]
+pub(super) struct AppliedContractException {
+    /// Exact normalized `oasdiff` detail path.
+    pub(super) detail: &'static str,
+
+    /// Authoritative or live evidence for the discrepancy.
+    pub(super) evidence: &'static str,
+
+    /// Drift channel containing the detail.
+    pub(super) kind: ContractDriftKind,
+
+    /// Operation for operation-level exceptions.
+    pub(super) operation: Option<OperationKey>,
+
+    /// Why Praxis intentionally preserves the runtime contract.
+    pub(super) rationale: &'static str,
 }
 
 impl OasdiffAreaReport {
