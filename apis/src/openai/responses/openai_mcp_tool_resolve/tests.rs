@@ -1685,3 +1685,146 @@ fn encode_function_name_lossy_collision_example() {
     let name_b = encode_function_name("my_server", "get");
     assert_eq!(name_a, name_b, "dots sanitized to underscores create identical names");
 }
+
+// =========================================================================
+// Duplicate server_label Rejection
+// =========================================================================
+
+#[test]
+fn duplicate_label_rejected() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+    ];
+    let err = check_duplicate_labels(&entries).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate server_label"),
+        "should report duplicate label: {err}"
+    );
+}
+
+#[test]
+fn duplicate_label_with_credentials_rejected() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_a"}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_b"}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_err(),
+        "credentialed duplicates must be rejected"
+    );
+}
+
+#[test]
+fn duplicate_label_different_urls_rejected() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_err(),
+        "same label with different URLs must be rejected"
+    );
+}
+
+#[test]
+fn distinct_labels_accepted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    assert!(check_duplicate_labels(&entries).is_ok(), "distinct labels should pass");
+}
+
+#[test]
+fn duplicate_label_connector_id_not_counted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "s", "connector_id": "conn_1"}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_ok(),
+        "connector_id entries are not resolvable and should not trigger duplicate check"
+    );
+}
+
+#[test]
+fn duplicate_label_deferred_not_counted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.2/mcp", "defer_loading": true}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_ok(),
+        "deferred entries are not resolvable and should not trigger duplicate check"
+    );
+}
+
+#[test]
+fn duplicate_label_empty_entries_accepted() {
+    let entries: Vec<serde_json::Value> = Vec::new();
+    assert!(check_duplicate_labels(&entries).is_ok(), "empty entries should pass");
+}
+
+#[test]
+fn duplicate_label_single_entry_accepted() {
+    let entries = vec![serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"})];
+    assert!(check_duplicate_labels(&entries).is_ok(), "single entry should pass");
+}
+
+#[test]
+fn duplicate_label_all_non_resolvable_accepted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "connector_id": "conn_1"}),
+        serde_json::json!({"server_label": "s", "connector_id": "conn_2"}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_ok(),
+        "all non-resolvable entries should pass"
+    );
+}
+
+#[test]
+fn duplicate_label_reports_offending_label() {
+    let entries = vec![
+        serde_json::json!({"server_label": "my_srv", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "my_srv", "server_url": "http://10.0.0.1/mcp"}),
+    ];
+    let err = check_duplicate_labels(&entries).unwrap_err();
+    assert!(
+        err.to_string().contains("my_srv"),
+        "error should name the duplicate label: {err}"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_label_entries_rejected_at_filter_level() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [
+            {"type": "mcp", "server_label": "s", "server_url": "http://10.0.0.5/mcp", "authorization": "tok_a"},
+            {"type": "mcp", "server_label": "s", "server_url": "http://10.0.0.5/mcp", "authorization": "tok_b"}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(
+        rejection.status, 400,
+        "duplicate labels must be a 400 client error, not 502"
+    );
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(
+        body_str.contains("duplicate server_label"),
+        "response body should mention the duplicate: {body_str}"
+    );
+}
