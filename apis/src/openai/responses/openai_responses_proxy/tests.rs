@@ -140,6 +140,35 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
 }
 
 #[tokio::test]
+async fn rebuild_preserves_provider_previous_response_id_without_rehydrate() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request_body = json!({
+        "model": "gpt-4.1",
+        "input": "continue",
+        "previous_response_id": "resp_provider"
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.messages.push(json!({
+        "type": "function_call_output",
+        "call_id": "file_search_1",
+        "output": "search context"
+    }));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_provider"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["previous_response_id"], "resp_provider");
+    assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn rebuild_serializes_from_state_request_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");

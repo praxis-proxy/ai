@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use super::client::MAX_CONCURRENT_SEARCHES;
 use crate::{
     openai::api_client::{self, ApiClient, ApiClientConfig},
-    subrequest::SubRequestConnector,
+    subrequest::SubRequestClient,
 };
 
 // -----------------------------------------------------------------------------
@@ -30,6 +30,12 @@ const MAX_RESPONSE_BYTES: usize = MAX_JSON_BODY_BYTES;
 
 /// Maximum successful wire bytes retained across one execution: 64 MiB.
 const MAX_TOTAL_RESPONSE_BYTES: usize = MAX_JSON_BODY_BYTES;
+
+/// Default maximum combined router and file-search continuation state: 50 MiB.
+const DEFAULT_MAX_STATE_BYTES: usize = 52_428_800;
+
+/// Maximum combined continuation state: 256 MiB.
+const MAX_STATE_BYTES: usize = 268_435_456;
 
 /// Maximum callout timeout: 60 seconds.
 const MAX_TIMEOUT_MS: u64 = 60_000;
@@ -88,6 +94,11 @@ pub(crate) struct FileSearchFilterConfig {
     /// Maximum cumulative successful response bytes per filter execution.
     pub max_total_response_bytes: Option<usize>,
 
+    /// Maximum combined iterative-router and file-search continuation bytes.
+    ///
+    /// Configure the same value on the enclosing `iterative_request_router`.
+    pub max_state_bytes: Option<usize>,
+
     /// Behaviour when a vector-store callout fails.
     ///
     /// Named `on_error` because `parse_filter_config` strips
@@ -128,6 +139,9 @@ pub(crate) struct ValidatedConfig {
     /// Maximum cumulative successful response bytes.
     pub max_total_response_bytes: usize,
 
+    /// Maximum combined iterative-router and file-search continuation bytes.
+    pub max_state_bytes: usize,
+
     /// Whole-call timeout.
     pub timeout: Duration,
 }
@@ -151,6 +165,7 @@ pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConf
     let on_error = cfg.on_error.unwrap_or(OnError::Reject);
     let (max_response_bytes, max_total_response_bytes) =
         response_limits(cfg.max_response_bytes, cfg.max_total_response_bytes)?;
+    let max_state_bytes = validated_state_limit(cfg.max_state_bytes)?;
     let timeout_ms = validated_timeout(cfg.timeout_ms)?;
 
     let api_client = build_api_client(
@@ -166,6 +181,7 @@ pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConf
         on_error,
         max_response_bytes,
         max_total_response_bytes,
+        max_state_bytes,
         timeout: Duration::from_millis(timeout_ms),
     })
 }
@@ -174,7 +190,19 @@ pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConf
 // Private helpers
 // -----------------------------------------------------------------------------
 
-/// Build the shared API client with a dedicated Pingora connector.
+/// Resolve and validate the combined continuation-state limit.
+fn validated_state_limit(configured: Option<usize>) -> Result<usize, FilterError> {
+    let limit = configured.unwrap_or(DEFAULT_MAX_STATE_BYTES);
+    if limit == 0 {
+        return Err("openai_file_search_callout: max_state_bytes must be greater than 0".into());
+    }
+    if limit > MAX_STATE_BYTES {
+        return Err(format!("openai_file_search_callout: max_state_bytes must not exceed {MAX_STATE_BYTES}").into());
+    }
+    Ok(limit)
+}
+
+/// Build the shared API client with a dedicated sub-request client.
 fn build_api_client(
     vector_store_url: &Url,
     has_authorization: bool,
@@ -183,7 +211,7 @@ fn build_api_client(
 ) -> ApiClient {
     ApiClient::new(ApiClientConfig {
         api_base_url: vector_store_url.as_str().to_owned(),
-        connector: SubRequestConnector::new(4, None),
+        client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
         timeout: Duration::from_millis(timeout_ms),
         max_response_bytes,
         forward_header_names: if has_authorization {

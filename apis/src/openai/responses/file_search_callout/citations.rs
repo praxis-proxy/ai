@@ -218,10 +218,6 @@ fn record_valid_marker(
 /// Replace citation markers in every assistant output-text part.
 ///
 /// Returns whether the response was modified.
-#[expect(
-    dead_code,
-    reason = "consumed when core continuation returns the final inference response"
-)]
 pub(crate) fn annotate_response(
     response: &mut Value,
     citation_files: &HashMap<String, String>,

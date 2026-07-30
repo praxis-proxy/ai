@@ -14,7 +14,9 @@ use praxis_protocol::ListenerPipelines;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+#[cfg(test)]
 use crate::pipelines::resolve_pipelines;
+use crate::pipelines::resolve_pipelines_with_client;
 
 // -----------------------------------------------------------------------------
 // Reload
@@ -31,13 +33,42 @@ use crate::pipelines::resolve_pipelines;
 ///
 /// Returns an error if the new config fails validation or pipeline
 /// construction. The running server is unaffected.
+#[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "test wrapper mirrors reload inputs")]
+pub(crate) fn reload_pipelines(
+    new_config: &Config,
+    old_config: &Config,
+    registry: &FilterRegistry,
+    live: &ListenerPipelines,
+    health_shutdown: &Arc<Mutex<CancellationToken>>,
+    kv_stores: &praxis_core::kv::KvStoreRegistry,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let pool_size = new_config
+        .runtime
+        .subrequest_pool_size
+        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
+    let client = praxis_core::subrequest::SubRequestClient::new(
+        praxis_core::subrequest::SubRequestConnector::new(pool_size, new_config.runtime.subrequest_max_connections),
+    );
+    reload_pipelines_with_client(
+        new_config,
+        old_config,
+        registry,
+        live,
+        health_shutdown,
+        kv_stores,
+        &client,
+    )
+}
+
+/// Reload pipelines while retaining the server-owned subrequest client.
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::cognitive_complexity,
     reason = "orchestration function"
 )]
-pub(crate) fn reload_pipelines(
+pub(crate) fn reload_pipelines_with_client(
     new_config: &Config,
     old_config: &Config,
     registry: &FilterRegistry,
@@ -149,7 +180,25 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_protocol_changes(old, new);
     detect_compression_additions(old, new);
     detect_tls_toggles(old, new);
-    detect_subrequest_connector_changes(old, new);
+    detect_subrequest_client_changes(old, new);
+}
+
+/// Detect connector settings that cannot change without rebuilding the server.
+fn detect_subrequest_client_changes(old: &Config, new: &Config) {
+    if old.runtime.subrequest_max_connections != new.runtime.subrequest_max_connections {
+        warn!(
+            old = ?old.runtime.subrequest_max_connections,
+            new = ?new.runtime.subrequest_max_connections,
+            "runtime.subrequest_max_connections changed; requires restart (connector is shared and created at startup)"
+        );
+    }
+    if old.runtime.subrequest_pool_size != new.runtime.subrequest_pool_size {
+        warn!(
+            old = ?old.runtime.subrequest_pool_size,
+            new = ?new.runtime.subrequest_pool_size,
+            "runtime.subrequest_pool_size changed; requires restart (connector is shared and created at startup)"
+        );
+    }
 }
 
 /// Detect listener additions, removals, and address rebinds.
@@ -261,24 +310,6 @@ fn detect_tls_toggles(old: &Config, new: &Config) {
     }
 }
 
-/// Detect changes to sub-request connector parameters.
-fn detect_subrequest_connector_changes(old: &Config, new: &Config) {
-    if old.runtime.subrequest_pool_size != new.runtime.subrequest_pool_size {
-        warn!(
-            old_pool_size = ?old.runtime.subrequest_pool_size,
-            new_pool_size = ?new.runtime.subrequest_pool_size,
-            "subrequest pool size changed; requires restart"
-        );
-    }
-    if old.runtime.subrequest_max_connections != new.runtime.subrequest_max_connections {
-        warn!(
-            old_max = ?old.runtime.subrequest_max_connections,
-            new_max = ?new.runtime.subrequest_max_connections,
-            "subrequest max connections changed; requires restart"
-        );
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Stateful Filter Warnings
 // -----------------------------------------------------------------------------
@@ -338,7 +369,6 @@ mod tests {
             &live,
             &shutdown,
             &empty_kv_stores(),
-            &test_client(),
         );
 
         assert!(result.is_ok(), "valid reload should succeed");
@@ -372,7 +402,6 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
-            &test_client(),
         );
         assert!(result.is_err(), "invalid filter should return Err");
 
@@ -393,7 +422,6 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
-            &test_client(),
         )
         .unwrap();
 
@@ -416,7 +444,6 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
-            &test_client(),
         )
         .unwrap();
 
@@ -454,7 +481,6 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
-            &test_client(),
         );
         assert!(
             !old_token.is_cancelled(),
@@ -491,7 +517,6 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
-            &test_client(),
         );
         assert!(result.is_ok(), "reload with new listener should succeed");
         assert!(
@@ -617,19 +642,27 @@ filter_chains:
     }
 
     #[test]
-    fn no_restart_required_no_warnings() {
+    fn subrequest_max_connections_change_detected() {
         let old = valid_config();
-        let new = valid_config();
-        log_restart_required_changes(&old, &new);
+        let mut new = valid_config();
+        new.runtime.subrequest_max_connections = Some(64);
+
+        detect_subrequest_client_changes(&old, &new);
     }
 
     #[test]
-    fn subrequest_connector_change_detected() {
+    fn subrequest_pool_size_change_detected() {
         let old = valid_config();
         let mut new = valid_config();
-        new.runtime.subrequest_pool_size = Some(32);
-        new.runtime.subrequest_max_connections = Some(256);
+        new.runtime.subrequest_pool_size = Some(64);
 
+        detect_subrequest_client_changes(&old, &new);
+    }
+
+    #[test]
+    fn no_restart_required_no_warnings() {
+        let old = valid_config();
+        let new = valid_config();
         log_restart_required_changes(&old, &new);
     }
 
@@ -660,8 +693,7 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let health_registry: HealthRegistry = Arc::new(HashMap::new());
-        let pipelines =
-            resolve_pipelines(&config, &registry, &health_registry, &empty_kv_stores(), &test_client()).unwrap();
+        let pipelines = resolve_pipelines(&config, &registry, &health_registry, &empty_kv_stores()).unwrap();
         let shutdown = Arc::new(Mutex::new(CancellationToken::new()));
         (pipelines, config, registry, shutdown)
     }
@@ -669,10 +701,5 @@ filter_chains:
     /// Empty KV store registry for tests without KV stores.
     fn empty_kv_stores() -> praxis_core::kv::KvStoreRegistry {
         praxis_core::kv::KvStoreRegistry::new()
-    }
-
-    /// Minimal sub-request client for tests.
-    fn test_client() -> praxis_core::subrequest::SubRequestClient {
-        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
     }
 }

@@ -26,10 +26,6 @@ pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 /// without affecting external callers.
 ///
 /// [`RequestExtensions`]: praxis_filter::RequestExtensions
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "fields used incrementally as more filters are ported")
-)]
 pub(crate) struct ResponsesState {
     /// Maps file IDs to filenames for citation annotation extraction.
     pub citation_files: HashMap<String, String>,
@@ -45,6 +41,12 @@ pub(crate) struct ResponsesState {
     /// Can be a string ID or an object with `id`. Controls which
     /// stored conversation this request belongs to.
     pub conversation: Option<serde_json::Value>,
+
+    /// Public output retained across local file-search inference rounds.
+    ///
+    /// This is request-local continuation state. Private search context stays
+    /// in [`Self::messages`] and is never exposed through Conversations.
+    pub file_search_output_items: Vec<serde_json::Value>,
 
     /// Additional fields to include in the response.
     ///
@@ -168,6 +170,7 @@ impl Default for ResponsesState {
             citation_files: HashMap::new(),
             context_management: None,
             conversation: None,
+            file_search_output_items: Vec::new(),
             include: Vec::new(),
             history_rehydrated: false,
             input: Vec::new(),
@@ -203,7 +206,6 @@ impl ResponsesState {
             .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
 
         let tools = extract_array_field(&body, "tools");
-
         Self {
             context_management: body.get("context_management").cloned(),
             conversation: body.get("conversation").cloned(),
@@ -249,6 +251,35 @@ impl ResponsesState {
             unreachable!("output was normalized to an array")
         };
         items
+    }
+
+    /// Saturating recursive sum for numeric token-usage fields.
+    pub(crate) fn merge_usage(&mut self, current: &serde_json::Value) {
+        merge_usage_value(&mut self.usage, current);
+    }
+}
+
+/// Merge one provider usage object into an accumulated response value.
+fn merge_usage_value(accumulated: &mut serde_json::Value, current: &serde_json::Value) {
+    match (accumulated, current) {
+        (serde_json::Value::Object(accumulated), serde_json::Value::Object(current)) => {
+            for (key, value) in current {
+                match accumulated.get_mut(key) {
+                    Some(existing) => merge_usage_value(existing, value),
+                    None => {
+                        accumulated.insert(key.clone(), value.clone());
+                    },
+                }
+            }
+        },
+        (serde_json::Value::Number(accumulated), serde_json::Value::Number(current)) => {
+            if let (Some(left), Some(right)) = (accumulated.as_u64(), current.as_u64()) {
+                *accumulated = serde_json::Number::from(left.saturating_add(right));
+            } else {
+                *accumulated = current.clone();
+            }
+        },
+        (accumulated, current) => current.clone_into(accumulated),
     }
 }
 

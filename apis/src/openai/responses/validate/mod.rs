@@ -30,7 +30,6 @@ use praxis_filter::{
 use tracing::{debug, trace};
 
 use super::error::responses_error_rejection;
-use crate::is_event_stream_content_type;
 
 // -----------------------------------------------------------------------------
 // OpenaiResponsesValidateFilter

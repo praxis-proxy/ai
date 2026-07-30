@@ -18,7 +18,7 @@ use praxis_protocol::{CertWatcherShutdowns, ListenerPipelines, Protocol as _, ht
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::pipelines::resolve_pipelines;
+use crate::pipelines::resolve_pipelines_with_client;
 
 // -----------------------------------------------------------------------------
 // Config Path Resolution
@@ -120,7 +120,7 @@ struct ServerState {
     pipelines: Arc<ListenerPipelines>,
     /// KV store registry.
     kv_stores: praxis_core::kv::KvStoreRegistry,
-    /// Shared sub-request client for filters and `iterative_request_router` step chains.
+    /// Shared sub-request client for iterative subrequests.
     subrequest_client: praxis_core::subrequest::SubRequestClient,
     /// Health check cancellation token.
     health_shutdown: Arc<Mutex<CancellationToken>>,
@@ -156,8 +156,9 @@ fn build_server_state(
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
-    let pipelines = resolve_pipelines(config, registry, health_registry, &kv_stores, &subrequest_client)
-        .unwrap_or_else(|e| fatal(&e));
+    let pipelines =
+        resolve_pipelines_with_client(config, registry, health_registry, &kv_stores, &subrequest_client)
+            .unwrap_or_else(|e| fatal(&e));
 
     let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_health_check_tasks(config, Arc::clone(health_registry), &health_shutdown);

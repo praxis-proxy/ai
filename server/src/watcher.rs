@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::reload::reload_pipelines;
+use crate::reload::reload_pipelines_with_client;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -62,7 +62,7 @@ pub(crate) struct WatcherParams {
     /// Token for clean watcher shutdown.
     pub(crate) shutdown: CancellationToken,
 
-    /// Shared sub-request client, preserved across reloads.
+    /// Shared sub-request client retained across pipeline reloads.
     pub(crate) subrequest_client: praxis_core::subrequest::SubRequestClient,
 }
 
@@ -174,7 +174,7 @@ fn handle_reload(
         },
     };
 
-    match reload_pipelines(
+    match reload_pipelines_with_client(
         &new_config,
         current_config,
         registry,
@@ -295,10 +295,8 @@ mod tests {
         let registry = Arc::new(FilterRegistry::with_builtins());
         let health_registry = Arc::new(std::collections::HashMap::new());
         let kv_stores = praxis_core::kv::KvStoreRegistry::new();
-        let pipelines = Arc::new(
-            crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores, &test_client())
-                .unwrap(),
-        );
+        let pipelines =
+            Arc::new(crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores).unwrap());
         let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
         let shutdown = CancellationToken::new();
 
@@ -310,7 +308,9 @@ mod tests {
             pipelines,
             registry,
             shutdown: shutdown.clone(),
-            subrequest_client: test_client(),
+            subrequest_client: praxis_core::subrequest::SubRequestClient::new(
+                praxis_core::subrequest::SubRequestConnector::new(8, None),
+            ),
         });
 
         std::thread::sleep(Duration::from_millis(100));
@@ -329,10 +329,8 @@ mod tests {
         let registry = Arc::new(FilterRegistry::with_builtins());
         let health_registry = Arc::new(std::collections::HashMap::new());
         let kv_stores = praxis_core::kv::KvStoreRegistry::new();
-        let pipelines = Arc::new(
-            crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores, &test_client())
-                .unwrap(),
-        );
+        let pipelines =
+            Arc::new(crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores).unwrap());
         let old_ptr = Arc::as_ptr(&pipelines.get("web").unwrap().load());
         let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
         let shutdown = CancellationToken::new();
@@ -345,7 +343,9 @@ mod tests {
             pipelines: Arc::clone(&pipelines),
             registry: Arc::clone(&registry),
             shutdown: shutdown.clone(),
-            subrequest_client: test_client(),
+            subrequest_client: praxis_core::subrequest::SubRequestClient::new(
+                praxis_core::subrequest::SubRequestConnector::new(8, None),
+            ),
         });
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
@@ -372,10 +372,8 @@ mod tests {
         let registry = Arc::new(FilterRegistry::with_builtins());
         let health_registry = Arc::new(std::collections::HashMap::new());
         let kv_stores = praxis_core::kv::KvStoreRegistry::new();
-        let pipelines = Arc::new(
-            crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores, &test_client())
-                .unwrap(),
-        );
+        let pipelines =
+            Arc::new(crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores).unwrap());
         let old_ptr = Arc::as_ptr(&pipelines.get("web").unwrap().load());
         let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
         let shutdown = CancellationToken::new();
@@ -388,7 +386,9 @@ mod tests {
             pipelines: Arc::clone(&pipelines),
             registry: Arc::clone(&registry),
             shutdown: shutdown.clone(),
-            subrequest_client: test_client(),
+            subrequest_client: praxis_core::subrequest::SubRequestClient::new(
+                praxis_core::subrequest::SubRequestConnector::new(8, None),
+            ),
         });
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
@@ -445,10 +445,8 @@ mod tests {
         let registry = Arc::new(FilterRegistry::with_builtins());
         let health_registry = Arc::new(std::collections::HashMap::new());
         let kv_stores = praxis_core::kv::KvStoreRegistry::new();
-        let pipelines = Arc::new(
-            crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores, &test_client())
-                .unwrap(),
-        );
+        let pipelines =
+            Arc::new(crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores).unwrap());
         let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
         let shutdown = CancellationToken::new();
 
@@ -460,7 +458,9 @@ mod tests {
             pipelines,
             registry,
             shutdown: shutdown.clone(),
-            subrequest_client: test_client(),
+            subrequest_client: praxis_core::subrequest::SubRequestClient::new(
+                praxis_core::subrequest::SubRequestConnector::new(8, None),
+            ),
         });
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -509,11 +509,6 @@ mod tests {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.0).expect("failed to restore working directory");
         }
-    }
-
-    /// Minimal sub-request client for tests.
-    fn test_client() -> praxis_core::subrequest::SubRequestClient {
-        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
     }
 
     /// Valid YAML config for watcher tests.

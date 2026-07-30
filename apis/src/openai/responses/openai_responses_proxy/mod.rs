@@ -243,7 +243,8 @@ impl serde::Serialize for OutboundBody<'_> {
                     map.serialize_entry(name, &self.state.messages)?;
                     wrote_input = true;
                 },
-                "previous_response_id" | "conversation" => {},
+                "previous_response_id" if self.state.history_rehydrated => {},
+                "conversation" => {},
                 _ => map.serialize_entry(name, value)?,
             }
         }

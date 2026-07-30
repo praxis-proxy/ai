@@ -3,27 +3,35 @@
 
 //! OGX-backed file search execution for the OpenAI Responses API.
 //!
-//! The filter is registered and continuation-ready. On an ordinary first pass
-//! it is a no-op because response output items do not exist until inference has
-//! completed. A continuation or agentic-loop owner can re-enter the request
-//! phase with those items populated, at which point this filter executes a
-//! bounded set of pending `file_search_call` items and terminalizes any excess.
+//! The filter runs inside `iterative_request_router` so a model response that
+//! contains `file_search_call` output can trigger OGX search and another model
+//! inference within the same client request. Search context remains private to
+//! the model round trip; completed call items and citations are assembled into
+//! the final public Responses API object.
 
 pub(crate) mod citations;
 pub(crate) mod client;
 mod config;
 mod model_context;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use praxis_filter::{
-    FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
+use serde::{Deserialize, de::SeqAccess};
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use self::{
+    citations::annotate_response,
     client::{
         FileSearchClient, FileSearchClientConfig, MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES,
         SearchBatch, SearchFailure, SearchSpec, request_error,
@@ -55,18 +63,23 @@ const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 
 /// Executes pending file search calls against an OGX vector store API.
 ///
-/// First-pass requests remain unchanged until core continuation support can
-/// re-enter the request phase with pending file-search calls. Re-entered
-/// streaming requests are rejected because citation markers require an
-/// incremental SSE transformer. Search queries are forwarded to OGX unchanged;
-/// continuation context and citation marker formatting are internal.
+/// The enclosing iterative router owns model re-entry. Streaming requests are
+/// rejected because citation markers require an incremental SSE transformer.
+/// Search queries are forwarded to OGX unchanged; model context and citation
+/// marker formatting are internal.
 pub struct FileSearchCalloutFilter {
     /// Callout client for the vector store API.
     client: FileSearchClient,
 
+    /// Combined router and filter continuation-state ceiling.
+    max_state_bytes: usize,
+
     /// Whether a failed callout rejects or produces an incomplete result.
     on_error: OnError,
 }
+
+/// Request-local marker used to reject streaming before the first subrequest.
+struct StreamingRequest;
 
 impl FileSearchCalloutFilter {
     /// Create a filter from parsed YAML configuration.
@@ -89,6 +102,7 @@ impl FileSearchCalloutFilter {
 
         Ok(Box::new(Self {
             client,
+            max_state_bytes: validated.max_state_bytes,
             on_error: validated.on_error,
         }))
     }
@@ -98,7 +112,7 @@ impl FileSearchCalloutFilter {
     fn apply_batch(state: &mut ResponsesState, plan: &SearchPlan, batch: &SearchBatch) -> Result<(), FilterAction> {
         let failed_calls: HashSet<usize> = batch.failures.iter().map(|failure| failure.call_index).collect();
         let expose_results = state.include.iter().any(|value| value == "file_search_call.results");
-        let mut model_messages = Vec::with_capacity(plan.calls.len().saturating_mul(2));
+        let mut bridges = Vec::with_capacity(plan.calls.len());
         let mut remaining_model_bytes = MAX_TOTAL_MODEL_CONTEXT_BYTES;
         let response_identity_hash = state
             .response_object
@@ -154,7 +168,7 @@ impl FileSearchCalloutFilter {
                 }
 
                 if let Some(messages) = call_model_messages {
-                    model_messages.extend(messages);
+                    bridges.push((call.output_index, messages));
                 }
                 applied = true;
             }
@@ -172,7 +186,9 @@ impl FileSearchCalloutFilter {
                 false,
             )));
         }
-        state.messages.extend(model_messages);
+        state
+            .messages
+            .extend(continuation_replay_items(state.output_items(), bridges));
         Ok(())
     }
 
@@ -235,6 +251,143 @@ impl FileSearchCalloutFilter {
             false,
         )))
     }
+
+    /// Execute pending calls before the next inference body is serialized.
+    async fn execute_pending(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if let Some(rejection) = unsupported_streaming_rejection(ctx) {
+            return Ok(rejection);
+        }
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return Ok(FilterAction::Continue);
+        };
+
+        let plan = build_search_plan(state);
+        if !plan.has_pending_calls {
+            return Ok(FilterAction::Continue);
+        }
+
+        let batch = self.execute_plan(&plan).await;
+        if let Some(rejection) = self.failure_rejection(&batch) {
+            return Ok(rejection);
+        }
+
+        let framework_bytes = retained_iteration_bytes(ctx);
+        let state = ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .ok_or_else(|| -> FilterError { "openai_file_search_callout: ResponsesState disappeared".into() })?;
+        if let Err(rejection) = Self::apply_batch(state, &plan, &batch) {
+            return Ok(rejection);
+        }
+        if !continuation_state_fits(framework_bytes, state, self.max_state_bytes, 0) {
+            return Ok(continuation_state_rejection());
+        }
+
+        reset_tool_choice(state);
+        state.iteration = state.iteration.saturating_add(1);
+
+        Ok(FilterAction::Continue)
+    }
+
+    /// Capture a model response and expose whether another inference is needed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response state commit and final assembly are sequential"
+    )]
+    fn capture_response(
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        max_state_bytes: usize,
+    ) -> Result<FilterAction, FilterError> {
+        let is_success = ctx
+            .response_header
+            .as_deref()
+            .is_some_and(|response| response.status.is_success());
+        if !is_success {
+            return Ok(FilterAction::Continue);
+        }
+
+        let continued = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+            state.iteration != 0 || !state.file_search_output_items.is_empty() || !state.citation_files.is_empty()
+        });
+        let Some(bytes) = body.as_ref() else {
+            return Ok(invalid_success_response_action(continued));
+        };
+        let framework_bytes = retained_iteration_bytes(ctx);
+        let response_wire_bytes = bytes.len();
+        if let Some(state) = ctx.extensions.get::<ResponsesState>()
+            && !continuation_state_fits(
+                framework_bytes,
+                state,
+                max_state_bytes,
+                response_wire_bytes.saturating_mul(2),
+            )
+        {
+            return Ok(continuation_state_rejection());
+        }
+        let Ok(mut response) = serde_json::from_slice::<Value>(bytes) else {
+            return Ok(invalid_success_response_action(continued));
+        };
+        if !response.is_object() {
+            return Ok(invalid_success_response_action(continued));
+        }
+        let Some(output) = response.get("output").and_then(Value::as_array) else {
+            return Ok(invalid_success_response_action(continued));
+        };
+        if output.iter().any(is_pending_file_search_call) && has_client_function_call(output) {
+            return Ok(mixed_tool_response_rejection());
+        }
+
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            return Ok(FilterAction::Continue);
+        };
+        if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
+            state.merge_usage(usage);
+        }
+        if !state.usage.is_null()
+            && let Some(object) = response.as_object_mut()
+        {
+            object.insert("usage".to_owned(), state.usage.clone());
+        }
+        if !combined_output_fits(state, &response, MAX_JSON_BODY_BYTES) {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                "openai_file_search_callout: accumulated output exceeds the JSON response byte limit",
+                false,
+            )));
+        }
+        let completed_output = std::mem::take(state.output_items_mut());
+        state.file_search_output_items.extend(completed_output);
+        state.response_object = response;
+        if !continuation_state_fits(framework_bytes, state, max_state_bytes, response_wire_bytes) {
+            return Ok(continuation_state_rejection());
+        }
+
+        if remaining_file_search_call_budget(state) == 0 {
+            terminalize_all_pending_calls(state);
+        }
+        if state.output_items().iter().any(is_pending_file_search_call) {
+            ctx.filter_results
+                .entry("openai_file_search_callout")
+                .or_default()
+                .set("pending", "true")?;
+            return Ok(FilterAction::Continue);
+        }
+
+        let encoded = match finalize_public_response(state) {
+            Ok(encoded) => encoded,
+            Err(rejection) => return Ok(rejection),
+        };
+        clear_rewritten_response_headers(ctx);
+        *body = Some(encoded);
+        ctx.filter_results
+            .entry("openai_file_search_callout")
+            .or_default()
+            .set("pending", "false")?;
+
+        Ok(FilterAction::Continue)
+    }
 }
 
 #[async_trait]
@@ -243,40 +396,406 @@ impl HttpFilter for FileSearchCalloutFilter {
         "openai_file_search_callout"
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        }
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        }
+    }
+
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        let action = self.execute_pending(ctx).await?;
+        if matches!(action, FilterAction::Continue) {
+            preserve_original_request_headers(ctx);
+            ctx.request_headers_to_set.push((
+                http::header::ACCEPT_ENCODING,
+                http::HeaderValue::from_static("identity"),
+            ));
+        }
+        Ok(action)
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+        if let Some(rejection) = initialize_file_search_state(ctx, body, self.max_state_bytes) {
+            return Ok(rejection);
+        }
+        self.execute_pending(ctx).await
+    }
+
+    fn on_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+        Self::capture_response(ctx, body, self.max_state_bytes)
+    }
+}
+
+/// Restore end-to-end client headers after the iterative router isolates a
+/// transitioned step. Headers tied to the original wire representation or
+/// request identity cannot be replayed after the JSON body changes.
+fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
+    let Some(state) = ctx.extensions.get::<IterationState>() else {
+        return;
+    };
+    if state.iteration() == 0 {
+        return;
+    }
+    let headers = state
+        .original_request
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            should_replay_original_header(name) && !connection_nominates_header(&state.original_request.headers, name)
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    ctx.request_headers_to_set.extend(headers);
+}
+
+/// Whether `Connection` marks a request header as specific to one hop.
+fn connection_nominates_header(headers: &http::HeaderMap, name: &http::header::HeaderName) -> bool {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|token| token.eq_ignore_ascii_case(name.as_str()))
+}
+
+/// Whether a header remains valid after the continuation body is rewritten.
+fn should_replay_original_header(name: &http::header::HeaderName) -> bool {
+    !praxis_core::reserved_headers::is_reserved(name.as_str())
+        && !matches!(
+            name.as_str(),
+            "accept-encoding"
+                | "connection"
+                | "content-encoding"
+                | "content-length"
+                | "content-md5"
+                | "digest"
+                | "expect"
+                | "host"
+                | "idempotency-key"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "signature"
+                | "signature-input"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        )
+}
+
+/// Create file-search state inside the router after a bounded preflight.
+fn initialize_file_search_state(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    max_state_bytes: usize,
+) -> Option<FilterAction> {
+    let bytes = body.as_ref()?;
+    let probe = probe_request(bytes)?;
+    if probe.stream {
+        ctx.extensions.insert(StreamingRequest);
+    }
+    if ctx.extensions.get::<ResponsesState>().is_some() {
+        return None;
+    }
+    if !probe.tools.0 {
+        return None;
+    }
+    let framework_bytes = retained_iteration_bytes(ctx);
+    if framework_bytes.saturating_add(bytes.len().saturating_mul(4)) > max_state_bytes {
+        return Some(continuation_state_rejection());
+    }
+    let parsed = serde_json::from_slice::<Value>(bytes).ok()?;
+    let state = ResponsesState::from_request_body(parsed);
+    if !continuation_state_fits(framework_bytes, &state, max_state_bytes, 0) {
+        return Some(continuation_state_rejection());
+    }
+    ctx.extensions.insert(state);
+    None
+}
+
+/// Minimal root object used to detect hosted file search without retaining the
+/// full request for unrelated Responses calls.
+#[derive(Deserialize)]
+struct FileSearchRequestProbe {
+    /// Whether the client requested an SSE response.
+    #[serde(default)]
+    stream: bool,
+
+    /// Whether the request's tools array contains a file-search declaration.
+    #[serde(default)]
+    tools: FileSearchToolsProbe,
+}
+
+/// Allocation-free result of scanning the request's tools array.
+#[derive(Default)]
+struct FileSearchToolsProbe(bool);
+
+impl<'de> Deserialize<'de> for FileSearchToolsProbe {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Sequence visitor that remembers whether any tool declares file search.
+        struct ToolsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ToolsVisitor {
+            type Value = FileSearchToolsProbe;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an array of Responses API tools")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut declared = false;
+                while let Some(tool) = seq.next_element::<FileSearchToolProbe<'de>>()? {
+                    declared |= tool.kind.as_deref() == Some("file_search");
+                }
+                Ok(FileSearchToolsProbe(declared))
+            }
+        }
+
+        deserializer.deserialize_seq(ToolsVisitor)
+    }
+}
+
+/// Minimal borrowed view of one Responses API tool declaration.
+#[derive(Deserialize)]
+struct FileSearchToolProbe<'a> {
+    /// Hosted tool discriminator.
+    #[serde(borrow, default, rename = "type")]
+    kind: Option<Cow<'a, str>>,
+}
+
+/// Extract only the routing facts needed before retaining full request state.
+fn probe_request(bytes: &[u8]) -> Option<FileSearchRequestProbe> {
+    serde_json::from_slice(bytes).ok()
+}
+
+/// Framework-owned bytes already charged by the iterative router.
+fn retained_iteration_bytes(ctx: &HttpFilterContext<'_>) -> usize {
+    ctx.extensions
+        .get::<IterationState>()
+        .map_or(0, IterationState::retained_bytes)
+}
+
+/// Check framework-retained and filter-owned continuation payloads together.
+#[expect(
+    clippy::too_many_lines,
+    reason = "accounts each retained state field without allocation"
+)]
+fn continuation_state_fits(
+    framework_bytes: usize,
+    state: &ResponsesState,
+    max_bytes: usize,
+    incoming_bytes: usize,
+) -> bool {
+    let mut used = framework_bytes.saturating_add(incoming_bytes);
+    for value in [
+        &state.request_body,
+        &state.response_object,
+        &state.tool_choice,
+        &state.usage,
+    ] {
+        let Some(size) = bounded_json_size(value, max_bytes.saturating_sub(used)).ok().flatten() else {
+            return false;
         };
+        used = used.saturating_add(size);
+    }
+    for values in [
+        &state.file_search_output_items,
+        &state.input,
+        &state.messages,
+        &state.persisted_messages,
+        &state.previous_tools,
+        &state.tool_calls,
+        &state.tools,
+    ] {
+        let Some(size) = bounded_json_size(values, max_bytes.saturating_sub(used)).ok().flatten() else {
+            return false;
+        };
+        used = used.saturating_add(size);
+    }
+    for value in [
+        state.context_management.as_ref(),
+        state.conversation.as_ref(),
+        state.previous_usage.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(size) = bounded_json_size(value, max_bytes.saturating_sub(used)).ok().flatten() else {
+            return false;
+        };
+        used = used.saturating_add(size);
+    }
+    let string_bytes = state
+        .citation_files
+        .iter()
+        .map(|(key, value)| key.len().saturating_add(value.len()))
+        .chain(state.include.iter().map(String::len))
+        .chain(state.previous_response_id.iter().map(String::len))
+        .chain(
+            state
+                .mcp_tool_map
+                .iter()
+                .map(|((server, tool), _)| server.len().saturating_add(tool.len())),
+        )
+        .fold(0_usize, usize::saturating_add);
+    used = used.saturating_add(string_bytes);
+    for value in state.mcp_tool_map.values() {
+        let Some(size) = bounded_json_size(value, max_bytes.saturating_sub(used)).ok().flatten() else {
+            return false;
+        };
+        used = used.saturating_add(size);
+    }
+    used <= max_bytes
+}
 
-        if let Some(rejection) = unsupported_streaming_rejection(ctx, state) {
-            return Ok(rejection);
+/// Reject work whose request-local continuation state exceeds its ceiling.
+fn continuation_state_rejection() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "openai_file_search_callout: continuation state exceeds max_state_bytes",
+        false,
+    ))
+}
+
+/// Reject an invalid successful model response only after local continuation began.
+fn invalid_success_response_action(continued: bool) -> FilterAction {
+    if continued {
+        FilterAction::Reject(responses_error_rejection(
+            502,
+            "server_error",
+            "openai_file_search_callout: inference continuation returned an invalid response",
+            false,
+        ))
+    } else {
+        FilterAction::Continue
+    }
+}
+
+/// Assemble accumulated output and citations into a bounded public response.
+fn finalize_public_response(state: &mut ResponsesState) -> Result<Bytes, FilterAction> {
+    let final_output = std::mem::take(state.output_items_mut());
+    let mut combined_output = std::mem::take(&mut state.file_search_output_items);
+    combined_output.extend(final_output);
+    *state.output_items_mut() = combined_output;
+
+    annotate_response(&mut state.response_object, &state.citation_files).map_err(|error| {
+        warn!(%error, "failed to annotate final file-search response");
+        final_response_rejection("openai_file_search_callout: failed to annotate final response")
+    })?;
+    bounded_json_size(&state.response_object, MAX_JSON_BODY_BYTES)
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            final_response_rejection("openai_file_search_callout: final response exceeds the JSON response byte limit")
+        })?;
+    serde_json::to_vec(&state.response_object)
+        .map(Bytes::from)
+        .map_err(|error| {
+            warn!(%error, "failed to encode final file-search response");
+            final_response_rejection("openai_file_search_callout: failed to encode final response")
+        })
+}
+
+/// Build a consistent failure while assembling a model's final response.
+fn final_response_rejection(message: &str) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(502, "server_error", message, false))
+}
+
+/// Whether a model output requires a client-supplied function result.
+fn has_client_function_call(output: &[Value]) -> bool {
+    output
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+}
+
+/// Reject mixed tools until private search context can resume across requests.
+fn mixed_tool_response_rejection() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        "openai_file_search_callout: a model response cannot combine file_search_call with client-executed function_call",
+        false,
+    ))
+}
+
+/// Allow the model to answer after satisfying the first forced search call.
+fn reset_tool_choice(state: &mut ResponsesState) {
+    state.tool_choice = Value::String("auto".to_owned());
+    if let Some(request) = state.request_body.as_object_mut() {
+        request.remove("tool_choice");
+    }
+}
+
+/// Retain model-facing output and replace hosted calls with private bridges.
+fn continuation_replay_items(output: &[Value], bridges: Vec<(usize, [Value; 2])>) -> Vec<Value> {
+    let mut replay = Vec::with_capacity(output.len().saturating_add(bridges.len()));
+    let mut bridges = bridges.into_iter().peekable();
+    for (output_index, item) in output.iter().enumerate() {
+        let replay_item = matches!(item.get("type").and_then(Value::as_str), Some("reasoning"))
+            || (item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("assistant"));
+        if replay_item {
+            // The item remains public and must also enter the next request.
+            replay.push(item.clone());
         }
-
-        let plan = build_search_plan(state);
-        if !plan.has_pending_calls {
-            return Ok(FilterAction::Continue);
+        while bridges.peek().is_some_and(|(index, _)| *index == output_index) {
+            let Some((_index, messages)) = bridges.next() else {
+                break;
+            };
+            replay.extend(messages);
         }
+    }
+    replay
+}
 
-        debug!(
-            pending_calls = plan.calls.len(),
-            scheduled_searches = plan.spec_coordinates.len(),
-            "executing file search callouts"
-        );
-
-        let batch = self.execute_plan(&plan).await;
-        if let Some(rejection) = self.failure_rejection(&batch) {
-            return Ok(rejection);
-        }
-
-        let state = ctx
-            .extensions
-            .get_mut::<ResponsesState>()
-            .ok_or_else(|| -> FilterError { "openai_file_search_callout: ResponsesState disappeared".into() })?;
-        if let Err(rejection) = Self::apply_batch(state, &plan, &batch) {
-            return Ok(rejection);
-        }
-
-        Ok(FilterAction::Continue)
+/// Drop upstream representation metadata after replacing the response bytes.
+fn clear_rewritten_response_headers(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(response) = &mut ctx.response_header {
+        response.headers.remove(http::header::CONTENT_ENCODING);
+        response.headers.remove(http::header::CONTENT_LENGTH);
+        response.headers.remove(http::header::CONTENT_RANGE);
+        response.headers.remove(http::header::ETAG);
+        response.headers.remove(http::header::LAST_MODIFIED);
+        ctx.response_headers_modified = true;
     }
 }
 
@@ -535,13 +1054,33 @@ fn remaining_file_search_call_budget(state: &ResponsesState) -> usize {
         return MAX_PENDING_CALLS;
     };
     let used_calls = state
-        .output_items()
+        .file_search_output_items
         .iter()
+        .chain(state.output_items())
         .filter(|item| is_builtin_tool_call(item) && !is_pending_file_search_call(item))
         .count();
     usize::try_from(max_tool_calls)
         .unwrap_or(usize::MAX)
         .saturating_sub(used_calls)
+}
+
+/// Check all retained, current, and incoming output against one request budget.
+fn combined_output_fits(state: &ResponsesState, incoming_response: &Value, max_bytes: usize) -> bool {
+    let incoming_output = incoming_response
+        .get("output")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    bounded_json_size(
+        &(
+            state.file_search_output_items.as_slice(),
+            state.output_items(),
+            incoming_output,
+        ),
+        max_bytes,
+    )
+    .ok()
+    .flatten()
+    .is_some()
 }
 
 /// Return whether an output item is a provider-hosted built-in tool call.
@@ -701,17 +1240,17 @@ fn join_queries_bounded(queries: &[String]) -> (String, bool) {
     (joined, false)
 }
 
-/// Reject only a streaming continuation that is ready to execute file search.
-fn unsupported_streaming_rejection(ctx: &HttpFilterContext<'_>, state: &ResponsesState) -> Option<FilterAction> {
-    let streaming = ctx
-        .get_metadata("openai_responses_format.stream")
-        .is_some_and(|value| value == "true");
-    let pending = state.output_items().iter().any(is_pending_file_search_call);
-    (streaming && (pending || !state.citation_files.is_empty())).then(|| {
+/// Reject streaming before the iterative router can silently buffer SSE.
+fn unsupported_streaming_rejection(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
+    (ctx.extensions.get::<StreamingRequest>().is_some()
+        || ctx
+            .get_metadata("openai_responses_format.stream")
+            .is_some_and(|value| value == "true"))
+    .then(|| {
         FilterAction::Reject(responses_error_rejection(
             400,
             "invalid_request_error",
-            "openai_file_search_callout: stream=true is not supported because file citation markers require SSE transformation",
+            "openai_file_search_callout: stream=true is not supported by an iterative file-search pipeline",
             true,
         ))
     })
@@ -738,6 +1277,18 @@ fn terminalize_unplanned_pending_calls(state: &mut ResponsesState, plan: &Search
             continue;
         }
         if let Some(object) = item.as_object_mut() {
+            object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
+            object.remove("results");
+        }
+    }
+}
+
+/// Mark every pending call incomplete when no built-in tool budget remains.
+fn terminalize_all_pending_calls(state: &mut ResponsesState) {
+    for item in state.output_items_mut() {
+        if is_pending_file_search_call(item)
+            && let Some(object) = item.as_object_mut()
+        {
             object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
             object.remove("results");
         }

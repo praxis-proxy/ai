@@ -42,6 +42,7 @@ fn minimal_config_uses_safe_defaults() {
     assert!(config.authorization.is_none());
     assert_eq!(config.max_response_bytes, 10_485_760);
     assert_eq!(config.max_total_response_bytes, 67_108_864);
+    assert_eq!(config.max_state_bytes, 52_428_800);
     assert_eq!(config.on_error, OnError::Reject);
 }
 
@@ -178,6 +179,8 @@ fn config_validates_timeouts_and_budgets() {
         "vector_store_url: https://8.8.8.8\nmax_response_bytes: 0\n",
         "vector_store_url: https://8.8.8.8\nmax_total_response_bytes: 0\n",
         "vector_store_url: https://8.8.8.8\nmax_response_bytes: 100\nmax_total_response_bytes: 99\n",
+        "vector_store_url: https://8.8.8.8\nmax_state_bytes: 0\n",
+        "vector_store_url: https://8.8.8.8\nmax_state_bytes: 268435457\n",
     ] {
         assert!(parse_config(yaml).is_err(), "invalid bound must fail: {yaml}");
     }
@@ -450,6 +453,55 @@ fn response_output_is_bounded_after_search_formatting() {
     assert!(response_fits(&state, 1_024));
 }
 
+#[test]
+fn continuation_header_replay_excludes_stale_request_metadata() {
+    for name in [
+        http::header::AUTHORIZATION,
+        http::header::ACCEPT,
+        http::header::CONTENT_TYPE,
+        http::header::HeaderName::from_static("x-tenant-id"),
+    ] {
+        assert!(should_replay_original_header(&name), "{name} should be replayed");
+    }
+
+    for name in [
+        http::header::HOST,
+        http::header::CONTENT_LENGTH,
+        http::header::CONTENT_ENCODING,
+        http::header::ACCEPT_ENCODING,
+        http::header::HeaderName::from_static("idempotency-key"),
+        http::header::HeaderName::from_static("x-praxis-internal-test"),
+    ] {
+        assert!(!should_replay_original_header(&name), "{name} should not be replayed");
+    }
+}
+
+#[test]
+fn continuation_header_replay_excludes_connection_nominated_headers() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("keep-alive, X-Request-Hop"),
+    );
+    let nominated = http::header::HeaderName::from_static("x-request-hop");
+
+    assert!(connection_nominates_header(&headers, &nominated));
+    assert!(!connection_nominates_header(&headers, &http::header::AUTHORIZATION));
+}
+
+#[test]
+fn output_budget_is_shared_across_inference_rounds() {
+    let state = ResponsesState {
+        file_search_output_items: vec![json!({"type":"reasoning","content":"a".repeat(40)})],
+        response_object: json!({"output":[{"type":"file_search_call","content":"b".repeat(40)}]}),
+        ..Default::default()
+    };
+    let incoming = json!({"output":[{"type":"message","content":"c".repeat(40)}]});
+
+    assert!(combined_output_fits(&state, &incoming, 512));
+    assert!(!combined_output_fits(&state, &incoming, 128));
+}
+
 #[tokio::test]
 async fn no_state_or_pending_calls_is_a_noop() {
     let server = MockServer::json(200, &json!({"data": []}));
@@ -459,6 +511,13 @@ async fn no_state_or_pending_calls_is_a_noop() {
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
+    assert_eq!(
+        ctx.request_headers_to_set
+            .iter()
+            .find(|(name, _)| *name == http::header::ACCEPT_ENCODING)
+            .map(|(_, value)| value),
+        Some(&http::HeaderValue::from_static("identity"))
+    );
 
     ctx.extensions.insert(state_with(&["vs-a"], vec![]));
     assert!(matches!(
@@ -466,6 +525,62 @@ async fn no_state_or_pending_calls_is_a_noop() {
         FilterAction::Continue
     ));
     assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn request_body_initializes_file_search_state_inside_router() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let mut ctx = make_context(None);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"search","tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]}"#,
+    ));
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("state should be initialized");
+    assert_eq!(state.messages[0]["content"], "search");
+    assert_eq!(state.tools[0]["type"], "file_search");
+}
+
+#[tokio::test]
+async fn non_file_search_body_does_not_consume_continuation_budget() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "max_state_bytes: 128\n");
+    let mut ctx = make_context(None);
+    let mut body = Some(Bytes::from(json!({"input":"x".repeat(256)}).to_string()));
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
+async fn initial_state_is_rejected_before_oversized_json_duplication() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "max_state_bytes: 128\n");
+    let mut ctx = make_context(None);
+    let mut body = Some(Bytes::from(
+        json!({
+            "model":"gpt-4.1",
+            "input":"x".repeat(256),
+            "tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]
+        })
+        .to_string(),
+    ));
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Reject(_)
+    ));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
 }
 
 #[tokio::test]
@@ -477,6 +592,22 @@ async fn streaming_file_search_is_rejected_before_callout() {
 
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(_)
+    ));
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn streaming_without_file_search_is_rejected_before_buffering() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let mut ctx = make_context(None);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
+    ));
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
         FilterAction::Reject(_)
     ));
     assert!(server.requests().is_empty());
@@ -499,7 +630,25 @@ async fn streaming_rehydrated_citations_are_rejected_without_a_pending_call() {
 }
 
 #[tokio::test]
-async fn first_pass_streaming_declaration_is_not_rejected() {
+async fn streaming_rehydrated_state_is_rejected_from_the_request_body() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let mut state = state_with(&["vs-a"], vec![]);
+    state.history_rehydrated = true;
+    let mut ctx = make_context(Some(state));
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"search","stream":true,"tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]}"#,
+    ));
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Reject(_)
+    ));
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn first_pass_streaming_file_search_is_rejected() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let mut ctx = make_context(Some(state_with(&["vs-a"], vec![])));
@@ -508,7 +657,7 @@ async fn first_pass_streaming_declaration_is_not_rejected() {
 
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
+        FilterAction::Reject(_)
     ));
     assert!(server.requests().is_empty());
 }
@@ -518,10 +667,10 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     let server = MockServer::json(200, &one_result("file-a", "report.pdf", 0.95, "Revenue grew."));
     let filter = make_filter(server.port, "");
     let output = vec![
-        json!({"type":"reasoning","id":"rs-1","summary":[]}),
+        json!({"type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"opaque-reasoning"}),
         json!({"type":"file_search_call","id":"fs-1","status":"searching","queries":["revenue"]}),
         json!({"type":"mcp_list_tools","id":"mcp-list","tools":[]}),
-        json!({"type":"message","id":"msg-1","role":"assistant","content":[]}),
+        json!({"type":"message","id":"msg-1","role":"assistant","content":[{"type":"output_text","text":"I will check."}]}),
     ];
     let mut state = state_with(&["vs-a"], output.clone());
     state.include.push("file_search_call.results".to_owned());
@@ -538,7 +687,24 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.output_items()[1]["status"], "completed");
     assert_eq!(state.messages.iter().filter(|item| item["id"] == "mcp-list").count(), 0);
-    assert_eq!(item_ids(&state.messages), vec!["input-1"]);
+    assert_eq!(item_ids(&state.messages), vec!["input-1", "rs-1", "msg-1"]);
+    assert_eq!(
+        state.messages.iter().find(|item| item["id"] == "rs-1").unwrap()["encrypted_content"],
+        "opaque-reasoning"
+    );
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .skip(1)
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["reasoning", "function_call", "function_call_output", "message"]
+    );
+    assert_eq!(
+        state.messages.iter().find(|item| item["id"] == "msg-1").unwrap()["content"][0]["text"],
+        "I will check."
+    );
     assert_eq!(
         state.response_object["output"],
         Value::Array(state.output_items().to_vec())
@@ -565,6 +731,53 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     ));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.messages.len(), message_len);
+}
+
+#[test]
+fn mixed_client_and_file_search_calls_are_rejected_before_search() {
+    let state = state_with(&["vs-a"], vec![]);
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut response_header);
+    let mut body = Some(Bytes::from(
+        json!({
+            "id":"resp-1",
+            "output":[
+                {"type":"file_search_call","id":"fs-1","status":"searching","queries":["revenue"]},
+                {"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup_tax","arguments":"{}","status":"completed"}
+            ]
+        })
+        .to_string(),
+    ));
+
+    assert!(matches!(
+        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
+        FilterAction::Reject(_)
+    ));
+    let state = ctx.extensions.remove::<ResponsesState>().unwrap();
+    assert!(state.output_items().is_empty());
+}
+
+#[tokio::test]
+async fn forced_tool_choice_resets_after_search_execution() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let mut state = one_pending_state(&["vs-a"]);
+    state.request_body = json!({
+        "input":"search",
+        "tool_choice":{"type":"file_search"},
+        "tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]
+    });
+    state.tool_choice = json!({"type":"file_search"});
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.tool_choice, "auto");
+    assert!(state.request_body.get("tool_choice").is_none());
 }
 
 #[tokio::test]
@@ -783,6 +996,102 @@ async fn max_tool_calls_counts_completed_calls_in_the_current_output() {
     assert!(server.requests().is_empty());
 }
 
+#[test]
+fn exhausted_tool_budget_finishes_without_another_inference() {
+    let prior = json!({"type":"file_search_call","id":"fs-prior","status":"completed"});
+    let mut state = state_with(&["vs-a"], vec![]);
+    state.file_search_output_items.push(prior);
+    state.max_tool_calls = Some(1);
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut response_header);
+    let mut body = Some(Bytes::from(
+        json!({
+            "id":"resp-budget",
+            "output":[{
+                "type":"file_search_call",
+                "id":"fs-exhausted",
+                "status":"searching",
+                "queries":["again"]
+            }]
+        })
+        .to_string(),
+    ));
+
+    assert!(matches!(
+        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
+        FilterAction::Continue
+    ));
+    let encoded: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(encoded["output"][0]["status"], "completed");
+    assert_eq!(encoded["output"][1]["status"], "incomplete");
+    assert_eq!(
+        ctx.filter_results["openai_file_search_callout"].get("pending"),
+        Some("false")
+    );
+}
+
+#[test]
+fn malformed_success_after_search_is_rejected() {
+    let mut state = state_with(&["vs-a"], vec![]);
+    state.iteration = 1;
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut response_header);
+    let mut body = Some(Bytes::from_static(b"not-json"));
+
+    assert!(matches!(
+        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
+        FilterAction::Reject(_)
+    ));
+}
+
+#[test]
+fn malformed_output_shape_after_search_is_rejected() {
+    for response in [json!({}), json!({"output":"invalid"})] {
+        let mut state = state_with(&["vs-a"], vec![]);
+        state.iteration = 1;
+        let mut ctx = make_context(Some(state));
+        let mut response_header = crate::test_utils::make_response();
+        ctx.response_header = Some(&mut response_header);
+        let mut body = Some(Bytes::from(response.to_string()));
+
+        assert!(matches!(
+            FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
+            FilterAction::Reject(_)
+        ));
+    }
+}
+
+#[test]
+fn final_response_rewrite_clears_representation_headers() {
+    let mut state = state_with(&["vs-a"], vec![]);
+    state.iteration = 1;
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    for name in [
+        http::header::CONTENT_ENCODING,
+        http::header::CONTENT_LENGTH,
+        http::header::CONTENT_RANGE,
+        http::header::ETAG,
+        http::header::LAST_MODIFIED,
+    ] {
+        response_header
+            .headers
+            .insert(name, http::HeaderValue::from_static("stale"));
+    }
+    ctx.response_header = Some(&mut response_header);
+    let mut body = Some(Bytes::from(json!({"id":"resp-final","output":[]}).to_string()));
+
+    assert!(matches!(
+        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
+        FilterAction::Continue
+    ));
+    let response = ctx.response_header.as_deref().unwrap();
+    assert!(response.headers.is_empty());
+    assert!(ctx.response_headers_modified);
+}
+
 #[tokio::test]
 async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
     let server = MockServer::json(200, &json!({"data": []}));
@@ -807,7 +1116,7 @@ async fn no_store_ids_terminalizes_calls_and_replays_siblings() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let output = vec![
-        json!({"type":"reasoning","id":"rs-1","summary":[]}),
+        json!({"type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"opaque-reasoning"}),
         json!({"type":"file_search_call","id":"fs-1","status":"searching","queries":["q"]}),
     ];
     let mut ctx = make_context(Some(state_with(&[], output)));
@@ -819,7 +1128,15 @@ async fn no_store_ids_terminalizes_calls_and_replays_siblings() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.output_items()[1]["status"], "incomplete");
     assert!(state.output_items()[1].get("results").is_none());
-    assert_eq!(state.messages.len(), 2);
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["reasoning", "function_call", "function_call_output"]
+    );
+    assert_eq!(state.messages[0]["encrypted_content"], "opaque-reasoning");
     assert!(server.requests().is_empty());
 }
 
@@ -1298,6 +1615,7 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
     });
     FileSearchCalloutFilter {
         client,
+        max_state_bytes: validated.max_state_bytes,
         on_error: validated.on_error,
     }
 }

@@ -7,7 +7,7 @@ Executes pending file search calls against an OGX vector store API.
 
 ## Configuration Notes
 
-First-pass requests remain unchanged until core continuation support can re-enter the request phase with pending file-search calls. Re-entered streaming requests are rejected because citation markers require an incremental SSE transformer. Search queries are forwarded to OGX unchanged; continuation context and citation marker formatting are internal.
+The enclosing iterative router owns model re-entry. Streaming requests are rejected because citation markers require an incremental SSE transformer. Search queries are forwarded to OGX unchanged; model context and citation marker formatting are internal.
 
 ## Configuration
 
@@ -19,6 +19,7 @@ First-pass requests remain unchanged until core continuation support can re-ente
 | `auth_type` | `bearer` \| `none` | no | Authentication method. When omitted, a configured key selects `bearer`; otherwise authentication defaults to `none`. |
 | `max_response_bytes` | integer | no | Maximum response body size in bytes per callout. |
 | `max_total_response_bytes` | integer | no | Maximum cumulative successful response bytes per filter execution. |
+| `max_state_bytes` | integer | no | Maximum combined iterative-router and file-search continuation bytes. Configure the same value on the enclosing `iterative_request_router`. |
 | `on_error` | `ignore` \| `reject` | no | Behaviour when a vector-store callout fails. Named `on_error` because `parse_filter_config` strips `failure_mode` as a pipeline-structural key. |
 | `timeout_ms` | integer | no | Whole-call timeout in milliseconds. |
 | `vector_store_url` | string | yes | Base URL for the OGX vector store API. |

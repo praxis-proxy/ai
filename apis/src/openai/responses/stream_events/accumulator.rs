@@ -88,7 +88,7 @@ pub(super) fn accumulate_response_object(
         let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
         let had_prior_usage = !state.usage.is_null();
         if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
-            merge_usage(&mut state.usage, usage);
+            state.merge_usage(usage);
         }
         if !state.usage.is_null()
             && let Some(object) = response.as_object_mut()
