@@ -80,6 +80,7 @@ fn test_sources() -> Vec<SpecSourceReport> {
         area: "Conversations",
         operations: 5,
         projection_sha256: "test-projection-sha256".to_owned(),
+        include_inherited_security: false,
     }]
 }
 
@@ -482,6 +483,12 @@ fn json_report_includes_oasdiff_missing_and_response_drift() {
     let value = report_json(&report, &test_args());
 
     assert_eq!(value.pointer("/schema_version").and_then(Value::as_u64), Some(3));
+    assert_eq!(
+        value
+            .pointer("/area_projections/0/inherited_security")
+            .and_then(Value::as_str),
+        Some("deployment")
+    );
     assert!(value.get("overall_conformance").is_none());
     assert_eq!(
         value
@@ -731,6 +738,8 @@ paths:
     parameters:
       - {in: path, name: conversation_id, required: true, schema: {type: string}}
     get:
+      security:
+        - OperationAuth: []
       responses:
         '200':
           description: OK
@@ -743,6 +752,7 @@ paths:
 components:
   securitySchemes:
     ApiKeyAuth: {type: http, scheme: bearer}
+    OperationAuth: {type: apiKey, name: x-op-key, in: header}
   schemas:
     Conversation:
       type: object
@@ -752,18 +762,76 @@ components:
     Unused: {type: string}
 ";
 
-    let bundle = build_reference_projection(source, CONVERSATIONS_SCOPE).unwrap();
+    let inherited_scope = super::model::OperationScope::new("inherited", "Inherited", &["/conversations"]);
+    let bundle = build_reference_projection(source, inherited_scope).unwrap();
     let bundle: Value = serde_yaml::from_str(&bundle).unwrap();
-    assert!(bundle.pointer("/security/0/ApiKeyAuth").is_some());
-    assert!(bundle.pointer("/components/securitySchemes/ApiKeyAuth").is_some());
-    assert!(bundle.pointer("/components/schemas/Conversation").is_some());
-    assert!(bundle.pointer("/components/schemas/Metadata").is_some());
-    assert!(bundle.pointer("/components/schemas/Unused").is_none());
-    assert!(bundle.pointer("/paths/~1models").is_none());
+    assert!(
+        bundle.pointer("/security/0/ApiKeyAuth").is_some(),
+        "owned inherited security should remain in the projection"
+    );
+    assert!(
+        bundle.pointer("/components/securitySchemes/ApiKeyAuth").is_some(),
+        "owned inherited security schemes should remain in the projection"
+    );
+    assert!(
+        bundle.pointer("/components/securitySchemes/OperationAuth").is_some(),
+        "operation-level security schemes should remain in the owned projection"
+    );
+    assert!(
+        bundle.pointer("/components/schemas/Conversation").is_some(),
+        "referenced schemas should remain in the projection"
+    );
+    assert!(
+        bundle.pointer("/components/schemas/Metadata").is_some(),
+        "transitively referenced schemas should remain in the projection"
+    );
+    assert!(
+        bundle.pointer("/components/schemas/Unused").is_none(),
+        "unreferenced schemas should be excluded"
+    );
+    assert!(
+        bundle.pointer("/paths/~1models").is_none(),
+        "paths outside the scope should be excluded"
+    );
     assert!(
         bundle
             .pointer("/paths/~1conversations~1{conversation_id}/parameters")
-            .is_some()
+            .is_some(),
+        "path-level parameters should remain in the projection"
+    );
+
+    let conversations = build_reference_projection(source, CONVERSATIONS_SCOPE).unwrap();
+    let conversations: Value = serde_yaml::from_str(&conversations).unwrap();
+    assert!(
+        conversations.pointer("/security").is_none(),
+        "deployment-owned global security should be excluded"
+    );
+    assert!(
+        conversations
+            .pointer("/components/securitySchemes/ApiKeyAuth")
+            .is_none(),
+        "security schemes referenced only by deployment-owned security should be excluded"
+    );
+    assert!(
+        conversations
+            .pointer("/components/securitySchemes/OperationAuth")
+            .is_some(),
+        "operation-level security schemes should survive deployment-owned exclusion"
+    );
+    let get_op = conversations
+        .pointer("/paths/~1conversations~1{conversation_id}/get/security")
+        .expect("operation-level security block should remain in the projection");
+    assert!(
+        get_op
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|req| req.get("OperationAuth").is_some()),
+        "operation-level OperationAuth should remain in the operation security block"
+    );
+    assert!(
+        conversations.pointer("/components/schemas/Conversation").is_some(),
+        "contract schemas should remain after excluding inherited security"
     );
 }
 
