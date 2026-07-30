@@ -19,16 +19,9 @@ use std::{
 
 use cargo_metadata::{DependencyKind, Metadata, NodeDep, Package, PackageId, Resolve};
 
-#[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    reason = "tests"
-)]
-mod tests;
+// -----------------------------------------------------------------------------
+// Public Types
+// -----------------------------------------------------------------------------
 
 /// Active Cargo feature selection for a build script invocation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -39,6 +32,10 @@ pub struct ActiveFeatures {
     /// Explicit active non-default feature names.
     pub names: Vec<String>,
 }
+
+// -----------------------------------------------------------------------------
+// Public Functions
+// -----------------------------------------------------------------------------
 
 /// Convert a Cargo feature name to the corresponding build-script env
 /// suffix, e.g. `my-feature` becomes `MY_FEATURE`.
@@ -213,6 +210,10 @@ pub fn generate_registration_code(crates: &[String]) -> String {
     code
 }
 
+// -----------------------------------------------------------------------------
+// Private Helpers
+// -----------------------------------------------------------------------------
+
 /// Build a package lookup by package ID.
 fn packages_by_id(packages: &[Package]) -> HashMap<&PackageId, &Package> {
     packages.iter().map(|pkg| (&pkg.id, pkg)).collect()
@@ -227,3 +228,14 @@ fn resolve_or_panic(metadata: &Metadata) -> &Resolve {
         .as_ref()
         .expect("cargo metadata returned no resolve graph; verify MetadataCommand does not pass --no-deps")
 }
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "tests"
+)]
+mod tests;
