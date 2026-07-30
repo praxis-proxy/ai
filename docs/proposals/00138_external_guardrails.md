@@ -1,9 +1,10 @@
 ---
-issue: https://github.com/praxis-proxy/praxis/issues/138
-discussion: https://github.com/praxis-proxy/praxis/issues/138
-status: proposed
+issue: https://github.com/praxis-proxy/ai/issues/76
+discussion: https://github.com/praxis-proxy/ai/issues/76
+status: accepted
 authors:
   - liavweiss
+  - christinaexyou
 graduation_criteria:
   - How? section with requirements and design reviewed
   - ai_guardrails filter scaffold merged
@@ -14,12 +15,23 @@ stakeholders:
   - twghu
 ---
 
+> **Current status (2026-07):** Task 0 (scaffold) and Task 1
+> (NeMo provider + request-side integration) are merged and covered
+> by unit, integration, and example e2e tests — the graduation
+> criteria above are met. Task 2 (redact / mask action,
+> [#579](https://github.com/praxis-proxy/praxis/issues/579)) and
+> Task 3 (response-side evaluation,
+> [#580](https://github.com/praxis-proxy/praxis/issues/580)) are not
+> yet implemented, and the shared-types plan for `security/guardrails`
+> was dropped. See the **Design** and **Known Limitations** sections
+> for what shipped vs. what deviated or is still deferred.
+
 # External Guardrail Provider Integration
 
 ## What?
 
 Create a new **AI guardrails filter** (`ai_guardrails`) under
-`ai/guardrails/` that calls external content safety providers
+`filters/src/guardrails/` that calls external content safety providers
 via HTTP, inspects request and response bodies, and acts on the
 provider's verdict: pass, block, or redact (mask).
 
@@ -34,8 +46,7 @@ logic. The first provider is NeMo Guardrails, using the
 
 ### Goals
 
-- New standalone filter under `ai/guardrails/`, behind the
-  existing AI feature flag
+- New standalone filter under `filters/src/guardrails/`
 - Generic provider trait so new providers are a single-file
   addition
 - Request-side guardrails: evaluate client requests before
@@ -80,7 +91,7 @@ of local pattern matching.
 A dedicated AI guardrails filter gives operators a clean
 separation: local pattern matching stays in
 `security/guardrails`, while external provider calls live in
-`ai/guardrails`. Both can run in the same pipeline.
+`filters/src/guardrails`. Both can run in the same pipeline.
 
 ### User Stories
 
@@ -111,7 +122,7 @@ separation: local pattern matching stays in
 ### Requirements
 
 - New standalone filter (`ai_guardrails`) under
-  `ai/guardrails/`, behind the AI feature flag
+  `filters/src/guardrails/`
 - Guardrails results need to indicate pass, block, and
   whether content was modified (redacted)
 - Guardrails need to be configurable on both requests and
@@ -124,8 +135,30 @@ separation: local pattern matching stays in
 
 #### Proposed Structure
 
+> **As implemented:** the shared-types split below was dropped.
+> `GuardResult`, `GuardPhase`, and `GuardProvider` all live inside
+> `praxis-ai-filters`, private to the `ai_guardrails` filter — there
+> is no `builtins/http/guardrails.rs` in praxis core, and
+> `security/guardrails` (in `../praxis/filter/src/builtins/http/security/guardrails/`)
+> was left untouched with its own internal types, not updated to
+> import these. The two filters coexist as originally intended, but
+> do not share result types.
+>
+> Actual layout (in the `praxis-ai` repo):
+>
+> ```
+> filters/src/guardrails/
+> ├── mod.rs             # Module root
+> ├── config.rs          # YAML config types
+> ├── filter.rs          # HttpFilter impl
+> ├── tests.rs           # Unit tests
+> └── providers/
+>     ├── mod.rs         # GuardProvider trait + GuardResult/GuardPhase
+>     └── nemo.rs        # NemoProvider: HTTP call + mapping
+> ```
+
 ```
-filter/src/builtins/http/
+filter/src/
 ├── guardrails.rs              # Shared types: GuardResult, GuardPhase
 │                              # (used by ai/ and security/ guardrails)
 ├── ai/
@@ -143,6 +176,13 @@ filter/src/builtins/http/
 ```
 
 #### Shared Guardrails Types
+
+> **As implemented:** this section describes the original plan.
+> `GuardResult`/`GuardPhase` were not extracted to a shared core
+> module; they are defined directly in
+> `filters/src/guardrails/providers/mod.rs`. Revisit this if a
+> second AI provider or a `security/guardrails` convergence effort
+> makes sharing worthwhile.
 
 `guardrails.rs` lives at `builtins/http/`.
 It holds types that both `ai/guardrails` and
@@ -208,6 +248,13 @@ silently skipping guardrail evaluation).
 Shared by all providers since the body format is determined
 by the model server, not the guard provider.
 
+> **As implemented:** `extract_messages` only recognizes the
+> OpenAI Chat `{"messages": [...]}` shape today. MCP body formats
+> and the `phase`-aware `choices[].message.content` / response
+> extraction are not implemented — request bodies without a
+> top-level `messages` array are rejected (fail-closed) rather than
+> parsed as MCP.
+
 #### Request Path Flow
 
 1. Body is buffered via `StreamBuffer`
@@ -244,6 +291,12 @@ by the model server, not the guard provider.
 
 #### Configuration
 
+> **As implemented:** `phase.response: true` is rejected as a hard
+> config error at filter construction time (not a silent no-op),
+> since response-side evaluation (#580) does not exist yet. The
+> example below is updated to reflect that; see `Known Limitations`
+> item 1.
+
 ```yaml
 # Pipeline example: both filters together
 
@@ -263,11 +316,21 @@ by the model server, not the guard provider.
     endpoint: "http://nemo:8000/v1/guardrail/checks"
     timeout_ms: 5000
   phase:
-    request: true               # default: true
-    response: true              # default: false
+    request: true   # default: true
+    response: false # default: false; `true` is a config error until #580
 ```
 
 #### Config Types (Rust)
+
+> **As implemented** (`filters/src/guardrails/config.rs` /
+> `providers/nemo.rs`): `endpoint` and `timeout_ms` live in a
+> provider-specific `NemoConfig`, not the shared `ProviderConfig` —
+> `ProviderConfig` only holds `type` plus a `#[serde(flatten)]`
+> opaque `serde_yaml::Value` that each provider parses itself. NeMo
+> also gained an optional `model: String` field (default `""`), and
+> the default `timeout_ms` is 10s, not 5s. `PhaseConfig::response`
+> is still parsed (default `false`), but `AiGuardrailsFilter::from_config`
+> now returns `Err` if it's `true`.
 
 ```rust
 // ai/guardrails/config.rs
@@ -294,7 +357,7 @@ pub struct PhaseConfig {
     #[serde(default = "default_true")]
     pub request: bool,
     #[serde(default)]
-    pub response: bool,
+    pub response: bool,  // as implemented: `true` rejected in AiGuardrailsFilter::from_config until #580
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +375,12 @@ needed.
 
 #### Filter
 
+> **As implemented:** `from_config` rejects `phase.response: true`
+> outright instead of storing a `phase_response: bool` for later use.
+> `Redact` currently maps to `Continue` (body forwarded unchanged) —
+> see Task 2 / `Known Limitations`. There is no `forbidden()` helper;
+> `Block` builds `Rejection::status(403).with_body(reason)` inline.
+
 ```rust
 // ai/guardrails/filter.rs
 
@@ -323,6 +392,7 @@ pub struct AiGuardrailsFilter {
 impl AiGuardrailsFilter {
     /// Parse AiGuardrailsConfig, validate timeout_ms > 0,
     /// match on ProviderType to instantiate the provider.
+    /// Returns `Err` if `phase.response` is `true` (#580 not shipped).
     pub fn from_config(config: &serde_yaml::Value)
         -> Result<Box<dyn HttpFilter>, FilterError>;
 }
@@ -358,6 +428,15 @@ impl HttpFilter for AiGuardrailsFilter {
 ```
 
 #### NeMo Provider
+
+> **As implemented:** `NemoProvider` additionally carries a `model:
+> String` field (sent on every request, default `""`) and enforces a
+> 1 MiB response cap via `Content-Length` and an incremental
+> read-abort. `reason` for `Block`/`Redact` is derived by joining the
+> names of any rails in `rails_status` whose `status` is `"blocked"`,
+> sorted alphabetically — not a single free-text field from NeMo. An
+> unrecognized `status` value is a hard `Err`, not silently treated
+> as `Pass`.
 
 ```rust
 // provider/nemo.rs
@@ -414,7 +493,9 @@ impl GuardProvider for NemoProvider {
 
 ### Task Plan
 
-**Task 0: Scaffold the `ai_guardrails` filter**
+**Task 0: Scaffold the `ai_guardrails` filter** — ✅ Done
+(with deviation: `security/guardrails` was not updated to share
+types; see `Shared Guardrails Types` above)
 - Blocked by: nothing
 - Create `builtins/http/guardrails.rs` with shared types:
   `GuardResult`, `GuardPhase`
@@ -436,7 +517,7 @@ impl GuardProvider for NemoProvider {
 - Acceptance: `filter: ai_guardrails` is accepted by the
   pipeline. Existing filters and tests unaffected.
 
-**Task 1: NeMo provider + request-side integration**
+**Task 1: NeMo provider + request-side integration** — ✅ Done
 - Blocked by: Task 0
 - Implement `NemoProvider` in `provider/nemo.rs`
   - POST to `/v1/guardrail/checks` endpoint
@@ -455,7 +536,10 @@ impl GuardProvider for NemoProvider {
   calls NeMo endpoint. Provider errors propagate as
   FilterError.
 
-**Task 2: NeMo mask / redact action**
+**Task 2: NeMo mask / redact action** — Not started
+(tracked as [#579](https://github.com/praxis-proxy/praxis/issues/579);
+`GuardResult::Redact` currently maps to `Continue` with the body
+forwarded unchanged)
 - Blocked by: Task 1
 - When NeMo returns `"modified"` status, the redacted
   content is available in the NeMo response at:
@@ -468,7 +552,11 @@ impl GuardProvider for NemoProvider {
 - For request-side: replace the last user message
   content in the request body with the redacted version
 
-**Task 3: NeMo response-side guardrails**
+**Task 3: NeMo response-side guardrails** — Not started
+(tracked as [#580](https://github.com/praxis-proxy/praxis/issues/580);
+`phase.response: true` is currently a hard config error rather than
+a silent no-op, so this is a config-schema change too, not purely
+additive)
 - Blocked by: Task 1 + async `on_response_body` support
 - `on_response_body` is currently sync (Pingora
   constraint). This task requires making
@@ -491,9 +579,13 @@ Task 1.
    sync in the `HttpFilter` trait (Pingora constraint).
    Response-side guardrails require making
    `on_response_body` async (a sync-to-async bridge at
-   the Pingora boundary). A dedicated issue will be
-   opened to track this separately from the AI
-   guardrails work.
+   the Pingora boundary). Tracked as
+   [#580](https://github.com/praxis-proxy/praxis/issues/580).
+   As implemented, `phase.response: true` is rejected as a
+   hard config error at `AiGuardrailsFilter::from_config` time
+   (not silently ignored), so operators get an immediate,
+   actionable error instead of a filter that appears configured
+   but never runs.
 
 2. **Streaming responses** - Buffered-only for v1.
    MCP responses are returned as JSON-RPC wrapped inside
@@ -507,3 +599,26 @@ Task 1.
    content may be checked twice. Acceptable for v1;
    deduplication strategies can be explored in a
    follow-up.
+
+4. **Redact is a no-op forward** - `GuardResult::Redact`
+   (NeMo `"modified"` status) currently maps to `Continue`;
+   the provider's masked/redacted text (`modified_text`) is
+   discarded and the original, unmodified body is forwarded
+   to the upstream. Tracked as
+   [#579](https://github.com/praxis-proxy/praxis/issues/579).
+   Operators relying on NeMo's PII-masking rails should be
+   aware that masking does not yet take effect at the proxy.
+
+5. **No shared types with `security/guardrails`** - the
+   `builtins/http/guardrails.rs` shared-types module described
+   above was never created; `GuardResult`/`GuardPhase` are
+   private to `praxis-ai-filters`. `security/guardrails` (in
+   praxis core) keeps its own independent types. Revisit if a
+   second AI provider or a convergence effort makes sharing
+   worthwhile.
+
+6. **No MCP message extraction** - `extract_messages()` only
+   recognizes the OpenAI Chat `{"messages": [...]}` shape.
+   Request bodies in MCP JSON-RPC format are rejected
+   (fail-closed) rather than evaluated, contrary to the original
+   "Common Helper" design.

@@ -8,6 +8,7 @@
 //! persisting response records and conversation history.
 
 mod postgres;
+pub(crate) mod postgres_url;
 mod schemas;
 mod sqlite;
 mod trait_def;

@@ -1857,7 +1857,7 @@ async fn postgres_store_init_failure_is_not_cached() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host={}"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -1898,7 +1898,7 @@ async fn postgres_store_init_failure_is_not_cached_on_get() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host={}"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -1934,7 +1934,7 @@ async fn postgres_store_init_failure_is_not_cached_on_delete() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host={}"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -1983,7 +1983,7 @@ fn valid_postgres_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2002,7 +2002,7 @@ fn postgres_config_accepts_postgresql_scheme() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgresql://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgresql://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2159,7 +2159,7 @@ fn postgres_config_rejects_hostaddr_loopback_override() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=127.0.0.1"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=127.0.0.1"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2174,7 +2174,7 @@ fn postgres_config_rejects_host_loopback_override() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=127.0.0.1"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=127.0.0.1"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2195,10 +2195,7 @@ fn postgres_config_rejects_legacy_ipv4_host_override() {
         "0xa9fea9fe",
         "0x0a000005",
     ] {
-        let yaml = postgres_config_yaml(
-            &format!("postgres://user:pass@203.0.113.10:5432/praxis?host={host}"),
-            "",
-        );
+        let yaml = postgres_config_yaml(&format!("postgres://user:pass@1.2.3.4:5432/praxis?host={host}"), "");
         let result = ResponseStoreFilter::from_config(&yaml);
         assert!(
             result.is_err(),
@@ -2212,7 +2209,7 @@ fn postgres_config_rejects_host_localhost_override() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=localhost"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=localhost"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2227,7 +2224,7 @@ fn postgres_config_rejects_mixed_case_host_query_as_missing_explicit_host() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres:///?HoSt=203.0.113.10"
+database_url: "postgres:///?HoSt=1.2.3.4"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2245,7 +2242,7 @@ fn postgres_config_rejects_hostaddr_unspecified_override() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=::"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=::"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2260,7 +2257,7 @@ fn postgres_config_rejects_ipv4_mapped_link_local_hostaddr() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=::ffff:169.254.169.254"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=::ffff:169.254.169.254"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2360,7 +2357,7 @@ fn postgres_config_rejects_socket_host_without_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=%2Fvar%2Frun%2Fpostgresql"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=%2Fvar%2Frun%2Fpostgresql"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2378,7 +2375,7 @@ fn postgres_config_allows_socket_host_with_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=%2Fvar%2Frun%2Fpostgresql"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=%2Fvar%2Frun%2Fpostgresql"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -2416,7 +2413,7 @@ fn postgres_config_rejects_socket_host_path_traversal_with_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=%2Fvar%2Frun%2F..%2Fpostgresql"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=%2Fvar%2Frun%2F..%2Fpostgresql"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -2453,7 +2450,7 @@ fn postgres_config_with_ssl_mode_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: require
@@ -2469,7 +2466,7 @@ fn postgres_config_with_ssl_root_cert_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: verify-ca
@@ -2489,7 +2486,7 @@ fn postgres_config_with_url_verify_sslmode_and_ssl_root_cert_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full"
 responses_table: responses
 conversations_table: conversations
 ssl_root_cert: /path/to/ca.pem
@@ -2505,7 +2502,7 @@ fn postgres_config_with_url_sslrootcert_and_verified_sslmode_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2523,7 +2520,7 @@ fn postgres_config_with_url_ssl_root_cert_alias_and_verified_sslmode_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?ssl-mode=verify-ca&ssl-root-cert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?ssl-mode=verify-ca&ssl-root-cert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2541,7 +2538,7 @@ fn postgres_config_accepts_ssl_root_cert_without_explicit_ssl_mode() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 ssl_root_cert: /path/to/ca.pem
@@ -2561,7 +2558,7 @@ fn postgres_config_rejects_ssl_root_cert_with_non_verified_ssl_mode() {
         let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
             r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 {ssl_mode}
@@ -2582,7 +2579,7 @@ fn postgres_config_rejects_ssl_root_cert_with_non_verified_url_sslmode() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require"
 responses_table: responses
 conversations_table: conversations
 ssl_root_cert: /path/to/ca.pem
@@ -2598,7 +2595,7 @@ fn postgres_config_mixed_case_url_sslmode_falls_through_to_verified_default() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?SSLMODE=verify-full&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?SSLMODE=verify-full&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2616,7 +2613,7 @@ fn postgres_config_rejects_url_sslrootcert_without_verified_ssl_mode() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2634,7 +2631,7 @@ fn postgres_config_rejects_url_sslrootcert_when_last_sslmode_is_not_verified() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full&sslmode=require&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full&sslmode=require&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2652,7 +2649,7 @@ fn postgres_config_explicit_ssl_mode_overrides_url_sslmode() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: require
@@ -2672,7 +2669,7 @@ fn postgres_config_explicit_verified_ssl_mode_allows_url_sslrootcert() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: verify-full
@@ -2691,7 +2688,7 @@ fn postgres_config_rejects_ssl_root_cert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: verify-ca
@@ -2708,7 +2705,7 @@ fn postgres_config_rejects_url_sslrootcert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full&sslrootcert=../ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full&sslrootcert=../ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2723,7 +2720,7 @@ fn postgres_config_rejects_url_encoded_sslrootcert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full&sslrootcert=%2e%2e%2fca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full&sslrootcert=%2e%2e%2fca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2741,7 +2738,7 @@ fn postgres_config_rejects_url_sslcert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&sslcert=../client.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&sslcert=../client.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2756,7 +2753,7 @@ fn postgres_config_rejects_url_sslkey_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&sslkey=../client.key"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&sslkey=../client.key"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2772,7 +2769,7 @@ fn postgres_config_rejects_long_responses_table() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: {responses_table}
 conversations_table: conversations
 "#
@@ -2791,7 +2788,7 @@ fn postgres_config_rejects_long_conversations_table_for_index_name() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: {conversations_table}
 "#
@@ -2910,7 +2907,7 @@ fn postgres_config_rejects_ipv6_bracketed_loopback() {
 #[test]
 fn postgres_config_rejects_socket_path_with_traversal() {
     let yaml = postgres_config_yaml(
-        "postgres://user@203.0.113.10/db?host=%2Fvar%2Frun%2F..%2F..%2Fetc%2Fdb",
+        "postgres://user@1.2.3.4/db?host=%2Fvar%2Frun%2F..%2F..%2Fetc%2Fdb",
         "allow_private_database_url: true",
     );
     let result = ResponseStoreFilter::from_config(&yaml);
@@ -4420,7 +4417,7 @@ conversations_table: conversations
 
 #[test]
 fn postgres_config_accepts_public_ipv4_host() {
-    let yaml = postgres_config_yaml("postgres://user:pass@203.0.113.10:5432/praxis", "");
+    let yaml = postgres_config_yaml("postgres://user:pass@1.2.3.4:5432/praxis", "");
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(result.is_ok(), "public IPv4 postgres host should be accepted");
 }
@@ -4455,7 +4452,7 @@ fn postgres_config_rejects_ipv4_mapped_loopback_in_authority() {
 #[test]
 fn postgres_config_url_fragment_not_treated_as_query() {
     let yaml = postgres_config_yaml(
-        "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full#sslrootcert=/path/to/ca.pem",
+        "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full#sslrootcert=/path/to/ca.pem",
         "ssl_root_cert: /path/to/ca.pem",
     );
     let result = ResponseStoreFilter::from_config(&yaml);
@@ -4467,7 +4464,7 @@ fn postgres_config_rejects_ssl_cert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&ssl-cert=../client.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&ssl-cert=../client.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4482,7 +4479,7 @@ fn postgres_config_rejects_ssl_key_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&ssl-key=../client.key"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&ssl-key=../client.key"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4497,7 +4494,7 @@ fn postgres_config_with_ssl_ca_alias_and_verified_sslmode_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?ssl-mode=verify-full&ssl-ca=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?ssl-mode=verify-full&ssl-ca=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4550,7 +4547,7 @@ fn revalidate_postgres_host_rejects_hostaddr_query_param() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=127.0.0.1"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=127.0.0.1"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4569,7 +4566,7 @@ fn revalidate_postgres_host_accepts_public_ip() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4585,7 +4582,7 @@ fn revalidate_postgres_host_rejects_host_query_param_loopback() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=127.0.0.1"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=127.0.0.1"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4604,7 +4601,7 @@ fn postgres_config_rejects_hostaddr_with_invalid_ip() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=not-an-ip"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=not-an-ip"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4616,7 +4613,7 @@ conversations_table: conversations
 
 #[test]
 fn postgres_config_accepts_ipv6_public_host() {
-    let yaml = postgres_config_yaml("postgres://user:pass@[2001:db8::1]:5432/praxis", "");
+    let yaml = postgres_config_yaml("postgres://user:pass@[2606:4700::1]:5432/praxis", "");
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(result.is_ok(), "public IPv6 postgres host should be accepted");
 }

@@ -24,11 +24,12 @@ workspace = true
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 praxis-ai-apis = { workspace = true }
-praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
+reqwest.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -36,4 +37,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 metrics-util = { workspace = true }
+praxis-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+wiremock = { workspace = true }
