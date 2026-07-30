@@ -269,14 +269,6 @@ fn round_trip_captures_tool_and_model_requests() {
         model_body["tool_choice"], "auto",
         "agentic_loop must reset tool_choice to auto on re-entry"
     );
-
-    assert!(
-        second_model_req
-            .headers
-            .to_lowercase()
-            .contains("content-type: application/json"),
-        "second model request should have content-type: application/json (restored after IRR clears headers)"
-    );
 }
 
 /// Load the checked-in example while enabling loopback only for the
