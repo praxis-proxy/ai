@@ -49,7 +49,7 @@ use tracing::{debug, trace, warn};
 
 use self::config::{ModelRewriteConfig, OnInvalidBehavior, validate_config};
 use super::error::responses_error_rejection;
-use crate::classifier::is_responses_create;
+use crate::{classifier::is_responses_create, json_body::replace_json_body};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -361,11 +361,9 @@ fn serialize_and_update(
     value: &serde_json::Value,
     result: &RewriteResult,
 ) -> Result<FilterAction, FilterError> {
-    let serialized = serde_json::to_vec(value).map_err(|e| -> FilterError {
+    replace_json_body(body, value, "openai_responses_model_rewrite", "model").map_err(|e| -> FilterError {
         format!("openai_responses_model_rewrite: failed to re-serialize rewritten request body: {e}").into()
     })?;
-
-    *body = Some(Bytes::from(serialized));
 
     debug!(
         original = ?result.original_model,
