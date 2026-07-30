@@ -607,8 +607,8 @@ class TestAgenticLoopVLLM:
         The proxy resolves the MCP tool (tools/list), sends inference
         to vLLM, dispatches the function_call via tools/call on the
         MCP server, and re-enters inference with the result. The
-        client receives the final model answer, not the intermediate
-        function_call.
+        accumulated output contains the full execution trace:
+        function_call, function_call_output, and the final message.
         """
         _, mcp_port = agentic_proxy
         mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
@@ -634,22 +634,18 @@ class TestAgenticLoopVLLM:
 
         assert response.status == "completed"
 
-        function_calls = [
-            item for item in response.output
-            if item.type == "function_call"
-        ]
-        assert len(function_calls) == 0, (
-            "MCP function calls should be auto-executed by the proxy, "
-            "not returned to the client; "
-            f"got: {[fc.name for fc in function_calls]}"
+        output_types = [item.type for item in response.output]
+        assert "function_call" in output_types, (
+            "accumulated output should contain the auto-executed "
+            f"function_call; got: {output_types}"
         )
-
-        messages = [
-            item for item in response.output if item.type == "message"
-        ]
-        assert len(messages) >= 1, (
-            "final response should contain a message from the model; "
-            f"got output types: {[i.type for i in response.output]}"
+        assert "function_call_output" in output_types, (
+            "accumulated output should contain the MCP tool result; "
+            f"got: {output_types}"
+        )
+        assert "message" in output_types, (
+            "accumulated output should contain the final model answer; "
+            f"got: {output_types}"
         )
 
     def test_client_function_exits_agentic_loop(self, agentic_client):
