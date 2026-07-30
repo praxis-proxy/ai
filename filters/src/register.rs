@@ -178,6 +178,10 @@ fn register_openai_response_filters(registry: &mut FilterRegistry) {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::build_ai_registry;
@@ -190,6 +194,11 @@ mod tests {
         assert!(
             names.contains(&"openai_responses_validate"),
             "expected openai_responses_validate in registry"
+        );
+        assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
+        assert!(
+            names.contains(&"anthropic_validate"),
+            "expected anthropic filter in registry"
         );
         assert!(
             names.contains(&"request_id"),
