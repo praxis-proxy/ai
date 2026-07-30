@@ -491,7 +491,7 @@ async fn tool_choice_serialized_from_state() {
 }
 
 #[tokio::test]
-async fn rebuild_sets_content_type_header() {
+async fn rebuild_does_not_set_content_type_header() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -513,13 +513,11 @@ async fn rebuild_sets_content_type_header() {
     ));
     let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    let has_content_type = ctx
-        .request_headers_to_set
-        .iter()
-        .any(|(k, v)| k == http::header::CONTENT_TYPE && v == "application/json");
     assert!(
-        has_content_type,
-        "content-type: application/json should be set after body rebuild"
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-type"),
+        "filter must not set content-type (core handles framing)"
     );
 }
 
