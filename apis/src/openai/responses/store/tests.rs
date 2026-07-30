@@ -3094,6 +3094,36 @@ async fn get_input_items_returns_404_when_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_rejects_invalid_query_params() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_qp", "default", json!(["hello"])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_qp/input_items?limit=abc");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "should return 400 for invalid limit");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_rejects_key_only_query_param() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_ko", "default", json!(["hello"])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_ko/input_items?limit");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "should return 400 for key-only param");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_limit_and_order() {
     let filter = make_filter();
     init_store_and_seed(
@@ -3516,7 +3546,7 @@ fn extract_response_id_empty_id_segment() {
 
 #[test]
 fn parse_query_params_empty() {
-    let params = super::filter::parse_query_params(None);
+    let params = super::filter::parse_query_params(None).unwrap();
     assert!(params.cursor.is_none(), "cursor should be None for empty query");
     assert_eq!(params.limit, 20, "limit should default to 20");
     assert_eq!(params.order, Order::Descending, "order should default to Descending");
@@ -3524,7 +3554,7 @@ fn parse_query_params_empty() {
 
 #[test]
 fn parse_query_params_all_fields() {
-    let params = super::filter::parse_query_params(Some("after=5&limit=10&order=asc"));
+    let params = super::filter::parse_query_params(Some("after=5&limit=10&order=asc")).unwrap();
     assert_eq!(
         params.cursor.as_deref(),
         Some("5"),
@@ -3535,14 +3565,32 @@ fn parse_query_params_all_fields() {
 }
 
 #[test]
-fn parse_query_params_invalid_limit_ignored() {
-    let params = super::filter::parse_query_params(Some("limit=abc"));
-    assert_eq!(params.limit, 20, "invalid limit should keep default");
+fn parse_query_params_invalid_limit_rejected() {
+    let err = super::filter::parse_query_params(Some("limit=abc")).unwrap_err();
+    assert!(
+        err.contains("Invalid value for 'limit'"),
+        "should reject non-numeric limit: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_zero_limit_rejected() {
+    let err = super::filter::parse_query_params(Some("limit=0")).unwrap_err();
+    assert!(err.contains("must be between 1 and"), "should reject zero limit: {err}");
+}
+
+#[test]
+fn parse_query_params_above_max_limit_rejected() {
+    let err = super::filter::parse_query_params(Some("limit=101")).unwrap_err();
+    assert!(
+        err.contains("must be between 1 and"),
+        "should reject above-max limit: {err}"
+    );
 }
 
 #[test]
 fn parse_query_params_decodes_percent_encoded_cursor() {
-    let params = super::filter::parse_query_params(Some("after=item%5F1"));
+    let params = super::filter::parse_query_params(Some("after=item%5F1")).unwrap();
     assert_eq!(
         params.cursor.as_deref(),
         Some("item_1"),
@@ -3551,12 +3599,77 @@ fn parse_query_params_decodes_percent_encoded_cursor() {
 }
 
 #[test]
-fn parse_query_params_unknown_order_ignored() {
-    let params = super::filter::parse_query_params(Some("order=random"));
+fn parse_query_params_empty_after_rejected() {
+    let err = super::filter::parse_query_params(Some("after=")).unwrap_err();
+    assert!(
+        err.contains("cursor must not be empty"),
+        "should reject empty after: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_unknown_order_rejected() {
+    let err = super::filter::parse_query_params(Some("order=random")).unwrap_err();
+    assert!(
+        err.contains("Invalid value for 'order'"),
+        "should reject unknown order value: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_include_bracket_rejected() {
+    let err = super::filter::parse_query_params(Some("include[]=reasoning.encrypted_content")).unwrap_err();
+    assert!(
+        err.contains("not supported"),
+        "should reject include[] parameter: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_include_bare_rejected() {
+    let err = super::filter::parse_query_params(Some("include=reasoning.encrypted_content")).unwrap_err();
+    assert!(
+        err.contains("not supported"),
+        "should reject bare include parameter: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_unknown_parameter_rejected() {
+    let err = super::filter::parse_query_params(Some("foo=bar")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "should reject unknown parameter: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_boundary_limits_accepted() {
+    let one = super::filter::parse_query_params(Some("limit=1")).unwrap();
+    assert_eq!(one.limit, 1, "limit=1 should be accepted");
+    let max = super::filter::parse_query_params(Some("limit=100")).unwrap();
+    assert_eq!(max.limit, 100, "limit=100 should be accepted");
+}
+
+#[test]
+fn parse_query_params_key_only_limit_rejected() {
+    let err = super::filter::parse_query_params(Some("limit")).unwrap_err();
+    assert!(err.contains("Missing value"), "should reject key-only limit: {err}");
+}
+
+#[test]
+fn parse_query_params_key_only_order_rejected() {
+    let err = super::filter::parse_query_params(Some("order")).unwrap_err();
+    assert!(err.contains("Missing value"), "should reject key-only order: {err}");
+}
+
+#[test]
+fn parse_query_params_key_only_unknown_ignored() {
+    let params = super::filter::parse_query_params(Some("order=asc&foo")).unwrap();
     assert_eq!(
         params.order,
-        Order::Descending,
-        "unknown order value should keep default"
+        Order::Ascending,
+        "unknown key-only param should be ignored"
     );
 }
 

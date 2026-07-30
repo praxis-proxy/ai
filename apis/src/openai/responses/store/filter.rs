@@ -62,7 +62,7 @@ use super::{
         DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, error::responses_error_rejection,
         state::ResponsesState,
     },
-    InputItemPage, ListParams, Order,
+    InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
     list_input_items,
 };
@@ -882,28 +882,43 @@ impl ResponseStoreFilter {
         }
     }
 
-    /// Serve `GET /v1/responses/{id}/input_items`.
-    async fn handle_get_input_items(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
+    /// Load a [`ResponseRecord`] from the store, returning a
+    /// [`FilterAction`] rejection on store or not-found errors.
+    async fn load_record(&self, ctx: &HttpFilterContext<'_>, id: &str) -> Result<ResponseRecord, FilterAction> {
         let Some(store) = self.ensure_store().await else {
-            return FilterAction::Reject(reject_store_error());
+            return Err(FilterAction::Reject(reject_store_error()));
         };
 
         let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
         debug!(response_id = id, tenant_id, "retrieving input items");
 
-        let record = match store.get_response(tenant_id, id).await {
-            Ok(Some(r)) => r,
+        match store.get_response(tenant_id, id).await {
+            Ok(Some(r)) => Ok(r),
             Ok(None) => {
                 debug!(response_id = id, "response not found for input_items");
-                return FilterAction::Reject(reject_not_found(id));
+                Err(FilterAction::Reject(reject_not_found(id)))
             },
             Err(e) => {
                 warn!(response_id = id, error = %e, "store lookup failed");
-                return FilterAction::Reject(reject_store_error());
+                Err(FilterAction::Reject(reject_store_error()))
+            },
+        }
+    }
+
+    /// Serve `GET /v1/responses/{id}/input_items`.
+    async fn handle_get_input_items(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
+        let params = match parse_query_params(ctx.request.uri.query()) {
+            Ok(p) => p,
+            Err(msg) => {
+                debug!(response_id = id, error = %msg, "invalid input_items query parameter");
+                return FilterAction::Reject(reject_invalid_input(&msg));
             },
         };
 
-        let params = parse_query_params(ctx.request.uri.query());
+        let record = match self.load_record(ctx, id).await {
+            Ok(r) => r,
+            Err(action) => return action,
+        };
         build_input_items_response(id, &record, &params)
     }
 }
@@ -954,40 +969,88 @@ fn build_input_items_ok(id: &str, page: &InputItemPage) -> FilterAction {
 }
 
 /// Parse cursor-based pagination parameters from a query string.
-pub(super) fn parse_query_params(query: Option<&str>) -> ListParams {
+///
+/// Returns an error message suitable for a 400 response when the query
+/// contains a malformed value, an out-of-range limit, an unknown order,
+/// or an unsupported parameter.
+pub(super) fn parse_query_params(query: Option<&str>) -> Result<ListParams, String> {
     let Some(qs) = query else {
-        return ListParams::default();
+        return Ok(ListParams::default());
     };
 
     let mut params = ListParams::default();
 
     for pair in qs.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
         let Some((key, value)) = pair.split_once('=') else {
+            reject_known_key_only_param(pair)?;
             continue;
         };
-        match key {
-            "after" => {
-                params.cursor = Some(
-                    percent_encoding::percent_decode_str(value)
-                        .decode_utf8_lossy()
-                        .into_owned(),
-                );
-            },
-            "limit" => {
-                if let Ok(n) = value.parse::<u32>() {
-                    params.limit = n;
-                }
-            },
-            "order" => match value {
-                "asc" => params.order = Order::Ascending,
-                "desc" => params.order = Order::Descending,
-                _ => {},
-            },
-            _ => {},
-        }
+        apply_query_param(&mut params, key, value)?;
     }
 
-    params
+    Ok(params)
+}
+
+/// Apply a single query-string key/value pair to [`ListParams`].
+fn apply_query_param(params: &mut ListParams, key: &str, value: &str) -> Result<(), String> {
+    match key {
+        "after" => {
+            if value.is_empty() {
+                return Err("Invalid value for 'after': cursor must not be empty.".to_owned());
+            }
+            params.cursor = Some(
+                percent_encoding::percent_decode_str(value)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+            );
+        },
+        "limit" => params.limit = parse_limit(value)?,
+        "order" => params.order = parse_order(value)?,
+        "include" | "include[]" => {
+            return Err("The 'include' parameter is not supported by the local response store.".to_owned());
+        },
+        _ => return Err(format!("Unknown query parameter: '{key}'.")),
+    }
+    Ok(())
+}
+
+/// Parse and validate a `limit` query-string value.
+fn parse_limit(value: &str) -> Result<u32, String> {
+    let n: u32 = value
+        .parse()
+        .map_err(|_e| format!("Invalid value for 'limit': '{value}' is not a valid integer."))?;
+    if n == 0 || n > MAX_PAGE_LIMIT {
+        return Err(format!(
+            "Invalid value for 'limit': must be between 1 and {MAX_PAGE_LIMIT}, got {n}."
+        ));
+    }
+    Ok(n)
+}
+
+/// Parse and validate an `order` query-string value.
+fn parse_order(value: &str) -> Result<Order, String> {
+    match value {
+        "asc" => Ok(Order::Ascending),
+        "desc" => Ok(Order::Descending),
+        _ => Err(format!(
+            "Invalid value for 'order': must be 'asc' or 'desc', got '{value}'."
+        )),
+    }
+}
+
+/// Reject a key-only query component (no `=`) when it matches a known
+/// parameter name. Unknown key-only components are ignored to match
+/// OpenAI behavior.
+fn reject_known_key_only_param(key: &str) -> Result<(), String> {
+    match key {
+        "limit" | "order" | "after" | "include" | "include[]" => {
+            Err(format!("Missing value for query parameter '{key}'."))
+        },
+        _ => Ok(()),
+    }
 }
 
 /// Build a 404 rejection with a Responses API error body.
