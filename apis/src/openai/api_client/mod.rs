@@ -191,23 +191,14 @@ impl ApiClient {
         max_bytes: usize,
     ) -> Result<Bytes, ApiClientError> {
         let headers = self.build_header_map(request_headers);
-
-        let (peer, uri) = subrequest::resolve_url(url)
-            .await
-            .map_err(|e| ApiClientError::CalloutFailed {
-                detail: format!("content download failed: {e}"),
-            })?;
-
         let request = SubRequest {
             method: http::Method::GET,
-            uri,
+            uri: http::Uri::default(),
             headers,
             body: Bytes::new(),
         };
 
-        let response = self
-            .client
-            .execute(&peer, &request, max_bytes, self.timeout, None)
+        let response = subrequest::execute_url(&self.client, url, request, max_bytes, self.timeout)
             .await
             .map_err(map_subrequest_error)?;
 
@@ -252,20 +243,14 @@ impl ApiClient {
         headers: HeaderMap,
         body: Bytes,
     ) -> Result<SubResponse, ApiClientError> {
-        let (peer, uri) = subrequest::resolve_url(url)
-            .await
-            .map_err(|e| ApiClientError::CalloutFailed { detail: e.to_string() })?;
-
         let request = SubRequest {
             method,
-            uri,
+            uri: http::Uri::default(),
             headers,
             body,
         };
 
-        let response = self
-            .client
-            .execute(&peer, &request, self.max_response_bytes, self.timeout, None)
+        let response = subrequest::execute_url(&self.client, url, request, self.max_response_bytes, self.timeout)
             .await
             .map_err(map_subrequest_error)?;
 

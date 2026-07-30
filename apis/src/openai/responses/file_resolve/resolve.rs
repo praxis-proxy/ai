@@ -408,7 +408,6 @@ impl FilesApiClient {
 
     /// Fetch metadata and content, returning the base64 content
     /// and MIME type for the caller to format per the schema.
-    #[expect(clippy::large_stack_frames, reason = "Pingora context types are large")]
     async fn resolve_file(
         &self,
         file_id: &str,

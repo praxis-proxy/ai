@@ -131,21 +131,8 @@ impl SearchClient {
 
     /// Execute a search request and map the result to a
     /// [`SearchOutcome`].
-    async fn execute_search(&self, url: &str, mut request: SubRequest) -> SearchOutcome {
-        let (peer, uri) = match subrequest::resolve_url(url).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(provider = self.provider.as_str(), error = %e, "search URL parse failed");
-                return self.transport_failure_outcome();
-            },
-        };
-
-        request.uri = uri;
-
-        let result = self
-            .client
-            .execute(&peer, &request, MAX_SEARCH_RESPONSE_BYTES, self.timeout, None)
-            .await;
+    async fn execute_search(&self, url: &str, request: SubRequest) -> SearchOutcome {
+        let result = subrequest::execute_url(&self.client, url, request, MAX_SEARCH_RESPONSE_BYTES, self.timeout).await;
         self.map_search_result(result)
     }
 

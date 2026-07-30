@@ -393,7 +393,6 @@ fn rewrite_body(
 /// History messages prepended by rehydrate are also walked so
 /// that any `file_id` references in them are resolved.
 #[expect(clippy::too_many_arguments, reason = "threading resolver through state sync")]
-#[expect(clippy::large_stack_frames, reason = "Pingora context types are large")]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: &serde_json::Value,
@@ -445,7 +444,6 @@ async fn sync_state(
 
 /// Resolve file references in rehydrated history when the
 /// current input did not require a body rewrite.
-#[expect(clippy::large_stack_frames, reason = "Pingora context types are large")]
 async fn resolve_state_history(
     ctx: &mut HttpFilterContext<'_>,
     client: &FilesApiClient,
