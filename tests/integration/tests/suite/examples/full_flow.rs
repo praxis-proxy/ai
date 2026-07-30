@@ -555,21 +555,12 @@ async fn full_flow_websocket_non_101_backend_response_remains_http() {
     assert_eq!(
         parse_status(&raw),
         http::StatusCode::UPGRADE_REQUIRED.as_u16(),
-        "the upstream non-101 status should remain an HTTP response"
-    );
-    assert!(
-        raw.to_ascii_lowercase().contains("content-type: application/json"),
-        "the normal error filter should format the HTTP rejection as JSON"
-    );
-    let body: serde_json::Value =
-        serde_json::from_str(&parse_body(&raw)).expect("formatted error body should be valid JSON");
-    assert_eq!(
-        body["error"]["code"], "426",
-        "the formatted error should retain the upstream status code"
+        "the upstream non-101 status should be forwarded unchanged"
     );
     assert_eq!(
-        body["error"]["message"], "upstream error (HTTP 426)",
-        "the formatted error should describe the upstream rejection"
+        parse_body(&raw),
+        "upgrade rejected",
+        "the upstream body should be forwarded unchanged"
     );
 }
 
