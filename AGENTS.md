@@ -109,8 +109,8 @@ New capabilities require:
 
 1. Create module under `filters/src/` or `apis/src/`
 2. Implement `HttpFilter` from `praxis-filter`
-3. Register in `server/src/lib.rs` via
-   `register_filters!` macro
+3. Register in `praxis_ai_filters::register_ai_filters`
+   (`filters/src/register.rs`) via `register_filters!`
 4. Add unit tests and doctests
 5. Add example config in `examples/configs/`
 

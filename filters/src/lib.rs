@@ -12,6 +12,7 @@ pub mod agentic;
 pub mod guardrails;
 pub mod inference;
 pub mod prompt_enrich;
+mod register;
 mod time_to_first_token;
 mod token_usage;
 
@@ -19,6 +20,7 @@ pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
+pub use register::{build_ai_registry, register_ai_filters};
 pub use time_to_first_token::TimeToFirstTokenFilter;
 pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
 
