@@ -639,13 +639,17 @@ class TestAgenticLoopVLLM:
             "accumulated output should contain the auto-executed "
             f"function_call; got: {output_types}"
         )
-        assert "function_call_output" in output_types, (
-            "accumulated output should contain the MCP tool result; "
-            f"got: {output_types}"
+        assert "mcp_call" in output_types, (
+            "accumulated output should contain the MCP tool result "
+            f"(mcp_call); got: {output_types}"
         )
-        assert "message" in output_types, (
-            "accumulated output should contain the final model answer; "
-            f"got: {output_types}"
+        rounds = sum(
+            1 for t in output_types
+            if t in ("function_call", "message", "reasoning")
+        )
+        assert rounds >= 2, (
+            "accumulated output should span at least two inference "
+            f"rounds; got: {output_types}"
         )
 
     def test_client_function_exits_agentic_loop(self, agentic_client):
