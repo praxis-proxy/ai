@@ -308,9 +308,7 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        }
+        BodyMode::Stream
     }
 
     fn needs_request_context(&self) -> bool {
@@ -442,6 +440,9 @@ impl HttpFilter for OpenaiConversationsFilter {
         ctx.insert_filter_state(ConversationResponseState { armed });
 
         if armed {
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_JSON_BODY_BYTES),
+            });
             drop(self.get_or_init_store().await);
         }
 

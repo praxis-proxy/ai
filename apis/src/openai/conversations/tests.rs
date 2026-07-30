@@ -1256,14 +1256,14 @@ async fn unmatched_path_continues() {
 }
 
 #[tokio::test]
-async fn post_routes_use_stream_buffer_body_mode() {
+async fn post_routes_use_stream_buffer_request_body_mode() {
     let filter = build_test_filter();
     assert!(
         matches!(
             filter.request_body_mode(),
             BodyMode::StreamBuffer { max_bytes: Some(_) }
         ),
-        "conversation POST routes require buffered bodies for local handling"
+        "request body mode must be StreamBuffer so the pipeline pre-reads the body for local handling"
     );
 
     let req = make_request(Method::POST, "/v1/conversations");
@@ -1279,6 +1279,15 @@ async fn post_routes_use_stream_buffer_body_mode() {
 }
 
 #[tokio::test]
+async fn response_body_mode_defaults_to_stream() {
+    let filter = build_test_filter();
+    assert!(
+        matches!(filter.response_body_mode(), BodyMode::Stream),
+        "response body mode should default to Stream to avoid buffering unrelated responses"
+    );
+}
+
+#[tokio::test]
 async fn unmatched_post_path_continues() {
     let filter = build_test_filter();
 
@@ -1287,13 +1296,6 @@ async fn unmatched_post_path_continues() {
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
-    assert!(
-        matches!(
-            filter.request_body_mode(),
-            BodyMode::StreamBuffer { max_bytes: Some(_) }
-        ),
-        "body mode declaration is static; unmatched path handling remains a local Continue"
-    );
 }
 
 #[tokio::test]
@@ -3032,6 +3034,7 @@ async fn on_response_armed_for_json_200() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
+    ctx.response_body_mode = filter.response_body_mode();
     set_append_back_metadata(&mut ctx);
 
     let mut resp = make_response();
@@ -3041,6 +3044,26 @@ async fn on_response_armed_for_json_200() {
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(ctx.response_body_mode, BodyMode::StreamBuffer { max_bytes: Some(_) }),
+        "armed append-back should upgrade response body mode to StreamBuffer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_unarmed_keeps_stream_body_mode() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.response_body_mode = filter.response_body_mode();
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(ctx.response_body_mode, BodyMode::Stream),
+        "unarmed response should keep default Stream body mode"
+    );
 }
 
 // -----------------------------------------------------------------------------

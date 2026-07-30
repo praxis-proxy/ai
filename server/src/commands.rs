@@ -35,7 +35,14 @@ pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn
     let registry = praxis_ai::build_full_registry();
     let health_registry = praxis_core::health::build_health_registry(&config.clusters);
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
-    praxis_ai::resolve_pipelines(config, &registry, &health_registry, &kv_stores)?;
+    let pool_size = config
+        .runtime
+        .subrequest_pool_size
+        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
+    let subrequest_client = praxis_core::subrequest::SubRequestClient::new(
+        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections),
+    );
+    praxis_ai::resolve_pipelines(config, &registry, &health_registry, &kv_stores, &subrequest_client)?;
     Ok(())
 }
 

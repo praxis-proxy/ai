@@ -44,6 +44,7 @@ pub(crate) fn reload_pipelines(
     live: &ListenerPipelines,
     health_shutdown: &Arc<Mutex<CancellationToken>>,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("building new pipelines from reloaded config");
 
@@ -54,7 +55,7 @@ pub(crate) fn reload_pipelines(
 
     let health_registry = build_health_registry(&new_config.clusters);
 
-    let new_pipelines = match resolve_pipelines(new_config, registry, &health_registry, kv_stores) {
+    let new_pipelines = match resolve_pipelines(new_config, registry, &health_registry, kv_stores, subrequest_client) {
         Ok(p) => p,
         Err(e) => {
             error!(error = %e, "config reload failed: pipeline build error");
@@ -142,6 +143,7 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_protocol_changes(old, new);
     detect_compression_additions(old, new);
     detect_tls_toggles(old, new);
+    detect_subrequest_connector_changes(old, new);
 }
 
 /// Detect listener additions, removals, and address rebinds.
@@ -253,6 +255,24 @@ fn detect_tls_toggles(old: &Config, new: &Config) {
     }
 }
 
+/// Detect changes to sub-request connector parameters.
+fn detect_subrequest_connector_changes(old: &Config, new: &Config) {
+    if old.runtime.subrequest_pool_size != new.runtime.subrequest_pool_size {
+        warn!(
+            old_pool_size = ?old.runtime.subrequest_pool_size,
+            new_pool_size = ?new.runtime.subrequest_pool_size,
+            "subrequest pool size changed; requires restart"
+        );
+    }
+    if old.runtime.subrequest_max_connections != new.runtime.subrequest_max_connections {
+        warn!(
+            old_max = ?old.runtime.subrequest_max_connections,
+            new_max = ?new.runtime.subrequest_max_connections,
+            "subrequest max connections changed; requires restart"
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Stateful Filter Warnings
 // -----------------------------------------------------------------------------
@@ -312,6 +332,7 @@ mod tests {
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &test_client(),
         );
 
         assert!(result.is_ok(), "valid reload should succeed");
@@ -345,6 +366,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &test_client(),
         );
         assert!(result.is_err(), "invalid filter should return Err");
 
@@ -365,6 +387,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &test_client(),
         )
         .unwrap();
 
@@ -387,6 +410,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &test_client(),
         )
         .unwrap();
 
@@ -424,6 +448,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &test_client(),
         );
         assert!(
             !old_token.is_cancelled(),
@@ -460,6 +485,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &test_client(),
         );
         assert!(result.is_ok(), "reload with new listener should succeed");
         assert!(
@@ -591,6 +617,16 @@ filter_chains:
         log_restart_required_changes(&old, &new);
     }
 
+    #[test]
+    fn subrequest_connector_change_detected() {
+        let old = valid_config();
+        let mut new = valid_config();
+        new.runtime.subrequest_pool_size = Some(32);
+        new.runtime.subrequest_max_connections = Some(256);
+
+        log_restart_required_changes(&old, &new);
+    }
+
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
@@ -618,7 +654,8 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let health_registry: HealthRegistry = Arc::new(HashMap::new());
-        let pipelines = resolve_pipelines(&config, &registry, &health_registry, &empty_kv_stores()).unwrap();
+        let pipelines =
+            resolve_pipelines(&config, &registry, &health_registry, &empty_kv_stores(), &test_client()).unwrap();
         let shutdown = Arc::new(Mutex::new(CancellationToken::new()));
         (pipelines, config, registry, shutdown)
     }
@@ -626,5 +663,10 @@ filter_chains:
     /// Empty KV store registry for tests without KV stores.
     fn empty_kv_stores() -> praxis_core::kv::KvStoreRegistry {
         praxis_core::kv::KvStoreRegistry::new()
+    }
+
+    /// Minimal sub-request client for tests.
+    fn test_client() -> praxis_core::subrequest::SubRequestClient {
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
     }
 }

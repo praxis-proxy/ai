@@ -104,6 +104,8 @@ struct ServerState {
     pipelines: Arc<ListenerPipelines>,
     /// KV store registry.
     kv_stores: praxis_core::kv::KvStoreRegistry,
+    /// Shared sub-request client for filters and `iterative_request_router` step chains.
+    subrequest_client: praxis_core::subrequest::SubRequestClient,
     /// Health check cancellation token.
     health_shutdown: Arc<Mutex<CancellationToken>>,
 }
@@ -113,7 +115,16 @@ fn build_server_state(config: &Config, registry: &FilterRegistry, health_registr
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
-    let pipelines = resolve_pipelines(config, registry, health_registry, &kv_stores).unwrap_or_else(|e| fatal(&e));
+    let pool_size = config
+        .runtime
+        .subrequest_pool_size
+        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
+    let subrequest_client = praxis_core::subrequest::SubRequestClient::new(
+        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections),
+    );
+
+    let pipelines = resolve_pipelines(config, registry, health_registry, &kv_stores, &subrequest_client)
+        .unwrap_or_else(|e| fatal(&e));
 
     let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_health_check_tasks(config, Arc::clone(health_registry), &health_shutdown);
@@ -121,6 +132,7 @@ fn build_server_state(config: &Config, registry: &FilterRegistry, health_registr
     ServerState {
         pipelines: Arc::new(pipelines),
         kv_stores,
+        subrequest_client,
         health_shutdown,
     }
 }
@@ -170,6 +182,7 @@ fn spawn_watcher(
         pipelines: state.pipelines,
         registry: Arc::new(registry),
         shutdown: CancellationToken::new(),
+        subrequest_client: state.subrequest_client,
     });
     Some(handle)
 }
