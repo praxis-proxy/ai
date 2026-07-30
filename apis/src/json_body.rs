@@ -71,6 +71,13 @@ pub struct SerializedJson {
 }
 
 impl SerializedJson {
+    /// Wrap already-serialized JSON bytes (produced by a state-driven serializer rather than a
+    /// `serde_json::Value`) for a later body replacement.
+    #[must_use]
+    pub fn from_bytes(bytes: impl Into<Bytes>) -> Self {
+        Self { bytes: bytes.into() }
+    }
+
     /// Length of the serialized body in bytes.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -331,5 +338,20 @@ mod tests {
         let value = json!({"a": 1});
         let serialized = serialize_json_body(&value).unwrap();
         assert_eq!(serialized.as_bytes(), &Bytes::from(serde_json::to_vec(&value).unwrap()));
+    }
+
+    #[test]
+    fn from_bytes_wraps_preserialized_json() {
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&req);
+        let mut body = Some(Bytes::from_static(b"{}"));
+        let bytes = Bytes::from(serde_json::to_vec(&json!({"a": 1})).unwrap());
+
+        let mutation =
+            SerializedJson::from_bytes(bytes.clone()).commit(&mut ctx, &mut body, "openai_responses_proxy", "body");
+
+        assert_eq!(mutation.new_len(), bytes.len());
+        assert_eq!(body.as_ref().unwrap(), &bytes);
+        assert_eq!(ctx.extra_request_headers[0].1, bytes.len().to_string());
     }
 }

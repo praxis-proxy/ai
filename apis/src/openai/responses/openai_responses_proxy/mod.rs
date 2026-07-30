@@ -41,6 +41,7 @@ use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
+use crate::json_body::{SerializedJson, serialize_json_body};
 
 // -----------------------------------------------------------------------------
 // ResponsesProxyFilter
@@ -186,7 +187,7 @@ impl HttpFilter for ResponsesProxyFilter {
             Err(action) => return Ok(action),
         };
 
-        *body = Some(Bytes::from(serialized));
+        SerializedJson::from_bytes(serialized).commit(body, "openai_responses_proxy", "body");
 
         Ok(FilterAction::Continue)
     }
@@ -210,8 +211,8 @@ fn strip_conversation_field(body: &mut Option<Bytes>) {
         .is_some_and(|obj| obj.remove("conversation").is_some())
     {
         debug!("stripped conversation from passthrough body");
-        if let Ok(serialized) = serde_json::to_vec(&parsed) {
-            *body = Some(Bytes::from(serialized));
+        if let Ok(serialized) = serialize_json_body(&parsed) {
+            serialized.commit(body, "openai_responses_proxy", "conversation");
         }
     }
 }
