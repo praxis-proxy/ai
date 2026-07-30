@@ -102,6 +102,7 @@ mod tests;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -238,19 +239,7 @@ impl HttpFilter for AgenticLoopFilter {
             )));
         }
 
-        state.tool_calls.clear();
-        state.parallel_tool_calls = false;
-        if let Some(obj) = state.request_body.as_object_mut() {
-            obj.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
-        }
-
-        if state.iteration > 0 {
-            state.tool_choice = json!("auto");
-            if let Some(obj) = state.request_body.as_object_mut() {
-                obj.insert("tool_choice".to_owned(), json!("auto"));
-            }
-        }
-
+        prepare_iteration(ctx, &mut state);
         trace!(iteration = state.iteration, "agentic_loop on_request_body");
         ctx.extensions.insert(state);
         Ok(FilterAction::Continue)
@@ -285,6 +274,31 @@ impl HttpFilter for AgenticLoopFilter {
         let result = evaluate_loop_decision(ctx, &mut state, body, &self.config)?;
         ctx.extensions.insert(state);
         Ok(result)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Request-Side Bookkeeping
+// -----------------------------------------------------------------------------
+
+/// Prepare state for the current iteration: clear stale tool calls,
+/// force `parallel_tool_calls=false`, and on re-entry reset
+/// `tool_choice` and set `Content-Type` (subrequests do not inherit
+/// the original client header).
+fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) {
+    state.tool_calls.clear();
+    state.parallel_tool_calls = false;
+    if let Some(obj) = state.request_body.as_object_mut() {
+        obj.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
+    }
+
+    if state.iteration > 0 {
+        state.tool_choice = json!("auto");
+        if let Some(obj) = state.request_body.as_object_mut() {
+            obj.insert("tool_choice".to_owned(), json!("auto"));
+        }
+        ctx.request_headers_to_set
+            .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));
     }
 }
 

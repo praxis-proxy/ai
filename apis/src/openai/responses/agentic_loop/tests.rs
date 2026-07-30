@@ -158,6 +158,50 @@ async fn tool_choice_reset_after_first_iteration() {
 }
 
 // -----------------------------------------------------------------------------
+// on_request_body: Content-Type on Re-entry
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sets_content_type_on_reentry() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.iteration = 1;
+    ctx.extensions.insert(state);
+
+    drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
+
+    let has_content_type = ctx
+        .request_headers_to_set
+        .iter()
+        .any(|(k, v)| k == http::header::CONTENT_TYPE && v == "application/json");
+    assert!(has_content_type, "IRR re-entry must set content-type: application/json");
+}
+
+#[tokio::test]
+async fn does_not_set_content_type_on_first_pass() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
+
+    let has_content_type = ctx
+        .request_headers_to_set
+        .iter()
+        .any(|(k, _)| k == http::header::CONTENT_TYPE);
+    assert!(
+        !has_content_type,
+        "first pass relies on client content-type, filter must not set it"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // on_request_body: Parallel Tool Calls
 // -----------------------------------------------------------------------------
 
