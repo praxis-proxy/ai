@@ -77,6 +77,7 @@ use self::{
 use super::{openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState};
 use crate::{
     classifier::is_responses_create,
+    json_body::serialize_json_body,
     openai::api_client::{ApiClient, ApiClientConfig},
     subrequest::SubRequestClient,
 };
@@ -369,13 +370,12 @@ fn rewrite_body(
     parsed: &serde_json::Value,
     max_body_bytes: usize,
 ) -> Result<Option<FilterAction>, FilterError> {
-    let rewritten = serde_json::to_vec(parsed)
+    let rewritten = serialize_json_body(parsed)
         .map_err(|e| -> FilterError { format!("openai_file_resolve: failed to serialize body: {e}").into() })?;
-    let len = rewritten.len();
-    if len > max_body_bytes {
-        return Ok(Some(reject_rewritten_body_too_large(len, max_body_bytes)));
+    if rewritten.len() > max_body_bytes {
+        return Ok(Some(reject_rewritten_body_too_large(rewritten.len(), max_body_bytes)));
     }
-    *body = Some(Bytes::from(rewritten));
+    rewritten.commit(body, "openai_file_resolve", "input");
     Ok(None)
 }
 
