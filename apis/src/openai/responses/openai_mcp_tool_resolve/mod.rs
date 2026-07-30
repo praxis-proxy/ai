@@ -54,7 +54,7 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
-use crate::mcp_client;
+use crate::{json_body::serialize_json_body, mcp_client};
 
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
@@ -518,12 +518,12 @@ fn rewrite_request_body(
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
     rewrite_tool_choice(obj, tool_map);
 
-    let serialized = serde_json::to_vec(&parsed).map_err(|e| {
+    let serialized = serialize_json_body(&parsed).map_err(|e| {
         debug!(error = %e, "failed to serialize rewritten body");
         ResolveError::Serialization(e)
     })?;
 
-    *body = Some(Bytes::from(serialized));
+    serialized.commit(body, "openai_mcp_tool_resolve", "tools");
 
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
     Ok(())

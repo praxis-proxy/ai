@@ -36,11 +36,10 @@ use tracing::debug;
 ///
 /// # Errors
 ///
-/// Returns [`JsonBodyError`] if `value` fails to serialize.
-pub fn serialize_json_body(value: &Value) -> Result<SerializedJson, JsonBodyError> {
-    let bytes = serde_json::to_vec(value).map_err(|e| JsonBodyError(format!("failed to serialize JSON body: {e}")))?;
+/// Returns [`serde_json::Error`] if `value` fails to serialize.
+pub fn serialize_json_body(value: &Value) -> Result<SerializedJson, serde_json::Error> {
     Ok(SerializedJson {
-        bytes: Bytes::from(bytes),
+        bytes: Bytes::from(serde_json::to_vec(value)?),
     })
 }
 
@@ -52,14 +51,14 @@ pub fn serialize_json_body(value: &Value) -> Result<SerializedJson, JsonBodyErro
 ///
 /// # Errors
 ///
-/// Returns [`JsonBodyError`] if `value` fails to serialize.
+/// Returns [`serde_json::Error`] if `value` fails to serialize.
 pub fn replace_json_body(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     value: &Value,
     filter: &'static str,
     field: &'static str,
-) -> Result<BodyMutation, JsonBodyError> {
+) -> Result<BodyMutation, serde_json::Error> {
     Ok(serialize_json_body(value)?.commit(ctx, body, filter, field))
 }
 
@@ -178,18 +177,6 @@ impl BodyMutation {
         new - old
     }
 }
-
-/// Error returned when a mutated JSON value cannot be re-serialized.
-#[derive(Debug)]
-pub struct JsonBodyError(String);
-
-impl std::fmt::Display for JsonBodyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for JsonBodyError {}
 
 // -----------------------------------------------------------------------------
 // Tests
