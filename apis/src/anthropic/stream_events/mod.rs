@@ -19,7 +19,10 @@ use serde_json::Value;
 use tracing::debug;
 
 use self::config::{AnthropicStreamEventsConfig, build_config};
-use crate::is_event_stream_content_type;
+use crate::{
+    anthropic::wire::{MessageDeltaUsage, MessageUsage},
+    is_event_stream_content_type,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -725,28 +728,13 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
 }
 
 /// Build a schema-complete Anthropic `Message.usage` value.
-fn message_start_usage() -> Value {
-    serde_json::json!({
-        "cache_creation": null,
-        "cache_creation_input_tokens": null,
-        "cache_read_input_tokens": null,
-        "inference_geo": null,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "server_tool_use": null,
-        "service_tier": null
-    })
+fn message_start_usage() -> MessageUsage {
+    MessageUsage::new(0, 0, None)
 }
 
 /// Build a schema-complete Anthropic `message_delta.usage` value.
-fn message_delta_usage(output_tokens: u64) -> Value {
-    serde_json::json!({
-        "cache_creation_input_tokens": null,
-        "cache_read_input_tokens": null,
-        "input_tokens": null,
-        "output_tokens": output_tokens,
-        "server_tool_use": null
-    })
+fn message_delta_usage(output_tokens: u64) -> MessageDeltaUsage {
+    MessageDeltaUsage::new(output_tokens)
 }
 
 /// Map `OpenAI` finish reasons to Anthropic stop reasons.
@@ -977,6 +965,7 @@ mod tests {
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
                 "inference_geo",
+                "output_tokens_details",
                 "server_tool_use",
                 "service_tier",
             ],
@@ -1015,6 +1004,7 @@ mod tests {
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
                 "input_tokens",
+                "output_tokens_details",
                 "server_tool_use",
             ],
             "message_delta usage",

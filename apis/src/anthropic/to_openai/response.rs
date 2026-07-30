@@ -3,7 +3,10 @@
 
 //! Chat Completions-compatible response to Anthropic Messages transformation.
 
+use http::StatusCode;
 use serde_json::{Map, Value, json};
+
+use crate::anthropic::wire::{self, MessageResponse, MessageUsage};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -14,6 +17,21 @@ const RESPONSE_TYPE: &str = "message";
 
 /// Default response role.
 const RESPONSE_ROLE: &str = "assistant";
+
+/// Anthropic error types that may be preserved from an upstream response.
+const ANTHROPIC_ERROR_TYPES: &[&str] = &[
+    "invalid_request_error",
+    "authentication_error",
+    "billing_error",
+    "permission_error",
+    "not_found_error",
+    "conflict_error",
+    "request_too_large",
+    "rate_limit_error",
+    "timeout_error",
+    "api_error",
+    "overloaded_error",
+];
 
 // -----------------------------------------------------------------------------
 // Response Transformation
@@ -36,35 +54,83 @@ pub(crate) fn transform_response(body: &[u8], request_model: &str) -> Result<Tra
         return Err("response body is not a JSON object".to_owned());
     };
 
-    let mut anthropic = Map::new();
-
     let id = match obj.get("id").and_then(Value::as_str) {
         Some(id) => format!("msg_{id}"),
         None => format!("msg_{}", timestamp_hex_id()),
     };
 
-    anthropic.insert("id".to_owned(), Value::String(id));
-    anthropic.insert("type".to_owned(), Value::String(RESPONSE_TYPE.to_owned()));
-    anthropic.insert("role".to_owned(), Value::String(RESPONSE_ROLE.to_owned()));
-
     let model = obj.get("model").and_then(Value::as_str).unwrap_or(request_model);
-    anthropic.insert("model".to_owned(), Value::String(model.to_owned()));
-
-    let content = build_content_blocks(obj);
-    anthropic.insert("content".to_owned(), Value::Array(content));
 
     let (stop_reason, original_finish_reason) = map_finish_reason(obj);
-    anthropic.insert("stop_reason".to_owned(), Value::String(stop_reason));
-    anthropic.insert("stop_sequence".to_owned(), Value::Null);
+    let response = MessageResponse {
+        id,
+        r#type: RESPONSE_TYPE,
+        role: RESPONSE_ROLE,
+        model,
+        content: build_content_blocks(obj),
+        stop_reason,
+        stop_sequence: None,
+        stop_details: None,
+        container: None,
+        usage: build_usage(obj),
+    };
 
-    let usage = build_usage(obj);
-    anthropic.insert("usage".to_owned(), usage);
-
-    let body = serde_json::to_vec(&Value::Object(anthropic)).map_err(|e| format!("serialization failed: {e}"))?;
+    let body = serde_json::to_vec(&response).map_err(|e| format!("serialization failed: {e}"))?;
     Ok(TransformResult {
         body,
         original_finish_reason,
     })
+}
+
+/// Transform an upstream 4xx or 5xx response into Anthropic error format.
+pub(crate) fn transform_error_response(body: &[u8], status: StatusCode, header_request_id: Option<&str>) -> Vec<u8> {
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let is_anthropic_error = parsed
+        .as_ref()
+        .is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("error"));
+    let message = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("upstream request failed");
+    let upstream_error_type = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .filter(|error_type| is_anthropic_error || ANTHROPIC_ERROR_TYPES.contains(error_type));
+    let request_id = parsed
+        .as_ref()
+        .and_then(|value| value.get("request_id"))
+        .and_then(Value::as_str)
+        .or(header_request_id);
+    let error_type = upstream_error_type.unwrap_or_else(|| error_type_for_status(status));
+
+    wire::error_body(error_type, message, request_id)
+}
+
+/// Map an HTTP error status to its Anthropic error type.
+fn error_type_for_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "authentication_error",
+        402 => "billing_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        409 => "conflict_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        504 => "timeout_error",
+        529 => "overloaded_error",
+        500..=599 => "api_error",
+        _ => "invalid_request_error",
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -164,7 +230,7 @@ fn map_finish_reason(obj: &Map<String, Value>) -> (String, String) {
 /// `prompt_tokens` includes them. The cached count must be subtracted
 /// here so downstream Anthropic-format consumers that sum
 /// `input_tokens + cache_read_input_tokens` don't double-count.
-fn build_usage(obj: &Map<String, Value>) -> Value {
+fn build_usage(obj: &Map<String, Value>) -> MessageUsage {
     let usage = obj.get("usage");
 
     let prompt_tokens = usage
@@ -187,18 +253,7 @@ fn build_usage(obj: &Map<String, Value>) -> Value {
         None => prompt_tokens,
     };
 
-    let mut usage_obj = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens
-    });
-
-    if let Some(cached) = cache_read
-        && let Some(obj) = usage_obj.as_object_mut()
-    {
-        obj.insert("cache_read_input_tokens".to_owned(), Value::Number(cached.into()));
-    }
-
-    usage_obj
+    MessageUsage::new(input_tokens, output_tokens, cache_read)
 }
 
 // -----------------------------------------------------------------------------
@@ -224,7 +279,105 @@ fn timestamp_hex_id() -> String {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
+    use http::StatusCode;
+
     use super::*;
+
+    fn assert_null_fields(value: &Value, fields: &[&str]) {
+        for field in fields {
+            assert!(value.get(*field).is_some(), "expected {field} to be present");
+            assert!(value[*field].is_null(), "expected {field} to be null");
+        }
+    }
+
+    #[test]
+    fn compatible_upstream_error_is_preserved() {
+        let body = br#"{"error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req_body"}"#;
+        let output = transform_error_response(body, StatusCode::TOO_MANY_REQUESTS, Some("req_header"));
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "rate_limit_error");
+        assert_eq!(parsed["error"]["message"], "slow down");
+        assert_eq!(parsed["request_id"], "req_body");
+    }
+
+    #[test]
+    fn future_anthropic_error_type_is_preserved() {
+        let body = br#"{"type":"error","error":{"type":"future_error","message":"new failure"}}"#;
+        let output = transform_error_response(body, StatusCode::INTERNAL_SERVER_ERROR, None);
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["error"]["type"], "future_error");
+        assert_eq!(parsed["error"]["message"], "new failure");
+    }
+
+    #[test]
+    fn incompatible_error_type_uses_status_mapping_and_header_request_id() {
+        let output = transform_error_response(
+            br#"{"error":{"type":"server_error","message":"failed"}}"#,
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("req_header"),
+        );
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert_eq!(parsed["error"]["message"], "failed");
+        assert_eq!(parsed["request_id"], "req_header");
+    }
+
+    #[test]
+    fn top_level_error_message_is_preserved() {
+        let output = transform_error_response(
+            br#"{"message":"backend rejected the request"}"#,
+            StatusCode::BAD_REQUEST,
+            None,
+        );
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+        assert_eq!(parsed["error"]["message"], "backend rejected the request");
+        assert!(parsed["request_id"].is_null());
+    }
+
+    #[test]
+    fn unstructured_errors_do_not_reflect_unknown_text() {
+        for body in [
+            b"".as_slice(),
+            b"[]".as_slice(),
+            b"<html>secret backend diagnostic</html>".as_slice(),
+        ] {
+            let output = transform_error_response(body, StatusCode::BAD_GATEWAY, None);
+            let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+            assert_eq!(parsed["error"]["type"], "api_error");
+            assert_eq!(parsed["error"]["message"], "upstream request failed");
+            assert!(parsed["request_id"].is_null());
+        }
+    }
+
+    #[test]
+    fn error_statuses_map_to_anthropic_types() {
+        for (status, expected) in [
+            (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            (StatusCode::UNAUTHORIZED, "authentication_error"),
+            (StatusCode::PAYMENT_REQUIRED, "billing_error"),
+            (StatusCode::FORBIDDEN, "permission_error"),
+            (StatusCode::NOT_FOUND, "not_found_error"),
+            (StatusCode::CONFLICT, "conflict_error"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+            (StatusCode::GATEWAY_TIMEOUT, "timeout_error"),
+            (StatusCode::from_u16(529).unwrap(), "overloaded_error"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
+        ] {
+            let output = transform_error_response(b"", status, None);
+            let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+            assert_eq!(parsed["error"]["type"], expected, "status {status}");
+        }
+    }
 
     #[test]
     fn basic_text_response() {
@@ -238,8 +391,21 @@ mod tests {
         assert_eq!(parsed["content"][0]["type"], "text", "content block type");
         assert_eq!(parsed["content"][0]["text"], "Hello!", "content text");
         assert_eq!(parsed["stop_reason"], "end_turn", "stop → end_turn");
+        assert_null_fields(&parsed, &["container", "stop_details", "stop_sequence"]);
         assert_eq!(parsed["usage"]["input_tokens"], 10, "input tokens");
         assert_eq!(parsed["usage"]["output_tokens"], 5, "output tokens");
+        assert_null_fields(
+            &parsed["usage"],
+            &[
+                "cache_creation",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "inference_geo",
+                "output_tokens_details",
+                "server_tool_use",
+                "service_tier",
+            ],
+        );
     }
 
     #[test]
@@ -277,6 +443,17 @@ mod tests {
             parsed["usage"]["input_tokens"], 20,
             "input_tokens should exclude cached tokens (100 prompt - 80 cached)"
         );
+        assert_null_fields(
+            &parsed["usage"],
+            &[
+                "cache_creation",
+                "cache_creation_input_tokens",
+                "inference_geo",
+                "output_tokens_details",
+                "server_tool_use",
+                "service_tier",
+            ],
+        );
     }
 
     #[test]
@@ -308,10 +485,7 @@ mod tests {
             parsed["usage"]["input_tokens"], 42,
             "input_tokens should be unchanged when no cache info is present"
         );
-        assert!(
-            parsed["usage"].get("cache_read_input_tokens").is_none(),
-            "cache_read_input_tokens should be absent when no cache info is present"
-        );
+        assert_null_fields(&parsed["usage"], &["cache_read_input_tokens"]);
     }
 
     #[test]

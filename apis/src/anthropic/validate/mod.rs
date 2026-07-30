@@ -10,7 +10,13 @@
 mod config;
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::needless_raw_strings, reason = "tests")]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::needless_raw_strings,
+    reason = "tests"
+)]
 mod tests;
 
 use async_trait::async_trait;
@@ -21,6 +27,7 @@ use praxis_filter::{
 use tracing::debug;
 
 use self::config::{AnthropicValidateConfig, build_config};
+use crate::anthropic::wire;
 
 // -----------------------------------------------------------------------------
 // AnthropicValidateFilter
@@ -119,15 +126,5 @@ fn validate_request(body: &[u8]) -> Option<Rejection> {
 
 /// Build a 400 rejection with a JSON error body.
 fn reject(message: &str) -> Rejection {
-    let body = serde_json::json!({
-        "error": {
-            "message": message,
-            "type": "invalid_request_error"
-        }
-    })
-    .to_string();
-
-    Rejection::status(400)
-        .with_header("content-type", "application/json")
-        .with_body(Bytes::from(body))
+    wire::invalid_request_rejection(message)
 }
