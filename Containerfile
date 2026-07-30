@@ -29,18 +29,24 @@ COPY server/build_support/Cargo.toml ./server/build_support/Cargo.toml
 
 # The server crate has a build.rs that discovers external filter
 # crates via cargo metadata for build-time auto-registration,
-# backed by the praxis-ai-build-support crate.
+# backed by the praxis-ai-build-support crate. build.rs is a
+# build-dependency of the server crate, not an ordinary crate under
+# test: cargo compiles it (and everything it depends on) up front,
+# so praxis-ai-build-support needs its real source here too, not a
+# stub — a stub would compile but export none of the functions
+# build.rs calls, breaking compilation of the build script itself.
 COPY server/build.rs ./server/build.rs
+COPY server/build_support/src ./server/build_support/src
 
 # Strip workspace members not needed for the binary.
 RUN sed -i '/xtask/d; /tests\//d' Cargo.toml
 
-# Create stub source files for all crates.
-RUN mkdir -p apis/src filters/src server/src server/build_support/src \
+# Create stub source files for the crates whose real source isn't
+# needed until after dependencies are cached.
+RUN mkdir -p apis/src filters/src server/src \
     && echo '//! stub' > apis/src/lib.rs \
     && echo '//! stub' > filters/src/lib.rs \
     && echo '//! stub' > server/src/lib.rs \
-    && echo '//! stub' > server/build_support/src/lib.rs \
     && printf '//! stub\nfn main() {}\n' > server/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -53,12 +59,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Replace stubs with real source, then rebuild. Only the project
 # crates recompile; all external dependencies are cached.
+# build_support/src was already real (see above), so it is not
+# copied again here.
 COPY apis/src ./apis/src
 COPY filters/src ./filters/src
 COPY server/src ./server/src
-COPY server/build_support/src ./server/build_support/src
 
-RUN find apis/src filters/src server/src server/build_support/src \
+RUN find apis/src filters/src server/src \
     -name '*.rs' -exec touch {} +
 
 # ------------------------------------------------------------------------------
