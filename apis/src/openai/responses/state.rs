@@ -64,10 +64,11 @@ pub(crate) struct ResponsesState {
     /// `agentic_loop` at the start of each new inference round.
     pub iteration: u32,
 
-    /// Maximum number of tool-call rounds in the agentic loop.
+    /// Maximum number of built-in tool invocations.
     ///
-    /// `agentic_loop` checks this to cap iterations. `None` means
-    /// no explicit limit was set by the client.
+    /// Reserved for future use by built-in tool filters. Not
+    /// currently enforced by any filter. `None` means no explicit
+    /// limit was set by the client.
     pub max_tool_calls: Option<u32>,
 
     /// Resolved MCP tool definitions keyed by `(server_label,
@@ -136,6 +137,14 @@ pub(crate) struct ResponsesState {
     /// request. `stream_events` merges per-iteration usage into
     /// the running total.
     pub usage: serde_json::Value,
+
+    /// Output items accumulated across all agentic loop iterations.
+    ///
+    /// Each round's model output items and MCP execution results are
+    /// appended here so the final response contains the complete
+    /// trace. `agentic_loop` writes model items, `mcp_dispatch`
+    /// writes `mcp_call` and `mcp_approval_request` items.
+    pub accumulated_output: Vec<serde_json::Value>,
 }
 
 impl Default for ResponsesState {
@@ -161,6 +170,7 @@ impl Default for ResponsesState {
             tool_choice: serde_json::Value::String("auto".to_owned()),
             tools: Vec::new(),
             usage: serde_json::Value::Null,
+            accumulated_output: Vec::new(),
         }
     }
 }
@@ -190,6 +200,7 @@ impl ResponsesState {
             request_body: body,
             tool_choice,
             tools,
+            accumulated_output: Vec::new(),
             ..Default::default()
         }
     }
@@ -526,6 +537,7 @@ mod tests {
         assert_eq!(state.tool_choice, json!("auto"));
         assert!(state.tools.is_empty());
         assert!(state.usage.is_null());
+        assert!(state.accumulated_output.is_empty());
     }
 
     #[test]

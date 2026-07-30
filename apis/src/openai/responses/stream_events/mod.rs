@@ -10,7 +10,7 @@
 //! [`SseFrameParser`]: crate::openai::sse::SseFrameParser
 //! [`ResponsesState`]: super::state::ResponsesState
 
-mod accumulator;
+pub(crate) mod accumulator;
 mod config;
 
 use std::time::{Duration, Instant};

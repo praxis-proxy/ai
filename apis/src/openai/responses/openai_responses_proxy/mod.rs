@@ -244,6 +244,9 @@ impl serde::Serialize for OutboundBody<'_> {
                     wrote_input = true;
                 },
                 "previous_response_id" | "conversation" => {},
+                "tool_choice" => {
+                    map.serialize_entry(name, &self.state.tool_choice)?;
+                },
                 _ => map.serialize_entry(name, value)?,
             }
         }

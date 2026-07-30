@@ -1,54 +1,68 @@
 # Agentic Loop Controller
 #
-# Demonstrates the agentic_loop filter that manages the inference
-# loop lifecycle for the Responses API. The filter observes whether
-# tool calls are present in the response and signals whether to
-# loop back for another inference round or exit to the client.
+# Demonstrates the agentic_loop filter with iterative_request_router
+# for step-based model-tool-model looping in the Responses API.
 #
-# Tool call classification and execution are NOT handled here —
-# those are the responsibility of tool_parse and sub-filters
-# routed via branch chains.
+# The iterative_request_router (IRR) repeatedly runs one inference step.
+# `openai_mcp_dispatch` dynamically executes MCP calls against the server URL
+# supplied in the request, then the same step sends the result back to the
+# model. Client-side function calls do not match the MCP tool map and are
+# returned to the client without looping.
 #
-# Pipeline ordering:
+# Pre-IRR filters run once on the client request to set up shared
+# state (ResponsesState) which persists across all IRR iterations
+# via extension swapping.
+#
+# Response-phase execution order:
+#   Response filters execute in REVERSE order within each step.
+#   Filters listed first in the YAML run last in the response phase.
+#
+# Pipeline ordering (pre-IRR, runs once):
 #   1. openai_responses_format — classifies body, promotes metadata
 #   2. openai_responses_validate — validates parameters, generates IDs
 #   3. openai_response_store — registers the store backend
 #   4. openai_responses_rehydrate — loads previous_response_id context
-#      and creates ResponsesState (required by agentic_loop)
-#   5. responses_proxy — rebuilds outbound request from ResponsesState
-#   6. agentic_loop — checks exit conditions, sets loop control signal
 #
-# Loop control is via filter_results + branch chain re-entrance:
-#   agentic_loop.action = "loop"  — branch re-enters at responses_proxy
-#   agentic_loop.action = "done"  — exit the loop
+# IRR inference filter chain:
+#   Request phase (forward):
+#     openai_mcp_dispatch → agentic_loop → openai_responses_proxy
+#       → router → load_balancer
+#   Response phase (reverse):
+#     load_balancer → router → openai_responses_proxy → agentic_loop
+#       → openai_mcp_dispatch
+#   agentic_loop extracts completed function calls. MCP dispatch then
+#   identifies calls resolved from the request, writes the IRR transition,
+#   and executes them at the start of the next iteration before inference.
 #
-# The branch chain on agentic_loop uses the praxis-core ReEnter
-# rejoin mode (see examples/configs/branching/reentrance.yaml in
-# praxis-core). max_iterations on the branch chain provides an
-# infrastructure-level safety cap; max_infer_iters on the filter
-# provides application-level semantics (marking the response as
-# incomplete when the iteration limit is reached).
+# Transition rules (evaluated after each step's response-body):
+#   openai_mcp_dispatch.action = "loop" → next: inference
+#   default                             → done (exit to client)
 #
 # Config knobs:
-#   max_infer_iters: caps total inference loop iterations (default 10)
+#   max_infer_iters: application-level iteration cap (default 10)
+#   max_iterations:  infrastructure-level safety cap on IRR. It must be
+#                    at least max_infer_iters + 1 (initial inference plus
+#                    the allowed MCP-backed inference continuations).
+#
+# Streaming limitation:
+#   IRR does not support incremental streaming. All responses within
+#   the loop are fully buffered.
 #
 # Example requests:
 #
-#   # First turn (stored, agentic_loop passes through)
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"Hello"}'
 #
-#   # Multi-turn with agentic_loop active
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{
 #       "model": "gpt-4.1",
 #       "input": "What is the weather in SF?",
-#       "previous_response_id": "resp_abc",
-#       "tools": [{"type": "function", "name": "get_weather",
-#                  "parameters": {"type":"object","properties":
-#                  {"location":{"type":"string"}}}}]
+#       "tools": [{"type": "mcp", "server_label": "weather",
+#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "allowed_tools": ["get_weather"],
+#                  "require_approval": "never"}]
 #     }'
 #
 # Build:
@@ -71,6 +85,8 @@ filter_chains:
 
       - filter: openai_responses_validate
 
+      - filter: openai_tool_parse
+
       - filter: openai_response_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
@@ -79,33 +95,33 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
-      - filter: openai_responses_proxy
-        name: inference
+      - filter: openai_mcp_tool_resolve
 
-      - filter: agentic_loop
-        max_infer_iters: 10
-        branch_chains:
-          - name: tool-loop
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 11
+        steps:
+          - name: inference
+            filters:
+              # Runs first on request re-entry to execute the pending MCP
+              # call, and last on the model response to select loop/done.
+              - filter: openai_mcp_dispatch
+              - filter: agentic_loop
+                max_infer_iters: 10
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference-backend"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
             on_result:
-              filter: agentic_loop
-              key: action
-              result: loop
-            rejoin: inference
-            max_iterations: 15
-            chains:
-              - name: tool-execution
-                filters:
-                  - filter: openai_web_search
-
-      - filter: router
-        routes:
-          - path: "/v1/responses"
-            headers:
-              x-praxis-ai-format: "openai_responses"
-            cluster: "inference-backend"
-
-      - filter: load_balancer
-        clusters:
-          - name: "inference-backend"
-            endpoints:
-              - "127.0.0.1:3001"
+              - filter: openai_mcp_dispatch
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true

@@ -28,7 +28,6 @@ const SKIP: &[&str] = &[
     "mcp-classifier-routing.yaml",
     "model-to-header-routing.yaml",
     "openai/conversations/conversations.yaml",
-    "openai/responses/agentic-loop.yaml",
     "openai/responses/format-routing.yaml",
     "openai/responses/full-flow.yaml",
     "openai/responses/model-rewrite.yaml",

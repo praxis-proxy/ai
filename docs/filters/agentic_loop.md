@@ -7,13 +7,14 @@ Agentic loop controller for the Responses API pipeline.
 
 ## Configuration Notes
 
-Reads tool calls from [`ResponsesState`] during `on_request`, checks exit conditions, manages iteration state, and writes `filter_results` to control branch chain looping. Branch chains only evaluate conditions after `on_request`, so all loop control must happen in this phase.
+Manages iteration bookkeeping in `on_request_body`, extracts tool calls from non-streaming response bodies, and evaluates loop control in `on_response_body` (end-of-stream), writing `filter_results` for `iterative_request_router` transitions.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_infer_iters` | u32 | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the response is marked incomplete and the loop exits. |
+| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. |
+| `max_body_bytes` | integer | no | Maximum response body size in bytes for `StreamBuffer` mode. |
 
 ## Examples
 
@@ -28,4 +29,5 @@ filter: agentic_loop
 ```yaml
 filter: agentic_loop
 max_infer_iters: 10
+max_body_bytes: 10485760
 ```
