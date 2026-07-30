@@ -21,8 +21,9 @@
     {
       "area_id": "conversations",
       "area": "Conversations",
-      "projection_sha256": "8c613541c92f2df0fd2f3a424fd067adceb737d5d0dfe1916ed19dc52ff61421",
-      "operations": 8
+      "projection_sha256": "b5b8af413e9cc84597d300f41789b6fb988f328baa531a61df8877fe321dc856",
+      "operations": 8,
+      "inherited_security": "deployment"
     }
   ],
   "capability_coverage": {
@@ -370,11 +371,8 @@
           ]
         },
         "inherited_contract": {
-          "exact": false,
-          "details": [
-            "security.deleted",
-            "components.securitySchemes.deleted"
-          ]
+          "exact": true,
+          "details": []
         },
         "upstream_spec_exceptions": [
           {
@@ -539,18 +537,15 @@
     "area_contracts": [
       {
         "area": "Conversations",
-        "exact": false,
-        "details": [
-          "security.deleted",
-          "components.securitySchemes.deleted"
-        ]
+        "exact": true,
+        "details": []
       }
     ],
     "all_exact": false,
     "fixes_required": {
       "summary": {
         "operations_to_fix": 5,
-        "area_contracts_to_fix": 1,
+        "area_contracts_to_fix": 0,
         "missing_operations": 0,
         "request_drift_operations": 4,
         "response_drift_operations": 3,
@@ -686,22 +681,7 @@
           ]
         }
       ],
-      "by_area": [
-        {
-          "area": "Conversations",
-          "fixes": [
-            {
-              "area": "area",
-              "kind": "inherited_contract",
-              "summary": "Align global or inherited OpenAPI contract fields with the OpenAI spec.",
-              "detail_paths": [
-                "security.deleted",
-                "components.securitySchemes.deleted"
-              ]
-            }
-          ]
-        }
-      ]
+      "by_area": []
     }
   },
   "runtime_verification": {

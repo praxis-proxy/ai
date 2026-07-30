@@ -10,7 +10,7 @@ pub(super) const OPENAI_REFERENCE_MANIFEST: &str = "docs/conformance/specs/opena
 
 /// Conversations operations selected from the full OpenAI reference.
 pub(super) const CONVERSATIONS_SCOPE: OperationScope =
-    OperationScope::new("conversations", "Conversations", &["/conversations"]);
+    OperationScope::new("conversations", "Conversations", &["/conversations"]).without_inherited_security();
 
 /// Runtime checks executed while generating the conformance report.
 const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[

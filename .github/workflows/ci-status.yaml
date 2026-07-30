@@ -61,11 +61,24 @@ jobs:
               });
 
               // Only include GitHub Actions checks, excluding ourselves
-              const relevant = checkRuns.filter(cr => {
+              const filtered = checkRuns.filter(cr => {
                 if (excludedChecks.has(cr.name)) return false;
                 if (!cr.app || cr.app.slug !== 'github-actions') return false;
                 return true;
               });
+
+              // Deduplicate by check name, keeping the most recently started run.
+              // When cancel-in-progress supersedes a run, both the cancelled and
+              // the replacement run appear as separate check_run entries on the
+              // same SHA. Without dedup the cancelled run blocks forever.
+              const latestByName = new Map();
+              for (const cr of filtered) {
+                const prev = latestByName.get(cr.name);
+                if (!prev || new Date(cr.started_at) > new Date(prev.started_at)) {
+                  latestByName.set(cr.name, cr);
+                }
+              }
+              const relevant = [...latestByName.values()];
 
               if (relevant.length === 0) {
                 core.info('No other CI checks found yet, waiting...');
@@ -73,8 +86,12 @@ jobs:
                 continue;
               }
 
-              const pending = relevant.filter(cr => !terminalStatuses.has(cr.status));
-              const completed = relevant.filter(cr => terminalStatuses.has(cr.status));
+              // A check is done when its status is "completed", OR when the API
+              // reports a conclusion despite the status still being "in_progress"
+              // (a known GitHub glitch where status never flips).
+              const isDone = cr => terminalStatuses.has(cr.status) || cr.conclusion != null;
+              const pending = relevant.filter(cr => !isDone(cr));
+              const completed = relevant.filter(cr => isDone(cr));
 
               core.info(`Checks: ${completed.length} completed, ${pending.length} pending out of ${relevant.length} total`);
 

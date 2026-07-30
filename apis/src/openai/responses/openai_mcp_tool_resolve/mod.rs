@@ -167,17 +167,32 @@ impl McpToolResolveFilter {
 
     /// Resolve all MCP entries, building both the global dispatch
     /// map and pre-built function tools for body rewriting.
+    ///
+    /// Server resolutions run concurrently via
+    /// [`futures::future::try_join_all`]. Non-credentialed entries
+    /// sharing the same `(server_label, server_url)` are
+    /// deduplicated to a single resolution task; credentialed
+    /// entries always resolve independently.
     async fn resolve_all_entries(
         &self,
         entries: &[serde_json::Value],
         previous_tools: Option<&Vec<serde_json::Value>>,
     ) -> Result<Resolution, ResolveError> {
+        let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries);
+
+        let futures: Vec<_> = task_entries
+            .iter()
+            .zip(&task_allowed_names)
+            .map(|(entry, allowed)| self.resolve_entry(entry, previous_tools, allowed.as_deref()))
+            .collect();
+        let task_results = futures::future::try_join_all(futures).await?;
+
         let mut tool_map = HashMap::new();
         let mut per_entry = Vec::with_capacity(entries.len());
-        let mut fetched: HashMap<(&str, &str), Vec<serde_json::Value>> = HashMap::new();
 
-        for entry in entries {
-            let Some(tools) = self.resolve_entry(entry, previous_tools, &mut fetched).await? else {
+        for (entry, task_idx) in entries.iter().zip(&entry_to_task) {
+            let tools_opt = task_idx.and_then(|idx| task_results.get(idx)?.clone());
+            let Some(tools) = tools_opt else {
                 per_entry.push(Vec::new());
                 continue;
             };
@@ -195,36 +210,32 @@ impl McpToolResolveFilter {
         Ok(Resolution { per_entry, tool_map })
     }
 
-    /// Resolve tools for a single entry, reusing within-request
-    /// cached results for the same `(label, url)`.
-    async fn resolve_entry<'a>(
+    /// Resolve tools for a single MCP entry independently.
+    ///
+    /// `cache_allowed_names` is the union of `allowed_tools` names
+    /// across all entries sharing this resolution task; it is passed
+    /// to [`find_cached_listing`] so the cache is only used when it
+    /// covers every entry in the group.
+    async fn resolve_entry(
         &self,
-        entry: &'a serde_json::Value,
+        entry: &serde_json::Value,
         previous_tools: Option<&Vec<serde_json::Value>>,
-        fetched: &mut HashMap<(&'a str, &'a str), Vec<serde_json::Value>>,
+        cache_allowed_names: Option<&[String]>,
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
         let Some(server_url) = resolvable_server_url(entry) else {
             return Ok(None);
         };
         let label = server_label(entry);
-        let has_credentials = has_entry_credentials(entry);
-        if !has_credentials && let Some(cached) = fetched.get(&(label, server_url)) {
-            return Ok(Some(cached.clone()));
-        }
         mcp_client::validate_mcp_url(server_url, self.timeout, self.allow_loopback)
             .await
             .map_err(ResolveError::Client)?;
-        let allowed = extract_allowed_tools(entry);
-        if !has_credentials
-            && let Some(cached) = find_cached_listing(previous_tools, label, server_url, allowed.as_names())
+        if !has_entry_credentials(entry)
+            && let Some(cached) = find_cached_listing(previous_tools, label, server_url, cache_allowed_names)
         {
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
         let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools, self.allow_loopback).await?;
-        if !has_credentials {
-            fetched.insert((label, server_url), tools.clone());
-        }
         Ok(Some(tools))
     }
 }
@@ -377,6 +388,64 @@ fn check_duplicate_labels(entries: &[serde_json::Value]) -> Result<(), ResolveEr
         }
     }
     Ok(())
+}
+
+/// Return type for [`dedup_entries`]: `(entry_to_task, task_entries, task_allowed_names)`.
+type DedupResult<'a> = (Vec<Option<usize>>, Vec<&'a serde_json::Value>, Vec<Option<Vec<String>>>);
+
+/// Deduplicate MCP entries into resolution tasks. Non-credentialed
+/// entries sharing the same `(label, url)` map to a single task;
+/// credentialed entries always get their own task.
+fn dedup_entries(entries: &[serde_json::Value]) -> DedupResult<'_> {
+    let mut entry_to_task: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut task_entries: Vec<&serde_json::Value> = Vec::new();
+    let mut task_allowed_names: Vec<Option<Vec<String>>> = Vec::new();
+    let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
+
+    for (slot, entry) in entry_to_task.iter_mut().zip(entries) {
+        let Some(url) = resolvable_server_url(entry) else {
+            continue;
+        };
+        let allowed = extract_allowed_tools(entry);
+        let existing = if has_entry_credentials(entry) {
+            None
+        } else {
+            seen.get(&(server_label(entry), url)).copied()
+        };
+        if let Some(task_idx) = existing {
+            if let Some(merged) = task_allowed_names.get_mut(task_idx) {
+                merge_allowed_names(merged, &allowed.names);
+            }
+            *slot = Some(task_idx);
+        } else {
+            let task_idx = task_entries.len();
+            if !has_entry_credentials(entry) {
+                seen.insert((server_label(entry), url), task_idx);
+            }
+            task_entries.push(entry);
+            task_allowed_names.push(allowed.names);
+            *slot = Some(task_idx);
+        }
+    }
+
+    (entry_to_task, task_entries, task_allowed_names)
+}
+
+/// Merge `new` into `existing` as a union. If either side is
+/// unrestricted (`None`), the result is unrestricted.
+fn merge_allowed_names(existing: &mut Option<Vec<String>>, new: &Option<Vec<String>>) {
+    let Some(new_names) = new else {
+        *existing = None;
+        return;
+    };
+    let Some(existing_names) = existing.as_mut() else {
+        return;
+    };
+    for name in new_names {
+        if !existing_names.contains(name) {
+            existing_names.push(name.clone());
+        }
+    }
 }
 
 /// Count distinct resolvable `(server_label, server_url)` pairs.
