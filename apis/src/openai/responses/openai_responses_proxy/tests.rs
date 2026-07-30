@@ -222,7 +222,7 @@ async fn rebuilds_body_with_conversation_history() {
 }
 
 #[tokio::test]
-async fn updates_content_length_header() {
+async fn does_not_set_content_length_header() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -244,25 +244,11 @@ async fn updates_content_length_header() {
     ));
     let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    let has_content_length = ctx
-        .extra_request_headers
-        .iter()
-        .any(|(k, _)| k.as_ref() == "content-length");
     assert!(
-        has_content_length,
-        "content-length header should be set after body rebuild"
-    );
-
-    let cl_value: usize = ctx
-        .extra_request_headers
-        .iter()
-        .find(|(k, _)| k.as_ref() == "content-length")
-        .map(|(_, v)| v.parse().unwrap())
-        .unwrap();
-    assert_eq!(
-        cl_value,
-        body.as_ref().unwrap().len(),
-        "content-length should match rebuilt body size"
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-length"),
+        "filter must not set content-length (core handles framing)"
     );
 }
 
@@ -404,12 +390,11 @@ async fn passthrough_strips_conversation_from_body() {
         "conversation should be stripped even without ResponsesState"
     );
     assert_eq!(parsed["model"], "gpt-4.1", "other fields should be preserved");
-    assert_eq!(
+    assert!(
         ctx.extra_request_headers
             .iter()
-            .find(|(name, _value)| name.as_ref() == "content-length")
-            .map(|(_name, value)| value.parse::<usize>().unwrap()),
-        body.as_ref().map(Bytes::len)
+            .all(|(k, _)| k.as_ref() != "content-length"),
+        "filter must not set content-length (core handles framing)"
     );
 }
 

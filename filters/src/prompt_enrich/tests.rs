@@ -434,18 +434,15 @@ async fn body_none_returns_continue() {
 }
 
 #[tokio::test]
-async fn updates_content_length_header() {
+async fn does_not_set_content_length_header() {
     let filter = make_filter(Some(&[("system", "Injected system prompt.")]), None);
-    let (body, ctx) = run_filter(filter.as_ref(), r#"{"messages":[{"role":"user","content":"Hi"}]}"#).await;
+    let (_body, ctx) = run_filter(filter.as_ref(), r#"{"messages":[{"role":"user","content":"Hi"}]}"#).await;
 
-    let serialized = serde_json::to_vec(&body).unwrap();
-    assert_eq!(ctx.extra_request_headers.len(), 1, "should set content-length header");
-    let (name, value) = &ctx.extra_request_headers[0];
-    assert_eq!(name, "content-length", "header name should be content-length");
-    assert_eq!(
-        value,
-        &serialized.len().to_string(),
-        "content-length should match serialized body size"
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-length"),
+        "filter must not set content-length (core handles framing)"
     );
 }
 

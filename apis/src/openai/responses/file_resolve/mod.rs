@@ -60,8 +60,6 @@ pub(crate) mod resolve_url;
 )]
 mod tests;
 
-use std::borrow::Cow;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -287,7 +285,7 @@ async fn resolve_and_rewrite(
     }
 
     debug!(count, "resolved file_id references");
-    if let Some(rejection) = rewrite_body(body, parsed, ctx, filter.config.max_body_bytes)? {
+    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes)? {
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
@@ -369,7 +367,6 @@ async fn update_state(
 fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
-    ctx: &mut HttpFilterContext<'_>,
     max_body_bytes: usize,
 ) -> Result<Option<FilterAction>, FilterError> {
     let rewritten = serde_json::to_vec(parsed)
@@ -379,8 +376,6 @@ fn rewrite_body(
         return Ok(Some(reject_rewritten_body_too_large(len, max_body_bytes)));
     }
     *body = Some(Bytes::from(rewritten));
-    ctx.extra_request_headers
-        .push((Cow::Borrowed("content-length"), len.to_string()));
     Ok(None)
 }
 
