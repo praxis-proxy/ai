@@ -1,0 +1,45 @@
+# External Metering
+#
+# Strips tenant identity headers and client credentials from metered
+# inference requests before they reach the upstream provider.
+#
+# Tenant headers are trusted input produced by an authenticating layer in
+# front of the proxy. Forwarding them upstream would leak tenant attribution,
+# and letting a client set them itself would allow tenant impersonation, so
+# the filter removes every header carrying the configured prefix along with
+# any client-supplied credential.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/external-metering.yaml
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "x-tenant-username: alice" \
+#     -H "x-tenant-group: engineering" \
+#     -H "x-tenant-subscription: sub-42" \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# The upstream receives the request without x-tenant-* , authorization,
+# or x-api-key headers.
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: external_metering
+        identity_header_prefix: "x-tenant-"
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"

@@ -61,6 +61,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
 
+### Metering
+
+| Filter | Description |
+|--------|-------------|
+| [`external_metering`](external_metering.md) | Strips tenant identity headers and client credentials from metered inference requests before they reach the upstream provider. |
+
 ### Prompt Enrich
 
 | Filter | Description |
