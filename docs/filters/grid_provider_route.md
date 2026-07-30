@@ -7,7 +7,7 @@ Exact provider-local mapping from an authenticated Grid selection to a private b
 
 ## Configuration Notes
 
-The provider listener requires downstream mTLS and must run `peer_identity_trust` before this filter. The filter consumes the exact `x-grid-peer-selected-candidate` and `x-grid-peer-hop-request-id` fields, validates candidate/model/path against provider-local configuration, and removes all peer fields before the backend hop. It also removes client-supplied provider attribution fields before writing provider-owned replacements.
+The provider listener requires downstream mTLS and must run `peer_identity_trust` before this filter. The filter consumes the exact `x-grid-peer-selected-candidate`, `x-grid-peer-hop-request-id`, and optional `x-grid-peer-overlay-revision` fields, validates candidate/model/path against provider-local configuration, and removes all peer fields before the backend hop. It also removes client-supplied provider attribution fields before writing provider-owned replacements. A valid peer overlay revision is rewritten into the provider-owned namespace for backend telemetry; it is correlation evidence, not an authorization grant.
 
 These names are AI-owned rather than Praxis-reserved because Praxis intentionally strips `x-praxis-*` headers before upstream requests. Praxis AI startup validation rejects optional/plaintext client certificate modes, a provider chain that does not begin with `peer_identity_trust`, conditional/fail-open boundary filters, and branch-conditional provider consumers.
 

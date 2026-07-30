@@ -37,11 +37,11 @@ use serde::Deserialize;
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     metadata::{
-        PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND, ROUTE_LOCAL_SITE, ROUTE_NAME,
-        ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID,
-        SELECTED_CANDIDATE_HEADER, set_credential_metadata,
+        OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
+        ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_TIER, ROUTE_SITE,
+        ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
-    overlay::{self, OverlayReloadHandle, RouteSnapshot},
+    overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, RouteSnapshot},
 };
 
 /// Maximum length for header values read from the request.
@@ -74,12 +74,17 @@ const MAX_TTL_SECS: u64 = 86_400;
 ///     cluster: local-inference
 /// ```
 ///
-/// **Overlay mode** — candidates are loaded from a Grid overlay file:
+/// **Overlay mode** — candidates are loaded from a Grid overlay envelope:
 ///
 /// ```yaml
 /// filter: grid_route
-/// overlay_file: /etc/grid/grid-config.json
+/// overlay_file: /etc/grid/grid-overlay.json
 /// model_header: x-model
+/// expected_overlay_scope:
+///   network: production-grid
+///   gateway: public-edge
+///   namespace: grid-system
+///   local_site: east-edge
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,7 +109,15 @@ struct GridRouteConfig {
     #[serde(default)]
     provider_hop_clusters: Vec<String>,
 
-    /// Path to a Grid overlay JSON file (`grid-config.json`).
+    /// Expected scope of the overlay envelope.
+    ///
+    /// When set, each specified field is validated against the
+    /// envelope scope on load and every reload. Rejected on mismatch.
+    /// Only relevant in overlay mode with envelope-format files.
+    expected_overlay_scope: Option<ExpectedOverlayScope>,
+
+    /// Path to a Grid overlay JSON file (`grid-overlay.json` envelope or
+    /// legacy `grid-config.json`).
     ///
     /// When set, candidates and `local_site` are read from the overlay
     /// instead of the YAML config.
@@ -263,8 +276,8 @@ enum AffinityOutcome<'a> {
 ///
 /// **Modes:**
 /// - **Static:** candidates are declared inline in the YAML config.
-/// - **Overlay:** candidates are loaded from a Grid `grid-config.json` file and hot-reloaded via [`ArcSwap`] when the
-///   file changes.
+/// - **Overlay:** candidates are loaded from a Grid overlay file (`grid-overlay.json` envelope or legacy
+///   `grid-config.json`) and hot-reloaded via [`ArcSwap`] when the file changes.
 ///
 /// **Behavior:**
 /// - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written.
@@ -285,11 +298,13 @@ enum AffinityOutcome<'a> {
 /// optionally `rank`, `selection_tier`).  When session affinity is enabled,
 /// `session.bound`, `session.reused`, and `session.failover` keys are also
 /// written. When the selected cluster is present in `provider_hop_clusters`,
-/// client-supplied `x-grid-peer-selected-candidate` and
-/// `x-grid-peer-hop-request-id` values are removed and replaced with the
-/// selected stable ID and a generated provider-hop request ID. These AI-owned,
-/// non-reserved headers are sent only to an mTLS-authenticated provider
-/// gateway; the provider must run `peer_identity_trust` before consuming them.
+/// client-supplied `x-grid-peer-selected-candidate`,
+/// `x-grid-peer-hop-request-id`, and `x-grid-peer-overlay-revision` values
+/// are removed and replaced with the selected stable ID, a generated
+/// provider-hop request ID, and the serving overlay revision (envelope mode
+/// only). These AI-owned, non-reserved headers are sent only to an
+/// mTLS-authenticated provider gateway; the provider must run
+/// `peer_identity_trust` before consuming them.
 /// No credential reference or value is forwarded. No request-time database,
 /// control-plane, or metrics lookups are performed.
 ///
@@ -308,6 +323,26 @@ enum AffinityOutcome<'a> {
 /// event on the parent directory.  The overlay `ConfigMap` **must not**
 /// use `subPath` volume mounts — `subPath` bypasses the `..data` symlink
 /// mechanism and the watcher will not detect updates.
+///
+/// **Envelope contract:** Grid publishes `grid-overlay.json` as a versioned,
+/// content-addressed envelope alongside the legacy `grid-config.json` payload.
+/// Any reserved envelope field selects strict envelope parsing; malformed
+/// envelopes never fall back to legacy. When `expected_overlay_scope` is
+/// configured, legacy payloads are rejected so scope validation cannot be
+/// bypassed. Praxis AI recomputes the RFC 8785 canonical SHA-256 digest over
+/// `network`, `local_site`, and the ordered candidate list before accepting a
+/// snapshot.
+///
+/// The revision lifecycle is observable as:
+/// - **rendered:** Grid constructed the envelope.
+/// - **distributed:** Grid applied it to the destination `ConfigMap`.
+/// - **accepted:** Praxis AI parsed, scope-checked, and digest-verified it.
+/// - **serving:** a request selected a route from that exact snapshot.
+///
+/// Invalid cold-start envelopes fail filter construction. Invalid reloads
+/// retain the same-process last-known-good snapshot. Envelope-mode provider
+/// hops carry the serving revision from the same immutable snapshot used for
+/// candidate selection.
 ///
 /// **Scope:** overlay hot reload swaps the candidate list and `local_site`
 /// only.  It cannot add or remove `load_balancer` clusters, change
@@ -357,10 +392,13 @@ impl GridRouteFilter {
         if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
             return Err("grid: cannot set both overlay_file and candidates".into());
         }
+        if cfg.overlay_file.is_none() && cfg.expected_overlay_scope.is_some() {
+            return Err("grid: expected_overlay_scope requires envelope overlay_file mode".into());
+        }
 
         let (snapshot, reload_handle) = if let Some(path) = cfg.overlay_file {
             let reload = cfg.reload.unwrap_or_default();
-            build_overlay_snapshot(path, &reload)?
+            build_overlay_snapshot(path, &reload, cfg.expected_overlay_scope)?
         } else if let Some(candidates_raw) = cfg.candidates {
             if cfg.reload.is_some() {
                 return Err("grid: reload block is not valid with static candidates".into());
@@ -384,6 +422,7 @@ impl GridRouteFilter {
 
     /// Core routing path: session affinity lookup, admission filtering,
     /// candidate selection, metadata output.
+    #[expect(clippy::too_many_lines, reason = "sequential affinity/selection/metadata pipeline")]
     fn select_and_route(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -400,14 +439,26 @@ impl GridRouteFilter {
             name,
         );
         if let AffinityOutcome::Reused(c) = outcome {
-            return apply_reused(ctx, &snap.local_site, c, &self.provider_hop_clusters);
+            return apply_reused(
+                ctx,
+                &snap.local_site,
+                c,
+                &self.provider_hop_clusters,
+                snap.semantic_revision.as_ref(),
+            );
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
         let Some(c) = select_admitted(&snap.candidates, kind, name) else {
             tracing::debug!(kind = kind.as_str(), name = %name, "grid_route: no candidate");
             return Ok(FilterAction::Reject(Rejection::status(404)));
         };
-        apply_route(ctx, &snap.local_site, c, &self.provider_hop_clusters)?;
+        apply_route(
+            ctx,
+            &snap.local_site,
+            c,
+            &self.provider_hop_clusters,
+            snap.semantic_revision.as_ref(),
+        )?;
         if let Some(aff) = &self.session_affinity {
             record_session(aff, ctx, &c.stable_id, session_key.as_deref(), failover);
         }
@@ -419,14 +470,34 @@ impl GridRouteFilter {
 type SnapshotResult = Result<(Arc<ArcSwap<RouteSnapshot>>, Option<OverlayReloadHandle>), FilterError>;
 
 /// Build an overlay-backed snapshot with optional watcher.
-fn build_overlay_snapshot(path: PathBuf, reload: &ReloadConfig) -> SnapshotResult {
+fn build_overlay_snapshot(
+    path: PathBuf,
+    reload: &ReloadConfig,
+    expected_scope: Option<ExpectedOverlayScope>,
+) -> SnapshotResult {
     let content = overlay::read_overlay_bounded(&path)
         .map_err(|e| FilterError::from(format!("grid: failed to read overlay file {}: {e}", path.display())))?;
-    let snap = RouteSnapshot::from_overlay(&content)?;
+    let snap = RouteSnapshot::from_overlay_with_scope(&content, expected_scope.as_ref())?;
+    tracing::info!(
+        path = %path.display(),
+        contract_format = ?snap.contract_format,
+        schema_version = snap.schema_version.as_deref().unwrap_or("none"),
+        accepted_revision = snap.semantic_revision.as_deref().unwrap_or("none"),
+        serving_revision = snap.semantic_revision.as_deref().unwrap_or("none"),
+        candidate_count = snap.candidates.len(),
+        "grid_route: overlay snapshot initialized"
+    );
     let shared = Arc::new(ArcSwap::from_pointee(snap));
-    let handle = reload
-        .enabled
-        .then(|| overlay::spawn_overlay_watcher(path, Arc::clone(&shared), reload.debounce_ms));
+    let handle = if reload.enabled {
+        Some(overlay::spawn_overlay_watcher_with_scope(
+            path,
+            Arc::clone(&shared),
+            reload.debounce_ms,
+            expected_scope,
+        )?)
+    } else {
+        None
+    };
     Ok((shared, handle))
 }
 
@@ -513,6 +584,8 @@ impl HttpFilter for GridRouteFilter {
             .push(HeaderName::from_static(SELECTED_CANDIDATE_HEADER));
         ctx.request_headers_to_remove
             .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static(OVERLAY_REVISION_HEADER));
 
         if ctx.cluster.is_some() {
             tracing::debug!("grid_route: cluster already set; preserving");
@@ -538,10 +611,11 @@ fn apply_reused(
     local_site: &Arc<str>,
     candidate: &RouteCandidate,
     provider_hop_clusters: &BTreeSet<String>,
+    semantic_revision: Option<&Arc<str>>,
 ) -> Result<FilterAction, FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
-    write_provider_context(ctx, candidate, provider_hop_clusters)?;
+    write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)?;
     ctx.set_metadata("grid.route.session.bound", "true");
     ctx.set_metadata("grid.route.session.reused", "true");
     ctx.set_metadata("grid.route.session.failover", "false");
@@ -554,10 +628,11 @@ fn apply_route(
     local_site: &Arc<str>,
     candidate: &RouteCandidate,
     provider_hop_clusters: &BTreeSet<String>,
+    semantic_revision: Option<&Arc<str>>,
 ) -> Result<(), FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
-    write_provider_context(ctx, candidate, provider_hop_clusters)
+    write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)
 }
 
 /// Record session-affinity metadata and store a binding.
@@ -839,6 +914,7 @@ fn write_provider_context(
     ctx: &mut HttpFilterContext<'_>,
     candidate: &RouteCandidate,
     provider_hop_clusters: &BTreeSet<String>,
+    semantic_revision: Option<&Arc<str>>,
 ) -> Result<(), FilterError> {
     if !provider_hop_clusters.contains(candidate.cluster.as_ref()) {
         return Ok(());
@@ -864,6 +940,12 @@ fn write_provider_context(
         HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
         request_id_value,
     ));
+    if let Some(rev) = semantic_revision {
+        let rev_value = HeaderValue::from_str(rev)
+            .map_err(|error| FilterError::from(format!("grid_route: invalid serving overlay revision: {error}")))?;
+        ctx.request_headers_to_set
+            .push((HeaderName::from_static(OVERLAY_REVISION_HEADER), rev_value));
+    }
     ctx.set_metadata(ROUTE_PROVIDER_HOP_REQUEST_ID, hop_request_id);
     Ok(())
 }
@@ -2284,7 +2366,7 @@ mod tests {
             let req = crate::test_utils::make_request(Method::POST, "/chat");
             let mut ctx = crate::test_utils::make_filter_context(&req);
             let allowlist = BTreeSet::from(["provider-gateway".to_owned()]);
-            let error = write_provider_context(&mut ctx, &snapshot.candidates[0], &allowlist)
+            let error = write_provider_context(&mut ctx, &snapshot.candidates[0], &allowlist, None)
                 .expect_err("invalid candidate ID must fail closed");
             assert!(error.to_string().contains("candidate ID"));
         }
@@ -2329,6 +2411,121 @@ mod tests {
             pending_header(&second_ctx, PROVIDER_HOP_REQUEST_ID_HEADER)
         );
         assert_eq!(second_ctx.get_metadata("grid.route.session.reused"), Some("true"));
+    }
+
+    // ---- Overlay revision header ----
+
+    #[tokio::test]
+    async fn envelope_snapshot_emits_revision_header() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-minimal.json");
+        let snap = RouteSnapshot::from_overlay(fixture).unwrap();
+        let expected_rev = snap.semantic_revision.clone().unwrap();
+        let shared = Arc::new(ArcSwap::from_pointee(snap));
+        let filter = GridRouteFilter {
+            model_header: HeaderName::from_static("x-model"),
+            _reload_handle: None,
+            provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
+            session_affinity: None,
+            snapshot: shared,
+        };
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(
+            pending_header(&ctx, OVERLAY_REVISION_HEADER),
+            Some(expected_rev.as_ref()),
+            "envelope revision must be emitted as a request header"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_does_not_emit_revision_header() {
+        let filter = make_provider_context_filter(true);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            pending_header(&ctx, OVERLAY_REVISION_HEADER).is_none(),
+            "legacy/static snapshots must not emit overlay revision header"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_supplied_revision_header_stripped() {
+        let filter = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert(
+            HeaderName::from_static(OVERLAY_REVISION_HEADER),
+            HeaderValue::from_static("spoofed-revision"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static(OVERLAY_REVISION_HEADER)),
+            "client-supplied revision header must be stripped"
+        );
+    }
+
+    // ---- Overlay envelope config ----
+
+    #[test]
+    fn expected_overlay_scope_accepted_in_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-overlay.json");
+        std::fs::write(
+            &path,
+            include_str!("../../../tests/fixtures/overlay-contract/v1/valid-minimal.json"),
+        )
+        .unwrap();
+        let yaml = format!(
+            "overlay_file: {}\nreload:\n  enabled: false\nexpected_overlay_scope:\n  network: test-net\n  gateway: gw\n  namespace: ns\n  local_site: site-a\n",
+            path.display()
+        );
+        assert!(parse(&yaml).is_ok(), "valid expected_overlay_scope should parse");
+    }
+
+    #[test]
+    fn expected_overlay_scope_mismatch_fails_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-overlay.json");
+        std::fs::write(
+            &path,
+            include_str!("../../../tests/fixtures/overlay-contract/v1/valid-minimal.json"),
+        )
+        .unwrap();
+        let yaml = format!(
+            "overlay_file: {}\nreload:\n  enabled: false\nexpected_overlay_scope:\n  network: wrong-network\n",
+            path.display()
+        );
+        let err = parse_err(&yaml);
+        assert!(
+            err.to_string().contains("expected scope.network"),
+            "scope mismatch at startup should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn expected_overlay_scope_rejected_with_static_candidates() {
+        let yaml = "local_site: site-a\n\
+                    expected_overlay_scope:\n\
+                    \x20 network: test-net\n\
+                    candidates:\n\
+                    \x20 - kind: inference_model\n\
+                    \x20   name: model-a\n\
+                    \x20   site: site-a\n\
+                    \x20   cluster: cluster-a\n";
+        let error = parse_err(yaml);
+        assert!(
+            error
+                .to_string()
+                .contains("expected_overlay_scope requires envelope overlay_file mode"),
+            "unexpected static scope error: {error}"
+        );
     }
 
     // ---- Test utilities ----
@@ -2395,7 +2592,11 @@ mod tests {
     }
 
     fn assert_provider_headers_removed(ctx: &HttpFilterContext<'_>) {
-        for name in [SELECTED_CANDIDATE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER] {
+        for name in [
+            SELECTED_CANDIDATE_HEADER,
+            PROVIDER_HOP_REQUEST_ID_HEADER,
+            OVERLAY_REVISION_HEADER,
+        ] {
             assert!(
                 ctx.request_headers_to_remove.contains(&HeaderName::from_static(name)),
                 "{name} must be removed"
@@ -2484,7 +2685,7 @@ mod tests {
         let mut route_candidates = Vec::new();
         for (admission_str, cluster) in candidates {
             route_candidates.push(RouteCandidate {
-                admission_state: AdmissionState::from_overlay_str(admission_str),
+                admission_state: AdmissionState::from_overlay_str(admission_str).unwrap(),
                 cluster: Arc::from(*cluster),
                 credential: None,
                 fresh: true,

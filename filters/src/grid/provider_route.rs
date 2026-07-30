@@ -24,9 +24,10 @@ use serde::Deserialize;
 use super::{
     descriptor,
     metadata::{
-        CandidateCredential, PROVIDER_ATTRIBUTION_HEADER, PROVIDER_ATTRIBUTION_RESPONSE_HEADER,
-        PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID,
-        PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL, PROVIDER_ROUTE_PROVIDER_ID, PROVIDER_ROUTE_REQUEST_ID,
+        CandidateCredential, OVERLAY_REVISION_HEADER, PROVIDER_ATTRIBUTION_HEADER,
+        PROVIDER_ATTRIBUTION_RESPONSE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_OVERLAY_REVISION_HEADER,
+        PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID, PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL,
+        PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID, PROVIDER_ROUTE_REQUEST_ID,
         SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
 };
@@ -37,6 +38,10 @@ const MAX_PROVIDER_ROUTES: usize = 1024;
 const MAX_PATHS_PER_ROUTE: usize = 64;
 /// Upper bound on header/field value length.
 const MAX_VALUE_LEN: usize = 256;
+
+/// Invalid edge-supplied overlay revision.
+#[derive(Debug)]
+struct InvalidPeerOverlayRevision;
 
 /// Deserialized configuration for the `grid_provider_route` filter.
 #[derive(Debug, Deserialize)]
@@ -100,11 +105,13 @@ struct ProviderRoute {
 ///
 /// The provider listener requires downstream mTLS and must run
 /// `peer_identity_trust` before this filter. The filter consumes the exact
-/// `x-grid-peer-selected-candidate` and `x-grid-peer-hop-request-id` fields,
-/// validates candidate/model/path against provider-local configuration, and
-/// removes all peer fields before the backend hop. It also removes
-/// client-supplied provider attribution fields before writing provider-owned
-/// replacements.
+/// `x-grid-peer-selected-candidate`, `x-grid-peer-hop-request-id`, and optional
+/// `x-grid-peer-overlay-revision` fields, validates candidate/model/path
+/// against provider-local configuration, and removes all peer fields before
+/// the backend hop. It also removes client-supplied provider attribution
+/// fields before writing provider-owned replacements. A valid peer overlay
+/// revision is rewritten into the provider-owned namespace for backend
+/// telemetry; it is correlation evidence, not an authorization grant.
 ///
 /// These names are AI-owned rather than Praxis-reserved because Praxis
 /// intentionally strips `x-praxis-*` headers before upstream requests.
@@ -175,6 +182,10 @@ impl HttpFilter for GridProviderRouteFilter {
         true
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the fail-closed provider-boundary decision atomic"
+    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         strip_edge_headers(ctx);
 
@@ -183,6 +194,10 @@ impl HttpFilter for GridProviderRouteFilter {
         };
         let Some(request_id) = request_header(ctx, PROVIDER_HOP_REQUEST_ID_HEADER).map(str::to_owned) else {
             return Ok(FilterAction::Reject(Rejection::status(403)));
+        };
+        let overlay_revision = match peer_overlay_revision(ctx) {
+            Ok(revision) => revision.map(str::to_owned),
+            Err(InvalidPeerOverlayRevision) => return Ok(FilterAction::Reject(Rejection::status(403))),
         };
         let Some(model) = request_header_by_name(ctx, &self.model_header).map(str::to_owned) else {
             return Ok(FilterAction::Reject(Rejection::status(400)));
@@ -200,8 +215,11 @@ impl HttpFilter for GridProviderRouteFilter {
         ctx.set_metadata(PROVIDER_ROUTE_MODEL, &model);
         ctx.set_metadata(PROVIDER_ROUTE_PROVIDER_ID, &*self.provider_id);
         ctx.set_metadata(PROVIDER_ROUTE_REQUEST_ID, &request_id);
+        if let Some(revision) = &overlay_revision {
+            ctx.set_metadata(PROVIDER_ROUTE_OVERLAY_REVISION, revision);
+        }
         set_credential_metadata(ctx, route.credential.as_ref());
-        set_provider_headers(ctx, &self.provider_id, &request_id)?;
+        set_provider_headers(ctx, &self.provider_id, &request_id, overlay_revision.as_deref())?;
 
         Ok(FilterAction::Continue)
     }
@@ -234,7 +252,11 @@ fn strip_edge_headers(ctx: &mut HttpFilterContext<'_>) {
     ctx.request_headers_to_remove
         .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
     ctx.request_headers_to_remove
+        .push(HeaderName::from_static(OVERLAY_REVISION_HEADER));
+    ctx.request_headers_to_remove
         .push(HeaderName::from_static(PROVIDER_REQUEST_ID_HEADER));
+    ctx.request_headers_to_remove
+        .push(HeaderName::from_static(PROVIDER_OVERLAY_REVISION_HEADER));
     ctx.request_headers_to_remove
         .push(HeaderName::from_static(PROVIDER_ATTRIBUTION_HEADER));
     ctx.request_headers_to_remove.push(AUTHORIZATION);
@@ -245,6 +267,7 @@ fn set_provider_headers(
     ctx: &mut HttpFilterContext<'_>,
     provider_id: &str,
     request_id: &str,
+    overlay_revision: Option<&str>,
 ) -> Result<(), FilterError> {
     ctx.request_headers_to_set.push((
         HeaderName::from_static(PROVIDER_REQUEST_ID_HEADER),
@@ -256,7 +279,34 @@ fn set_provider_headers(
         HeaderValue::from_str(provider_id)
             .map_err(|e| FilterError::from(format!("grid_provider_route: invalid provider attribution: {e}")))?,
     ));
+    if let Some(revision) = overlay_revision {
+        ctx.request_headers_to_set.push((
+            HeaderName::from_static(PROVIDER_OVERLAY_REVISION_HEADER),
+            HeaderValue::from_str(revision).map_err(|error| {
+                FilterError::from(format!(
+                    "grid_provider_route: invalid provider overlay revision: {error}"
+                ))
+            })?,
+        ));
+    }
     Ok(())
+}
+
+/// Read and validate the optional serving revision supplied by the edge.
+fn peer_overlay_revision<'a>(ctx: &'a HttpFilterContext<'_>) -> Result<Option<&'a str>, InvalidPeerOverlayRevision> {
+    let header = HeaderName::from_static(OVERLAY_REVISION_HEADER);
+    let Some(value) = ctx.request.headers.get(header) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_error| InvalidPeerOverlayRevision)?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(InvalidPeerOverlayRevision);
+    }
+    Ok(Some(value))
 }
 
 /// Extract a bounded, non-empty header value by static name.
@@ -404,6 +454,10 @@ mod tests {
             HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
             HeaderValue::from_str(hop_request_id).unwrap(),
         );
+        req.headers.insert(
+            HeaderName::from_static(OVERLAY_REVISION_HEADER),
+            HeaderValue::from_static("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
         req.headers.insert("X-Model", HeaderValue::from_str(model).unwrap());
         req
     }
@@ -427,6 +481,12 @@ mod tests {
                 .iter()
                 .any(|h| h.as_str() == PROVIDER_HOP_REQUEST_ID_HEADER),
             "must remove hop-request-id header"
+        );
+        assert!(
+            ctx.request_headers_to_remove
+                .iter()
+                .any(|h| h.as_str() == OVERLAY_REVISION_HEADER),
+            "must remove overlay-revision header"
         );
         assert!(
             ctx.request_headers_to_remove.contains(&AUTHORIZATION),
@@ -464,12 +524,20 @@ mod tests {
             HeaderName::from_static(PROVIDER_REQUEST_ID_HEADER),
             HeaderValue::from_static("spoofed-request"),
         );
+        req.headers.insert(
+            HeaderName::from_static(PROVIDER_OVERLAY_REVISION_HEADER),
+            HeaderValue::from_static("spoofed-revision"),
+        );
         let mut ctx = test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
 
         assert!(matches!(action, FilterAction::Continue));
-        for name in [PROVIDER_ATTRIBUTION_HEADER, PROVIDER_REQUEST_ID_HEADER] {
+        for name in [
+            PROVIDER_ATTRIBUTION_HEADER,
+            PROVIDER_REQUEST_ID_HEADER,
+            PROVIDER_OVERLAY_REVISION_HEADER,
+        ] {
             assert!(
                 ctx.request_headers_to_remove.contains(&HeaderName::from_static(name)),
                 "{name} must be removed before provider-owned output"
@@ -477,6 +545,10 @@ mod tests {
         }
         assert_eq!(pending_header(&ctx, PROVIDER_ATTRIBUTION_HEADER), Some("test-provider"));
         assert_eq!(pending_header(&ctx, PROVIDER_REQUEST_ID_HEADER), Some("req-1"));
+        assert_eq!(
+            pending_header(&ctx, PROVIDER_OVERLAY_REVISION_HEADER),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[tokio::test]
@@ -488,7 +560,11 @@ mod tests {
         let action = f.on_request(&mut ctx).await.unwrap();
 
         assert!(matches!(action, FilterAction::Continue));
-        for name in [SELECTED_CANDIDATE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER] {
+        for name in [
+            SELECTED_CANDIDATE_HEADER,
+            PROVIDER_HOP_REQUEST_ID_HEADER,
+            OVERLAY_REVISION_HEADER,
+        ] {
             assert!(
                 ctx.request_headers_to_remove.contains(&HeaderName::from_static(name)),
                 "{name} must be removed"
@@ -498,6 +574,44 @@ mod tests {
                 "{name} must not be re-emitted to the backend"
             );
         }
+        assert_eq!(
+            pending_header(&ctx, PROVIDER_OVERLAY_REVISION_HEADER),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "provider must rewrite the peer revision under provider ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_peer_overlay_revision_is_denied() {
+        let f = make_filter("abc123");
+        let mut req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        req.headers.insert(
+            HeaderName::from_static(OVERLAY_REVISION_HEADER),
+            HeaderValue::from_static("not-a-sha256-revision"),
+        );
+        let mut ctx = test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Reject(r) if r.status == 403));
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static(OVERLAY_REVISION_HEADER))
+        );
+        assert!(ctx.request_headers_to_set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_without_overlay_revision_remains_supported() {
+        let f = make_filter("abc123");
+        let mut req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        req.headers.remove(OVERLAY_REVISION_HEADER);
+        let mut ctx = test_utils::make_filter_context(&req);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(pending_header(&ctx, PROVIDER_OVERLAY_REVISION_HEADER).is_none());
     }
 
     #[tokio::test]
@@ -511,7 +625,11 @@ mod tests {
         let action = f.on_request(&mut ctx).await.unwrap();
 
         assert!(matches!(action, FilterAction::Reject(r) if r.status == 403));
-        for name in [SELECTED_CANDIDATE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER] {
+        for name in [
+            SELECTED_CANDIDATE_HEADER,
+            PROVIDER_HOP_REQUEST_ID_HEADER,
+            OVERLAY_REVISION_HEADER,
+        ] {
             assert!(ctx.request_headers_to_remove.contains(&HeaderName::from_static(name)));
         }
         assert!(ctx.request_headers_to_remove.contains(&AUTHORIZATION));

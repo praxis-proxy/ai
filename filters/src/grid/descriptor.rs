@@ -85,16 +85,14 @@ impl AdmissionState {
 
     /// Parse an admission state from a Grid overlay string.
     ///
-    /// Unknown values default to [`NewAndExisting`] for forward
-    /// compatibility — the Grid operator may introduce new states
-    /// before AI is updated.
-    ///
-    /// [`NewAndExisting`]: AdmissionState::NewAndExisting
-    pub(crate) fn from_overlay_str(s: &str) -> Self {
+    /// Returns an error on unknown values so the overlay is rejected
+    /// and hot reload retains the last-known-good snapshot.
+    pub(crate) fn from_overlay_str(s: &str) -> Result<Self, String> {
         match s {
-            "existing_only" => Self::ExistingOnly,
-            "none" => Self::Excluded,
-            _ => Self::NewAndExisting,
+            "new_and_existing" => Ok(Self::NewAndExisting),
+            "existing_only" => Ok(Self::ExistingOnly),
+            "none" => Ok(Self::Excluded),
+            other => Err(format!("unknown admission_state: {other}")),
         }
     }
 }
@@ -254,7 +252,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
     }
 
     let mut candidates = Vec::with_capacity(raw.len());
-    let mut seen: HashSet<(CapabilityKind, String, String)> = HashSet::with_capacity(raw.len());
+    let mut seen: HashSet<(CapabilityKind, String, String, String)> = HashSet::with_capacity(raw.len());
 
     for (i, c) in raw.into_iter().enumerate() {
         validate_name(&format!("candidates[{i}].name"), &c.name)?;
@@ -262,8 +260,15 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
         validate_name(&format!("candidates[{i}].cluster"), &c.cluster)?;
         validate_credential(i, c.credential.as_ref())?;
 
-        if !seen.insert((c.kind, c.name.clone(), c.site.clone())) {
-            return Err(format!("grid: duplicate candidate '{}/{}/{}'", c.kind.as_str(), c.name, c.site).into());
+        if !seen.insert((c.kind, c.name.clone(), c.site.clone(), c.cluster.clone())) {
+            return Err(format!(
+                "grid: duplicate candidate '{}/{}/{}/{}'",
+                c.kind.as_str(),
+                c.name,
+                c.site,
+                c.cluster
+            )
+            .into());
         }
 
         let stable_id = default_stable_id(c.kind, &c.name, &c.site, &c.cluster);
@@ -451,10 +456,19 @@ mod tests {
     fn duplicate_candidate_rejected() {
         let err = validate_candidates(vec![
             candidate("inference_model", "llama", "site-a", "c1"),
-            candidate("inference_model", "llama", "site-a", "c2"),
+            candidate("inference_model", "llama", "site-a", "c1"),
         ])
         .expect_err("should fail");
         assert!(err.to_string().contains("duplicate candidate"), "{err}");
+    }
+
+    #[test]
+    fn same_site_different_cluster_not_duplicate() {
+        let result = validate_candidates(vec![
+            candidate("inference_model", "llama", "site-a", "c1"),
+            candidate("inference_model", "llama", "site-a", "c2"),
+        ]);
+        assert!(result.is_ok());
     }
 
     #[test]

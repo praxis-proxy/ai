@@ -15,6 +15,7 @@
 //! [`ArcSwap`]: arc_swap::ArcSwap
 
 use std::{
+    fmt::Write as _,
     io::Read as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -55,6 +56,147 @@ pub(crate) const MAX_OVERLAY_SIZE: u64 = 2 * 1024 * 1024;
 /// after this timeout, a warning is logged and the thread is detached.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum time to wait for the overlay watcher to register.
+const WATCHER_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum length of envelope scope and provenance string fields.
+const MAX_ENVELOPE_FIELD_LEN: usize = 256;
+
+// -----------------------------------------------------------------------------
+// Contract format
+// -----------------------------------------------------------------------------
+
+/// Whether the snapshot was loaded from the versioned envelope or
+/// the legacy flat payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContractFormat {
+    /// Versioned content-addressed envelope (`grid-overlay.json`).
+    Envelope,
+    /// Legacy flat overlay (`grid-config.json`).
+    Legacy,
+}
+
+// -----------------------------------------------------------------------------
+// Envelope wire types (JSON)
+// -----------------------------------------------------------------------------
+
+/// Versioned content-addressed envelope wrapping a [`OverlayDocument`].
+///
+/// Does **not** use `deny_unknown_fields` — the Grid operator may add
+/// new envelope metadata before AI is updated.
+#[derive(Debug, Deserialize)]
+struct EnvelopeDocument {
+    /// Envelope schema version (must be `"1.0.0"`).
+    schema_version: String,
+
+    /// Content-addressed revision.
+    revision: RevisionField,
+
+    /// Content digest (must equal revision in v1).
+    content_digest: DigestField,
+
+    /// Scope identifying the producing gateway and network.
+    scope: ScopeField,
+
+    /// Provenance metadata — validated but not consumed for routing decisions.
+    provenance: ProvenanceField,
+
+    /// The embedded routing overlay.
+    overlay: OverlayDocument,
+}
+
+/// Content-addressed revision field.
+#[derive(Debug, Deserialize)]
+struct RevisionField {
+    /// Revision kind (must be `"content_addressed"`).
+    kind: String,
+
+    /// Hash algorithm (must be `"sha256"`).
+    algorithm: String,
+
+    /// 64 lowercase hex character hash value.
+    value: String,
+}
+
+/// Content digest field.
+///
+/// In v1, the digest has `algorithm` and `value` but no `kind`
+/// (the kind is implicit from the revision).
+#[derive(Debug, Deserialize)]
+struct DigestField {
+    /// Hash algorithm (must be `"sha256"`).
+    algorithm: String,
+
+    /// 64 lowercase hex character hash value.
+    value: String,
+}
+
+/// Scope field identifying the producing gateway.
+#[derive(Debug, Deserialize)]
+struct ScopeField {
+    /// Grid network name.
+    network: String,
+
+    /// Gateway name.
+    gateway: String,
+
+    /// Namespace.
+    namespace: String,
+
+    /// Local site identifier.
+    local_site: String,
+}
+
+/// Provenance metadata for audit and debugging.
+///
+/// Validated for structural presence and scope consistency, but not
+/// consumed for routing decisions.  Does **not** use `deny_unknown_fields`
+/// — the Grid operator may add new provenance fields.
+#[derive(Debug, Deserialize)]
+struct ProvenanceField {
+    /// Producer identifier (e.g. `"grid-operator"`).
+    producer: String,
+
+    /// Producer version.
+    producer_version: String,
+
+    /// Grid network name — must match `scope.network`.
+    grid_network_name: String,
+
+    /// Grid network UID from the `GridNetwork` resource.
+    grid_network_uid: String,
+
+    /// Grid network generation from the `GridNetwork` resource.
+    grid_network_generation: u64,
+
+    /// ISO-8601 timestamp when the overlay was rendered.
+    rendered_at: String,
+}
+
+/// Expected overlay scope for validation at load/reload time.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExpectedOverlayScope {
+    /// Expected network name.
+    #[serde(default)]
+    pub(crate) network: Option<String>,
+
+    /// Expected gateway name.
+    #[serde(default)]
+    pub(crate) gateway: Option<String>,
+
+    /// Expected namespace.
+    #[serde(default)]
+    pub(crate) namespace: Option<String>,
+
+    /// Expected local site.
+    #[serde(default)]
+    pub(crate) local_site: Option<String>,
+}
+
+/// Supported schema version.
+const SUPPORTED_SCHEMA_VERSION: &str = "1.0.0";
+
 // -----------------------------------------------------------------------------
 // Overlay wire types (JSON)
 // -----------------------------------------------------------------------------
@@ -75,10 +217,9 @@ pub(crate) struct OverlayDocument {
     #[serde(default)]
     pub(crate) generated_at: Option<String>,
 
-    /// Network name.  Accepted but not used by `grid_route`.
+    /// Network name.  Used for scope validation in envelope mode.
     #[serde(default)]
-    #[expect(dead_code, reason = "accepted for forward compatibility")]
-    network: Option<String>,
+    pub(super) network: Option<String>,
 }
 
 /// A single routing candidate from the Grid overlay.
@@ -179,6 +320,9 @@ pub(crate) struct RouteSnapshot {
     /// Validated route candidates.
     pub(crate) candidates: Vec<RouteCandidate>,
 
+    /// Whether this snapshot was loaded from an envelope or legacy payload.
+    pub(crate) contract_format: ContractFormat,
+
     /// SHA-256 digest of the raw overlay file content that produced
     /// this snapshot.  Used for change detection; `[0; 32]` for
     /// statically configured snapshots.
@@ -190,21 +334,152 @@ pub(crate) struct RouteSnapshot {
 
     /// Local site identifier.
     pub(crate) local_site: Arc<str>,
+
+    /// Envelope schema version (`"1.0.0"` for envelope, [`None`] for legacy).
+    pub(crate) schema_version: Option<Arc<str>>,
+
+    /// Semantic content-addressed revision (hex string for envelope,
+    /// [`None`] for legacy/static).
+    pub(crate) semantic_revision: Option<Arc<str>>,
 }
 
 impl RouteSnapshot {
     /// Build a snapshot from raw overlay file content.
     ///
-    /// Computes the content hash, parses JSON, validates the overlay,
-    /// and returns a ready-to-swap snapshot.
+    /// Detects the format (versioned envelope vs legacy flat payload)
+    /// by checking for a `schema_version` field.  Envelope payloads
+    /// are fully validated: schema version, revision shape, digest
+    /// recomputation, scope consistency.  A malformed envelope never
+    /// falls back to legacy parsing.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the JSON is invalid, a candidate kind
-    /// is unrecognised, or validation fails.
+    /// is unrecognised, validation fails, or envelope integrity checks
+    /// do not pass.
+    #[cfg(test)]
     pub(crate) fn from_overlay(content: &[u8]) -> Result<Self, FilterError> {
+        Self::from_overlay_with_scope(content, None)
+    }
+
+    /// Build a snapshot from raw overlay file content with optional
+    /// scope validation.
+    ///
+    /// When `expected_scope` is provided, each specified field is
+    /// compared against the envelope scope.  Mismatches are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] on any parse, validation, digest, or
+    /// scope mismatch error.
+    pub(crate) fn from_overlay_with_scope(
+        content: &[u8],
+        expected_scope: Option<&ExpectedOverlayScope>,
+    ) -> Result<Self, FilterError> {
         let content_hash: [u8; 32] = Sha256::digest(content).into();
 
+        let value: serde_json::Value = serde_json::from_slice(content)
+            .map_err(|e| FilterError::from(format!("grid: overlay parse error: {e}")))?;
+
+        if has_envelope_signal(&value) {
+            Self::from_envelope(content, content_hash, &value, expected_scope)
+        } else if expected_scope.is_some() {
+            Err(
+                "grid: expected envelope format (expected_overlay_scope is configured) but received legacy payload"
+                    .into(),
+            )
+        } else {
+            Self::from_legacy(content, content_hash)
+        }
+    }
+
+    /// Parse and validate a versioned envelope payload.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential envelope validation with scope/digest checks"
+    )]
+    fn from_envelope(
+        content: &[u8],
+        content_hash: [u8; 32],
+        value: &serde_json::Value,
+        expected_scope: Option<&ExpectedOverlayScope>,
+    ) -> Result<Self, FilterError> {
+        let envelope: EnvelopeDocument = serde_json::from_slice(content)
+            .map_err(|e| FilterError::from(format!("grid: envelope parse error: {e}")))?;
+
+        if envelope.schema_version != SUPPORTED_SCHEMA_VERSION {
+            return Err(format!("grid: unsupported envelope schema version: {}", envelope.schema_version).into());
+        }
+
+        validate_envelope_metadata(&envelope)?;
+        validate_revision_shape(&envelope.revision, "revision")?;
+        validate_revision_shape_digest(&envelope.content_digest, "content_digest")?;
+
+        if envelope.revision.value != envelope.content_digest.value {
+            return Err("grid: envelope revision and content_digest disagree".into());
+        }
+
+        let overlay_value = value
+            .get("overlay")
+            .ok_or_else(|| FilterError::from("grid: envelope missing overlay field"))?;
+        let recomputed = compute_semantic_digest(overlay_value)?;
+        if recomputed != envelope.content_digest.value {
+            return Err(format!(
+                "grid: envelope digest mismatch: expected {}, computed {recomputed}",
+                envelope.content_digest.value
+            )
+            .into());
+        }
+
+        let overlay_network = envelope
+            .overlay
+            .network
+            .as_deref()
+            .ok_or_else(|| FilterError::from("grid: envelope overlay.network is required"))?;
+        if overlay_network != envelope.scope.network {
+            return Err(format!(
+                "grid: envelope scope.network ({}) != overlay.network ({overlay_network})",
+                envelope.scope.network
+            )
+            .into());
+        }
+        if envelope.scope.local_site != envelope.overlay.local_site {
+            return Err(format!(
+                "grid: envelope scope.local_site ({}) != overlay.local_site ({})",
+                envelope.scope.local_site, envelope.overlay.local_site
+            )
+            .into());
+        }
+
+        if envelope.provenance.grid_network_name != envelope.scope.network {
+            return Err(format!(
+                "grid: envelope provenance.grid_network_name ({}) != scope.network ({})",
+                envelope.provenance.grid_network_name, envelope.scope.network
+            )
+            .into());
+        }
+
+        if let Some(expected) = expected_scope {
+            validate_expected_scope(expected, &envelope.scope)?;
+        }
+
+        descriptor::validate_local_site(&envelope.overlay.local_site)?;
+        let candidates = overlay_to_candidates(&envelope.overlay)?;
+        let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
+
+        Ok(Self {
+            candidates,
+            contract_format: ContractFormat::Envelope,
+            content_hash,
+            generated_at,
+            local_site: Arc::from(envelope.overlay.local_site.as_str()),
+            schema_version: Some(Arc::from(envelope.schema_version.as_str())),
+            semantic_revision: Some(Arc::from(envelope.revision.value.as_str())),
+        })
+    }
+
+    /// Parse a legacy flat overlay payload.
+    fn from_legacy(content: &[u8], content_hash: [u8; 32]) -> Result<Self, FilterError> {
         let doc: OverlayDocument = serde_json::from_slice(content)
             .map_err(|e| FilterError::from(format!("grid: overlay parse error: {e}")))?;
 
@@ -214,9 +489,12 @@ impl RouteSnapshot {
 
         Ok(Self {
             candidates,
+            contract_format: ContractFormat::Legacy,
             content_hash,
             generated_at,
             local_site: Arc::from(doc.local_site.as_str()),
+            schema_version: None,
+            semantic_revision: None,
         })
     }
 
@@ -226,11 +504,157 @@ impl RouteSnapshot {
     pub(crate) fn from_static(candidates: Vec<RouteCandidate>, local_site: Arc<str>) -> Self {
         Self {
             candidates,
+            contract_format: ContractFormat::Legacy,
             content_hash: [0; 32],
             generated_at: None,
             local_site,
+            schema_version: None,
+            semantic_revision: None,
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Envelope validation helpers
+// -----------------------------------------------------------------------------
+
+/// Reserved top-level fields that signal an envelope document.
+///
+/// If any of these is present, the document is treated as an envelope
+/// and must pass full envelope validation — no fallback to legacy parsing.
+const ENVELOPE_SIGNAL_FIELDS: &[&str] = &["schema_version", "revision", "content_digest", "scope", "provenance"];
+
+/// Returns `true` if the JSON value contains any reserved envelope field.
+fn has_envelope_signal(value: &serde_json::Value) -> bool {
+    ENVELOPE_SIGNAL_FIELDS.iter().any(|f| value.get(*f).is_some())
+}
+
+/// Validate shape of a revision field.
+fn validate_revision_shape(field: &RevisionField, name: &str) -> Result<(), FilterError> {
+    if field.kind != "content_addressed" {
+        return Err(format!("grid: envelope {name}.kind must be \"content_addressed\"").into());
+    }
+    if field.algorithm != "sha256" {
+        return Err(format!("grid: envelope {name}.algorithm must be \"sha256\"").into());
+    }
+    validate_hex_value(&field.value, name)
+}
+
+/// Validate shape of a digest field.
+fn validate_revision_shape_digest(field: &DigestField, name: &str) -> Result<(), FilterError> {
+    if field.algorithm != "sha256" {
+        return Err(format!("grid: envelope {name}.algorithm must be \"sha256\"").into());
+    }
+    validate_hex_value(&field.value, name)
+}
+
+/// Validate that a value is exactly 64 lowercase hex characters.
+fn validate_hex_value(value: &str, name: &str) -> Result<(), FilterError> {
+    if value.len() != 64 {
+        return Err(format!("grid: envelope {name}.value must be 64 hex characters").into());
+    }
+    if !value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+        return Err(format!("grid: envelope {name}.value must be lowercase hex").into());
+    }
+    Ok(())
+}
+
+/// Validate bounded v1 scope and provenance fields.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates the complete envelope metadata contract in one sequence"
+)]
+fn validate_envelope_metadata(envelope: &EnvelopeDocument) -> Result<(), FilterError> {
+    for (name, value) in [
+        ("scope.network", envelope.scope.network.as_str()),
+        ("scope.gateway", envelope.scope.gateway.as_str()),
+        ("scope.namespace", envelope.scope.namespace.as_str()),
+        ("scope.local_site", envelope.scope.local_site.as_str()),
+        ("provenance.producer", envelope.provenance.producer.as_str()),
+        (
+            "provenance.producer_version",
+            envelope.provenance.producer_version.as_str(),
+        ),
+        (
+            "provenance.grid_network_name",
+            envelope.provenance.grid_network_name.as_str(),
+        ),
+        (
+            "provenance.grid_network_uid",
+            envelope.provenance.grid_network_uid.as_str(),
+        ),
+        ("provenance.rendered_at", envelope.provenance.rendered_at.as_str()),
+    ] {
+        validate_bounded_nonblank(name, value, MAX_ENVELOPE_FIELD_LEN)?;
+    }
+    if envelope.provenance.grid_network_generation == 0 {
+        return Err("grid: envelope provenance.grid_network_generation must be positive".into());
+    }
+    chrono::DateTime::parse_from_rfc3339(&envelope.provenance.rendered_at).map_err(|error| {
+        FilterError::from(format!(
+            "grid: envelope provenance.rendered_at is not RFC 3339: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Validate a bounded, non-whitespace string.
+fn validate_bounded_nonblank(field: &str, value: &str, max_len: usize) -> Result<(), FilterError> {
+    if value.trim().is_empty() || value.len() > max_len {
+        return Err(format!("grid: envelope {field} must be 1-{max_len} non-blank bytes").into());
+    }
+    Ok(())
+}
+
+/// Recompute the semantic digest of an overlay [`serde_json::Value`].
+///
+/// Extracts `candidates`, `local_site`, and `network` from the value,
+/// canonicalizes via RFC 8785, and computes SHA-256.
+fn compute_semantic_digest(overlay_value: &serde_json::Value) -> Result<String, FilterError> {
+    let mut semantic = serde_json::Map::new();
+    if let Some(candidates) = overlay_value.get("candidates") {
+        semantic.insert("candidates".to_owned(), candidates.clone());
+    }
+    if let Some(local_site) = overlay_value.get("local_site") {
+        semantic.insert("local_site".to_owned(), local_site.clone());
+    }
+    if let Some(network) = overlay_value.get("network") {
+        semantic.insert("network".to_owned(), network.clone());
+    }
+    let semantic_value = serde_json::Value::Object(semantic);
+    let canonical = serde_json_canonicalizer::to_vec(&semantic_value)
+        .map_err(|e| FilterError::from(format!("grid: canonicalization error: {e}")))?;
+    let digest: [u8; 32] = Sha256::digest(&canonical).into();
+    let mut hex = String::with_capacity(64);
+    for b in &digest {
+        let _unused = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
+/// Validate the envelope scope against expected values.
+fn validate_expected_scope(expected: &ExpectedOverlayScope, scope: &ScopeField) -> Result<(), FilterError> {
+    if let Some(network) = &expected.network
+        && *network != scope.network
+    {
+        return Err(format!("grid: expected scope.network={network}, got {}", scope.network).into());
+    }
+    if let Some(gateway) = &expected.gateway
+        && *gateway != scope.gateway
+    {
+        return Err(format!("grid: expected scope.gateway={gateway}, got {}", scope.gateway).into());
+    }
+    if let Some(namespace) = &expected.namespace
+        && *namespace != scope.namespace
+    {
+        return Err(format!("grid: expected scope.namespace={namespace}, got {}", scope.namespace).into());
+    }
+    if let Some(local_site) = &expected.local_site
+        && *local_site != scope.local_site
+    {
+        return Err(format!("grid: expected scope.local_site={local_site}, got {}", scope.local_site).into());
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -263,7 +687,7 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
         .collect::<Result<Vec<_>, FilterError>>()?;
 
     let mut candidates = descriptor::validate_candidates(raw)?;
-    enrich_from_overlay(&mut candidates, &doc.candidates);
+    enrich_from_overlay(&mut candidates, &doc.candidates)?;
     Ok(candidates)
 }
 
@@ -275,19 +699,30 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
 /// [`CandidateConfig`] is never bypassed.
 ///
 /// [`validate_candidates`]: descriptor::validate_candidates
-pub(super) fn enrich_from_overlay(candidates: &mut [RouteCandidate], overlay: &[OverlayCandidate]) {
-    for (c, oc) in candidates.iter_mut().zip(overlay.iter()) {
+pub(super) fn enrich_from_overlay(
+    candidates: &mut [RouteCandidate],
+    overlay: &[OverlayCandidate],
+) -> Result<(), FilterError> {
+    for (i, (c, oc)) in candidates.iter_mut().zip(overlay.iter()).enumerate() {
         if let Some(s) = &oc.admission_state {
-            c.admission_state = AdmissionState::from_overlay_str(s);
+            c.admission_state = AdmissionState::from_overlay_str(s)
+                .map_err(|e| FilterError::from(format!("grid: candidate {i}: {e}")))?;
         }
         c.rank = oc.rank;
         if let Some(t) = &oc.selection_tier {
+            if t.trim().is_empty() || t.len() > 128 {
+                return Err(format!("grid: candidate {i}: selection_tier must be 1-128 non-blank bytes").into());
+            }
             c.selection_tier = Some(Arc::from(t.as_str()));
         }
         if let Some(id) = &oc.stable_id {
+            if id.trim().is_empty() || id.len() > 256 || id.parse::<http::HeaderValue>().is_err() {
+                return Err(format!("grid: candidate {i}: stable_id must be a valid 1-256 byte header value").into());
+            }
             c.stable_id = Arc::from(id.as_str());
         }
     }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -349,39 +784,84 @@ impl Drop for OverlayReloadHandle {
 ///
 /// Returns a handle that cancels and joins the watcher on drop.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the tokio runtime cannot be created on the watcher thread.
-#[expect(clippy::expect_used, reason = "fatal if tokio runtime cannot start")]
+/// Returns [`FilterError`] if the watcher thread, runtime, or filesystem
+/// watcher cannot be initialized within [`WATCHER_START_TIMEOUT`].
+#[cfg(test)]
 pub(crate) fn spawn_overlay_watcher(
     path: PathBuf,
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
     debounce_ms: u64,
-) -> OverlayReloadHandle {
+) -> Result<OverlayReloadHandle, FilterError> {
+    spawn_overlay_watcher_with_scope(path, snapshot, debounce_ms, None)
+}
+
+/// Spawn a file watcher with optional expected scope validation.
+///
+/// Blocks until the watcher thread confirms readiness (watcher
+/// registered and authoritative re-read complete) or reports failure.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps watcher startup, readiness rendezvous, and cleanup together"
+)]
+pub(crate) fn spawn_overlay_watcher_with_scope(
+    path: PathBuf,
+    snapshot: Arc<ArcSwap<RouteSnapshot>>,
+    debounce_ms: u64,
+    expected_scope: Option<ExpectedOverlayScope>,
+) -> Result<OverlayReloadHandle, FilterError> {
     let shutdown = CancellationToken::new();
     let token = shutdown.clone();
 
-    let thread = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("overlay watcher tokio runtime");
-        rt.block_on(watch_loop(path, snapshot, debounce_ms, token));
-    });
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(0);
 
-    OverlayReloadHandle {
+    let thread = std::thread::Builder::new()
+        .name("grid-overlay-watcher".to_owned())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    drop(ready_tx.send(Err(format!("failed to create watcher runtime: {error}"))));
+                    return;
+                },
+            };
+            rt.block_on(watch_loop(path, snapshot, debounce_ms, token, expected_scope, ready_tx));
+        })
+        .map_err(|error| FilterError::from(format!("grid: failed to spawn overlay watcher: {error}")))?;
+
+    let handle = OverlayReloadHandle {
         shutdown,
         thread: Some(thread),
+    };
+    match ready_rx.recv_timeout(WATCHER_START_TIMEOUT) {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(message)) => {
+            drop(handle);
+            Err(FilterError::from(format!(
+                "grid: overlay watcher failed to initialize: {message}"
+            )))
+        },
+        Err(error) => {
+            drop(handle);
+            Err(FilterError::from(format!(
+                "grid: overlay watcher did not initialize within {} seconds: {error}",
+                WATCHER_START_TIMEOUT.as_secs()
+            )))
+        },
     }
 }
 
 /// Core watch loop: set up the notify watcher, debounce events,
 /// and trigger overlay reloads.
+#[expect(clippy::too_many_arguments, reason = "readiness channel added for startup barrier")]
 async fn watch_loop(
     path: PathBuf,
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
     debounce_ms: u64,
     shutdown: CancellationToken,
+    expected_scope: Option<ExpectedOverlayScope>,
+    ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
     let (tx, mut rx) = mpsc::channel::<()>(16);
 
@@ -390,7 +870,9 @@ async fn watch_loop(
     let _watcher = match setup_watcher(tx, &watch_dir) {
         Ok(w) => w,
         Err(e) => {
+            let msg = format!("{e}");
             tracing::error!(error = %e, "grid_route: failed to start overlay file watcher");
+            drop(ready_tx.send(Err(msg)));
             return;
         },
     };
@@ -398,7 +880,9 @@ async fn watch_loop(
     // Authoritative re-read after watcher registration to close the
     // startup race window: any overlay change between the initial read
     // in build_overlay_snapshot and watcher registration is caught here.
-    handle_overlay_reload(&path, &snapshot);
+    handle_overlay_reload(&path, &snapshot, expected_scope.as_ref());
+
+    drop(ready_tx.send(Ok(())));
 
     tracing::info!(
         path = %path.display(),
@@ -406,7 +890,15 @@ async fn watch_loop(
         "grid_route: overlay file watcher started"
     );
 
-    run_event_loop(&mut rx, &path, &snapshot, debounce_ms, &shutdown).await;
+    run_event_loop(
+        &mut rx,
+        &path,
+        &snapshot,
+        debounce_ms,
+        &shutdown,
+        expected_scope.as_ref(),
+    )
+    .await;
 }
 
 /// Process filesystem events until shutdown is requested.
@@ -414,12 +906,14 @@ async fn watch_loop(
     clippy::cognitive_complexity,
     reason = "complexity is from tokio::select! macro expansion"
 )]
+#[expect(clippy::too_many_arguments, reason = "watcher loop needs all context")]
 async fn run_event_loop(
     rx: &mut mpsc::Receiver<()>,
     path: &Path,
     snapshot: &ArcSwap<RouteSnapshot>,
     debounce_ms: u64,
     shutdown: &CancellationToken,
+    expected_scope: Option<&ExpectedOverlayScope>,
 ) {
     loop {
         tokio::select! {
@@ -429,7 +923,7 @@ async fn run_event_loop(
                     tracing::info!("grid_route: overlay file watcher shutting down");
                     return;
                 }
-                handle_overlay_reload(path, snapshot);
+                handle_overlay_reload(path, snapshot, expected_scope);
             }
             () = shutdown.cancelled() => {
                 tracing::info!("grid_route: overlay file watcher shutting down");
@@ -440,7 +934,11 @@ async fn run_event_loop(
 }
 
 /// Read, validate, and swap the overlay snapshot.
-fn handle_overlay_reload(path: &Path, snapshot: &ArcSwap<RouteSnapshot>) {
+fn handle_overlay_reload(
+    path: &Path,
+    snapshot: &ArcSwap<RouteSnapshot>,
+    expected_scope: Option<&ExpectedOverlayScope>,
+) {
     let Some(content) = read_overlay(path) else {
         return;
     };
@@ -449,7 +947,7 @@ fn handle_overlay_reload(path: &Path, snapshot: &ArcSwap<RouteSnapshot>) {
         return;
     }
 
-    apply_overlay(path, &content, snapshot);
+    apply_overlay(path, &content, snapshot, expected_scope);
 }
 
 /// Read the overlay file with a bounded read.
@@ -504,20 +1002,49 @@ fn is_unchanged(content: &[u8], snapshot: &ArcSwap<RouteSnapshot>) -> bool {
 }
 
 /// Parse the overlay and swap the snapshot on success.
-fn apply_overlay(path: &Path, content: &[u8], snapshot: &ArcSwap<RouteSnapshot>) {
-    match RouteSnapshot::from_overlay(content) {
+#[expect(clippy::too_many_lines, reason = "error and success paths with structured logging")]
+fn apply_overlay(
+    path: &Path,
+    content: &[u8],
+    snapshot: &ArcSwap<RouteSnapshot>,
+    expected_scope: Option<&ExpectedOverlayScope>,
+) {
+    match RouteSnapshot::from_overlay_with_scope(content, expected_scope) {
         Ok(new_snap) => {
+            let previous_serving_revision = snapshot
+                .load()
+                .semantic_revision
+                .as_deref()
+                .unwrap_or("none")
+                .to_owned();
+            let accepted_revision = new_snap.semantic_revision.as_deref().unwrap_or("none").to_owned();
+            let schema_version = new_snap.schema_version.as_deref().unwrap_or("none").to_owned();
+            let candidate_count = new_snap.candidates.len();
+            let local_site = Arc::clone(&new_snap.local_site);
+            let contract_format = new_snap.contract_format;
+            snapshot.store(Arc::new(new_snap));
             tracing::info!(
-                candidate_count = new_snap.candidates.len(),
-                local_site = &*new_snap.local_site,
+                candidate_count,
+                local_site = &*local_site,
+                contract_format = ?contract_format,
+                schema_version = %schema_version,
+                accepted_revision = %accepted_revision,
+                serving_revision = %accepted_revision,
+                previous_serving_revision = %previous_serving_revision,
                 "grid_route: overlay reloaded"
             );
-            snapshot.store(Arc::new(new_snap));
         },
         Err(e) => {
+            let serving_rev = snapshot
+                .load()
+                .semantic_revision
+                .as_deref()
+                .unwrap_or("none")
+                .to_owned();
             tracing::error!(
                 path = %path.display(),
                 error = %e,
+                retained_serving_revision = %serving_rev,
                 "grid_route: overlay reload failed, retaining previous snapshot"
             );
         },
@@ -868,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_overlay_unknown_admission_state_defaults() {
+    fn parse_overlay_unknown_admission_state_rejected() {
         let json = r#"{
             "local_site": "site-a",
             "candidates": [{
@@ -880,12 +1407,8 @@ mod tests {
                 "admission_state": "future_state_v2"
             }]
         }"#;
-        let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
-        assert_eq!(
-            snap.candidates[0].admission_state,
-            AdmissionState::NewAndExisting,
-            "unknown admission state should default to NewAndExisting for forward compatibility"
-        );
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "unknown admission state must be rejected");
     }
 
     #[test]
@@ -940,6 +1463,47 @@ mod tests {
         }"#;
         let snap = RouteSnapshot::from_overlay(json.as_bytes());
         assert!(snap.is_ok(), "unknown fields on candidates must still be accepted");
+    }
+
+    #[test]
+    fn parse_overlay_oversized_stable_id_rejected() {
+        let long_id = "x".repeat(257);
+        let json = format!(
+            r#"{{"local_site":"site-a","candidates":[{{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"stable_id":"{long_id}"}}]}}"#
+        );
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "stable_id exceeding 256 bytes must be rejected");
+    }
+
+    #[test]
+    fn parse_overlay_empty_stable_id_rejected() {
+        let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"stable_id":""}]}"#;
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "empty stable_id must be rejected");
+    }
+
+    #[test]
+    fn parse_overlay_whitespace_stable_id_rejected() {
+        let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"stable_id":"   "}]}"#;
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "whitespace stable_id must be rejected");
+    }
+
+    #[test]
+    fn parse_overlay_oversized_selection_tier_rejected() {
+        let long_tier = "t".repeat(129);
+        let json = format!(
+            r#"{{"local_site":"site-a","candidates":[{{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"selection_tier":"{long_tier}"}}]}}"#
+        );
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "selection_tier exceeding 128 bytes must be rejected");
+    }
+
+    #[test]
+    fn parse_overlay_empty_selection_tier_rejected() {
+        let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"selection_tier":""}]}"#;
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "empty selection_tier must be rejected");
     }
 
     // -------------------------------------------------------------------------
@@ -1039,7 +1603,7 @@ mod tests {
     #[test]
     fn retain_on_read_failure() {
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(Path::new("/nonexistent/overlay.json"), &snap);
+        handle_overlay_reload(Path::new("/nonexistent/overlay.json"), &snap, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1049,7 +1613,7 @@ mod tests {
         let path = dir.path().join("grid-config.json");
         std::fs::write(&path, b"").unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap);
+        handle_overlay_reload(&path, &snap, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1059,7 +1623,7 @@ mod tests {
         let path = dir.path().join("grid-config.json");
         std::fs::write(&path, "{{not json}}").unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap);
+        handle_overlay_reload(&path, &snap, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1070,7 +1634,7 @@ mod tests {
         let json = r#"{"local_site":"","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#;
         std::fs::write(&path, json).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap);
+        handle_overlay_reload(&path, &snap, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1080,7 +1644,7 @@ mod tests {
         let path = dir.path().join("grid-config.json");
         std::fs::write(&path, r#"{"local_site":"a","candidates":[]}"#).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap);
+        handle_overlay_reload(&path, &snap, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1092,7 +1656,7 @@ mod tests {
             r#"{"local_site":"a","candidates":[{"kind":"bad_kind","name":"m","site":"s","cluster":"c","fresh":true}]}"#;
         std::fs::write(&path, json).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap);
+        handle_overlay_reload(&path, &snap, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1103,7 +1667,7 @@ mod tests {
         let content = vec![b'x'; (MAX_OVERLAY_SIZE + 1) as usize];
         std::fs::write(&path, &content).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap);
+        handle_overlay_reload(&path, &snap, None);
         assert_eq!(snap.load().content_hash, hash);
     }
 
@@ -1114,8 +1678,633 @@ mod tests {
         let json = r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"credential":{"strategy":"bearer_token","token":"leaked","secretRef":{"name":"k","namespace":"n","key":"k"}}}]}"#;
         std::fs::write(&path, json).unwrap();
         let (snap, hash) = make_valid_snapshot();
-        handle_overlay_reload(&path, &snap);
+        handle_overlay_reload(&path, &snap, None);
         assert_eq!(snap.load().content_hash, hash);
+    }
+
+    #[test]
+    fn retain_on_unknown_admission_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        let json = r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"admission_state":"future_state"}]}"#;
+        std::fs::write(&path, json).unwrap();
+        let (snap, hash) = make_valid_snapshot();
+        handle_overlay_reload(&path, &snap, None);
+        assert_eq!(
+            snap.load().content_hash,
+            hash,
+            "unknown admission_state must retain LKG"
+        );
+    }
+
+    #[test]
+    fn retain_on_invalid_stable_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        let long_id = "x".repeat(257);
+        let json = format!(
+            r#"{{"local_site":"a","candidates":[{{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"stable_id":"{long_id}"}}]}}"#
+        );
+        std::fs::write(&path, &json).unwrap();
+        let (snap, hash) = make_valid_snapshot();
+        handle_overlay_reload(&path, &snap, None);
+        assert_eq!(snap.load().content_hash, hash, "oversized stable_id must retain LKG");
+    }
+
+    #[test]
+    fn retain_on_legacy_downgrade_with_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grid-config.json");
+        let json = r#"{"local_site":"a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true}]}"#;
+        std::fs::write(&path, json).unwrap();
+        let (snap, hash) = make_valid_snapshot();
+        let scope = ExpectedOverlayScope {
+            network: Some("net".to_owned()),
+            gateway: None,
+            namespace: None,
+            local_site: None,
+        };
+        handle_overlay_reload(&path, &snap, Some(&scope));
+        assert_eq!(
+            snap.load().content_hash,
+            hash,
+            "legacy payload with expected_scope must retain LKG"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Envelope parsing
+    // -------------------------------------------------------------------------
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test helper constructs full envelope with computed digest"
+    )]
+    fn make_envelope_json(local_site: &str, model: &str, cluster: &str, network: &str) -> String {
+        let overlay_obj = serde_json::json!({
+            "local_site": local_site,
+            "network": network,
+            "candidates": [{
+                "kind": "inference_model",
+                "name": model,
+                "site": local_site,
+                "cluster": cluster,
+                "fresh": true
+            }]
+        });
+        let semantic = serde_json::json!({
+            "candidates": overlay_obj["candidates"],
+            "local_site": overlay_obj["local_site"],
+            "network": overlay_obj["network"],
+        });
+        let canonical = serde_json_canonicalizer::to_vec(&semantic).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&canonical).into();
+        let mut hex = String::with_capacity(64);
+        for b in &digest {
+            let _unused = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+        }
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": "1.0.0",
+            "revision": {
+                "kind": "content_addressed",
+                "algorithm": "sha256",
+                "value": hex
+            },
+            "content_digest": {
+                "algorithm": "sha256",
+                "value": hex
+            },
+            "scope": {
+                "network": network,
+                "gateway": "gw",
+                "namespace": "ns",
+                "local_site": local_site
+            },
+            "provenance": {
+                "producer": "test",
+                "producer_version": "0.1.0",
+                "grid_network_name": network,
+                "grid_network_uid": "test-uid",
+                "grid_network_generation": 1,
+                "rendered_at": "2026-07-29T00:00:00Z"
+            },
+            "overlay": overlay_obj
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn envelope_accepted_with_valid_digest() {
+        let json = make_envelope_json("site-a", "llama-3", "local", "test-net");
+        let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Envelope);
+        assert_eq!(snap.schema_version.as_deref(), Some("1.0.0"));
+        assert!(snap.semantic_revision.is_some());
+        assert_eq!(snap.candidates.len(), 1);
+        assert_eq!(&*snap.local_site, "site-a");
+    }
+
+    #[test]
+    fn legacy_accepted_without_schema_version() {
+        let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"site-a","cluster":"c","fresh":true}]}"#;
+        let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Legacy);
+        assert!(snap.semantic_revision.is_none());
+        assert!(snap.schema_version.is_none());
+    }
+
+    #[test]
+    fn unsupported_schema_version_rejected() {
+        let mut json: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        json["schema_version"] = serde_json::json!("2.0.0");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&json).unwrap().as_bytes());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn envelope_no_legacy_fallback_on_malformed() {
+        let json = r#"{"schema_version":"1.0.0","overlay":{"local_site":"a","candidates":[]}}"#;
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "malformed envelope must not fall back to legacy");
+    }
+
+    #[test]
+    fn any_reserved_field_triggers_envelope_path() {
+        for field in &["revision", "content_digest", "scope", "provenance"] {
+            let json = format!(r#"{{"local_site":"a","candidates":[],"{field}":"present"}}"#,);
+            let result = RouteSnapshot::from_overlay(json.as_bytes());
+            assert!(
+                result.is_err(),
+                "reserved field {field} must trigger envelope path and fail, not parse as legacy"
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_missing_schema_no_downgrade() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("schema_version");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(
+            result.is_err(),
+            "envelope with schema_version removed but other envelope fields present must not downgrade to legacy"
+        );
+    }
+
+    #[test]
+    fn digest_mismatch_rejected() {
+        let mut json: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        let bad_digest = "0".repeat(64);
+        json["content_digest"]["value"] = serde_json::json!(bad_digest);
+        json["revision"]["value"] = serde_json::json!(bad_digest);
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&json).unwrap().as_bytes());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn revision_digest_disagreement_rejected() {
+        let mut json: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        json["revision"]["value"] = serde_json::json!("1".repeat(64));
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&json).unwrap().as_bytes());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("disagree"));
+    }
+
+    #[test]
+    fn scope_network_mismatch_rejected() {
+        let mut json: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        json["scope"]["network"] = serde_json::json!("wrong-net");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&json).unwrap().as_bytes());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("scope.network"));
+    }
+
+    #[test]
+    fn scope_local_site_mismatch_rejected() {
+        let mut json: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        json["scope"]["local_site"] = serde_json::json!("wrong-site");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&json).unwrap().as_bytes());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("scope.local_site"));
+    }
+
+    #[test]
+    fn expected_scope_validation_passes() {
+        let json = make_envelope_json("site-a", "m", "c", "test-net");
+        let scope = ExpectedOverlayScope {
+            network: Some("test-net".to_owned()),
+            gateway: Some("gw".to_owned()),
+            namespace: Some("ns".to_owned()),
+            local_site: Some("site-a".to_owned()),
+        };
+        let snap = RouteSnapshot::from_overlay_with_scope(json.as_bytes(), Some(&scope)).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Envelope);
+    }
+
+    #[test]
+    fn expected_scope_network_mismatch_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "test-net");
+        let scope = ExpectedOverlayScope {
+            network: Some("wrong-net".to_owned()),
+            gateway: None,
+            namespace: None,
+            local_site: None,
+        };
+        let result = RouteSnapshot::from_overlay_with_scope(json.as_bytes(), Some(&scope));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected scope.network"));
+    }
+
+    #[test]
+    fn legacy_rejected_when_expected_scope_configured() {
+        let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"site-a","cluster":"c","fresh":true}]}"#;
+        let scope = ExpectedOverlayScope {
+            network: Some("strict-net".to_owned()),
+            gateway: None,
+            namespace: None,
+            local_site: None,
+        };
+        let result = RouteSnapshot::from_overlay_with_scope(json.as_bytes(), Some(&scope));
+        assert!(
+            result.is_err(),
+            "legacy payload must be rejected when expected_overlay_scope is configured"
+        );
+    }
+
+    #[test]
+    fn legacy_accepted_without_expected_scope() {
+        let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"site-a","cluster":"c","fresh":true}]}"#;
+        let snap = RouteSnapshot::from_overlay_with_scope(json.as_bytes(), None).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Legacy);
+    }
+
+    #[test]
+    fn missing_provenance_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("provenance");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(result.is_err(), "envelope without provenance must be rejected");
+    }
+
+    #[test]
+    fn incomplete_provenance_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["provenance"].as_object_mut().unwrap().remove("producer_version");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(
+            result.is_err(),
+            "envelope with incomplete v1 provenance must be rejected"
+        );
+    }
+
+    #[test]
+    fn blank_provenance_field_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["provenance"]["grid_network_uid"] = serde_json::json!("   ");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(result.is_err(), "blank v1 provenance values must be rejected");
+    }
+
+    #[test]
+    fn zero_grid_network_generation_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["provenance"]["grid_network_generation"] = serde_json::json!(0);
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(result.is_err(), "zero GridNetwork generation must be rejected");
+    }
+
+    #[test]
+    fn invalid_rendered_at_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["provenance"]["rendered_at"] = serde_json::json!("not-a-timestamp");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(result.is_err(), "rendered_at must be valid RFC 3339");
+    }
+
+    #[test]
+    fn blank_scope_field_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["scope"]["gateway"] = serde_json::json!(" ");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(result.is_err(), "blank scope values must be rejected");
+    }
+
+    #[test]
+    fn missing_overlay_network_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["overlay"].as_object_mut().unwrap().remove("network");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(
+            result.is_err(),
+            "envelope with missing overlay.network must be rejected (digest or required check)"
+        );
+    }
+
+    #[test]
+    fn provenance_scope_network_mismatch_rejected() {
+        let json = make_envelope_json("site-a", "m", "c", "n");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["provenance"]["grid_network_name"] = serde_json::json!("wrong-net");
+        let result = RouteSnapshot::from_overlay(serde_json::to_string(&value).unwrap().as_bytes());
+        assert!(result.is_err(), "provenance/scope network mismatch must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("provenance.grid_network_name"),
+            "error should mention provenance mismatch"
+        );
+    }
+
+    #[test]
+    fn envelope_unknown_fields_accepted() {
+        let mut json: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        json["future_field"] = serde_json::json!("forward_compat");
+        let snap = RouteSnapshot::from_overlay(serde_json::to_string(&json).unwrap().as_bytes()).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Envelope);
+    }
+
+    #[test]
+    fn timestamp_change_same_revision() {
+        let json_a = make_envelope_json("site-a", "m", "c", "n");
+        let snap_a = RouteSnapshot::from_overlay(json_a.as_bytes()).unwrap();
+
+        let mut json_b: serde_json::Value = serde_json::from_str(&json_a).unwrap();
+        json_b["overlay"]["generated_at"] = serde_json::json!("2099-12-31T23:59:59Z");
+        json_b["provenance"]["rendered_at"] = serde_json::json!("2099-12-31T23:59:59Z");
+        let snap_b = RouteSnapshot::from_overlay(serde_json::to_string(&json_b).unwrap().as_bytes()).unwrap();
+
+        assert_eq!(
+            snap_a.semantic_revision.as_deref(),
+            snap_b.semantic_revision.as_deref(),
+            "timestamp changes must not affect semantic revision"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Envelope LKG retention
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn retain_on_envelope_version_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.json");
+        let mut json: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        json["schema_version"] = serde_json::json!("99.0.0");
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let (snap, hash) = make_valid_snapshot();
+        handle_overlay_reload(&path, &snap, None);
+        assert_eq!(snap.load().content_hash, hash, "LKG retained on schema version error");
+    }
+
+    #[test]
+    fn retain_on_envelope_digest_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.json");
+        let mut json: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        let bad = "0".repeat(64);
+        json["content_digest"]["value"] = serde_json::json!(bad);
+        json["revision"]["value"] = serde_json::json!(bad);
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let (snap, hash) = make_valid_snapshot();
+        handle_overlay_reload(&path, &snap, None);
+        assert_eq!(snap.load().content_hash, hash, "LKG retained on digest error");
+    }
+
+    #[test]
+    fn retain_on_envelope_scope_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.json");
+        std::fs::write(&path, make_envelope_json("site-a", "m", "c", "n")).unwrap();
+        let scope = ExpectedOverlayScope {
+            network: Some("wrong".to_owned()),
+            gateway: None,
+            namespace: None,
+            local_site: None,
+        };
+        let (snap, hash) = make_valid_snapshot();
+        handle_overlay_reload(&path, &snap, Some(&scope));
+        assert_eq!(snap.load().content_hash, hash, "LKG retained on scope mismatch");
+    }
+
+    // -------------------------------------------------------------------------
+    // Fixture-based tests (Grid-generated fixtures)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn grid_fixture_valid_minimal() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-minimal.json");
+        let snap = RouteSnapshot::from_overlay(fixture).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Envelope);
+        assert_eq!(
+            snap.semantic_revision.as_deref(),
+            Some("abd5f4855454390febb53ad2085d182c465a78c5d14f0132317b4c9335aa8494"),
+            "revision must match manifest"
+        );
+    }
+
+    #[test]
+    fn grid_fixture_valid_multi_candidate() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-multi-candidate.json");
+        let snap = RouteSnapshot::from_overlay(fixture).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Envelope);
+        assert!(
+            snap.candidates.len() >= 2,
+            "multi-candidate fixture must have 2+ candidates"
+        );
+        assert_eq!(
+            snap.semantic_revision.as_deref(),
+            Some("75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"),
+            "revision must match manifest"
+        );
+    }
+
+    #[test]
+    fn grid_fixture_legacy_payload() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/legacy-payload.json");
+        let snap = RouteSnapshot::from_overlay(fixture).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Legacy);
+        assert!(snap.semantic_revision.is_none());
+    }
+
+    #[test]
+    fn grid_fixture_unsupported_schema_version() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/unsupported-schema-version.json");
+        let result = RouteSnapshot::from_overlay(fixture);
+        assert!(result.is_err(), "unsupported schema version must be rejected");
+    }
+
+    #[test]
+    fn grid_fixture_invalid_digest() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/invalid-digest.json");
+        let result = RouteSnapshot::from_overlay(fixture);
+        assert!(result.is_err(), "invalid digest must be rejected");
+    }
+
+    #[test]
+    fn grid_fixture_revision_digest_disagreement() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/revision-digest-disagreement.json");
+        let result = RouteSnapshot::from_overlay(fixture);
+        assert!(result.is_err(), "revision/digest disagreement must be rejected");
+    }
+
+    #[test]
+    fn grid_fixture_timestamp_change_same_revision() {
+        let valid_fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-multi-candidate.json");
+        let ts_fixture =
+            include_bytes!("../../../tests/fixtures/overlay-contract/v1/timestamp-change-same-revision.json");
+        let snap_valid = RouteSnapshot::from_overlay(valid_fixture).unwrap();
+        let snap_ts = RouteSnapshot::from_overlay(ts_fixture).unwrap();
+        assert_eq!(
+            snap_valid.semantic_revision.as_deref(),
+            snap_ts.semantic_revision.as_deref(),
+            "timestamp change must not affect semantic revision"
+        );
+        assert_eq!(
+            snap_ts.semantic_revision.as_deref(),
+            Some("75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"),
+            "revision must match manifest"
+        );
+    }
+
+    #[test]
+    fn grid_fixture_unknown_additive_field() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/unknown-additive-field.json");
+        let snap = RouteSnapshot::from_overlay(fixture).unwrap();
+        assert_eq!(snap.contract_format, ContractFormat::Envelope);
+        assert_eq!(
+            snap.semantic_revision.as_deref(),
+            Some("75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"),
+            "additive fields must not change revision"
+        );
+    }
+
+    #[test]
+    fn grid_fixture_network_scope_mismatch() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/network-scope-mismatch.json");
+        let result = RouteSnapshot::from_overlay(fixture);
+        assert!(result.is_err(), "network scope mismatch must be rejected");
+    }
+
+    #[test]
+    fn grid_fixture_local_site_scope_mismatch() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/local-site-scope-mismatch.json");
+        let result = RouteSnapshot::from_overlay(fixture);
+        assert!(result.is_err(), "local-site scope mismatch must be rejected");
+    }
+
+    #[test]
+    fn grid_fixture_malformed_envelope() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/malformed-envelope.json");
+        let result = RouteSnapshot::from_overlay(fixture);
+        assert!(result.is_err(), "malformed envelope must be rejected");
+    }
+
+    #[test]
+    fn grid_fixture_hybrid_missing_schema() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/hybrid-missing-schema.json");
+        let result = RouteSnapshot::from_overlay(fixture);
+        assert!(
+            result.is_err(),
+            "hybrid document with envelope fields but missing schema_version must be rejected"
+        );
+    }
+
+    #[test]
+    fn grid_fixture_credential_ref_no_secret_value() {
+        let fixture = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-multi-candidate.json");
+        let content = std::str::from_utf8(fixture).unwrap().to_lowercase();
+        assert!(!content.contains("bearer "), "fixture must not contain bearer token");
+        assert!(!content.contains("token_value"), "fixture must not contain token value");
+        assert!(!content.contains("-----begin"), "fixture must not contain PEM key");
+        assert!(content.contains("secretref"), "fixture must use credential references");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one manifest-driven test checks every cross-repository fixture"
+    )]
+    fn grid_fixture_manifest_complete() {
+        let manifest_bytes = include_bytes!("../../../tests/fixtures/overlay-contract/v1/manifest.json");
+        let manifest: serde_json::Value = serde_json::from_slice(manifest_bytes).unwrap();
+        assert_eq!(manifest["contract_version"], "1.0.0");
+        assert_eq!(manifest["source"], "praxis-proxy/grid");
+        assert_eq!(manifest["source_path"], "tests/fixtures/overlay-contract/v1");
+        let fixtures = manifest["fixtures"].as_object().unwrap();
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests/fixtures/overlay-contract/v1");
+        for name in fixtures.keys() {
+            assert!(
+                fixture_dir.join(name).exists(),
+                "manifest references {name} but file is missing"
+            );
+        }
+        for (name, expectation) in fixtures {
+            let content = std::fs::read(fixture_dir.join(name)).unwrap();
+            let result = RouteSnapshot::from_overlay(&content);
+            match expectation["expected"].as_str() {
+                Some("accept") => {
+                    let snapshot = result.unwrap_or_else(|error| {
+                        panic!("fixture {name} should be accepted: {error}");
+                    });
+                    assert_eq!(snapshot.contract_format, ContractFormat::Envelope);
+                    assert_eq!(
+                        snapshot.semantic_revision.as_deref(),
+                        expectation["revision"].as_str(),
+                        "fixture {name} revision differs from the manifest"
+                    );
+                },
+                Some("accept_legacy") => {
+                    let snapshot = result.unwrap_or_else(|error| {
+                        panic!("legacy fixture {name} should be accepted: {error}");
+                    });
+                    assert_eq!(snapshot.contract_format, ContractFormat::Legacy);
+                },
+                Some("reject") => {
+                    assert!(result.is_err(), "fixture {name} should be rejected");
+                    assert!(
+                        expectation["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+                        "rejected fixture {name} must declare a reason"
+                    );
+                },
+                other => panic!("fixture {name} has unsupported expected outcome: {other:?}"),
+            }
+        }
+        for entry in std::fs::read_dir(&fixture_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".json")
+                && name != "manifest.json"
+            {
+                assert!(
+                    fixtures.contains_key(name),
+                    "fixture file {name} exists but is not listed in manifest"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_candidate_kind_rejected() {
+        let json = r#"{"local_site":"a","candidates":[{"kind":"unknown_kind","name":"m","site":"a","cluster":"c","fresh":true}]}"#;
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "unknown candidate kind must be rejected");
+    }
+
+    #[test]
+    fn max_overlay_size_is_bounded() {
+        const { assert!(MAX_OVERLAY_SIZE <= 2 * 1024 * 1024) };
+        const { assert!(MAX_OVERLAY_SIZE > 0) };
     }
 
     // -------------------------------------------------------------------------
@@ -1141,7 +2330,7 @@ mod tests {
         let snap = Arc::new(ArcSwap::from_pointee(
             RouteSnapshot::from_overlay(json.as_bytes()).unwrap(),
         ));
-        let handle = spawn_overlay_watcher(path, snap, DEFAULT_DEBOUNCE_MS);
+        let handle = spawn_overlay_watcher(path, snap, DEFAULT_DEBOUNCE_MS).unwrap();
 
         std::thread::sleep(Duration::from_millis(100));
         assert!(!handle.shutdown.is_cancelled(), "shutdown should not be cancelled yet");
@@ -1150,6 +2339,24 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "Drop should complete within bounded join timeout"
+        );
+    }
+
+    #[test]
+    fn watcher_initialization_failure_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("grid-config.json");
+        let json = make_overlay_json("site-a", "llama-3", "local");
+        let snap = Arc::new(ArcSwap::from_pointee(
+            RouteSnapshot::from_overlay(json.as_bytes()).unwrap(),
+        ));
+
+        let error = spawn_overlay_watcher(path, snap, DEFAULT_DEBOUNCE_MS)
+            .expect_err("missing watcher directory must fail filter initialization");
+
+        assert!(
+            error.to_string().contains("failed to initialize"),
+            "unexpected watcher initialization error: {error}"
         );
     }
 
@@ -1164,7 +2371,7 @@ mod tests {
             let snap = Arc::new(ArcSwap::from_pointee(
                 RouteSnapshot::from_overlay(json.as_bytes()).unwrap(),
             ));
-            let handle = spawn_overlay_watcher(path.clone(), Arc::clone(&snap), DEFAULT_DEBOUNCE_MS);
+            let handle = spawn_overlay_watcher(path.clone(), Arc::clone(&snap), DEFAULT_DEBOUNCE_MS).unwrap();
             std::thread::sleep(Duration::from_millis(50));
             let start = std::time::Instant::now();
             drop(handle);
@@ -1193,7 +2400,7 @@ mod tests {
         let json_v2 = make_overlay_json("site-a", "gpt-4", "cluster-v2");
         std::fs::write(&path, &json_v2).unwrap();
 
-        let _handle = spawn_overlay_watcher(path, Arc::clone(&snap), DEFAULT_DEBOUNCE_MS);
+        let _handle = spawn_overlay_watcher(path, Arc::clone(&snap), DEFAULT_DEBOUNCE_MS).unwrap();
         let v2_hash = RouteSnapshot::from_overlay(json_v2.as_bytes()).unwrap().content_hash;
 
         poll_until(Duration::from_secs(5), || snap.load().content_hash == v2_hash);
@@ -1219,7 +2426,7 @@ mod tests {
         let initial = RouteSnapshot::from_overlay(json_v1.as_bytes()).unwrap();
         let old_hash = initial.content_hash;
         let snap = Arc::new(ArcSwap::from_pointee(initial));
-        let _handle = spawn_overlay_watcher(path.clone(), Arc::clone(&snap), DEFAULT_DEBOUNCE_MS);
+        let _handle = spawn_overlay_watcher(path.clone(), Arc::clone(&snap), DEFAULT_DEBOUNCE_MS).unwrap();
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
 
@@ -1246,7 +2453,7 @@ mod tests {
 
         let initial = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
         let snap = Arc::new(ArcSwap::from_pointee(initial));
-        let _handle = spawn_overlay_watcher(path.clone(), Arc::clone(&snap), DEFAULT_DEBOUNCE_MS);
+        let _handle = spawn_overlay_watcher(path.clone(), Arc::clone(&snap), DEFAULT_DEBOUNCE_MS).unwrap();
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
 
@@ -1271,7 +2478,7 @@ mod tests {
         let initial = RouteSnapshot::from_overlay(json_v1.as_bytes()).unwrap();
         let old_hash = initial.content_hash;
         let snap = Arc::new(ArcSwap::from_pointee(initial));
-        let _handle = spawn_overlay_watcher(path.clone(), Arc::clone(&snap), DEFAULT_DEBOUNCE_MS);
+        let _handle = spawn_overlay_watcher(path.clone(), Arc::clone(&snap), DEFAULT_DEBOUNCE_MS).unwrap();
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
 
@@ -1323,7 +2530,7 @@ mod tests {
         let initial = RouteSnapshot::from_overlay(json_v1.as_bytes()).unwrap();
         let old_hash = initial.content_hash;
         let snap = Arc::new(ArcSwap::from_pointee(initial));
-        let _handle = spawn_overlay_watcher(overlay_path, Arc::clone(&snap), DEFAULT_DEBOUNCE_MS);
+        let _handle = spawn_overlay_watcher(overlay_path, Arc::clone(&snap), DEFAULT_DEBOUNCE_MS).unwrap();
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
 
