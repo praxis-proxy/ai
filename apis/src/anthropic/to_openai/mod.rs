@@ -4,8 +4,9 @@
 //! Anthropic Messages to Chat Completions-compatible transformation filter.
 //!
 //! Rewrites Anthropic Messages request bodies to the Chat Completions
-//! request shape and transforms compatible non-streaming responses back.
-//! Streaming SSE transformation is handled by the separate
+//! request shape, transforms compatible non-streaming successes back, and
+//! normalizes pre-stream upstream errors for both request modes. Successful
+//! streaming SSE transformation is handled by the separate
 //! `anthropic_stream_events` filter.
 //!
 //! The filter name preserves the proposal/config surface. `OpenAI` here
@@ -26,7 +27,7 @@ use tracing::{debug, warn};
 use self::config::{AnthropicToOpenaiConfig, build_config};
 use crate::anthropic::wire;
 
-/// Metadata key selecting non-streaming success transformation.
+/// Metadata key selecting success or error response transformation.
 const RESPONSE_TRANSFORM_KEY: &str = "anthropic_to_openai.response_transform";
 /// Response transform marker for a successful response.
 const RESPONSE_TRANSFORM_SUCCESS: &str = "success";
@@ -101,21 +102,17 @@ impl HttpFilter for AnthropicToOpenaiFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        let request_id = canonicalize_response_request_id(ctx);
         let Some(transform) = response_transform(ctx) else {
             return Ok(FilterAction::Continue);
         };
 
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         if transform == RESPONSE_TRANSFORM_ERROR {
-            let (status, request_id) = ctx.response_header.as_ref().map_or((500, None), |response| {
-                let request_id = response
-                    .headers
-                    .get("request-id")
-                    .and_then(|value| value.to_str().ok())
-                    // The header storage is released before body hooks run.
-                    .map(str::to_owned);
-                (response.status.as_u16(), request_id)
-            });
+            let status = ctx
+                .response_header
+                .as_ref()
+                .map_or(500, |response| response.status.as_u16());
             ctx.set_metadata(RESPONSE_STATUS_KEY, status.to_string());
             if let Some(request_id) = request_id {
                 ctx.set_metadata(RESPONSE_REQUEST_ID_KEY, request_id);
@@ -125,14 +122,7 @@ impl HttpFilter for AnthropicToOpenaiFilter {
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
             max_bytes: Some(self.config.max_body_bytes),
         });
-        if let Some(resp) = &mut ctx.response_header {
-            resp.headers.remove(http::header::CONTENT_LENGTH);
-            resp.headers.insert(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/json"),
-            );
-            ctx.response_headers_modified = true;
-        }
+        prepare_transformed_response_headers(ctx);
 
         Ok(FilterAction::Continue)
     }
@@ -142,6 +132,7 @@ impl HttpFilter for AnthropicToOpenaiFilter {
             .push(http::header::HeaderName::from_static("anthropic-version"));
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("x-api-key"));
+        ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
 
         Ok(FilterAction::Continue)
     }
@@ -257,6 +248,44 @@ fn transform_request_body(body: &mut Option<Bytes>) -> FilterAction {
 // Response Body Helpers
 // -----------------------------------------------------------------------------
 
+/// Remove stale representation metadata before replacing a response body.
+fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(resp) = &mut ctx.response_header {
+        resp.headers.remove(http::header::CONTENT_LENGTH);
+        resp.headers.remove(http::header::CONTENT_ENCODING);
+        resp.headers.remove(http::header::CONTENT_RANGE);
+        resp.headers.remove(http::header::ETAG);
+        for header in ["content-digest", "content-md5", "digest", "repr-digest"] {
+            resp.headers.remove(header);
+        }
+        resp.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        ctx.response_headers_modified = true;
+    }
+}
+
+/// Expose the upstream request ID through Anthropic's canonical header.
+fn canonicalize_response_request_id(ctx: &mut HttpFilterContext<'_>) -> Option<String> {
+    let request_id = ctx.response_header.as_ref().and_then(|response| {
+        response
+            .headers
+            .get("request-id")
+            .or_else(|| response.headers.get("x-request-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    });
+    if let Some(request_id) = request_id.as_deref()
+        && let Some(response) = &mut ctx.response_header
+        && let Ok(value) = http::HeaderValue::from_str(request_id)
+    {
+        response.headers.insert("request-id", value);
+        ctx.response_headers_modified = true;
+    }
+    request_id
+}
+
 /// Return true when the response should be buffered and transformed.
 #[cfg(test)]
 fn should_transform_response(ctx: &HttpFilterContext<'_>) -> bool {
@@ -271,11 +300,24 @@ fn response_transform(ctx: &HttpFilterContext<'_>) -> Option<&'static str> {
         .is_some_and(|v| v == "true");
     let status = ctx.response_header.as_ref().map(|response| response.status);
     let is_error = status.is_some_and(|status| status.is_client_error() || status.is_server_error());
-    let is_success = status.is_none_or(|status| status.is_success());
+    let is_complete_success = status.is_none_or(|status| status == http::StatusCode::OK)
+        && ctx.response_header.as_ref().is_none_or(|response| {
+            !response.headers.contains_key(http::header::CONTENT_ENCODING)
+                && !response.headers.contains_key(http::header::CONTENT_RANGE)
+                && response
+                    .headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_none_or(|value| {
+                        let media_type = value.split(';').next().unwrap_or_default().trim();
+                        media_type.eq_ignore_ascii_case("application/json")
+                            || media_type.to_ascii_lowercase().ends_with("+json")
+                    })
+        });
 
     if is_error {
         Some(RESPONSE_TRANSFORM_ERROR)
-    } else if !is_streaming && is_success {
+    } else if !is_streaming && is_complete_success {
         Some(RESPONSE_TRANSFORM_SUCCESS)
     } else {
         None
@@ -383,7 +425,7 @@ mod tests {
         let mut ctx = make_filter_context(&request);
         let mut response = make_response();
         response.status = StatusCode::SERVICE_UNAVAILABLE;
-        response.headers.insert("request-id", "req_header".parse().unwrap());
+        response.headers.insert("x-request-id", "req_header".parse().unwrap());
         response
             .headers
             .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("72"));
@@ -399,6 +441,14 @@ mod tests {
                 .is_some_and(|response| !response.headers.contains_key(http::header::CONTENT_LENGTH)),
             "buffered error should remove content-length during the header phase"
         );
+        assert_eq!(
+            ctx.response_header
+                .as_ref()
+                .and_then(|response| response.headers.get("request-id"))
+                .and_then(|value| value.to_str().ok()),
+            Some("req_header"),
+            "OpenAI request IDs should be exposed through Anthropic's response header"
+        );
         ctx.response_header = None;
 
         let mut body = Some(Bytes::from_static(
@@ -412,6 +462,64 @@ mod tests {
         assert_eq!(parsed["error"]["type"], "api_error");
         assert_eq!(parsed["error"]["message"], "unavailable");
         assert_eq!(parsed["request_id"], "req_header");
+    }
+
+    #[tokio::test]
+    async fn rewritten_errors_remove_stale_representation_headers() {
+        for content_encoding in ["gzip", "br"] {
+            let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 4096").unwrap();
+            let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+            let request = make_request(Method::POST, "/v1/messages");
+            let mut ctx = make_filter_context(&request);
+            let mut response = make_response();
+            response.status = StatusCode::BAD_REQUEST;
+            response
+                .headers
+                .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/plain"));
+            response.headers.insert(
+                http::header::CONTENT_ENCODING,
+                http::HeaderValue::from_str(content_encoding).unwrap(),
+            );
+            response.headers.insert(
+                http::header::CONTENT_RANGE,
+                http::HeaderValue::from_static("bytes 0-41/42"),
+            );
+            response
+                .headers
+                .insert(http::header::ETAG, http::HeaderValue::from_static("\"upstream\""));
+            response
+                .headers
+                .insert("content-digest", http::HeaderValue::from_static("sha-256=:abc:"));
+            ctx.response_header = Some(&mut response);
+
+            drop(filter.on_response(&mut ctx).await.unwrap());
+
+            assert!(
+                matches!(ctx.response_body_mode, BodyMode::StreamBuffer { max_bytes: Some(4096) }),
+                "rewritten errors should use the configured buffer limit"
+            );
+            assert_eq!(
+                ctx.response_header
+                    .as_ref()
+                    .and_then(|response| response.headers.get(http::header::CONTENT_TYPE))
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "rewritten errors should advertise JSON"
+            );
+            for header in [
+                http::header::CONTENT_ENCODING,
+                http::header::CONTENT_RANGE,
+                http::header::ETAG,
+                http::HeaderName::from_static("content-digest"),
+            ] {
+                assert!(
+                    ctx.response_header
+                        .as_ref()
+                        .is_some_and(|response| !response.headers.contains_key(&header)),
+                    "{header} should be removed when rewriting a {content_encoding}-encoded error"
+                );
+            }
+        }
     }
 
     // --- extract_request_metadata ---
@@ -478,6 +586,21 @@ mod tests {
         assert!(body.is_none());
     }
 
+    #[tokio::test]
+    async fn on_request_prevents_upstream_response_encoding() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
+            "response transformation requires an unencoded upstream representation"
+        );
+    }
+
     #[test]
     fn transform_request_body_valid_transforms() {
         let mut body = Some(Bytes::from(
@@ -538,6 +661,127 @@ mod tests {
         assert!(
             should_transform_response(&ctx),
             "non-streaming success should be transformed"
+        );
+    }
+
+    #[test]
+    fn should_not_transform_encoded_non_streaming_success() {
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        let mut response = make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+        ctx.response_header = Some(&mut response);
+
+        assert!(
+            !should_transform_response(&ctx),
+            "encoded success should pass through with its representation headers intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_non_streaming_success_passes_through_unchanged() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        let mut response = make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+        ctx.response_header = Some(&mut response);
+
+        drop(filter.on_response(&mut ctx).await.unwrap());
+
+        assert_eq!(ctx.response_body_mode, BodyMode::Stream);
+        assert!(
+            ctx.response_header
+                .as_ref()
+                .is_some_and(|response| response.headers.contains_key(http::header::CONTENT_ENCODING))
+        );
+
+        let encoded = Bytes::from_static(b"\x1f\x8bencoded-response");
+        let mut body = Some(encoded.clone());
+        let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(body, Some(encoded));
+    }
+
+    #[tokio::test]
+    async fn non_json_success_passes_through_unchanged() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        let mut response = make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/plain"));
+        ctx.response_header = Some(&mut response);
+
+        drop(filter.on_response(&mut ctx).await.unwrap());
+
+        assert_eq!(ctx.response_body_mode, BodyMode::Stream);
+        assert_eq!(
+            ctx.response_header
+                .as_ref()
+                .and_then(|response| response.headers.get(http::header::CONTENT_TYPE))
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain")
+        );
+
+        let original = Bytes::from_static(b"upstream plaintext");
+        let mut body = Some(original.clone());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        assert_eq!(body, Some(original));
+    }
+
+    #[tokio::test]
+    async fn successful_responses_canonicalize_request_id() {
+        for is_streaming in ["false", "true"] {
+            let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+            let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+            let request = make_request(Method::POST, "/v1/messages");
+            let mut ctx = make_filter_context(&request);
+            ctx.set_metadata("anthropic_to_openai.streaming", is_streaming);
+            let mut response = make_response();
+            response.headers.insert("x-request-id", "req_success".parse().unwrap());
+            ctx.response_header = Some(&mut response);
+
+            drop(filter.on_response(&mut ctx).await.unwrap());
+
+            assert_eq!(
+                ctx.response_header
+                    .as_ref()
+                    .and_then(|response| response.headers.get("request-id"))
+                    .and_then(|value| value.to_str().ok()),
+                Some("req_success"),
+                "stream={is_streaming}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_transform_partial_non_streaming_success() {
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        let mut response = make_response();
+        response.status = StatusCode::PARTIAL_CONTENT;
+        response.headers.insert(
+            http::header::CONTENT_RANGE,
+            http::HeaderValue::from_static("bytes 0-99/200"),
+        );
+        ctx.response_header = Some(&mut response);
+
+        assert!(
+            !should_transform_response(&ctx),
+            "partial success should pass through with its representation headers intact"
         );
     }
 

@@ -67,6 +67,8 @@ Translated non-streaming messages include:
 
 - `id`, `content`, `model`, `role`, `stop_reason`, `stop_sequence`, and
   `type`;
+- typed text blocks with `citations: null`;
+- typed tool-use blocks with `caller: {"type":"direct"}`;
 - `container: null`;
 - `stop_details: null`; and
 - a complete `usage` object.
@@ -77,8 +79,11 @@ Full usage includes:
 - `cache_read_input_tokens` when the upstream reports cached prompt
   tokens, otherwise `null`; and
 - `cache_creation`, `cache_creation_input_tokens`, `inference_geo`,
-  `output_tokens_details`, `server_tool_use`, and `service_tier` as
-  `null` because Chat Completions does not provide compatible values.
+  `server_tool_use`, and `service_tier` as `null` because Chat Completions
+  does not provide compatible values.
+
+`output_tokens_details` is omitted. It is optional in Anthropic's current
+API but absent from the compatibility schema targeted by this change.
 
 The existing subtraction of cached tokens from `input_tokens` remains
 unchanged.
@@ -89,7 +94,7 @@ unchanged.
 tokens. `message_delta.usage` uses its own schema, with cumulative
 `output_tokens` and explicit null values for
 `cache_creation_input_tokens`, `cache_read_input_tokens`, `input_tokens`,
-`output_tokens_details`, and `server_tool_use`.
+and `server_tool_use`. Both usage shapes omit `output_tokens_details`.
 
 No streaming chunk or provider payload is cloned solely for schema
 completion.
@@ -142,11 +147,18 @@ After a buffered error body completes, the translator:
    type, or when a canonical top-level `"type": "error"` discriminator
    identifies a forward-compatible Anthropic error envelope;
 3. otherwise maps the HTTP status to the closest Anthropic type;
-4. copies `request_id` from the body or `request-id` response header when
-   available;
+4. copies `request_id` from the body or the `request-id` response header,
+   falling back to `x-request-id`, and exposes the canonical `request-id`
+   response header when available;
 5. preserves the upstream HTTP status; and
-6. sets the content type to JSON and removes the stale content length
-   before buffering so the protocol layer can frame the transformed body.
+6. sets the content type to JSON and removes stale `Content-Length`,
+   `Content-Encoding`, `Content-Range`, and `ETag` representation metadata
+   before buffering so clients interpret the transformed body correctly.
+
+The request transformation removes `Accept-Encoding` because Praxis does not
+decode upstream response bodies. If an upstream still returns an encoded or
+partial successful representation, Praxis passes that response through
+unchanged instead of attempting to parse and corrupt it.
 
 The status mapping covers Anthropic's documented types:
 
@@ -185,7 +197,7 @@ Unit coverage will verify:
 - exact presence and nullability of all non-streaming `Message` and
   `Usage` fields;
 - exact presence and nullability of streaming start and delta usage
-  fields, including `output_tokens_details`;
+  fields, including omission of `output_tokens_details`;
 - complete local error envelopes;
 - diagnostic text round-trips through JSON escaping;
 - preservation of compatible upstream error types and request IDs;

@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use praxis_filter::Rejection;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Fallback error body used only if Serde serialization fails.
 const ERROR_SERIALIZATION_FALLBACK: &[u8] = br#"{"type":"error","error":{"type":"api_error","message":"failed to serialize error response"},"request_id":null}"#;
@@ -14,26 +14,81 @@ const ERROR_SERIALIZATION_FALLBACK: &[u8] = br#"{"type":"error","error":{"type":
 /// Complete Anthropic Messages response.
 #[derive(Serialize)]
 pub(crate) struct MessageResponse<'a> {
+    /// Ordered response content blocks.
+    pub content: Vec<ContentBlock<'a>>,
+    /// Container information, when available.
+    pub container: Option<Value>,
     /// Message identifier.
     pub id: String,
-    /// Response discriminator.
-    pub r#type: &'static str,
-    /// Message author role.
-    pub role: &'static str,
     /// Model that generated the response.
     pub model: &'a str,
-    /// Ordered response content blocks.
-    pub content: Vec<Value>,
+    /// Message author role.
+    pub role: &'static str,
+    /// Extended stop information, when available.
+    pub stop_details: Option<Value>,
     /// Reason generation stopped.
     pub stop_reason: String,
     /// Matched stop sequence, when available.
     pub stop_sequence: Option<&'static str>,
-    /// Extended stop information, when available.
-    pub stop_details: Option<Value>,
-    /// Container information, when available.
-    pub container: Option<Value>,
+    /// Response discriminator.
+    pub r#type: &'static str,
     /// Token and service usage.
     pub usage: MessageUsage,
+}
+
+/// Anthropic response content block.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub(crate) enum ContentBlock<'a> {
+    /// Assistant-generated text.
+    Text {
+        /// Source citations, when available.
+        citations: Option<Value>,
+        /// Generated text.
+        text: &'a str,
+    },
+    /// Assistant-requested tool invocation.
+    ToolUse {
+        /// Execution context that produced the tool call.
+        caller: DirectCaller,
+        /// Tool call identifier.
+        id: &'a str,
+        /// Parsed tool arguments.
+        input: Map<String, Value>,
+        /// Tool name.
+        name: &'a str,
+    },
+}
+
+impl<'a> ContentBlock<'a> {
+    /// Create an assistant-generated text block.
+    pub(crate) fn text(text: &'a str) -> Self {
+        Self::Text { citations: None, text }
+    }
+
+    /// Create a directly requested tool-use block.
+    pub(crate) fn tool_use(id: &'a str, input: Map<String, Value>, name: &'a str) -> Self {
+        Self::ToolUse {
+            caller: DirectCaller::new(),
+            id,
+            input,
+            name,
+        }
+    }
+}
+
+/// Direct tool invocation caller.
+#[derive(Serialize)]
+pub(crate) struct DirectCaller {
+    /// Caller discriminator.
+    r#type: &'static str,
+}
+
+impl DirectCaller {
+    /// Create a direct invocation caller.
+    pub(crate) fn new() -> Self {
+        Self { r#type: "direct" }
+    }
 }
 
 /// Complete Anthropic Messages usage object.
@@ -51,8 +106,6 @@ pub(crate) struct MessageUsage {
     pub input_tokens: u64,
     /// Generated output tokens.
     pub output_tokens: u64,
-    /// Extended output token details, when reported.
-    pub output_tokens_details: Option<Value>,
     /// Server tool usage, when reported.
     pub server_tool_use: Option<Value>,
     /// Service tier, when reported.
@@ -69,7 +122,6 @@ impl MessageUsage {
             inference_geo: None,
             input_tokens,
             output_tokens,
-            output_tokens_details: None,
             server_tool_use: None,
             service_tier: None,
         }
@@ -87,8 +139,6 @@ pub(crate) struct MessageDeltaUsage {
     pub input_tokens: Option<u64>,
     /// Cumulative generated output tokens.
     pub output_tokens: u64,
-    /// Extended output token details, when reported.
-    pub output_tokens_details: Option<Value>,
     /// Server tool usage, when reported.
     pub server_tool_use: Option<Value>,
 }
@@ -101,7 +151,6 @@ impl MessageDeltaUsage {
             cache_read_input_tokens: None,
             input_tokens: None,
             output_tokens,
-            output_tokens_details: None,
             server_tool_use: None,
         }
     }
@@ -110,32 +159,32 @@ impl MessageDeltaUsage {
 /// Anthropic error response envelope.
 #[derive(Serialize)]
 struct ErrorResponse<'a> {
-    /// Top-level response discriminator.
-    r#type: &'static str,
     /// Structured error details.
     error: ErrorDetail<'a>,
     /// Anthropic request identifier, when supplied upstream.
     request_id: Option<&'a str>,
+    /// Top-level response discriminator.
+    r#type: &'static str,
 }
 
 /// Anthropic structured error details.
 #[derive(Serialize)]
 struct ErrorDetail<'a> {
-    /// Anthropic error category.
-    r#type: &'a str,
     /// Human-readable diagnostic.
     message: &'a str,
+    /// Anthropic error category.
+    r#type: &'a str,
 }
 
 /// Serialize a schema-complete Anthropic error response.
 pub(crate) fn error_body(error_type: &str, message: &str, request_id: Option<&str>) -> Vec<u8> {
     serde_json::to_vec(&ErrorResponse {
-        r#type: "error",
         error: ErrorDetail {
-            r#type: error_type,
             message,
+            r#type: error_type,
         },
         request_id,
+        r#type: "error",
     })
     .unwrap_or_else(|_| ERROR_SERIALIZATION_FALLBACK.to_vec())
 }

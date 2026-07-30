@@ -20,7 +20,7 @@ use tracing::debug;
 
 use self::config::{AnthropicStreamEventsConfig, build_config};
 use crate::{
-    anthropic::wire::{MessageDeltaUsage, MessageUsage},
+    anthropic::wire::{ContentBlock, MessageDeltaUsage, MessageUsage},
     is_event_stream_content_type,
 };
 
@@ -539,13 +539,14 @@ fn transform_delta(ctx: &mut HttpFilterContext<'_>, delta: &Value, output: &mut 
 fn emit_text_delta(ctx: &mut HttpFilterContext<'_>, content: &str, output: &mut Vec<u8>) {
     if !is_text_block_open(ctx) {
         let idx = get_block_index(ctx);
+        let content_block = ContentBlock::text("");
         emit_event(
             output,
             "content_block_start",
             &serde_json::json!({
                 "type": "content_block_start",
                 "index": idx,
-                "content_block": {"type": "text", "text": ""}
+                "content_block": content_block
             }),
         );
         ctx.set_metadata(TEXT_BLOCK_OPEN_KEY, "true".to_owned());
@@ -617,6 +618,7 @@ fn emit_tool_block_start(
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let content_block = ContentBlock::tool_use(id, serde_json::Map::new(), name);
 
     emit_event(
         output,
@@ -624,7 +626,7 @@ fn emit_tool_block_start(
         &serde_json::json!({
             "type": "content_block_start",
             "index": idx,
-            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+            "content_block": content_block
         }),
     );
     set_tool_block_index(ctx, tool_call_key, idx);
@@ -902,6 +904,12 @@ mod tests {
             "second chunk should emit text_delta immediately"
         );
         assert!(out2.contains("Hello"), "text content should be forwarded immediately");
+        let start = event_data(&out2, "content_block_start");
+        assert_eq!(
+            start.pointer("/content_block/citations"),
+            Some(&Value::Null),
+            "streaming text citations should be null"
+        );
     }
 
     #[test]
@@ -965,12 +973,12 @@ mod tests {
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
                 "inference_geo",
-                "output_tokens_details",
                 "server_tool_use",
                 "service_tier",
             ],
             "message_start usage",
         );
+        assert_absent_fields(usage, &["output_tokens_details"], "message_start usage");
         assert_u64_field(usage, "input_tokens", 0, "message_start usage");
         assert_u64_field(usage, "output_tokens", 0, "message_start usage");
     }
@@ -1004,11 +1012,11 @@ mod tests {
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
                 "input_tokens",
-                "output_tokens_details",
                 "server_tool_use",
             ],
             "message_delta usage",
         );
+        assert_absent_fields(usage, &["output_tokens_details"], "message_delta usage");
         assert_u64_field(usage, "output_tokens", 7, "message_delta usage");
     }
 
@@ -1226,6 +1234,16 @@ mod tests {
         assert!(
             out.contains(r#""id":"call_1""#) && out.contains(r#""name":"get_weather""#),
             "tool_use block should preserve id and function name"
+        );
+        let start = event_data(&out, "content_block_start");
+        assert_eq!(
+            start
+                .get("content_block")
+                .and_then(|block| block.get("caller"))
+                .and_then(|caller| caller.get("type"))
+                .and_then(Value::as_str),
+            Some("direct"),
+            "streaming tool_use blocks should identify a direct caller"
         );
         assert!(
             out.contains("input_json_delta") && out.contains(r#""partial_json":"{\"city\":"#),
@@ -1697,6 +1715,12 @@ mod tests {
             .map(|data| serde_json::from_str::<Value>(data).unwrap())
             .map(|event| event.get("index").and_then(Value::as_u64).unwrap())
             .collect()
+    }
+
+    fn assert_absent_fields(value: &Value, fields: &[&str], label: &str) {
+        for field in fields {
+            assert!(value.get(*field).is_none(), "{label} should omit {field}");
+        }
     }
 
     fn assert_null_fields(value: &Value, fields: &[&str], label: &str) {

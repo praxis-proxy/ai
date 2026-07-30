@@ -4,9 +4,10 @@
 //! Chat Completions-compatible response to Anthropic Messages transformation.
 
 use http::StatusCode;
-use serde_json::{Map, Value, json};
+use serde::Deserialize;
+use serde_json::{Map, Value};
 
-use crate::anthropic::wire::{self, MessageResponse, MessageUsage};
+use crate::anthropic::wire::{self, ContentBlock, MessageResponse, MessageUsage};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -32,6 +33,20 @@ const ANTHROPIC_ERROR_TYPES: &[&str] = &[
     "api_error",
     "overloaded_error",
 ];
+
+/// Minimal upstream error fields needed for Anthropic normalization.
+#[derive(Deserialize)]
+struct UpstreamError {
+    /// Nested error details, when present.
+    error: Option<Value>,
+    /// Top-level error message, when present.
+    message: Option<Value>,
+    /// Upstream request identifier, when present.
+    request_id: Option<Value>,
+    /// Top-level response discriminator, when present.
+    #[serde(rename = "type")]
+    r#type: Option<Value>,
+}
 
 // -----------------------------------------------------------------------------
 // Response Transformation
@@ -63,15 +78,15 @@ pub(crate) fn transform_response(body: &[u8], request_model: &str) -> Result<Tra
 
     let (stop_reason, original_finish_reason) = map_finish_reason(obj);
     let response = MessageResponse {
-        id,
-        r#type: RESPONSE_TYPE,
-        role: RESPONSE_ROLE,
-        model,
         content: build_content_blocks(obj),
+        container: None,
+        id,
+        model,
+        role: RESPONSE_ROLE,
+        stop_details: None,
         stop_reason,
         stop_sequence: None,
-        stop_details: None,
-        container: None,
+        r#type: RESPONSE_TYPE,
         usage: build_usage(obj),
     };
 
@@ -84,31 +99,28 @@ pub(crate) fn transform_response(body: &[u8], request_model: &str) -> Result<Tra
 
 /// Transform an upstream 4xx or 5xx response into Anthropic error format.
 pub(crate) fn transform_error_response(body: &[u8], status: StatusCode, header_request_id: Option<&str>) -> Vec<u8> {
-    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let parsed = serde_json::from_slice::<UpstreamError>(body).ok();
     let is_anthropic_error = parsed
         .as_ref()
-        .is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("error"));
+        .and_then(|value| value.r#type.as_ref())
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "error");
     let message = parsed
         .as_ref()
-        .and_then(|value| value.get("error"))
+        .and_then(|value| value.error.as_ref())
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
-        .or_else(|| {
-            parsed
-                .as_ref()
-                .and_then(|value| value.get("message"))
-                .and_then(Value::as_str)
-        })
+        .or_else(|| parsed.as_ref()?.message.as_ref()?.as_str())
         .unwrap_or("upstream request failed");
     let upstream_error_type = parsed
         .as_ref()
-        .and_then(|value| value.get("error"))
+        .and_then(|value| value.error.as_ref())
         .and_then(|error| error.get("type"))
         .and_then(Value::as_str)
         .filter(|error_type| is_anthropic_error || ANTHROPIC_ERROR_TYPES.contains(error_type));
     let request_id = parsed
         .as_ref()
-        .and_then(|value| value.get("request_id"))
+        .and_then(|value| value.request_id.as_ref())
         .and_then(Value::as_str)
         .or(header_request_id);
     let error_type = upstream_error_type.unwrap_or_else(|| error_type_for_status(status));
@@ -138,7 +150,7 @@ fn error_type_for_status(status: StatusCode) -> &'static str {
 // -----------------------------------------------------------------------------
 
 /// Extract content blocks from the first choice.
-fn build_content_blocks(obj: &Map<String, Value>) -> Vec<Value> {
+fn build_content_blocks<'a>(obj: &'a Map<String, Value>) -> Vec<ContentBlock<'a>> {
     let mut blocks = Vec::new();
 
     let choice = obj.get("choices").and_then(Value::as_array).and_then(|c| c.first());
@@ -155,16 +167,16 @@ fn build_content_blocks(obj: &Map<String, Value>) -> Vec<Value> {
 }
 
 /// Extract a text content block from the message if present.
-fn extract_text_block(message: Option<&Value>, blocks: &mut Vec<Value>) {
+fn extract_text_block<'a>(message: Option<&'a Value>, blocks: &mut Vec<ContentBlock<'a>>) {
     if let Some(content) = message.and_then(|m| m.get("content")).and_then(Value::as_str)
         && !content.is_empty()
     {
-        blocks.push(json!({"type": "text", "text": content}));
+        blocks.push(ContentBlock::text(content));
     }
 }
 
 /// Extract tool call blocks from the message.
-fn extract_tool_call_blocks(message: Option<&Value>, blocks: &mut Vec<Value>) {
+fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<ContentBlock<'a>>) {
     let Some(Value::Array(tool_calls)) = message.and_then(|m| m.get("tool_calls")) else {
         return;
     };
@@ -181,14 +193,9 @@ fn extract_tool_call_blocks(message: Option<&Value>, blocks: &mut Vec<Value>) {
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
             .unwrap_or("{}");
-        let input: Value = serde_json::from_str(args_str).unwrap_or_else(|_| Value::Object(Map::new()));
+        let input = serde_json::from_str::<Map<String, Value>>(args_str).unwrap_or_default();
 
-        blocks.push(json!({
-            "type": "tool_use",
-            "id": id,
-            "name": name,
-            "input": input
-        }));
+        blocks.push(ContentBlock::tool_use(id, input, name));
     }
 }
 
@@ -280,8 +287,15 @@ fn timestamp_hex_id() -> String {
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use http::StatusCode;
+    use serde_json::json;
 
     use super::*;
+
+    fn assert_absent_fields(value: &Value, fields: &[&str]) {
+        for field in fields {
+            assert!(value.get(*field).is_none(), "expected {field} to be absent");
+        }
+    }
 
     fn assert_null_fields(value: &Value, fields: &[&str]) {
         for field in fields {
@@ -342,6 +356,28 @@ mod tests {
     }
 
     #[test]
+    fn irrelevant_error_fields_are_ignored() {
+        let body =
+            br#"{"message":"backend rejected the request","irrelevant":[{"nested":"value"},{"nested":"value"}]}"#;
+        let output = transform_error_response(body, StatusCode::BAD_REQUEST, None);
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["error"]["message"], "backend rejected the request");
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    }
+
+    #[test]
+    fn malformed_optional_error_fields_do_not_discard_message() {
+        let body = br#"{"error":{"type":"rate_limit_error","message":"slow down"},"request_id":123}"#;
+        let output = transform_error_response(body, StatusCode::TOO_MANY_REQUESTS, None);
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["error"]["message"], "slow down");
+        assert_eq!(parsed["error"]["type"], "rate_limit_error");
+        assert!(parsed["request_id"].is_null());
+    }
+
+    #[test]
     fn unstructured_errors_do_not_reflect_unknown_text() {
         for body in [
             b"".as_slice(),
@@ -390,10 +426,16 @@ mod tests {
         assert_eq!(parsed["role"], "assistant", "role should be assistant");
         assert_eq!(parsed["content"][0]["type"], "text", "content block type");
         assert_eq!(parsed["content"][0]["text"], "Hello!", "content text");
+        assert!(
+            parsed["content"][0].get("citations").is_some(),
+            "text content should include citations"
+        );
+        assert!(parsed["content"][0]["citations"].is_null(), "citations should be null");
         assert_eq!(parsed["stop_reason"], "end_turn", "stop → end_turn");
         assert_null_fields(&parsed, &["container", "stop_details", "stop_sequence"]);
         assert_eq!(parsed["usage"]["input_tokens"], 10, "input tokens");
         assert_eq!(parsed["usage"]["output_tokens"], 5, "output tokens");
+        assert_absent_fields(&parsed["usage"], &["output_tokens_details"]);
         assert_null_fields(
             &parsed["usage"],
             &[
@@ -401,7 +443,6 @@ mod tests {
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
                 "inference_geo",
-                "output_tokens_details",
                 "server_tool_use",
                 "service_tier",
             ],
@@ -419,6 +460,10 @@ mod tests {
         assert_eq!(parsed["content"][0]["type"], "tool_use", "tool_use block");
         assert_eq!(parsed["content"][0]["name"], "get_weather", "tool name");
         assert_eq!(parsed["content"][0]["input"]["city"], "NYC", "parsed input");
+        assert_eq!(
+            parsed["content"][0]["caller"]["type"], "direct",
+            "tool_use caller should identify a direct invocation"
+        );
     }
 
     #[test]
@@ -449,11 +494,11 @@ mod tests {
                 "cache_creation",
                 "cache_creation_input_tokens",
                 "inference_geo",
-                "output_tokens_details",
                 "server_tool_use",
                 "service_tier",
             ],
         );
+        assert_absent_fields(&parsed["usage"], &["output_tokens_details"]);
     }
 
     #[test]
@@ -555,5 +600,39 @@ mod tests {
             json!({}),
             "invalid JSON arguments should fallback to empty object"
         );
+    }
+
+    #[test]
+    fn non_object_tool_call_arguments_fallback_to_empty_object() {
+        for arguments in ["[]", "null", "\"text\""] {
+            let body = json!({
+                "id": "chatcmpl-1",
+                "model": "gpt-4",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": arguments
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            });
+            let encoded = serde_json::to_vec(&body).unwrap();
+            let transformed = transform_response(&encoded, "gpt-4").unwrap();
+            let parsed: Value = serde_json::from_slice(&transformed.body).unwrap();
+
+            assert_eq!(
+                parsed["content"][0]["input"],
+                json!({}),
+                "{arguments} should not produce a non-object tool input"
+            );
+        }
     }
 }

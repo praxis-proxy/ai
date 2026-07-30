@@ -20,8 +20,9 @@ Praxis integration-test utilities.
 
 - Rust stable 1.96+.
 - Rust nightly is required for `rustfmt`.
-- Praxis core remains unchanged; the existing path dependency at `../praxis`
-  supplies the dynamic response body mode and mutable response headers.
+- Praxis core remains unchanged. Published Praxis crates supply the dynamic
+  response body mode and mutable response headers; `make patch-praxis` can
+  optionally override them with a local `../praxis` checkout.
 - Do not clone request, response, header, body, or SSE data unless correctness
   requires ownership.
 - Do not buffer successful streaming responses; keep them in
@@ -155,16 +156,31 @@ Praxis integration-test utilities.
   ```rust
   #[derive(Serialize)]
   pub(crate) struct MessageResponse<'a> {
+      pub content: Vec<ContentBlock<'a>>,
+      pub container: Option<Value>,
       pub id: String,
-      pub r#type: &'static str,
-      pub role: &'static str,
       pub model: &'a str,
-      pub content: Vec<Value>,
+      pub role: &'static str,
+      pub stop_details: Option<Value>,
       pub stop_reason: String,
       pub stop_sequence: Option<&'static str>,
-      pub stop_details: Option<Value>,
-      pub container: Option<Value>,
+      pub r#type: &'static str,
       pub usage: MessageUsage,
+  }
+
+  #[derive(Serialize)]
+  #[serde(rename_all = "snake_case", tag = "type")]
+  pub(crate) enum ContentBlock<'a> {
+      Text {
+          citations: Option<Value>,
+          text: &'a str,
+      },
+      ToolUse {
+          caller: DirectCaller,
+          id: &'a str,
+          input: Value,
+          name: &'a str,
+      },
   }
 
   #[derive(Serialize)]
@@ -175,7 +191,6 @@ Praxis integration-test utilities.
       pub inference_geo: Option<String>,
       pub input_tokens: u64,
       pub output_tokens: u64,
-      pub output_tokens_details: Option<Value>,
       pub server_tool_use: Option<Value>,
       pub service_tier: Option<String>,
   }
@@ -186,7 +201,6 @@ Praxis integration-test utilities.
       pub cache_read_input_tokens: Option<u64>,
       pub input_tokens: Option<u64>,
       pub output_tokens: u64,
-      pub output_tokens_details: Option<Value>,
       pub server_tool_use: Option<Value>,
   }
   ```
@@ -314,11 +328,11 @@ Praxis integration-test utilities.
           "cache_creation_input_tokens",
           "cache_read_input_tokens",
           "inference_geo",
-          "output_tokens_details",
           "server_tool_use",
           "service_tier",
       ],
   );
+  assert!(parsed["usage"].get("output_tokens_details").is_none());
   ```
 
   Keep the cached-token test, but assert
@@ -554,9 +568,10 @@ Praxis integration-test utilities.
   `transform_non_streaming_body`.
 
   Before buffering either transformation, set
-  `content-type: application/json`, remove the stale `content-length`, and
-  leave `resp.status` unchanged. The protocol layer then frames the
-  transformed body without a stale length.
+  `content-type: application/json`; remove stale `content-length`,
+  `content-encoding`, `content-range`, and `etag` representation metadata;
+  and leave `resp.status` unchanged. Add gzip and Brotli regression cases
+  that verify rewritten JSON never retains the upstream encoding metadata.
 
 - [ ] **Step 5: Run upstream-error and filter tests**
 
@@ -593,9 +608,10 @@ Praxis integration-test utilities.
   `message_delta.usage` values without changing the incremental SSE state
   machine.
 
-- [ ] **Step 1: Add the missing streaming field assertions**
+- [ ] **Step 1: Add the streaming field assertions**
 
-  Add `"output_tokens_details"` to both null-field assertion lists:
+  Assert that nullable fields are present and that
+  `output_tokens_details` is absent:
 
   ```rust
   assert_null_fields(
@@ -605,17 +621,18 @@ Praxis integration-test utilities.
           "cache_creation_input_tokens",
           "cache_read_input_tokens",
           "inference_geo",
-          "output_tokens_details",
           "server_tool_use",
           "service_tier",
       ],
       "message_start usage",
   );
+  assert!(usage.get("output_tokens_details").is_none());
   ```
 
   The delta assertion list must contain
   `cache_creation_input_tokens`, `cache_read_input_tokens`, `input_tokens`,
-  `output_tokens_details`, and `server_tool_use`.
+  and `server_tool_use`, with a separate absence assertion for
+  `output_tokens_details`.
 
 - [ ] **Step 2: Run streaming schema tests and verify they fail**
 
@@ -626,7 +643,7 @@ Praxis integration-test utilities.
   cargo test -p praxis-ai-apis message_delta_usage_matches_anthropic_schema -- --nocapture
   ```
 
-  Expected: both tests fail because `output_tokens_details` is absent.
+  Expected: both tests fail because `output_tokens_details` is present.
 
 - [ ] **Step 3: Replace local usage JSON builders with shared types**
 
@@ -693,7 +710,6 @@ Praxis integration-test utilities.
       "cache_creation_input_tokens",
       "cache_read_input_tokens",
       "inference_geo",
-      "output_tokens_details",
       "server_tool_use",
       "service_tier",
   ] {
@@ -702,6 +718,7 @@ Praxis integration-test utilities.
           "usage should include {field}",
       );
   }
+  assert!(transformed["usage"].get("output_tokens_details").is_none());
   ```
 
 - [ ] **Step 2: Add non-streaming and streaming pre-stream error tests**
@@ -840,7 +857,7 @@ Praxis integration-test utilities.
 
 **Interfaces:**
 
-- Consumes: verified branch `codex/issue-416-anthropic-schema`.
+- Consumes: verified branch `codex/issue-416-anthropic-schema-fix`.
 - Produces: a pushed branch, a non-draft GitHub pull request, and an issue
   comment linking the implementation.
 
@@ -861,7 +878,7 @@ Praxis integration-test utilities.
   Run:
 
   ```console
-  git push -u origin codex/issue-416-anthropic-schema
+  git push -u origin codex/issue-416-anthropic-schema-fix
   ```
 
 - [ ] **Step 3: Open a ready-for-review pull request**

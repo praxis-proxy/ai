@@ -130,6 +130,14 @@ fn anthropic_to_openai_transforms_response_body() {
         transformed["content"][0]["text"], "Hello from a Chat Completions backend.",
         "Chat Completions response text should map to Anthropic content"
     );
+    assert!(
+        transformed["content"][0].get("citations").is_some(),
+        "text content should include citations"
+    );
+    assert!(
+        transformed["content"][0]["citations"].is_null(),
+        "text content citations should be null"
+    );
     assert_eq!(
         transformed["usage"]["input_tokens"], 11,
         "prompt tokens should map to input tokens"
@@ -143,7 +151,6 @@ fn anthropic_to_openai_transforms_response_body() {
         "cache_creation_input_tokens",
         "cache_read_input_tokens",
         "inference_geo",
-        "output_tokens_details",
         "server_tool_use",
         "service_tier",
     ] {
@@ -153,6 +160,10 @@ fn anthropic_to_openai_transforms_response_body() {
         );
         assert!(transformed["usage"][field].is_null(), "usage {field} should be null");
     }
+    assert!(
+        transformed["usage"].get("output_tokens_details").is_none(),
+        "usage should omit output_tokens_details"
+    );
 }
 
 fn run_anthropic_to_openai_error(status: u16, response_body: &str, stream: bool) -> (u16, serde_json::Value) {
