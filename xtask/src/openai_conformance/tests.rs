@@ -738,6 +738,8 @@ paths:
     parameters:
       - {in: path, name: conversation_id, required: true, schema: {type: string}}
     get:
+      security:
+        - OperationAuth: []
       responses:
         '200':
           description: OK
@@ -750,6 +752,7 @@ paths:
 components:
   securitySchemes:
     ApiKeyAuth: {type: http, scheme: bearer}
+    OperationAuth: {type: apiKey, name: x-op-key, in: header}
   schemas:
     Conversation:
       type: object
@@ -769,6 +772,10 @@ components:
     assert!(
         bundle.pointer("/components/securitySchemes/ApiKeyAuth").is_some(),
         "owned inherited security schemes should remain in the projection"
+    );
+    assert!(
+        bundle.pointer("/components/securitySchemes/OperationAuth").is_some(),
+        "operation-level security schemes should remain in the owned projection"
     );
     assert!(
         bundle.pointer("/components/schemas/Conversation").is_some(),
@@ -804,6 +811,23 @@ components:
             .pointer("/components/securitySchemes/ApiKeyAuth")
             .is_none(),
         "security schemes referenced only by deployment-owned security should be excluded"
+    );
+    assert!(
+        conversations
+            .pointer("/components/securitySchemes/OperationAuth")
+            .is_some(),
+        "operation-level security schemes should survive deployment-owned exclusion"
+    );
+    let get_op = conversations
+        .pointer("/paths/~1conversations~1{conversation_id}/get/security")
+        .expect("operation-level security block should remain in the projection");
+    assert!(
+        get_op
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|req| req.get("OperationAuth").is_some()),
+        "operation-level OperationAuth should remain in the operation security block"
     );
     assert!(
         conversations.pointer("/components/schemas/Conversation").is_some(),
