@@ -27,24 +27,6 @@ mod tests {
     /// [`Fixture::write_filter_crate`].
     const FIXTURE_FILTER_NAME: &str = "e2e_fixture_filter";
 
-    /// Closes the loop that `praxis-ai-build-support`'s unit tests
-    /// (`server/build_support/src/tests.rs`) cannot reach alone: a
-    /// marked external filter dependency must not just be
-    /// *discovered*, but the generated `register_external_filters`
-    /// function must compile and, at runtime, register the filter
-    /// into a real `praxis_filter::FilterRegistry`.
-    ///
-    /// The fixture crates are generated into a temp dir and built as
-    /// an isolated, non-workspace Cargo project so this stays purely
-    /// a test concern (no trace in the shipped `praxis-ai-proxy`
-    /// manifest or `cargo tree`).
-    ///
-    /// Spawns a `cargo run` subprocess and is comparatively slow;
-    /// skip it locally with `cargo test -p praxis-ai-proxy -- --skip
-    /// external_filter_discovery_e2e`. It also needs the sibling
-    /// `../praxis` checkout for a real `praxis-proxy-filter` path
-    /// dependency and skips itself when that's absent (e.g. the
-    /// standard CI unit-test job).
     #[test]
     fn external_filter_dependency_is_discovered_and_registered_at_runtime() {
         if !Fixture::praxis_filter_dir().join("Cargo.toml").is_file() {

@@ -161,6 +161,10 @@ fn direct_runtime_dependency_manifest_paths_excludes_dev_and_disabled_optional_d
     );
 }
 
+// -----------------------------------------------------------------------------
+// Test Utilities
+// -----------------------------------------------------------------------------
+
 /// Build a minimal but structurally-valid `cargo_metadata::Metadata`,
 /// substituting a caller-supplied `resolve` field body (or `null`).
 fn minimal_metadata_json(resolve_body: &str) -> Metadata {
