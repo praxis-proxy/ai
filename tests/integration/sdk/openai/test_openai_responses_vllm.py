@@ -212,9 +212,11 @@ def _write_agentic_config(
         "        allow_loopback: true\n",
     )
     config = config.replace(
-        "- filter: openai_mcp_dispatch\n",
         "- filter: openai_mcp_dispatch\n"
-        "                allow_loopback: true\n",
+        "              - filter: agentic_loop",
+        "- filter: openai_mcp_dispatch\n"
+        "                allow_loopback: true\n"
+        "              - filter: agentic_loop",
     )
     config = config.replace(
         "max_iterations: 11\n",
