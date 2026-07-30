@@ -3611,9 +3611,21 @@ fn parse_query_params_unknown_order_rejected() {
 }
 
 #[test]
-fn parse_query_params_include_rejected() {
+fn parse_query_params_include_bracket_rejected() {
     let err = super::filter::parse_query_params(Some("include[]=reasoning.encrypted_content")).unwrap_err();
-    assert!(err.contains("not supported"), "should reject include parameter: {err}");
+    assert!(
+        err.contains("not supported"),
+        "should reject include[] parameter: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_include_bare_rejected() {
+    let err = super::filter::parse_query_params(Some("include=reasoning.encrypted_content")).unwrap_err();
+    assert!(
+        err.contains("not supported"),
+        "should reject bare include parameter: {err}"
+    );
 }
 
 #[test]

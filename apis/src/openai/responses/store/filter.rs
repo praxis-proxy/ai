@@ -907,17 +907,17 @@ impl ResponseStoreFilter {
 
     /// Serve `GET /v1/responses/{id}/input_items`.
     async fn handle_get_input_items(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
-        let record = match self.load_record(ctx, id).await {
-            Ok(r) => r,
-            Err(action) => return action,
-        };
-
         let params = match parse_query_params(ctx.request.uri.query()) {
             Ok(p) => p,
             Err(msg) => {
                 debug!(response_id = id, error = %msg, "invalid input_items query parameter");
                 return FilterAction::Reject(reject_invalid_input(&msg));
             },
+        };
+
+        let record = match self.load_record(ctx, id).await {
+            Ok(r) => r,
+            Err(action) => return action,
         };
         build_input_items_response(id, &record, &params)
     }
