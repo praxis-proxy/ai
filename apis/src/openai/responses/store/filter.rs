@@ -998,6 +998,9 @@ pub(super) fn parse_query_params(query: Option<&str>) -> Result<ListParams, Stri
 fn apply_query_param(params: &mut ListParams, key: &str, value: &str) -> Result<(), String> {
     match key {
         "after" => {
+            if value.is_empty() {
+                return Err("Invalid value for 'after': cursor must not be empty.".to_owned());
+            }
             params.cursor = Some(
                 percent_encoding::percent_decode_str(value)
                     .decode_utf8_lossy()

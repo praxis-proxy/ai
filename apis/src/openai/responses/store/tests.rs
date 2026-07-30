@@ -3602,6 +3602,15 @@ fn parse_query_params_decodes_percent_encoded_cursor() {
 }
 
 #[test]
+fn parse_query_params_empty_after_rejected() {
+    let err = super::filter::parse_query_params(Some("after=")).unwrap_err();
+    assert!(
+        err.contains("cursor must not be empty"),
+        "should reject empty after: {err}"
+    );
+}
+
+#[test]
 fn parse_query_params_unknown_order_rejected() {
     let err = super::filter::parse_query_params(Some("order=random")).unwrap_err();
     assert!(
