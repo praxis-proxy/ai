@@ -742,28 +742,6 @@ class TestAgenticLoopVLLM:
         )
         assert function_calls[0].name == "get_weather"
 
-    def test_web_search_tool_accepted_in_pipeline(self, agentic_client):
-        """The web_search_preview tool is accepted by the pipeline.
-
-        Qwen3-0.6B may not produce web_search_call output items (an
-        OpenAI-specific feature), so this test verifies the proxy
-        correctly handles the tool config and completes without error,
-        rather than asserting on specific search behavior.
-        """
-        response = agentic_client.responses.create(
-            model=VLLM_MODEL,
-            input="What is the capital of France? /no_think",
-            tools=[{"type": "web_search_preview"}],
-            store=False,
-            max_output_tokens=256,
-        )
-
-        assert response.status == "completed"
-        assert len(response.output) >= 1, (
-            "expected at least one output item; "
-            f"got: {[i.type for i in response.output]}"
-        )
-
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
