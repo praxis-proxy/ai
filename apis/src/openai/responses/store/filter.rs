@@ -234,8 +234,7 @@ impl ResponseStoreFilter {
     /// Return whether this exchange should release response body
     /// chunks immediately instead of waiting for EOS.
     fn should_release_skipped_response_body(&self, ctx: &HttpFilterContext<'_>) -> bool {
-        ctx.get_metadata("responses._reformat_error").is_none()
-            && (should_skip_persist(ctx) || self.store.get().and_then(Option::as_ref).is_none())
+        should_skip_persist(ctx) || self.store.get().and_then(Option::as_ref).is_none()
     }
 
     /// Return the initialized store and terminal response bytes.
@@ -809,9 +808,6 @@ impl HttpFilter for ResponseStoreFilter {
 
         if is_streaming_request(ctx) {
             if !end_of_stream {
-                if ctx.get_metadata("responses._reformat_error").is_some() {
-                    return Ok(FilterAction::Continue);
-                }
                 return Ok(FilterAction::Release);
             }
             return self.persist_from_streaming_state(ctx);
