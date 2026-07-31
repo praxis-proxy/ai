@@ -127,6 +127,11 @@ fn discover_filters(responses_dir: &Path) -> Vec<FilterMeta> {
 }
 
 /// Collect all `.rs` files under a directory (non-recursive, skips tests).
+///
+/// Only scans `dir` itself, not nested subdirectories.  This is
+/// intentional: every `responses/` submodule keeps its filter in the
+/// immediate directory (e.g. `store/mod.rs`), so a recursive walk
+/// would only add noise from test helpers or internal modules.
 fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -568,5 +573,89 @@ mod tests {
             first_sentence("Does stuff.\n\n# YAML\n\n```yaml\nfilter: foo\n```"),
             "Does stuff."
         );
+    }
+
+    fn parse_single_filter(source: &str) -> FilterMeta {
+        let file = syn::parse_file(source).expect("synthetic source must parse");
+        let struct_docs = collect_struct_docs(&file);
+        file.items
+            .iter()
+            .filter_map(|item| {
+                if let syn::Item::Impl(imp) = item {
+                    Some(imp)
+                } else {
+                    None
+                }
+            })
+            .find_map(|imp| try_extract_filter(imp, &struct_docs))
+            .expect("should extract exactly one filter")
+    }
+
+    #[test]
+    fn extract_filter_from_synthetic_impl() {
+        let meta = parse_single_filter(
+            r#"
+            /// Does something cool.
+            struct FakeFilter;
+            impl HttpFilter for FakeFilter {
+                fn name(&self) -> &'static str { "fake_filter" }
+                async fn on_request(&self, ctx: &mut Ctx) -> Result<()> { Ok(()) }
+                async fn on_request_body(&self, ctx: &mut BodyCtx) -> Result<()> { Ok(()) }
+                fn request_body_access(&self) -> BodyAccess { BodyAccess::ReadWrite }
+                fn request_body_mode(&self) -> BodyMode { BodyMode::StreamBuffer { max_bytes: 1024 } }
+            }
+        "#,
+        );
+
+        assert_eq!(meta.name, "fake_filter");
+        assert_eq!(meta.description, "Does something cool.");
+        assert!(meta.hooks.on_request);
+        assert!(meta.hooks.on_request_body);
+        assert!(!meta.hooks.on_response);
+        assert!(!meta.hooks.on_response_body);
+        assert_eq!(meta.request_body_access, "ReadWrite");
+        assert_eq!(meta.request_body_mode, "StreamBuffer");
+        assert_eq!(meta.response_body_access, "None");
+        assert_eq!(meta.response_body_mode, "Stream");
+    }
+
+    #[test]
+    fn extract_filter_unused_ctx_marks_inactive() {
+        let meta = parse_single_filter(
+            r#"
+            struct InactiveFilter;
+            impl HttpFilter for InactiveFilter {
+                fn name(&self) -> &'static str { "inactive_filter" }
+                async fn on_request(&self, _ctx: &mut Ctx) -> Result<()> { Ok(()) }
+                async fn on_response(&self, _ctx: &mut Ctx) -> Result<()> { Ok(()) }
+            }
+        "#,
+        );
+        assert!(!meta.hooks.on_request, "underscore-prefixed ctx should be inactive");
+        assert!(!meta.hooks.on_response, "underscore-prefixed ctx should be inactive");
+    }
+
+    #[test]
+    fn body_access_read_write_matched_before_read_only() {
+        let rw: syn::Block = syn::parse_str("{ BodyAccess::ReadWrite }").unwrap();
+        assert_eq!(extract_body_access_value(&rw), "ReadWrite");
+
+        let ro: syn::Block = syn::parse_str("{ BodyAccess::ReadOnly }").unwrap();
+        assert_eq!(extract_body_access_value(&ro), "ReadOnly");
+
+        let none: syn::Block = syn::parse_str("{ BodyAccess::None }").unwrap();
+        assert_eq!(extract_body_access_value(&none), "None");
+    }
+
+    #[test]
+    fn body_mode_stream_buffer_matched_before_stream() {
+        let sb: syn::Block = syn::parse_str("{ BodyMode::StreamBuffer { max_bytes: 1024 } }").unwrap();
+        assert_eq!(extract_body_mode_value(&sb), "StreamBuffer");
+
+        let sl: syn::Block = syn::parse_str("{ BodyMode::SizeLimit { max_bytes: 512 } }").unwrap();
+        assert_eq!(extract_body_mode_value(&sl), "SizeLimit");
+
+        let stream: syn::Block = syn::parse_str("{ BodyMode::Stream }").unwrap();
+        assert_eq!(extract_body_mode_value(&stream), "Stream");
     }
 }
