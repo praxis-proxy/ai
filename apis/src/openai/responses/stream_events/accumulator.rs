@@ -296,3 +296,43 @@ fn upsert_tool_call(tool_calls: &mut Vec<Value>, tool_call: Value) {
 
     tool_calls.push(tool_call);
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::merge_usage;
+
+    #[test]
+    fn merge_usage_inserts_new_keys() {
+        let mut acc = json!({"prompt_tokens": 10});
+        merge_usage(&mut acc, &json!({"completion_tokens": 5}));
+        assert_eq!(
+            acc,
+            json!({"prompt_tokens": 10, "completion_tokens": 5}),
+            "new keys should be inserted"
+        );
+    }
+
+    #[test]
+    fn merge_usage_non_u64_numbers_replaced() {
+        let mut acc = json!({"tokens": -1});
+        merge_usage(&mut acc, &json!({"tokens": 5}));
+        assert_eq!(
+            acc.get("tokens").and_then(serde_json::Value::as_u64),
+            Some(5),
+            "negative accumulated value should be replaced"
+        );
+    }
+
+    #[test]
+    fn merge_usage_type_mismatch_replaced() {
+        let mut acc = json!("old");
+        merge_usage(&mut acc, &json!("new"));
+        assert_eq!(acc, json!("new"), "non-object/non-number should be replaced");
+    }
+}
