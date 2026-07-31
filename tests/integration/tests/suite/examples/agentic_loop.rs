@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, build_pipeline, example_config_path, free_port, http_send,
-    json_post, load_example_config, parse_body, parse_status, patch_yaml, start_backend_with_shutdown,
-    start_mcp_mock_server_with_config, start_proxy,
+    json_post, parse_body, parse_status, patch_yaml, start_backend_with_shutdown, start_mcp_mock_server_with_config,
+    start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -21,11 +21,7 @@ use praxis_test_utils::{
 
 #[test]
 fn example_config_builds_pipeline() {
-    let config = load_example_config(
-        "openai/responses/agentic-loop.yaml",
-        free_port(),
-        HashMap::from([("127.0.0.1:3001", 19901_u16)]),
-    );
+    let config = load_agentic_config(free_port(), 19901);
     let _pipeline = build_pipeline(&config);
 }
 
@@ -38,11 +34,7 @@ fn single_pass_completes_through_irr() {
     let model = start_backend_with_shutdown(r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#);
     let proxy_port = free_port();
 
-    let config = load_example_config(
-        "openai/responses/agentic-loop.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3001", model.port())]),
-    );
+    let config = load_agentic_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
     let body = r#"{"model":"gpt-4.1","input":"Hello"}"#;
@@ -76,11 +68,7 @@ fn client_function_call_returns_without_server_execution() {
     )])
     .start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_example_config(
-        "openai/responses/agentic-loop.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3001", model.port())]),
-    );
+    let config = load_agentic_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
     let request = serde_json::json!({
@@ -273,10 +261,23 @@ fn round_trip_captures_tool_and_model_requests() {
 
 /// Load the checked-in example while enabling loopback only for the
 /// test-owned MCP server.
+fn patch_web_search_api_key(yaml: &str) -> String {
+    yaml.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
+}
+
+fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
+}
+
 fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n",
         "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",

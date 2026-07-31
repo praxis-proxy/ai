@@ -143,6 +143,156 @@ fn emit_status_uses_valid_key() {
 }
 
 // -----------------------------------------------------------------------------
+// on_response_body: Loop Signaling
+// -----------------------------------------------------------------------------
+
+#[test]
+fn on_response_body_signals_loop_when_web_search_calls_present() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test query"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let results = ctx
+        .filter_results
+        .get("openai_web_search")
+        .expect("should have openai_web_search entry");
+    assert_eq!(results.get("action"), Some("loop"));
+}
+
+#[test]
+fn on_response_body_signals_done_when_no_web_search_calls() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let state = ResponsesState::from_request_body(body);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let results = ctx
+        .filter_results
+        .get("openai_web_search")
+        .expect("should have openai_web_search entry");
+    assert_eq!(results.get("action"), Some("done"));
+}
+
+#[test]
+fn on_response_body_passthrough_without_state() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.filter_results.is_empty(),
+        "should not write filter_results without state"
+    );
+}
+
+#[test]
+fn on_response_body_passthrough_on_non_end_of_stream() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, false).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.filter_results.is_empty(),
+        "should not set filter_results on non-end-of-stream"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// on_request_body: Passthrough
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn on_request_body_passthrough_without_state() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test]
+async fn on_request_body_passthrough_when_no_web_search_calls() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let state = ResponsesState::from_request_body(body);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.web_search_calls.is_empty());
+}
+
+#[tokio::test]
+async fn on_request_body_passthrough_on_non_end_of_stream() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, false).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+// -----------------------------------------------------------------------------
 // Output formatting tests
 // -----------------------------------------------------------------------------
 

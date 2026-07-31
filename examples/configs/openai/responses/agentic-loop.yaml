@@ -5,9 +5,10 @@
 #
 # The iterative_request_router (IRR) repeatedly runs one inference step.
 # `openai_mcp_dispatch` dynamically executes MCP calls against the server URL
-# supplied in the request, then the same step sends the result back to the
-# model. Client-side function calls do not match the MCP tool map and are
-# returned to the client without looping.
+# supplied in the request, and `openai_web_search` executes web searches
+# against an external search provider. Both dispatch results back to the
+# model via the loop. Client-side function calls do not match any
+# dispatch filter and are returned to the client without looping.
 #
 # Pre-IRR filters run once on the client request to set up shared
 # state (ResponsesState) which persists across all IRR iterations
@@ -25,18 +26,20 @@
 #
 # IRR inference filter chain:
 #   Request phase (forward):
-#     openai_mcp_dispatch → agentic_loop → openai_responses_proxy
-#       → router → load_balancer
+#     openai_web_search → openai_mcp_dispatch → agentic_loop
+#       → openai_responses_proxy → router → load_balancer
 #   Response phase (reverse):
 #     load_balancer → router → openai_responses_proxy → agentic_loop
-#       → openai_mcp_dispatch
-#   agentic_loop extracts completed function calls. MCP dispatch then
-#   identifies calls resolved from the request, writes the IRR transition,
-#   and executes them at the start of the next iteration before inference.
+#       → openai_mcp_dispatch → openai_web_search
+#   agentic_loop extracts completed function calls and web_search_call
+#   items. Dispatch filters then identify their respective calls, write
+#   the IRR transition, and execute them at the start of the next
+#   iteration before inference.
 #
 # Transition rules (evaluated after each step's response-body):
-#   openai_mcp_dispatch.action = "loop" → next: inference
-#   default                             → done (exit to client)
+#   openai_mcp_dispatch.action = "loop"  → next: inference
+#   openai_web_search.action   = "loop"  → next: inference
+#   default                              → done (exit to client)
 #
 # Config knobs:
 #   max_infer_iters: application-level iteration cap (default 10)
@@ -103,8 +106,15 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              # Runs first on request re-entry to execute the pending MCP
-              # call, and last on the model response to select loop/done.
+              # Runs first on request re-entry to execute pending web
+              # searches, and last on the model response to detect
+              # web_search_call items.
+              - filter: openai_web_search
+                provider: brave
+                api_key: ${WEB_SEARCH_API_KEY}
+              # Runs second on request re-entry to execute pending MCP
+              # calls, and second-to-last on the model response to
+              # classify MCP tool calls.
               - filter: openai_mcp_dispatch
               - filter: agentic_loop
                 max_infer_iters: 10
@@ -120,6 +130,10 @@ filter_chains:
                       - "127.0.0.1:3001"
             on_result:
               - filter: openai_mcp_dispatch
+                key: action
+                value: loop
+                next: inference
+              - filter: openai_web_search
                 key: action
                 value: loop
                 next: inference
