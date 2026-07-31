@@ -1,13 +1,24 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Web search filter for the Responses API.
+//! Web search filter for the Responses API agentic loop.
 //!
-//! Validates configuration and constructs a search client at startup
-//! but does not execute searches at runtime. When `tool_dispatch`
-//! (#26) and branch re-entrance land in praxis-core, this filter
-//! will handle model-driven `web_search_call` dispatch in the
-//! agentic loop.
+//! Operates in two phases within the `iterative_request_router`:
+//!
+//! 1. **Response path** (`on_response_body`): detects `web_search_call` items in [`ResponsesState::web_search_calls`]
+//!    and writes `openai_web_search.action = "loop"` to [`filter_results`] for the IRR step transition.
+//! 2. **Request path** (`on_request_body`, re-entry): executes pending web searches via [`SearchClient`] and appends
+//!    results to `messages`, `persisted_messages`, and `accumulated_output`.
+//!
+//! # Pipeline dependencies
+//!
+//! - **`agentic_loop`** must run before this filter in the response phase (after in YAML order) to extract
+//!   `web_search_call` items from the model response into [`ResponsesState::web_search_calls`].
+//! - The IRR transition must match `openai_web_search.action = "loop"` and target the same inference step.
+//!
+//! [`ResponsesState::web_search_calls`]: super::state::ResponsesState
+//! [`filter_results`]: HttpFilterContext::filter_results
+//! [`SearchClient`]: provider::SearchClient
 
 pub(crate) mod config;
 pub(crate) mod provider;
@@ -29,7 +40,10 @@ mod tests;
 use std::fmt::Write as _;
 
 use async_trait::async_trait;
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
+use bytes::Bytes;
+use praxis_filter::{
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -37,7 +51,21 @@ use self::{
     config::{SearchContextSize, WebSearchFilterConfig, build_config},
     provider::{SearchClient, SearchOutcome, SearchResult},
 };
+use super::state::ResponsesState;
 use crate::openai::responses::error::responses_error_rejection;
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Filter results key for the loop control action.
+const FILTER_RESULT_KEY: &str = "openai_web_search";
+
+/// Action value signalling a loop-back for web search dispatch.
+const ACTION_LOOP: &str = "loop";
+
+/// Action value signalling no web search dispatch needed.
+const ACTION_DONE: &str = "done";
 
 // -----------------------------------------------------------------------------
 // WebSearchFilter
@@ -45,11 +73,9 @@ use crate::openai::responses::error::responses_error_rejection;
 
 /// Web search filter for model-driven `web_search_call` dispatch.
 ///
-/// Validates configuration and constructs a search client at startup.
-/// At runtime this filter is a passthrough — it does not modify
-/// requests or responses. When `tool_dispatch` (#26) and branch
-/// re-entrance are available, this filter will execute searches
-/// dispatched by the model during the agentic loop.
+/// Detects pending web search calls in the response phase and
+/// executes them on re-entry via the `iterative_request_router`
+/// agentic loop.
 ///
 /// # YAML
 ///
@@ -71,7 +97,6 @@ use crate::openai::responses::error::responses_error_rejection;
 /// status_on_error: 502
 /// max_body_bytes: 67108864
 /// ```
-#[expect(dead_code, reason = "fields used at startup and reserved for tool_dispatch (#26)")]
 pub struct WebSearchFilter {
     /// The search client for executing queries.
     search_client: SearchClient,
@@ -136,6 +161,28 @@ impl WebSearchFilter {
             max_body_bytes: validated.max_body_bytes,
         }))
     }
+
+    /// Execute a single web search call and append results to state.
+    async fn execute_single_search(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        call: &Value,
+        context_size: SearchContextSize,
+    ) -> Result<(), FilterAction> {
+        let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
+        let query = call.get("action").and_then(|a| a.get("query")).and_then(Value::as_str);
+
+        let Some(query) = query else {
+            warn!(call_id, "web_search_call missing action.query, skipping");
+            append_result(ctx, call_id, "incomplete", "", &[]);
+            return Ok(());
+        };
+
+        let results = resolve_search_outcome(&self.search_client, query, context_size, call_id, false).await?;
+
+        append_result(ctx, call_id, "completed", query, &results);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -144,20 +191,116 @@ impl HttpFilter for WebSearchFilter {
         "openai_web_search"
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(self.max_body_bytes),
+        }
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(self.max_body_bytes),
+        }
+    }
+
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return Ok(FilterAction::Continue);
+        };
+
+        if state.web_search_calls.is_empty() {
+            return Ok(FilterAction::Continue);
+        }
+
+        let context_size = ctx
+            .get_metadata("tool_parse.search_context_size")
+            .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
+
+        let calls: Vec<Value> = state.web_search_calls.clone();
+        debug!(count = calls.len(), "executing pending web search calls");
+
+        for call in &calls {
+            if let Err(rejection) = self.execute_single_search(ctx, call, context_size).await {
+                return Ok(rejection);
+            }
+        }
+
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.web_search_calls.clear();
+        }
+
+        Ok(FilterAction::Continue)
+    }
+
+    fn on_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return Ok(FilterAction::Continue);
+        };
+
+        if state.web_search_calls.is_empty() {
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Continue);
+        }
+
+        debug!(
+            count = state.web_search_calls.len(),
+            "web search calls pending, signaling loop"
+        );
+        set_action(ctx, ACTION_LOOP)?;
         Ok(FilterAction::Continue)
     }
 }
 
+/// Append search results to [`ResponsesState`].
+fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str, query: &str, results: &[SearchResult]) {
+    let output_item = build_output_item(call_id, status, query, results);
+    let tool_result = build_tool_result_message(call_id, results);
+
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.messages.push(tool_result.clone());
+        state.persisted_messages.push(tool_result);
+        state.accumulated_output.push(output_item);
+    }
+}
+
 // -----------------------------------------------------------------------------
-// Helpers (pub(crate) for tool_dispatch)
+// Helpers
 // -----------------------------------------------------------------------------
 
 /// Execute a search and resolve its outcome to a result list.
 ///
 /// Returns `Err(FilterAction)` when the search is rejected under
 /// closed failure mode.
-#[expect(dead_code, reason = "scaffolded for tool_dispatch (#26)")]
 pub(crate) async fn resolve_search_outcome(
     search_client: &SearchClient,
     query: &str,
@@ -184,7 +327,7 @@ pub(crate) async fn resolve_search_outcome(
 }
 
 /// Emit a `web_search_call` status update via filter results.
-#[cfg_attr(not(test), expect(dead_code, reason = "scaffolded for tool_dispatch (#26)"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved for per-call status tracking"))]
 pub(crate) fn emit_status(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str) {
     let key = format!("web_search_call_{call_id}");
     let results = ctx.filter_results.entry("openai_web_search").or_default();
@@ -194,7 +337,6 @@ pub(crate) fn emit_status(ctx: &mut HttpFilterContext<'_>, call_id: &str, status
 }
 
 /// Build a `web_search_call` output item for the response.
-#[cfg_attr(not(test), expect(dead_code, reason = "scaffolded for tool_dispatch (#26)"))]
 pub(crate) fn build_output_item(call_id: &str, status: &str, query: &str, results: &[SearchResult]) -> Value {
     let mut item = serde_json::json!({
         "type": "web_search_call",
@@ -225,7 +367,6 @@ pub(crate) fn build_output_item(call_id: &str, status: &str, query: &str, result
 }
 
 /// Build a tool result message to append to conversation history.
-#[cfg_attr(not(test), expect(dead_code, reason = "scaffolded for tool_dispatch (#26)"))]
 pub(crate) fn build_tool_result_message(call_id: &str, results: &[SearchResult]) -> Value {
     let content = if results.is_empty() {
         "No search results found.".to_owned()
@@ -251,4 +392,13 @@ pub(crate) fn format_search_results(results: &[SearchResult]) -> String {
         let _infallible = write!(out, "[{}] {}\n{}\n{}", i + 1, r.title, r.url, r.snippet);
     }
     out
+}
+
+/// Write the loop control action to filter results.
+fn set_action(ctx: &mut HttpFilterContext<'_>, action: &'static str) -> Result<(), FilterError> {
+    ctx.filter_results
+        .entry(FILTER_RESULT_KEY)
+        .or_default()
+        .set("action", action)?;
+    Ok(())
 }

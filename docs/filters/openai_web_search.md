@@ -7,7 +7,7 @@ Web search filter for model-driven `web_search_call` dispatch.
 
 ## Configuration Notes
 
-Validates configuration and constructs a search client at startup. At runtime this filter is a passthrough — it does not modify requests or responses. When `tool_dispatch` (#26) and branch re-entrance are available, this filter will execute searches dispatched by the model during the agentic loop.
+Detects pending web search calls in the response phase and executes them on re-entry via the `iterative_request_router` agentic loop.
 
 ## Configuration
 
@@ -20,6 +20,7 @@ Validates configuration and constructs a search client at startup. At runtime th
 | `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
 | `failure_mode` | `closed` \| `open` | no | Failure mode for search callouts. |
 | `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
+| `base_url` | string | no | Override the provider's default API base URL. |
 
 ## Examples
 

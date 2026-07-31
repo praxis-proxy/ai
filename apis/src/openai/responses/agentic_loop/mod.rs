@@ -9,7 +9,8 @@
 //!
 //! Does **not** classify tool calls by type or execute them —
 //! MCP classification and execution are handled by
-//! `openai_mcp_dispatch`.
+//! `openai_mcp_dispatch`, web search execution by
+//! `openai_web_search`.
 //!
 //! # Loop control
 //!
@@ -23,7 +24,8 @@
 //! For non-streaming responses (the only mode supported by IRR),
 //! this filter parses the response body JSON and extracts
 //! `function_call` items from the `output` array into
-//! `state.tool_calls`. It also appends these items to
+//! `state.tool_calls` and `web_search_call` items into
+//! `state.web_search_calls`. It also appends these items to
 //! `state.messages` so the model sees its own calls on re-entry.
 //!
 //! For streaming responses (future), `stream_events` populates
@@ -32,17 +34,18 @@
 //! filter skips body parsing and checks `state.tool_calls` as-is.
 //!
 //! `on_request_body` handles iteration bookkeeping: clearing stale
-//! tool calls from the previous round, forcing
-//! `parallel_tool_calls` to `false` (v1 supports one function
-//! call per round), and resetting `tool_choice` to `"auto"` on
-//! re-entry.
+//! tool calls and web search calls from the previous round,
+//! forcing `parallel_tool_calls` to `false` (v1 supports one
+//! function call per round), and resetting `tool_choice` to
+//! `"auto"` on re-entry.
 //!
 //! # Filter order
 //!
-//! For MCP execution, it must appear after `openai_mcp_dispatch`
-//! and before `openai_responses_proxy`. Response filters execute in
-//! reverse order, so the loop extracts function calls before MCP
-//! dispatch classifies them and publishes the IRR transition.
+//! For tool execution, it must appear after `openai_web_search`
+//! and `openai_mcp_dispatch` and before `openai_responses_proxy`.
+//! Response filters execute in reverse order, so the loop
+//! extracts tool calls before dispatch filters classify them and
+//! publish the IRR transition.
 //!
 //! ```yaml
 //! filter: iterative_request_router
@@ -51,6 +54,9 @@
 //! steps:
 //!   - name: inference
 //!     filters:
+//!       - filter: openai_web_search
+//!         provider: brave
+//!         api_key: ${WEB_SEARCH_API_KEY}
 //!       - filter: openai_mcp_dispatch
 //!       - filter: agentic_loop
 //!         max_infer_iters: 10
@@ -64,6 +70,10 @@
 //!             endpoints: ["127.0.0.1:3001"]
 //!     on_result:
 //!       - filter: openai_mcp_dispatch
+//!         key: action
+//!         value: loop
+//!         next: inference
+//!       - filter: openai_web_search
 //!         key: action
 //!         value: loop
 //!         next: inference
@@ -287,6 +297,7 @@ impl HttpFilter for AgenticLoopFilter {
 /// the original client header).
 fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) {
     state.tool_calls.clear();
+    state.web_search_calls.clear();
     state.parallel_tool_calls = false;
     if let Some(obj) = state.request_body.as_object_mut() {
         obj.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
@@ -314,7 +325,7 @@ fn evaluate_loop_decision(
     body: &mut Option<Bytes>,
     config: &AgenticLoopConfig,
 ) -> Result<FilterAction, FilterError> {
-    if state.tool_calls.is_empty() {
+    if state.tool_calls.is_empty() && state.web_search_calls.is_empty() {
         trace!("no tool calls, signaling done");
         finalize_response_body(state, body);
         return set_done(ctx);
@@ -334,11 +345,8 @@ fn evaluate_loop_decision(
         ))),
         None => {
             state.iteration += 1;
-            debug!(
-                iteration = state.iteration,
-                tool_calls = state.tool_calls.len(),
-                "tool calls present, signaling loop"
-            );
+            let (tc, wsc) = (state.tool_calls.len(), state.web_search_calls.len());
+            debug!(iteration = state.iteration, tc, wsc, "pending calls, signaling loop");
             finalize_response_body(state, body);
             set_action(ctx, ACTION_LOOP)?;
             Ok(FilterAction::Continue)
@@ -390,6 +398,11 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
                 state.persisted_messages.push(item.clone());
             },
             Some("reasoning") => {
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item.clone());
+            },
+            Some("web_search_call") => {
+                state.web_search_calls.push(item.clone());
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
