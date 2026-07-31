@@ -822,4 +822,10 @@ mod tests {
             "explicit ssl_mode should override URL sslmode"
         );
     }
+
+    #[test]
+    fn connect_options_applies_ssl_root_cert() {
+        pg_connect_options("postgres://user:pass@example.com/db", None, Some("/path/to/ca.pem"))
+            .expect("ssl_root_cert path should be accepted");
+    }
 }
