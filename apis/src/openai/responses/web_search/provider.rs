@@ -571,7 +571,7 @@ mod tests {
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_brave_request("test query", 5);
         assert!(
             url.starts_with("http://localhost:9999/"),
@@ -591,7 +591,7 @@ mod tests {
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_tavily_request("test query", SearchContextSize::Medium);
         assert!(
             url.starts_with("http://localhost:9999/"),
@@ -611,7 +611,7 @@ mod tests {
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_you_request("test query", 5);
         assert!(
             url.starts_with("http://localhost:9999/"),

@@ -345,12 +345,8 @@ fn evaluate_loop_decision(
         ))),
         None => {
             state.iteration += 1;
-            debug!(
-                iteration = state.iteration,
-                tool_calls = state.tool_calls.len(),
-                web_search_calls = state.web_search_calls.len(),
-                "pending calls present, signaling loop"
-            );
+            let (tc, wsc) = (state.tool_calls.len(), state.web_search_calls.len());
+            debug!(iteration = state.iteration, tc, wsc, "pending calls, signaling loop");
             finalize_response_body(state, body);
             set_action(ctx, ACTION_LOOP)?;
             Ok(FilterAction::Continue)
