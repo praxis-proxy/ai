@@ -15,7 +15,10 @@ use tracing::info;
 
 use super::{
     pool::{PoolConfig, apply_pool_config},
-    schemas::{TableNames, generate_ddl, validate_postgres_identifiers},
+    schemas::{
+        ColumnCheck, SCHEMA_VERSION, TableNames, VERSION_COLUMNS, check_column_presence, expected_table_columns,
+        generate_ddl, schema_version_table, validate_postgres_identifiers,
+    },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, ResponseRecord, StoreError},
 };
@@ -139,6 +142,9 @@ impl PostgresResponseStore {
                 .map_err(|e| StoreError::Database(e.to_string()))?;
         }
 
+        validate_schema(&pool, &tables).await?;
+        check_schema_version(&pool, &tables).await?;
+
         info!(
             responses = responses_table,
             conversations = conversations_table,
@@ -241,6 +247,69 @@ fn pg_connect_options(
     Ok(options)
 }
 
+/// Query column metadata for each table and verify expected columns exist.
+async fn validate_schema(pool: &sqlx::PgPool, tables: &TableNames) -> Result<(), StoreError> {
+    let version_table = schema_version_table(&tables.responses);
+    let expected = expected_table_columns(tables);
+    let mut results = Vec::with_capacity(expected.len() + 1);
+
+    for (table_name, expected_cols) in &expected {
+        let actual: Vec<String> = sqlx::query_scalar::<_, String>(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1",
+        )
+        .bind(*table_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        results.push((*table_name, *expected_cols, actual));
+    }
+
+    let actual: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(version_table.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| StoreError::Database(e.to_string()))?;
+    results.push((version_table.as_str(), VERSION_COLUMNS, actual));
+
+    let refs: Vec<ColumnCheck<'_>> = results
+        .iter()
+        .map(|(name, expected, actual)| (*name, *expected, actual.as_slice()))
+        .collect();
+
+    check_column_presence(&refs)
+}
+
+/// Stamp or validate the schema version.
+async fn check_schema_version(pool: &sqlx::PgPool, tables: &TableNames) -> Result<(), StoreError> {
+    let vt = schema_version_table(&tables.responses);
+    let select = format!("SELECT version FROM {vt}");
+    let row: Option<i64> = sqlx::query_scalar(AssertSqlSafe(select.as_str()))
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    match row {
+        None => {
+            let insert = format!("INSERT INTO {vt} (version) VALUES ($1) ON CONFLICT (version) DO NOTHING");
+            sqlx::query(AssertSqlSafe(insert.as_str()))
+                .bind(SCHEMA_VERSION)
+                .execute(pool)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            Ok(())
+        },
+        Some(v) if v == SCHEMA_VERSION => Ok(()),
+        Some(v) => Err(StoreError::Database(format!(
+            "schema version mismatch in '{vt}': stored version {v}, \
+             expected {SCHEMA_VERSION}; database migration required"
+        ))),
+    }
+}
 
 #[async_trait]
 impl ResponseStore for PostgresResponseStore {

@@ -12,7 +12,10 @@ use tracing::info;
 
 use super::{
     pool::{PoolConfig, apply_pool_config},
-    schemas::{TableNames, generate_ddl},
+    schemas::{
+        ColumnCheck, SCHEMA_VERSION, TableNames, VERSION_COLUMNS, check_column_presence, expected_table_columns,
+        generate_ddl, schema_version_table,
+    },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, ResponseRecord, StoreError},
 };
@@ -77,6 +80,9 @@ impl SqliteResponseStore {
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;
         }
+
+        validate_schema(&pool, &tables).await?;
+        check_schema_version(&pool, &tables).await?;
 
         info!(
             responses = responses_table,
@@ -184,6 +190,69 @@ fn is_memory_database_url(database_url: &str) -> bool {
     query
         .split('&')
         .any(|param| param == "mode=memory" || param.starts_with("mode=memory&"))
+}
+
+/// Fetch column names for a `SQLite` table via `PRAGMA table_info`.
+async fn table_column_names(pool: &SqlitePool, table: &str) -> Result<Vec<String>, StoreError> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let rows = sqlx::query(AssertSqlSafe(pragma.as_str()))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    rows.iter()
+        .map(|row| row.try_get::<String, _>("name"))
+        .collect::<Result<_, _>>()
+        .map_err(|e| StoreError::Database(e.to_string()))
+}
+
+/// Query column metadata for each table and verify expected columns exist.
+async fn validate_schema(pool: &SqlitePool, tables: &TableNames) -> Result<(), StoreError> {
+    let version_table = schema_version_table(&tables.responses);
+    let expected = expected_table_columns(tables);
+    let mut results = Vec::with_capacity(expected.len() + 1);
+
+    for (table_name, expected_cols) in &expected {
+        results.push((*table_name, *expected_cols, table_column_names(pool, table_name).await?));
+    }
+    results.push((
+        version_table.as_str(),
+        VERSION_COLUMNS,
+        table_column_names(pool, &version_table).await?,
+    ));
+
+    let refs: Vec<ColumnCheck<'_>> = results
+        .iter()
+        .map(|(name, expected, actual)| (*name, *expected, actual.as_slice()))
+        .collect();
+
+    check_column_presence(&refs)
+}
+
+/// Stamp or validate the schema version.
+async fn check_schema_version(pool: &SqlitePool, tables: &TableNames) -> Result<(), StoreError> {
+    let vt = schema_version_table(&tables.responses);
+    let select = format!("SELECT version FROM {vt}");
+    let row: Option<i64> = sqlx::query_scalar(AssertSqlSafe(select.as_str()))
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    match row {
+        None => {
+            let insert = format!("INSERT OR IGNORE INTO {vt} (version) VALUES (?)");
+            sqlx::query(AssertSqlSafe(insert.as_str()))
+                .bind(SCHEMA_VERSION)
+                .execute(pool)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            Ok(())
+        },
+        Some(v) if v == SCHEMA_VERSION => Ok(()),
+        Some(v) => Err(StoreError::Database(format!(
+            "schema version mismatch in '{vt}': stored version {v}, \
+             expected {SCHEMA_VERSION}; database migration required"
+        ))),
+    }
 }
 
 #[async_trait]
