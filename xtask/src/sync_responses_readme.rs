@@ -6,6 +6,7 @@
 //! `HttpFilter` implementations found in that directory.
 
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -30,20 +31,30 @@ pub(crate) struct Args {
 // Data Types
 // -----------------------------------------------------------------------------
 
+/// Which pipeline hooks a filter implements.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one bool per pipeline hook is the natural representation"
+)]
+struct PipelineHooks {
+    /// `on_request` does real work (ctx parameter is used).
+    on_request: bool,
+    /// Filter implements `on_request_body`.
+    on_request_body: bool,
+    /// `on_response` does real work (ctx parameter is used).
+    on_response: bool,
+    /// Filter implements `on_response_body`.
+    on_response_body: bool,
+}
+
 /// Extracted pipeline metadata for one filter.
 struct FilterMeta {
     /// Filter name from `fn name()`.
     name: String,
     /// First sentence of the filter struct's doc comment.
     description: String,
-    /// Whether `on_request` does real work (ctx param not prefixed with `_`).
-    on_request: bool,
-    /// Whether the filter implements `on_request_body`.
-    on_request_body: bool,
-    /// Whether the filter implements `on_response`.
-    on_response: bool,
-    /// Whether the filter implements `on_response_body`.
-    on_response_body: bool,
+    /// Active pipeline hooks.
+    hooks: PipelineHooks,
     /// Request-side body access (`None`, `ReadOnly`, `ReadWrite`).
     request_body_access: String,
     /// Request-side body mode (`Stream`, `StreamBuffer`).
@@ -95,21 +106,15 @@ pub(crate) fn run(args: &Args) {
 fn discover_filters(responses_dir: &Path) -> Vec<FilterMeta> {
     let mut filters = Vec::new();
 
-    // Scan the top-level mod.rs (contains ResponsesFormatFilter).
     let top_mod = responses_dir.join("mod.rs");
     if top_mod.is_file() {
         filters.extend(extract_filters_from_file(&top_mod));
     }
 
-    // Scan each subdirectory for filter implementations.
     let Ok(entries) = fs::read_dir(responses_dir) else {
         return filters;
     };
-    let mut subdirs: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
+    let mut subdirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     subdirs.sort();
 
     for subdir in &subdirs {
@@ -131,9 +136,7 @@ fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| {
             p.extension().is_some_and(|e| e == "rs")
-                && !p
-                    .file_name()
-                    .is_some_and(|n| n == "tests.rs" || n == "test.rs")
+                && !p.file_name().is_some_and(|n| n == "tests.rs" || n == "test.rs")
         })
         .collect();
     files.sort();
@@ -156,77 +159,77 @@ fn extract_filters_from_file(path: &Path) -> Vec<FilterMeta> {
         let syn::Item::Impl(imp) = item else {
             continue;
         };
-
-        // Only look at `impl HttpFilter for ...` blocks.
-        let Some((trait_path, _for)) = &imp.trait_ else {
-            continue;
-        };
-        let trait_name = trait_path
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .unwrap_or_default();
-        if trait_name != "HttpFilter" {
-            continue;
+        if let Some(meta) = try_extract_filter(imp, &struct_docs) {
+            filters.push(meta);
         }
+    }
 
-        let Some(name) = extract_filter_name(imp) else {
+    filters
+}
+
+/// Try to extract a [`FilterMeta`] from a single `impl` block.
+fn try_extract_filter(imp: &syn::ItemImpl, struct_docs: &HashMap<String, String>) -> Option<FilterMeta> {
+    if !is_http_filter_impl(imp) {
+        return None;
+    }
+
+    let name = extract_filter_name(imp)?;
+    let struct_name = impl_self_type_name(imp).unwrap_or_default();
+    let description = struct_docs
+        .get(&struct_name)
+        .map(|doc| first_sentence(doc))
+        .unwrap_or_default();
+
+    let mut meta = new_filter_meta(name, description);
+    for impl_item in &imp.items {
+        let syn::ImplItem::Fn(method) = impl_item else {
             continue;
         };
+        classify_method(method, &mut meta);
+    }
+    Some(meta)
+}
 
-        let struct_name = impl_self_type_name(imp).unwrap_or_default();
-        let description = struct_docs
-            .get(&struct_name)
-            .map(|doc| first_sentence(doc))
-            .unwrap_or_default();
+/// Check if an impl block is `impl HttpFilter for ...`.
+fn is_http_filter_impl(imp: &syn::ItemImpl) -> bool {
+    imp.trait_
+        .as_ref()
+        .and_then(|(path, _)| path.segments.last())
+        .is_some_and(|seg| seg.ident == "HttpFilter")
+}
 
-        let mut meta = FilterMeta {
-            name,
-            description,
+/// Create a [`FilterMeta`] with default (inactive) hook state.
+fn new_filter_meta(name: String, description: String) -> FilterMeta {
+    FilterMeta {
+        name,
+        description,
+        hooks: PipelineHooks {
             on_request: false,
             on_request_body: false,
             on_response: false,
             on_response_body: false,
-            request_body_access: "None".to_owned(),
-            request_body_mode: "Stream".to_owned(),
-            response_body_access: "None".to_owned(),
-            response_body_mode: "Stream".to_owned(),
-        };
-
-        for impl_item in &imp.items {
-            let syn::ImplItem::Fn(method) = impl_item else {
-                continue;
-            };
-            let ident = method.sig.ident.to_string();
-            match ident.as_str() {
-                "on_request" => {
-                    meta.on_request = !has_unused_ctx_param(&method.sig);
-                }
-                "on_request_body" => meta.on_request_body = true,
-                "on_response" => {
-                    meta.on_response = !has_unused_ctx_param(&method.sig);
-                }
-                "on_response_body" => meta.on_response_body = true,
-                "request_body_access" => {
-                    meta.request_body_access = extract_body_access_value(&method.block);
-                }
-                "request_body_mode" => {
-                    meta.request_body_mode = extract_body_mode_value(&method.block);
-                }
-                "response_body_access" => {
-                    meta.response_body_access = extract_body_access_value(&method.block);
-                }
-                "response_body_mode" => {
-                    meta.response_body_mode = extract_body_mode_value(&method.block);
-                }
-                _ => {}
-            }
-        }
-
-        filters.push(meta);
+        },
+        request_body_access: "None".to_owned(),
+        request_body_mode: "Stream".to_owned(),
+        response_body_access: "None".to_owned(),
+        response_body_mode: "Stream".to_owned(),
     }
+}
 
-    filters
+/// Classify one method from an `impl HttpFilter` block into the
+/// appropriate [`FilterMeta`] field.
+fn classify_method(method: &syn::ImplItemFn, meta: &mut FilterMeta) {
+    match method.sig.ident.to_string().as_str() {
+        "on_request" => meta.hooks.on_request = !has_unused_ctx_param(&method.sig),
+        "on_request_body" => meta.hooks.on_request_body = true,
+        "on_response" => meta.hooks.on_response = !has_unused_ctx_param(&method.sig),
+        "on_response_body" => meta.hooks.on_response_body = true,
+        "request_body_access" => meta.request_body_access = extract_body_access_value(&method.block),
+        "request_body_mode" => meta.request_body_mode = extract_body_mode_value(&method.block),
+        "response_body_access" => meta.response_body_access = extract_body_access_value(&method.block),
+        "response_body_mode" => meta.response_body_mode = extract_body_mode_value(&method.block),
+        _ => {},
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -234,8 +237,8 @@ fn extract_filters_from_file(path: &Path) -> Vec<FilterMeta> {
 // -----------------------------------------------------------------------------
 
 /// Collect doc comments for all structs in a file, keyed by struct name.
-fn collect_struct_docs(file: &syn::File) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
+fn collect_struct_docs(file: &syn::File) -> HashMap<String, String> {
+    let mut map = HashMap::new();
     for item in &file.items {
         if let syn::Item::Struct(s) = item {
             let doc = extract_doc_comment(&s.attrs);
@@ -264,14 +267,12 @@ fn extract_doc_comment(attrs: &[syn::Attribute]) -> String {
         if !attr.path().is_ident("doc") {
             continue;
         }
-        if let syn::Meta::NameValue(nv) = &attr.meta {
-            if let syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
-                ..
+        if let syn::Meta::NameValue(nv) = &attr.meta
+            && let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s), ..
             }) = &nv.value
-            {
-                lines.push(s.value());
-            }
+        {
+            lines.push(s.value());
         }
     }
     lines
@@ -295,31 +296,23 @@ fn first_sentence(doc: &str) -> String {
         .lines()
         .map(str::trim)
         .take_while(|line| {
-            !line.is_empty()
-                && !line.starts_with('#')
-                && !line.starts_with("```")
-                && !line.starts_with("[`")
+            !line.is_empty() && !line.starts_with('#') && !line.starts_with("```") && !line.starts_with("[`")
         })
         .collect::<Vec<_>>()
         .join(" ");
 
-    for (i, ch) in prose.char_indices() {
+    let chars: Vec<char> = prose.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
         if ch != '.' {
             continue;
         }
-        let rest = &prose[i + 1..];
-        if rest.is_empty() {
-            return prose[..=i].to_owned();
-        }
-        let mut chars = rest.chars();
-        if let Some(next) = chars.next() {
-            if next == ' ' {
-                if let Some(after_space) = chars.next() {
-                    if after_space.is_uppercase() {
-                        return prose[..=i].to_owned();
-                    }
-                }
-            }
+        let is_end = match chars.get(i + 1) {
+            None => true,
+            Some(&' ') => chars.get(i + 2).is_some_and(char::is_ascii_uppercase),
+            Some(_) => false,
+        };
+        if is_end {
+            return chars.get(..=i).map(|s| s.iter().collect()).unwrap_or(prose);
         }
     }
     prose
@@ -377,8 +370,6 @@ fn extract_body_access_value(block: &syn::Block) -> String {
         "ReadWrite".to_owned()
     } else if tokens.contains("ReadOnly") {
         "ReadOnly".to_owned()
-    } else if tokens.contains("None") {
-        "None".to_owned()
     } else {
         "None".to_owned()
     }
@@ -403,14 +394,18 @@ fn extract_body_mode_value(block: &syn::Block) -> String {
 /// Render the full README content.
 fn render_readme(filters: &[FilterMeta]) -> String {
     let mut out = String::new();
+    write_header(&mut out);
+    for f in filters {
+        write_row(&mut out, f);
+    }
+    out
+}
 
+/// Write the markdown header and table header.
+fn write_header(out: &mut String) {
     writeln!(out, "# OpenAI Responses Filters").unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "Pipeline overview for filters under `apis/src/openai/responses/`."
-    )
-    .unwrap();
+    writeln!(out, "Pipeline overview for filters under `apis/src/openai/responses/`.").unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
@@ -429,23 +424,21 @@ fn render_readme(filters: &[FilterMeta]) -> String {
         "|--------|-------------|:------------:|:-----------------:|:--------------:|:------------------:|"
     )
     .unwrap();
+}
 
-    for f in filters {
-        let on_req = format_header_hook(f.on_request);
-        let on_req_body = format_body_hook(f.on_request_body, &f.request_body_access, &f.request_body_mode);
-        let on_resp = format_header_hook(f.on_response);
-        let on_resp_body =
-            format_body_hook(f.on_response_body, &f.response_body_access, &f.response_body_mode);
-        writeln!(
-            out,
-            "| `{name}` | {desc} | {on_req} | {on_req_body} | {on_resp} | {on_resp_body} |",
-            name = f.name,
-            desc = f.description,
-        )
-        .unwrap();
-    }
-
-    out
+/// Write one table row.
+fn write_row(out: &mut String, f: &FilterMeta) {
+    let on_req = format_header_hook(f.hooks.on_request);
+    let on_req_body = format_body_hook(f.hooks.on_request_body, &f.request_body_access, &f.request_body_mode);
+    let on_resp = format_header_hook(f.hooks.on_response);
+    let on_resp_body = format_body_hook(f.hooks.on_response_body, &f.response_body_access, &f.response_body_mode);
+    writeln!(
+        out,
+        "| `{name}` | {desc} | {on_req} | {on_req_body} | {on_resp} | {on_resp_body} |",
+        name = f.name,
+        desc = f.description,
+    )
+    .unwrap();
 }
 
 /// Format a header-phase hook cell (`on_request` / `on_response`).
@@ -519,18 +512,12 @@ mod tests {
 
     #[test]
     fn first_sentence_period_at_end() {
-        assert_eq!(
-            first_sentence("Rewrites the model field."),
-            "Rewrites the model field."
-        );
+        assert_eq!(first_sentence("Rewrites the model field."), "Rewrites the model field.");
     }
 
     #[test]
     fn first_sentence_no_period() {
-        assert_eq!(
-            first_sentence("Rewrites the model field"),
-            "Rewrites the model field"
-        );
+        assert_eq!(first_sentence("Rewrites the model field"), "Rewrites the model field");
     }
 
     #[test]
