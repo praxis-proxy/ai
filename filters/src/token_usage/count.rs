@@ -36,9 +36,9 @@ use serde::Deserialize;
 use tracing::{debug, trace};
 
 use super::{
-    TokenUsage,
+    StreamingTokens, TokenUsage,
     providers::{parse_anthropic, parse_bedrock, parse_google, parse_openai},
-    set_token_usage, streaming,
+    set_cache_token_usage, set_token_usage, streaming,
 };
 use crate::agentic::a2a::sse;
 
@@ -63,6 +63,12 @@ const META_INPUT: &str = "token_count.input";
 
 /// Metadata key for accumulated output tokens (streaming).
 const META_OUTPUT: &str = "token_count.output";
+
+/// Metadata key for accumulated prompt cache reads (streaming).
+const META_CACHE_READ: &str = "token_count.cache_read";
+
+/// Metadata key for accumulated prompt cache writes (streaming).
+const META_CACHE_WRITE: &str = "token_count.cache_write";
 
 /// Metadata key for hex-encoded JSON body buffer (non-streaming).
 const META_BUF_HEX: &str = "token_count.buf_hex";
@@ -135,11 +141,11 @@ impl ProviderKind {
     }
 
     /// Extract partial usage from providers that split counts across events.
-    fn extract_streaming_tokens(self, event_data: &[u8]) -> (Option<u64>, Option<u64>) {
+    fn extract_streaming_tokens(self, event_data: &[u8]) -> StreamingTokens {
         match self {
             Self::Anthropic => streaming::parse_anthropic_event(event_data),
             Self::Bedrock => streaming::parse_bedrock_event(event_data),
-            Self::OpenAi | Self::Azure | Self::Google | Self::BedrockInvokeModel => (None, None),
+            Self::OpenAi | Self::Azure | Self::Google | Self::BedrockInvokeModel => StreamingTokens::default(),
         }
     }
 }
@@ -271,6 +277,8 @@ impl HttpFilter for TokenCountFilter {
 /// Reads Bedrock `InvokeModel` token counts from response headers; no-op if
 /// either header is absent or unparseable. Unlike every other provider, no
 /// body access is required for this path.
+///
+/// The response headers carry no prompt cache breakdown, so none is recorded.
 fn extract_bedrock_headers(ctx: &mut HttpFilterContext<'_>) {
     let input = ctx
         .response_header
@@ -328,10 +336,13 @@ fn handle_json_body(
                 usage.output_tokens(),
                 Some(usage.total_tokens()),
             );
+            set_cache_token_usage(ctx, usage.cache_read_tokens(), usage.cache_write_tokens());
             debug!(
                 input = usage.input_tokens(),
                 output = usage.output_tokens(),
                 total = usage.total_tokens(),
+                cache_read = usage.cache_read_tokens(),
+                cache_write = usage.cache_write_tokens(),
                 "extracted token usage from JSON response"
             );
         }
@@ -404,9 +415,15 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
         .insert(META_INPUT.to_owned(), usage.input_tokens().to_string());
     ctx.filter_metadata
         .insert(META_OUTPUT.to_owned(), usage.output_tokens().to_string());
+    ctx.filter_metadata
+        .insert(META_CACHE_READ.to_owned(), usage.cache_read_tokens().to_string());
+    ctx.filter_metadata
+        .insert(META_CACHE_WRITE.to_owned(), usage.cache_write_tokens().to_string());
     trace!(
         input = usage.input_tokens(),
         output = usage.output_tokens(),
+        cache_read = usage.cache_read_tokens(),
+        cache_write = usage.cache_write_tokens(),
         "complete token usage found in SSE event"
     );
     true
@@ -414,16 +431,22 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
 
 /// Try partial extraction (Anthropic, Bedrock streaming).
 fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: ProviderKind) {
-    let (input, output) = provider.extract_streaming_tokens(payload);
+    let tokens = provider.extract_streaming_tokens(payload);
 
-    if let Some(inp) = input {
-        merge_accumulated_count(ctx, META_INPUT, inp);
-        trace!(input = inp, "partial input tokens from SSE event");
-    }
-    if let Some(out) = output {
-        merge_accumulated_count(ctx, META_OUTPUT, out);
-        trace!(output = out, "partial output tokens from SSE event");
-    }
+    merge_reported_count(ctx, META_INPUT, tokens.input);
+    merge_reported_count(ctx, META_OUTPUT, tokens.output);
+    merge_reported_count(ctx, META_CACHE_READ, tokens.cache_read);
+    merge_reported_count(ctx, META_CACHE_WRITE, tokens.cache_write);
+}
+
+/// Merge one count into its accumulator, skipping counts the event omitted.
+fn merge_reported_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<u64>) {
+    let Some(value) = value else {
+        return;
+    };
+
+    merge_accumulated_count(ctx, key, value);
+    trace!(key, value, "partial token count from SSE event");
 }
 
 /// Merge via max: correct for providers that report running totals
@@ -453,9 +476,23 @@ fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>) {
         .get(META_OUTPUT)
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let cache_read: u64 = ctx
+        .filter_metadata
+        .get(META_CACHE_READ)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let cache_write: u64 = ctx
+        .filter_metadata
+        .get(META_CACHE_WRITE)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     set_token_usage(ctx, input, output, None);
-    debug!(input, output, "finalized streaming token counts");
+    set_cache_token_usage(ctx, cache_read, cache_write);
+    debug!(
+        input,
+        output, cache_read, cache_write, "finalized streaming token counts"
+    );
 }
 
 // -----------------------------------------------------------------------------
