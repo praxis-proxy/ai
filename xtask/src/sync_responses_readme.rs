@@ -394,15 +394,14 @@ fn extract_body_mode_value(block: &syn::Block) -> String {
 /// Render the full README content.
 fn render_readme(filters: &[FilterMeta]) -> String {
     let mut out = String::new();
-    write_header(&mut out);
-    for f in filters {
-        write_row(&mut out, f);
-    }
+    write_preamble(&mut out);
+    write_description_list(&mut out, filters);
+    write_pipeline_table(&mut out, filters);
     out
 }
 
-/// Write the markdown header and table header.
-fn write_header(out: &mut String) {
+/// Write the markdown preamble.
+fn write_preamble(out: &mut String) {
     writeln!(out, "# OpenAI Responses Filters").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "Pipeline overview for filters under `apis/src/openai/responses/`.").unwrap();
@@ -413,32 +412,46 @@ fn write_header(out: &mut String) {
     )
     .unwrap();
     writeln!(out, "     Do not edit by hand. -->").unwrap();
+}
+
+/// Write the filter description list.
+fn write_description_list(out: &mut String, filters: &[FilterMeta]) {
+    writeln!(out).unwrap();
+    for f in filters {
+        if f.description.is_empty() {
+            writeln!(out, "- **`{}`**", f.name).unwrap();
+        } else {
+            writeln!(out, "- **`{}`** — {}", f.name, f.description).unwrap();
+        }
+    }
+}
+
+/// Write the pipeline hooks table.
+fn write_pipeline_table(out: &mut String, filters: &[FilterMeta]) {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "| Filter | Description | `on_request` | `on_request_body` | `on_response` | `on_response_body` |"
+        "| Filter | `on_request` | `on_request_body` | `on_response` | `on_response_body` |"
     )
     .unwrap();
     writeln!(
         out,
-        "|--------|-------------|:------------:|:-----------------:|:--------------:|:------------------:|"
+        "|--------|:------------:|:-----------------:|:--------------:|:------------------:|"
     )
     .unwrap();
-}
 
-/// Write one table row.
-fn write_row(out: &mut String, f: &FilterMeta) {
-    let on_req = format_header_hook(f.hooks.on_request);
-    let on_req_body = format_body_hook(f.hooks.on_request_body, &f.request_body_access, &f.request_body_mode);
-    let on_resp = format_header_hook(f.hooks.on_response);
-    let on_resp_body = format_body_hook(f.hooks.on_response_body, &f.response_body_access, &f.response_body_mode);
-    writeln!(
-        out,
-        "| `{name}` | {desc} | {on_req} | {on_req_body} | {on_resp} | {on_resp_body} |",
-        name = f.name,
-        desc = f.description,
-    )
-    .unwrap();
+    for f in filters {
+        let on_req = format_header_hook(f.hooks.on_request);
+        let on_req_body = format_body_hook(f.hooks.on_request_body, &f.request_body_access, &f.request_body_mode);
+        let on_resp = format_header_hook(f.hooks.on_response);
+        let on_resp_body = format_body_hook(f.hooks.on_response_body, &f.response_body_access, &f.response_body_mode);
+        writeln!(
+            out,
+            "| `{name}` | {on_req} | {on_req_body} | {on_resp} | {on_resp_body} |",
+            name = f.name
+        )
+        .unwrap();
+    }
 }
 
 /// Format a header-phase hook cell (`on_request` / `on_response`).
