@@ -53,6 +53,19 @@ impl PoolConfig {
         if self.max_connections == Some(0) {
             return Err("pool.max_connections must be at least 1".into());
         }
+        if self.acquire_timeout_secs == Some(0) {
+            return Err(
+                "pool.acquire_timeout_secs must be at least 1 (use idle_timeout_secs: 0 to disable idle timeout)"
+                    .into(),
+            );
+        }
+        if let (Some(min), Some(max)) = (self.min_connections, self.max_connections)
+            && min > max
+        {
+            return Err(format!(
+                "pool.min_connections ({min}) must not exceed pool.max_connections ({max})"
+            ));
+        }
         Ok(())
     }
 
@@ -203,6 +216,57 @@ acquire_timeout_secs: 30
     #[test]
     fn validate_accepts_omitted_max_connections() {
         let cfg = PoolConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_acquire_timeout() {
+        let cfg = PoolConfig {
+            acquire_timeout_secs: Some(0),
+            ..PoolConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("acquire_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_positive_acquire_timeout() {
+        let cfg = PoolConfig {
+            acquire_timeout_secs: Some(30),
+            ..PoolConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_min_exceeds_max_connections() {
+        let cfg = PoolConfig {
+            min_connections: Some(20),
+            max_connections: Some(10),
+            ..PoolConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("min_connections"), "{err}");
+        assert!(err.contains("max_connections"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_min_equals_max_connections() {
+        let cfg = PoolConfig {
+            min_connections: Some(5),
+            max_connections: Some(5),
+            ..PoolConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_min_less_than_max_connections() {
+        let cfg = PoolConfig {
+            min_connections: Some(2),
+            max_connections: Some(10),
+            ..PoolConfig::default()
+        };
         assert!(cfg.validate().is_ok());
     }
 
