@@ -6,7 +6,7 @@
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
 //! across filter phases. It holds the heavy data needed by the
 //! validate → rehydrate → `openai_tool_parse` → `openai_responses_proxy` →
-//! `stream_events` → `tool_dispatch` pipeline.
+//! `stream_events` → `agentic_loop` pipeline.
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
@@ -14,11 +14,13 @@ use std::collections::HashMap;
 
 /// Request-scoped state shared across Responses API filters.
 ///
-/// Stored in [`RequestExtensions`] by the validate filter and read
-/// or mutated by subsequent filters. Uses [`serde_json::Value`] for
-/// flexibility while the Responses API types stabilize; can be
-/// refactored to typed structs later without affecting external
-/// callers.
+/// Created by `openai_responses_validate` for every Responses API
+/// create request. When `previous_response_id` is present,
+/// `openai_responses_rehydrate` replaces it with an enriched
+/// version that includes conversation history. Uses
+/// [`serde_json::Value`] for flexibility while the Responses API
+/// types stabilize; can be refactored to typed structs later
+/// without affecting external callers.
 ///
 /// [`RequestExtensions`]: praxis_filter::RequestExtensions
 #[cfg_attr(
@@ -59,13 +61,14 @@ pub(crate) struct ResponsesState {
     pub input: Vec<serde_json::Value>,
 
     /// Current agentic loop iteration (0-indexed). Incremented by
-    /// `tool_dispatch` at the start of each new inference round.
+    /// `agentic_loop` at the start of each new inference round.
     pub iteration: u32,
 
-    /// Maximum number of tool-call rounds in the agentic loop.
+    /// Maximum number of built-in tool invocations.
     ///
-    /// `tool_dispatch` checks this to cap iterations. `None` means
-    /// no explicit limit was set by the client.
+    /// Reserved for future use by built-in tool filters. Not
+    /// currently enforced by any filter. `None` means no explicit
+    /// limit was set by the client.
     pub max_tool_calls: Option<u32>,
 
     /// Resolved MCP tool definitions keyed by `(server_label,
@@ -79,7 +82,7 @@ pub(crate) struct ResponsesState {
     ///
     /// Initialized from the current request's input. When
     /// `previous_response_id` is set, `rehydrate` prepends stored
-    /// history. `tool_dispatch` appends tool results during agentic
+    /// history. `agentic_loop` appends tool results during agentic
     /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
@@ -116,13 +119,13 @@ pub(crate) struct ResponsesState {
 
     /// Tool calls from the current inference response only.
     ///
-    /// Cleared by `tool_dispatch` at the start of each iteration
+    /// Cleared by `agentic_loop` at the start of each iteration
     /// before `stream_events` writes new ones. Without explicit
     /// clearing, stale tool calls from a previous iteration cause
     /// duplicate dispatch.
     pub tool_calls: Vec<serde_json::Value>,
 
-    /// Tool choice setting. Reset to `"auto"` by `tool_dispatch`
+    /// Tool choice setting. Reset to `"auto"` by `agentic_loop`
     /// after the first iteration; the original value from the
     /// request only applies to the first inference call.
     pub tool_choice: serde_json::Value,
@@ -134,6 +137,14 @@ pub(crate) struct ResponsesState {
     /// request. `stream_events` merges per-iteration usage into
     /// the running total.
     pub usage: serde_json::Value,
+
+    /// Output items accumulated across all agentic loop iterations.
+    ///
+    /// Each round's model output items and MCP execution results are
+    /// appended here so the final response contains the complete
+    /// trace. `agentic_loop` writes model items, `mcp_dispatch`
+    /// writes `mcp_call` and `mcp_approval_request` items.
+    pub accumulated_output: Vec<serde_json::Value>,
 }
 
 impl Default for ResponsesState {
@@ -159,6 +170,7 @@ impl Default for ResponsesState {
             tool_choice: serde_json::Value::String("auto".to_owned()),
             tools: Vec::new(),
             usage: serde_json::Value::Null,
+            accumulated_output: Vec::new(),
         }
     }
 }
@@ -188,6 +200,7 @@ impl ResponsesState {
             request_body: body,
             tool_choice,
             tools,
+            accumulated_output: Vec::new(),
             ..Default::default()
         }
     }
@@ -524,6 +537,7 @@ mod tests {
         assert_eq!(state.tool_choice, json!("auto"));
         assert!(state.tools.is_empty());
         assert!(state.usage.is_null());
+        assert!(state.accumulated_output.is_empty());
     }
 
     #[test]

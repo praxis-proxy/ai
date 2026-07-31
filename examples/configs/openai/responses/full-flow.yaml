@@ -72,6 +72,12 @@
 #      remains available for HTTP create requests; WebSocket
 #      handshakes are format-only and have no mode.
 #
+# Agentic loop:
+#   This config does NOT include the iterative_request_router (IRR).
+#   IRR fully buffers responses, which is incompatible with streaming
+#   and WebSocket. For MCP-driven agentic tool loops, see
+#   agentic-loop.yaml which wraps the inference step in an IRR.
+#
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer
 # authentication and authorization boundary before enabling the
@@ -213,7 +219,6 @@ filter_chains:
       - filter: openai_mcp_tool_resolve
 
       - filter: openai_responses_proxy
-        name: inference
 
       - filter: router
         routes:
@@ -229,7 +234,6 @@ filter_chains:
             cluster: "inference-backend"
           - path_prefix: "/v1/vector_stores"
             cluster: "vector-stores-backend"
-
       - filter: load_balancer
         clusters:
           - name: "prompts-api"

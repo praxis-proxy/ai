@@ -29,7 +29,7 @@ use praxis_filter::{
 };
 use tracing::{debug, trace};
 
-use super::error::responses_error_rejection;
+use super::{error::responses_error_rejection, state::ResponsesState};
 
 // -----------------------------------------------------------------------------
 // OpenaiResponsesValidateFilter
@@ -121,11 +121,12 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         let conversation_id = resolve_conversation_id(ctx, &parsed);
 
         enrich_context(ctx, &response_id, &conversation_id);
+        ctx.extensions.insert(ResponsesState::from_request_body(parsed));
 
         debug!(
             response_id = %response_id,
             conversation_id = %conversation_id,
-            "request validated"
+            "request validated, state initialized"
         );
 
         Ok(FilterAction::Release)
@@ -309,6 +310,24 @@ mod tests {
             Some("false"),
             "stream should default to false"
         );
+    }
+
+    #[tokio::test]
+    async fn valid_request_creates_responses_state() {
+        let ctx = run_filter(
+            r#"{"model": "gpt-4.1", "input": "Hello", "tools": [{"type": "function", "name": "f"}]}"#,
+            &[],
+        )
+        .await;
+
+        let state = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .expect("validate should insert ResponsesState");
+        assert_eq!(state.input.len(), 1, "input should be populated");
+        assert_eq!(state.tools.len(), 1, "tools should be populated");
+        assert_eq!(state.iteration, 0, "iteration should start at 0");
+        assert!(state.tool_calls.is_empty(), "tool_calls should start empty");
     }
 
     #[tokio::test]

@@ -172,9 +172,18 @@ fn register_openai_response_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "openai_web_search" => praxis_ai_apis::openai::WebSearchFilter::from_config
     );
+    register_openai_agentic_filters(registry);
+}
+
+/// Register OpenAI agentic loop and MCP dispatch filters.
+fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "openai_mcp_dispatch" => praxis_ai_apis::openai::McpDispatchFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config
     );
 }
 
