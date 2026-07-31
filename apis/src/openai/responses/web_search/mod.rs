@@ -174,13 +174,13 @@ impl WebSearchFilter {
 
         let Some(query) = query else {
             warn!(call_id, "web_search_call missing action.query, skipping");
-            append_result(ctx, call_id, "", &[]);
+            append_result(ctx, call_id, "incomplete", "", &[]);
             return Ok(());
         };
 
         let results = resolve_search_outcome(&self.search_client, query, context_size, call_id, false).await?;
 
-        append_result(ctx, call_id, query, &results);
+        append_result(ctx, call_id, "completed", query, &results);
         Ok(())
     }
 }
@@ -282,8 +282,8 @@ impl HttpFilter for WebSearchFilter {
 }
 
 /// Append search results to [`ResponsesState`].
-fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, query: &str, results: &[SearchResult]) {
-    let output_item = build_output_item(call_id, "completed", query, results);
+fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str, query: &str, results: &[SearchResult]) {
+    let output_item = build_output_item(call_id, status, query, results);
     let tool_result = build_tool_result_message(call_id, results);
 
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
