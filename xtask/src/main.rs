@@ -26,6 +26,7 @@ mod openai_conformance;
 mod openai_conformance_gate;
 mod port;
 mod sync_example_readme;
+mod sync_responses_readme;
 
 use clap::{Parser, Subcommand};
 
@@ -88,6 +89,10 @@ enum Command {
 
     /// Enforce or acknowledge failures in a generated conformance report.
     OpenaiConformanceGate(openai_conformance_gate::Args),
+
+    /// Generate the pipeline-overview table in
+    /// `apis/src/openai/responses/README.md`.
+    SyncResponsesReadme(sync_responses_readme::Args),
 }
 
 // -----------------------------------------------------------------------------
@@ -111,6 +116,7 @@ fn main() {
         Command::OpenaiConformance(args) => openai_conformance::run(&args),
         Command::OpenaiConformanceReference(args) => openai_conformance::run_reference(&args),
         Command::OpenaiConformanceGate(args) => openai_conformance_gate::run(&args),
+        Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),
     }
 }
 
