@@ -79,6 +79,8 @@ pub(crate) struct SearchClient {
     failure_mode: FailureMode,
     /// HTTP status to return on rejection.
     status_on_error: u16,
+    /// Override the provider's default API base URL.
+    base_url: Option<String>,
 }
 
 impl std::fmt::Debug for SearchClient {
@@ -91,6 +93,7 @@ impl std::fmt::Debug for SearchClient {
             .field("default_context_size", &self.default_context_size)
             .field("failure_mode", &self.failure_mode)
             .field("status_on_error", &self.status_on_error)
+            .field("base_url", &self.base_url)
             .finish()
     }
 }
@@ -102,17 +105,21 @@ impl SearchClient {
     ///
     /// Returns [`FilterError`] if the API key header value is
     /// not valid ASCII.
-    pub(crate) fn from_config(config: &ValidatedConfig) -> Result<Self, FilterError> {
+    pub(crate) fn from_config(
+        config: &ValidatedConfig,
+        subrequest_client: SubRequestClient,
+    ) -> Result<Self, FilterError> {
         http::HeaderValue::from_str(config.api_key.expose_secret())
             .map_err(|e| FilterError::from(format!("invalid API key header value: {e}")))?;
         Ok(Self {
-            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+            client: subrequest_client,
             timeout: Duration::from_millis(config.timeout_ms),
             provider: config.provider,
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
             failure_mode: config.failure_mode,
             status_on_error: config.status_on_error,
+            base_url: config.base_url.clone(),
         })
     }
 
@@ -170,7 +177,8 @@ impl SearchClient {
     /// Build a Brave Search API request.
     fn build_brave_request(&self, query: &str, count: u32) -> (String, SubRequest) {
         let encoded_query = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
-        let url = format!("https://api.search.brave.com/res/v1/web/search?q={encoded_query}&count={count}");
+        let base = self.base_url.as_deref().unwrap_or("https://api.search.brave.com");
+        let url = format!("{base}/res/v1/web/search?q={encoded_query}&count={count}");
 
         let mut headers = HeaderMap::new();
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
@@ -213,7 +221,8 @@ impl SearchClient {
         );
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
 
-        let url = "https://api.tavily.com/search".to_owned();
+        let base = self.base_url.as_deref().unwrap_or("https://api.tavily.com");
+        let url = format!("{base}/search");
         (
             url,
             SubRequest {
@@ -244,7 +253,8 @@ impl SearchClient {
                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
         );
 
-        let url = "https://api.you.com/v1/search".to_owned();
+        let base = self.base_url.as_deref().unwrap_or("https://api.you.com");
+        let url = format!("{base}/v1/search");
         (
             url,
             SubRequest {
@@ -391,6 +401,10 @@ mod tests {
 
     use super::*;
 
+    fn test_subrequest_client() -> SubRequestClient {
+        SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None))
+    }
+
     #[test]
     fn parse_brave_results_normal() {
         let json = json!({
@@ -484,8 +498,9 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             failure_mode: FailureMode::Closed,
             status_on_error: 502,
+            base_url: None,
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
 
         let (url, request) = client.build_you_request("Praxis proxy", 5);
 
@@ -538,9 +553,70 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             failure_mode: FailureMode::Closed,
             status_on_error: 502,
+            base_url: None,
         };
-        let client = SearchClient::from_config(&config);
+        let client = SearchClient::from_config(&config, test_subrequest_client());
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn base_url_overrides_brave_url() {
+        let config = ValidatedConfig {
+            provider: SearchProvider::Brave,
+            api_key: SecretString::from("test-key".to_owned()),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            failure_mode: FailureMode::Closed,
+            status_on_error: 502,
+            base_url: Some("http://localhost:9999".into()),
+        };
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let (url, _) = client.build_brave_request("test query", 5);
+        assert!(
+            url.starts_with("http://localhost:9999/"),
+            "base_url should override the default Brave URL; got: {url}"
+        );
+    }
+
+    #[test]
+    fn base_url_overrides_tavily_url() {
+        let config = ValidatedConfig {
+            provider: SearchProvider::Tavily,
+            api_key: SecretString::from("test-key".to_owned()),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            failure_mode: FailureMode::Closed,
+            status_on_error: 502,
+            base_url: Some("http://localhost:9999".into()),
+        };
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let (url, _) = client.build_tavily_request("test query", SearchContextSize::Medium);
+        assert!(
+            url.starts_with("http://localhost:9999/"),
+            "base_url should override the default Tavily URL; got: {url}"
+        );
+    }
+
+    #[test]
+    fn base_url_overrides_you_url() {
+        let config = ValidatedConfig {
+            provider: SearchProvider::You,
+            api_key: SecretString::from("test-key".to_owned()),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            failure_mode: FailureMode::Closed,
+            status_on_error: 502,
+            base_url: Some("http://localhost:9999".into()),
+        };
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let (url, _) = client.build_you_request("test query", 5);
+        assert!(
+            url.starts_with("http://localhost:9999/"),
+            "base_url should override the default You.com URL; got: {url}"
+        );
     }
 
     #[test]
@@ -553,8 +629,9 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             failure_mode: FailureMode::Closed,
             status_on_error: 502,
+            base_url: None,
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
         assert!(
             matches!(outcome, SearchOutcome::Rejected { status: 502 }),
@@ -572,8 +649,9 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             failure_mode: FailureMode::Open,
             status_on_error: 502,
+            base_url: None,
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
         assert!(
             matches!(outcome, SearchOutcome::Skipped),
@@ -590,8 +668,9 @@ mod tests {
             max_body_bytes: 64 * 1024 * 1024,
             failure_mode,
             status_on_error: 502,
+            base_url: None,
         };
-        SearchClient::from_config(&config).unwrap()
+        SearchClient::from_config(&config, test_subrequest_client()).unwrap()
     }
 
     fn spawn_http_server(listener: TcpListener, status: u16, body: &str) {

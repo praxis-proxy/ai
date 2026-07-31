@@ -60,8 +60,6 @@ pub(crate) mod resolve_url;
 )]
 mod tests;
 
-use std::borrow::Cow;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -145,19 +143,54 @@ pub struct FileResolveFilter {
 impl FileResolveFilter {
     /// Create a filter from parsed YAML config.
     ///
+    /// Uses an isolated [`SubRequestClient`] with a default pool
+    /// size of 4. Prefer [`from_config_with_client`] when a shared
+    /// client is available.
+    ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid or the
     /// callout client cannot be constructed.
-    #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
+    ///
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        Self::build(config, client)
+    }
+
+    /// Create a filter using the shared [`SubRequestClient`].
+    ///
+    /// The shared client inherits the server-level pool size and
+    /// connection limits from the runtime configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid or the
+    /// callout client cannot be constructed.
+    ///
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    pub fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::build(config, client)
+    }
+
+    /// Shared constructor body for [`from_config`](Self::from_config) and
+    /// [`from_config_with_client`](Self::from_config_with_client).
+    #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
+    fn build(
+        config: &serde_yaml::Value,
+        subrequest_client: SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
         let validated = validate_config(cfg)?;
         let forward_header_names = prepare_forward_header_names(&validated.forward_headers)?;
 
         let api_client = ApiClient::new(ApiClientConfig {
             api_base_url: validated.files_api_url.clone(),
-            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+            client: subrequest_client,
             timeout: std::time::Duration::from_millis(validated.timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names,
@@ -287,7 +320,7 @@ async fn resolve_and_rewrite(
     }
 
     debug!(count, "resolved file_id references");
-    if let Some(rejection) = rewrite_body(body, parsed, ctx, filter.config.max_body_bytes)? {
+    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes)? {
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
@@ -369,7 +402,6 @@ async fn update_state(
 fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
-    ctx: &mut HttpFilterContext<'_>,
     max_body_bytes: usize,
 ) -> Result<Option<FilterAction>, FilterError> {
     let rewritten = serde_json::to_vec(parsed)
@@ -379,8 +411,6 @@ fn rewrite_body(
         return Ok(Some(reject_rewritten_body_too_large(len, max_body_bytes)));
     }
     *body = Some(Bytes::from(rewritten));
-    ctx.extra_request_headers
-        .push((Cow::Borrowed("content-length"), len.to_string()));
     Ok(None)
 }
 

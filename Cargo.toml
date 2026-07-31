@@ -36,7 +36,7 @@ quote = "1.0.46"
 rand = "0.10.1"
 rcgen = "0.14.8"
 regex = "1.12.4"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
 rmcp = { version = "3.0.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 rustls = "0.23.41"
 schemars = "1.2.1"
@@ -63,11 +63,11 @@ wiremock = "0.6.5"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-praxis-core = { version = "0.5.0", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.5.0", package = "praxis-proxy-filter" }
-praxis-protocol = { version = "0.5.0", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.5.0", package = "praxis-proxy-tls" }
-praxis = { version = "0.5.0", package = "praxis-proxy" }
+praxis-core = { version = "0.5.1", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.5.1", package = "praxis-proxy-filter" }
+praxis-protocol = { version = "0.5.1", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.5.1", package = "praxis-proxy-tls" }
+praxis = { version = "0.5.1", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
 
 # Praxis AI workspace dependencies

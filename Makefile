@@ -98,6 +98,7 @@ lint:
 	cargo xtask lint-example-tests
 	cargo xtask lint-markdown-links
 	cargo xtask sync-example-readme
+	cargo xtask sync-responses-readme
 
 fmt:
 	cargo +nightly fmt --all

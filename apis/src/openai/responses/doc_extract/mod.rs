@@ -50,8 +50,6 @@ mod extract;
 )]
 mod tests;
 
-use std::borrow::Cow;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -196,7 +194,7 @@ fn extract_and_rewrite(
     }
 
     debug!(count, "extracted input_file parts");
-    if let Some(rejection) = rewrite_body(body, parsed, ctx, filter.config.max_body_bytes)? {
+    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes)? {
         return Ok(rejection);
     }
     if let Err(e) = sync_state_after_rewrite(ctx, parsed, &mut budget) {
@@ -248,7 +246,6 @@ fn extract_item_parts(item: &mut serde_json::Value, budget: &mut ExtractionBudge
 fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
-    ctx: &mut HttpFilterContext<'_>,
     max_body_bytes: usize,
 ) -> Result<Option<FilterAction>, FilterError> {
     let rewritten = serde_json::to_vec(parsed)
@@ -258,8 +255,6 @@ fn rewrite_body(
         return Ok(Some(reject_rewritten_body_too_large(len, max_body_bytes)));
     }
     *body = Some(Bytes::from(rewritten));
-    ctx.extra_request_headers
-        .push((Cow::Borrowed("content-length"), len.to_string()));
     Ok(None)
 }
 

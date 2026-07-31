@@ -73,7 +73,6 @@ impl SearchContextSize {
     ///
     /// Used at runtime for per-request metadata where rejecting is
     /// not appropriate.
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved for tool_dispatch (#26)"))]
     pub(crate) fn from_str_or_default(s: &str) -> Self {
         Self::from_str(s).unwrap_or(Self::Medium)
     }
@@ -137,6 +136,10 @@ pub(super) struct WebSearchFilterConfig {
     /// HTTP status code to return when rejecting on error.
     #[serde(default)]
     pub status_on_error: Option<u16>,
+
+    /// Override the provider's default API base URL.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -166,6 +169,9 @@ pub(crate) struct ValidatedConfig {
 
     /// HTTP status on error.
     pub status_on_error: u16,
+
+    /// Override the provider's default API base URL.
+    pub base_url: Option<String>,
 }
 
 impl std::fmt::Debug for ValidatedConfig {
@@ -178,6 +184,7 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("max_body_bytes", &self.max_body_bytes)
             .field("failure_mode", &self.failure_mode)
             .field("status_on_error", &self.status_on_error)
+            .field("base_url", &self.base_url)
             .finish()
     }
 }
@@ -210,6 +217,7 @@ pub(super) fn build_config(raw: &WebSearchFilterConfig) -> Result<ValidatedConfi
         max_body_bytes: validate_max_body_bytes_field(raw.max_body_bytes)?,
         failure_mode: raw.failure_mode.unwrap_or(FailureMode::Closed),
         status_on_error,
+        base_url: raw.base_url.clone(),
     })
 }
 
@@ -297,6 +305,7 @@ mod tests {
             max_body_bytes: None,
             failure_mode: None,
             status_on_error: None,
+            base_url: None,
         }
     }
 
@@ -362,6 +371,20 @@ mod tests {
         assert_eq!(validated.timeout_ms, 15_000);
         assert_eq!(validated.failure_mode, FailureMode::Open);
         assert_eq!(validated.status_on_error, 503);
+    }
+
+    #[test]
+    fn build_config_base_url_threaded_through() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://localhost:9999".into());
+        let validated = build_config(&cfg).unwrap();
+        assert_eq!(validated.base_url.as_deref(), Some("http://localhost:9999"));
+    }
+
+    #[test]
+    fn build_config_base_url_none_by_default() {
+        let validated = build_config(&base_config()).unwrap();
+        assert!(validated.base_url.is_none());
     }
 
     #[test]

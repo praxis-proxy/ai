@@ -17,58 +17,6 @@ permissions: {}
 
 jobs:
   # ----------------------------------------------------------------------------
-  # PR Size Check
-  # ----------------------------------------------------------------------------
-
-  pr-size-check:
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Generate token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
-          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
-
-      - name: Check PR size
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          MAX_ADDITIONS: "750"
-        run: |
-          labels=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels -q '.labels[].name')
-          if echo "$labels" | grep -q '^skip/pr-conventions$'; then
-            echo "skip/pr-conventions label present — skipping size check"
-            exit 0
-          fi
-
-          if [ "${{ github.event.action }}" = "reopened" ]; then
-            perm=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.sender.login }}/permission -q .permission)
-            if [ "$perm" = "admin" ] || [ "$perm" = "maintain" ]; then
-              gh pr edit "$PR_NUMBER" --repo "${{ github.repository }}" --add-label "skip/pr-conventions"
-              echo "Maintainer reopened — added skip/pr-conventions label"
-              exit 0
-            fi
-          fi
-
-          added=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" --paginate \
-            --jq '[.[] | select(.filename | test("Cargo\\.(lock|toml)$|^(examples/|tests/|benchmarks/|docs/)") | not) | select(.filename | test("\\.md$") | not) | .additions] | add // 0')
-
-          if [ "$added" -gt "$MAX_ADDITIONS" ]; then
-            marker="<!-- praxis:pr-size-check -->"
-            already=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-              --jq "[.[] | select(.body | contains(\"${marker}\"))] | length")
-            if [ "$already" -eq 0 ]; then
-              gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
-                --body "${marker}
-          **PR too large**: ${added} lines added (limit: ${MAX_ADDITIONS}, excludes Cargo files, tests, docs, examples, and benchmarks). Please split into smaller PRs. Add \`skip/pr-conventions\` label to override."
-            fi
-            echo "::error::PR has ${added} lines added (limit: ${MAX_ADDITIONS})"
-            exit 1
-          fi
-
-  # ----------------------------------------------------------------------------
   # PR Description Check
   # ----------------------------------------------------------------------------
 

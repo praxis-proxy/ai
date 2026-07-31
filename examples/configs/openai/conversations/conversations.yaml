@@ -29,6 +29,13 @@ filter_chains:
         # conversations_table defaults to "openai_conversations"
         # items_table defaults to "openai_conversation_items"
         #
+        # Connection pool tuning (optional, sqlx defaults apply when omitted):
+        #   pool:
+        #     max_connections: 10      # maximum pool connections (default: 10)
+        #     min_connections: 0       # minimum idle connections (default: 0)
+        #     idle_timeout_secs: 600   # seconds before idle connections close (default: 600, 0 to disable)
+        #     acquire_timeout_secs: 30 # seconds to wait for a connection (default: 30)
+        #
         # PostgreSQL backend:
         #   backend: postgres
         #   database_url: "postgres://user:pass@db.example.com:5432/praxis"

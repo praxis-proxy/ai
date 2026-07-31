@@ -17,8 +17,6 @@ mod config;
 )]
 mod tests;
 
-use std::borrow::Cow;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -148,7 +146,7 @@ impl HttpFilter for PromptEnrichFilter {
 
     async fn on_request_body(
         &self,
-        ctx: &mut HttpFilterContext<'_>,
+        _ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
@@ -178,11 +176,7 @@ impl HttpFilter for PromptEnrichFilter {
         let serialized =
             serde_json::to_vec(&value).map_err(|e| -> FilterError { format!("prompt_enrich: {e}").into() })?;
 
-        let len = serialized.len();
         *body = Some(Bytes::from(serialized));
-
-        ctx.extra_request_headers
-            .push((Cow::Borrowed("content-length"), len.to_string()));
 
         Ok(FilterAction::Continue)
     }

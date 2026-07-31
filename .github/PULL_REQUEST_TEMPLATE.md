@@ -10,13 +10,15 @@ Closes #
 
 ## Validation
 
-<!-- List exact commands and results, including manual or backend-backed proof.
-Explain any checks that were not run. -->
+<!-- List exact commands and any manual or backend-backed proof. -->
+
+- [ ] Unit tests
+- [ ] Integration or functional tests
+- [ ] `make lint`
 
 ## Checklist
 
 - [ ] I reviewed every changed line and can explain the change.
-- [ ] Tests are added or updated when behavior changes.
 - [ ] New capabilities include an example config and functional example test.
 - [ ] User-facing behavior and generated documentation are updated.
 - [ ] Performance-sensitive changes include appropriate benchmark or load-test evidence.

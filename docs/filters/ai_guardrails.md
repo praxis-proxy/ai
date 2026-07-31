@@ -13,7 +13,7 @@ Calls an external AI guardrail provider to evaluate request (and eventually resp
 | `provider.type` | `nemo` | yes | Provider type selector. |
 | `phase` | PhaseConfig | no | Which phases to evaluate. |
 | `phase.request` | bool | no | Evaluate client requests before forwarding to the upstream. |
-| `phase.response` | bool | no | Evaluate upstream responses before forwarding to the client. |
+| `phase.response` | bool | no | Evaluate upstream responses before forwarding to the client. Response-side evaluation is not implemented yet (#580); setting this to `true` is rejected at filter construction time rather than silently ignored. |
 
 ## Example
 
