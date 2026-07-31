@@ -194,7 +194,7 @@ fn extract_and_rewrite(
     }
 
     debug!(count, "extracted input_file parts");
-    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes)? {
+    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = sync_state_after_rewrite(ctx, parsed, &mut budget) {
@@ -247,13 +247,14 @@ fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
     max_body_bytes: usize,
+    filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
     let rewritten = serialize_json_body(parsed)
-        .map_err(|e| -> FilterError { format!("openai_doc_extract: failed to serialize body: {e}").into() })?;
+        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
     if rewritten.len() > max_body_bytes {
         return Ok(Some(reject_rewritten_body_too_large(rewritten.len(), max_body_bytes)));
     }
-    rewritten.commit(body, "openai_doc_extract", "input");
+    rewritten.commit(body, filter_name, "input");
     Ok(None)
 }
 

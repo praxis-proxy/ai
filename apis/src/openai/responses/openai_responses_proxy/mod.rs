@@ -167,13 +167,13 @@ impl HttpFilter for ResponsesProxyFilter {
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
-            strip_conversation_field(body);
+            strip_conversation_field(body, self.name());
             debug!("no ResponsesState in extensions, passthrough");
             return Ok(FilterAction::Continue);
         };
 
         if !request_needs_rebuild(state) {
-            strip_conversation_field(body);
+            strip_conversation_field(body, self.name());
             debug!("ResponsesState does not require an outbound rewrite, passthrough");
             return Ok(FilterAction::Continue);
         }
@@ -187,7 +187,7 @@ impl HttpFilter for ResponsesProxyFilter {
             Err(action) => return Ok(action),
         };
 
-        SerializedJson::from_bytes(serialized).commit(body, "openai_responses_proxy", "body");
+        SerializedJson::from_bytes(serialized).commit(body, self.name(), "body");
 
         Ok(FilterAction::Continue)
     }
@@ -199,7 +199,7 @@ impl HttpFilter for ResponsesProxyFilter {
 
 /// Defensively strip `conversation` from a passthrough body so it never
 /// leaks to the backend even when no [`ResponsesState`] was produced.
-fn strip_conversation_field(body: &mut Option<Bytes>) {
+fn strip_conversation_field(body: &mut Option<Bytes>, filter_name: &'static str) {
     let Some(bytes) = body.as_ref() else {
         return;
     };
@@ -212,7 +212,7 @@ fn strip_conversation_field(body: &mut Option<Bytes>) {
     {
         debug!("stripped conversation from passthrough body");
         if let Ok(serialized) = serialize_json_body(&parsed) {
-            serialized.commit(body, "openai_responses_proxy", "conversation");
+            serialized.commit(body, filter_name, "conversation");
         }
     }
 }

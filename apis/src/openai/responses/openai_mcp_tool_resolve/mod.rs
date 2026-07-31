@@ -157,7 +157,7 @@ impl McpToolResolveFilter {
         debug!(tool_count = resolution.tool_map.len(), "mcp_tool_map built");
 
         let Resolution { per_entry, tool_map } = resolution;
-        rewrite_request_body(body, &original_bytes, per_entry, &tool_map)?;
+        rewrite_request_body(body, &original_bytes, per_entry, &tool_map, self.name())?;
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
         write_state(ctx, body_for_state, tool_map);
@@ -493,6 +493,7 @@ fn rewrite_request_body(
     original_bytes: &[u8],
     per_entry: Vec<Vec<serde_json::Value>>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
+    filter_name: &'static str,
 ) -> Result<(), ResolveError> {
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
         return Ok(());
@@ -523,7 +524,7 @@ fn rewrite_request_body(
         ResolveError::Serialization(e)
     })?;
 
-    serialized.commit(body, "openai_mcp_tool_resolve", "tools");
+    serialized.commit(body, filter_name, "tools");
 
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
     Ok(())

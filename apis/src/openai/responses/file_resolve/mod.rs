@@ -286,7 +286,7 @@ async fn resolve_and_rewrite(
     }
 
     debug!(count, "resolved file_id references");
-    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes)? {
+    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
@@ -369,13 +369,14 @@ fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
     max_body_bytes: usize,
+    filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
     let rewritten = serialize_json_body(parsed)
-        .map_err(|e| -> FilterError { format!("openai_file_resolve: failed to serialize body: {e}").into() })?;
+        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
     if rewritten.len() > max_body_bytes {
         return Ok(Some(reject_rewritten_body_too_large(rewritten.len(), max_body_bytes)));
     }
-    rewritten.commit(body, "openai_file_resolve", "input");
+    rewritten.commit(body, filter_name, "input");
     Ok(None)
 }
 

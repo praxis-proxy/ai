@@ -157,7 +157,7 @@ impl ModelRewriteFilter {
             return Ok(FilterAction::Continue);
         }
 
-        serialize_and_update(body, &value, &result)
+        serialize_and_update(body, &value, &result, self.name())
     }
 }
 
@@ -360,9 +360,10 @@ fn serialize_and_update(
     body: &mut Option<Bytes>,
     value: &serde_json::Value,
     result: &RewriteResult,
+    filter_name: &'static str,
 ) -> Result<FilterAction, FilterError> {
-    replace_json_body(body, value, "openai_responses_model_rewrite", "model").map_err(|e| -> FilterError {
-        format!("openai_responses_model_rewrite: failed to re-serialize rewritten request body: {e}").into()
+    replace_json_body(body, value, filter_name, "model").map_err(|e| -> FilterError {
+        format!("{filter_name}: failed to re-serialize rewritten request body: {e}").into()
     })?;
 
     debug!(

@@ -174,8 +174,8 @@ impl HttpFilter for PromptEnrichFilter {
         messages.splice(0..0, self.prepend.iter().cloned());
         messages.extend(self.append.iter().cloned());
 
-        replace_json_body(body, &value, "prompt_enrich", "messages")
-            .map_err(|e| -> FilterError { format!("prompt_enrich: {e}").into() })?;
+        replace_json_body(body, &value, self.name(), "messages")
+            .map_err(|e| -> FilterError { format!("{}: {e}", self.name()).into() })?;
 
         Ok(FilterAction::Continue)
     }
