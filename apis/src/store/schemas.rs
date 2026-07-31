@@ -222,8 +222,8 @@ const POSTGRES_MAX_CONVERSATION_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN -
 const POSTGRES_MAX_ITEMS_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - 17;
 
 /// Maximum responses table name length that leaves room for the
-/// `_schema_version` (15) suffix in the derived version table name.
-const POSTGRES_MAX_RESPONSES_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - 15;
+/// `_schema_version` suffix in the derived version table name.
+const POSTGRES_MAX_RESPONSES_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - SCHEMA_VERSION_SUFFIX.len();
 
 /// Reject identifiers that could cause SQL injection or invalid DDL.
 pub(crate) fn validate_identifier(name: &str) -> Result<(), StoreError> {
@@ -568,6 +568,13 @@ mod tests {
         assert!(msg.contains("missing_a"), "{msg}");
         assert!(msg.contains("table_b"), "{msg}");
         assert!(msg.contains("missing_b"), "{msg}");
+    }
+
+    #[test]
+    fn check_column_presence_tolerates_extra_columns() {
+        let actual = vec!["id".to_owned(), "tenant_id".to_owned(), "extra_col".to_owned()];
+        let input = [("t", &["id", "tenant_id"][..], actual.as_slice())];
+        check_column_presence(&input).expect("extra columns should not cause failure");
     }
 
     #[test]
