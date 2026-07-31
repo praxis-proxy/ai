@@ -4,9 +4,9 @@
 //! File watcher for hot config reload.
 //!
 //! Monitors the config file for changes, debounces filesystem
-//! events, and triggers [`reload_pipelines`] on each valid change.
+//! events, and triggers [`reload_pipelines_with_client`] on each valid change.
 //!
-//! [`reload_pipelines`]: crate::reload::reload_pipelines
+//! [`reload_pipelines_with_client`]: crate::reload::reload_pipelines_with_client
 
 use std::{
     path::PathBuf,
