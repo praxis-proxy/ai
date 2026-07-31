@@ -14,6 +14,7 @@ use sqlx::{
 use tracing::info;
 
 use super::{
+    pool::{PoolConfig, apply_pool_config},
     schemas::{TableNames, generate_ddl, validate_postgres_identifiers},
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, ResponseRecord, StoreError},
@@ -107,7 +108,7 @@ impl PostgresResponseStore {
     /// initialization, or table name validation fails.
     #[expect(
         clippy::too_many_arguments,
-        reason = "constructor mirrors SqliteResponseStore::new with SSL additions"
+        reason = "constructor mirrors SqliteResponseStore::new with SSL and pool additions"
     )]
     pub async fn new(
         database_url: &str,
@@ -116,6 +117,7 @@ impl PostgresResponseStore {
         items_table: Option<&str>,
         ssl_mode: Option<SslMode>,
         ssl_root_cert: Option<&str>,
+        pool_config: Option<&PoolConfig>,
     ) -> Result<Self, StoreError> {
         let tables = TableNames {
             responses: responses_table.to_owned(),
@@ -126,7 +128,7 @@ impl PostgresResponseStore {
         let ddl = generate_ddl(&tables)?;
 
         let options = pg_connect_options(database_url, ssl_mode, ssl_root_cert)?;
-        let pool = Box::pin(PgPoolOptions::new().connect_with(options))
+        let pool = Box::pin(apply_pool_config(PgPoolOptions::new(), pool_config).connect_with(options))
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
@@ -238,6 +240,7 @@ fn pg_connect_options(
 
     Ok(options)
 }
+
 
 #[async_trait]
 impl ResponseStore for PostgresResponseStore {

@@ -984,6 +984,274 @@ fn example_config_agentic_loop_parses() {
 }
 
 // -----------------------------------------------------------------------------
+// on_response_body: web_search_call Extraction
+// -----------------------------------------------------------------------------
+
+#[test]
+fn web_search_call_extracted_to_web_search_calls_not_tool_calls() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [
+            {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {"type": "search", "query": "rust async"}
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.is_empty(),
+        "web_search_call must not appear in tool_calls"
+    );
+    assert_eq!(
+        state.web_search_calls.len(),
+        1,
+        "web_search_call must appear in web_search_calls"
+    );
+    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+}
+
+#[test]
+fn web_search_call_triggers_loop() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.web_search_calls = vec![json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "loop");
+}
+
+#[test]
+fn web_search_call_alone_increments_iteration() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.web_search_calls = vec![json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test"}
+    })];
+    ctx.extensions.insert(state);
+
+    drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.iteration, 1, "iteration should increment from 0 to 1");
+}
+
+#[test]
+fn mixed_function_and_web_search_calls() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{}",
+                "status": "completed"
+            },
+            {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {"type": "search", "query": "weather SF"}
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    assert_action(&ctx, "loop");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.tool_calls.len(), 1, "one function_call in tool_calls");
+    assert_eq!(
+        state.web_search_calls.len(),
+        1,
+        "one web_search_call in web_search_calls"
+    );
+    assert_eq!(state.tool_calls[0]["call_id"], "call_1");
+    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+}
+
+#[test]
+fn web_search_call_subject_to_iteration_limit() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 2").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.web_search_calls = vec![json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test"}
+    })];
+    state.iteration = 2;
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(r) if r.status == 508),
+        "web_search_call at iteration limit should produce 508 rejection"
+    );
+}
+
+#[tokio::test]
+async fn web_search_calls_cleared_on_prepare() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.web_search_calls = vec![json!({
+        "type": "web_search_call",
+        "id": "ws_stale",
+        "action": {"type": "search", "query": "old query"}
+    })];
+    ctx.extensions.insert(state);
+
+    drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.web_search_calls.is_empty(),
+        "on_request_body must clear stale web_search_calls from previous round"
+    );
+}
+
+#[test]
+fn web_search_call_appended_to_messages_and_persisted() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [
+            {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {"type": "search", "query": "test query"}
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let msg_types: Vec<&str> = state
+        .messages
+        .iter()
+        .filter_map(|m| m.get("type").and_then(Value::as_str))
+        .collect();
+    assert!(
+        msg_types.contains(&"web_search_call"),
+        "web_search_call should be in messages: {msg_types:?}"
+    );
+
+    let persisted_types: Vec<&str> = state
+        .persisted_messages
+        .iter()
+        .filter_map(|m| m.get("type").and_then(Value::as_str))
+        .collect();
+    assert!(
+        persisted_types.contains(&"web_search_call"),
+        "web_search_call should be in persisted_messages: {persisted_types:?}"
+    );
+
+    assert!(
+        state
+            .accumulated_output
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call")),
+        "web_search_call should be in accumulated_output"
+    );
+}
+
+#[test]
+fn web_search_call_does_not_count_as_function_call_for_limit() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [
+            {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {"type": "search", "query": "query 1"}
+            },
+            {
+                "type": "web_search_call",
+                "id": "ws_2",
+                "status": "completed",
+                "action": {"type": "search", "query": "query 2"}
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "multiple web_search_calls should not trigger the one-function-call limit"
+    );
+    assert_action(&ctx, "loop");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls.len(), 2);
+    assert!(state.tool_calls.is_empty());
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 

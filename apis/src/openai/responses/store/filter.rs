@@ -124,6 +124,7 @@ impl ResponseStoreFilter {
                     &self.config.responses_table,
                     &self.config.conversations_table,
                     None,
+                    self.config.pool.as_ref(),
                 )
                 .await;
                 store.map(|s| {
@@ -147,6 +148,7 @@ impl ResponseStoreFilter {
                     None,
                     self.config.ssl_mode,
                     ssl_root_cert,
+                    self.config.pool.as_ref(),
                 ))
                 .await;
                 store.map(|s| {

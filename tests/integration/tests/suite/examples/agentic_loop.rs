@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, build_pipeline, example_config_path, free_port, http_send,
-    json_post, load_example_config, parse_body, parse_status, patch_yaml, start_backend_with_shutdown,
-    start_mcp_mock_server_with_config, start_proxy,
+    json_post, parse_body, parse_status, patch_yaml, start_backend_with_shutdown, start_mcp_mock_server_with_config,
+    start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -21,11 +21,7 @@ use praxis_test_utils::{
 
 #[test]
 fn example_config_builds_pipeline() {
-    let config = load_example_config(
-        "openai/responses/agentic-loop.yaml",
-        free_port(),
-        HashMap::from([("127.0.0.1:3001", 19901_u16)]),
-    );
+    let config = load_agentic_config(free_port(), 19901);
     let _pipeline = build_pipeline(&config);
 }
 
@@ -38,11 +34,7 @@ fn single_pass_completes_through_irr() {
     let model = start_backend_with_shutdown(r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#);
     let proxy_port = free_port();
 
-    let config = load_example_config(
-        "openai/responses/agentic-loop.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3001", model.port())]),
-    );
+    let config = load_agentic_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
     let body = r#"{"model":"gpt-4.1","input":"Hello"}"#;
@@ -76,11 +68,7 @@ fn client_function_call_returns_without_server_execution() {
     )])
     .start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_example_config(
-        "openai/responses/agentic-loop.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3001", model.port())]),
-    );
+    let config = load_agentic_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
     let request = serde_json::json!({
@@ -271,12 +259,141 @@ fn round_trip_captures_tool_and_model_requests() {
     );
 }
 
-/// Load the checked-in example while enabling loopback only for the
-/// test-owned MCP server.
+// -----------------------------------------------------------------------------
+// Round-Trip: Web Search via IRR
+// -----------------------------------------------------------------------------
+
+#[test]
+fn web_search_round_trip_executes_and_re_enters_inference() {
+    let first_response = serde_json::json!({
+        "id": "resp_ws_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust 2025 edition"}
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_ws_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Rust 2025 brings great features."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    spawn_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust 2025 edition features",
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "web search round-trip should return 200");
+    let body = parse_body(&raw);
+    let response: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_ws_2",
+        "final response should be the second model response after web search"
+    );
+
+    let model_reqs = model.requests();
+    assert_eq!(
+        model_reqs.len(),
+        2,
+        "model backend should receive exactly two requests (initial + post-search)"
+    );
+
+    let second_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[1].body).expect("second model request should be valid JSON");
+    let input = second_body["input"]
+        .as_array()
+        .expect("second model request input should be an array");
+    let has_search_result = input.iter().any(|item| item["type"] == "web_search_call");
+    assert!(
+        has_search_result,
+        "second inference input should contain web_search_call result"
+    );
+}
+
+fn spawn_search_mock(listener: std::net::TcpListener) {
+    use std::io::{Read as _, Write as _};
+    let body = serde_json::json!({
+        "web": {
+            "results": [{
+                "title": "Rust 2025 Edition",
+                "url": "https://blog.rust-lang.org/2025",
+                "description": "The Rust 2025 edition is here."
+            }]
+        }
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let _n = stream.read(&mut buf).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+}
+
+fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = yaml.replace(
+        "api_key: ${WEB_SEARCH_API_KEY}",
+        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+    );
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse web search config")
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+fn patch_web_search_api_key(yaml: &str) -> String {
+    yaml.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
+}
+
+fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
+}
+
 fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n",
         "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",

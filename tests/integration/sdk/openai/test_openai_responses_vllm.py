@@ -188,8 +188,34 @@ class MCPHandler(BaseHTTPRequestHandler):
         pass
 
 
+class BraveSearchHandler(BaseHTTPRequestHandler):
+    """Mock Brave Search API returning canned results."""
+
+    def do_GET(self):
+        payload = json.dumps({
+            "web": {
+                "results": [
+                    {
+                        "title": "Mock Search Result",
+                        "url": "https://example.com/mock",
+                        "description": "A mock search result for testing",
+                    }
+                ]
+            }
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 def _write_agentic_config(
     praxis_port: int, db_path: str, mcp_port: int,
+    search_port: int,
 ) -> str:
     """Patch agentic-loop.yaml with test ports and allow_loopback."""
     with open(AGENTIC_CONFIG_PATH) as f:
@@ -223,6 +249,15 @@ def _write_agentic_config(
         "max_iterations: 11\n"
         "        timeout_ms: 120000\n"
         "        step_timeout_ms: 120000\n",
+    )
+    config = config.replace(
+        "- filter: openai_web_search\n"
+        "                provider: brave\n"
+        "                api_key: ${WEB_SEARCH_API_KEY}",
+        "- filter: openai_web_search\n"
+        "                provider: brave\n"
+        "                api_key: test-key\n"
+        f"                base_url: http://127.0.0.1:{search_port}",
     )
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -541,12 +576,23 @@ def mcp_server():
 
 
 @pytest.fixture(scope="session")
-def agentic_proxy(tmp_path_factory, request, mcp_server):
+def search_server():
+    """Start an in-process mock Brave search server for the test session."""
+    port = _free_port()
+    server = HTTPServer(("127.0.0.1", port), BraveSearchHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield port
+    server.shutdown()
+
+
+@pytest.fixture(scope="session")
+def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
     """Start a Praxis proxy with the agentic-loop config."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("agentic-responses")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_agentic_config(port, db_path, mcp_server)
+    config_path = _write_agentic_config(port, db_path, mcp_server, search_server)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -561,7 +607,7 @@ def agentic_proxy(tmp_path_factory, request, mcp_server):
     try:
         _wait_for_proxy(port)
         started = True
-        yield port, mcp_server
+        yield port, mcp_server, search_server
     finally:
         proc.send_signal(signal.SIGINT)
         try:
@@ -582,7 +628,7 @@ def agentic_proxy(tmp_path_factory, request, mcp_server):
 @pytest.fixture(scope="session")
 def agentic_client(agentic_proxy):
     """Return an OpenAI client pointed at the agentic Praxis proxy."""
-    proxy_port, _ = agentic_proxy
+    proxy_port, _, _ = agentic_proxy
     return OpenAI(
         base_url=f"http://127.0.0.1:{proxy_port}/v1",
         api_key="test",
@@ -610,7 +656,7 @@ class TestAgenticLoopVLLM:
         accumulated output contains the full execution trace:
         function_call, mcp_call, and the final message.
         """
-        _, mcp_port = agentic_proxy
+        _, mcp_port, _ = agentic_proxy
         mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(

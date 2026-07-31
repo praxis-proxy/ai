@@ -9,7 +9,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
 use crate::store::{
-    SslMode,
+    PoolConfig, SslMode,
     postgres_url::{
         self, has_postgres_url_ssl_root_cert, is_verified_postgres_sslmode, postgres_url_sslmode,
         validate_postgres_url_tls_file_params,
@@ -83,6 +83,13 @@ pub(crate) struct ConversationsConfig {
     /// development and tests.
     #[serde(default)]
     pub allow_private_database_url: bool,
+
+    /// Connection pool tuning options.
+    ///
+    /// When omitted, sqlx defaults apply (`max_connections = 10`,
+    /// `idle_timeout = 600s`, `acquire_timeout = 30s`).
+    #[serde(default)]
+    pub pool: Option<PoolConfig>,
 }
 
 /// Serde default for [`ConversationsConfig::conversations_table`].
@@ -116,6 +123,9 @@ pub(crate) fn validate_config(cfg: &ConversationsConfig) -> Result<(), FilterErr
     let database_url = cfg.database_url.expose_secret();
     if database_url.is_empty() {
         return Err(format!("{FILTER_NAME}: 'database_url' must not be empty").into());
+    }
+    if let Some(pool) = &cfg.pool {
+        pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
     let responses_table = validate_table_names(cfg)?;
     match cfg.backend {

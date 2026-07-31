@@ -9,7 +9,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
 use crate::store::{
-    SslMode,
+    PoolConfig, SslMode,
     postgres_url::{
         self, has_postgres_url_ssl_root_cert, is_verified_postgres_sslmode, postgres_url_sslmode,
         validate_postgres_url_tls_file_params,
@@ -81,6 +81,13 @@ pub(crate) struct ResponseStoreConfig {
     /// development and tests.
     #[serde(default)]
     pub allow_private_database_url: bool,
+
+    /// Connection pool tuning options.
+    ///
+    /// When omitted, sqlx defaults apply (`max_connections = 10`,
+    /// `idle_timeout = 600s`, `acquire_timeout = 30s`).
+    #[serde(default)]
+    pub pool: Option<PoolConfig>,
 }
 
 // -----------------------------------------------------------------------------
@@ -99,6 +106,9 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
         .map_err(|e| format!("{FILTER_NAME}: invalid conversations_table: {e}"))?;
     if cfg.responses_table.eq_ignore_ascii_case(&cfg.conversations_table) {
         return Err(format!("{FILTER_NAME}: response and conversation table names must be distinct").into());
+    }
+    if let Some(pool) = &cfg.pool {
+        pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
     match cfg.backend {
         StorageBackend::Sqlite => {

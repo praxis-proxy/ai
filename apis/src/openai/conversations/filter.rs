@@ -108,6 +108,7 @@ impl OpenaiConversationsFilter {
             responses_table,
             &self.config.conversations_table,
             Some(&self.config.items_table),
+            self.config.pool.as_ref(),
         )
         .await
         .map(|s| {
@@ -131,6 +132,7 @@ impl OpenaiConversationsFilter {
             Some(&self.config.items_table),
             self.config.ssl_mode,
             ssl_root_cert,
+            self.config.pool.as_ref(),
         )
         .await
         .map(|s| {
