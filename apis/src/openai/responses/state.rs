@@ -125,6 +125,15 @@ pub(crate) struct ResponsesState {
     /// duplicate dispatch.
     pub tool_calls: Vec<serde_json::Value>,
 
+    /// Web search calls from the current inference response only.
+    ///
+    /// Cleared by `agentic_loop` at the start of each iteration.
+    /// Stored separately from `tool_calls` because `web_search_call`
+    /// items have a different shape (`action.query` instead of
+    /// `name`/`arguments`) and must not trigger the
+    /// one-function-call-per-round limit.
+    pub web_search_calls: Vec<serde_json::Value>,
+
     /// Tool choice setting. Reset to `"auto"` by `agentic_loop`
     /// after the first iteration; the original value from the
     /// request only applies to the first inference call.
@@ -167,6 +176,7 @@ impl Default for ResponsesState {
             request_body: serde_json::Value::Null,
             response_object: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            web_search_calls: Vec::new(),
             tool_choice: serde_json::Value::String("auto".to_owned()),
             tools: Vec::new(),
             usage: serde_json::Value::Null,
@@ -534,6 +544,7 @@ mod tests {
         assert!(state.request_body.is_null());
         assert!(state.response_object.is_null());
         assert!(state.tool_calls.is_empty());
+        assert!(state.web_search_calls.is_empty());
         assert_eq!(state.tool_choice, json!("auto"));
         assert!(state.tools.is_empty());
         assert!(state.usage.is_null());
