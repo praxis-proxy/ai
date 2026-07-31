@@ -93,13 +93,14 @@ pub(crate) fn reload_pipelines_with_client(
         new_ceiling,
     );
 
-    let new_pipelines = match resolve_pipelines(new_config, registry, &health_registry, kv_stores, &updated_client) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(error = %e, "config reload failed: pipeline build error");
-            return Err(e);
-        },
-    };
+    let new_pipelines =
+        match resolve_pipelines_with_client(new_config, registry, &health_registry, kv_stores, &updated_client) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "config reload failed: pipeline build error");
+                return Err(e);
+            },
+        };
 
     log_restart_required_changes(old_config, new_config);
     warn_stateful_filter_reset(new_config);
