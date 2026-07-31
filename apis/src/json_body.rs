@@ -4,13 +4,13 @@
 //! Shared JSON request-body mutation.
 //!
 //! Several filters buffer the request body (`BodyMode::StreamBuffer`), mutate a parsed JSON value, and then
-//! re-serialize it back into the body, each re-implementing the same serialize / replace / Content-Length fixup
-//! dance. This module provides that shared machinery so individual filters only own their mutation logic:
+//! re-serialize it back into the body, each re-implementing the same serialize / replace dance. This module
+//! provides that shared machinery so individual filters only own their mutation logic:
 //!
 //! ```text
 //! let mut value: serde_json::Value = serde_json::from_slice(raw)?;
 //! value["model"] = "qwen-2.5-72b".into();
-//! let mutation = replace_json_body(ctx, body, &value, "model_rewrite", "model")?;
+//! let mutation = replace_json_body(body, &value, "model_rewrite", "model")?;
 //! ```
 //!
 //! [`serialize_json_body`] and [`SerializedJson::commit`] split the two halves for callers that must inspect the
@@ -19,13 +19,10 @@
 //! Every commit emits one consistent `tracing` event carrying the filter name, the field changed, and the size
 //! delta, and returns a [`BodyMutation`] report with the same data for callers that need it programmatically.
 //!
-//! Request-side only: core repairs upstream `Content-Length` framing for mutated request bodies, but has no
-//! equivalent response-side repair, so response-body mutation needs different machinery.
-
-use std::borrow::Cow;
+//! Request-side only: core repairs upstream `Content-Length` framing for mutated request bodies via
+//! `mutated_request_body_len`, so filters must not set `Content-Length` themselves.
 
 use bytes::Bytes;
-use praxis_filter::HttpFilterContext;
 use serde_json::Value;
 use tracing::debug;
 
@@ -43,8 +40,7 @@ pub fn serialize_json_body(value: &Value) -> Result<SerializedJson, serde_json::
     })
 }
 
-/// Serialize `value`, replace the buffered request `body`, fix up `Content-Length`, and emit the mutation
-/// event.
+/// Serialize `value`, replace the buffered request `body`, and emit the mutation event.
 ///
 /// Convenience wrapper around [`serialize_json_body`] and [`SerializedJson::commit`] for callers with no
 /// pre-commit checks.
@@ -53,13 +49,12 @@ pub fn serialize_json_body(value: &Value) -> Result<SerializedJson, serde_json::
 ///
 /// Returns [`serde_json::Error`] if `value` fails to serialize.
 pub fn replace_json_body(
-    ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     value: &Value,
     filter: &'static str,
     field: &'static str,
 ) -> Result<BodyMutation, serde_json::Error> {
-    Ok(serialize_json_body(value)?.commit(ctx, body, filter, field))
+    Ok(serialize_json_body(value)?.commit(body, filter, field))
 }
 
 /// A serialized JSON body ready to be committed.
@@ -95,11 +90,12 @@ impl SerializedJson {
         &self.bytes
     }
 
-    /// Replace the buffered request body with the serialized value, push the corrected `Content-Length`, and
-    /// emit the mutation event. Returns a [`BodyMutation`] report of what changed.
+    /// Replace the buffered request body with the serialized value and emit the mutation event.
+    /// Returns a [`BodyMutation`] report of what changed.
+    ///
+    /// Does not set `Content-Length`; core handles upstream framing via `mutated_request_body_len`.
     pub fn commit(
         self,
-        ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         filter: &'static str,
         field: &'static str,
@@ -112,8 +108,6 @@ impl SerializedJson {
         };
 
         *body = Some(self.bytes);
-        ctx.extra_request_headers
-            .push((Cow::Borrowed("content-length"), mutation.new_len().to_string()));
 
         debug!(
             filter = mutation.filter(),
@@ -192,25 +186,21 @@ impl BodyMutation {
     reason = "tests"
 )]
 mod tests {
-    use http::Method;
     use serde_json::json;
 
     use super::*;
-    use crate::test_utils::{make_filter_context, make_request};
 
     fn serialized_len(value: &Value) -> usize {
         serde_json::to_vec(value).unwrap().len()
     }
 
     #[test]
-    fn replace_grows_body_and_fixes_content_length() {
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
+    fn replace_grows_body() {
         let original = json!({"model": "a"});
         let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
         let mutated = json!({"model": "qwen-2.5-72b-instruct"});
 
-        let mutation = replace_json_body(&mut ctx, &mut body, &mutated, "model_rewrite", "model").unwrap();
+        let mutation = replace_json_body(&mut body, &mutated, "model_rewrite", "model").unwrap();
 
         assert_eq!(mutation.filter(), "model_rewrite");
         assert_eq!(mutation.field(), "model");
@@ -222,21 +212,15 @@ mod tests {
             &Bytes::from(serde_json::to_vec(&mutated).unwrap()),
             "buffered body should hold the mutated value"
         );
-        assert_eq!(ctx.extra_request_headers.len(), 1);
-        let (name, value) = &ctx.extra_request_headers[0];
-        assert_eq!(name.as_ref(), "content-length");
-        assert_eq!(value, &mutation.new_len().to_string());
     }
 
     #[test]
     fn replace_shrinks_body_reports_negative_delta() {
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
         let original = json!({"model": "qwen-2.5-72b-instruct"});
         let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
         let mutated = json!({"model": "a"});
 
-        let mutation = replace_json_body(&mut ctx, &mut body, &mutated, "model_rewrite", "model").unwrap();
+        let mutation = replace_json_body(&mut body, &mutated, "model_rewrite", "model").unwrap();
 
         assert!(mutation.size_delta() < 0, "shrinkage should report a negative delta");
         assert_eq!(mutation.size_delta(), {
@@ -249,40 +233,28 @@ mod tests {
 
     #[test]
     fn replace_with_absent_body_reports_zero_original_len() {
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
         let mut body = None;
         let mutated = json!({"model": "qwen-2.5-72b"});
 
-        let mutation = replace_json_body(&mut ctx, &mut body, &mutated, "model_rewrite", "model").unwrap();
+        let mutation = replace_json_body(&mut body, &mutated, "model_rewrite", "model").unwrap();
 
         assert_eq!(mutation.original_len(), 0);
         assert_eq!(mutation.new_len(), serialized_len(&mutated));
         assert!(body.is_some(), "body should be populated after commit");
-        assert_eq!(ctx.extra_request_headers.len(), 1);
     }
 
     #[test]
     fn replace_counts_multibyte_content_in_bytes() {
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
         let mut body = Some(Bytes::from_static(b"{}"));
-        let mutated = json!({"input": "héllo ✓ 世界"});
+        let mutated = json!({"input": "hello world"});
 
-        let mutation = replace_json_body(&mut ctx, &mut body, &mutated, "prompt_enrich", "input").unwrap();
+        let mutation = replace_json_body(&mut body, &mutated, "prompt_enrich", "input").unwrap();
 
         assert_eq!(mutation.new_len(), serialized_len(&mutated));
-        assert!(
-            mutation.new_len() > "héllo ✓ 世界".len(),
-            "JSON escaping aside, length is measured in bytes"
-        );
-        assert_eq!(ctx.extra_request_headers[0].1, mutation.new_len().to_string());
     }
 
     #[test]
     fn two_step_serialize_then_commit_supports_pre_commit_checks() {
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
         let original = json!({"input": [{"type": "input_image", "image_url": "https://example.com/a.png"}]});
         let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
         let mutated = json!({"input": [{"type": "input_text", "text": "resolved"}]});
@@ -296,28 +268,23 @@ mod tests {
             "body must be untouched before commit"
         );
 
-        // Callers with a size cap (e.g. file_resolve / doc_extract) check here, before commit.
         let max_body_bytes = 1024;
         assert!(serialized.len() <= max_body_bytes);
 
-        let mutation = serialized.commit(&mut ctx, &mut body, "openai_file_resolve", "input");
+        let mutation = serialized.commit(&mut body, "openai_file_resolve", "input");
         assert_eq!(mutation.field(), "input");
         assert_eq!(mutation.original_len(), serialized_len(&original));
         assert_eq!(body.as_ref().unwrap().len(), serialized_len(&mutated));
-        assert_eq!(ctx.extra_request_headers[0].1, serialized_len(&mutated).to_string());
     }
 
     #[test]
-    fn commit_with_identical_value_still_repairs_content_length() {
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
+    fn commit_with_identical_value_reports_zero_delta() {
         let value = json!({"model": "a"});
         let mut body = Some(Bytes::from(serde_json::to_vec(&value).unwrap()));
 
-        let mutation = replace_json_body(&mut ctx, &mut body, &value, "model_rewrite", "model").unwrap();
+        let mutation = replace_json_body(&mut body, &value, "model_rewrite", "model").unwrap();
 
         assert_eq!(mutation.size_delta(), 0);
-        assert_eq!(ctx.extra_request_headers.len(), 1);
     }
 
     #[test]
@@ -329,16 +296,13 @@ mod tests {
 
     #[test]
     fn from_bytes_wraps_preserialized_json() {
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
         let mut body = Some(Bytes::from_static(b"{}"));
         let bytes = Bytes::from(serde_json::to_vec(&json!({"a": 1})).unwrap());
 
         let mutation =
-            SerializedJson::from_bytes(bytes.clone()).commit(&mut ctx, &mut body, "openai_responses_proxy", "body");
+            SerializedJson::from_bytes(bytes.clone()).commit(&mut body, "openai_responses_proxy", "body");
 
         assert_eq!(mutation.new_len(), bytes.len());
         assert_eq!(body.as_ref().unwrap(), &bytes);
-        assert_eq!(ctx.extra_request_headers[0].1, bytes.len().to_string());
     }
 }
