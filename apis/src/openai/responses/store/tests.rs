@@ -1316,7 +1316,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     let record = store
@@ -1428,7 +1428,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
         "EOS should persist from accumulated state and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     let record = store
@@ -1512,7 +1512,7 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_rehydrated_messages");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     seeded_store
@@ -1606,7 +1606,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     let record = store
@@ -1637,7 +1637,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_fallback_mcp_metadata");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     seeded_store
@@ -1736,7 +1736,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     let record = store
@@ -4676,4 +4676,73 @@ fn assert_has_json_content_type(rejection: &praxis_filter::Rejection) {
         .iter()
         .any(|(k, v)| k == "content-type" && v == "application/json");
     assert!(has_ct, "rejection should have application/json content-type");
+}
+
+// -----------------------------------------------------------------------------
+// Pool Config
+// -----------------------------------------------------------------------------
+
+#[test]
+fn config_accepts_pool_options() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+pool:
+  max_connections: 20
+  min_connections: 2
+  idle_timeout_secs: 300
+  acquire_timeout_secs: 15
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+
+    let pool = cfg.pool.expect("pool config should be present");
+    assert_eq!(pool.max_connections, Some(20));
+    assert_eq!(pool.min_connections, Some(2));
+    assert_eq!(pool.idle_timeout_secs, Some(300));
+    assert_eq!(pool.acquire_timeout_secs, Some(15));
+}
+
+#[test]
+fn config_accepts_partial_pool_options() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+pool:
+  max_connections: 50
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+
+    let pool = cfg.pool.expect("pool config should be present");
+    assert_eq!(pool.max_connections, Some(50));
+    assert!(pool.min_connections.is_none());
+    assert!(pool.idle_timeout_secs.is_none());
+    assert!(pool.acquire_timeout_secs.is_none());
+}
+
+#[test]
+fn config_omitted_pool_yields_none() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+    assert!(cfg.pool.is_none(), "omitted pool should be None");
 }

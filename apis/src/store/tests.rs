@@ -20,9 +20,15 @@ use crate::openai::responses::store::{ListParams, Order, list_input_items};
 
 #[tokio::test]
 async fn sqlite_store_initializes_schema() {
-    let store = SqliteResponseStore::new("sqlite::memory:", "test_responses", "test_conversation_messages", None)
-        .await
-        .expect("store creation should succeed");
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "test_responses",
+        "test_conversation_messages",
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed");
 
     let result = store
         .get_response("tenant_a", "nonexistent")
@@ -1348,7 +1354,7 @@ async fn file_backed_store_crud() {
     let db_path = dir.path().join("test.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let store = SqliteResponseStore::new(&url, "file_responses", "file_conversations", None)
+    let store = SqliteResponseStore::new(&url, "file_responses", "file_conversations", None, None)
         .await
         .expect("file-backed store creation should succeed");
 
@@ -1377,7 +1383,7 @@ async fn schema_migration_is_idempotent() {
     let db_path = dir.path().join("idempotent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let store = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"))
+    let store = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"), None)
         .await
         .expect("first init should succeed");
 
@@ -1386,7 +1392,7 @@ async fn schema_migration_is_idempotent() {
 
     drop(store);
 
-    let store2 = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"))
+    let store2 = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"), None)
         .await
         .expect("second init with same tables should succeed");
 
@@ -1621,6 +1627,7 @@ async fn pg_nonexistent_ssl_root_cert_fails() {
         None,
         Some(SslMode::VerifyCa),
         Some("/nonexistent/ca.pem"),
+        None,
     ))
     .await;
 
@@ -1642,6 +1649,7 @@ async fn make_pg_store() -> PostgresResponseStore {
         &format!("test_conversations_{suffix}"),
         None,
         Some(SslMode::Disable),
+        None,
         None,
     ))
     .await
@@ -2336,15 +2344,21 @@ async fn pg_delete_conversation_preserves_items() {
 // -----------------------------------------------------------------------------
 
 async fn make_store() -> SqliteResponseStore {
-    SqliteResponseStore::new("sqlite::memory:", "test_responses", "test_conversation_messages", None)
-        .await
-        .expect("store creation should succeed")
+    SqliteResponseStore::new(
+        "sqlite::memory:",
+        "test_responses",
+        "test_conversation_messages",
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed")
 }
 
 async fn make_file_store(dir: &tempfile::TempDir) -> SqliteResponseStore {
     let db_path = dir.path().join("concurrent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None)
+    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None, None)
         .await
         .expect("file-backed store creation should succeed")
 }
@@ -2355,6 +2369,7 @@ async fn make_store_with_items() -> SqliteResponseStore {
         "test_responses",
         "test_conversation_messages",
         Some("test_conversation_items"),
+        None,
     )
     .await
     .expect("store creation should succeed")
@@ -2372,6 +2387,7 @@ async fn make_pg_store_with_items() -> PostgresResponseStore {
         &conversations_table,
         Some(&items_table),
         Some(SslMode::Disable),
+        None,
         None,
     )
     .await

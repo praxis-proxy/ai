@@ -11,6 +11,7 @@ use sqlx::{
 use tracing::info;
 
 use super::{
+    pool::{PoolConfig, apply_pool_config},
     schemas::{TableNames, generate_ddl},
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, ResponseRecord, StoreError},
@@ -53,6 +54,7 @@ impl SqliteResponseStore {
         responses_table: &str,
         conversations_table: &str,
         items_table: Option<&str>,
+        pool_config: Option<&PoolConfig>,
     ) -> Result<Self, StoreError> {
         let tables = TableNames {
             responses: responses_table.to_owned(),
@@ -65,7 +67,7 @@ impl SqliteResponseStore {
             .parse()
             .map_err(|e: sqlx::Error| StoreError::Database(e.to_string()))?;
 
-        let pool = sqlite_pool_options(database_url)
+        let pool = sqlite_pool_options(database_url, pool_config)
             .connect_with(options.create_if_missing(true))
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -154,7 +156,12 @@ impl SqliteResponseStore {
 }
 
 /// Build pool options for the requested `SQLite` database URL.
-fn sqlite_pool_options(database_url: &str) -> SqlitePoolOptions {
+///
+/// In-memory databases are pinned to a single connection regardless
+/// of pool config (required to keep the database alive). For
+/// file-backed databases, user-supplied [`PoolConfig`] values are
+/// applied on top of sqlx defaults.
+fn sqlite_pool_options(database_url: &str, pool_config: Option<&PoolConfig>) -> SqlitePoolOptions {
     if is_memory_database_url(database_url) {
         SqlitePoolOptions::new()
             .max_connections(1)
@@ -162,9 +169,10 @@ fn sqlite_pool_options(database_url: &str) -> SqlitePoolOptions {
             .idle_timeout(None)
             .max_lifetime(None)
     } else {
-        SqlitePoolOptions::new()
+        apply_pool_config(SqlitePoolOptions::new(), pool_config)
     }
 }
+
 
 /// Return whether the database URL targets an in-memory `SQLite` database.
 fn is_memory_database_url(database_url: &str) -> bool {
