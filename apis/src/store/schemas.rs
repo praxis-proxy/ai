@@ -672,4 +672,85 @@ mod tests {
             "should reject collision: {err}"
         );
     }
+
+    #[test]
+    fn generate_ddl_includes_items_ddl() {
+        let tables = TableNames {
+            responses: "test_responses".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: Some("test_items".to_owned()),
+        };
+        let ddl = generate_ddl(&tables).expect("valid names with items should produce DDL");
+        assert_eq!(
+            ddl.len(),
+            6,
+            "should produce 6 DDL statements (responses, conversations, tenant_id index, items, items index, version)"
+        );
+        assert!(
+            ddl[3].contains("test_items"),
+            "fourth statement should create items table: {}",
+            ddl[3]
+        );
+        assert!(
+            ddl[4].contains("idx_test_items_conversation"),
+            "fifth statement should create items index: {}",
+            ddl[4]
+        );
+    }
+
+    #[test]
+    fn generate_ddl_rejects_items_same_as_responses() {
+        let tables = TableNames {
+            responses: "shared_name".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: Some("shared_name".to_owned()),
+        };
+        let err = generate_ddl(&tables).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("items and response table names must be distinct"),
+            "should reject items == responses: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_ddl_rejects_items_same_as_conversations() {
+        let tables = TableNames {
+            responses: "test_responses".to_owned(),
+            conversations: "shared_name".to_owned(),
+            items: Some("shared_name".to_owned()),
+        };
+        let err = generate_ddl(&tables).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("items and conversation table names must be distinct"),
+            "should reject items == conversations: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_postgres_table_identifiers_accepts_valid() {
+        validate_postgres_table_identifiers("test_responses", "test_conversations")
+            .expect("valid names should pass PostgreSQL validation");
+    }
+
+    #[test]
+    fn validate_postgres_table_set_identifiers_accepts_valid_with_items() {
+        validate_postgres_table_set_identifiers("test_responses", "test_conversations", Some("test_items"))
+            .expect("valid names with items should pass PostgreSQL validation");
+    }
+
+    #[test]
+    fn validate_postgres_table_set_identifiers_rejects_long_items() {
+        let err = validate_postgres_table_set_identifiers(
+            "test_responses",
+            "test_conversations",
+            Some(&"i".repeat(POSTGRES_MAX_ITEMS_TABLE_LEN + 1)),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("PostgreSQL identifier limit"),
+            "should reject items name PostgreSQL would truncate: {err}"
+        );
+    }
 }
