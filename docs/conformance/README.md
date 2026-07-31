@@ -38,8 +38,7 @@ sources, backed by tests of the real runtime path.
 ### Verified Conversations request behavior
 
 The Conversations create and update request-body edge cases were checked
-against `api.openai.com` on 2026-07-27. Temporary conversations were deleted
-after the probe.
+against `api.openai.com` on 2026-07-27.
 
 | Request | Result |
 | --- | --- |
