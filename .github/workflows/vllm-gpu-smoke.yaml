@@ -1,0 +1,141 @@
+name: vLLM GPU Smoke
+
+# Manual GPU hello-world against Qwen/Qwen3-0.6B on a T4-class runner.
+# Intended for Ken's offered `gpu-t4-4-core` larger-runner shape (or equivalent).
+# Does not use the OGX ec2-github-runner / personal-PAT pattern.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: GitHub Actions runner label for the GPU host
+        required: true
+        default: gpu-t4-4-core
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  VLLM_IMAGE: "docker.io/vllm/vllm-openai:v0.22.1-cu129@sha256:e1668bce9790a4b86682f8fcc99678153a13e12dc70e05348d8e239ffa474b05"
+  VLLM_MODEL: "Qwen/Qwen3-0.6B"
+
+jobs:
+  vllm-gpu-hello:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify GPU and container runtime
+        run: |
+          nvidia-smi
+          if command -v docker >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            docker info >/dev/null
+          elif command -v podman >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            podman info >/dev/null
+          else
+            echo "Neither docker nor podman is available on this runner" >&2
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Pull vLLM CUDA image
+        run: |
+          "$CONTAINER_RUNTIME" pull "$VLLM_IMAGE"
+
+      - name: Start vLLM on GPU
+        run: |
+          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+            "$CONTAINER_RUNTIME" run -d --name vllm \
+              --device nvidia.com/gpu=all \
+              -p 8000:8000 \
+              -e HUGGING_FACE_HUB_TOKEN="${{ secrets.HUGGING_FACE_HUB_TOKEN }}" \
+              "$VLLM_IMAGE" \
+              --model "$VLLM_MODEL" \
+              --max-model-len 4096 \
+              --served-model-name "$VLLM_MODEL" \
+              --enable-auto-tool-choice \
+              --tool-call-parser hermes \
+              --reasoning-parser deepseek_r1 \
+              --gpu-memory-utilization 0.7
+          else
+            "$CONTAINER_RUNTIME" run -d --name vllm \
+              --gpus all \
+              -p 8000:8000 \
+              -e HUGGING_FACE_HUB_TOKEN="${{ secrets.HUGGING_FACE_HUB_TOKEN }}" \
+              "$VLLM_IMAGE" \
+              --model "$VLLM_MODEL" \
+              --max-model-len 4096 \
+              --served-model-name "$VLLM_MODEL" \
+              --enable-auto-tool-choice \
+              --tool-call-parser hermes \
+              --reasoning-parser deepseek_r1 \
+              --gpu-memory-utilization 0.7
+          fi
+
+      - name: Start OGX
+        run: |
+          uv run --with 'ogx[starter]' ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          echo $! > /tmp/ogx.pid
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Wait for vLLM readiness
+        run: |
+          echo "Waiting for vLLM health and model endpoints..."
+          timeout 1200 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+                                       curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+            sleep 5
+          done'
+          echo "vLLM is ready"
+          curl -sf http://127.0.0.1:8000/v1/models | head -c 500
+          echo
+
+      - name: Wait for OGX readiness
+        run: |
+          echo "Waiting for OGX server..."
+          timeout 120 bash -c 'until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+            sleep 2
+          done'
+          echo "OGX is ready"
+
+      - name: Run GPU hello-world smoke
+        run: |
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py \
+            -s -k test_stateless_request
+
+      - name: vLLM container logs
+        if: failure()
+        run: |
+          "$CONTAINER_RUNTIME" logs vllm || true
+
+      - name: OGX logs
+        if: failure()
+        run: cat /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+
+      - name: Stop vLLM
+        if: always()
+        run: |
+          "$CONTAINER_RUNTIME" rm -f vllm || true
+
+      - name: Stop OGX
+        if: always()
+        run: |
+          if [ -f /tmp/ogx.pid ]; then
+            kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
+          fi
