@@ -156,9 +156,8 @@ fn build_server_state(
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
-    let pipelines =
-        resolve_pipelines_with_client(config, registry, health_registry, &kv_stores, &subrequest_client)
-            .unwrap_or_else(|e| fatal(&e));
+    let pipelines = resolve_pipelines_with_client(config, registry, health_registry, &kv_stores, &subrequest_client)
+        .unwrap_or_else(|e| fatal(&e));
 
     let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_health_check_tasks(config, Arc::clone(health_registry), &health_shutdown);
