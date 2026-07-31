@@ -468,7 +468,9 @@ async fn replay_codex_responses_session_through_full_flow_example() {
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        &yaml
+            .replace("sqlite://responses.db?mode=rwc", db.url())
+            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );

@@ -135,7 +135,10 @@ fn walk_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if path.file_name().is_some_and(|n| n == "target") {
+            if path
+                .file_name()
+                .is_some_and(|n| n == "target" || n.as_encoded_bytes().starts_with(b"."))
+            {
                 continue;
             }
             walk_rs_files(&path, out);

@@ -51,6 +51,9 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
         )
         .unwrap();
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
+    pipeline.set_subrequest_client(praxis_core::subrequest::SubRequestClient::new(
+        praxis_core::subrequest::SubRequestConnector::new(8, None),
+    ));
     Arc::new(pipeline)
 }
 

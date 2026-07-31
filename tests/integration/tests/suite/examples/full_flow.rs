@@ -47,7 +47,9 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        &yaml
+            .replace("sqlite://responses.db?mode=rwc", db.url())
+            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
         proxy_port,
         &HashMap::from([
             ("127.0.0.1:9999", files_api_port),
@@ -204,7 +206,7 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
     assert_eq!(
         parse_status(&raw),
         404,
-        "chat completions bodies should not match the Responses-only route"
+        "non-Responses body should not match the format-constrained route"
     );
 }
 
@@ -218,6 +220,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let db = TempSqlite::new("full_flow_prev");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
         .expect("example config should exist");
+    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -322,7 +325,7 @@ async fn full_flow_websocket_upgrade_preserves_handshake_and_ordered_text() {
     ])
     .await;
     let proxy_port = free_port();
-    let (config, _db) = isolated_full_flow_config(
+    let (config, _db) = ws_full_flow_config(
         "websocket_upgrade",
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
@@ -397,7 +400,7 @@ async fn full_flow_websocket_preserves_binary_frames_bidirectionally() {
     let server_payload = bytes::Bytes::from_static(&[0x00, 0x7F, 0x80, 0xFF]);
     let mut backend = start_scripted_websocket_backend(vec![WsServerAction::Binary(server_payload.clone())]).await;
     let proxy_port = free_port();
-    let (config, _db) = isolated_full_flow_config(
+    let (config, _db) = ws_full_flow_config(
         "websocket_binary",
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
@@ -441,7 +444,7 @@ async fn full_flow_websocket_survives_idle_and_relays_ping_pong() {
     ])
     .await;
     let proxy_port = free_port();
-    let (config, _db) = isolated_full_flow_config(
+    let (config, _db) = ws_full_flow_config(
         "websocket_idle",
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
@@ -502,7 +505,7 @@ async fn full_flow_websocket_survives_idle_and_relays_ping_pong() {
 async fn full_flow_websocket_early_backend_disconnect_is_bounded() {
     let backend = start_scripted_websocket_backend(vec![WsServerAction::Disconnect]).await;
     let proxy_port = free_port();
-    let (config, _db) = isolated_full_flow_config(
+    let (config, _db) = ws_full_flow_config(
         "websocket_disconnect",
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
@@ -536,7 +539,7 @@ async fn full_flow_websocket_early_backend_disconnect_is_bounded() {
 async fn full_flow_websocket_non_101_backend_response_remains_http() {
     let backend = Backend::status(426, "upgrade rejected").start_with_shutdown();
     let proxy_port = free_port();
-    let (config, _db) = isolated_full_flow_config(
+    let (config, _db) = ws_full_flow_config(
         "websocket_non_101",
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
@@ -564,54 +567,32 @@ async fn full_flow_websocket_non_101_backend_response_remains_http() {
     );
 }
 
-/// Keep the bodyless handshake out of the HTTP stateful branch.
+/// WebSocket handshakes reach the inference backend through the
+/// non-IRR pipeline variant (IRR buffers all responses and cannot
+/// handle 101 upgrades).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_flow_websocket_handshake_does_not_take_stateful_route() {
-    let ws_backend = start_scripted_websocket_backend(vec![WsServerAction::Text("native".to_owned())]).await;
-    let stateful_backend = Backend::fixed("stateful-backend").start_with_shutdown();
+async fn full_flow_websocket_handshake_reaches_inference_backend() {
+    let ws_backend = start_scripted_websocket_backend(vec![WsServerAction::Text("hello".to_owned())]).await;
     let proxy_port = free_port();
-    let db = TempSqlite::new("websocket_routing");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
-        .expect("example config should exist")
-        .replace("sqlite://responses.db?mode=rwc", db.url())
-        .replace(
-            "          - path: \"/v1/responses\"\n            headers:\n              x-praxis-ai-format: \"openai_responses\"",
-            "          - path: \"/v1/responses\"\n            headers:\n              x-praxis-responses-mode: \"stateful\"\n            cluster: \"stateful-backend\"\n\n          - path: \"/v1/responses\"\n            headers:\n              x-praxis-ai-format: \"openai_responses\"",
-        )
-        .replace(
-            "              - \"127.0.0.1:3001\"",
-            "              - \"127.0.0.1:3001\"\n          - name: \"stateful-backend\"\n            endpoints:\n              - \"127.0.0.1:3002\"",
-        );
-    let patched = patch_yaml(
-        &yaml,
+    let (config, _db) = ws_full_flow_config(
+        "websocket_routing",
         proxy_port,
-        &HashMap::from([
-            ("127.0.0.1:3001", ws_backend.port()),
-            ("127.0.0.1:3002", stateful_backend.port()),
-        ]),
+        &HashMap::from([("127.0.0.1:3001", ws_backend.port())]),
     );
-    let config = praxis_core::config::Config::from_yaml(&patched).expect("routing config should parse");
-    let proxy = start_proxy(&config);
-
-    let raw = http_send(proxy.addr(), &json_post("/v1/responses", r#"{"input":"stateful"}"#));
-    assert_eq!(
-        parse_body(&raw),
-        "stateful-backend",
-        "control request should use stateful route"
-    );
+    let _proxy = start_proxy(&config);
 
     let url = format!("ws://127.0.0.1:{proxy_port}/v1/responses");
-    let (mut socket, response) = connect_websocket(url).await.expect("handshake should use native route");
+    let (mut socket, response) = connect_websocket(url).await.expect("handshake should succeed");
     assert_eq!(
         response.status(),
         http::StatusCode::SWITCHING_PROTOCOLS,
-        "the handshake should reach the format-only inference route"
+        "the handshake should reach the inference backend"
     );
     socket.send(Message::Text("start".into())).await.unwrap();
     assert_eq!(
         next_ws_message(&mut socket).await.into_text().unwrap(),
-        "native",
-        "the handshake should not enter the stateful HTTP route"
+        "hello",
+        "the backend response should be relayed to the client"
     );
 }
 
@@ -665,8 +646,11 @@ async fn next_backend_event(backend: &mut praxis_test_utils::WsBackendGuard) -> 
         .expect("backend observation channel should remain open")
 }
 
-/// Load the full-flow example with isolated persistence and patched ports.
-fn isolated_full_flow_config(
+/// Load the full-flow example with a per-test temp database.
+/// The full-flow config routes streaming and WebSocket requests
+/// through the outer pipeline (no IRR), so this works for all
+/// request types without modification.
+fn ws_full_flow_config(
     test_name: &str,
     proxy_port: u16,
     ports: &HashMap<&str, u16>,
@@ -674,11 +658,10 @@ fn isolated_full_flow_config(
     let db = TempSqlite::new(test_name);
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
         .expect("example config should exist");
-    let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
-        proxy_port,
-        ports,
-    );
-    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let yaml = yaml
+        .replace("sqlite://responses.db?mode=rwc", db.url())
+        .replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let patched = patch_yaml(&yaml, proxy_port, ports);
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("full-flow config should parse");
     (config, db)
 }

@@ -1,0 +1,127 @@
+# Agentic Loop Controller
+#
+# Demonstrates the agentic_loop filter with iterative_request_router
+# for step-based model-tool-model looping in the Responses API.
+#
+# The iterative_request_router (IRR) repeatedly runs one inference step.
+# `openai_mcp_dispatch` dynamically executes MCP calls against the server URL
+# supplied in the request, then the same step sends the result back to the
+# model. Client-side function calls do not match the MCP tool map and are
+# returned to the client without looping.
+#
+# Pre-IRR filters run once on the client request to set up shared
+# state (ResponsesState) which persists across all IRR iterations
+# via extension swapping.
+#
+# Response-phase execution order:
+#   Response filters execute in REVERSE order within each step.
+#   Filters listed first in the YAML run last in the response phase.
+#
+# Pipeline ordering (pre-IRR, runs once):
+#   1. openai_responses_format — classifies body, promotes metadata
+#   2. openai_responses_validate — validates parameters, generates IDs
+#   3. openai_response_store — registers the store backend
+#   4. openai_responses_rehydrate — loads previous_response_id context
+#
+# IRR inference filter chain:
+#   Request phase (forward):
+#     openai_mcp_dispatch → agentic_loop → openai_responses_proxy
+#       → router → load_balancer
+#   Response phase (reverse):
+#     load_balancer → router → openai_responses_proxy → agentic_loop
+#       → openai_mcp_dispatch
+#   agentic_loop extracts completed function calls. MCP dispatch then
+#   identifies calls resolved from the request, writes the IRR transition,
+#   and executes them at the start of the next iteration before inference.
+#
+# Transition rules (evaluated after each step's response-body):
+#   openai_mcp_dispatch.action = "loop" → next: inference
+#   default                             → done (exit to client)
+#
+# Config knobs:
+#   max_infer_iters: application-level iteration cap (default 10)
+#   max_iterations:  infrastructure-level safety cap on IRR. It must be
+#                    at least max_infer_iters + 1 (initial inference plus
+#                    the allowed MCP-backed inference continuations).
+#
+# Streaming limitation:
+#   IRR does not support incremental streaming. All responses within
+#   the loop are fully buffered.
+#
+# Example requests:
+#
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello"}'
+#
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather in SF?",
+#       "tools": [{"type": "mcp", "server_label": "weather",
+#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "allowed_tools": ["get_weather"],
+#                  "require_approval": "never"}]
+#     }'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [agentic-pipeline]
+
+filter_chains:
+  - name: agentic-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: openai_tool_parse
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: openai_mcp_tool_resolve
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 11
+        steps:
+          - name: inference
+            filters:
+              # Runs first on request re-entry to execute the pending MCP
+              # call, and last on the model response to select loop/done.
+              - filter: openai_mcp_dispatch
+              - filter: agentic_loop
+                max_infer_iters: 10
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference-backend"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_mcp_dispatch
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
