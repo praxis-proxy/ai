@@ -29,14 +29,7 @@ pub fn resolve_pipelines(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
-    let pool_size = config
-        .runtime
-        .subrequest_pool_size
-        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
-    let client = praxis_core::subrequest::SubRequestClient::new(
-        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections),
-    );
-    resolve_pipelines_with_client(config, registry, health_registry, kv_stores, &client)
+    resolve_pipelines_with_client(config, registry, health_registry, kv_stores, subrequest_client)
 }
 
 /// Build listener pipelines with the server-owned subrequest client.
@@ -98,7 +91,6 @@ fn configure_pipeline(
     }
     pipeline.set_subrequest_client(subrequest_client.clone());
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-    pipeline.set_subrequest_client(subrequest_client.clone());
     pipeline.apply_insecure_options(&config.insecure_options);
     Ok(())
 }

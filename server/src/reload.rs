@@ -47,9 +47,10 @@ pub(crate) fn reload_pipelines(
         .runtime
         .subrequest_pool_size
         .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
-    let client = praxis_core::subrequest::SubRequestClient::new(
-        praxis_core::subrequest::SubRequestConnector::new(pool_size, new_config.runtime.subrequest_max_connections),
-    );
+    let client = praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(
+        pool_size,
+        new_config.runtime.subrequest_max_connections,
+    ));
     reload_pipelines_with_client(
         new_config,
         old_config,
@@ -693,7 +694,8 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let health_registry: HealthRegistry = Arc::new(HashMap::new());
-        let pipelines = resolve_pipelines(&config, &registry, &health_registry, &empty_kv_stores()).unwrap();
+        let pipelines =
+            resolve_pipelines(&config, &registry, &health_registry, &empty_kv_stores(), &test_client()).unwrap();
         let shutdown = Arc::new(Mutex::new(CancellationToken::new()));
         (pipelines, config, registry, shutdown)
     }
@@ -701,5 +703,10 @@ filter_chains:
     /// Empty KV store registry for tests without KV stores.
     fn empty_kv_stores() -> praxis_core::kv::KvStoreRegistry {
         praxis_core::kv::KvStoreRegistry::new()
+    }
+
+    /// Minimal sub-request client for tests.
+    fn test_client() -> praxis_core::subrequest::SubRequestClient {
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
     }
 }
