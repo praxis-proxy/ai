@@ -1187,16 +1187,37 @@ fn has_from_config_method(imp: &syn::ItemImpl) -> bool {
 }
 
 /// Extract the config type name from `let cfg: T = parse_filter_config(...)`.
+///
+/// Scans `from_config` first. When `from_config` delegates to a
+/// private helper (e.g. `build`), the `parse_filter_config` call
+/// lives there instead, so we fall back to scanning other methods
+/// in the same impl block.
 fn extract_config_type_name(imp: &syn::ItemImpl) -> Option<String> {
-    let method = imp.items.iter().find_map(|item| {
-        if let syn::ImplItem::Fn(m) = item
-            && m.sig.ident == "from_config"
-        {
-            return Some(m);
-        }
-        None
-    })?;
+    let methods: Vec<&syn::ImplItemFn> = imp
+        .items
+        .iter()
+        .filter_map(|item| if let syn::ImplItem::Fn(m) = item { Some(m) } else { None })
+        .collect();
 
+    let from_config = methods.iter().find(|m| m.sig.ident == "from_config")?;
+
+    if let Some(name) = scan_method_for_config_type(from_config) {
+        return Some(name);
+    }
+
+    for method in &methods {
+        if method.sig.ident == "from_config" {
+            continue;
+        }
+        if let Some(name) = scan_method_for_config_type(method) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Scan a method body for `let cfg: T = parse_filter_config(...)` and return `T`.
+fn scan_method_for_config_type(method: &syn::ImplItemFn) -> Option<String> {
     for stmt in &method.block.stmts {
         if let syn::Stmt::Local(local) = stmt {
             let Some(init) = local.init.as_ref() else {
@@ -2357,6 +2378,36 @@ mod tests {
                 extract_config_type_name(imp),
                 Some("MyFilterConfig".to_owned()),
                 "should extract config type name"
+            );
+        } else {
+            panic!("expected impl");
+        }
+    }
+
+    #[test]
+    fn extract_config_type_from_delegated_build() {
+        let source = r#"
+            impl MyFilter {
+                fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+                    let client = SubRequestClient::new();
+                    Self::build(config, client)
+                }
+
+                fn build(
+                    config: &serde_yaml::Value,
+                    client: SubRequestClient,
+                ) -> Result<Box<dyn HttpFilter>, FilterError> {
+                    let cfg: MyFilterConfig = parse_filter_config("my_filter", config)?;
+                    Ok(Box::new(Self { timeout: cfg.timeout }))
+                }
+            }
+        "#;
+        let file: syn::File = syn::parse_str(source).unwrap();
+        if let syn::Item::Impl(imp) = &file.items[0] {
+            assert_eq!(
+                extract_config_type_name(imp),
+                Some("MyFilterConfig".to_owned()),
+                "should find config type in delegated build method"
             );
         } else {
             panic!("expected impl");

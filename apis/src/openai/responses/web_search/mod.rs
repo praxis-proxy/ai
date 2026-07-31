@@ -84,16 +84,52 @@ pub struct WebSearchFilter {
 impl WebSearchFilter {
     /// Create a filter from parsed YAML config.
     ///
+    /// Uses an isolated [`SubRequestClient`] with a default pool
+    /// size of 4. Prefer [`from_config_with_client`] when a shared
+    /// client is available.
+    ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid or the
     /// search client cannot be constructed.
     ///
     /// [`FilterError`]: praxis_filter::FilterError
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client =
+            crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        Self::build(config, client)
+    }
+
+    /// Create a filter using the shared [`SubRequestClient`].
+    ///
+    /// The shared client inherits the server-level pool size and
+    /// connection limits from the runtime configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid or the
+    /// search client cannot be constructed.
+    ///
+    /// [`FilterError`]: praxis_filter::FilterError
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    pub fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: crate::subrequest::SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::build(config, client)
+    }
+
+    /// Shared constructor body for [`from_config`](Self::from_config) and
+    /// [`from_config_with_client`](Self::from_config_with_client).
+    fn build(
+        config: &serde_yaml::Value,
+        subrequest_client: crate::subrequest::SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: WebSearchFilterConfig = parse_filter_config("openai_web_search", config)?;
         let validated = build_config(&cfg)?;
-        let search_client = SearchClient::from_config(&validated)?;
+        let search_client = SearchClient::from_config(&validated, subrequest_client)?;
         Ok(Box::new(Self {
             search_client,
             default_context_size: validated.default_context_size,

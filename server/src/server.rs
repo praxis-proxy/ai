@@ -59,7 +59,9 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 #[expect(clippy::allow_attributes, reason = "lint is platform/config-dependent")]
 #[allow(clippy::needless_pass_by_value, reason = "server owns config")]
 pub fn run_server(config: Config, config_path: Option<PathBuf>) -> ! {
-    run_server_with_registry(config, crate::build_full_registry(), config_path)
+    let subrequest_client = create_subrequest_client(&config);
+    let registry = crate::build_full_registry(&subrequest_client);
+    boot_server(config, registry, subrequest_client, config_path)
 }
 
 /// Build filter pipelines from the given registry, register protocols and run the server.
@@ -74,13 +76,27 @@ pub fn run_server(config: Config, config_path: Option<PathBuf>) -> ! {
 #[expect(clippy::allow_attributes, reason = "lint is platform/config-dependent")]
 #[allow(clippy::needless_pass_by_value, reason = "server owns config")]
 pub fn run_server_with_registry(config: Config, registry: FilterRegistry, config_path: Option<PathBuf>) -> ! {
+    let subrequest_client = create_subrequest_client(&config);
+    boot_server(config, registry, subrequest_client, config_path)
+}
+
+/// Common server startup: enforce checks, build pipelines, register
+/// protocols, spawn the config watcher, and run.
+#[expect(clippy::allow_attributes, reason = "lint is platform/config-dependent")]
+#[allow(clippy::needless_pass_by_value, reason = "server owns config")]
+fn boot_server(
+    config: Config,
+    registry: FilterRegistry,
+    subrequest_client: praxis_core::subrequest::SubRequestClient,
+    config_path: Option<PathBuf>,
+) -> ! {
     enforce_root_check(&config);
     warn_insecure_options(&config);
     init_runtime_limits(&config.runtime);
     warn_insecure_key_permissions(&config);
 
     let health_registry = build_health_registry(&config.clusters);
-    let state = build_server_state(&config, &registry, &health_registry);
+    let state = build_server_state(&config, &registry, &health_registry, subrequest_client);
 
     info!("initializing server");
     let mut server = PingoraServerRuntime::new(&config);
@@ -110,11 +126,13 @@ struct ServerState {
     health_shutdown: Arc<Mutex<CancellationToken>>,
 }
 
-/// Build filter pipelines, health checks, and registries.
-fn build_server_state(config: &Config, registry: &FilterRegistry, health_registry: &HealthRegistry) -> ServerState {
-    info!("building filter pipelines");
-    let kv_stores = praxis_core::kv::KvStoreRegistry::new();
-
+/// Create a [`SubRequestClient`] from the runtime configuration.
+///
+/// Called early in startup so the shared client can be captured by
+/// filter factories during registry construction.
+///
+/// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+fn create_subrequest_client(config: &Config) -> praxis_core::subrequest::SubRequestClient {
     let pool_size = config
         .runtime
         .subrequest_pool_size
@@ -122,10 +140,21 @@ fn build_server_state(config: &Config, registry: &FilterRegistry, health_registr
     let subrequest_connector =
         praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections);
     let subrequest_response_ceiling = config.body_limits.max_response_bytes.unwrap_or(usize::MAX);
-    let subrequest_client = praxis_core::subrequest::SubRequestClient::with_max_response_bytes(
+    praxis_core::subrequest::SubRequestClient::with_max_response_bytes(
         subrequest_connector,
         subrequest_response_ceiling,
-    );
+    )
+}
+
+/// Build filter pipelines, health checks, and registries.
+fn build_server_state(
+    config: &Config,
+    registry: &FilterRegistry,
+    health_registry: &HealthRegistry,
+    subrequest_client: praxis_core::subrequest::SubRequestClient,
+) -> ServerState {
+    info!("building filter pipelines");
+    let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
     let pipelines = resolve_pipelines(config, registry, health_registry, &kv_stores, &subrequest_client)
         .unwrap_or_else(|e| fatal(&e));
