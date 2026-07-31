@@ -429,6 +429,14 @@ fn write_description_list(out: &mut String, filters: &[FilterMeta]) {
 /// Write the pipeline hooks table.
 fn write_pipeline_table(out: &mut String, filters: &[FilterMeta]) {
     writeln!(out).unwrap();
+    writeln!(out, "## Pipeline Hooks").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Body-phase columns show `Access / Mode` when the hook is implemented."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
     writeln!(
         out,
         "| Filter | `on_request` | `on_request_body` | `on_response` | `on_response_body` |"
@@ -441,17 +449,22 @@ fn write_pipeline_table(out: &mut String, filters: &[FilterMeta]) {
     .unwrap();
 
     for f in filters {
-        let on_req = format_header_hook(f.hooks.on_request);
-        let on_req_body = format_body_hook(f.hooks.on_request_body, &f.request_body_access, &f.request_body_mode);
-        let on_resp = format_header_hook(f.hooks.on_response);
-        let on_resp_body = format_body_hook(f.hooks.on_response_body, &f.response_body_access, &f.response_body_mode);
-        writeln!(
-            out,
-            "| `{name}` | {on_req} | {on_req_body} | {on_resp} | {on_resp_body} |",
-            name = f.name
-        )
-        .unwrap();
+        write_pipeline_row(out, f);
     }
+}
+
+/// Write one pipeline table row.
+fn write_pipeline_row(out: &mut String, f: &FilterMeta) {
+    let on_req = format_header_hook(f.hooks.on_request);
+    let on_req_body = format_body_hook(f.hooks.on_request_body, &f.request_body_access, &f.request_body_mode);
+    let on_resp = format_header_hook(f.hooks.on_response);
+    let on_resp_body = format_body_hook(f.hooks.on_response_body, &f.response_body_access, &f.response_body_mode);
+    writeln!(
+        out,
+        "| `{name}` | {on_req} | {on_req_body} | {on_resp} | {on_resp_body} |",
+        name = f.name
+    )
+    .unwrap();
 }
 
 /// Format a header-phase hook cell (`on_request` / `on_response`).

@@ -19,6 +19,10 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_tool_parse`** — Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body.
 - **`openai_web_search`** — Web search filter for model-driven `web_search_call` dispatch.
 
+## Pipeline Hooks
+
+Body-phase columns show `Access / Mode` when the hook is implemented.
+
 | Filter | `on_request` | `on_request_body` | `on_response` | `on_response_body` |
 |--------|:------------:|:-----------------:|:--------------:|:------------------:|
 | `openai_doc_extract` | — | ReadWrite / StreamBuffer | — | — |
