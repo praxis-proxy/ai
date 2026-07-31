@@ -1431,7 +1431,7 @@ async fn sqlite_rejects_table_with_missing_columns() {
         .expect("manual create should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "bad_responses", "ok_conversations", None).await;
+    let result = SqliteResponseStore::new(&url, "bad_responses", "ok_conversations", None, None).await;
     let Err(err) = result else {
         panic!("init should fail on schema mismatch");
     };
@@ -1469,7 +1469,7 @@ async fn sqlite_rejects_items_table_with_missing_columns() {
     .expect("manual create should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "ok_responses", "ok_conversations", Some("bad_items")).await;
+    let result = SqliteResponseStore::new(&url, "ok_responses", "ok_conversations", Some("bad_items"), None).await;
     let Err(err) = result else {
         panic!("init should fail on items schema mismatch");
     };
@@ -1493,7 +1493,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
     let db_path = dir.path().join("version.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let _store = SqliteResponseStore::new(&url, "vr", "vc", None)
+    let _store = SqliteResponseStore::new(&url, "vr", "vc", None, None)
         .await
         .expect("store creation should succeed");
 
@@ -1533,7 +1533,7 @@ async fn sqlite_rejects_schema_version_mismatch() {
         .expect("insert should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "vr", "vc", None).await;
+    let result = SqliteResponseStore::new(&url, "vr", "vc", None, None).await;
     let Err(err) = result else {
         panic!("init should fail on version mismatch");
     };
@@ -1556,11 +1556,11 @@ async fn sqlite_accepts_matching_schema_version() {
     let db_path = dir.path().join("good_version.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let _store = SqliteResponseStore::new(&url, "vr", "vc", None)
+    let _store = SqliteResponseStore::new(&url, "vr", "vc", None, None)
         .await
         .expect("first init should succeed");
 
-    let _store2 = SqliteResponseStore::new(&url, "vr", "vc", None)
+    let _store2 = SqliteResponseStore::new(&url, "vr", "vc", None, None)
         .await
         .expect("second init with matching version should succeed");
 }
@@ -1827,6 +1827,7 @@ async fn pg_rejects_table_with_missing_columns() {
         None,
         Some(SslMode::Disable),
         None,
+        None,
     ))
     .await;
     let Err(err) = result else {
@@ -1886,6 +1887,7 @@ async fn pg_rejects_schema_version_mismatch() {
         &conv_table,
         None,
         Some(SslMode::Disable),
+        None,
         None,
     ))
     .await;
