@@ -399,6 +399,9 @@ mod tests {
         let null = serde_json::from_value::<UpdateConversationRequest>(json!({"metadata": null}));
         assert!(null.is_err(), "metadata must be an object on update");
 
+        let array = serde_json::from_value::<UpdateConversationRequest>(json!({"metadata": ["a", "b"]}));
+        assert!(array.is_err(), "metadata must reject arrays");
+
         let replacement: UpdateConversationRequest =
             serde_json::from_value(json!({"metadata": {"project": "praxis"}})).unwrap();
         assert_eq!(replacement.metadata.as_value(), &json!({"project": "praxis"}));

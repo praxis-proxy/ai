@@ -1226,7 +1226,10 @@ async fn update_conversation_body_requires_metadata() {
         panic!("expected Reject, got {action:?}");
     };
     assert_eq!(rejection.status, 400);
-    assert_eq!(rejection_body(&rejection)["error"]["type"], "invalid_request_error");
+    let error = &rejection_body(&rejection)["error"];
+    assert_eq!(error["type"], "invalid_request_error");
+    assert_eq!(error["code"], "missing_required_parameter");
+    assert_eq!(error["param"], "metadata");
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}"));
     let mut ctx = make_filter_context(&req);
@@ -2739,6 +2742,10 @@ async fn update_conversation_with_invalid_metadata_returns_400() {
         panic!("expected Reject, got {action:?}");
     };
     assert_eq!(rejection.status, 400, "invalid metadata should return 400");
+    let error = &rejection_body(&rejection)["error"];
+    assert_eq!(error["type"], "invalid_request_error");
+    assert_eq!(error["code"], "invalid_type");
+    assert_eq!(error["param"], "metadata");
 }
 
 #[tokio::test]
@@ -2758,7 +2765,10 @@ async fn update_conversation_with_null_metadata_returns_400() {
         panic!("expected Reject, got {action:?}");
     };
     assert_eq!(rejection.status, 400);
-    assert_eq!(rejection_body(&rejection)["error"]["type"], "invalid_request_error");
+    let error = &rejection_body(&rejection)["error"];
+    assert_eq!(error["type"], "invalid_request_error");
+    assert_eq!(error["code"], "invalid_type");
+    assert_eq!(error["param"], "metadata");
 }
 
 #[tokio::test]

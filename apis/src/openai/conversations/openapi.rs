@@ -161,15 +161,37 @@ mod tests {
             document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/1/type"),
             Some(&Value::String("null".to_owned()))
         );
-        assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/metadata/anyOf/1/type"),
-            Some(&Value::String("null".to_owned()))
-        );
         assert!(
             document
                 .pointer("/paths/~1conversations/post/requestBody/required")
                 .is_none_or(|required| required == &Value::Bool(false)),
             "create request body should be optional"
+        );
+    }
+
+    #[test]
+    fn generated_create_metadata_has_two_layer_nullable_anyof() {
+        let document = serde_json::to_value(implementation_openapi()).unwrap();
+        let base = "/components/schemas/CreateConversationRequest/properties/metadata";
+
+        assert_eq!(
+            document.pointer(&format!("{base}/anyOf/1/type")),
+            Some(&Value::String("null".to_owned()))
+        );
+        assert_eq!(
+            document.pointer(&format!("{base}/anyOf/0/anyOf/0/type")),
+            Some(&Value::String("object".to_owned())),
+            "inner anyOf should contain the string-map object type"
+        );
+        assert_eq!(
+            document.pointer(&format!("{base}/anyOf/0/anyOf/0/additionalProperties/type")),
+            Some(&Value::String("string".to_owned())),
+            "metadata values should be strings"
+        );
+        assert_eq!(
+            document.pointer(&format!("{base}/anyOf/0/anyOf/1/type")),
+            Some(&Value::String("null".to_owned())),
+            "inner anyOf should include null"
         );
     }
 
