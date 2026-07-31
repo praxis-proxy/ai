@@ -1586,6 +1586,295 @@ async fn fail_open_isolates_a_malformed_pending_call() {
 }
 
 // -----------------------------------------------------------------------------
+// function_call → file_search_call translation
+// -----------------------------------------------------------------------------
+
+#[test]
+fn extract_file_search_queries_handles_all_conventions() {
+    assert_eq!(
+        extract_file_search_queries(r#"{"query": "revenue"}"#),
+        vec!["revenue"],
+        "single query field should be extracted"
+    );
+    assert_eq!(
+        extract_file_search_queries(r#"{"queries": ["a", "b"]}"#),
+        vec!["a", "b"],
+        "queries array should be extracted"
+    );
+    assert_eq!(
+        extract_file_search_queries(r#"{"query": "", "queries": ["fallback"]}"#),
+        vec!["fallback"],
+        "empty query should fall through to queries array"
+    );
+    assert_eq!(
+        extract_file_search_queries("not json"),
+        vec!["not json"],
+        "malformed JSON should use raw string as single query"
+    );
+    assert!(
+        extract_file_search_queries("").is_empty(),
+        "empty string should produce no queries"
+    );
+    assert_eq!(
+        extract_file_search_queries(r#"{"other": "field"}"#),
+        vec![r#"{"other": "field"}"#],
+        "valid JSON without query fields should use raw string"
+    );
+}
+
+#[test]
+fn translate_single_query() {
+    let mut response = json!({
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "file_search",
+            "arguments": "{\"query\": \"revenue growth\"}",
+            "status": "completed"
+        }]
+    });
+
+    let count = translate_function_calls_to_file_search(&mut response);
+
+    assert_eq!(count, 1, "one item should be translated");
+    let item = &response["output"][0];
+    assert_eq!(item["type"], "file_search_call", "type should be rewritten");
+    assert_eq!(item["status"], "searching", "status should be set to searching");
+    assert_eq!(item["queries"], json!(["revenue growth"]), "query should be extracted");
+    assert_eq!(item["id"], "fc_1", "id should be preserved");
+    assert!(item.get("name").is_none(), "name should be removed");
+    assert!(item.get("arguments").is_none(), "arguments should be removed");
+    assert!(item.get("call_id").is_none(), "call_id should be removed");
+}
+
+#[test]
+fn translate_queries_array() {
+    let mut response = json!({
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "file_search",
+            "arguments": "{\"queries\": [\"revenue\", \"profit\"]}",
+            "status": "completed"
+        }]
+    });
+
+    translate_function_calls_to_file_search(&mut response);
+
+    assert_eq!(
+        response["output"][0]["queries"],
+        json!(["revenue", "profit"]),
+        "queries array should be extracted from arguments"
+    );
+}
+
+#[test]
+fn translate_malformed_arguments() {
+    let mut response = json!({
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "file_search",
+            "arguments": "not valid json",
+            "status": "completed"
+        }]
+    });
+
+    translate_function_calls_to_file_search(&mut response);
+
+    assert_eq!(
+        response["output"][0]["queries"],
+        json!(["not valid json"]),
+        "malformed arguments should fall back to raw string"
+    );
+}
+
+#[test]
+fn translate_skips_non_file_search() {
+    let mut response = json!({
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Paris\"}",
+            "status": "completed"
+        }]
+    });
+
+    let count = translate_function_calls_to_file_search(&mut response);
+
+    assert_eq!(count, 0, "non-file_search function_calls should not be translated");
+    assert_eq!(
+        response["output"][0]["type"], "function_call",
+        "type should remain function_call"
+    );
+}
+
+#[test]
+fn translate_skips_without_tool_declaration() {
+    let state = ResponsesState {
+        response_object: json!({"output": []}),
+        tools: vec![json!({"type": "function", "name": "get_weather"})],
+        ..Default::default()
+    };
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut response_header);
+    let mut body = Some(Bytes::from(
+        json!({
+            "id": "resp-no-tool",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "file_search",
+                "arguments": "{\"query\": \"revenue\"}",
+                "status": "completed"
+            }]
+        })
+        .to_string(),
+    ));
+
+    let _action = FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.output_items()[0]["type"],
+        "function_call",
+        "should not translate without file_search tool in request"
+    );
+}
+
+#[test]
+fn translate_triggers_pending_flag() {
+    let state = state_with(&["vs-a"], vec![]);
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut response_header);
+    let mut body = Some(Bytes::from(
+        json!({
+            "id": "resp-vllm-1",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "file_search",
+                "arguments": "{\"query\": \"revenue growth\"}",
+                "status": "completed"
+            }]
+        })
+        .to_string(),
+    ));
+
+    let action = FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "translated file_search_call should trigger pending continuation"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_file_search_callout"].get("pending"),
+        Some("true"),
+        "pending flag should be set after translation"
+    );
+}
+
+#[test]
+fn translate_mixed_triggers_rejection() {
+    let state = state_with(&["vs-a"], vec![]);
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut response_header);
+    let mut body = Some(Bytes::from(
+        json!({
+            "id": "resp-vllm-mixed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "file_search",
+                    "arguments": "{\"query\": \"revenue\"}",
+                    "status": "completed"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": "call_2",
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"Paris\"}",
+                    "status": "completed"
+                }
+            ]
+        })
+        .to_string(),
+    ));
+
+    let action = FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "translated file_search_call + client function_call should trigger mixed-tool rejection"
+    );
+}
+
+#[tokio::test]
+async fn translate_end_to_end_executes_search() {
+    let server = MockServer::json(200, &one_result("file-a", "report.pdf", 0.95, "Revenue grew 37%."));
+    let filter = make_filter(server.port, "");
+
+    let mut state = state_with(&["vs-a"], vec![]);
+    state.include.push("file_search_call.results".to_owned());
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut response_header);
+    let mut body = Some(Bytes::from(
+        json!({
+            "id": "resp-vllm-e2e",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "file_search",
+                "arguments": "{\"query\": \"revenue growth\"}",
+                "status": "completed"
+            }]
+        })
+        .to_string(),
+    ));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "capture_response should continue with pending translation"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_file_search_callout"].get("pending"),
+        Some("true"),
+        "pending flag should be set"
+    );
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "execute_pending should complete search"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let item = &state.output_items()[0];
+    assert_eq!(item["type"], "file_search_call", "type should be file_search_call");
+    assert_eq!(
+        item["status"], "completed",
+        "status should be completed after execution"
+    );
+    assert_eq!(server.requests().len(), 1, "search callout should have fired");
+}
+
+// -----------------------------------------------------------------------------
 // Test helpers
 // -----------------------------------------------------------------------------
 

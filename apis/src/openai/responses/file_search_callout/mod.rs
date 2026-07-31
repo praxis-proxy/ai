@@ -28,7 +28,7 @@ use praxis_filter::{
 };
 use serde::{Deserialize, de::SeqAccess};
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use self::{
     citations::annotate_response,
@@ -330,6 +330,21 @@ impl FileSearchCalloutFilter {
         };
         if !response.is_object() {
             return Ok(invalid_success_response_action(continued));
+        }
+        let has_file_search_tool = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+            state
+                .tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("file_search"))
+        });
+        if has_file_search_tool {
+            let translated = translate_function_calls_to_file_search(&mut response);
+            if translated > 0 {
+                debug!(
+                    count = translated,
+                    "translated function_call(name=file_search) to file_search_call"
+                );
+            }
         }
         let Some(output) = response.get("output").and_then(Value::as_array) else {
             return Ok(invalid_success_response_action(continued));
@@ -1263,6 +1278,84 @@ fn is_pending_file_search_call(item: &Value) -> bool {
             item.get("status").and_then(Value::as_str),
             Some("searching" | "in_progress")
         )
+}
+
+/// Whether an output item is a vLLM-emitted `function_call` for file search.
+fn is_file_search_function_call(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("function_call")
+        && item.get("name").and_then(Value::as_str) == Some("file_search")
+}
+
+/// Parse file-search queries from a `function_call` arguments string.
+///
+/// Handles three conventions:
+/// 1. `{"query": "..."}` — single query string (most common from vLLM)
+/// 2. `{"queries": ["...", "..."]}` — explicit query array
+/// 3. Raw string fallback — entire arguments string used as one query
+fn extract_file_search_queries(arguments: &str) -> Vec<String> {
+    if let Ok(parsed) = serde_json::from_str::<Value>(arguments) {
+        if let Some(query) = parsed.get("query").and_then(Value::as_str)
+            && !query.is_empty()
+        {
+            return vec![query.to_owned()];
+        }
+        if let Some(queries) = parsed.get("queries").and_then(Value::as_array) {
+            let result: Vec<String> = queries
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !result.is_empty() {
+                return result;
+            }
+        }
+    }
+    if arguments.is_empty() {
+        Vec::new()
+    } else {
+        vec![arguments.to_owned()]
+    }
+}
+
+/// Translate vLLM `function_call` items with `name == "file_search"` into
+/// `file_search_call` items so the pending-call scan recognizes them.
+///
+/// Returns the number of translated items.
+fn translate_function_calls_to_file_search(response: &mut Value) -> usize {
+    let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let mut translated = 0;
+    for item in output.iter_mut() {
+        if !is_file_search_function_call(item) {
+            continue;
+        }
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+
+        let queries = object
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map(extract_file_search_queries)
+            .unwrap_or_default();
+
+        object.insert("type".to_owned(), Value::String("file_search_call".to_owned()));
+        object.insert("status".to_owned(), Value::String("searching".to_owned()));
+        object.insert(
+            "queries".to_owned(),
+            Value::Array(queries.into_iter().map(Value::String).collect()),
+        );
+
+        object.remove("name");
+        object.remove("arguments");
+        object.remove("call_id");
+
+        translated += 1;
+    }
+    translated
 }
 
 /// Mark pending calls that could not be scheduled as incomplete.
