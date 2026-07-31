@@ -32,16 +32,20 @@ pub(crate) fn load_and_validate_for_cli(
 /// Validate a parsed configuration by building filter pipelines.
 pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     praxis_core::logging::validate_log_overrides(config)?;
-    let registry = praxis_ai::build_full_registry();
-    let health_registry = praxis_core::health::build_health_registry(&config.clusters);
-    let kv_stores = praxis_core::kv::KvStoreRegistry::new();
     let pool_size = config
         .runtime
         .subrequest_pool_size
         .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
-    let subrequest_client = praxis_core::subrequest::SubRequestClient::new(
-        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections),
+    let subrequest_connector =
+        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections);
+    let subrequest_response_ceiling = config.body_limits.max_response_bytes.unwrap_or(usize::MAX);
+    let subrequest_client = praxis_core::subrequest::SubRequestClient::with_max_response_bytes(
+        subrequest_connector,
+        subrequest_response_ceiling,
     );
+    let registry = praxis_ai::build_full_registry(&subrequest_client);
+    let health_registry = praxis_core::health::build_health_registry(&config.clusters);
+    let kv_stores = praxis_core::kv::KvStoreRegistry::new();
     praxis_ai::resolve_pipelines(config, &registry, &health_registry, &kv_stores, &subrequest_client)?;
     Ok(())
 }

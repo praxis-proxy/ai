@@ -3,6 +3,7 @@
 
 //! Public AI filter registration for consumers outside `praxis-ai-proxy`.
 
+use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
@@ -11,6 +12,10 @@ use crate::{
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
+///
+/// When `subrequest_client` is provided, filters that make HTTP
+/// callouts (`openai_file_resolve`, `openai_web_search`) capture the
+/// shared client instead of creating isolated per-filter connectors.
 ///
 /// Does not call [`FilterRegistry::with_builtins`].
 /// Does not register auto-discovered external filters.
@@ -22,25 +27,29 @@ use crate::{
 ///     Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()),
 /// );
 /// ```
-pub fn register_ai_filters(registry: &mut FilterRegistry) {
+pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     register_agentic_filters(registry);
     register_general_ai_filters(registry);
     register_anthropic_filters(registry);
-    register_openai_filters(registry);
+    register_openai_filters(registry, subrequest_client);
 }
 
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.
 ///
 /// Equivalent to [`FilterRegistry::with_builtins`] followed by
-/// [`register_ai_filters`]. Does not register auto-discovered external
-/// filters.
+/// [`register_ai_filters`] with no shared sub-request client. Does
+/// not register auto-discovered external filters.
+///
+/// Filters that make HTTP callouts create isolated per-filter
+/// connectors. Use [`register_ai_filters`] with a shared client
+/// when the server runtime is available.
 ///
 /// Pipelines that use OpenAI store or rehydrate filters must also install
 /// [`praxis_ai_apis::store::ResponseStoreRegistry`] as a pipeline extension.
 #[must_use]
 pub fn build_ai_registry() -> FilterRegistry {
     let mut registry = FilterRegistry::with_builtins();
-    register_ai_filters(&mut registry);
+    register_ai_filters(&mut registry, None);
     registry
 }
 
@@ -109,8 +118,8 @@ fn register_anthropic_filters(registry: &mut FilterRegistry) {
 }
 
 /// Register OpenAI Responses API request-path filters.
-fn register_openai_filters(registry: &mut FilterRegistry) {
-    register_openai_responses_filters(registry);
+fn register_openai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    register_openai_responses_filters(registry, subrequest_client);
     praxis_filter::register_filters!(
         @register registry,
         http "openai_conversations" => praxis_ai_apis::openai::OpenaiConversationsFilter::from_config
@@ -118,15 +127,12 @@ fn register_openai_filters(registry: &mut FilterRegistry) {
 }
 
 /// Register OpenAI Responses API filters.
-fn register_openai_responses_filters(registry: &mut FilterRegistry) {
+fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
         @register registry,
         http "openai_doc_extract" => praxis_ai_apis::openai::DocExtractFilter::from_config
     );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "openai_file_resolve" => praxis_ai_apis::openai::FileResolveFilter::from_config
-    );
+    register_file_resolve(registry, subrequest_client);
     praxis_filter::register_filters!(
         @register registry,
         http "openai_responses_format" => praxis_ai_apis::openai::ResponsesFormatFilter::from_config
@@ -143,11 +149,11 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "openai_responses_rehydrate" => praxis_ai_apis::openai::RehydrateFilter::from_config
     );
-    register_openai_response_filters(registry);
+    register_openai_response_filters(registry, subrequest_client);
 }
 
 /// Register OpenAI Responses API response-path and persistence filters.
-fn register_openai_response_filters(registry: &mut FilterRegistry) {
+fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
         @register registry,
         http "openai_response_store" => praxis_ai_apis::openai::ResponseStoreFilter::from_config
@@ -168,10 +174,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "openai_tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
     );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "openai_web_search" => praxis_ai_apis::openai::WebSearchFilter::from_config
-    );
+    register_web_search(registry, subrequest_client);
     register_openai_agentic_filters(registry);
 }
 
@@ -185,6 +188,54 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config
     );
+}
+
+// -----------------------------------------------------------------------------
+// Sub-request-aware registration
+// -----------------------------------------------------------------------------
+
+/// Register `openai_file_resolve` with the shared client when
+/// available, otherwise fall back to an isolated per-filter connector.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_file_resolve(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "openai_file_resolve",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    praxis_ai_apis::openai::FileResolveFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_resolve'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "openai_file_resolve" => praxis_ai_apis::openai::FileResolveFilter::from_config
+        );
+    }
+}
+
+/// Register `openai_web_search` with the shared client when
+/// available, otherwise fall back to an isolated per-filter connector.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "openai_web_search",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    praxis_ai_apis::openai::WebSearchFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_web_search'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "openai_web_search" => praxis_ai_apis::openai::WebSearchFilter::from_config
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------

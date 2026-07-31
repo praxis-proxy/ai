@@ -48,11 +48,18 @@ include!(concat!(env!("OUT_DIR"), "/external_filters.rs"));
 /// Build a [`FilterRegistry`] with core builtins, AI filters, and
 /// auto-discovered external filters.
 ///
+/// The shared [`SubRequestClient`] is captured by filters that make
+/// HTTP callouts so they share the server-level connection pool
+/// instead of creating isolated per-filter connectors.
+///
 /// [`FilterRegistry`]: praxis_filter::FilterRegistry
+/// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 #[must_use]
-pub fn build_full_registry() -> praxis_filter::FilterRegistry {
+pub fn build_full_registry(
+    subrequest_client: &praxis_core::subrequest::SubRequestClient,
+) -> praxis_filter::FilterRegistry {
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
-    praxis_ai_filters::register_ai_filters(&mut registry);
+    praxis_ai_filters::register_ai_filters(&mut registry, Some(subrequest_client));
     register_external_filters(&mut registry);
     registry
 }

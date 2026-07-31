@@ -102,11 +102,14 @@ impl SearchClient {
     ///
     /// Returns [`FilterError`] if the API key header value is
     /// not valid ASCII.
-    pub(crate) fn from_config(config: &ValidatedConfig) -> Result<Self, FilterError> {
+    pub(crate) fn from_config(
+        config: &ValidatedConfig,
+        subrequest_client: SubRequestClient,
+    ) -> Result<Self, FilterError> {
         http::HeaderValue::from_str(config.api_key.expose_secret())
             .map_err(|e| FilterError::from(format!("invalid API key header value: {e}")))?;
         Ok(Self {
-            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+            client: subrequest_client,
             timeout: Duration::from_millis(config.timeout_ms),
             provider: config.provider,
             api_key: config.api_key.clone(),
@@ -391,6 +394,10 @@ mod tests {
 
     use super::*;
 
+    fn test_subrequest_client() -> SubRequestClient {
+        SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None))
+    }
+
     #[test]
     fn parse_brave_results_normal() {
         let json = json!({
@@ -485,7 +492,7 @@ mod tests {
             failure_mode: FailureMode::Closed,
             status_on_error: 502,
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
 
         let (url, request) = client.build_you_request("Praxis proxy", 5);
 
@@ -539,7 +546,7 @@ mod tests {
             failure_mode: FailureMode::Closed,
             status_on_error: 502,
         };
-        let client = SearchClient::from_config(&config);
+        let client = SearchClient::from_config(&config, test_subrequest_client());
         assert!(client.is_ok());
     }
 
@@ -554,7 +561,7 @@ mod tests {
             failure_mode: FailureMode::Closed,
             status_on_error: 502,
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
         assert!(
             matches!(outcome, SearchOutcome::Rejected { status: 502 }),
@@ -573,7 +580,7 @@ mod tests {
             failure_mode: FailureMode::Open,
             status_on_error: 502,
         };
-        let client = SearchClient::from_config(&config).unwrap();
+        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
         assert!(
             matches!(outcome, SearchOutcome::Skipped),
@@ -591,7 +598,7 @@ mod tests {
             failure_mode,
             status_on_error: 502,
         };
-        SearchClient::from_config(&config).unwrap()
+        SearchClient::from_config(&config, test_subrequest_client()).unwrap()
     }
 
     fn spawn_http_server(listener: TcpListener, status: u16, body: &str) {

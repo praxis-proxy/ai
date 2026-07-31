@@ -16,6 +16,15 @@ use praxis_protocol::http::load_http_handler;
 use tokio::sync::Notify;
 
 // -----------------------------------------------------------------------------
+// Shared Test Client
+// -----------------------------------------------------------------------------
+
+/// Default sub-request client for integration tests.
+fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+    praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
+}
+
+// -----------------------------------------------------------------------------
 // Pipeline Building
 // -----------------------------------------------------------------------------
 
@@ -67,7 +76,7 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
 ///
 /// [`build_with_chains`]: FilterPipeline::build_with_chains
 pub fn build_pipeline(config: &Config) -> FilterPipeline {
-    let registry = praxis_ai::build_full_registry();
+    let registry = praxis_ai::build_full_registry(&test_subrequest_client());
     let listener = config
         .listeners
         .first()
@@ -214,7 +223,7 @@ fn spawn_proxy_server(config: &Config, registry: &FilterRegistry) -> ProxyGuard 
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_proxy(config: &Config) -> ProxyGuard {
-    start_proxy_with_registry(config, &praxis_ai::build_full_registry())
+    start_proxy_with_registry(config, &praxis_ai::build_full_registry(&test_subrequest_client()))
 }
 
 /// Start the proxy with a custom filter registry.
@@ -341,7 +350,7 @@ pub fn start_reloadable_proxy(yaml: &str) -> ReloadableProxyGuard {
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_tls_proxy(config: &Config, client_config: &Arc<rustls::ClientConfig>) -> ProxyGuard {
-    let guard = spawn_proxy_server(config, &praxis_ai::build_full_registry());
+    let guard = spawn_proxy_server(config, &praxis_ai::build_full_registry(&test_subrequest_client()));
     crate::net::tls::wait_for_https(&guard.addr, client_config);
     guard
 }
@@ -356,7 +365,7 @@ pub fn start_tls_proxy(config: &Config, client_config: &Arc<rustls::ClientConfig
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_tls_proxy_no_wait(config: &Config) -> ProxyGuard {
-    spawn_proxy_server(config, &praxis_ai::build_full_registry())
+    spawn_proxy_server(config, &praxis_ai::build_full_registry(&test_subrequest_client()))
 }
 
 // -----------------------------------------------------------------------------
@@ -426,7 +435,7 @@ filter_chains:
 ///
 /// [`FilterRegistry`]: praxis_filter::FilterRegistry
 pub fn registry_with(name: &str, make: fn() -> Box<dyn HttpFilter>) -> FilterRegistry {
-    let mut registry = praxis_ai::build_full_registry();
+    let mut registry = praxis_ai::build_full_registry(&test_subrequest_client());
     registry
         .register(name, FilterFactory::Http(Arc::new(move |_| Ok(make()))))
         .expect("duplicate filter name in test registry");
