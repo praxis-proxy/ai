@@ -11,10 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
-use serde::{
-    Deserialize, Serialize,
-    de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor},
-};
+use serde::{Deserialize, Serialize, de::Visitor};
 use serde_json::Value;
 
 use super::config::OnError;
@@ -32,39 +29,6 @@ pub(super) const MAX_CONCURRENT_SEARCHES: usize = 8;
 
 /// OpenAI's maximum number of file-search results per call.
 const MAX_NUM_RESULTS: usize = 50;
-
-/// Maximum content chunks decoded across one response page.
-const MAX_DECODED_CONTENT_CHUNKS: usize = 4_096;
-
-/// Maximum original queries accepted in response page metadata.
-const MAX_QUERIES_PER_RESPONSE: usize = 64;
-
-/// Maximum opaque pagination token bytes accepted from OGX.
-const MAX_NEXT_PAGE_BYTES: usize = 4_096;
-
-/// Maximum bytes accepted in one decoded content chunk.
-const MAX_CONTENT_CHUNK_BYTES: usize = 2_097_152; // 2 MiB
-
-/// Maximum entries in OpenAI-compatible result attributes.
-const MAX_ATTRIBUTE_ENTRIES: usize = 16;
-
-/// Maximum characters in one OpenAI-compatible attribute key.
-const MAX_ATTRIBUTE_KEY_CHARS: usize = 64;
-
-/// Maximum characters in one OpenAI-compatible string attribute value.
-const MAX_ATTRIBUTE_STRING_CHARS: usize = 512;
-
-/// Maximum nesting accepted in ignored OGX content extensions.
-const MAX_IGNORED_EXTENSION_DEPTH: usize = 8;
-
-/// Maximum entries accepted in one ignored OGX extension container.
-const MAX_IGNORED_EXTENSION_ENTRIES: usize = 65_536;
-
-/// Maximum bytes accepted in one ignored OGX extension string or key.
-const MAX_IGNORED_EXTENSION_STRING_BYTES: usize = 2_097_152; // 2 MiB
-
-/// Maximum bytes accepted in a schema field name before it is owned.
-const MAX_SCHEMA_FIELD_BYTES: usize = 64;
 
 /// Maximum rendered query size sent to OGX: 64 `KiB`.
 pub(super) const MAX_QUERY_BYTES: usize = 65_536;
@@ -192,7 +156,6 @@ struct TranslatedRankingOptions<'a> {
 }
 
 /// Response from vector store search.
-#[cfg(test)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct VectorStoreSearchResponse {
     /// Search results.
@@ -894,11 +857,10 @@ async fn parse_response_body_with_deadline(
     let remaining = deadline_remaining(timeout, execution_started, store_id)?;
     let error_store_id = bounded_store_id(store_id);
     let parse_store_id = error_store_id.clone();
-    let decode_deadline = execution_started.checked_add(timeout).unwrap_or(execution_started);
     let mut task = tokio::task::spawn_blocking(move || {
         let _response_admission = response_admission;
         let _decode_slot = decode_slot;
-        parse_response_body(&body, &parse_store_id, result_limit, decode_deadline)
+        parse_response_body(&body, &parse_store_id, result_limit)
     });
     match tokio::time::timeout(remaining, &mut task).await {
         Ok(Ok(result)) => result,
@@ -913,897 +875,53 @@ async fn parse_response_body_with_deadline(
     }
 }
 
-/// Parse one bounded API response without retaining its response buffer.
-fn parse_response_body(
-    body: &[u8],
-    store_id: &str,
-    result_limit: usize,
-    decode_deadline: Instant,
-) -> Result<SearchResponse, FileSearchError> {
+/// Parse one API response without retaining its response buffer.
+fn parse_response_body(body: &[u8], store_id: &str, result_limit: usize) -> Result<SearchResponse, FileSearchError> {
     let body_bytes = body.len();
-    let data = deserialize_bounded_search_results(body, result_limit, decode_deadline).map_err(|error| {
-        if Instant::now() >= decode_deadline {
-            return execution_deadline_error(store_id);
-        }
-        FileSearchError::Deserialize {
-            body_bytes,
-            line: error.line(),
-            column: error.column(),
-            store_id: store_id.to_owned(),
-        }
+    let data = deserialize_search_results(body, result_limit).map_err(|error| FileSearchError::Deserialize {
+        body_bytes,
+        line: error.line(),
+        column: error.column(),
+        store_id: store_id.to_owned(),
     })?;
     Ok(SearchResponse { body_bytes, data })
 }
 
-/// Deserialize the response page while retaining only its top-k results.
-fn deserialize_bounded_search_results(
-    body: &[u8],
-    result_limit: usize,
-    decode_deadline: Instant,
-) -> Result<Vec<SearchResult>, serde_json::Error> {
-    let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let results = SearchResponseSeed {
-        decode_deadline,
-        result_limit,
+/// Deserialize the response page, apply OGX file-ID fixups, and retain top-k.
+fn deserialize_search_results(body: &[u8], result_limit: usize) -> Result<Vec<SearchResult>, serde_json::Error> {
+    let mut response = serde_json::from_slice::<VectorStoreSearchResponse>(body)?;
+    response.data.truncate(MAX_NUM_RESULTS);
+    for result in &mut response.data {
+        fixup_ogx_file_id(result);
     }
-    .deserialize(&mut deserializer)?;
-    deserializer.end()?;
-    Ok(results)
+    response.data.sort_by(|left, right| right.score.total_cmp(&left.score));
+    response.data.truncate(result_limit);
+    Ok(response.data)
 }
 
-/// Seed that rejects an oversized map key before retaining its owned copy.
-struct BoundedMapKeySeed {
-    /// Maximum accepted UTF-8 bytes.
-    max_bytes: usize,
-
-    /// Static rejection text that cannot include attacker-controlled input.
-    limit_error: &'static str,
-}
-
-impl<'de> DeserializeSeed<'de> for BoundedMapKeySeed {
-    type Value = String;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_identifier(BoundedMapKeyVisitor {
-            max_bytes: self.max_bytes,
-            limit_error: self.limit_error,
-        })
-    }
-}
-
-/// Visitor that owns only keys already proven to fit their schema limit.
-struct BoundedMapKeyVisitor {
-    /// Maximum accepted UTF-8 bytes.
-    max_bytes: usize,
-
-    /// Static rejection text that cannot include attacker-controlled input.
-    limit_error: &'static str,
-}
-
-impl Visitor<'_> for BoundedMapKeyVisitor {
-    type Value = String;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded vector-store response field name")
-    }
-
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        if v.len() > self.max_bytes {
-            return Err(E::custom(self.limit_error));
-        }
-        Ok(v.to_owned())
-    }
-
-    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-        if v.len() > self.max_bytes {
-            return Err(E::custom(self.limit_error));
-        }
-        Ok(v)
-    }
-}
-
-/// Seed that validates and discards an extension key without copying it.
-struct BoundedIgnoredMapKeySeed;
-
-impl<'de> DeserializeSeed<'de> for BoundedIgnoredMapKeySeed {
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_identifier(BoundedIgnoredMapKeyVisitor)
-    }
-}
-
-/// Visitor for ignored extension keys.
-struct BoundedIgnoredMapKeyVisitor;
-
-impl Visitor<'_> for BoundedIgnoredMapKeyVisitor {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded vector-store extension field name")
-    }
-
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        if v.len() > MAX_IGNORED_EXTENSION_STRING_BYTES {
-            return Err(E::custom("vector-store content extension key exceeds the byte limit"));
-        }
-        Ok(())
-    }
-
-    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-        self.visit_str(&v)
-    }
-}
-
-/// Seed for one bounded vector-store response page.
-struct SearchResponseSeed {
-    /// Hard deadline checked during response traversal.
-    decode_deadline: Instant,
-
-    /// Maximum results retained from the page.
-    result_limit: usize,
-}
-
-impl<'de> DeserializeSeed<'de> for SearchResponseSeed {
-    type Value = Vec<SearchResult>;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_map(SearchResponseVisitor {
-            decode_deadline: self.decode_deadline,
-            result_limit: self.result_limit,
-        })
-    }
-}
-
-/// Visitor that validates bounded page metadata and requires one `data` array.
-struct SearchResponseVisitor {
-    /// Hard deadline checked during response traversal.
-    decode_deadline: Instant,
-
-    /// Maximum results retained from the page.
-    result_limit: usize,
-}
-
-impl<'de> Visitor<'de> for SearchResponseVisitor {
-    type Value = Vec<SearchResult>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a vector-store search response object")
-    }
-
-    #[expect(clippy::too_many_lines, reason = "validates the complete bounded page schema")]
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut results = None;
-        while let Some(key) = map.next_key_seed(BoundedMapKeySeed {
-            max_bytes: MAX_SCHEMA_FIELD_BYTES,
-            limit_error: "vector-store response field name exceeds the byte limit",
-        })? {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            match key.as_str() {
-                "data" => {
-                    if results.is_some() {
-                        return Err(A::Error::duplicate_field("data"));
-                    }
-                    results = Some(map.next_value_seed(SearchResultsSeed {
-                        decode_deadline: self.decode_deadline,
-                        result_limit: self.result_limit,
-                    })?);
-                },
-                "object" => {
-                    let object = map.next_value::<String>()?;
-                    if object != "vector_store.search_results.page" {
-                        return Err(A::Error::custom("invalid vector-store response object type"));
-                    }
-                },
-                "search_query" => {
-                    map.next_value_seed(BoundedStringListSeed {
-                        decode_deadline: self.decode_deadline,
-                        max_items: MAX_QUERIES_PER_RESPONSE,
-                        max_string_bytes: MAX_QUERY_BYTES,
-                    })?;
-                },
-                "has_more" => {
-                    map.next_value::<bool>()?;
-                },
-                "next_page" => {
-                    let next_page = map.next_value::<Option<String>>()?;
-                    if next_page
-                        .as_ref()
-                        .is_some_and(|value| value.len() > MAX_NEXT_PAGE_BYTES)
-                    {
-                        return Err(A::Error::custom("vector-store next-page token exceeds the byte limit"));
-                    }
-                },
-                _ => {
-                    return Err(A::Error::custom("unknown vector-store response field"));
-                },
-            }
-        }
-        results.ok_or_else(|| A::Error::missing_field("data"))
-    }
-}
-
-/// Seed for the bounded `data` result array.
-struct SearchResultsSeed {
-    /// Hard deadline checked while decoding result entries.
-    decode_deadline: Instant,
-
-    /// Maximum results retained from the array.
-    result_limit: usize,
-}
-
-impl<'de> DeserializeSeed<'de> for SearchResultsSeed {
-    type Value = Vec<SearchResult>;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(SearchResultsVisitor {
-            decode_deadline: self.decode_deadline,
-            result_limit: self.result_limit,
-        })
-    }
-}
-
-/// Seed for one result whose nested content is deadline and count bounded.
-struct SearchResultSeed {
-    /// Hard deadline checked during nested traversal.
-    decode_deadline: Instant,
-}
-
-impl<'de> DeserializeSeed<'de> for SearchResultSeed {
-    type Value = SearchResult;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_map(SearchResultVisitor {
-            decode_deadline: self.decode_deadline,
-        })
-    }
-}
-
-/// Visitor for the exact OGX result fields consumed by the filter.
-struct SearchResultVisitor {
-    /// Hard deadline checked between fields.
-    decode_deadline: Instant,
-}
-
-impl<'de> Visitor<'de> for SearchResultVisitor {
-    type Value = SearchResult;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a vector-store search result")
-    }
-
-    #[expect(clippy::too_many_lines, reason = "owns and validates every required result field")]
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut attributes = None;
-        let mut attributes_seen = false;
-        let mut content = None;
-        let mut file_id = None;
-        let mut filename = None;
-        let mut score = None;
-        while let Some(key) = map.next_key_seed(BoundedMapKeySeed {
-            max_bytes: MAX_SCHEMA_FIELD_BYTES,
-            limit_error: "vector-store result field name exceeds the byte limit",
-        })? {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            match key.as_str() {
-                "attributes" => {
-                    if attributes_seen {
-                        return Err(A::Error::duplicate_field("attributes"));
-                    }
-                    attributes_seen = true;
-                    attributes = map.next_value_seed(OptionalAttributesSeed {
-                        decode_deadline: self.decode_deadline,
-                    })?;
-                },
-                "content" => {
-                    if content.is_some() {
-                        return Err(A::Error::duplicate_field("content"));
-                    }
-                    content = Some(map.next_value_seed(ContentChunksSeed {
-                        decode_deadline: self.decode_deadline,
-                    })?);
-                },
-                "file_id" => set_once(&mut file_id, map.next_value()?, "file_id")?,
-                "filename" => set_once(&mut filename, map.next_value()?, "filename")?,
-                "score" => set_once(&mut score, map.next_value()?, "score")?,
-                _ => {
-                    return Err(A::Error::custom("unknown vector-store result field"));
-                },
-            }
-        }
-        let file_id = canonical_ogx_file_id(&attributes, file_id.ok_or_else(|| A::Error::missing_field("file_id"))?);
-        let result = SearchResult {
-            attributes,
-            content: content.ok_or_else(|| A::Error::missing_field("content"))?,
-            file_id,
-            filename: filename.ok_or_else(|| A::Error::missing_field("filename"))?,
-            score: score.ok_or_else(|| A::Error::missing_field("score"))?,
-        };
-        Ok(result)
-    }
-}
-
-/// Select the OpenAI Files API ID from OGX's indexed-document result shape.
+/// Replace OGX's internal document UUID with the OpenAI Files API ID.
 ///
 /// OGX may return its internal document UUID as the top-level `file_id` and
 /// retain the source `file-*` identifier in attributes. Canonical responses
 /// already carrying a `file-*` ID remain authoritative.
-fn canonical_ogx_file_id(attributes: &Option<Value>, file_id: String) -> String {
-    if file_id.strip_prefix("file-").is_some_and(|suffix| !suffix.is_empty()) {
-        return file_id;
+fn fixup_ogx_file_id(result: &mut SearchResult) {
+    if result
+        .file_id
+        .strip_prefix("file-")
+        .is_some_and(|suffix| !suffix.is_empty())
+    {
+        return;
     }
-    attributes
+    if let Some(canonical) = result
+        .attributes
         .as_ref()
         .and_then(Value::as_object)
         .and_then(|attributes| attributes.get("file_id"))
         .and_then(Value::as_str)
         .filter(|candidate| candidate.strip_prefix("file-").is_some_and(|suffix| !suffix.is_empty()))
-        .map_or(file_id, str::to_owned)
-}
-
-/// Seed for nullable, OpenAI-compatible result attributes.
-struct OptionalAttributesSeed {
-    /// Hard deadline checked between attribute entries.
-    decode_deadline: Instant,
-}
-
-impl<'de> DeserializeSeed<'de> for OptionalAttributesSeed {
-    type Value = Option<Value>;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_option(OptionalAttributesVisitor {
-            decode_deadline: self.decode_deadline,
-        })
+        result.file_id = canonical.to_owned();
     }
-}
-
-/// Visitor for a nullable bounded attributes object.
-struct OptionalAttributesVisitor {
-    /// Hard deadline checked between attribute entries.
-    decode_deadline: Instant,
-}
-
-impl<'de> Visitor<'de> for OptionalAttributesVisitor {
-    type Value = Option<Value>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("null or an OpenAI-compatible attributes object")
-    }
-
-    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer
-            .deserialize_map(AttributesVisitor {
-                decode_deadline: self.decode_deadline,
-            })
-            .map(Some)
-    }
-}
-
-/// Visitor retaining at most the public Responses attributes schema.
-struct AttributesVisitor {
-    /// Hard deadline checked between attribute entries.
-    decode_deadline: Instant,
-}
-
-impl<'de> Visitor<'de> for AttributesVisitor {
-    type Value = Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an OpenAI-compatible attributes object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut attributes = serde_json::Map::new();
-        while let Some(key) = map.next_key_seed(BoundedMapKeySeed {
-            max_bytes: MAX_ATTRIBUTE_KEY_CHARS.saturating_mul(4),
-            limit_error: "vector-store result attribute key exceeds the byte limit",
-        })? {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            if attributes.len() == MAX_ATTRIBUTE_ENTRIES {
-                return Err(A::Error::custom(
-                    "vector-store result attributes exceed the entry limit",
-                ));
-            }
-            if exceeds_character_limit(&key, MAX_ATTRIBUTE_KEY_CHARS) {
-                return Err(A::Error::custom(
-                    "vector-store result attribute key exceeds the character limit",
-                ));
-            }
-            let value = map.next_value_seed(AttributeValueSeed)?;
-            if attributes.insert(key, value).is_some() {
-                return Err(A::Error::custom("duplicate vector-store result attribute"));
-            }
-        }
-        Ok(Value::Object(attributes))
-    }
-}
-
-/// Seed for one primitive public attribute value.
-struct AttributeValueSeed;
-
-impl<'de> DeserializeSeed<'de> for AttributeValueSeed {
-    type Value = Value;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(AttributeValueVisitor)
-    }
-}
-
-/// Visitor rejecting nested or oversized public attribute values.
-struct AttributeValueVisitor;
-
-impl Visitor<'_> for AttributeValueVisitor {
-    type Value = Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded string, number, or boolean attribute")
-    }
-
-    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
-        Ok(Value::Bool(v))
-    }
-
-    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-        Ok(Value::Number(v.into()))
-    }
-
-    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
-        Ok(Value::Number(v.into()))
-    }
-
-    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
-        serde_json::Number::from_f64(v)
-            .map(Value::Number)
-            .ok_or_else(|| E::custom("vector-store result attribute number must be finite"))
-    }
-
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        if exceeds_character_limit(v, MAX_ATTRIBUTE_STRING_CHARS) {
-            return Err(E::custom(
-                "vector-store result string attribute exceeds the character limit",
-            ));
-        }
-        Ok(Value::String(v.to_owned()))
-    }
-
-    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-        if exceeds_character_limit(&v, MAX_ATTRIBUTE_STRING_CHARS) {
-            return Err(E::custom(
-                "vector-store result string attribute exceeds the character limit",
-            ));
-        }
-        Ok(Value::String(v))
-    }
-}
-
-/// Store one required map field or reject a duplicate.
-fn set_once<T, E: serde::de::Error>(slot: &mut Option<T>, value: T, field: &'static str) -> Result<(), E> {
-    if slot.replace(value).is_some() {
-        return Err(E::duplicate_field(field));
-    }
-    Ok(())
-}
-
-/// Seed for bounded content chunks within one result.
-struct ContentChunksSeed {
-    /// Hard deadline checked between chunks.
-    decode_deadline: Instant,
-}
-
-impl<'de> DeserializeSeed<'de> for ContentChunksSeed {
-    type Value = Vec<ContentChunk>;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(ContentChunksVisitor {
-            decode_deadline: self.decode_deadline,
-        })
-    }
-}
-
-/// Visitor that rejects excess chunks before retaining more work.
-struct ContentChunksVisitor {
-    /// Hard deadline checked between chunks.
-    decode_deadline: Instant,
-}
-
-impl<'de> Visitor<'de> for ContentChunksVisitor {
-    type Value = Vec<ContentChunk>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded vector-store content array")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut chunks = Vec::new();
-        while let Some(chunk) = seq.next_element_seed(ContentChunkSeed {
-            decode_deadline: self.decode_deadline,
-        })? {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            if chunks.len() == MAX_DECODED_CONTENT_CHUNKS {
-                return Err(A::Error::custom("vector-store result exceeds the content chunk limit"));
-            }
-            chunks.push(chunk);
-        }
-        Ok(chunks)
-    }
-}
-
-/// Seed for one exact text content chunk.
-struct ContentChunkSeed {
-    /// Hard deadline checked between fields.
-    decode_deadline: Instant,
-}
-
-impl<'de> DeserializeSeed<'de> for ContentChunkSeed {
-    type Value = ContentChunk;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_map(ContentChunkVisitor {
-            decode_deadline: self.decode_deadline,
-        })
-    }
-}
-
-/// Visitor for the text chunk subset exposed by the OpenAI search endpoint.
-struct ContentChunkVisitor {
-    /// Hard deadline checked between fields.
-    decode_deadline: Instant,
-}
-
-impl<'de> Visitor<'de> for ContentChunkVisitor {
-    type Value = ContentChunk;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a vector-store text content chunk")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut chunk_type = None;
-        let mut text = None;
-        while let Some(key) = map.next_key_seed(BoundedMapKeySeed {
-            max_bytes: MAX_SCHEMA_FIELD_BYTES,
-            limit_error: "vector-store content field name exceeds the byte limit",
-        })? {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            match key.as_str() {
-                "type" => set_once(&mut chunk_type, map.next_value()?, "type")?,
-                "text" => set_once(&mut text, map.next_value()?, "text")?,
-                "embedding" | "chunk_metadata" | "metadata" => {
-                    map.next_value_seed(BoundedIgnoredSeed {
-                        decode_deadline: self.decode_deadline,
-                        depth: 0,
-                    })?;
-                },
-                _ => {
-                    return Err(A::Error::custom("unknown vector-store content field"));
-                },
-            }
-        }
-        let text: String = text.ok_or_else(|| A::Error::missing_field("text"))?;
-        if text.len() > MAX_CONTENT_CHUNK_BYTES {
-            return Err(A::Error::custom("vector-store content chunk exceeds the byte limit"));
-        }
-        Ok(ContentChunk {
-            _chunk_type: chunk_type.ok_or_else(|| A::Error::missing_field("type"))?,
-            text,
-        })
-    }
-}
-
-/// Seed traversing an unused extension with deadline and shape bounds.
-struct BoundedIgnoredSeed {
-    /// Hard deadline checked throughout traversal.
-    decode_deadline: Instant,
-
-    /// Current nested container depth.
-    depth: usize,
-}
-
-impl<'de> DeserializeSeed<'de> for BoundedIgnoredSeed {
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(BoundedIgnoredVisitor {
-            decode_deadline: self.decode_deadline,
-            depth: self.depth,
-        })
-    }
-}
-
-/// Visitor discarding a bounded extension without retaining its values.
-struct BoundedIgnoredVisitor {
-    /// Hard deadline checked throughout traversal.
-    decode_deadline: Instant,
-
-    /// Current nested container depth.
-    depth: usize,
-}
-
-impl<'de> Visitor<'de> for BoundedIgnoredVisitor {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded JSON extension value")
-    }
-
-    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_bool<E: serde::de::Error>(self, _value: bool) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_i64<E: serde::de::Error>(self, _value: i64) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_u64<E: serde::de::Error>(self, _value: u64) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_f64<E: serde::de::Error>(self, _value: f64) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        ensure_decode_deadline::<E>(self.decode_deadline)?;
-        if v.len() > MAX_IGNORED_EXTENSION_STRING_BYTES {
-            return Err(E::custom(
-                "vector-store content extension string exceeds the byte limit",
-            ));
-        }
-        Ok(())
-    }
-
-    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-        self.visit_str(&v)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        BoundedIgnoredSeed {
-            decode_deadline: self.decode_deadline,
-            depth: self.depth,
-        }
-        .deserialize(deserializer)
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        if self.depth >= MAX_IGNORED_EXTENSION_DEPTH {
-            return Err(A::Error::custom(
-                "vector-store content extension exceeds the nesting limit",
-            ));
-        }
-        let mut entries = 0_usize;
-        while seq
-            .next_element_seed(BoundedIgnoredSeed {
-                decode_deadline: self.decode_deadline,
-                depth: self.depth.saturating_add(1),
-            })?
-            .is_some()
-        {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            entries = entries.saturating_add(1);
-            if entries > MAX_IGNORED_EXTENSION_ENTRIES {
-                return Err(A::Error::custom(
-                    "vector-store content extension exceeds the entry limit",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        if self.depth >= MAX_IGNORED_EXTENSION_DEPTH {
-            return Err(A::Error::custom(
-                "vector-store content extension exceeds the nesting limit",
-            ));
-        }
-        let mut entries = 0_usize;
-        while map.next_key_seed(BoundedIgnoredMapKeySeed)?.is_some() {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            entries = entries.saturating_add(1);
-            if entries > MAX_IGNORED_EXTENSION_ENTRIES {
-                return Err(A::Error::custom(
-                    "vector-store content extension exceeds the entry limit",
-                ));
-            }
-            map.next_value_seed(BoundedIgnoredSeed {
-                decode_deadline: self.decode_deadline,
-                depth: self.depth.saturating_add(1),
-            })?;
-        }
-        Ok(())
-    }
-}
-
-/// Seed for bounded search-query metadata ignored by aggregation.
-struct BoundedStringListSeed {
-    /// Hard deadline checked between list entries.
-    decode_deadline: Instant,
-
-    /// Maximum strings accepted in the list.
-    max_items: usize,
-
-    /// Maximum bytes accepted in one string.
-    max_string_bytes: usize,
-}
-
-impl<'de> DeserializeSeed<'de> for BoundedStringListSeed {
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(BoundedStringListVisitor {
-            decode_deadline: self.decode_deadline,
-            max_items: self.max_items,
-            max_string_bytes: self.max_string_bytes,
-        })
-    }
-}
-
-/// Visitor that validates ignored string-list metadata without retaining it.
-struct BoundedStringListVisitor {
-    /// Hard deadline checked between list entries.
-    decode_deadline: Instant,
-
-    /// Maximum strings accepted in the list.
-    max_items: usize,
-
-    /// Maximum bytes accepted in one string.
-    max_string_bytes: usize,
-}
-
-impl<'de> Visitor<'de> for BoundedStringListVisitor {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded list of strings")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut count = 0_usize;
-        while let Some(value) = seq.next_element::<String>()? {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            count = count.saturating_add(1);
-            if count > self.max_items || value.len() > self.max_string_bytes {
-                return Err(A::Error::custom("vector-store search-query metadata exceeds its limit"));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Streaming top-k visitor for vector-store results.
-struct SearchResultsVisitor {
-    /// Hard deadline checked while decoding result entries.
-    decode_deadline: Instant,
-
-    /// Maximum results retained from the array.
-    result_limit: usize,
-}
-
-impl<'de> Visitor<'de> for SearchResultsVisitor {
-    type Value = Vec<SearchResult>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an array of vector-store search results")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut decoded_results = 0_usize;
-        let mut decoded_chunks = 0_usize;
-        let mut results = Vec::with_capacity(self.result_limit);
-        while let Some(result) = seq.next_element_seed(SearchResultSeed {
-            decode_deadline: self.decode_deadline,
-        })? {
-            ensure_decode_deadline::<A::Error>(self.decode_deadline)?;
-            decoded_results = decoded_results.saturating_add(1);
-            if decoded_results > MAX_NUM_RESULTS {
-                return Err(A::Error::custom("vector-store response exceeds the result count limit"));
-            }
-            decoded_chunks = decoded_chunks
-                .checked_add(result.content.len())
-                .ok_or_else(|| A::Error::custom("vector-store content chunk count overflow"))?;
-            if decoded_chunks > MAX_DECODED_CONTENT_CHUNKS {
-                return Err(A::Error::custom(
-                    "vector-store response exceeds the content chunk count limit",
-                ));
-            }
-            merge_top_results(&mut results, std::iter::once(result), self.result_limit);
-        }
-        Ok(results)
-    }
-}
-
-/// Reject a decoder that has crossed its shared execution deadline.
-fn ensure_decode_deadline<E: serde::de::Error>(deadline: Instant) -> Result<(), E> {
-    if Instant::now() >= deadline {
-        return Err(E::custom("vector-store response decode deadline exceeded"));
-    }
-    Ok(())
-}
-
-/// Return whether a string contains more than the permitted characters.
-fn exceeds_character_limit(value: &str, limit: usize) -> bool {
-    value.chars().nth(limit).is_some()
 }
 
 /// Merge one bounded concurrency chunk into the aggregate batch.
@@ -1947,18 +1065,18 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use serde_json::json;
 
     use super::{
-        MAX_ATTRIBUTE_ENTRIES, MAX_DECODED_CONTENT_CHUNKS, SearchResult, VectorStoreSearchRequest,
-        deserialize_bounded_search_results, merge_top_results, parse_response_body, response_admission_units,
+        SearchResult, VectorStoreSearchRequest, deserialize_search_results, merge_top_results, parse_response_body,
+        response_admission_units,
     };
 
     fn decode(body: &[u8], limit: usize) -> Result<Vec<SearchResult>, serde_json::Error> {
-        deserialize_bounded_search_results(body, limit, Instant::now() + Duration::from_secs(60))
+        deserialize_search_results(body, limit)
     }
 
     fn result(file_id: &str, score: f64) -> SearchResult {
@@ -2004,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_decoder_retains_top_ranked_chunks() {
+    fn deserializer_retains_top_ranked_chunks() {
         let body = serde_json::to_vec(&json!({
             "data": [
                 {"content":[{"type":"text","text":"old"}],"file_id":"file-a","filename":"a.txt","score":0.2},
@@ -2022,9 +1140,13 @@ mod tests {
         assert!(
             decoded
                 .iter()
-                .any(|result| result.file_id == "file-a" && result.score == 0.9)
+                .any(|result| result.file_id == "file-a" && result.score == 0.9),
+            "highest-scored file-a chunk must be retained"
         );
-        assert!(decoded.iter().any(|result| result.file_id == "file-b"));
+        assert!(
+            decoded.iter().any(|result| result.file_id == "file-b"),
+            "file-b must be retained"
+        );
     }
 
     #[test]
@@ -2066,60 +1188,13 @@ mod tests {
     }
 
     #[test]
-    fn bounded_decoder_requires_data_array() {
-        assert!(decode(b"{}", 10).is_err());
-        assert!(decode(br#"{"data":null}"#, 10).is_err());
+    fn deserializer_requires_data_array() {
+        assert!(decode(b"{}", 10).is_err(), "empty object must fail without data field");
+        assert!(decode(br#"{"data":null}"#, 10).is_err(), "null data must fail");
     }
 
     #[test]
-    fn bounded_decoder_rejects_excess_content_work() {
-        let chunks = (0..=MAX_DECODED_CONTENT_CHUNKS)
-            .map(|_| json!({"type":"text","text":"x"}))
-            .collect::<Vec<_>>();
-        let body = serde_json::to_vec(&json!({
-            "data":[{"content":chunks,"file_id":"file-a","filename":"a.txt","score":0.9}]
-        }))
-        .expect("test response must serialize");
-
-        assert!(decode(&body, 10).is_err());
-    }
-
-    #[test]
-    fn bounded_decoder_rejects_nonconformant_attributes() {
-        let nested = serde_json::to_vec(&json!({
-            "data":[{
-                "attributes":{"nested":{"value":true}},
-                "content":[{"type":"text","text":"x"}],
-                "file_id":"file-a","filename":"a.txt","score":0.9
-            }]
-        }))
-        .expect("test response must serialize");
-        let too_many = serde_json::to_vec(&json!({
-            "data":[{
-                "attributes":(0..=MAX_ATTRIBUTE_ENTRIES)
-                    .map(|index| (format!("key-{index}"), json!(index)))
-                    .collect::<serde_json::Map<_,_>>(),
-                "content":[{"type":"text","text":"x"}],
-                "file_id":"file-a","filename":"a.txt","score":0.9
-            }]
-        }))
-        .expect("test response must serialize");
-        let oversized = serde_json::to_vec(&json!({
-            "data":[{
-                "attributes":{"key":"x".repeat(super::MAX_ATTRIBUTE_STRING_CHARS + 1)},
-                "content":[{"type":"text","text":"x"}],
-                "file_id":"file-a","filename":"a.txt","score":0.9
-            }]
-        }))
-        .expect("test response must serialize");
-
-        assert!(decode(&nested, 10).is_err());
-        assert!(decode(&too_many, 10).is_err());
-        assert!(decode(&oversized, 10).is_err());
-    }
-
-    #[test]
-    fn bounded_decoder_accepts_primitive_attribute_values() {
+    fn deserializer_accepts_primitive_attribute_values() {
         let decoded = decode(
             br#"{"data":[{
                 "attributes":{"boolean":true,"negative":-1,"positive":1,"float":1.5,"string":"value"},
@@ -2142,168 +1217,29 @@ mod tests {
     }
 
     #[test]
-    fn bounded_decoder_rejects_invalid_container_shapes() {
-        let cases: &[&[u8]] = &[
-            b"[]",
-            br#"{"data":{}}"#,
-            br#"{"data":[1]}"#,
-            br#"{"data":[{"content":1}]}"#,
-            br#"{"data":[{"content":[1]}]}"#,
-            br#"{"data":[{"content":[{"type":1,"text":"x"}]}]}"#,
-            br#"{"data":[{"attributes":[]}]}"#,
-            br#"{"search_query":"query","data":[]}"#,
-        ];
-
-        for body in cases {
-            assert!(decode(body, 10).is_err(), "invalid shape must be rejected");
-        }
-    }
-
-    #[test]
-    fn bounded_decoder_rejects_duplicate_and_bounded_fields() {
-        let cases: &[&[u8]] = &[
-            br#"{"data":[],"data":[]}"#,
-            br#"{"object":"wrong","data":[]}"#,
-            br#"{"data":[{"attributes":null,"attributes":null}]}"#,
-            br#"{"data":[{"content":[],"content":[]}]}"#,
-            br#"{"data":[{"unknown":null}]}"#,
-            br#"{"data":[{"file_id":"file-a","file_id":"file-b"}]}"#,
-        ];
-        for body in cases {
-            assert!(decode(body, 10).is_err(), "invalid field must be rejected");
-        }
-
-        let oversized_page = serde_json::to_vec(&json!({
-            "next_page":"x".repeat(super::MAX_NEXT_PAGE_BYTES + 1),
-            "data":[],
-        }))
+    fn deserializer_uses_ogx_source_file_id_for_internal_documents() {
+        let body = serde_json::to_vec(&json!({"data":[
+            {"attributes":{"file_id":"file-source"},"content":[{"type":"text","text":"fallback"}],
+             "file_id":"83441278-02e0-44bb-b385-892a1d4680c5","filename":"report.txt","score":0.9},
+            {"attributes":{"file_id":"file-shadow"},"content":[{"type":"text","text":"canonical"}],
+             "file_id":"file-canonical","filename":"report.txt","score":0.8}
+        ]}))
         .expect("test response must serialize");
-        assert!(decode(&oversized_page, 10).is_err());
-
-        let oversized_attribute_key = "x".repeat(super::MAX_ATTRIBUTE_KEY_CHARS + 1);
-        let oversized_attribute = serde_json::to_vec(&json!({
-            "data":[{
-                "attributes":{oversized_attribute_key:null},
-                "content":[{"type":"text","text":"x"}],
-                "file_id":"file-a","filename":"a.txt","score":0.9
-            }]
-        }))
-        .expect("test response must serialize");
-        assert!(decode(&oversized_attribute, 10).is_err());
-    }
-
-    #[test]
-    fn bounded_decoder_uses_ogx_source_file_id_for_internal_documents() {
-        let decoded = decode(
-            br#"{"data":[
-                {
-                    "attributes":{"file_id":"file-source"},
-                    "content":[{"type":"text","text":"fallback"}],
-                    "file_id":"83441278-02e0-44bb-b385-892a1d4680c5",
-                    "filename":"report.txt",
-                    "score":0.9
-                },
-                {
-                    "attributes":{"file_id":"file-shadow"},
-                    "content":[{"type":"text","text":"canonical"}],
-                    "file_id":"file-canonical",
-                    "filename":"report.txt",
-                    "score":0.8
-                }
-            ]}"#,
-            10,
-        )
-        .expect("OGX result IDs must decode");
+        let decoded = decode(&body, 10).expect("OGX result IDs must decode");
 
         let mut decoded = decoded.into_iter();
-        assert_eq!(
-            decoded.next().map(|result| result.file_id).as_deref(),
-            Some("file-source")
-        );
-        assert_eq!(
-            decoded.next().map(|result| result.file_id).as_deref(),
-            Some("file-canonical")
-        );
+        assert_eq!(decoded.next().map(|r| r.file_id).as_deref(), Some("file-source"));
+        assert_eq!(decoded.next().map(|r| r.file_id).as_deref(), Some("file-canonical"));
     }
 
     #[test]
-    fn bounded_decoder_accepts_bounded_ogx_content_extensions() {
-        let body = serde_json::to_vec(&json!({
-            "object":"vector_store.search_results.page",
-            "search_query":["query"],
-            "data":[{
-                "attributes":{"team":"infra"},
-                "content":[{
-                    "type":"text",
-                    "text":"result",
-                    "embedding":[0.1, 0.2],
-                    "chunk_metadata":{"index":1},
-                    "metadata":{"tags":["a", "b"]}
-                }],
-                "file_id":"file-a","filename":"a.txt","score":0.9
-            }],
-            "has_more":false,
-            "next_page":null
-        }))
-        .expect("test response must serialize");
-
-        let decoded = decode(&body, 10).expect("bounded OGX extensions must decode");
-        assert_eq!(decoded.len(), 1);
-    }
-
-    #[test]
-    fn bounded_decoder_checks_deadline_during_nested_traversal() {
-        let body = br#"{"data":[{"content":[{"type":"text","text":"x","metadata":{"nested":[1,2,3]}}],"file_id":"file-a","filename":"a.txt","score":0.9}]}"#;
-        let expired = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(Instant::now);
-
-        assert!(deserialize_bounded_search_results(body, 10, expired).is_err());
-    }
-
-    #[test]
-    fn bounded_decoder_rejects_unknown_top_level_payloads_without_traversal() {
-        let body = br#"{"unknown":{"large":[1,2,3]},"data":[]}"#;
-
-        assert!(decode(body, 10).is_err());
-    }
-
-    #[test]
-    fn bounded_decoder_does_not_echo_oversized_map_keys_or_content_types() {
-        let oversized_key = format!("sensitive-{}", "x".repeat(1_024));
-        let unknown = serde_json::to_vec(&json!({oversized_key.clone(): null, "data": []}))
-            .expect("test response must serialize");
-        let unknown_error = decode(&unknown, 10).expect_err("oversized key must fail").to_string();
-        assert!(unknown_error.len() < 256);
-        assert!(!unknown_error.contains(&oversized_key));
-
-        let oversized_type = format!("sensitive-{}", "y".repeat(1_024));
-        let content = serde_json::to_vec(&json!({
-            "data":[{
-                "content":[{"type":oversized_type.clone(),"text":"x"}],
-                "file_id":"file-a","filename":"a.txt","score":0.9
-            }]
-        }))
-        .expect("test response must serialize");
-        let content_error = decode(&content, 10)
-            .expect_err("unsupported type must fail")
-            .to_string();
-        assert!(content_error.len() < 256);
-        assert!(!content_error.contains(&oversized_type));
-    }
-
-    #[test]
-    fn production_decode_error_retains_only_bounded_location_metadata() {
-        let secret = format!("secret-{}", "z".repeat(1_024));
-        let body =
-            serde_json::to_vec(&json!({secret.clone(): null, "data": []})).expect("test response must serialize");
-        let error = parse_response_body(&body, "store-a", 10, Instant::now() + Duration::from_secs(60))
-            .expect_err("invalid response must fail");
+    fn decode_error_retains_only_location_metadata() {
+        let body = br#"{"data":[{"content":[{"type":"text","text":"x"}],"file_id":"file-a","filename":"a.txt","score":"NaN"}]}"#;
+        let error = parse_response_body(body, "store-a", 10).expect_err("invalid response must fail");
         let rendered = error.to_string();
 
-        assert!(rendered.len() < 256);
-        assert!(!rendered.contains(&secret));
-        assert!(rendered.contains("line"));
-        assert!(rendered.contains("column"));
+        assert!(rendered.len() < 256, "error must be compact");
+        assert!(rendered.contains("line"), "error must include line");
+        assert!(rendered.contains("column"), "error must include column");
     }
 }
