@@ -19,7 +19,10 @@ use serde_json::Value;
 use tracing::debug;
 
 use self::config::{AnthropicStreamEventsConfig, build_config};
-use crate::is_event_stream_content_type;
+use crate::{
+    anthropic::wire::{ContentBlock, MessageDeltaUsage, MessageUsage},
+    is_event_stream_content_type,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -536,13 +539,14 @@ fn transform_delta(ctx: &mut HttpFilterContext<'_>, delta: &Value, output: &mut 
 fn emit_text_delta(ctx: &mut HttpFilterContext<'_>, content: &str, output: &mut Vec<u8>) {
     if !is_text_block_open(ctx) {
         let idx = get_block_index(ctx);
+        let content_block = ContentBlock::text("");
         emit_event(
             output,
             "content_block_start",
             &serde_json::json!({
                 "type": "content_block_start",
                 "index": idx,
-                "content_block": {"type": "text", "text": ""}
+                "content_block": content_block
             }),
         );
         ctx.set_metadata(TEXT_BLOCK_OPEN_KEY, "true".to_owned());
@@ -614,6 +618,7 @@ fn emit_tool_block_start(
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let content_block = ContentBlock::tool_use(id, serde_json::Map::new(), name);
 
     emit_event(
         output,
@@ -621,7 +626,7 @@ fn emit_tool_block_start(
         &serde_json::json!({
             "type": "content_block_start",
             "index": idx,
-            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+            "content_block": content_block
         }),
     );
     set_tool_block_index(ctx, tool_call_key, idx);
@@ -725,28 +730,13 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
 }
 
 /// Build a schema-complete Anthropic `Message.usage` value.
-fn message_start_usage() -> Value {
-    serde_json::json!({
-        "cache_creation": null,
-        "cache_creation_input_tokens": null,
-        "cache_read_input_tokens": null,
-        "inference_geo": null,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "server_tool_use": null,
-        "service_tier": null
-    })
+fn message_start_usage() -> MessageUsage {
+    MessageUsage::new(0, 0, None)
 }
 
 /// Build a schema-complete Anthropic `message_delta.usage` value.
-fn message_delta_usage(output_tokens: u64) -> Value {
-    serde_json::json!({
-        "cache_creation_input_tokens": null,
-        "cache_read_input_tokens": null,
-        "input_tokens": null,
-        "output_tokens": output_tokens,
-        "server_tool_use": null
-    })
+fn message_delta_usage(output_tokens: u64) -> MessageDeltaUsage {
+    MessageDeltaUsage::new(output_tokens)
 }
 
 /// Map `OpenAI` finish reasons to Anthropic stop reasons.
@@ -914,6 +904,12 @@ mod tests {
             "second chunk should emit text_delta immediately"
         );
         assert!(out2.contains("Hello"), "text content should be forwarded immediately");
+        let start = event_data(&out2, "content_block_start");
+        assert_eq!(
+            start.pointer("/content_block/citations"),
+            Some(&Value::Null),
+            "streaming text citations should be null"
+        );
     }
 
     #[test]
@@ -982,6 +978,7 @@ mod tests {
             ],
             "message_start usage",
         );
+        assert_absent_fields(usage, &["output_tokens_details"], "message_start usage");
         assert_u64_field(usage, "input_tokens", 0, "message_start usage");
         assert_u64_field(usage, "output_tokens", 0, "message_start usage");
     }
@@ -1019,6 +1016,7 @@ mod tests {
             ],
             "message_delta usage",
         );
+        assert_absent_fields(usage, &["output_tokens_details"], "message_delta usage");
         assert_u64_field(usage, "output_tokens", 7, "message_delta usage");
     }
 
@@ -1236,6 +1234,16 @@ mod tests {
         assert!(
             out.contains(r#""id":"call_1""#) && out.contains(r#""name":"get_weather""#),
             "tool_use block should preserve id and function name"
+        );
+        let start = event_data(&out, "content_block_start");
+        assert_eq!(
+            start
+                .get("content_block")
+                .and_then(|block| block.get("caller"))
+                .and_then(|caller| caller.get("type"))
+                .and_then(Value::as_str),
+            Some("direct"),
+            "streaming tool_use blocks should identify a direct caller"
         );
         assert!(
             out.contains("input_json_delta") && out.contains(r#""partial_json":"{\"city\":"#),
@@ -1707,6 +1715,12 @@ mod tests {
             .map(|data| serde_json::from_str::<Value>(data).unwrap())
             .map(|event| event.get("index").and_then(Value::as_u64).unwrap())
             .collect()
+    }
+
+    fn assert_absent_fields(value: &Value, fields: &[&str], label: &str) {
+        for field in fields {
+            assert!(value.get(*field).is_none(), "{label} should omit {field}");
+        }
     }
 
     fn assert_null_fields(value: &Value, fields: &[&str], label: &str) {

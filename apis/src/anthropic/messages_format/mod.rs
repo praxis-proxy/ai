@@ -32,14 +32,17 @@ use std::borrow::Cow;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     builtins::http::{payload_processing::OnInvalidBehavior, value_safety::is_safe_promoted_value},
     parse_filter_config,
 };
 use tracing::{debug, trace};
 
 use self::config::{AnthropicMessagesFormatConfig, build_config};
-use crate::classifier::{AiRequestFormat, ClassifiedRequest, classify_request_body};
+use crate::{
+    anthropic::wire,
+    classifier::{AiRequestFormat, ClassifiedRequest, classify_request_body},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -181,13 +184,7 @@ fn handle_invalid_format(format: AiRequestFormat, config: &AnthropicMessagesForm
             };
 
             trace!(reason = message, "rejecting unrecognized body");
-            Some(FilterAction::Reject(
-                Rejection::status(400)
-                    .with_header("content-type", "application/json")
-                    .with_body(Bytes::from(format!(
-                        r#"{{"error":{{"message":"{message}","type":"invalid_request_error"}}}}"#
-                    ))),
-            ))
+            Some(FilterAction::Reject(wire::invalid_request_rejection(message)))
         },
     }
 }

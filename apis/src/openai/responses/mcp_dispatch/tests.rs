@@ -184,12 +184,32 @@ fn filter_response_body_access() {
 }
 
 #[test]
+fn filter_request_body_access() {
+    let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
+    let filter = McpDispatchFilter::from_config(&config).unwrap();
+    assert_eq!(filter.request_body_access(), praxis_filter::BodyAccess::ReadOnly);
+}
+
+#[test]
 fn filter_response_body_mode() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("max_body_bytes: 1024").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
     assert!(
         matches!(
             filter.response_body_mode(),
+            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
+        ),
+        "should return StreamBuffer with configured max_bytes"
+    );
+}
+
+#[test]
+fn filter_request_body_mode() {
+    let config = serde_yaml::from_str::<serde_yaml::Value>("max_body_bytes: 1024").unwrap();
+    let filter = McpDispatchFilter::from_config(&config).unwrap();
+    assert!(
+        matches!(
+            filter.request_body_mode(),
             praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
         ),
         "should return StreamBuffer with configured max_bytes"
@@ -846,6 +866,16 @@ fn make_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
     McpDispatchFilter::from_config(&yaml).unwrap()
 }
 
+fn assert_dispatch_action(ctx: &praxis_filter::HttpFilterContext<'_>, expected: &str) {
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_mcp_dispatch")
+            .and_then(|results| results.get("action")),
+        Some(expected),
+        "unexpected MCP dispatch action"
+    );
+}
+
 #[test]
 fn on_response_body_not_end_of_stream_returns_release() {
     let filter = make_dispatch_filter();
@@ -875,6 +905,7 @@ fn on_response_body_no_mcp_calls_returns_continue() {
     let mut body = None;
     let result = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(result, FilterAction::Continue));
+    assert_dispatch_action(&ctx, "done");
 }
 
 #[test]
@@ -899,6 +930,7 @@ fn on_response_body_with_mcp_calls_sets_execute_metadata() {
         ctx.filter_metadata.get("openai_mcp_dispatch.action"),
         Some(&"execute_mcp".to_owned())
     );
+    assert_dispatch_action(&ctx, "loop");
 }
 
 #[test]
@@ -919,6 +951,7 @@ fn on_response_body_approval_required_sets_done_metadata() {
         ctx.filter_metadata.get("openai_mcp_dispatch.action"),
         Some(&"done".to_owned())
     );
+    assert_dispatch_action(&ctx, "done");
 }
 
 // =========================================================================
@@ -930,7 +963,8 @@ async fn on_request_no_state_returns_continue() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    let result = filter.on_request(&mut ctx).await.unwrap();
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(result, FilterAction::Continue));
 }
 
@@ -945,7 +979,7 @@ async fn on_request_no_mcp_calls_returns_continue() {
 }
 
 #[tokio::test]
-async fn on_request_executes_and_appends_results() {
+async fn on_request_body_executes_and_appends_results_before_proxy_serialization() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -955,11 +989,15 @@ async fn on_request_executes_and_appends_results() {
         ..ResponsesState::default()
     };
     ctx.extensions.insert(state);
-    let result = filter.on_request(&mut ctx).await.unwrap();
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(result, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(!state.messages.is_empty(), "should append result messages");
-    assert!(!state.output_items().is_empty(), "should append output items");
+    assert!(
+        !state.accumulated_output.is_empty(),
+        "should append output items to accumulated_output"
+    );
     assert!(state.tool_calls.is_empty(), "should clear executed MCP tool calls");
 }
 
@@ -1019,6 +1057,7 @@ fn resolve_to_dispatch_encoded_name_roundtrip() {
         ctx.filter_metadata.get("openai_mcp_dispatch.action"),
         Some(&"execute_mcp".to_owned()),
     );
+    assert_dispatch_action(&ctx, "loop");
 
     let (key, entry) = find_by_encoded_name(&tool_map, &encoded).unwrap();
     assert_eq!((key.0.as_str(), key.1.as_str()), (label, tool_name));
@@ -1045,14 +1084,15 @@ async fn resolve_to_dispatch_execute_with_original_name() {
         ..ResponsesState::default()
     });
 
-    let result = filter.on_request(&mut ctx).await.unwrap();
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(result, FilterAction::Continue));
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(!state.messages.is_empty(), "should append result messages");
 
-    let output = state.output_items();
-    assert!(!output.is_empty(), "should append output items");
+    let output = &state.accumulated_output;
+    assert!(!output.is_empty(), "should append output items to accumulated_output");
     assert_eq!(output[0]["type"], "mcp_call");
     assert_eq!(
         output[0]["name"], tool_name,

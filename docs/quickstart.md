@@ -41,6 +41,10 @@ filter_chains:
         routes:
           - path_prefix: "/v1"
             cluster: openai_backend
+      - filter: headers
+        request_set:
+          - name: Host
+            value: api.openai.com
       - filter: load_balancer
         clusters:
           - name: openai_backend
@@ -69,7 +73,7 @@ curl http://127.0.0.1:8080/v1/responses \
 ## Next steps
 
 - [Example configs](../examples/README.md): working YAML
-  for every feature.
+  for supported features and integration patterns.
 - [Filters](filters/README.md): AI filters and how to
   write your own.
 - [Praxis core](https://github.com/praxis-proxy/praxis):

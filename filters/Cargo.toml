@@ -28,6 +28,7 @@ futures = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 praxis-ai-apis = { workspace = true }
+praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 reqwest.workspace = true
 serde = { workspace = true }
@@ -37,6 +38,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 metrics-util = { workspace = true }
-praxis-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 wiremock = { workspace = true }

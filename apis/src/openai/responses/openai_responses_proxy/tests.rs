@@ -113,7 +113,7 @@ async fn initialized_state_preserves_scalar_input_on_first_pass() {
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     assert!(
-        ctx.extra_request_headers.is_empty(),
+        ctx.request_headers_to_set.is_empty(),
         "byte-exact first-pass forwarding must not synthesize content-length"
     );
 }
@@ -136,7 +136,7 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
-    assert!(ctx.extra_request_headers.is_empty());
+    assert!(ctx.request_headers_to_set.is_empty());
 }
 
 #[tokio::test]
@@ -456,6 +456,68 @@ async fn rebuild_non_object_request_body_passes_through() {
     assert!(
         rebuilt.is_array(),
         "non-object request_body should pass through without modification"
+    );
+}
+
+#[tokio::test]
+async fn tool_choice_serialized_from_state() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "tool_choice": "auto"
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.tool_choice = json!("none");
+    state
+        .messages
+        .splice(0..0, vec![json!({"role": "user", "content": "stored"})]);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"hello","tool_choice":"auto"}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["tool_choice"], "none",
+        "tool_choice should come from state, not from original request_body"
+    );
+}
+
+#[tokio::test]
+async fn rebuild_does_not_set_content_type_header() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "previous_response_id": "resp_abc123"
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
+    state
+        .messages
+        .splice(0..0, vec![json!({"role": "user", "content": "stored"})]);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"test","previous_response_id":"resp_abc123"}"#,
+    ));
+    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-type"),
+        "filter must not set content-type (core handles framing)"
     );
 }
 

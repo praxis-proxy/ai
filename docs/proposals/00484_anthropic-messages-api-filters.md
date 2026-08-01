@@ -588,21 +588,32 @@ SDK clients to reach OpenAI-compatible backends
   (read-write)
 - `response_body_mode` → `Stream` (static default)
 - `on_response`: upgrade to `StreamBuffer` via
-  `ctx.set_response_body_mode()` only when request
-  metadata says `stream != "true"`
-- `on_response_body`: transform non-streaming
-  response body from OpenAI format back to
-  Anthropic format; no-op for streaming requests
-  (handled by `anthropic_stream_events`)
+  `ctx.set_response_body_mode()` for transformable
+  non-streaming successes and every upstream 4xx/5xx
+- `on_response_body`: transform compatible
+  non-streaming success bodies from OpenAI format back
+  to Anthropic format, and normalize pre-stream error
+  bodies for both request modes
 
 **Streaming coexistence:** by declaring `Stream`
 statically and upgrading to `StreamBuffer` per-request,
 both `anthropic_to_openai` and
 `anthropic_stream_events` can coexist in a single
 pipeline. Non-streaming requests get full response
-buffering for transformation; streaming requests
-pass through to `anthropic_stream_events` for
-per-chunk SSE conversion.
+buffering for compatible successful transformations.
+Successful streaming responses pass through to
+`anthropic_stream_events` for per-chunk SSE conversion.
+Pre-stream 4xx/5xx responses are buffered and normalized
+even when the original request enabled streaming.
+
+When a body is replaced, the filter preserves the status,
+copies `request-id` (falling back to `x-request-id`) into
+the Anthropic body and canonical response header, sets the
+content type to JSON, and clears stale `Content-Length`,
+`Content-Encoding`, `Content-Range`, and `ETag` headers.
+The request-side filter removes `Accept-Encoding`; encoded
+or partial successful responses are passed through if an
+upstream still returns them.
 
 **Request transformation (Anthropic → OpenAI):**
 

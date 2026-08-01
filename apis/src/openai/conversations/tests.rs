@@ -214,6 +214,71 @@ fn reject_unknown_fields() {
 }
 
 #[test]
+fn config_accepts_pool_options() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        pool:
+          max_connections: 20
+          min_connections: 2
+          idle_timeout_secs: 300
+          acquire_timeout_secs: 15
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+
+    let pool = cfg.pool.expect("pool config should be present");
+    assert_eq!(pool.max_connections, Some(20));
+    assert_eq!(pool.min_connections, Some(2));
+    assert_eq!(pool.idle_timeout_secs, Some(300));
+    assert_eq!(pool.acquire_timeout_secs, Some(15));
+}
+
+#[test]
+fn config_accepts_partial_pool_options() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        pool:
+          max_connections: 50
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+
+    let pool = cfg.pool.expect("pool config should be present");
+    assert_eq!(pool.max_connections, Some(50));
+    assert!(pool.min_connections.is_none());
+    assert!(pool.idle_timeout_secs.is_none());
+    assert!(pool.acquire_timeout_secs.is_none());
+}
+
+#[test]
+fn config_omitted_pool_yields_none() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+    assert!(cfg.pool.is_none(), "omitted pool should be None");
+}
+
+#[test]
 fn reject_postgres_without_scheme() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"

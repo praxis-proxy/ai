@@ -3,12 +3,15 @@
 
 //! Filter 8: execute MCP tool calls against upstream MCP servers.
 //!
-//! Operates in two phases within the agentic loop:
+//! Operates in two phases within an
+//! `iterative_request_router` inference step:
 //!
-//! 1. **Response path** (`on_response_body`): identifies MCP tool calls in [`ResponsesState::tool_calls`], checks
-//!    approval policies, and writes `openai_mcp_dispatch.action` into [`filter_metadata`] to signal re-entry.
-//! 2. **Request path** (`on_request`, re-entry): executes pending MCP calls via [`mcp_client::call_tool`] and appends
-//!    results to `messages`, `persisted_messages`, and `output_items`.
+//! 1. **Response path** (`on_response_body`): after `agentic_loop` extracts model-produced function calls, identifies
+//!    calls backed by [`ResponsesState::mcp_tool_map`], checks approval policies, and writes
+//!    `openai_mcp_dispatch.action = "loop"` to filter results.
+//! 2. **Request-body path** (`on_request_body`, next IRR iteration): executes pending MCP calls via
+//!    [`mcp_client::call_tool`] and appends results to `messages`, `persisted_messages`, and `output_items` before
+//!    `openai_responses_proxy` serializes the next inference request.
 //!
 //! # Pipeline dependencies
 //!
@@ -16,16 +19,16 @@
 //! - **`openai_stream_events`** (or equivalent accumulator) must populate [`ResponsesState::tool_calls`] from the
 //!   upstream response. Currently only `function_call` events are accumulated; native `mcp_call` events require either
 //!   `mcp_tool_resolve` rewriting MCP tools into function tools or the accumulator adding `mcp_call` support.
-//! - **`agentic_loop`** (issue #26, not yet built) must read `openai_mcp_dispatch.action` from [`filter_metadata`] and
-//!   trigger pipeline re-entry so that phase 2 executes.
+//! - **`agentic_loop`** must run after this filter in request order, so response order is `agentic_loop` then
+//!   `openai_mcp_dispatch`.
+//! - The IRR transition must match `openai_mcp_dispatch.action = "loop"` and target the same inference step.
 //!
-//! Uses [`filter_metadata`] (not `filter_results`) because
-//! `filter_results` are cleared after branch evaluation and no
-//! branch evaluation runs in the response-body phase.
+//! Ordinary client-side function calls do not match the MCP tool map,
+//! so this filter reports `done` and returns them to the client.
 //!
 //! [`ResponsesState::tool_calls`]: super::state::ResponsesState
 //! [`ResponsesState::mcp_tool_map`]: super::state::ResponsesState
-//! [`filter_metadata`]: HttpFilterContext::filter_metadata
+//! [`filter_results`]: HttpFilterContext::filter_results
 
 pub(crate) mod approval;
 mod config;
@@ -56,6 +59,15 @@ use self::{
 };
 use super::{openai_mcp_tool_resolve::encode_function_name, state::ResponsesState};
 use crate::mcp_client;
+
+/// Filter result key consumed by `iterative_request_router`.
+const FILTER_RESULT_KEY: &str = "openai_mcp_dispatch";
+
+/// Continue with another inference iteration after MCP execution.
+const ACTION_LOOP: &str = "loop";
+
+/// Return the current model response to the client.
+const ACTION_DONE: &str = "done";
 
 // -----------------------------------------------------------------------------
 // McpDispatchFilter
@@ -103,7 +115,10 @@ impl McpDispatchFilter {
     }
 
     /// Handle a tool call that requires approval.
-    fn handle_approval_required(ctx: &mut HttpFilterContext<'_>, pending: &PendingApproval) -> FilterAction {
+    fn handle_approval_required(
+        ctx: &mut HttpFilterContext<'_>,
+        pending: &PendingApproval,
+    ) -> Result<FilterAction, FilterError> {
         debug!(
             tool_name = %pending.tool_name,
             server_label = %pending.server_label,
@@ -120,13 +135,14 @@ impl McpDispatchFilter {
 
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             warn!("ResponsesState missing when handling approval");
-            return FilterAction::Continue;
+            return Ok(FilterAction::Continue);
         };
-        state.output_items_mut().push(approval_event);
+        state.accumulated_output.push(approval_event);
 
         ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "done".to_owned());
+        set_action(ctx, ACTION_DONE)?;
 
-        FilterAction::Continue
+        Ok(FilterAction::Continue)
     }
 }
 
@@ -134,6 +150,16 @@ impl McpDispatchFilter {
 impl HttpFilter for McpDispatchFilter {
     fn name(&self) -> &'static str {
         "openai_mcp_dispatch"
+    }
+
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(self.max_body_bytes),
+        }
     }
 
     fn response_body_access(&self) -> BodyAccess {
@@ -146,7 +172,20 @@ impl HttpFilter for McpDispatchFilter {
         }
     }
 
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
@@ -169,7 +208,7 @@ impl HttpFilter for McpDispatchFilter {
         for result in results {
             state.messages.push(result.message.clone());
             state.persisted_messages.push(result.message);
-            state.output_items_mut().push(result.output_item);
+            state.accumulated_output.push(result.output_item);
         }
 
         let tool_map_ref = &state.mcp_tool_map;
@@ -194,17 +233,28 @@ impl HttpFilter for McpDispatchFilter {
 
         let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &state.mcp_tool_map);
         if mcp_calls.is_empty() {
+            set_action(ctx, ACTION_DONE)?;
             return Ok(FilterAction::Continue);
         }
 
         if let Some(pending) = find_approval_required(&mcp_calls, &state.mcp_tool_map) {
-            return Ok(Self::handle_approval_required(ctx, &pending));
+            return Self::handle_approval_required(ctx, &pending);
         }
 
         ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "execute_mcp".to_owned());
+        set_action(ctx, ACTION_LOOP)?;
 
         Ok(FilterAction::Continue)
     }
+}
+
+/// Publish the dispatch decision for IRR transition evaluation.
+fn set_action(ctx: &mut HttpFilterContext<'_>, action: &'static str) -> Result<(), FilterError> {
+    ctx.filter_results
+        .entry(FILTER_RESULT_KEY)
+        .or_default()
+        .set("action", action)?;
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
