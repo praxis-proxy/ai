@@ -241,11 +241,15 @@ mod tests {
     #[test]
     fn replace_counts_multibyte_content_in_bytes() {
         let mut body = Some(Bytes::from_static(b"{}"));
-        let mutated = json!({"input": "hello world"});
+        let mutated = json!({"input": "caf\u{00e9} \u{2615} \u{65e5}\u{672c}\u{8a9e}"});
 
         let mutation = replace_json_body(&mut body, &mutated, "prompt_enrich", "input").unwrap();
 
         assert_eq!(mutation.new_len(), serialized_len(&mutated));
+        assert!(
+            mutation.new_len() > "caf\u{00e9} \u{2615} \u{65e5}\u{672c}\u{8a9e}".len(),
+            "JSON serialization of multibyte content should produce more bytes than the rust str len"
+        );
     }
 
     #[test]
