@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+
+# GPU-accelerated vLLM image with a model baked in at build time.
+#
+# Reference: https://hub.docker.com/r/vllm/vllm-openai
+
+FROM vllm/vllm-openai:v0.26.0
+
+RUN pip install "huggingface-hub[cli]"
+
+ARG INFERENCE_MODEL=""
+
+ENV INFERENCE_MODEL="${INFERENCE_MODEL}"
+ENV MODEL_CACHE_DIR="/opt/vllm/models"
+
+RUN if [ -z "${INFERENCE_MODEL}" ]; then \
+        echo "ERROR: INFERENCE_MODEL build argument is required" >&2 && exit 1; \
+    fi
+
+RUN --mount=type=secret,id=hf_token \
+    set -e && \
+    model_path="${MODEL_CACHE_DIR}/${INFERENCE_MODEL}" && \
+    mkdir -p "${model_path}" && \
+    if [ -f /run/secrets/hf_token ]; then \
+        HF_TOKEN=$(cat /run/secrets/hf_token) && \
+        hf download "${INFERENCE_MODEL}" --local-dir "${model_path}" --token "${HF_TOKEN}"; \
+    else \
+        hf download "${INFERENCE_MODEL}" --local-dir "${model_path}"; \
+    fi && \
+    rm -rf "${MODEL_CACHE_DIR}/.huggingface" "${model_path}/original"
+
+RUN useradd -r -u 1001 -m vllm
+USER 1001
+
+ENTRYPOINT ["vllm", "serve"]
