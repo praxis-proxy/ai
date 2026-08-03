@@ -32,6 +32,7 @@ pub(crate) mod model_rewrite;
 pub(crate) mod openai_mcp_tool_resolve;
 pub(crate) mod openai_responses_proxy;
 pub(crate) mod openai_tool_parse;
+pub(crate) mod responses_to_chat_completions;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;

@@ -185,6 +185,20 @@ pub(crate) enum TranslationError {
     /// A Responses tool has no Chat Completions-compatible representation.
     #[error("unsupported Responses tool type for Chat Completions translation: {0}")]
     UnsupportedToolType(String),
+    /// A Responses tool choice has no Chat Completions-compatible representation.
+    #[error("unsupported Responses tool_choice type for Chat Completions translation: {0}")]
+    UnsupportedToolChoiceType(String),
+}
+
+/// Borrowed canonical request fields that supersede their original request values.
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestOverrides<'a> {
+    /// Canonical enriched message items.
+    messages: Option<&'a [Value]>,
+    /// Canonical processed tool definitions.
+    tools: Option<&'a [Value]>,
+    /// Canonical current tool choice.
+    tool_choice: Option<&'a Value>,
 }
 
 // -----------------------------------------------------------------------------
@@ -193,39 +207,73 @@ pub(crate) enum TranslationError {
 
 /// Convert an `OpenAI` `Responses` create request into a Chat Completions request.
 pub(crate) fn responses_request_to_chat_request(request: &Value) -> Result<Value, TranslationError> {
+    translate_responses_request(request, RequestOverrides::default())
+}
+
+/// Convert canonical Responses state into a Chat Completions request.
+pub(crate) fn responses_state_to_chat_request(
+    request: &Value,
+    messages: &[Value],
+    tools: &[Value],
+    tool_choice: &Value,
+) -> Result<Value, TranslationError> {
+    translate_responses_request(
+        request,
+        RequestOverrides {
+            messages: Some(messages),
+            tools: Some(tools),
+            tool_choice: Some(tool_choice),
+        },
+    )
+}
+
+/// Convert a Responses request using optional borrowed canonical state overrides.
+fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>) -> Result<Value, TranslationError> {
     let obj = request
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Responses request"))?;
 
     let mut chat = Map::new();
-    copy_field(obj, &mut chat, "model");
-    copy_field(obj, &mut chat, "temperature");
-    copy_field(obj, &mut chat, "top_p");
-    copy_field(obj, &mut chat, "presence_penalty");
-    copy_field(obj, &mut chat, "frequency_penalty");
-    copy_field(obj, &mut chat, "parallel_tool_calls");
-    copy_field(obj, &mut chat, "prompt_cache_key");
-    copy_field(obj, &mut chat, "service_tier");
-    copy_field(obj, &mut chat, "extra_body");
-    map_top_logprobs(obj, &mut chat);
-    map_reasoning_effort(obj, &mut chat);
-    map_text_format(obj, &mut chat);
+    map_request_parameters(obj, &mut chat);
 
-    if let Some(max_output_tokens) = obj.get("max_output_tokens") {
-        chat.insert("max_completion_tokens".to_owned(), max_output_tokens.clone());
-    }
-
-    let messages = build_chat_messages(obj)?;
+    let messages = build_chat_messages(obj, overrides.messages)?;
     chat.insert("messages".to_owned(), Value::Array(messages));
 
-    if let Some(tools) = build_chat_tools(obj)? {
+    let tools = overrides
+        .tools
+        .or_else(|| obj.get("tools").and_then(Value::as_array).map(Vec::as_slice));
+    if let Some(tools) = tools
+        && let Some(tools) = build_chat_tools(tools)?
+    {
         chat.insert("tools".to_owned(), tools);
     }
-    if let Some(tool_choice) = build_chat_tool_choice(obj)? {
+    let tool_choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
+    if let Some(tool_choice) = build_chat_tool_choice(tool_choice)? {
         chat.insert("tool_choice".to_owned(), tool_choice);
     }
 
     Ok(Value::Object(chat))
+}
+
+/// Copy supported scalar parameters into the Chat Completions request.
+fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value>) {
+    copy_field(obj, chat, "model");
+    copy_field(obj, chat, "temperature");
+    copy_field(obj, chat, "top_p");
+    copy_field(obj, chat, "presence_penalty");
+    copy_field(obj, chat, "frequency_penalty");
+    copy_field(obj, chat, "parallel_tool_calls");
+    copy_field(obj, chat, "prompt_cache_key");
+    copy_field(obj, chat, "service_tier");
+    copy_field(obj, chat, "extra_body");
+    map_top_logprobs(obj, chat);
+    map_reasoning_effort(obj, chat);
+    map_text_format(obj, chat);
+    map_stream_options(obj, chat);
+
+    if let Some(max_output_tokens) = obj.get("max_output_tokens") {
+        chat.insert("max_completion_tokens".to_owned(), max_output_tokens.clone());
+    }
 }
 
 /// Copy a field from one JSON object to another.
@@ -275,6 +323,25 @@ fn map_text_format(source: &Map<String, Value>, target: &mut Map<String, Value>)
     }
 }
 
+/// Preserve streaming controls while requiring token usage in streaming responses.
+fn map_stream_options(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    let stream = source.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(value) = source.get("stream") {
+        target.insert("stream".to_owned(), value.clone());
+    }
+    if !stream {
+        return;
+    }
+
+    let mut options = source
+        .get("stream_options")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    options.insert("include_usage".to_owned(), Value::Bool(true));
+    target.insert("stream_options".to_owned(), Value::Object(options));
+}
+
 /// Build Chat Completions `json_schema` response format from a Responses format.
 fn json_schema_response_format(format: &Map<String, Value>) -> Value {
     if let Some(json_schema) = format.get("json_schema").and_then(Value::as_object) {
@@ -297,7 +364,10 @@ fn json_schema_response_format(format: &Map<String, Value>) -> Value {
 }
 
 /// Build Chat Completions messages from `Responses` instructions and input.
-fn build_chat_messages(obj: &Map<String, Value>) -> Result<Vec<Value>, TranslationError> {
+fn build_chat_messages(
+    obj: &Map<String, Value>,
+    messages_override: Option<&[Value]>,
+) -> Result<Vec<Value>, TranslationError> {
     let mut messages = Vec::new();
 
     if let Some(instructions) = obj.get("instructions").and_then(Value::as_str)
@@ -306,7 +376,9 @@ fn build_chat_messages(obj: &Map<String, Value>) -> Result<Vec<Value>, Translati
         messages.push(json!({"role": "system", "content": instructions}));
     }
 
-    if let Some(input) = obj.get("input") {
+    if let Some(override_messages) = messages_override {
+        append_input_item_sequence(&mut messages, override_messages)?;
+    } else if let Some(input) = obj.get("input") {
         append_input_messages(&mut messages, input)?;
     }
 
@@ -587,10 +659,7 @@ fn convert_input_file_part(part: &Value) -> Result<Value, TranslationError> {
 }
 
 /// Build Chat Completions tool definitions from `Responses` tools.
-fn build_chat_tools(obj: &Map<String, Value>) -> Result<Option<Value>, TranslationError> {
-    let Some(tools) = obj.get("tools").and_then(Value::as_array) else {
-        return Ok(None);
-    };
+fn build_chat_tools(tools: &[Value]) -> Result<Option<Value>, TranslationError> {
     let mut chat_tools = Vec::new();
 
     for tool in tools {
@@ -628,8 +697,8 @@ fn convert_function_tool(tool: &Map<String, Value>) -> Value {
 }
 
 /// Convert Responses `tool_choice` into Chat Completions-compatible shape.
-fn build_chat_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, TranslationError> {
-    let Some(choice) = obj.get("tool_choice") else {
+fn build_chat_tool_choice(choice: Option<&Value>) -> Result<Option<Value>, TranslationError> {
+    let Some(choice) = choice else {
         return Ok(None);
     };
 
@@ -641,71 +710,17 @@ fn build_chat_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, Tra
                 copy_field(choice_obj, &mut function, "name");
                 Some(json!({"type": "function", "function": Value::Object(function)}))
             },
-            Some("allowed_tools") => {
-                let allowed_tools = build_allowed_tools_choice(choice_obj)?;
-                Some(json!({"type": "allowed_tools", "allowed_tools": allowed_tools}))
-            },
-            Some(other) => {
-                warn!(
-                    tool_choice_type = other,
-                    "dropping unsupported Responses tool_choice object"
-                );
-                None
-            },
-            None => None,
+            Some(other) => return Err(TranslationError::UnsupportedToolChoiceType(other.to_owned())),
+            None => return Err(TranslationError::UnsupportedToolChoiceType("unknown".to_owned())),
         },
-        _ => None,
+        _ => {
+            return Err(TranslationError::UnsupportedToolChoiceType(
+                json_type_name(choice).to_owned(),
+            ));
+        },
     };
 
     Ok(tool_choice)
-}
-
-/// Convert Responses allowed-tools choice payloads to Chat's nested tool shape.
-fn build_allowed_tools_choice(choice: &Map<String, Value>) -> Result<Value, TranslationError> {
-    let source = choice.get("allowed_tools").and_then(Value::as_object).unwrap_or(choice);
-    let mut allowed_tools = Map::new();
-
-    copy_field(source, &mut allowed_tools, "mode");
-    if let Some(tools) = source.get("tools").and_then(Value::as_array) {
-        allowed_tools.insert(
-            "tools".to_owned(),
-            Value::Array(
-                tools
-                    .iter()
-                    .map(convert_allowed_tool_choice_tool)
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-        );
-    }
-
-    Ok(Value::Object(allowed_tools))
-}
-
-/// Convert a Responses allowed function entry into Chat's nested function entry.
-fn convert_allowed_tool_choice_tool(tool: &Value) -> Result<Value, TranslationError> {
-    let Some(tool_obj) = tool.as_object() else {
-        return Ok(tool.clone());
-    };
-    let Some(tool_type) = tool_obj.get("type").and_then(Value::as_str) else {
-        return Ok(tool.clone());
-    };
-    if tool_type != "function" {
-        return Err(TranslationError::UnsupportedToolType(tool_type.to_owned()));
-    }
-    if tool_obj.contains_key("function") {
-        return Ok(tool.clone());
-    }
-
-    let mut function = Map::new();
-    copy_field(tool_obj, &mut function, "name");
-    copy_field(tool_obj, &mut function, "description");
-    copy_field(tool_obj, &mut function, "parameters");
-    copy_field(tool_obj, &mut function, "strict");
-
-    Ok(json!({
-        "type": "function",
-        "function": Value::Object(function)
-    }))
 }
 
 /// Return a stable JSON type name for diagnostics.

@@ -22,6 +22,10 @@ mod tests {
         super::chat_completions::responses_request_to_chat_request(request).unwrap()
     }
 
+    fn map_state(request: &Value, messages: &[Value], tools: &[Value], tool_choice: &Value) -> Value {
+        super::chat_completions::responses_state_to_chat_request(request, messages, tools, tool_choice).unwrap()
+    }
+
     fn map_error(request: &Value) -> String {
         super::chat_completions::responses_request_to_chat_request(request)
             .unwrap_err()
@@ -36,6 +40,28 @@ mod tests {
     fn non_object_responses_request_returns_expected_object_error() {
         let error = super::chat_completions::responses_request_to_chat_request(&json!("hello")).unwrap_err();
         assert_eq!(error.to_string(), "Responses request must be a JSON object");
+    }
+
+    #[test]
+    fn state_overrides_supply_enriched_messages_tools_and_tool_choice() {
+        let request = json!({
+            "model": "gpt-4.1-mini",
+            "input": "client input",
+            "tools": [],
+            "tool_choice": "none"
+        });
+        let messages = vec![json!({"role": "user", "content": "rehydrated input"})];
+        let tools = vec![json!({
+            "type": "function",
+            "name": "lookup",
+            "parameters": {"type": "object"}
+        })];
+
+        let mapped = map_state(&request, &messages, &tools, &json!("required"));
+
+        assert_eq!(mapped["messages"][0]["content"], "rehydrated input");
+        assert_eq!(mapped["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(mapped["tool_choice"], "required");
     }
 
     #[test]
@@ -87,6 +113,31 @@ mod tests {
     }
 
     #[test]
+    fn streaming_request_preserves_options_and_forces_usage() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "stream": true,
+            "stream_options": {
+                "include_usage": false,
+                "include_obfuscation": false
+            }
+        }));
+
+        assert_eq!(mapped["stream"], true);
+        assert_eq!(mapped["stream_options"]["include_usage"], true);
+        assert_eq!(mapped["stream_options"]["include_obfuscation"], false);
+    }
+
+    #[test]
+    fn non_streaming_request_does_not_invent_stream_options() {
+        let mapped = map(&json!({"model": "m", "input": "hello", "stream": false}));
+
+        assert_eq!(mapped["stream"], false);
+        assert!(mapped.get("stream_options").is_none());
+    }
+
+    #[test]
     fn simple_inputs_map_or_drop_cleanly() {
         let string_input = map(&json!({"model": "gpt-4o-mini", "instructions": "", "input": "Hello"}));
         let object_input = map(&json!({"model": "gpt-4o-mini", "input": {"role": "developer", "content": "terse"}}));
@@ -103,33 +154,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_choices_map_without_widening() {
+    fn function_tool_choice_maps_without_widening() {
         let function_choice = map(&json!({
             "model": "gpt-4o-mini", "input": "hello",
             "tool_choice": {"type": "function", "name": "lookup_weather"}
-        }));
-        let allowed_tools = map(&json!({
-            "model": "gpt-4o-mini", "input": "hello",
-            "tool_choice": {
-                "type": "allowed_tools",
-                "mode": "auto",
-                "tools": [{"type": "function", "name": "lookup_weather"}]
-            }
         }));
 
         assert_eq!(
             function_choice["tool_choice"],
             json!({"type": "function", "function": {"name": "lookup_weather"}})
-        );
-        assert_eq!(
-            allowed_tools["tool_choice"],
-            json!({
-                "type": "allowed_tools",
-                "allowed_tools": {
-                    "mode": "auto",
-                    "tools": [{"type": "function", "function": {"name": "lookup_weather"}}]
-                }
-            })
         );
     }
 
@@ -154,18 +187,21 @@ mod tests {
     }
 
     #[test]
-    fn non_function_allowed_tools_are_rejected() {
+    fn allowed_tools_choice_is_rejected_until_policy_filter_lands() {
         let error = map_error(&json!({
-            "model": "gpt-4o-mini",
+            "model": "m",
             "input": "hello",
             "tool_choice": {
                 "type": "allowed_tools",
                 "mode": "auto",
-                "tools": [{"type": "file_search"}]
+                "tools": [{"type": "function", "name": "lookup"}]
             }
         }));
 
-        assert!(error.contains("file_search"));
+        assert_eq!(
+            error,
+            "unsupported Responses tool_choice type for Chat Completions translation: allowed_tools"
+        );
     }
 
     #[test]
@@ -1142,35 +1178,37 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_non_string_non_object_is_dropped() {
-        let mapped = map(&json!({"model": "m", "input": "hello", "tool_choice": 42}));
+    fn non_string_non_object_tool_choice_is_rejected() {
+        let error = map_error(&json!({"model": "m", "input": "hello", "tool_choice": 42}));
 
-        assert!(mapped.get("tool_choice").is_none());
+        assert_eq!(
+            error,
+            "unsupported Responses tool_choice type for Chat Completions translation: number"
+        );
     }
 
     #[test]
-    fn tool_choice_object_without_type_is_dropped() {
-        let mapped = map(&json!({"model": "m", "input": "hello", "tool_choice": {"name": "f"}}));
+    fn tool_choice_object_without_type_is_rejected() {
+        let error = map_error(&json!({"model": "m", "input": "hello", "tool_choice": {"name": "f"}}));
 
-        assert!(mapped.get("tool_choice").is_none());
+        assert_eq!(
+            error,
+            "unsupported Responses tool_choice type for Chat Completions translation: unknown"
+        );
     }
 
     #[test]
-    fn allowed_tools_choice_with_nested_allowed_tools_key() {
-        let mapped = map(&json!({
+    fn mcp_tool_choice_is_rejected_in_base_converter() {
+        let error = map_error(&json!({
             "model": "m",
             "input": "hello",
             "tool_choice": {
-                "type": "allowed_tools",
-                "allowed_tools": {
-                    "mode": "auto",
-                    "tools": [{"type": "function", "name": "f"}]
-                }
+                "type": "mcp",
+                "server_label": "docs"
             }
         }));
 
-        assert_eq!(mapped["tool_choice"]["type"], "allowed_tools");
-        assert_eq!(mapped["tool_choice"]["allowed_tools"]["mode"], "auto");
+        assert!(error.ends_with(": mcp"));
     }
 
     // -------------------------------------------------------------------------

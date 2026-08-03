@@ -178,6 +178,10 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "responses_to_chat_completions" => praxis_ai_apis::openai::ResponsesToChatCompletionsFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "openai_mcp_tool_resolve" => praxis_ai_apis::openai::McpToolResolveFilter::from_config
     );
     praxis_filter::register_filters!(
@@ -286,6 +290,10 @@ mod tests {
         assert!(
             names.contains(&"openai_responses_validate"),
             "expected openai_responses_validate in registry"
+        );
+        assert!(
+            names.contains(&"responses_to_chat_completions"),
+            "expected responses_to_chat_completions in registry"
         );
         assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
         assert!(
