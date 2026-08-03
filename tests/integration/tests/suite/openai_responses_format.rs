@@ -110,10 +110,6 @@ fn unknown_json_routes_to_default_cluster() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    // On a non-create path the endpoint is not authoritative, so a body with
-    // no recognizable format signals stays unknown_json and falls through to
-    // the default cluster. (On POST /v1/responses the same body is a Responses
-    // create request — see `responses_create_without_discriminator_*`.)
     let body = r#"{"model":"gpt-4","prompt":"hello"}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
 
@@ -121,7 +117,9 @@ fn unknown_json_routes_to_default_cluster() {
     assert_eq!(
         parse_body(&raw),
         "default-backend",
-        "unknown JSON should route to default cluster"
+        "unknown JSON on a non-create path should route to the default cluster; the \
+         endpoint is not authoritative there (on POST /v1/responses the same body is a \
+         Responses create request -- see responses_create_without_discriminator_*)"
     );
 }
 
@@ -141,9 +139,6 @@ fn responses_create_without_discriminator_routes_to_responses_cluster() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    // A valid Responses create body may omit the discriminator fields body
-    // heuristics rely on; POST /v1/responses is authoritative, so it must
-    // still route to the responses cluster rather than fall through to default.
     let body = r#"{"model":"gpt-5"}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
@@ -151,7 +146,9 @@ fn responses_create_without_discriminator_routes_to_responses_cluster() {
     assert_eq!(
         parse_body(&raw),
         "responses-backend",
-        "no-discriminator create body should route to responses cluster"
+        "a create body omitting the discriminator fields must still route to the \
+         responses cluster because POST /v1/responses is authoritative, not fall \
+         through to default"
     );
 }
 
@@ -187,15 +184,14 @@ fn unknown_json_rejected_when_configured() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    // Reject applies to genuinely unknown JSON; use a non-create path so the
-    // body is not promoted to Responses by endpoint authority.
     let body = r#"{"model":"gpt-4","prompt":"hello"}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
 
     assert_eq!(
         parse_status(&raw),
         400,
-        "unknown JSON should be rejected when on_invalid: reject"
+        "unknown JSON should be rejected when on_invalid: reject; this uses a \
+         non-create path so the body is not promoted to responses by endpoint authority"
     );
     let response_body = parse_body(&raw);
     assert!(

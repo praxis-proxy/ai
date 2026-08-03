@@ -227,10 +227,6 @@ fn unknown_json_continues_in_continue_mode() {
 
 #[tokio::test]
 async fn on_request_body_rejects_unknown_json() {
-    // On a non-create path the endpoint is not authoritative, so a body with
-    // no recognizable format signals classifies as unknown_json and is
-    // rejected. (On POST /v1/responses the same body is a Responses create
-    // request — see `post_v1_responses_create_without_discriminator_*`.)
     let action = run_filter_raw_with_method(
         "on_invalid: reject",
         r#"{"prompt":"hello"}"#,
@@ -240,7 +236,9 @@ async fn on_request_body_rejects_unknown_json() {
     .await;
     assert!(
         matches!(action, FilterAction::Reject(_)),
-        "unknown JSON should be rejected"
+        "unknown JSON on a non-create path should be rejected; the endpoint is not \
+         authoritative there (on POST /v1/responses the same body is promoted to \
+         responses -- see post_v1_responses_create_without_discriminator_*)"
     );
 }
 
@@ -761,6 +759,25 @@ async fn post_v1_responses_create_preserves_body_facts() {
             .map(String::as_str),
         Some("false"),
         "store fact should be preserved"
+    );
+}
+
+/// Endpoint authority must hold under `on_invalid: reject`: a valid
+/// no-discriminator create body is a Responses request, so the reject path
+/// must never see it.
+#[tokio::test]
+async fn post_v1_responses_create_without_discriminator_not_rejected() {
+    let action = run_filter_raw_with_method(
+        "on_invalid: reject",
+        r#"{"model":"gpt-5"}"#,
+        http::Method::POST,
+        "/v1/responses",
+    )
+    .await;
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "valid no-discriminator body on the create endpoint must not be rejected"
     );
 }
 
