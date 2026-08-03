@@ -4,9 +4,9 @@
 //! File watcher for hot config reload.
 //!
 //! Monitors the config file for changes, debounces filesystem
-//! events, and triggers [`reload_pipelines`] on each valid change.
+//! events, and triggers [`reload_pipelines_with_client`] on each valid change.
 //!
-//! [`reload_pipelines`]: crate::reload::reload_pipelines
+//! [`reload_pipelines_with_client`]: crate::reload::reload_pipelines_with_client
 
 use std::{
     path::PathBuf,
@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::reload::reload_pipelines;
+use crate::reload::reload_pipelines_with_client;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -62,7 +62,7 @@ pub(crate) struct WatcherParams {
     /// Token for clean watcher shutdown.
     pub(crate) shutdown: CancellationToken,
 
-    /// Shared sub-request client, preserved across reloads.
+    /// Shared sub-request client retained across pipeline reloads.
     pub(crate) subrequest_client: praxis_core::subrequest::SubRequestClient,
 }
 
@@ -174,7 +174,7 @@ fn handle_reload(
         },
     };
 
-    match reload_pipelines(
+    match reload_pipelines_with_client(
         &new_config,
         current_config,
         registry,
@@ -310,7 +310,9 @@ mod tests {
             pipelines,
             registry,
             shutdown: shutdown.clone(),
-            subrequest_client: test_client(),
+            subrequest_client: praxis_core::subrequest::SubRequestClient::new(
+                praxis_core::subrequest::SubRequestConnector::new(8, None),
+            ),
         });
 
         std::thread::sleep(Duration::from_millis(100));
@@ -345,7 +347,9 @@ mod tests {
             pipelines: Arc::clone(&pipelines),
             registry: Arc::clone(&registry),
             shutdown: shutdown.clone(),
-            subrequest_client: test_client(),
+            subrequest_client: praxis_core::subrequest::SubRequestClient::new(
+                praxis_core::subrequest::SubRequestConnector::new(8, None),
+            ),
         });
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
@@ -388,7 +392,9 @@ mod tests {
             pipelines: Arc::clone(&pipelines),
             registry: Arc::clone(&registry),
             shutdown: shutdown.clone(),
-            subrequest_client: test_client(),
+            subrequest_client: praxis_core::subrequest::SubRequestClient::new(
+                praxis_core::subrequest::SubRequestConnector::new(8, None),
+            ),
         });
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
@@ -460,7 +466,9 @@ mod tests {
             pipelines,
             registry,
             shutdown: shutdown.clone(),
-            subrequest_client: test_client(),
+            subrequest_client: praxis_core::subrequest::SubRequestClient::new(
+                praxis_core::subrequest::SubRequestConnector::new(8, None),
+            ),
         });
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -478,6 +486,11 @@ mod tests {
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
+
+    /// Minimal sub-request client for tests.
+    fn test_client() -> praxis_core::subrequest::SubRequestClient {
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
+    }
 
     /// Poll `predicate` every 20ms until it returns `true` or `timeout` elapses.
     fn poll_until(timeout: Duration, predicate: impl Fn() -> bool) {
@@ -509,11 +522,6 @@ mod tests {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.0).expect("failed to restore working directory");
         }
-    }
-
-    /// Minimal sub-request client for tests.
-    fn test_client() -> praxis_core::subrequest::SubRequestClient {
-        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
     }
 
     /// Valid YAML config for watcher tests.

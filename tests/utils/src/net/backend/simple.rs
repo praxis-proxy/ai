@@ -541,7 +541,7 @@ pub fn start_backend_with_shutdown(body: &str) -> BackendGuard {
 // -----------------------------------------------------------------------------
 
 /// Map an HTTP status code to its reason phrase.
-fn reason_phrase(status: u16) -> &'static str {
+pub(super) fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",

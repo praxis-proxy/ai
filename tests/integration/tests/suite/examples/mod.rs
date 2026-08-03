@@ -11,6 +11,7 @@ mod agentic_loop;
 mod agentic_routing;
 mod anthropic_messages;
 mod credential_injection;
+mod file_search_callout;
 mod full_flow;
 mod guardrails;
 mod mcp_broker;
