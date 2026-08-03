@@ -33,8 +33,7 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::value_safety::is_safe_promoted_value, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
 use tracing::{debug, trace};
 
@@ -42,14 +41,7 @@ use self::{
     config::{ToolParseConfig, build_config},
     parser::{ParsedTools, parse_tools},
 };
-use crate::classifier::is_responses_create;
-
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Maximum length of a body-derived value promoted to filter results.
-const MAX_PROMOTED_VALUE_LEN: usize = 256;
+use crate::{classifier::is_responses_create, promotion::is_promotable_value};
 
 // -----------------------------------------------------------------------------
 // ToolParseFilter
@@ -174,10 +166,13 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) {
     write_tool_presence_metadata(ctx, parsed);
 
     if let Some(tc) = &parsed.tool_choice {
-        if let Some(val) = promotable_tool_choice_value(tc) {
-            ctx.set_metadata("openai_tool_parse.tool_choice", val);
+        let choice = tc.as_str();
+        if is_promotable_value(choice) {
+            ctx.set_metadata("openai_tool_parse.tool_choice", choice);
         }
-        if let Some(type_str) = promotable_tool_choice_type(tc) {
+        if let Some(type_str) = tc.type_str()
+            && is_promotable_value(type_str)
+        {
             ctx.set_metadata("openai_tool_parse.tool_choice_type", type_str);
         }
     }
@@ -297,10 +292,13 @@ fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools)
     promote_tool_presence_results(results, parsed)?;
 
     if let Some(tc) = &parsed.tool_choice {
-        if let Some(val) = promotable_tool_choice_value(tc) {
-            results.set("tool_choice", val.to_owned())?;
+        let choice = tc.as_str();
+        if is_promotable_value(choice) {
+            results.set("tool_choice", choice.to_owned())?;
         }
-        if let Some(type_str) = promotable_tool_choice_type(tc) {
+        if let Some(type_str) = tc.type_str()
+            && is_promotable_value(type_str)
+        {
             results.set("tool_choice_type", type_str.to_owned())?;
         }
     }
@@ -328,21 +326,4 @@ fn promote_tool_presence_results(
         }
     }
     Ok(())
-}
-
-/// Return a safe, bounded `tool_choice` value for metadata and
-/// filter results.
-fn promotable_tool_choice_value(choice: &parser::ToolChoice) -> Option<&str> {
-    is_safe_promoted(choice.as_str())
-}
-
-/// Return a safe, bounded `tool_choice_type` value for metadata
-/// and filter results.
-fn promotable_tool_choice_type(choice: &parser::ToolChoice) -> Option<&str> {
-    choice.type_str().and_then(is_safe_promoted)
-}
-
-/// Check that a value is safe and bounded for promotion.
-fn is_safe_promoted(val: &str) -> Option<&str> {
-    (val.len() <= MAX_PROMOTED_VALUE_LEN && is_safe_promoted_value(val)).then_some(val)
 }

@@ -14,6 +14,7 @@ pub mod classifier;
 pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
+pub mod promotion;
 #[cfg(feature = "store")]
 pub mod store;
 pub(crate) mod subrequest;

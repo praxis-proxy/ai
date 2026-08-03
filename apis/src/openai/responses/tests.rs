@@ -448,7 +448,7 @@ async fn missing_optional_facts_not_promoted() {
 }
 
 #[tokio::test]
-async fn oversized_model_not_promoted_to_header_or_results() {
+async fn oversized_model_not_promoted_to_header_or_results_or_metadata() {
     let long_model = "x".repeat(300);
     let body_str = format!(r#"{{"model":"{long_model}","input":"test"}}"#);
     let ctx = run_filter("{}", &body_str).await;
@@ -460,6 +460,10 @@ async fn oversized_model_not_promoted_to_header_or_results() {
     );
     let results = ctx.filter_results.get("openai_responses_format").unwrap();
     assert!(results.get("model").is_none(), "oversized model not in results");
+    assert!(
+        !ctx.filter_metadata.contains_key("openai_responses_format.model"),
+        "oversized model not in metadata"
+    );
 }
 
 #[tokio::test]
