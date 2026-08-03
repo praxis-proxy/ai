@@ -16,6 +16,7 @@ mod credential_injection;
 mod file_search_callout;
 mod full_flow;
 mod guardrails;
+mod lakera_guard;
 mod mcp_broker;
 mod model_to_header;
 mod openai_conversations;
