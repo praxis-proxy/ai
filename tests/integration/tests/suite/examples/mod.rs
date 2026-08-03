@@ -17,6 +17,7 @@ mod full_flow;
 mod full_flow_agentic;
 mod guardrails;
 mod inference_fallback;
+mod lakera_guard;
 mod mcp_broker;
 mod model_to_header;
 mod openai_agentic_loop;
