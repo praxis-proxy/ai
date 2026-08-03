@@ -144,7 +144,7 @@ impl ResponsesToChatCompletionsFilter {
     ) -> Result<(), FilterError> {
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
             Some(RESPONSE_TRANSFORM_ERROR) => {
-                transform_provider_error(ctx, body)?;
+                transform_provider_error(ctx, body, self.config.max_body_bytes)?;
                 Ok(())
             },
             Some(RESPONSE_TRANSFORM_SUCCESS) => self.transform_success_response(ctx, body),
@@ -203,8 +203,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         BodyAccess::ReadWrite
     }
 
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
 
@@ -267,6 +266,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Ok(bytes) => bytes,
             Err(action) => return Ok(action),
         };
+        ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
         ctx.set_metadata(ARMED_KEY, "true");
         ctx.set_metadata(CREATED_AT_KEY, ctx.time_source.now().as_secs().to_string());
@@ -349,10 +349,22 @@ fn captured_response_status(ctx: &HttpFilterContext<'_>) -> Result<http::StatusC
 }
 
 /// Normalize a finite provider error using the response-phase status snapshot.
-fn transform_provider_error(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) -> Result<(), FilterError> {
+fn transform_provider_error(
+    ctx: &HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    max_body_bytes: usize,
+) -> Result<(), FilterError> {
     let status = captured_response_status(ctx)?;
     let normalized = normalize_provider_error(status, body.as_deref().unwrap_or_default());
-    *body = Some(responses_error_body(&normalized.code, &normalized.message));
+    let mut transformed = responses_error_body(&normalized.code, &normalized.message);
+    if transformed.len() > max_body_bytes {
+        let fallback = normalize_provider_error(status, &[]);
+        transformed = responses_error_body(&fallback.code, &fallback.message);
+    }
+    if transformed.len() > max_body_bytes {
+        return Err("responses_to_chat_completions: normalized provider error exceeds maximum size".into());
+    }
+    *body = Some(transformed);
     Ok(())
 }
 

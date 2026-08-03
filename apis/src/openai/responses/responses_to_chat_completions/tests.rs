@@ -31,7 +31,7 @@ fn default_config_parses() {
 }
 
 #[tokio::test]
-async fn request_prevents_encoded_transformed_responses() {
+async fn request_headers_wait_for_successful_classification() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -39,11 +39,7 @@ async fn request_prevents_encoded_transformed_responses() {
     let action = filter.on_request(&mut context).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
-    assert!(
-        context
-            .request_headers_to_remove
-            .contains(&http::header::ACCEPT_ENCODING)
-    );
+    assert!(context.request_headers_to_remove.is_empty());
 }
 
 #[tokio::test]
@@ -183,6 +179,11 @@ async fn canonical_state_is_translated_and_arms_response() {
     assert_eq!(translated["messages"][0]["content"], "earlier history");
     assert_eq!(translated["messages"][1]["content"], "current input");
     assert_eq!(translated["stream"], false);
+    assert!(
+        context
+            .request_headers_to_remove
+            .contains(&http::header::ACCEPT_ENCODING)
+    );
     assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
     assert_eq!(context.get_metadata(CREATED_AT_KEY), Some("1700000000"));
 }
@@ -629,6 +630,43 @@ async fn finite_provider_error_uses_captured_status_without_mutable_headers() {
     assert_eq!(parsed["error"]["type"], "rate_limit_exceeded");
     assert_eq!(parsed["error"]["message"], "slow down");
     assert!(parsed["error"]["param"].is_null());
+}
+
+#[tokio::test]
+async fn expanded_provider_error_falls_back_within_configured_limit() {
+    let yaml = serde_yaml::from_str("max_body_bytes: 150").unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.status = StatusCode::BAD_REQUEST;
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let provider_body = serde_json::to_vec(&json!({
+        "error": {
+            "code": "invalid_prompt",
+            "message": "x".repeat(80)
+        }
+    }))
+    .unwrap();
+    assert!(provider_body.len() <= 150);
+    let mut body = Some(Bytes::from(provider_body));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(body.as_ref().unwrap().len() <= 150);
+    let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(parsed["error"]["message"], "upstream provider returned an error");
 }
 
 #[tokio::test]

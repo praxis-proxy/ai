@@ -35,7 +35,7 @@ fn default_text_config() -> Value {
 /// Request-scoped context needed to build a `Responses` resource from a provider
 /// Chat Completions response.
 #[derive(Debug, Clone)]
-pub(crate) struct ResponseContext {
+pub(crate) struct ResponseContext<'a> {
     /// Stable `Responses` resource id assigned by the caller.
     pub(crate) response_id: String,
     /// Creation timestamp for the `Responses` resource.
@@ -43,19 +43,19 @@ pub(crate) struct ResponseContext {
     /// Terminal timestamp for completed or incomplete `Responses` resources.
     pub(crate) completed_at: Option<u64>,
     /// Requested model name to expose on the `Responses` resource.
-    pub(crate) model: String,
+    pub(crate) model: &'a str,
     /// Optional `Responses` instructions carried from the original request.
-    pub(crate) instructions: Option<String>,
+    pub(crate) instructions: Option<&'a str>,
     /// Original `Responses` input value.
-    pub(crate) input: Value,
+    pub(crate) input: Option<&'a Value>,
     /// Original request metadata to carry onto the response.
-    pub(crate) metadata: Value,
+    pub(crate) metadata: Option<&'a Value>,
     /// Original `Responses` text configuration to carry onto the response.
-    pub(crate) text: Value,
+    pub(crate) text: Option<&'a Value>,
     /// Request temperature to echo, or the `Responses` default when absent.
-    pub(crate) temperature: Option<Value>,
+    pub(crate) temperature: Option<&'a Value>,
     /// Request top-p value to echo, or the `Responses` default when absent.
-    pub(crate) top_p: Option<Value>,
+    pub(crate) top_p: Option<&'a Value>,
     /// Request output token limit to echo.
     pub(crate) max_output_tokens: Option<u64>,
     /// Request tool-call limit to echo.
@@ -63,30 +63,30 @@ pub(crate) struct ResponseContext {
     /// Whether the original request allowed parallel tool calls.
     pub(crate) parallel_tool_calls: bool,
     /// Optional predecessor response id from the original request.
-    pub(crate) previous_response_id: Option<String>,
+    pub(crate) previous_response_id: Option<&'a str>,
     /// Whether the caller asked the `Responses` API to store the response.
     pub(crate) store: bool,
     /// Original `Responses` tool definitions.
-    pub(crate) tools: Vec<Value>,
+    pub(crate) tools: &'a [Value],
     /// Original `Responses` tool choice value.
-    pub(crate) tool_choice: Option<Value>,
+    pub(crate) tool_choice: Option<&'a Value>,
     /// Request presence penalty to echo on the `Responses` resource.
-    pub(crate) presence_penalty: Option<Value>,
+    pub(crate) presence_penalty: Option<&'a Value>,
     /// Request frequency penalty to echo on the `Responses` resource.
-    pub(crate) frequency_penalty: Option<Value>,
+    pub(crate) frequency_penalty: Option<&'a Value>,
     /// Request top-logprobs value to echo on the `Responses` resource.
     pub(crate) top_logprobs: Option<u64>,
     /// Request service tier to echo when the provider omits one.
-    pub(crate) service_tier: Option<Value>,
+    pub(crate) service_tier: Option<&'a Value>,
     /// Request safety identifier to echo on the `Responses` resource.
-    pub(crate) safety_identifier: Option<Value>,
+    pub(crate) safety_identifier: Option<&'a Value>,
     /// Request prompt cache key to echo on the `Responses` resource.
-    pub(crate) prompt_cache_key: Option<Value>,
+    pub(crate) prompt_cache_key: Option<&'a Value>,
 }
 
-impl ResponseContext {
+impl<'a> ResponseContext<'a> {
     /// Build a response context from the original `Responses` request.
-    pub(crate) fn from_responses_request(request: &Value, response_id: String, created_at: u64) -> Self {
+    pub(crate) fn from_responses_request(request: &'a Value, response_id: String, created_at: u64) -> Self {
         let request = ResponseRequestFields::new(request);
         Self {
             response_id,
@@ -94,24 +94,24 @@ impl ResponseContext {
             completed_at: None,
             model: request.string("model").unwrap_or_default(),
             instructions: request.string("instructions"),
-            input: request.cloned("input").unwrap_or(Value::Null),
-            metadata: request.cloned("metadata").unwrap_or_else(|| json!({})),
-            text: request.cloned("text").unwrap_or_else(default_text_config),
-            temperature: request.cloned("temperature"),
-            top_p: request.cloned("top_p"),
+            input: request.value("input"),
+            metadata: request.value("metadata"),
+            text: request.value("text"),
+            temperature: request.value("temperature"),
+            top_p: request.value("top_p"),
             max_output_tokens: request.u64("max_output_tokens"),
             max_tool_calls: request.u64("max_tool_calls"),
             parallel_tool_calls: request.bool("parallel_tool_calls").unwrap_or(true),
             previous_response_id: request.string("previous_response_id"),
             store: request.bool("store").unwrap_or(true),
             tools: request.array("tools").unwrap_or_default(),
-            tool_choice: request.cloned("tool_choice"),
-            presence_penalty: request.cloned("presence_penalty"),
-            frequency_penalty: request.cloned("frequency_penalty"),
+            tool_choice: request.value("tool_choice"),
+            presence_penalty: request.value("presence_penalty"),
+            frequency_penalty: request.value("frequency_penalty"),
             top_logprobs: request.u64("top_logprobs"),
-            service_tier: request.cloned("service_tier"),
-            safety_identifier: request.cloned("safety_identifier"),
-            prompt_cache_key: request.cloned("prompt_cache_key"),
+            service_tier: request.value("service_tier"),
+            safety_identifier: request.value("safety_identifier"),
+            prompt_cache_key: request.value("prompt_cache_key"),
         }
     }
 
@@ -138,17 +138,14 @@ impl<'a> ResponseRequestFields<'a> {
         }
     }
 
-    /// Clone a field value.
-    fn cloned(self, key: &str) -> Option<Value> {
-        self.obj.and_then(|obj| obj.get(key)).cloned()
+    /// Borrow a field value.
+    fn value(self, key: &str) -> Option<&'a Value> {
+        self.obj.and_then(|obj| obj.get(key))
     }
 
-    /// Clone a string field.
-    fn string(self, key: &str) -> Option<String> {
-        self.obj
-            .and_then(|obj| obj.get(key))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+    /// Borrow a string field.
+    fn string(self, key: &str) -> Option<&'a str> {
+        self.obj.and_then(|obj| obj.get(key)).and_then(Value::as_str)
     }
 
     /// Read an unsigned integer field.
@@ -161,9 +158,12 @@ impl<'a> ResponseRequestFields<'a> {
         self.obj.and_then(|obj| obj.get(key)).and_then(Value::as_bool)
     }
 
-    /// Clone an array field.
-    fn array(self, key: &str) -> Option<Vec<Value>> {
-        self.obj.and_then(|obj| obj.get(key)).and_then(Value::as_array).cloned()
+    /// Borrow an array field.
+    fn array(self, key: &str) -> Option<&'a [Value]> {
+        self.obj
+            .and_then(|obj| obj.get(key))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
     }
 }
 
@@ -246,6 +246,7 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
         && let Some(tools) = build_chat_tools(tools)?
     {
         chat.insert("tools".to_owned(), tools);
+        chat.remove("response_format");
     }
     let tool_choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
     if let Some(tool_choice) = build_chat_tool_choice(tool_choice)? {
@@ -742,7 +743,7 @@ fn json_type_name(value: &Value) -> &'static str {
 /// Convert a Chat Completions response into an `OpenAI` `Responses` resource.
 pub(crate) fn chat_response_to_response_resource(
     response: &Value,
-    context: &ResponseContext,
+    context: &ResponseContext<'_>,
 ) -> Result<Value, TranslationError> {
     let obj = response
         .as_object()
@@ -783,7 +784,7 @@ struct ResponseResourceParts<'a> {
 }
 
 /// Build a full `Responses` resource snapshot.
-fn response_resource(context: &ResponseContext, parts: &ResponseResourceParts<'_>) -> Value {
+fn response_resource(context: &ResponseContext<'_>, parts: &ResponseResourceParts<'_>) -> Value {
     let mut resource = json!({
         "id": context.response_id,
         "object": "response",
@@ -794,17 +795,17 @@ fn response_resource(context: &ResponseContext, parts: &ResponseResourceParts<'_
         "instructions": instructions_value(context),
         "max_output_tokens": max_output_tokens_value(context),
         "model": context.model,
-        "input": context.input,
+        "input": request_field_or_null(context.input),
         "output": Value::Array(parts.output.to_vec()),
         "parallel_tool_calls": context.parallel_tool_calls,
         "previous_response_id": previous_response_id_value(context),
         "reasoning": Value::Null,
         "store": context.store,
-        "temperature": number_or_default(context.temperature.as_ref(), 1.0),
-        "text": context.text,
+        "temperature": number_or_default(context.temperature, 1.0),
+        "text": text_value(context),
         "tool_choice": tool_choice_value(context),
-        "tools": context.tools,
-        "top_p": number_or_default(context.top_p.as_ref(), 1.0),
+        "tools": Value::Array(context.tools.to_vec()),
+        "top_p": number_or_default(context.top_p, 1.0),
         // TODO(responses): preserve request truncation when the compatibility
         // layer supports truncation semantics instead of emitting the default.
         "truncation": DEFAULT_TRUNCATION,
@@ -820,25 +821,25 @@ fn response_resource(context: &ResponseContext, parts: &ResponseResourceParts<'_
 }
 
 /// Insert required response fields that are sourced from the original request.
-fn insert_request_resource_fields(resource: &mut Value, context: &ResponseContext, status: &str) {
+fn insert_request_resource_fields(resource: &mut Value, context: &ResponseContext<'_>, status: &str) {
     if let Some(obj) = resource.as_object_mut() {
         obj.insert("completed_at".to_owned(), completed_at_value(status, context));
         obj.insert("max_tool_calls".to_owned(), max_tool_calls_value(context));
         obj.insert(
             "prompt_cache_key".to_owned(),
-            request_field_or_null(context.prompt_cache_key.as_ref()),
+            request_field_or_null(context.prompt_cache_key),
         );
         obj.insert(
             "safety_identifier".to_owned(),
-            request_field_or_null(context.safety_identifier.as_ref()),
+            request_field_or_null(context.safety_identifier),
         );
         obj.insert(
             "presence_penalty".to_owned(),
-            number_or_default(context.presence_penalty.as_ref(), 0.0),
+            number_or_default(context.presence_penalty, 0.0),
         );
         obj.insert(
             "frequency_penalty".to_owned(),
-            number_or_default(context.frequency_penalty.as_ref(), 0.0),
+            number_or_default(context.frequency_penalty, 0.0),
         );
         obj.insert(
             "top_logprobs".to_owned(),
@@ -881,29 +882,28 @@ fn incomplete_details(finish_reason: Option<&str>) -> Value {
 }
 
 /// Build the `instructions` response field.
-fn instructions_value(context: &ResponseContext) -> Value {
+fn instructions_value(context: &ResponseContext<'_>) -> Value {
     context
         .instructions
-        .as_ref()
-        .map_or(Value::Null, |instructions| Value::String(instructions.clone()))
+        .map_or(Value::Null, |instructions| Value::String(instructions.to_owned()))
 }
 
 /// Build the `max_output_tokens` response field.
-fn max_output_tokens_value(context: &ResponseContext) -> Value {
+fn max_output_tokens_value(context: &ResponseContext<'_>) -> Value {
     context
         .max_output_tokens
         .map_or(Value::Null, |max_output_tokens| Value::Number(max_output_tokens.into()))
 }
 
 /// Build the `max_tool_calls` response field.
-fn max_tool_calls_value(context: &ResponseContext) -> Value {
+fn max_tool_calls_value(context: &ResponseContext<'_>) -> Value {
     context
         .max_tool_calls
         .map_or(Value::Null, |max_tool_calls| Value::Number(max_tool_calls.into()))
 }
 
 /// Build the `completed_at` response field.
-fn completed_at_value(status: &str, context: &ResponseContext) -> Value {
+fn completed_at_value(status: &str, context: &ResponseContext<'_>) -> Value {
     if status == "in_progress" {
         Value::Null
     } else {
@@ -917,36 +917,39 @@ fn request_field_or_null(value: Option<&Value>) -> Value {
 }
 
 /// Build the `previous_response_id` response field.
-fn previous_response_id_value(context: &ResponseContext) -> Value {
+fn previous_response_id_value(context: &ResponseContext<'_>) -> Value {
     context
         .previous_response_id
-        .as_ref()
-        .map_or(Value::Null, |response_id| Value::String(response_id.clone()))
+        .map_or(Value::Null, |response_id| Value::String(response_id.to_owned()))
 }
 
 /// Build the `tool_choice` response field.
-fn tool_choice_value(context: &ResponseContext) -> Value {
+fn tool_choice_value(context: &ResponseContext<'_>) -> Value {
     context
         .tool_choice
-        .as_ref()
         .cloned()
         .unwrap_or_else(|| Value::String(DEFAULT_TOOL_CHOICE.to_owned()))
 }
 
 /// Build the `metadata` response field.
-fn metadata_value(context: &ResponseContext) -> Value {
-    if context.metadata.is_object() {
-        context.metadata.clone()
-    } else {
-        json!({})
-    }
+fn metadata_value(context: &ResponseContext<'_>) -> Value {
+    context
+        .metadata
+        .filter(|metadata| metadata.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
+/// Build the `text` response field.
+fn text_value(context: &ResponseContext<'_>) -> Value {
+    context.text.cloned().unwrap_or_else(default_text_config)
 }
 
 /// Build provider service tier, falling back to the request context when absent.
-fn service_tier_value_with_context(obj: &Map<String, Value>, context: &ResponseContext) -> Value {
+fn service_tier_value_with_context(obj: &Map<String, Value>, context: &ResponseContext<'_>) -> Value {
     obj.get("service_tier")
         .cloned()
-        .or_else(|| context.service_tier.clone())
+        .or_else(|| context.service_tier.cloned())
         .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()))
 }
 
@@ -964,7 +967,7 @@ fn number_value(value: f64) -> Value {
 }
 
 /// Build all `Responses` output items from the first Chat choice.
-fn build_output_items(obj: &Map<String, Value>, context: &ResponseContext, status: &str) -> Vec<Value> {
+fn build_output_items(obj: &Map<String, Value>, context: &ResponseContext<'_>, status: &str) -> Vec<Value> {
     let mut output = Vec::new();
     let Some(choice) = first_choice(obj) else {
         return output;
@@ -982,7 +985,7 @@ fn build_output_items(obj: &Map<String, Value>, context: &ResponseContext, statu
 fn append_message_output(
     output: &mut Vec<Value>,
     message: Option<&Value>,
-    context: &ResponseContext,
+    context: &ResponseContext<'_>,
     status: &str,
     logprobs: &[Value],
 ) {
@@ -996,12 +999,12 @@ fn append_message_output(
 }
 
 /// Build a stable assistant message output item id.
-fn message_item_id(context: &ResponseContext) -> String {
+fn message_item_id(context: &ResponseContext<'_>) -> String {
     format!("msg_{}", context.response_id)
 }
 
 /// Build a schema-complete `Responses` assistant message item.
-fn message_output_item(context: &ResponseContext, status: &str, content: &[Value]) -> Value {
+fn message_output_item(context: &ResponseContext<'_>, status: &str, content: &[Value]) -> Value {
     json!({
         "id": message_item_id(context),
         "type": "message",

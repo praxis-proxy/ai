@@ -43,4 +43,4 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 | `openai_stream_events` | ✓ | — | ✓ | ReadOnly / Stream |
 | `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | — | — |
 | `openai_web_search` | — | ReadOnly / StreamBuffer | — | ReadOnly / StreamBuffer |
-| `responses_to_chat_completions` | ✓ | ReadWrite / StreamBuffer | ✓ | ReadWrite / Stream |
+| `responses_to_chat_completions` | — | ReadWrite / StreamBuffer | ✓ | ReadWrite / Stream |
