@@ -20,6 +20,7 @@ see the [Praxis core filter reference][core-ref].
 | [`anthropic_stream_events`](anthropic_stream_events.md) | Transforms streaming SSE responses between `OpenAI` and Anthropic formats, processing each chunk as it arrives. |
 | [`anthropic_to_openai`](anthropic_to_openai.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The filter name refers to the OpenAI Chat Completions wire shape, not the Responses API; non-OpenAI compatible backends are valid targets. |
 | [`anthropic_validate`](anthropic_validate.md) | Validates Anthropic Messages request bodies for proxy-owned JSON envelope requirements. |
+| [`anthropic_web_search`](anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
 
 ### OpenAI
 

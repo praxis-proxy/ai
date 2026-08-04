@@ -8,6 +8,7 @@ mod protocol;
 mod stream_events;
 pub(crate) mod to_openai;
 mod validate;
+mod web_search;
 mod wire;
 
 pub use messages_format::AnthropicMessagesFormatFilter;
@@ -15,3 +16,4 @@ pub use protocol::AnthropicMessagesProtocolFilter;
 pub use stream_events::AnthropicStreamEventsFilter;
 pub use to_openai::AnthropicToOpenaiFilter;
 pub use validate::AnthropicValidateFilter;
+pub use web_search::AnthropicWebSearchFilter;
