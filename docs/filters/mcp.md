@@ -5,7 +5,7 @@
 
 Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata.
 
-MCP static catalog filter that aggregates tool catalogs from multiple backend MCP servers and handles `initialize`, `tools/list`, `tools/call`, `ping`, and `notifications/initialized` as a static broker.
+MCP static catalog filter that aggregates tool catalogs from multiple backend MCP servers and handles `tools/list`, `tools/call`, and current-profile broker methods (`initialize`, `ping`, and `notifications/initialized`).
 
 ## Configuration Notes
 

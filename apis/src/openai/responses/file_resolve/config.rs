@@ -21,7 +21,14 @@ const MAX_CONFIGURABLE_FILE_REFERENCES: usize = 128;
 /// Maximum allowed timeout (300 000 ms / 5 minutes).
 const MAX_TIMEOUT_MS: u64 = 300_000;
 
-/// Behavior when a referenced file cannot be fetched.
+/// Behavior when a `file_id` reference cannot be fetched.
+///
+/// Applies only to `file_id` (Files API availability). `file_url`
+/// resolution failures are always rejected regardless of this
+/// setting: a failed `file_url` fetch is a security-relevant signal
+/// (the target may be malicious or unreachable for policy reasons),
+/// not a simple availability gap, so it must never be downgraded to
+/// an implicit passthrough of the original URL to the backend.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OnMissing {
@@ -88,7 +95,9 @@ pub(crate) struct FileResolveConfig {
     #[serde(default = "default_max_file_references")]
     pub max_file_references: usize,
 
-    /// Behavior when a referenced file cannot be fetched.
+    /// Behavior when a `file_id` reference cannot be fetched. Does not
+    /// apply to `file_url`: a failed `file_url` fetch is always
+    /// rejected, regardless of this setting.
     #[serde(default)]
     pub on_missing: OnMissing,
 

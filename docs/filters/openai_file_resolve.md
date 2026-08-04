@@ -21,7 +21,7 @@ This filter resolves references inside Responses requests; it does not proxy cli
 | `forward_headers` | string[] | no | Headers to forward from the original request to the Files API for authentication and tenant isolation. No downstream headers are forwarded by default. |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 | `max_file_references` | integer | no | Maximum number of distinct content-part / `file_id` pairs to resolve in one request, including rehydrated history. |
-| `on_missing` | `continue` \| `reject` | no | Behavior when a referenced file cannot be fetched. |
+| `on_missing` | `continue` \| `reject` | no | Behavior when a `file_id` reference cannot be fetched. Does not apply to `file_url`: a failed `file_url` fetch is always rejected, regardless of this setting. |
 | `timeout_ms` | integer | no | HTTP timeout in milliseconds for Files API callout requests. |
 | `file_url` | `resolve` \| `passthrough` | no | Mode for `file_url` content parts in `input_file`. |
 | `allowed_file_url_origins` | string[] | no | Exact origins allowed to resolve to private addresses. Cloud metadata, unspecified, and multicast remain blocked. |

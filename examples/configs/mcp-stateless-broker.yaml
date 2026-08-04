@@ -1,7 +1,7 @@
 # MCP Stateless Broker (2026-07-28 Profile)
 #
-# Configurable stateless MCP broker using the 2026-07-28
-# release candidate profile. No protocol sessions,
+# Configurable stateless MCP broker using the final
+# MCP 2026-07-28 stateless profile. No protocol sessions,
 # no initialize handshake. Clients use server/discover
 # for capability discovery and include
 # MCP-Protocol-Version, Mcp-Method, and Mcp-Name
