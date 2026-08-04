@@ -138,6 +138,33 @@ async fn classified_responses_create_without_state_fails_closed() {
     assert_server_error(action);
 }
 
+#[tokio::test]
+async fn streaming_responses_create_without_state_uses_sse_error() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_format.stream", "true");
+    let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello","stream":true}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected rejection");
+    };
+    assert_eq!(rejection.status, 500);
+    assert_eq!(
+        rejection.headers.iter().find(|(name, _)| name == "content-type"),
+        Some(&("content-type".to_owned(), "text/event-stream".to_owned()))
+    );
+    let event = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(event.starts_with("event: error\ndata: "));
+    let data = event.strip_prefix("event: error\ndata: ").unwrap().trim_end();
+    let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(parsed["error"]["code"], "server_error");
+    assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
+}
+
 fn assert_server_error(action: FilterAction) {
     let FilterAction::Reject(rejection) = action else {
         panic!("expected rejection");

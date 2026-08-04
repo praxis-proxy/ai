@@ -291,7 +291,7 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
                 prerequisite = "openai_responses_format",
                 "request pipeline state is unavailable"
             );
-            Some(missing_pipeline_state())
+            Some(missing_pipeline_state(false))
         },
     }
 }
@@ -303,7 +303,7 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Re
             prerequisite = "openai_responses_validate",
             "request pipeline state is unavailable"
         );
-        return Err(missing_pipeline_state());
+        return Err(missing_pipeline_state(streaming));
     };
     responses_state_to_chat_request(&state.request_body, &state.messages, &state.tools, &state.tool_choice).map_err(
         |error| {
@@ -442,11 +442,11 @@ fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Resul
 }
 
 /// Build the fail-closed action for missing classifier or validator state.
-fn missing_pipeline_state() -> FilterAction {
+fn missing_pipeline_state(streaming: bool) -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         500,
         "server_error",
         "request pipeline state is unavailable",
-        false,
+        streaming,
     ))
 }
