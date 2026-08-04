@@ -123,7 +123,7 @@ fn collect_server_deps<'a>(packages: &'a [Package], resolve: &'a Resolve) -> Vec
     resolve
         .nodes
         .iter()
-        .find(|node| packages.iter().any(|p| p.id == node.id && p.name == "praxis-proxy"))
+        .find(|node| packages.iter().any(|p| p.id == node.id && p.name == "praxis-ai-proxy"))
         .map(|node| node.deps.iter().collect())
         .unwrap_or_default()
 }
