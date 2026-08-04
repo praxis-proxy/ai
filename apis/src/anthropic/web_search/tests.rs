@@ -219,7 +219,14 @@ async fn streaming_request_is_rejected_before_reentry() {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 400);
-    assert!(String::from_utf8_lossy(rejection.body.as_ref().unwrap()).contains("streaming is not supported"));
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("streaming is not supported"))
+    );
 }
 
 #[tokio::test]
@@ -395,6 +402,42 @@ async fn managed_call_without_query_is_rejected() {
     };
     assert_eq!(rejection.status, 400);
     assert!(String::from_utf8_lossy(rejection.body.as_ref().unwrap()).contains("query"));
+}
+
+#[tokio::test]
+async fn managed_call_with_empty_id_is_rejected() {
+    let filter = test_filter();
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = initialized_context(&request).await;
+    let mut body = Some(message_response(
+        json!([{"type":"tool_use","id":"","name":"WebSearch","input":{"query":"potato"}}]),
+        "tool_use",
+    ));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected rejection");
+    };
+    assert_eq!(rejection.status, 400);
+}
+
+#[tokio::test]
+async fn managed_call_with_whitespace_only_query_is_rejected() {
+    let filter = test_filter();
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = initialized_context(&request).await;
+    let mut body = Some(message_response(
+        json!([{"type":"tool_use","id":"toolu_search","name":"WebSearch","input":{"query":"   "}}]),
+        "tool_use",
+    ));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected rejection");
+    };
+    assert_eq!(rejection.status, 400);
 }
 
 #[tokio::test]

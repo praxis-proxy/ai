@@ -114,8 +114,7 @@ pub(crate) struct WebSearchFilterConfig {
 
     /// API key for the search provider (supports `${ENV_VAR}`).
     /// Wrapped in [`SecretString`] to prevent accidental logging.
-    #[serde(default)]
-    pub(crate) api_key: Option<SecretString>,
+    pub(crate) api_key: SecretString,
 
     /// Default search context size when the client omits it.
     #[serde(default)]
@@ -199,11 +198,7 @@ pub(crate) fn build_config(
     filter_name: &'static str,
     raw: &WebSearchFilterConfig,
 ) -> Result<ValidatedConfig, FilterError> {
-    let raw_key = raw
-        .api_key
-        .as_ref()
-        .ok_or_else(|| FilterError::from(format!("{filter_name}: api_key is required")))?;
-    let api_key = resolve_api_key(filter_name, raw_key.expose_secret())?;
+    let api_key = resolve_api_key(filter_name, raw.api_key.expose_secret())?;
     if api_key.is_empty() {
         return Err(FilterError::from(format!("{filter_name}: api_key must not be empty")));
     }
@@ -307,7 +302,7 @@ mod tests {
     fn base_config() -> WebSearchFilterConfig {
         WebSearchFilterConfig {
             provider: SearchProvider::Brave,
-            api_key: Some(SecretString::from("test-key-123".to_owned())),
+            api_key: SecretString::from("test-key-123".to_owned()),
             default_context_size: None,
             timeout_ms: None,
             max_body_bytes: None,
@@ -332,27 +327,20 @@ mod tests {
     #[test]
     fn build_config_rejects_empty_api_key() {
         let mut cfg = base_config();
-        cfg.api_key = Some(SecretString::from(String::new()));
+        cfg.api_key = SecretString::from(String::new());
         assert!(build_config("openai_web_search", &cfg).is_err());
     }
 
     #[test]
-    fn build_config_rejects_missing_api_key() {
-        let mut cfg = base_config();
-        cfg.api_key = None;
+    fn parse_config_uses_owner_name_for_missing_api_key() {
+        let yaml = serde_yaml::from_str("provider: brave").unwrap();
+        let error = parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml)
+            .err()
+            .expect("missing api_key should be rejected");
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
-            "None api_key should be rejected"
-        );
-    }
-
-    #[test]
-    fn build_config_uses_owner_name_in_diagnostics() {
-        let mut raw = base_config();
-        raw.api_key = None;
-        let error = build_config("anthropic_web_search", &raw).unwrap_err();
-        assert!(
-            error.to_string().contains("anthropic_web_search: api_key is required"),
+            error
+                .to_string()
+                .contains("anthropic_web_search: missing field `api_key`"),
             "diagnostic should name the owning filter: {error}"
         );
     }

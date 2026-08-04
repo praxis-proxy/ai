@@ -565,10 +565,9 @@ fn set_action(ctx: &mut HttpFilterContext<'_>, action: &'static str) -> Result<(
 
 /// Build an Anthropic JSON error response.
 fn anthropic_rejection(status: u16, error_type: &str, message: &str) -> Rejection {
-    let body = serde_json::json!({"error":{"type":error_type,"message":message}});
     Rejection::status(status)
         .with_header("content-type", "application/json")
-        .with_body(Bytes::from(body.to_string()))
+        .with_body(Bytes::from(super::wire::error_body(error_type, message, None)))
 }
 
 #[cfg(test)]

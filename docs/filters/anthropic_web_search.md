@@ -10,7 +10,7 @@ Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
-| `api_key` | string (secret) | no | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
+| `api_key` | string (secret) | yes | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |

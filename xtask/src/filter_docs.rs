@@ -2505,23 +2505,23 @@ mod tests {
                 .iter()
                 .find(|entry| entry.filter.name == filter_name)
                 .expect("web-search filter should be discovered");
-            let field_names: Vec<&str> = filter.filter.fields.iter().map(|field| field.name.as_str()).collect();
-            assert!(
-                field_names.contains(&"provider"),
-                "{filter_name} should document provider"
+            let api_key = filter
+                .filter
+                .fields
+                .iter()
+                .find(|field| field.name == "api_key")
+                .expect("web-search filter should document api_key");
+            assert_eq!(
+                api_key.required,
+                RequiredKind::Yes,
+                "{filter_name} should document api_key as required"
             );
-            assert!(
-                field_names.contains(&"provider_failure_mode"),
-                "{filter_name} should document provider_failure_mode"
-            );
-            assert!(
-                field_names.contains(&"status_on_error"),
-                "{filter_name} should document status_on_error"
-            );
-            assert!(
-                field_names.contains(&"base_url"),
-                "{filter_name} should document base_url"
-            );
+            for expected in ["provider", "provider_failure_mode", "status_on_error", "base_url"] {
+                assert!(
+                    filter.filter.fields.iter().any(|field| field.name == expected),
+                    "{filter_name} should document {expected}"
+                );
+            }
         }
     }
 
