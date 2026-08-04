@@ -1934,11 +1934,11 @@ async fn stateless_delete_returns_405() {
 #[tokio::test]
 async fn stateless_ignores_mcp_session_id_header() {
     let filter = make_stateless_broker_filter();
-    let mut req = make_stateless_mcp_request("ping", None);
+    let mut req = make_stateless_mcp_request("server/discover", None);
     req.headers
         .insert("mcp-session-id", "should-be-ignored".parse().unwrap());
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let mut body = Some(Bytes::from(stateless_body("ping", 1, None)));
+    let mut body = Some(Bytes::from(stateless_body("server/discover", 1, None)));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
@@ -1946,7 +1946,7 @@ async fn stateless_ignores_mcp_session_id_header() {
         FilterAction::Reject(rejection) => {
             assert_eq!(
                 rejection.status, 200,
-                "stateless ping should succeed even with session header"
+                "stateless server/discover should succeed even with session header"
             );
             assert!(
                 !rejection.headers.iter().any(|(k, _)| k == "mcp-session-id"),
@@ -2244,6 +2244,98 @@ async fn stateless_notifications_initialized_returns_method_not_found() {
 }
 
 #[tokio::test]
+async fn stateless_ping_returns_method_not_found() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("ping", None);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(stateless_body("ping", 1, None)));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 404, "stateless ping should return 404");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32601, "should return method not found");
+            assert_eq!(parsed["error"]["message"], "method not found");
+        },
+        _ => panic!("expected Reject with 404"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_ping_invalid_id_wins_before_method_not_found() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("ping", None);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = r#"{"jsonrpc":"2.0","id":1.5,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(
+                rejection.status, 200,
+                "invalid id should return a JSON-RPC error response"
+            );
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(
+                parsed["error"]["code"], -32600,
+                "invalid id must win before stateless ping method-not-found"
+            );
+        },
+        _ => panic!("expected Reject with JSON-RPC error"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_logging_set_level_returns_method_not_found() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("logging/setLevel", None);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(stateless_body("logging/setLevel", 1, None)));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 404, "stateless logging/setLevel should return 404");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32601, "should return method not found");
+        },
+        _ => panic!("expected Reject with 404"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_notifications_roots_list_changed_returns_method_not_found() {
+    let filter = make_stateless_broker_filter();
+    let req = make_stateless_mcp_request("notifications/roots/list_changed", None);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_notification_body("notifications/roots/list_changed");
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(
+                rejection.status, 404,
+                "stateless notifications/roots/list_changed should return 404"
+            );
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(parsed["error"]["code"], -32601, "should return method not found");
+        },
+        _ => panic!("expected Reject with 404"),
+    }
+}
+
+#[tokio::test]
 async fn stateless_notification_missing_mcp_method_rejected() {
     let filter = make_stateless_broker_filter();
     let mut req = crate::test_utils::make_request(http::Method::POST, "/mcp");
@@ -2321,9 +2413,9 @@ async fn string_json_rpc_id_with_quotes_preserved_in_stateless_error() {
 #[tokio::test]
 async fn stateless_missing_client_info_rejected() {
     let filter = make_stateless_broker_filter();
-    let req = make_stateless_mcp_request("ping", None);
+    let req = make_stateless_mcp_request("tools/list", None);
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2342,9 +2434,9 @@ async fn stateless_missing_client_info_rejected() {
 #[tokio::test]
 async fn stateless_null_client_info_rejected() {
     let filter = make_stateless_broker_filter();
-    let req = make_stateless_mcp_request("ping", None);
+    let req = make_stateless_mcp_request("tools/list", None);
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":null,"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":null,"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2363,9 +2455,9 @@ async fn stateless_null_client_info_rejected() {
 #[tokio::test]
 async fn stateless_string_client_info_rejected() {
     let filter = make_stateless_broker_filter();
-    let req = make_stateless_mcp_request("ping", None);
+    let req = make_stateless_mcp_request("tools/list", None);
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":"not-an-object","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":"not-an-object","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2384,9 +2476,9 @@ async fn stateless_string_client_info_rejected() {
 #[tokio::test]
 async fn stateless_client_info_missing_name_rejected() {
     let filter = make_stateless_broker_filter();
-    let req = make_stateless_mcp_request("ping", None);
+    let req = make_stateless_mcp_request("tools/list", None);
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2405,9 +2497,9 @@ async fn stateless_client_info_missing_name_rejected() {
 #[tokio::test]
 async fn stateless_client_info_missing_version_rejected() {
     let filter = make_stateless_broker_filter();
-    let req = make_stateless_mcp_request("ping", None);
+    let req = make_stateless_mcp_request("tools/list", None);
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#;
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2426,9 +2518,9 @@ async fn stateless_client_info_missing_version_rejected() {
 #[tokio::test]
 async fn stateless_array_client_capabilities_rejected() {
     let filter = make_stateless_broker_filter();
-    let req = make_stateless_mcp_request("ping", None);
+    let req = make_stateless_mcp_request("tools/list", None);
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":["not","an","object"]}}}"#;
+    let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":["not","an","object"]}}}"#;
     let mut body = Some(Bytes::from(body_str));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2754,6 +2846,31 @@ async fn stateless_header_body_mismatch_still_returns_32020() {
             assert_eq!(
                 parsed["error"]["code"], ERR_HEADER_MISMATCH,
                 "header/body mismatch must return -32020, not -32602"
+            );
+        },
+        _ => panic!("expected Reject with 400"),
+    }
+}
+
+#[tokio::test]
+async fn stateless_tools_call_malformed_params_win_before_header_mismatch() {
+    let filter = make_stateless_broker_filter();
+    let mut req = make_stateless_mcp_request("tools/call", Some("wrong_name"));
+    req.headers.insert("mcp-method", "tools/call".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_str = stateless_body_with_params("tools/call", 1, r#""arguments":{}"#);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match &action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "malformed params should return 400");
+            let body_str = std::str::from_utf8(rejection.body.as_ref().unwrap()).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            assert_eq!(
+                parsed["error"]["code"], ERR_INVALID_PARAMS,
+                "malformed params must win before tools/call header mismatch"
             );
         },
         _ => panic!("expected Reject with 400"),

@@ -19,6 +19,7 @@ mod tests;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_ai_apis::json_body::replace_json_body;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
@@ -173,10 +174,8 @@ impl HttpFilter for PromptEnrichFilter {
         messages.splice(0..0, self.prepend.iter().cloned());
         messages.extend(self.append.iter().cloned());
 
-        let serialized =
-            serde_json::to_vec(&value).map_err(|e| -> FilterError { format!("prompt_enrich: {e}").into() })?;
-
-        *body = Some(Bytes::from(serialized));
+        replace_json_body(body, &value, self.name(), "messages")
+            .map_err(|e| -> FilterError { format!("{}: {e}", self.name()).into() })?;
 
         Ok(FilterAction::Continue)
     }

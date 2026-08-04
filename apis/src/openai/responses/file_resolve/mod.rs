@@ -29,6 +29,13 @@
 //! passthrough`. No content-part validation — the inference backend
 //! handles that.
 //!
+//! `on_missing` only governs `file_id` availability gaps. A `file_url`
+//! fetch failure is always rejected, regardless of `on_missing`: the
+//! resolver's SSRF, redirect, and size checks may have just rejected
+//! an attacker-controlled target, and that outcome must never be
+//! downgraded into forwarding the original URL for the backend to
+//! fetch itself without the same protections.
+//!
 //! This filter resolves the file transport reference but does not
 //! interpret document contents. The inference backend must already
 //! support the resulting inline `input_file` / `file_data` or
@@ -77,6 +84,7 @@ use self::{
 use super::{openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState};
 use crate::{
     classifier::is_responses_create,
+    json_body::serialize_json_body,
     openai::api_client::{ApiClient, ApiClientConfig},
     subrequest::SubRequestClient,
 };
@@ -320,7 +328,7 @@ async fn resolve_and_rewrite(
     }
 
     debug!(count, "resolved file_id references");
-    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes)? {
+    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
@@ -403,14 +411,14 @@ fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
     max_body_bytes: usize,
+    filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
-    let rewritten = serde_json::to_vec(parsed)
-        .map_err(|e| -> FilterError { format!("openai_file_resolve: failed to serialize body: {e}").into() })?;
-    let len = rewritten.len();
-    if len > max_body_bytes {
-        return Ok(Some(reject_rewritten_body_too_large(len, max_body_bytes)));
+    let rewritten = serialize_json_body(parsed)
+        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
+    if rewritten.len() > max_body_bytes {
+        return Ok(Some(reject_rewritten_body_too_large(rewritten.len(), max_body_bytes)));
     }
-    *body = Some(Bytes::from(rewritten));
+    rewritten.commit(body, filter_name, "input");
     Ok(None)
 }
 

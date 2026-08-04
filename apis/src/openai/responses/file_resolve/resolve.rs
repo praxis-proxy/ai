@@ -619,6 +619,14 @@ async fn resolve_content_part(
 }
 
 /// Resolve one reference and apply the configured missing-file policy.
+///
+/// `on_missing: continue` only governs `file_id` availability gaps.
+/// `file_url` failures of any kind are always propagated: a failed
+/// fetch is security-relevant (the resolver's SSRF/redirect/size
+/// checks may have just rejected an attacker-controlled target), so
+/// it must never be downgraded into an implicit passthrough that
+/// hands the original URL to a backend that might fetch it itself
+/// without the same protections.
 async fn resolve_reference(
     source: &ReferenceSource,
     part_type: &str,
@@ -638,7 +646,8 @@ async fn resolve_reference(
         .await
     {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(e @ (ResolveError::TooManyReferences { .. } | ResolveError::FileUrlBlocked { .. })) => Err(e),
+        Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
+        Err(e) if matches!(source, ReferenceSource::FileUrl(_)) => Err(e),
         Err(e) if resolver.on_missing == OnMissing::Continue => {
             warn!(source = %source, error = %e, "file resolution failed, passing through");
             Ok(None)

@@ -65,7 +65,7 @@ use super::{
     file_resolve::resolve::content_parts_mut, openai_responses_proxy::serialized_outbound_body_len,
     state::ResponsesState,
 };
-use crate::classifier::is_responses_create;
+use crate::{classifier::is_responses_create, json_body::serialize_json_body};
 
 /// Converts `input_file` content parts to `input_text` for backends
 /// that do not support `input_file` natively (e.g. vLLM, llm-d).
@@ -194,7 +194,7 @@ fn extract_and_rewrite(
     }
 
     debug!(count, "extracted input_file parts");
-    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes)? {
+    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = sync_state_after_rewrite(ctx, parsed, &mut budget) {
@@ -247,14 +247,14 @@ fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
     max_body_bytes: usize,
+    filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
-    let rewritten = serde_json::to_vec(parsed)
-        .map_err(|e| -> FilterError { format!("openai_doc_extract: failed to serialize body: {e}").into() })?;
-    let len = rewritten.len();
-    if len > max_body_bytes {
-        return Ok(Some(reject_rewritten_body_too_large(len, max_body_bytes)));
+    let rewritten = serialize_json_body(parsed)
+        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
+    if rewritten.len() > max_body_bytes {
+        return Ok(Some(reject_rewritten_body_too_large(rewritten.len(), max_body_bytes)));
     }
-    *body = Some(Bytes::from(rewritten));
+    rewritten.commit(body, filter_name, "input");
     Ok(None)
 }
 

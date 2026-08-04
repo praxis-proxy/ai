@@ -6,10 +6,12 @@
 //! AI provider API types and persistence for Praxis.
 //!
 //! Contains provider-specific protocol types (OpenAI, Anthropic),
-//! request classification, and response storage backends.
+//! request classification, shared JSON body-mutation helpers, and
+//! response storage backends.
 
 pub mod anthropic;
 pub mod classifier;
+pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
 #[cfg(feature = "store")]

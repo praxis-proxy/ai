@@ -7,8 +7,8 @@ use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
-    A2aFilter, AiGuardrailsFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter, TimeToFirstTokenFilter,
-    TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
+    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -32,6 +32,7 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     register_general_ai_filters(registry);
     register_anthropic_filters(registry);
     register_openai_filters(registry, subrequest_client);
+    register_routing_filters(registry);
 }
 
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.
@@ -93,6 +94,14 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     );
 }
 
+/// Register intelligent routing filters.
+fn register_routing_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "intelligent_route" => IntelligentRouteFilter::from_config
+    );
+}
+
 /// Register Anthropic-specific filters.
 fn register_anthropic_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
@@ -149,6 +158,7 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
         @register registry,
         http "openai_responses_rehydrate" => praxis_ai_apis::openai::RehydrateFilter::from_config
     );
+    register_compact(registry, subrequest_client);
     register_openai_response_filters(registry, subrequest_client);
 }
 
@@ -216,6 +226,28 @@ fn register_file_resolve(registry: &mut FilterRegistry, subrequest_client: Optio
     }
 }
 
+/// Register `openai_responses_compact` with the shared client when
+/// available, otherwise fall back to an isolated per-filter connector.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "openai_responses_compact",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    praxis_ai_apis::openai::CompactFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_responses_compact'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "openai_responses_compact" => praxis_ai_apis::openai::CompactFilter::from_config
+        );
+    }
+}
+
 /// Register `openai_web_search` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
@@ -256,6 +288,10 @@ mod tests {
             "expected openai_responses_validate in registry"
         );
         assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
+        assert!(
+            names.contains(&"intelligent_route"),
+            "expected intelligent_route in registry"
+        );
         assert!(
             names.contains(&"anthropic_validate"),
             "expected anthropic filter in registry"

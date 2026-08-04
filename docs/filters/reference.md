@@ -32,6 +32,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_mcp_dispatch`](openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
 | [`openai_mcp_tool_resolve`](openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
 | [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
+| [`openai_responses_compact`](openai_responses_compact.md) | Summarizes conversation history when the token count exceeds a configured threshold. |
 | [`openai_responses_format`](openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
 | [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses API request bodies. |
 | [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
@@ -67,6 +68,12 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`prompt_enrich`](prompt_enrich.md) | Injects statically configured messages into the `messages` array of OpenAI-compatible chat completion request bodies. |
+
+### Routing
+
+| Filter | Description |
+|--------|-------------|
+| [`intelligent_route`](intelligent_route.md) | Selects an upstream cluster from an ordered candidate configuration by matching either an inference model name or MCP tool name. |
 
 ### Time To First Token
 

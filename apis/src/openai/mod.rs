@@ -27,7 +27,7 @@ pub use conversations::{
 };
 pub use operation::{OpenAiHandlingMode, OpenAiOperationSpec};
 pub use responses::{
-    AgenticLoopFilter, DocExtractFilter, FileResolveFilter, McpDispatchFilter, McpToolResolveFilter,
+    AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, McpDispatchFilter, McpToolResolveFilter,
     ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter, ResponsesFormatFilter,
     ToolParseFilter, WebSearchFilter, openai_responses_proxy::ResponsesProxyFilter,
     stream_events::OpenaiStreamEventsFilter,

@@ -21,7 +21,9 @@
 //! rejecting provider-owned parameter combinations.
 
 pub(crate) mod agentic_loop;
+pub(crate) mod compact;
 mod config;
+pub(crate) mod config_validation;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
@@ -492,6 +494,7 @@ pub(crate) mod validate;
 pub(crate) mod web_search;
 
 pub use agentic_loop::AgenticLoopFilter;
+pub use compact::CompactFilter;
 pub use rehydrate::RehydrateFilter;
 pub use validate::OpenaiResponsesValidateFilter;
 pub use web_search::WebSearchFilter;

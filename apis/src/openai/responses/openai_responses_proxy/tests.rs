@@ -3,6 +3,7 @@
 
 //! Unit tests for the Responses proxy filter.
 
+use base64::Engine as _;
 use bytes::Bytes;
 use http::Method;
 use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter};
@@ -519,6 +520,77 @@ async fn rebuild_does_not_set_content_type_header() {
             .all(|(k, _)| k.as_ref() != "content-type"),
         "filter must not set content-type (core handles framing)"
     );
+}
+
+// -----------------------------------------------------------------------------
+// messages_for_backend / compaction_to_assistant_message
+// -----------------------------------------------------------------------------
+
+#[test]
+fn messages_for_backend_borrows_when_no_compaction() {
+    let msgs = vec![
+        json!({"role": "user", "content": "hello"}),
+        json!({"role": "assistant", "content": "hi"}),
+    ];
+    let result = super::messages_for_backend(&msgs);
+    assert!(
+        matches!(result, std::borrow::Cow::Borrowed(_)),
+        "should borrow when no compaction items"
+    );
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn messages_for_backend_translates_compaction_item() {
+    let encoded = base64::engine::general_purpose::STANDARD.encode("summary text");
+    let msgs = vec![json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded})];
+    let result = super::messages_for_backend(&msgs);
+    assert!(matches!(result, std::borrow::Cow::Owned(_)));
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["role"], "assistant");
+    assert!(result[0]["content"].as_str().unwrap().contains("summary text"));
+}
+
+#[test]
+fn messages_for_backend_mixed_items() {
+    let encoded = base64::engine::general_purpose::STANDARD.encode("ctx");
+    let msgs = vec![
+        json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded}),
+        json!({"role": "user", "content": "hello"}),
+    ];
+    let result = super::messages_for_backend(&msgs);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0]["role"], "assistant");
+    assert_eq!(result[1]["role"], "user");
+}
+
+#[test]
+fn compaction_to_assistant_message_decodes_encrypted_content() {
+    let encoded = base64::engine::general_purpose::STANDARD.encode("decoded summary");
+    let item = json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded});
+    let msg = super::compaction_to_assistant_message(&item);
+    assert_eq!(msg["role"], "assistant");
+    assert!(msg["content"].as_str().unwrap().contains("decoded summary"));
+}
+
+#[test]
+fn compaction_to_assistant_message_handles_missing_content() {
+    let item = json!({"type": "compaction", "id": "c_1"});
+    let msg = super::compaction_to_assistant_message(&item);
+    assert_eq!(msg["role"], "assistant");
+    assert!(
+        msg["content"]
+            .as_str()
+            .unwrap()
+            .contains("[Previous conversation summary]")
+    );
+}
+
+#[test]
+fn compaction_to_assistant_message_handles_invalid_base64() {
+    let item = json!({"type": "compaction", "id": "c_1", "encrypted_content": "not!valid!base64!!!"});
+    let msg = super::compaction_to_assistant_message(&item);
+    assert_eq!(msg["role"], "assistant");
 }
 
 // -----------------------------------------------------------------------------

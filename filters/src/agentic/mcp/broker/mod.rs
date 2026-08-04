@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! MCP static catalog filter: static tool catalog, prefix management, broker
-//! behavior for `initialize`, `tools/list`, `ping`, `notifications`, and
-//! stateless-profile `tools/call` routing.
+//! behavior for `tools/list`, current-profile `initialize`, `ping`, and
+//! `notifications`, and stateless-profile `tools/call` routing.
 
 pub(crate) mod config;
 
@@ -72,8 +72,8 @@ const BASE64_SENTINEL_SUFFIX: &str = "?=";
 // -----------------------------------------------------------------------------
 
 /// MCP static catalog filter that aggregates tool catalogs from multiple backend
-/// MCP servers and handles `initialize`, `tools/list`, `tools/call`, `ping`,
-/// and `notifications/initialized` as a static broker.
+/// MCP servers and handles `tools/list`, `tools/call`, and current-profile
+/// broker methods (`initialize`, `ping`, and `notifications/initialized`).
 ///
 /// In the stateless profile, `tools/call` routes to the configured backend
 /// cluster by exposed tool name, stripping the public prefix from `params.name`
@@ -244,7 +244,6 @@ impl McpBrokerFilter {
             "server/discover" => self.handle_server_discover(envelope),
             "tools/list" => self.handle_stateless_tools_list(envelope),
             "tools/call" => self.handle_stateless_tools_call(ctx, value, envelope, body),
-            "ping" => handle_ping(envelope),
             "initialize" => json_rpc_error_action_with_status(
                 envelope,
                 404,
