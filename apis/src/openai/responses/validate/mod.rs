@@ -164,10 +164,10 @@ fn is_bodyless_responses_request(method: &http::Method, path: &str) -> bool {
         http::Method::GET | http::Method::DELETE => true,
         http::Method::POST => {
             let path = path.strip_suffix('/').unwrap_or(path);
-            matches!(
-                path.split('/').collect::<Vec<_>>().as_slice(),
-                ["", "v1", "responses", _, "cancel"]
-            )
+            path.strip_prefix("/v1/responses/").is_some_and(|rest| {
+                rest.strip_suffix("/cancel")
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+            })
         },
         _ => false,
     }
