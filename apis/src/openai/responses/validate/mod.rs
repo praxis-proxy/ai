@@ -29,7 +29,7 @@ use praxis_filter::{
 };
 use tracing::{debug, trace};
 
-use super::{error::responses_error_rejection, state::ResponsesState};
+use super::{error::responses_error_rejection, extract_conversation_id, state::ResponsesState};
 
 // -----------------------------------------------------------------------------
 // OpenaiResponsesValidateFilter
@@ -181,17 +181,6 @@ fn reject_invalid(message: &str, streaming: bool) -> FilterAction {
         message,
         streaming,
     ))
-}
-
-/// Extract conversation ID from the request body.
-///
-/// Handles both `"conversation": "conv_id"` and `"conversation": {"id": "conv_id"}`.
-fn extract_conversation_id(body: &serde_json::Value) -> Option<String> {
-    body.get("conversation").and_then(|c| {
-        c.as_str()
-            .or_else(|| c.get("id").and_then(serde_json::Value::as_str))
-            .map(str::to_owned)
-    })
 }
 
 /// Extract or generate a conversation ID for the request.

@@ -59,8 +59,8 @@ use tracing::{debug, trace, warn};
 
 use super::{
     super::{
-        DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, error::responses_error_rejection,
-        state::ResponsesState,
+        DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
+        error::responses_error_rejection, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
@@ -382,25 +382,6 @@ fn assemble_stored_messages(input: &Value, output: &Value) -> Value {
     }
 
     Value::Array(messages)
-}
-
-/// Append stored response input as valid Responses API item params.
-fn append_stored_input_items(messages: &mut Vec<Value>, input: Value) {
-    match input {
-        Value::Null => {},
-        Value::String(text) => messages.push(user_message_item(&text)),
-        Value::Array(items) => messages.extend(items),
-        other => messages.push(other),
-    }
-}
-
-/// Build a Responses API user message item from string input.
-fn user_message_item(text: &str) -> Value {
-    serde_json::json!({
-        "type": "message",
-        "role": "user",
-        "content": text
-    })
 }
 
 // -----------------------------------------------------------------------------
