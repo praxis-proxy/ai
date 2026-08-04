@@ -38,9 +38,11 @@ jobs:
           nvidia-smi
           if command -v docker >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            echo "GPU_FLAG=--gpus all" >> "$GITHUB_ENV"
             docker info >/dev/null
           elif command -v podman >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            echo "GPU_FLAG=--device nvidia.com/gpu=all" >> "$GITHUB_ENV"
             podman info >/dev/null
           else
             echo "Neither docker nor podman is available on this runner" >&2
@@ -59,33 +61,18 @@ jobs:
 
       - name: Start vLLM on GPU
         run: |
-          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-            "$CONTAINER_RUNTIME" run -d --name vllm \
-              --device nvidia.com/gpu=all \
-              -p 8000:8000 \
-              -e HUGGING_FACE_HUB_TOKEN="${{ secrets.HUGGING_FACE_HUB_TOKEN }}" \
-              "$VLLM_IMAGE" \
-              --model "$VLLM_MODEL" \
-              --max-model-len 4096 \
-              --served-model-name "$VLLM_MODEL" \
-              --enable-auto-tool-choice \
-              --tool-call-parser hermes \
-              --reasoning-parser deepseek_r1 \
-              --gpu-memory-utilization 0.7
-          else
-            "$CONTAINER_RUNTIME" run -d --name vllm \
-              --gpus all \
-              -p 8000:8000 \
-              -e HUGGING_FACE_HUB_TOKEN="${{ secrets.HUGGING_FACE_HUB_TOKEN }}" \
-              "$VLLM_IMAGE" \
-              --model "$VLLM_MODEL" \
-              --max-model-len 4096 \
-              --served-model-name "$VLLM_MODEL" \
-              --enable-auto-tool-choice \
-              --tool-call-parser hermes \
-              --reasoning-parser deepseek_r1 \
-              --gpu-memory-utilization 0.7
-          fi
+          "$CONTAINER_RUNTIME" run -d --name vllm \
+            $GPU_FLAG \
+            -p 8000:8000 \
+            -e HUGGING_FACE_HUB_TOKEN="${{ secrets.HUGGING_FACE_HUB_TOKEN }}" \
+            "$VLLM_IMAGE" \
+            --model "$VLLM_MODEL" \
+            --max-model-len 4096 \
+            --served-model-name "$VLLM_MODEL" \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            --reasoning-parser deepseek_r1 \
+            --gpu-memory-utilization 0.7
 
       - name: Start OGX
         run: |
