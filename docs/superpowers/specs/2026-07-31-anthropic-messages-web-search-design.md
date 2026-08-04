@@ -103,6 +103,13 @@ serialization. The rebuilt `Bytes` allocation is shared between the accumulator,
 `NextIterationBody`, and the active step body, so request propagation does not
 copy the payload or bypass IRR accounting.
 
+IRR intentionally starts each subrequest with a fresh header map. The
+`anthropic_messages_protocol` filter restores only the caller's
+`anthropic-version` and `anthropic-beta` negotiation headers from
+`original_request` on model re-entry. Credentials and other caller headers are
+not carried across the boundary; operators must inject backend credentials in
+the step pipeline.
+
 ## Data Flow
 
 ### Initial request
@@ -297,6 +304,8 @@ stub. Assert that:
 - The client receives the second model response.
 - The model backend receives exactly two `/v1/messages` requests.
 - The second model request preserves the original history and tool definition.
+- Both model requests preserve caller-supplied `anthropic-version` and
+  `anthropic-beta` headers.
 - The second model request contains the complete assistant `tool_use` turn.
 - Its following user turn contains the matching `tool_result` and normalized
   search results.

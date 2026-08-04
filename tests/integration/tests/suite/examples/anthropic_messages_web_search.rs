@@ -210,6 +210,47 @@ fn messages_web_search_round_trip_re_enters_the_model() {
 }
 
 #[test]
+fn caller_anthropic_headers_are_preserved_across_model_reentry() {
+    let fixture = fixture();
+    let model = StatefulCapturingBackend::new(vec![
+        (200, fixture["first_model_response"].to_string()),
+        (200, fixture["final_model_response"].to_string()),
+    ])
+    .start_with_shutdown();
+    let search = SearchStub::start(&fixture["search_response"]);
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_config(proxy_port, model.port(), search.port()));
+    let body = fixture["initial_request"].to_string();
+    let request = json_post_with_headers(
+        "/v1/messages",
+        &body,
+        &[
+            ("anthropic-version", "2024-01-01"),
+            ("anthropic-beta", "test-beta-2026-01-01"),
+        ],
+    );
+
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200);
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2, "model should receive two Messages requests");
+    for (index, request) in requests.iter().enumerate() {
+        let headers = request.headers.to_ascii_lowercase();
+        assert!(
+            headers.contains("anthropic-version: 2024-01-01"),
+            "model request {index} should preserve the caller's anthropic-version; headers: {}",
+            request.headers
+        );
+        assert!(
+            headers.contains("anthropic-beta: test-beta-2026-01-01"),
+            "model request {index} should preserve the caller's anthropic-beta; headers: {}",
+            request.headers
+        );
+    }
+}
+
+#[test]
 fn non_success_tool_use_response_passes_through_without_search_or_reentry() {
     let fixture = fixture();
     let upstream = fixture["first_model_response"].clone();
@@ -378,4 +419,21 @@ fn body_limit_rejects_before_large_rebuilt_request_reenters_model() {
         "oversized rebuilt body must halt before model re-entry"
     );
     assert_eq!(search.request_count(), 1, "the result must trigger rebuilt-body growth");
+}
+
+fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> String {
+    let mut extra = String::new();
+    for (name, value) in headers {
+        extra.push_str(&format!("{name}: {value}\r\n"));
+    }
+    format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         {extra}\
+         \r\n\
+         {body}",
+        body.len(),
+    )
 }
