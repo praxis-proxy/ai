@@ -119,6 +119,32 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
 }
 
 // =========================================================================
+// Cookie and forwarded header blocking
+// =========================================================================
+
+#[test]
+fn cookie_and_forwarded_headers_stripped_from_mcp_headers() {
+    let headers = serde_json::json!({
+        "cookie": "session=abc123",
+        "set-cookie": "id=xyz; Path=/",
+        "forwarded": "for=192.0.2.60;proto=http",
+        "x-forwarded-for": "203.0.113.50",
+        "x-forwarded-host": "original.example.com",
+        "x-forwarded-proto": "https",
+        "x-custom": "safe"
+    });
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
+
+    assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
+    assert!(
+        config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-custom")),
+        "x-custom should pass through"
+    );
+}
+
+// =========================================================================
 // Authorization
 // =========================================================================
 

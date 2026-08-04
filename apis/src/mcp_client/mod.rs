@@ -532,19 +532,22 @@ fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
     if matches!(
         *name,
         http::header::AUTHORIZATION
-            | http::header::HOST
-            | http::header::CONTENT_LENGTH
-            | http::header::TRANSFER_ENCODING
             | http::header::CONNECTION
+            | http::header::CONTENT_LENGTH
+            | http::header::COOKIE
+            | http::header::FORWARDED
+            | http::header::HOST
+            | http::header::PROXY_AUTHORIZATION
+            | http::header::SET_COOKIE
             | http::header::TE
             | http::header::TRAILER
+            | http::header::TRANSFER_ENCODING
             | http::header::UPGRADE
-            | http::header::PROXY_AUTHORIZATION
     ) {
         return true;
     }
     let s = name.as_str();
-    s.starts_with("x-praxis-") || s.starts_with("x-mcp-") || s.starts_with("x-a2a-")
+    s.starts_with("x-forwarded-") || s.starts_with("x-praxis-") || s.starts_with("x-mcp-") || s.starts_with("x-a2a-")
 }
 
 /// Hostnames that resolve to loopback.
@@ -562,10 +565,7 @@ fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
         },
         IpAddr::V6(v6) => {
             let [a, b, ..] = v6.octets();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (a == 0xFE && (b & 0xC0) == 0x80)
-                || (a & 0xFE) == 0xFC
+            v6.is_loopback() || v6.is_unspecified() || (a == 0xFE && (b & 0xC0) == 0x80) || (a & 0xFE) == 0xFC
         },
     }
 }
