@@ -873,7 +873,7 @@ fn flush_pending_sse_payloads(
     }
 }
 
-/// Invalid UTF-8 or unparseable JSON silently skips - the proxy must
+/// Invalid UTF-8 or unparseable JSON silently skips — the proxy must
 /// never fail on arbitrary SSE payloads.
 fn try_extract_task_from_sse_payload(
     data: &[u8],
