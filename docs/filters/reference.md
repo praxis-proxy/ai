@@ -87,3 +87,9 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`token_count`](token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`]. |
 | [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. |
+
+### Trace Context
+
+| Filter | Description |
+|--------|-------------|
+| [`trace_context`](trace_context.md) | Propagates correlation and W3C trace context to the upstream request. |

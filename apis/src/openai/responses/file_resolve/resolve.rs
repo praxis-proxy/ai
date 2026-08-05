@@ -26,7 +26,7 @@ use super::{
     config::OnMissing,
     resolve_url::{FileUrlResolver, redact_url},
 };
-use crate::openai::api_client::{ApiClient, ApiClientError};
+use crate::openai::api_client::{ApiClient, ApiClientError, Correlation};
 
 /// Files API path prefix used in resource URL construction.
 const FILES_PATH_PREFIX: &str = "v1/files";
@@ -346,6 +346,18 @@ impl FilesApiClient {
             max_file_references,
             max_resolved_bytes,
         }
+    }
+
+    /// Build the header set sent on every Files API callout for one
+    /// downstream request.
+    ///
+    /// Resolved once per request at the filter boundary — the only
+    /// place with access to the filter context — then threaded into
+    /// each callout, so correlation is established once rather than
+    /// per file reference.
+    pub(crate) fn callout_headers(&self, ctx: &praxis_filter::HttpFilterContext<'_>) -> http::HeaderMap {
+        self.client
+            .callout_headers(&ctx.request.headers, &Correlation::from_filter_context(ctx))
     }
 
     /// Create request-scoped resolution limits and cache state.
