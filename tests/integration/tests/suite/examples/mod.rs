@@ -14,6 +14,8 @@ mod compact;
 mod credential_injection;
 mod full_flow;
 mod guardrails;
+#[cfg(feature = "llmd-ext-proc")]
+mod llmd_ext_proc;
 mod mcp_broker;
 mod model_to_header;
 mod openai_conversations;
