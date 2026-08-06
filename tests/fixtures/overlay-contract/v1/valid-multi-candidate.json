@@ -1,0 +1,59 @@
+{
+  "schema_version": "1.0.0",
+  "revision": {
+    "kind": "content_addressed",
+    "algorithm": "sha256",
+    "value": "75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"
+  },
+  "content_digest": {
+    "algorithm": "sha256",
+    "value": "75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"
+  },
+  "scope": {
+    "network": "glb-demo",
+    "gateway": "glb-demo-edge-gateway",
+    "namespace": "grid-system",
+    "local_site": "east-edge"
+  },
+  "provenance": {
+    "producer": "grid-operator",
+    "producer_version": "0.1.0",
+    "source_name": "glb-demo",
+    "source_uid": "fixture-uid",
+    "source_generation": 1,
+    "rendered_at": "2026-07-29T00:00:00Z"
+  },
+  "overlay": {
+    "network": "glb-demo",
+    "local_site": "east-edge",
+    "candidates": [
+      {
+        "kind": "inference_model",
+        "name": "model-east",
+        "site": "east-provider",
+        "cluster": "sim-east-provider",
+        "fresh": true,
+        "credential": {
+          "strategy": "bearer_token",
+          "secretRef": {
+            "name": "east-cred",
+            "namespace": "grid-system",
+            "key": "token"
+          }
+        },
+        "stable_id": "east1234",
+        "rank": 0
+      },
+      {
+        "kind": "inference_model",
+        "name": "model-west",
+        "site": "west-provider",
+        "cluster": "sim-west-provider",
+        "fresh": true,
+        "stable_id": "west5678",
+        "rank": 1
+      }
+    ],
+    "generated_at": "2026-07-29T01:00:00Z"
+  }
+}

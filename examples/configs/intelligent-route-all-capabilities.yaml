@@ -4,13 +4,13 @@
 # intelligent_route today:
 #
 # - inference_model and mcp_tool candidate matching;
-# - local-site preference when freshness is equal;
-# - fresh candidates preferred over stale candidates; and
-# - configured order as the deterministic tie-breaker.
+# - producer-rendered order for locality and freshness decisions; and
+# - configured order as the deterministic request-path selection rule.
 #
 # Queue depth, cache utilization, latency, admission, and cost are not read on
 # the request path. A control-plane producer can use those signals to decide
-# candidate eligibility and order before writing this configuration.
+# candidate eligibility and order before writing this configuration. The
+# request path preserves that order rather than recomputing those scores.
 #
 # The mcp filter classifies MCP tools/call requests and continues past non-MCP
 # bodies. json_body_field promotes the model from inference requests.
@@ -40,7 +40,7 @@ filter_chains:
         local_site: site-a
         model_header: X-Model
         candidates:
-          # Equal freshness: the local model candidate wins.
+          # The producer placed the eligible local model first.
           - kind: inference_model
             name: granite-3.3-8b
             site: site-a
@@ -53,31 +53,32 @@ filter_chains:
             cluster: models-site-b
             fresh: true
 
-          # Freshness is stronger than locality: the remote candidate wins.
-          - kind: inference_model
-            name: llama-3.2-8b
-            site: site-a
-            cluster: models-site-a
-            fresh: false
-
+          # The producer placed the fresh remote model before the stale local
+          # model.
           - kind: inference_model
             name: llama-3.2-8b
             site: site-b
             cluster: models-site-b
             fresh: true
 
-          # MCP tool candidates use the same freshness and locality rules.
-          - kind: mcp_tool
-            name: weather-lookup
+          - kind: inference_model
+            name: llama-3.2-8b
             site: site-a
-            cluster: tools-site-a
+            cluster: models-site-a
             fresh: false
 
+          # MCP tool candidates preserve the same producer-rendered order.
           - kind: mcp_tool
             name: weather-lookup
             site: site-b
             cluster: tools-site-b
             fresh: true
+
+          - kind: mcp_tool
+            name: weather-lookup
+            site: site-a
+            cluster: tools-site-a
+            fresh: false
 
           # Equal score: the first configured local candidate wins.
           - kind: mcp_tool

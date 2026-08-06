@@ -11,6 +11,7 @@ use super::{
     *,
 };
 use crate::agentic::mcp::{
+    build_json_rpc_config,
     config::DEFAULT_MAX_BODY_BYTES,
     protocol::{
         PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_STATELESS_2026_07_28, ProtocolProfile, SUPPORTED_VERSIONS_CURRENT,

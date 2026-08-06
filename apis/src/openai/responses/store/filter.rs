@@ -59,8 +59,8 @@ use tracing::{debug, trace, warn};
 
 use super::{
     super::{
-        DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, error::responses_error_rejection,
-        state::ResponsesState,
+        DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
+        error::responses_error_rejection, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
@@ -384,25 +384,6 @@ fn assemble_stored_messages(input: &Value, output: &Value) -> Value {
     Value::Array(messages)
 }
 
-/// Append stored response input as valid Responses API item params.
-fn append_stored_input_items(messages: &mut Vec<Value>, input: Value) {
-    match input {
-        Value::Null => {},
-        Value::String(text) => messages.push(user_message_item(&text)),
-        Value::Array(items) => messages.extend(items),
-        other => messages.push(other),
-    }
-}
-
-/// Build a Responses API user message item from string input.
-fn user_message_item(text: &str) -> Value {
-    serde_json::json!({
-        "type": "message",
-        "role": "user",
-        "content": text
-    })
-}
-
 // -----------------------------------------------------------------------------
 // Path Extraction
 // -----------------------------------------------------------------------------
@@ -412,12 +393,8 @@ fn user_message_item(text: &str) -> Value {
 /// Returns `None` if the path does not match the expected pattern.
 pub(super) fn extract_response_id(path: &str) -> Option<&str> {
     let path = path.strip_suffix('/').unwrap_or(path);
-    let segments: Vec<&str> = path.split('/').collect();
-
-    match segments.as_slice() {
-        ["", "v1", "responses", id] if !id.is_empty() => Some(id),
-        _ => None,
-    }
+    let id = path.strip_prefix("/v1/responses/")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
 // -----------------------------------------------------------------------------
@@ -835,15 +812,20 @@ impl ResponseStoreFilter {
     async fn try_get_retrieval(&self, ctx: &HttpFilterContext<'_>) -> Result<Option<FilterAction>, FilterError> {
         let path = ctx.request.uri.path();
         let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
-        let segments: Vec<&str> = path.split('/').collect();
+        let rest = match path.strip_prefix("/v1/responses/") {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
 
-        match segments.as_slice() {
-            ["", "v1", "responses", id] if !id.is_empty() => Ok(Some(self.handle_get_response(ctx, id).await)),
-            ["", "v1", "responses", id, "input_items"] if !id.is_empty() => {
-                Ok(Some(self.handle_get_input_items(ctx, id).await))
-            },
-            _ => Ok(None),
+        if let Some(id) = rest.strip_suffix("/input_items") {
+            if !id.is_empty() && !id.contains('/') {
+                return Ok(Some(self.handle_get_input_items(ctx, id).await));
+            }
+        } else if !rest.contains('/') {
+            return Ok(Some(self.handle_get_response(ctx, rest).await));
         }
+
+        Ok(None)
     }
 
     /// Lazily initialize the store and return a clone of the `Arc`.

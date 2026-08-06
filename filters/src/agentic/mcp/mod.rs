@@ -190,8 +190,12 @@ impl HttpFilter for McpFilter {
 // Private Utilities
 // -----------------------------------------------------------------------------
 
-/// Build a `JsonRpcConfig` for the shared parser with MCP-appropriate defaults.
-fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
+/// Build a [`JsonRpcConfig`] for the shared parser with MCP-appropriate defaults.
+///
+/// Used by both the classifier filter and the broker filter.
+///
+/// [`JsonRpcConfig`]: praxis_filter::builtins::http::payload_processing::json_rpc::config::JsonRpcConfig
+pub(crate) fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
     use praxis_filter::builtins::http::payload_processing::json_rpc::config::{BatchPolicy, JsonRpcHeaders};
 
     let headers = JsonRpcHeaders {

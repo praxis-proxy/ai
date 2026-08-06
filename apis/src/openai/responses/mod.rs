@@ -489,6 +489,42 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
     }
 }
 
+// -----------------------------------------------------------------------------
+// Shared Utilities
+// -----------------------------------------------------------------------------
+
+/// Extract a conversation ID from a request body.
+///
+/// Accepts both string and object forms:
+/// - `"conversation": "conv_abc"`
+/// - `"conversation": {"id": "conv_abc"}`
+pub(crate) fn extract_conversation_id(body: &serde_json::Value) -> Option<String> {
+    body.get("conversation").and_then(|c| {
+        c.as_str()
+            .or_else(|| c.get("id").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned)
+    })
+}
+
+/// Append stored response input as valid Responses API item params.
+pub(crate) fn append_stored_input_items(messages: &mut Vec<serde_json::Value>, input: serde_json::Value) {
+    match input {
+        serde_json::Value::Null => {},
+        serde_json::Value::String(text) => messages.push(user_message_item(&text)),
+        serde_json::Value::Array(items) => messages.extend(items),
+        other => messages.push(other),
+    }
+}
+
+/// Build a Responses API user message item from string input.
+pub(crate) fn user_message_item(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": text,
+    })
+}
+
 pub(crate) mod rehydrate;
 pub(crate) mod validate;
 pub(crate) mod web_search;

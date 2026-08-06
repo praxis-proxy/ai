@@ -96,22 +96,25 @@ pub(crate) struct ClassifiedRequest {
 /// - `DELETE /v1/responses/{id}`
 pub(crate) fn is_responses_path(method: &http::Method, path: &str) -> bool {
     let path = normalize_trailing_slash(path);
-    let segments: Vec<&str> = path.split('/').collect();
+    let rest = match path.strip_prefix("/v1/responses/") {
+        Some(r) if !r.is_empty() => r,
+        _ => return false,
+    };
 
-    match (method, segments.as_slice()) {
-        // POST /v1/responses/input_tokens
-        // POST /v1/responses/compact
-        // Both have `input` in their body so body classification would also
-        // work, but path-matching is explicit about recognising these as
-        // Responses API endpoints regardless of payload shape.
-        (&http::Method::POST, ["", "v1", "responses", "input_tokens" | "compact"]) => true,
-        // GET /v1/responses/{id}
-        // DELETE /v1/responses/{id}
-        (&http::Method::GET | &http::Method::DELETE, ["", "v1", "responses", id]) if !id.is_empty() => true,
-        // GET /v1/responses/{id}/input_items
-        (&http::Method::GET, ["", "v1", "responses", id, "input_items"]) if !id.is_empty() => true,
-        // POST /v1/responses/{id}/cancel
-        (&http::Method::POST, ["", "v1", "responses", id, "cancel"]) if !id.is_empty() => true,
+    match *method {
+        http::Method::POST => {
+            matches!(rest, "input_tokens" | "compact")
+                || rest
+                    .strip_suffix("/cancel")
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+        },
+        http::Method::GET => {
+            !rest.contains('/')
+                || rest
+                    .strip_suffix("/input_items")
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+        },
+        http::Method::DELETE => !rest.contains('/'),
         _ => false,
     }
 }
