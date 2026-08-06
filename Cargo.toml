@@ -19,44 +19,44 @@ license = "MIT"
 repository = "https://github.com/praxis-proxy/ai"
 
 [workspace.dependencies]
-async-trait = "0.1.89"
-base64 = "0.23.0"
-bytes = "1.12.0"
+async-trait = "0.1.91"
+base64 = "0.23.1"
+bytes = "1.12.1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 dashmap = "6.2.1"
-futures = "0.3.32"
+futures = "0.3.33"
 h2 = "0.4.15"
-http = "1.4.2"
+http = "1.5.0"
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
-quote = "1.0.46"
-rand = "0.10.1"
+quote = "1.0.47"
+rand = "0.10.2"
 rcgen = "0.14.8"
-regex = "1.12.4"
+regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
-rmcp = { version = "3.0.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
-rustls = "0.23.41"
-schemars = "1.2.1"
+rmcp = { version = "3.1.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
+rustls = "0.23.43"
+schemars = "1.2.2"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
-serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json_canonicalizer = "0.3.2"
-serde_json = { version = "1.0.150", features = ["preserve_order"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 syn = { version = "3.0.3", features = ["full", "extra-traits", "visit"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.4" }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres"] }
 tempfile = "3.27.0"
-thiserror = "2.0.18"
+thiserror = "2.0.19"
 tiktoken-rs = "0.12.0"
 tikv-jemallocator = "0.7.0"
-tokio = { version = "1.52.3", features = ["macros", "rt"] }
+tokio = { version = "1.53.1", features = ["macros", "rt"] }
 tokio-rustls = "0.26.4"
 tokio-tungstenite = "0.30.0"
-tokio-util = "0.7.18"
+tokio-util = "0.7.19"
 url = "2.5.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
