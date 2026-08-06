@@ -433,12 +433,13 @@ fn promote_filter_results(
 ) -> Result<(), FilterError> {
     let results = ctx.filter_results.entry("mcp").or_default();
     let method_str = mcp.method.as_str();
-    if !contains_control_chars(method_str) {
+    if !contains_control_chars(method_str) && method_str.len() <= MAX_DYNAMIC_VALUE_LEN {
         results.set("method", method_str.to_owned())?;
     }
 
     if let Some(name) = &mcp.name
         && !contains_control_chars(name)
+        && name.len() <= MAX_DYNAMIC_VALUE_LEN
     {
         results.set("name", name.clone())?;
     }

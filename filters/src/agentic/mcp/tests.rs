@@ -1067,6 +1067,53 @@ async fn dynamic_values_over_length_limit_are_omitted() {
 }
 
 #[tokio::test]
+async fn oversized_custom_method_is_omitted_from_filter_results() {
+    let filter = make_default_filter();
+    let method = "m".repeat(MAX_DYNAMIC_VALUE_LEN + 1);
+    let body_str = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+    })
+    .to_string();
+    let req = make_mcp_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "oversized custom methods should release"
+    );
+    assert_oversized_value_is_omitted(&ctx, "mcp.method", "x-praxis-mcp-method", "method");
+}
+
+#[tokio::test]
+async fn oversized_resource_uri_is_omitted_from_filter_results() {
+    let filter = make_default_filter();
+    let uri = "u".repeat(MAX_DYNAMIC_VALUE_LEN + 1);
+    let body_str = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": {"uri": uri},
+    })
+    .to_string();
+    let req = make_mcp_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "oversized resource URIs should release"
+    );
+    assert_oversized_value_is_omitted(&ctx, "mcp.name", "x-praxis-mcp-name", "name");
+}
+
+#[tokio::test]
 async fn non_initialize_promotes_protocol_version_from_header() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
@@ -1249,6 +1296,36 @@ fn assert_dynamic_values_promoted(
         results.get("protocol_version"),
         Some(protocol_version),
         "256-byte protocol version should be in filter results"
+    );
+}
+
+fn assert_oversized_value_is_omitted(
+    ctx: &praxis_filter::HttpFilterContext<'_>,
+    metadata_key: &str,
+    header_name: &str,
+    result_key: &str,
+) {
+    assert_eq!(
+        ctx.get_metadata(metadata_key),
+        None,
+        "oversized value should be omitted from metadata"
+    );
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(key, value)| (key.as_ref(), value.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key(header_name),
+        "oversized value should be omitted from headers"
+    );
+
+    let results = ctx.filter_results.get("mcp").unwrap();
+    assert_eq!(
+        results.get(result_key),
+        None,
+        "oversized value should be omitted from filter results"
     );
 }
 
