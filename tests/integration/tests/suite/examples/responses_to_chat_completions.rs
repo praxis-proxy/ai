@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, free_port, http_send, json_post, parse_body, parse_status, start_capturing_backend, start_proxy,
+    Backend, StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_status,
+    start_capturing_backend, start_proxy,
 };
 
 use super::load_example_config;
@@ -26,7 +27,7 @@ fn responses_to_chat_completions_translates_request_and_response() {
         }],
         "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}
     });
-    let backend = start_capturing_backend(&chat_response.to_string());
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
     let config = load_example_config(EXAMPLE, proxy_port, HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
@@ -38,11 +39,16 @@ fn responses_to_chat_completions_translates_request_and_response() {
         "store": false
     });
 
-    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
-    let forwarded: serde_json::Value = serde_json::from_str(&backend.body()).expect("backend request should be JSON");
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses/", &request.to_string()));
+    let requests = backend.requests();
+    let forwarded_request = requests.first().expect("backend should receive one request");
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&forwarded_request.body).expect("backend request should be JSON");
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
 
     assert_eq!(parse_status(&raw), 200);
+    assert_eq!(forwarded_request.method, "POST");
+    assert_eq!(forwarded_request.uri, "/v1/chat/completions");
     assert_eq!(forwarded["model"], "gpt-4.1-mini");
     assert_eq!(
         forwarded["messages"][0],
@@ -92,4 +98,33 @@ fn responses_to_chat_completions_leaves_sse_for_stream_converter() {
 
     assert_eq!(parse_status(&raw), 200);
     assert_eq!(parse_body(&raw), sse);
+}
+
+#[test]
+fn responses_to_chat_completions_translates_streaming_request_body() {
+    let chat_response = serde_json::json!({
+        "id": "chatcmpl_stream_fallback",
+        "object": "chat.completion",
+        "model": "gpt-4.1-mini",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "finite fallback"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
+    });
+    let backend = start_capturing_backend(&chat_response.to_string());
+    let proxy_port = free_port();
+    let config = load_example_config(EXAMPLE, proxy_port, HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+    let request = r#"{"model":"gpt-4.1-mini","input":"Hello","stream":true,"store":false}"#;
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
+    let forwarded: serde_json::Value = serde_json::from_str(&backend.body()).expect("backend request should be JSON");
+
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(forwarded["stream"], true);
+    assert!(forwarded["messages"].is_array());
+    assert_eq!(forwarded["messages"][0]["content"], "Hello");
+    assert!(forwarded.get("input").is_none());
 }

@@ -376,8 +376,8 @@ fn finite_response_transform(ctx: &HttpFilterContext<'_>) -> Result<Option<&'sta
     if is_sse_response(ctx) {
         return Ok(None);
     }
-    if status == http::StatusCode::OK {
-        if has_unsupported_success_representation(ctx) {
+    if status.is_success() {
+        if status != http::StatusCode::OK || has_unsupported_success_representation(ctx) {
             return Err(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",

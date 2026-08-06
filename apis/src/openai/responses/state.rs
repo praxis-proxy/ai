@@ -248,12 +248,13 @@ impl ResponsesState {
 
 /// Normalize the `input` field into a message array.
 ///
-/// The Responses API `input` can be a string (single user message)
-/// or an array of message objects. Normalizes both forms to a
-/// `Vec<Value>`.
+/// The Responses API `input` can be a string (single user message),
+/// a single item object, or an array of items. Normalizes all three
+/// forms to a `Vec<Value>`.
 fn normalize_input(body: &serde_json::Value) -> Vec<serde_json::Value> {
     match body.get("input") {
         Some(serde_json::Value::Array(arr)) => arr.clone(),
+        Some(input @ serde_json::Value::Object(_)) => vec![input.clone()],
         Some(serde_json::Value::String(s)) => {
             vec![serde_json::json!({
                 "type": "message",
@@ -357,6 +358,23 @@ mod tests {
         });
         let state = ResponsesState::from_request_body(body);
         assert_eq!(state.input.len(), 2, "array input should preserve all items");
+    }
+
+    #[test]
+    fn from_request_body_wraps_object_input_as_single_item() {
+        let input = json!({
+            "type": "message",
+            "role": "developer",
+            "content": "Be terse."
+        });
+        let state = ResponsesState::from_request_body(json!({
+            "model": "gpt-4o",
+            "input": input
+        }));
+
+        assert_eq!(state.input, vec![input]);
+        assert_eq!(state.messages, state.input);
+        assert_eq!(state.persisted_messages, state.input);
     }
 
     #[test]

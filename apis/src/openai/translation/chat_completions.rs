@@ -249,7 +249,12 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
         chat.remove("response_format");
     }
     let tool_choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
-    if let Some(tool_choice) = build_chat_tool_choice(tool_choice)? {
+    let omit_synthesized_default = !chat.contains_key("tools")
+        && obj.get("tool_choice").is_none()
+        && overrides
+            .tool_choice
+            .is_some_and(|choice| choice.as_str() == Some("auto"));
+    if !omit_synthesized_default && let Some(tool_choice) = build_chat_tool_choice(tool_choice)? {
         chat.insert("tool_choice".to_owned(), tool_choice);
     }
 
@@ -760,12 +765,12 @@ pub(crate) fn chat_response_to_response_resource(
     let parts = ResponseResourceParts {
         status,
         incomplete_details: &incomplete_details,
-        output: &output,
+        output,
         usage: &usage,
         service_tier: &service_tier,
     };
 
-    Ok(response_resource(context, &parts))
+    Ok(response_resource(context, parts))
 }
 
 /// Values that vary between response resource snapshots.
@@ -776,7 +781,7 @@ struct ResponseResourceParts<'a> {
     /// Current incomplete details value.
     incomplete_details: &'a Value,
     /// Current output items.
-    output: &'a [Value],
+    output: Vec<Value>,
     /// Current usage object.
     usage: &'a Value,
     /// Current service tier.
@@ -784,7 +789,8 @@ struct ResponseResourceParts<'a> {
 }
 
 /// Build a full `Responses` resource snapshot.
-fn response_resource(context: &ResponseContext<'_>, parts: &ResponseResourceParts<'_>) -> Value {
+fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts<'_>) -> Value {
+    let status = parts.status;
     let mut resource = json!({
         "id": context.response_id,
         "object": "response",
@@ -796,7 +802,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: &ResponseResourcePart
         "max_output_tokens": max_output_tokens_value(context),
         "model": context.model,
         "input": request_field_or_null(context.input),
-        "output": Value::Array(parts.output.to_vec()),
+        "output": Value::Array(parts.output),
         "parallel_tool_calls": context.parallel_tool_calls,
         "previous_response_id": previous_response_id_value(context),
         "reasoning": Value::Null,
@@ -816,7 +822,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: &ResponseResourcePart
         "background": false,
         "service_tier": parts.service_tier
     });
-    insert_request_resource_fields(&mut resource, context, parts.status);
+    insert_request_resource_fields(&mut resource, context, status);
     resource
 }
 

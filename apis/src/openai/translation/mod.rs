@@ -65,6 +65,20 @@ mod tests {
     }
 
     #[test]
+    fn state_default_tool_choice_is_omitted_without_tools() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "hello"});
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+
+        let mapped = map_state(&request, &messages, &[], &json!("auto"));
+
+        assert!(mapped.get("tools").is_none());
+        assert!(
+            mapped.get("tool_choice").is_none(),
+            "Chat Completions backends may reject tool_choice when no tools are present"
+        );
+    }
+
+    #[test]
     fn responses_request_maps_to_chat_completions_wire_shape() {
         let mapped = map(&json!({
             "model": "gpt-4o-mini",

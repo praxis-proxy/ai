@@ -38,11 +38,12 @@ filter_chains:
 
       - filter: path_rewrite
         replace:
-          pattern: "^/v1/responses$"
+          pattern: "^/v1/responses/?$"
           replacement: "/v1/chat/completions"
         conditions:
           - when:
-              path: "/v1/responses"
+              path_prefix: "/v1/responses"
+              methods: [POST]
 
       - filter: router
         routes:

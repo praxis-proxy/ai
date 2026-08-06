@@ -65,6 +65,12 @@ fn normalize_code(status: StatusCode, provider_code: Option<&str>) -> String {
     if let Some(code) = provider_code.filter(|code| VALID_RESPONSE_ERROR_CODES.contains(code)) {
         return code.to_owned();
     }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return "rate_limit_exceeded".to_owned();
+    }
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return "server_error".to_owned();
+    }
     if status.is_client_error() {
         "invalid_prompt".to_owned()
     } else {

@@ -434,6 +434,26 @@ async fn encoded_success_is_rejected_before_response_headers_are_committed() {
 }
 
 #[tokio::test]
+async fn partial_content_success_is_rejected_before_response_headers_are_committed() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.status = StatusCode::PARTIAL_CONTENT;
+    context.response_header = Some(response);
+
+    let action = filter.on_response(&mut context).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("partial finite success should be rejected");
+    };
+    assert_eq!(rejection.status, 502);
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(parsed["error"]["code"], "server_error");
+}
+
+#[tokio::test]
 async fn redirect_response_is_not_treated_as_provider_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -797,6 +817,22 @@ fn unknown_client_error_falls_back_to_invalid_prompt() {
     );
     assert_eq!(normalized.code, "invalid_prompt");
     assert_eq!(normalized.message, "bad request");
+}
+
+#[test]
+fn code_less_rate_limit_uses_rate_limit_error_code() {
+    let normalized = normalize_provider_error(StatusCode::TOO_MANY_REQUESTS, br#"{"error":{"message":"slow down"}}"#);
+    assert_eq!(normalized.code, "rate_limit_exceeded");
+    assert_eq!(normalized.message, "slow down");
+}
+
+#[test]
+fn authentication_errors_do_not_masquerade_as_invalid_prompts() {
+    for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+        let normalized = normalize_provider_error(status, br#"{"error":{"message":"access denied"}}"#);
+        assert_eq!(normalized.code, "server_error");
+        assert_eq!(normalized.message, "access denied");
+    }
 }
 
 #[test]
