@@ -29,6 +29,7 @@ pub(crate) use self::{
     error::ApiClientError,
     url::{resource_url, validate_base_url, validate_forward_headers},
 };
+pub(crate) use crate::correlation::Correlation;
 use crate::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
 
 /// Configuration for constructing an [`ApiClient`].
@@ -126,12 +127,14 @@ impl ApiClient {
     }
 
     /// Send a GET request and parse the response body as JSON.
+    ///
+    /// `callout_headers` comes from [`Self::callout_headers`].
     pub(crate) async fn get_json(
         &self,
         url: String,
-        request_headers: &HeaderMap,
+        callout_headers: &HeaderMap,
     ) -> Result<serde_json::Value, ApiClientError> {
-        let headers = self.build_header_map(request_headers);
+        let headers = callout_headers.clone();
         let response = self.execute_url(&url, http::Method::GET, headers, Bytes::new()).await?;
         serde_json::from_slice(&response.body).map_err(|e| ApiClientError::DecodeFailed {
             detail: format!("JSON decode failed: {e}"),
@@ -144,13 +147,13 @@ impl ApiClient {
         &self,
         url: String,
         body: &serde_json::Value,
-        request_headers: &HeaderMap,
+        callout_headers: &HeaderMap,
     ) -> Result<serde_json::Value, ApiClientError> {
         let serialized = serde_json::to_vec(body).map_err(|e| ApiClientError::DecodeFailed {
             detail: format!("request body serialization failed: {e}"),
         })?;
 
-        let response = self.post_json_bytes(url, serialized, request_headers).await?;
+        let response = self.post_json_bytes(url, serialized, callout_headers).await?;
 
         serde_json::from_slice(&response).map_err(|e| ApiClientError::DecodeFailed {
             detail: format!("JSON decode failed: {e}"),
@@ -163,9 +166,9 @@ impl ApiClient {
         &self,
         url: String,
         body: Vec<u8>,
-        request_headers: &HeaderMap,
+        callout_headers: &HeaderMap,
     ) -> Result<Bytes, ApiClientError> {
-        let mut headers = self.build_header_map(request_headers);
+        let mut headers = callout_headers.clone();
         headers.remove(http::header::CONTENT_TYPE);
         headers.insert(
             http::header::CONTENT_TYPE,
@@ -187,10 +190,10 @@ impl ApiClient {
     pub(crate) async fn get_bytes(
         &self,
         url: &str,
-        request_headers: &HeaderMap,
+        callout_headers: &HeaderMap,
         max_bytes: usize,
     ) -> Result<Bytes, ApiClientError> {
-        let headers = self.build_header_map(request_headers);
+        let headers = callout_headers.clone();
         let request = SubRequest {
             method: http::Method::GET,
             uri: http::Uri::default(),
@@ -223,14 +226,27 @@ impl ApiClient {
         headers
     }
 
-    /// Build a [`HeaderMap`] from forwarded headers.
-    fn build_header_map(&self, request_headers: &HeaderMap) -> HeaderMap {
-        let mut map = HeaderMap::new();
+    /// Build the header set sent on every callout for one
+    /// downstream request.
+    ///
+    /// Combines the operator-configured `forward_headers` allowlist
+    /// with correlation headers, which are injected unconditionally
+    /// so a delegated call is always attributable to the downstream
+    /// request that caused it.
+    ///
+    /// Resolved once per downstream request at the filter boundary
+    /// and threaded into each callout, so the allowlist copy does
+    /// not repeat per file reference.
+    pub(crate) fn callout_headers(&self, request_headers: &HeaderMap, correlation: &Correlation) -> HeaderMap {
+        let mut map = HeaderMap::with_capacity(self.forward_header_names.len().saturating_add(2));
         for name in &self.forward_header_names {
             if let Some(value) = request_headers.get(name) {
                 map.insert(name.clone(), value.clone());
             }
         }
+        // After the allowlist, so correlation wins over a stale
+        // client-supplied value of the same name.
+        correlation.apply(&mut map);
         map
     }
 

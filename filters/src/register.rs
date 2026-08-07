@@ -8,7 +8,7 @@ use praxis_filter::FilterRegistry;
 
 use crate::{
     A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter, TraceContextFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -92,6 +92,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "time_to_first_token" => TimeToFirstTokenFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "trace_context" => TraceContextFilter::from_config
     );
 }
 
@@ -312,6 +316,7 @@ mod tests {
             "expected openai_responses_validate in registry"
         );
         assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
+        assert!(names.contains(&"trace_context"), "expected trace_context in registry");
         assert!(
             names.contains(&"intelligent_route"),
             "expected intelligent_route in registry"

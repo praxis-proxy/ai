@@ -311,6 +311,12 @@ async fn resolve_and_rewrite(
     body: &mut Option<Bytes>,
     parsed: &mut serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
+    // Establish the request's shared trace context before the first
+    // callout. This filter's callouts can run in the pre-read phase,
+    // ahead of header-phase filters, so this is often the hop that
+    // initializes it rather than the one that inherits it.
+    drop(crate::correlation::TraceContext::get_or_init(ctx));
+
     let mut budget = filter.client.resolution_budget();
     let count = match resolve_current_input(filter, ctx, parsed, &mut budget).await {
         Ok(count) => count,
@@ -363,11 +369,12 @@ async fn resolve_current_input(
     parsed: &mut serde_json::Value,
     budget: &mut ResolutionBudget,
 ) -> Result<usize, ResolveError> {
+    let callout_headers = filter.client.callout_headers(ctx);
     Box::pin(resolve_input_with_budget(
         parsed,
         &filter.client,
         filter.config.on_missing,
-        &ctx.request.headers,
+        &callout_headers,
         filter.url_resolver.as_ref(),
         budget,
     ))
@@ -439,6 +446,10 @@ async fn sync_state_with_budget(
     url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
+    // Resolved before the mutable state borrow: correlation reads
+    // the filter context, which is borrowed mutably below.
+    let callout_headers = client.callout_headers(ctx);
+
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         return Ok(());
     };
@@ -453,7 +464,7 @@ async fn sync_state_with_budget(
     let resolver = HistoryResolver {
         client,
         on_missing,
-        request_headers: &ctx.request.headers,
+        request_headers: &callout_headers,
         url_resolver,
     };
 
@@ -489,6 +500,10 @@ async fn resolve_state_history(
     url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
+    // Resolved before the mutable state borrow: correlation reads
+    // the filter context, which is borrowed mutably below.
+    let callout_headers = client.callout_headers(ctx);
+
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         return Ok(());
     };
@@ -497,7 +512,7 @@ async fn resolve_state_history(
     let resolver = HistoryResolver {
         client,
         on_missing,
-        request_headers: &ctx.request.headers,
+        request_headers: &callout_headers,
         url_resolver,
     };
 
