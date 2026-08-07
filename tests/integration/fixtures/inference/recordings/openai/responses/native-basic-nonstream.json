@@ -55,7 +55,7 @@
               "billing": {
                 "payer": "developer"
               },
-              "completed_at": 1786127228,
+              "completed_at": 0,
               "created_at": "1970-01-01T00:00:00Z",
               "error": null,
               "frequency_penalty": 0.0,
@@ -182,7 +182,7 @@
               "billing": {
                 "payer": "developer"
               },
-              "completed_at": 1786127228,
+              "completed_at": 0,
               "created_at": "1970-01-01T00:00:00Z",
               "error": null,
               "frequency_penalty": 0.0,

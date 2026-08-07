@@ -144,24 +144,24 @@ fn selected_scenario_consumes_the_discovered_snapshot_after_source_mutation() {
 }
 
 #[test]
-fn openai_record_reads_only_openai_key_and_redacts_every_surface() {
-    let root = scenario_root("ordinary prompt");
-    let provider = LocalProvider::start(PROVIDER_BODY_SENTINEL);
-    let env = FakeEnv::new([(OPENAI_API_KEY, SECRET_SENTINEL.as_bytes())]);
-    let out = root.path().join("openai.json");
-    let args = record_args(root.path(), "openai", provider.base_url(), Some(out.clone()), None);
-    let mut stdout = Vec::new();
+fn openai_target_reads_only_openai_key_and_builds_sensitive_bearer() {
+    let env = FakeEnv::new([
+        (OPENAI_API_KEY, SECRET_SENTINEL.as_bytes()),
+        (ANTHROPIC_API_KEY, b"unexpected-anthropic-key".as_slice()),
+        (INFERENCE_PROVIDER_API_KEY, b"unexpected-compatible-key".as_slice()),
+    ]);
 
-    run_record_with(args, &env, &mut stdout).expect("local OpenAI-shaped provider should record");
+    let target = provider_target("openai", "https://api.openai.com/", MODEL, &env)
+        .expect("the OpenAI first-party target should accept its dedicated credential");
 
     assert_eq!(env.reads(), [OPENAI_API_KEY]);
-    let request = provider.finish();
-    assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer cli-secret-sentinel")
-    );
-    assert_secret_absent(&stdout, &out, SECRET_SENTINEL);
+    let bearer = target
+        .outbound_headers
+        .get(reqwest::header::AUTHORIZATION)
+        .expect("bearer authorization header must be present");
+    assert_eq!(bearer.as_bytes(), b"Bearer cli-secret-sentinel");
+    assert!(bearer.is_sensitive());
+    assert!(!format!("{target:?}").contains(SECRET_SENTINEL));
     assert!(!format!("{env:?}").contains(SECRET_SENTINEL));
 }
 
@@ -267,17 +267,41 @@ fn anthropic_rejects_non_first_party_origins_before_environment_read() {
 }
 
 #[test]
+fn openai_rejects_non_first_party_origins_before_environment_read() {
+    for (case, base_url) in [
+        ("http", "http://api.openai.com/"),
+        ("lookalike", "https://api.openai.com.evil/"),
+        ("subdomain", "https://evil.api.openai.com/"),
+        ("non-default-port", "https://api.openai.com:8443/"),
+        ("userinfo", "https://user@api.openai.com/"),
+        ("path-prefix", "https://api.openai.com/v1"),
+        ("query", "https://api.openai.com/?version=1"),
+        ("fragment", "https://api.openai.com/#responses"),
+    ] {
+        let env = FakeEnv::new([(OPENAI_API_KEY, SECRET_SENTINEL.as_bytes())]);
+        let error = provider_target("openai", base_url, MODEL, &env)
+            .expect_err("only the exact OpenAI first-party origin may receive its credential");
+
+        assert_eq!(
+            error, "OpenAI provider base URL must be https://api.openai.com/",
+            "case {case}"
+        );
+        assert!(env.reads().is_empty(), "case {case}");
+    }
+}
+
+#[test]
 fn anthropic_default_base_url_is_selected_without_an_environment_read() {
     assert_eq!(default_provider_base_url("anthropic"), "https://api.anthropic.com");
 }
 
 #[test]
-fn openai_record_rejects_credential_equal_to_model_before_creating_output() {
+fn compatible_record_rejects_credential_equal_to_model_before_creating_output() {
     let root = scenario_root("ordinary prompt");
     let provider = LocalProvider::start_with_response_model(PROVIDER_BODY_SENTINEL, "provider-safe-model");
-    let env = FakeEnv::new([(OPENAI_API_KEY, MODEL.as_bytes())]);
+    let env = FakeEnv::new([(INFERENCE_PROVIDER_API_KEY, MODEL.as_bytes())]);
     let out = root.path().join("must-not-exist/openai.json");
-    let args = record_args(root.path(), "openai", provider.base_url(), Some(out.clone()), None);
+    let args = record_args(root.path(), "compatible", provider.base_url(), Some(out.clone()), None);
     let mut stdout = Vec::new();
 
     let error = run_record_with(args, &env, &mut stdout)
@@ -347,21 +371,16 @@ fn vllm_record_succeeds_without_a_credential() {
 }
 
 #[test]
-fn invalid_credential_header_is_opaque_and_starts_no_output() {
-    let root = scenario_root("ordinary prompt");
+fn openai_invalid_credential_header_is_opaque() {
     let env = FakeEnv::new([(OPENAI_API_KEY, b"bad\nsecret".as_slice())]);
-    let out = root.path().join("new-parent/fixture.json");
-    let args = record_args(root.path(), "openai", "http://127.0.0.1:9", Some(out.clone()), None);
-    let mut stdout = Vec::new();
 
-    let error = run_record_with(args, &env, &mut stdout).expect_err("invalid header bytes must be rejected");
+    let error = provider_target("openai", "https://api.openai.com/", MODEL, &env)
+        .expect_err("invalid header bytes must be rejected");
     let surfaces = error_surfaces(&error);
 
     assert_eq!(error, "provider credential could not be used");
     assert!(!surfaces.contains("bad"));
     assert!(!surfaces.contains("secret"));
-    assert!(stdout.is_empty());
-    assert!(!out.parent().unwrap().exists());
 }
 
 #[test]
@@ -369,7 +388,13 @@ fn openai_record_requires_only_the_openai_key() {
     let root = scenario_root("ordinary prompt");
     let env = FakeEnv::new([(INFERENCE_PROVIDER_API_KEY, SECRET_SENTINEL.as_bytes())]);
     let out = root.path().join("new-parent/fixture.json");
-    let args = record_args(root.path(), "openai", "http://127.0.0.1:9", Some(out.clone()), None);
+    let args = record_args(
+        root.path(),
+        "openai",
+        "https://api.openai.com/",
+        Some(out.clone()),
+        None,
+    );
 
     let error = run_record_with(args, &env, &mut Vec::new()).expect_err("OpenAI must require its dedicated key");
 
@@ -380,17 +405,17 @@ fn openai_record_requires_only_the_openai_key() {
 }
 
 #[test]
-fn openai_json_credential_reflection_is_opaque_and_creates_no_artifact() {
+fn compatible_json_credential_reflection_is_opaque_and_creates_no_artifact() {
     let secret = r#"cli-\"credential\"\\tail"#;
     let root = scenario_root("ordinary prompt");
     let provider = LocalProvider::start(secret);
-    let env = FakeEnv::new([(OPENAI_API_KEY, secret.as_bytes())]);
+    let env = FakeEnv::new([(INFERENCE_PROVIDER_API_KEY, secret.as_bytes())]);
     let out = root.path().join("must-not-exist/openai.json");
-    let args = record_args(root.path(), "openai", provider.base_url(), Some(out.clone()), None);
+    let args = record_args(root.path(), "compatible", provider.base_url(), Some(out.clone()), None);
     let mut stdout = Vec::new();
 
     let error =
-        run_record_with(args, &env, &mut stdout).expect_err("an echoed OpenAI credential must prevent fixture output");
+        run_record_with(args, &env, &mut stdout).expect_err("an echoed compatible credential must prevent output");
     let request = provider.finish();
     let surfaces = error_surfaces(&error);
 
@@ -1188,7 +1213,7 @@ fn check_maps_persisted_document_resource_failures_to_static_categories() {
 fn provider_target_debug_never_exposes_outbound_headers() {
     let env = FakeEnv::new([(OPENAI_API_KEY, SECRET_SENTINEL.as_bytes())]);
 
-    let target = provider_target("openai", "http://127.0.0.1:8000", MODEL, &env).unwrap();
+    let target = provider_target("openai", "https://api.openai.com/", MODEL, &env).unwrap();
 
     let debug = format!("{target:?}");
     assert!(!debug.contains(SECRET_SENTINEL));

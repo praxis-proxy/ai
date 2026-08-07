@@ -462,7 +462,8 @@ impl<'a> Sanitizer<'a> {
     /// Removes unstable provider padding at a parsed response-document root.
     fn sanitize_response_json_document(&mut self, value: &mut Value) -> Result<(), FixtureError> {
         if let Value::Object(object) = value
-            && object.get("object").and_then(Value::as_str) == Some("chat.completion.chunk")
+            && (object.get("object").and_then(Value::as_str) == Some("chat.completion.chunk")
+                || object.get("type").and_then(Value::as_str) == Some("response.output_text.delta"))
         {
             object.remove("obfuscation");
         }
@@ -499,6 +500,8 @@ impl<'a> Sanitizer<'a> {
                 nested_value = Value::from(0);
             } else if key == "created_at" {
                 nested_value = Value::from("1970-01-01T00:00:00Z");
+            } else if key == "completed_at" && !nested_value.is_null() {
+                nested_value = Value::from(0);
             } else {
                 self.sanitize_json_field(&key, &mut nested_value, is_model_object)?;
             }
@@ -724,7 +727,7 @@ fn encode_base64_fallibly(decoded: &[u8]) -> Result<String, FixtureError> {
 fn is_identifier_key(key: &str) -> bool {
     matches!(
         key,
-        "id" | "response_id" | "previous_response_id" | "call_id" | "tool_call_id" | "conversation_id"
+        "id" | "response_id" | "previous_response_id" | "call_id" | "tool_call_id" | "conversation_id" | "item_id"
     )
 }
 
@@ -2124,6 +2127,122 @@ mod tests {
             "{\"call_id\":\"call_recorded_0008\",\"id\":\"resp_recorded_0002\"}"
         );
         assert_eq!(frames[0].id.as_deref(), Some("resp_recorded_0002"));
+    }
+
+    #[test]
+    fn sanitize_normalizes_non_null_completed_at_and_preserves_null() {
+        // Arrange
+        let mut fixture = fixture();
+        fixture.turns[0].upstream.response.body = RecordedBody::Json {
+            value: json!({
+                "completed": {"completed_at": 1_786_127_242_u64},
+                "in_progress": {"completed_at": null}
+            }),
+        };
+
+        // Act
+        sanitize_fixture(&mut fixture, &RedactionRules::default()).unwrap();
+
+        // Assert
+        let RecordedBody::Json { value } = &fixture.turns[0].upstream.response.body else {
+            panic!("fixture response must be JSON")
+        };
+        assert_eq!(value["completed"]["completed_at"], 0);
+        assert!(value["in_progress"]["completed_at"].is_null());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test keeps root and nested obfuscation behavior visible in one audit"
+    )]
+    fn sanitize_drops_only_top_level_responses_delta_obfuscation_padding() {
+        // Arrange
+        let mut fixture = fixture();
+        fixture.turns[0].upstream.response.body = RecordedBody::Sse {
+            frames: vec![
+                crate::inference_fixture::SseFrame {
+                    event: Some("response.output_text.delta".to_owned()),
+                    data: json!({
+                        "type": "response.output_text.delta",
+                        "delta": "hello",
+                        "obfuscation": "provider-padding",
+                        "nested": {"obfuscation": "semantic-value"}
+                    })
+                    .to_string(),
+                    id: None,
+                    retry: None,
+                },
+                crate::inference_fixture::SseFrame {
+                    event: Some("user.event".to_owned()),
+                    data: json!({"type": "user.event", "obfuscation": "user-value"}).to_string(),
+                    id: None,
+                    retry: None,
+                },
+            ],
+            done: true,
+        };
+
+        // Act
+        sanitize_fixture(&mut fixture, &RedactionRules::default()).unwrap();
+
+        // Assert
+        let RecordedBody::Sse { frames, .. } = &fixture.turns[0].upstream.response.body else {
+            panic!("fixture response must be SSE")
+        };
+        let delta: Value = serde_json::from_str(&frames[0].data).unwrap();
+        let user: Value = serde_json::from_str(&frames[1].data).unwrap();
+        assert!(delta.get("obfuscation").is_none());
+        assert_eq!(delta["nested"]["obfuscation"], "semantic-value");
+        assert_eq!(user["obfuscation"], "user-value");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test keeps the defining item and its cross-event reference visible together"
+    )]
+    fn sanitize_maps_responses_item_id_to_the_referenced_item_identifier() {
+        // Arrange
+        let mut fixture = fixture();
+        fixture.turns[0].upstream.response.body = RecordedBody::Sse {
+            frames: vec![
+                crate::inference_fixture::SseFrame {
+                    event: Some("response.output_item.added".to_owned()),
+                    data: json!({
+                        "type": "response.output_item.added",
+                        "item": {"id": "msg_source", "type": "message"}
+                    })
+                    .to_string(),
+                    id: None,
+                    retry: None,
+                },
+                crate::inference_fixture::SseFrame {
+                    event: Some("response.output_text.delta".to_owned()),
+                    data: json!({
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_source",
+                        "delta": "hello"
+                    })
+                    .to_string(),
+                    id: None,
+                    retry: None,
+                },
+            ],
+            done: true,
+        };
+
+        // Act
+        sanitize_fixture(&mut fixture, &RedactionRules::default()).unwrap();
+
+        // Assert
+        let RecordedBody::Sse { frames, .. } = &fixture.turns[0].upstream.response.body else {
+            panic!("fixture response must be SSE")
+        };
+        let added: Value = serde_json::from_str(&frames[0].data).unwrap();
+        let delta: Value = serde_json::from_str(&frames[1].data).unwrap();
+        assert_eq!(delta["item_id"], added["item"]["id"]);
+        assert_eq!(delta["item_id"], "msg_recorded_0005");
     }
 
     #[test]

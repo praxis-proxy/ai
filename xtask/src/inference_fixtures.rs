@@ -313,6 +313,7 @@ fn provider_target(provider: &str, base_url: &str, model: &str, env: &dyn EnvRea
     let mut outbound_headers = reqwest::header::HeaderMap::new();
     match ProviderPolicy::for_provider(provider) {
         ProviderPolicy::OpenAi => {
+            validate_openai_origin(&base_url)?;
             let credential =
                 required_credential(env, OPENAI_API_KEY, "OPENAI_API_KEY is required for provider openai")?;
             insert_bearer_credential(&mut outbound_headers, &credential)?;
@@ -350,6 +351,22 @@ fn required_credential(
     env.read(name)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| missing_error.to_owned())
+}
+
+/// Rejects every target except the root of OpenAI's exact first-party origin.
+fn validate_openai_origin(base_url: &Url) -> Result<(), String> {
+    let is_first_party_root = base_url.scheme() == "https"
+        && base_url.host_str() == Some("api.openai.com")
+        && base_url.port_or_known_default() == Some(443)
+        && base_url.username().is_empty()
+        && base_url.password().is_none()
+        && base_url.path() == "/"
+        && base_url.query().is_none()
+        && base_url.fragment().is_none();
+    if !is_first_party_root {
+        return Err("OpenAI provider base URL must be https://api.openai.com/".to_owned());
+    }
+    Ok(())
 }
 
 /// Rejects every target except the root of Anthropic's exact first-party origin.
@@ -449,7 +466,7 @@ fn validate_provider(provider: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Requires the explicit synthetic-origin flag to use the synthetic provider.
+/// Requires provider `synthetic` when controlled synthetic provenance is requested.
 fn validate_controlled_synthetic(provider: &str, controlled_synthetic: bool) -> Result<(), String> {
     if controlled_synthetic && provider != "synthetic" {
         return Err("controlled synthetic imports require provider `synthetic`".to_owned());
