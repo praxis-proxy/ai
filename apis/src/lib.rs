@@ -18,6 +18,7 @@ pub mod promotion;
 #[cfg(feature = "store")]
 pub mod store;
 pub(crate) mod subrequest;
+pub(crate) mod web_search;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.

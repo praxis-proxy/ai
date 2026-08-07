@@ -14,7 +14,8 @@ use crate::{
 /// Register all in-tree AI HTTP filters into `registry`.
 ///
 /// When `subrequest_client` is provided, filters that make HTTP
-/// callouts (`openai_file_resolve`, `openai_web_search`) capture the
+/// callouts (`openai_file_resolve`, `openai_web_search`,
+/// `anthropic_web_search`) capture the
 /// shared client instead of creating isolated per-filter connectors.
 ///
 /// Does not call [`FilterRegistry::with_builtins`].
@@ -30,7 +31,7 @@ use crate::{
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     register_agentic_filters(registry);
     register_general_ai_filters(registry);
-    register_anthropic_filters(registry);
+    register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
     register_routing_filters(registry);
 }
@@ -103,7 +104,7 @@ fn register_routing_filters(registry: &mut FilterRegistry) {
 }
 
 /// Register Anthropic-specific filters.
-fn register_anthropic_filters(registry: &mut FilterRegistry) {
+fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
         @register registry,
         http "anthropic_messages_format" => praxis_ai_apis::anthropic::AnthropicMessagesFormatFilter::from_config
@@ -124,6 +125,7 @@ fn register_anthropic_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "anthropic_validate" => praxis_ai_apis::anthropic::AnthropicValidateFilter::from_config
     );
+    register_anthropic_web_search(registry, subrequest_client);
 }
 
 /// Register OpenAI Responses API request-path filters.
@@ -203,6 +205,28 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 // -----------------------------------------------------------------------------
 // Sub-request-aware registration
 // -----------------------------------------------------------------------------
+
+/// Register `anthropic_web_search` with the shared client when
+/// available, otherwise fall back to an isolated per-filter connector.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_anthropic_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "anthropic_web_search",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'anthropic_web_search'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "anthropic_web_search" => praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_config
+        );
+    }
+}
 
 /// Register `openai_file_resolve` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
@@ -295,6 +319,10 @@ mod tests {
         assert!(
             names.contains(&"anthropic_validate"),
             "expected anthropic filter in registry"
+        );
+        assert!(
+            names.contains(&"anthropic_web_search"),
+            "expected anthropic_web_search in registry"
         );
         assert!(
             names.contains(&"request_id"),
