@@ -17,6 +17,7 @@
 mod debug;
 mod echo;
 mod filter_docs;
+mod inference_fixtures;
 mod lint_deps;
 mod lint_example_tests;
 mod lint_markdown_links;
@@ -26,6 +27,7 @@ mod openai_conformance;
 mod openai_conformance_gate;
 mod port;
 mod sync_example_readme;
+mod sync_inference_readme;
 mod sync_responses_readme;
 
 use clap::{Parser, Subcommand};
@@ -46,6 +48,9 @@ struct Cli {
 /// Available xtask subcommands.
 #[derive(Subcommand)]
 enum Command {
+    /// Validate inference fixture coverage.
+    CheckInference(inference_fixtures::CheckArgs),
+
     /// Start a quick HTTP test server returning a static
     /// response to every request.
     Echo(echo::Args),
@@ -68,12 +73,18 @@ enum Command {
     /// Check that separator comments total exactly 80 columns.
     LintSeparators(lint_separators::Args),
 
+    /// Import an external provider recording into a two-sided fixture.
+    ImportInference(inference_fixtures::ImportArgs),
+
     /// Convert a Claude Code or Codex session log into a replay fixture.
     MakeReplayFixture(make_replay_fixture::Args),
 
     /// Verify or regenerate the `examples/README.md` table
     /// from YAML config header comments.
     SyncExampleReadme(sync_example_readme::Args),
+
+    /// Verify or regenerate the inference fixture coverage inventory.
+    SyncInferenceReadme(sync_inference_readme::Args),
 
     /// Generate per-filter documentation under `docs/filters/`.
     GenerateFilterDocs(filter_docs::GenerateArgs),
@@ -90,6 +101,9 @@ enum Command {
     /// Enforce or acknowledge failures in a generated conformance report.
     OpenaiConformanceGate(openai_conformance_gate::Args),
 
+    /// Record a two-sided fixture against a live provider.
+    RecordInference(inference_fixtures::RecordArgs),
+
     /// Generate the pipeline-overview table in
     /// `apis/src/openai/responses/README.md`.
     SyncResponsesReadme(sync_responses_readme::Args),
@@ -103,12 +117,14 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        Command::CheckInference(args) => inference_fixtures::run_check(&args),
         Command::Echo(args) => echo::run(args),
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),
         Command::LintExampleTests(args) => lint_example_tests::run(args),
         Command::LintMarkdownLinks(args) => lint_markdown_links::run(args),
         Command::LintSeparators(args) => lint_separators::run(args),
+        Command::ImportInference(args) => inference_fixtures::run_import(args),
         Command::MakeReplayFixture(args) => make_replay_fixture::run(args),
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
@@ -116,6 +132,8 @@ fn main() {
         Command::OpenaiConformance(args) => openai_conformance::run(&args),
         Command::OpenaiConformanceReference(args) => openai_conformance::run_reference(&args),
         Command::OpenaiConformanceGate(args) => openai_conformance_gate::run(&args),
+        Command::RecordInference(args) => inference_fixtures::run_record(args),
+        Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),
         Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),
     }
 }

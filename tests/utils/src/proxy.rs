@@ -3,7 +3,14 @@
 
 //! Proxy startup and configuration test utilities for integration tests.
 
-use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc, thread::JoinHandle, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::PathBuf,
+    sync::{Arc, mpsc},
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use arc_swap::ArcSwap;
 use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
@@ -13,6 +20,7 @@ use praxis_core::{
 };
 use praxis_filter::{FilterFactory, FilterPipeline, FilterRegistry, HttpFilter};
 use praxis_protocol::http::load_http_handler;
+use thiserror::Error;
 use tokio::sync::Notify;
 
 // -----------------------------------------------------------------------------
@@ -110,6 +118,24 @@ impl ShutdownSignalWatch for NotifyShutdownWatch {
 /// [`ProxyGuard`]: ProxyGuard
 const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Interval between checks that the proxy server thread has exited.
+const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Failure to stop and join a proxy server thread within its
+/// bounded shutdown deadline.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProxyShutdownError {
+    /// The producer did not finish before the shutdown deadline.
+    #[error("proxy shutdown timed out")]
+    Timeout,
+    /// The producer exited without sending its normal completion signal.
+    #[error("proxy shutdown completion channel disconnected")]
+    CompletionDisconnected,
+    /// The producer thread panicked.
+    #[error("proxy server thread panicked during shutdown")]
+    ThreadPanicked,
+}
+
 /// RAII guard that shuts down a Pingora proxy server when
 /// dropped. Returned by [`start_proxy_with_registry`] and
 /// related helpers so that test threads do not leak.
@@ -120,6 +146,14 @@ pub struct ProxyGuard {
     handle: Option<JoinHandle<()>>,
     /// Fires the shutdown signal on drop.
     notify: Arc<Notify>,
+    /// Reports that the server returned normally from its producer thread.
+    completion: mpsc::Receiver<()>,
+    /// Whether the normal completion signal has already been received.
+    completion_observed: bool,
+    /// Whether the completion sender disconnected without sending.
+    completion_disconnected: bool,
+    /// Maximum duration for one shutdown attempt.
+    join_timeout: Duration,
 }
 
 impl ProxyGuard {
@@ -127,6 +161,92 @@ impl ProxyGuard {
     pub fn addr(&self) -> &str {
         &self.addr
     }
+
+    /// Signal the proxy to stop and wait for its producer thread
+    /// to exit within a bounded deadline.
+    ///
+    /// A timeout retains the thread handle so a later call or the
+    /// guard's drop fallback can make another bounded join attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the producer does not finish before the
+    /// deadline, disconnects its completion channel, or panics.
+    pub fn shutdown(&mut self) -> Result<(), ProxyShutdownError> {
+        let deadline = Instant::now() + self.join_timeout;
+        self.notify.notify_one();
+
+        if self.handle.is_none() {
+            return Ok(());
+        }
+
+        self.observe_completion(deadline)?;
+        self.join_producer(deadline)
+    }
+
+    /// Waits for the normal producer completion signal once.
+    fn observe_completion(&mut self, deadline: Instant) -> Result<(), ProxyShutdownError> {
+        if !self.completion_observed && !self.completion_disconnected {
+            match self.completion.recv_timeout(remaining_until(deadline)) {
+                Ok(()) => self.completion_observed = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(ProxyShutdownError::Timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => self.completion_disconnected = true,
+            }
+        }
+        Ok(())
+    }
+
+    /// Polls for thread completion within the shared deadline, then joins it.
+    fn join_producer(&mut self, deadline: Instant) -> Result<(), ProxyShutdownError> {
+        while self.handle.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            let remaining = remaining_until(deadline);
+            if remaining.is_zero() {
+                return Err(if self.completion_disconnected {
+                    ProxyShutdownError::CompletionDisconnected
+                } else {
+                    ProxyShutdownError::Timeout
+                });
+            }
+            std::thread::sleep(JOIN_POLL_INTERVAL.min(remaining));
+        }
+
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        if handle.join().is_err() {
+            return Err(ProxyShutdownError::ThreadPanicked);
+        }
+        if self.completion_disconnected {
+            return Err(ProxyShutdownError::CompletionDisconnected);
+        }
+        Ok(())
+    }
+}
+
+/// Return the time remaining before `deadline` without underflow.
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Builds a producer that cannot complete until the test releases it.
+#[cfg(test)]
+pub(crate) fn blocked_proxy_guard_for_test(join_timeout: Duration) -> (ProxyGuard, mpsc::Sender<()>) {
+    let (release_tx, release_rx) = mpsc::channel();
+    let (completion_tx, completion) = mpsc::sync_channel(1);
+    let handle = std::thread::spawn(move || {
+        release_rx.recv().expect("test should release blocked producer");
+        let _sent = completion_tx.send(());
+    });
+    let guard = ProxyGuard {
+        addr: "127.0.0.1:0".to_owned(),
+        handle: Some(handle),
+        notify: Arc::new(Notify::new()),
+        completion,
+        completion_observed: false,
+        completion_disconnected: false,
+        join_timeout,
+    };
+    (guard, release_tx)
 }
 
 impl fmt::Display for ProxyGuard {
@@ -137,21 +257,13 @@ impl fmt::Display for ProxyGuard {
 
 impl Drop for ProxyGuard {
     fn drop(&mut self) {
-        self.notify.notify_one();
-        if let Some(handle) = self.handle.take() {
-            let start = std::time::Instant::now();
-            while !handle.is_finished() {
-                if start.elapsed() >= JOIN_TIMEOUT {
-                    tracing::warn!(
-                        addr = %self.addr,
-                        timeout_secs = JOIN_TIMEOUT.as_secs(),
-                        "server thread did not exit within timeout",
-                    );
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            let _ = handle.join();
+        if let Err(error) = self.shutdown() {
+            tracing::warn!(
+                addr = %self.addr,
+                error = %error,
+                timeout_secs = self.join_timeout.as_secs_f64(),
+                "server thread did not shut down cleanly",
+            );
         }
     }
 }
@@ -195,17 +307,23 @@ fn spawn_proxy_server(config: &Config, registry: &FilterRegistry) -> ProxyGuard 
 
     let notify = Arc::new(Notify::new());
     let watch_notify = Arc::clone(&notify);
+    let (completion_tx, completion) = mpsc::sync_channel(1);
 
     let handle = std::thread::spawn(move || {
         server.run(RunArgs {
             shutdown_signal: Box::new(NotifyShutdownWatch { notify: watch_notify }),
         });
+        let _sent = completion_tx.send(());
     });
 
     ProxyGuard {
         addr,
         handle: Some(handle),
         notify,
+        completion,
+        completion_observed: false,
+        completion_disconnected: false,
+        join_timeout: JOIN_TIMEOUT,
     }
 }
 
@@ -224,6 +342,18 @@ fn spawn_proxy_server(config: &Config, registry: &FilterRegistry) -> ProxyGuard 
 /// Panics if `config.listeners` is empty.
 pub fn start_proxy(config: &Config) -> ProxyGuard {
     start_proxy_with_registry(config, &praxis_ai::build_full_registry(&test_subrequest_client()))
+}
+
+/// Start the proxy server without issuing an HTTP readiness request.
+///
+/// Returns a [`ProxyGuard`] immediately after spawning the server thread. The
+/// caller must perform a readiness check appropriate for its trust boundary.
+///
+/// # Panics
+///
+/// Panics if `config.listeners` is empty.
+pub fn start_proxy_no_wait(config: &Config) -> ProxyGuard {
+    spawn_proxy_server(config, &praxis_ai::build_full_registry(&test_subrequest_client()))
 }
 
 /// Start the proxy with a custom filter registry.
@@ -440,4 +570,126 @@ pub fn registry_with(name: &str, make: fn() -> Box<dyn HttpFilter>) -> FilterReg
         .register(name, FilterFactory::Http(Arc::new(move |_| Ok(make()))))
         .expect("duplicate filter name in test registry");
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        thread::JoinHandle,
+        time::Duration,
+    };
+
+    use praxis_core::config::Config;
+    use tokio::sync::Notify;
+
+    use super::{ProxyGuard, ProxyShutdownError, simple_proxy_yaml, start_proxy};
+    use crate::free_port_guard;
+
+    #[test]
+    fn explicit_shutdown_joins_real_proxy_and_releases_listener() {
+        let proxy_port = free_port_guard().release();
+        let backend_port = free_port_guard().release();
+        let config =
+            Config::from_yaml(&simple_proxy_yaml(proxy_port, backend_port)).expect("test proxy config should parse");
+        let mut proxy = start_proxy(&config);
+
+        proxy
+            .shutdown()
+            .expect("explicit shutdown should join the proxy thread");
+
+        let rebound = TcpListener::bind(("127.0.0.1", proxy_port))
+            .expect("joined proxy must release its listener before success");
+        assert_eq!(rebound.local_addr().unwrap().port(), proxy_port);
+        proxy
+            .shutdown()
+            .expect("explicit shutdown should be idempotent after join");
+    }
+
+    #[test]
+    fn drop_fallback_joins_real_proxy_and_releases_listener() {
+        let proxy_port = free_port_guard().release();
+        let backend_port = free_port_guard().release();
+        let config =
+            Config::from_yaml(&simple_proxy_yaml(proxy_port, backend_port)).expect("test proxy config should parse");
+        let proxy = start_proxy(&config);
+
+        drop(proxy);
+
+        let rebound = TcpListener::bind(("127.0.0.1", proxy_port))
+            .expect("drop fallback must release its listener before returning");
+        assert_eq!(rebound.local_addr().unwrap().port(), proxy_port);
+    }
+
+    #[test]
+    fn explicit_shutdown_timeout_never_reports_an_unjoined_thread_as_success() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let thread_exited = Arc::clone(&exited);
+        let (release_tx, release_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            release_rx.recv().expect("test should release blocked producer");
+            thread_exited.store(true, Ordering::Release);
+            let _sent = completion_tx.send(());
+        });
+        let mut proxy = test_proxy_guard(handle, completion_rx, Duration::from_millis(20));
+
+        let error = proxy.shutdown().expect_err("blocked producer must time out");
+
+        assert_eq!(error, ProxyShutdownError::Timeout);
+        assert!(
+            !exited.load(Ordering::Acquire),
+            "timeout must not claim the thread joined"
+        );
+        release_tx.send(()).unwrap();
+        proxy
+            .shutdown()
+            .expect("a later bounded retry should join after release");
+        assert!(exited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn explicit_shutdown_reports_completion_disconnect() {
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        drop(completion_tx);
+        let handle = std::thread::spawn(|| {});
+        let mut proxy = test_proxy_guard(handle, completion_rx, Duration::from_secs(1));
+
+        let error = proxy
+            .shutdown()
+            .expect_err("missing completion signal must be an error");
+
+        assert_eq!(error, ProxyShutdownError::CompletionDisconnected);
+    }
+
+    #[test]
+    fn explicit_shutdown_reports_producer_panic() {
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let _completion_tx = completion_tx;
+            panic!("injected proxy thread panic");
+        });
+        let mut proxy = test_proxy_guard(handle, completion_rx, Duration::from_secs(1));
+
+        let error = proxy.shutdown().expect_err("producer panic must be an error");
+
+        assert_eq!(error, ProxyShutdownError::ThreadPanicked);
+    }
+
+    fn test_proxy_guard(handle: JoinHandle<()>, completion: mpsc::Receiver<()>, join_timeout: Duration) -> ProxyGuard {
+        ProxyGuard {
+            addr: "127.0.0.1:0".to_owned(),
+            handle: Some(handle),
+            notify: Arc::new(Notify::new()),
+            completion,
+            completion_observed: false,
+            completion_disconnected: false,
+            join_timeout,
+        }
+    }
 }

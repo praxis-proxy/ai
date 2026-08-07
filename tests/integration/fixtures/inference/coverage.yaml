@@ -1,0 +1,105 @@
+version: 1
+scope:
+  - messages_to_chat_completions
+  - messages_native_passthrough
+  - responses_native_passthrough
+features:
+  - id: messages.request.minimal
+    scopes:
+      - messages_to_chat_completions
+    status: live_covered
+    scenarios:
+      - messages/basic-nonstream
+      - messages/basic-stream
+    providers:
+      openai:
+        status: covered
+      vllm:
+        status: live_covered
+  - id: messages.response.text
+    scopes:
+      - messages_to_chat_completions
+    status: live_covered
+    scenarios:
+      - messages/basic-nonstream
+      - messages/basic-stream
+    providers:
+      openai:
+        status: covered
+      vllm:
+        status: live_covered
+  - id: messages.error.upstream
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/upstream-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.native.request
+    scopes:
+      - messages_native_passthrough
+    status: live_covered
+    scenarios:
+      - messages/native-basic-nonstream
+      - messages/native-basic-stream
+      - messages/native-tool-use
+    providers:
+      anthropic:
+        status: live_covered
+  - id: messages.native.response.text
+    scopes:
+      - messages_native_passthrough
+    status: live_covered
+    scenarios:
+      - messages/native-basic-nonstream
+      - messages/native-basic-stream
+    providers:
+      anthropic:
+        status: live_covered
+  - id: messages.native.tool_use
+    scopes:
+      - messages_native_passthrough
+    status: live_covered
+    scenarios:
+      - messages/native-tool-use
+    providers:
+      anthropic:
+        status: live_covered
+  - id: responses.native.request
+    scopes:
+      - responses_native_passthrough
+    status: live_covered
+    scenarios:
+      - responses/native-basic-nonstream
+      - responses/native-basic-stream
+      - responses/native-tool-call
+    providers:
+      openai:
+        status: live_covered
+      vllm:
+        status: live_covered
+  - id: responses.native.response.text
+    scopes:
+      - responses_native_passthrough
+    status: live_covered
+    scenarios:
+      - responses/native-basic-nonstream
+      - responses/native-basic-stream
+    providers:
+      openai:
+        status: live_covered
+      vllm:
+        status: live_covered
+  - id: responses.native.tool_call
+    scopes:
+      - responses_native_passthrough
+    status: live_covered
+    scenarios:
+      - responses/native-tool-call
+    providers:
+      openai:
+        status: live_covered
+      vllm:
+        status: live_covered
