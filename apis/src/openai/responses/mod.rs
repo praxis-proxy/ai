@@ -64,23 +64,22 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::{payload_processing::OnInvalidBehavior, value_safety::is_safe_promoted_value},
-    parse_filter_config,
+    builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
 };
 use tracing::{debug, trace};
 
 use self::config::{ResponsesFormatConfig, build_config};
-use crate::classifier::{
-    AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path,
-    is_responses_websocket_handshake,
+use crate::{
+    classifier::{
+        AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path,
+        is_responses_websocket_handshake,
+    },
+    promotion::is_promotable_value,
 };
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Maximum length of a body-derived value promoted to headers or filter results.
-const MAX_PROMOTED_VALUE_LEN: usize = 256;
 
 /// Default store name used when registering the response store in the
 /// per-request registry.
@@ -295,7 +294,7 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
 /// Write optional string and boolean-option metadata fields.
 fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     if let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
+        && is_promotable_value(model)
     {
         ctx.set_metadata("openai_responses_format.model", model.clone());
     }
@@ -354,8 +353,7 @@ fn promote_headers(
 
     if let Some(header) = &config.headers.model
         && let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
-        && model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(model)
     {
         ctx.extra_request_headers
             .push((Cow::Owned(header.clone()), model.clone()));
@@ -402,8 +400,7 @@ fn promote_optional_results(
     classified: &ClassifiedRequest,
 ) -> Result<(), FilterError> {
     if let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
-        && model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(model)
     {
         results.set("model", model.clone())?;
     }
