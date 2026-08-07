@@ -141,7 +141,7 @@ impl McpBrokerFilter {
         let cfg: McpBrokerConfig = parse_filter_config("mcp", config)?;
         let (validated, catalog) = build_config(cfg)?;
 
-        let json_rpc_config = build_json_rpc_config(validated.max_body_bytes);
+        let json_rpc_config = super::build_json_rpc_config(validated.max_body_bytes);
 
         Ok(Box::new(Self {
             cache_scope: validated.cache_scope,
@@ -1010,30 +1010,4 @@ fn json_rpc_error_action_with_id(id_json: &str, code: i32, message: &str) -> Fil
 /// Returns `true` when the request URI path matches the configured MCP path.
 fn request_path_matches(uri: &http::Uri, public_path: &str) -> bool {
     uri.path() == public_path
-}
-
-// -----------------------------------------------------------------------------
-// Shared Parser Config
-// -----------------------------------------------------------------------------
-
-/// Build a [`JsonRpcConfig`] for the shared parser.
-fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
-    use praxis_filter::builtins::http::payload_processing::{
-        OnInvalidBehavior,
-        json_rpc::config::{BatchPolicy, JsonRpcHeaders},
-    };
-
-    let headers = JsonRpcHeaders {
-        id: None,
-        kind: None,
-        method: None,
-    };
-
-    JsonRpcConfig {
-        batch_policy: BatchPolicy::Reject,
-        headers,
-        max_batch_size: 100,
-        max_body_bytes,
-        on_invalid: OnInvalidBehavior::Continue,
-    }
 }

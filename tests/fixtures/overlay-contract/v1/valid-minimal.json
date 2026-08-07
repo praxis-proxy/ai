@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0.0",
+  "revision": {
+    "kind": "content_addressed",
+    "algorithm": "sha256",
+    "value": "abd5f4855454390febb53ad2085d182c465a78c5d14f0132317b4c9335aa8494"
+  },
+  "content_digest": {
+    "algorithm": "sha256",
+    "value": "abd5f4855454390febb53ad2085d182c465a78c5d14f0132317b4c9335aa8494"
+  },
+  "scope": {
+    "network": "test-net",
+    "gateway": "gw",
+    "namespace": "ns",
+    "local_site": "site-a"
+  },
+  "provenance": {
+    "producer": "grid-operator",
+    "producer_version": "0.1.0",
+    "source_name": "test-net",
+    "source_uid": "uid-1",
+    "source_generation": 1,
+    "rendered_at": "2026-07-29T00:00:00Z"
+  },
+  "overlay": {
+    "network": "test-net",
+    "local_site": "site-a",
+    "candidates": [
+      {
+        "kind": "inference_model",
+        "name": "model-a",
+        "site": "site-a",
+        "cluster": "cluster-a",
+        "fresh": true,
+        "stable_id": "abcd1234",
+        "rank": 0
+      }
+    ],
+    "generated_at": "2026-07-29T00:00:00Z"
+  }
+}

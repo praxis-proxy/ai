@@ -102,8 +102,8 @@ struct GoogleUsageMetadata {
     /// Tokens in the prompt.
     prompt_token_count: u64,
 
-    /// Tokens in the candidates (output).
-    candidates_token_count: u64,
+    /// Tokens in the candidates (output). Absent in safety-filtered responses.
+    candidates_token_count: Option<u64>,
 
     /// Total tokens (optional, can be calculated).
     total_token_count: Option<u64>,
@@ -115,7 +115,7 @@ pub(super) fn parse_google(body: &[u8]) -> Option<TokenUsage> {
     let usage = response.usage_metadata?;
     Some(TokenUsage::new(
         usage.prompt_token_count,
-        usage.candidates_token_count,
+        usage.candidates_token_count.unwrap_or(0),
         usage.total_token_count,
     ))
 }
@@ -323,6 +323,19 @@ mod tests {
         assert_eq!(usage.input_tokens(), 0);
         assert_eq!(usage.output_tokens(), 0);
         assert_eq!(usage.total_tokens(), 0);
+    }
+
+    #[test]
+    fn google_missing_candidates_token_count_defaults_to_zero() {
+        let json = br#"{"usageMetadata": {"promptTokenCount": 42, "totalTokenCount": 42}}"#;
+        let usage = parse_google(json).unwrap();
+        assert_eq!(usage.input_tokens(), 42, "input tokens should be preserved");
+        assert_eq!(
+            usage.output_tokens(),
+            0,
+            "absent candidatesTokenCount should default to 0"
+        );
+        assert_eq!(usage.total_tokens(), 42);
     }
 
     // -------------------------------------------------------------------------
