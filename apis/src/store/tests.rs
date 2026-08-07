@@ -1423,6 +1423,29 @@ async fn create_items_and_sync_messages_empty_batch_is_noop() {
         .expect("empty batch should succeed");
 }
 
+#[tokio::test]
+async fn create_items_and_sync_messages_missing_conversation_errors() {
+    let store = make_store_with_items().await;
+    // No conversation row exists for "conv_gone" — mirrors a conversation
+    // deleted between the handler's existence check and this transaction.
+    let items = [make_conversation_item("item_a", "tenant_a", "conv_gone", 0)];
+    let err = store
+        .create_items_and_sync_messages("tenant_a", "conv_gone", &items)
+        .await
+        .expect_err("create against a missing conversation should error");
+    assert!(
+        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
+        "unexpected error: {err:?}"
+    );
+
+    // The transaction must roll back — no orphaned items may persist.
+    let fetched = store
+        .list_conversation_items("tenant_a", "conv_gone", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert!(fetched.is_empty(), "items must not persist when the message sync fails");
+}
+
 // -----------------------------------------------------------------------------
 // delete_item_and_sync_messages (SQLite)
 // -----------------------------------------------------------------------------
@@ -1485,6 +1508,46 @@ async fn delete_item_and_sync_messages_nonexistent_returns_false() {
         .await
         .expect("delete should succeed");
     assert!(!deleted, "nonexistent item should return false");
+}
+
+#[tokio::test]
+async fn delete_item_and_sync_messages_missing_conversation_errors() {
+    let store = make_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let items = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+        .await
+        .expect("create should succeed");
+
+    // Delete the conversation row; items intentionally survive (no FK).
+    ConversationItemStore::delete_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("delete conversation should succeed");
+
+    let err = store
+        .delete_item_and_sync_messages("tenant_a", "conv_1", "item_a")
+        .await
+        .expect_err("delete-item sync against a missing conversation should error");
+    assert!(
+        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
+        "unexpected error: {err:?}"
+    );
+
+    // The transaction must roll back — the item deletion must not persist.
+    let remaining = store
+        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&remaining, &["item_a"]);
 }
 
 // -----------------------------------------------------------------------------
@@ -2911,6 +2974,71 @@ async fn pg_delete_item_and_sync_messages_updates_cache() {
         .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
     assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
+    let store = make_pg_store_with_items().await;
+    // No conversation row exists — mirrors a conversation deleted between the
+    // handler's existence check and this transaction.
+    let items = [make_conversation_item("item_a", "tenant_a", "conv_missing", 0)];
+    let err = store
+        .create_items_and_sync_messages("tenant_a", "conv_missing", &items)
+        .await
+        .expect_err("create against a missing conversation should error");
+    assert!(
+        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
+        "unexpected error: {err:?}"
+    );
+
+    // The transaction must roll back — no orphaned items may persist.
+    let fetched = store
+        .list_conversation_items("tenant_a", "conv_missing", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert!(fetched.is_empty(), "items must not persist when the message sync fails");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
+    let store = make_pg_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_del_missing".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let items = [make_conversation_item("item_a", "tenant_a", "conv_del_missing", 0)];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_del_missing", &items)
+        .await
+        .expect("create should succeed");
+
+    // Delete the conversation row; items intentionally survive (no FK).
+    ConversationItemStore::delete_conversation(&store, "tenant_a", "conv_del_missing")
+        .await
+        .expect("delete conversation should succeed");
+
+    let err = store
+        .delete_item_and_sync_messages("tenant_a", "conv_del_missing", "item_a")
+        .await
+        .expect_err("delete-item sync against a missing conversation should error");
+    assert!(
+        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
+        "unexpected error: {err:?}"
+    );
+
+    // The transaction must roll back — the item deletion must not persist.
+    let remaining = store
+        .list_conversation_items("tenant_a", "conv_del_missing", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&remaining, &["item_a"]);
 }
 
 // -----------------------------------------------------------------------------

@@ -786,6 +786,12 @@ async fn sqlite_delete_item_and_sync(
 }
 
 /// Read all item JSON values and overwrite the conversation message cache.
+///
+/// Returns [`StoreError::Database`] if the conversation row is gone by
+/// the time the cache is written — i.e. it was deleted concurrently
+/// between the caller's existence check and this transaction. Callers
+/// run this inside a transaction, so the propagated error rolls back
+/// any item mutations made in the same transaction.
 #[expect(clippy::too_many_lines, reason = "sequential query pipeline within a transaction")]
 async fn sqlite_rebuild_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -823,13 +829,19 @@ async fn sqlite_rebuild_messages(
         "UPDATE {conv_table} SET messages = ? \
          WHERE conversation_id = ? AND tenant_id = ?"
     );
-    sqlx::query(AssertSqlSafe(update_sql.as_str()))
+    let updated = sqlx::query(AssertSqlSafe(update_sql.as_str()))
         .bind(&messages_json)
         .bind(conversation_id)
         .bind(tenant_id)
         .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::Database(format!(
+            "conversation disappeared during message sync: {conversation_id}"
+        )));
+    }
 
     Ok(())
 }
