@@ -87,6 +87,13 @@ fn discover_external_filter_crate_names_panics_when_resolve_is_missing() {
 }
 
 #[test]
+#[should_panic(expected = "resolve graph has no node for the root package")]
+fn discover_external_filter_crate_names_panics_when_root_has_no_matching_node() {
+    let metadata = minimal_metadata_json(r#"{"nodes":[],"root":"praxis-ai-proxy 0.1.0 (path+file:///tmp/fixture)"}"#);
+    let _unused = discover_external_filter_crate_names(&metadata);
+}
+
+#[test]
 fn discovers_normal_and_renamed_marked_dependencies_only() {
     let fixture = Fixture::build();
     let discovered = discover_external_filter_crate_names(&fixture.metadata(&[]));

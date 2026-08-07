@@ -88,8 +88,9 @@ pub fn resolve_active_features(
 ///
 /// # Panics
 ///
-/// Panics if `resolve.root` is `None`; verify `MetadataCommand` has
-/// an explicit `manifest_path` and does not pass `--no-deps`.
+/// Panics if `resolve.root` is `None`, or if no node in
+/// `resolve.nodes` matches it; verify `MetadataCommand` has an
+/// explicit `manifest_path` and does not pass `--no-deps`.
 #[must_use]
 #[expect(clippy::expect_used, reason = "build-time discovery: panics are the only error path")]
 pub fn collect_root_deps(resolve: &Resolve) -> Vec<&NodeDep> {
@@ -101,8 +102,13 @@ pub fn collect_root_deps(resolve: &Resolve) -> Vec<&NodeDep> {
         .nodes
         .iter()
         .find(|node| &node.id == root)
-        .map(|node| node.deps.iter().collect())
-        .unwrap_or_default()
+        .expect(
+            "cargo metadata resolve graph has no node for the root package; verify \
+             MetadataCommand is invoked with an explicit manifest_path and without --no-deps",
+        )
+        .deps
+        .iter()
+        .collect()
 }
 
 /// Check whether a dependency edge is available to normal runtime
