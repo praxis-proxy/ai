@@ -925,7 +925,17 @@ fn build_input_items_response(id: &str, record: &ResponseRecord, params: &ListPa
 /// Serialize a successful input items page into a 200 JSON response.
 fn build_input_items_ok(id: &str, page: &InputItemPage) -> FilterAction {
     let first_id = page.data.first().and_then(|v| v.get("id")).and_then(|v| v.as_str());
-    let last_id = page.data.last().and_then(|v| v.get("id")).and_then(|v| v.as_str());
+    // Items normally carry a synthetic ID (see `normalize_input_items`),
+    // but non-object array entries can't be tagged with one. Fall back
+    // to the page's numeric cursor so `after`-based pagination stays
+    // usable even for that edge case, instead of exposing a `null`
+    // `last_id` clients have no way to resume from.
+    let last_id = page
+        .data
+        .last()
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .or(page.next_cursor.as_deref());
 
     let body = serde_json::json!({
         "object": "list",

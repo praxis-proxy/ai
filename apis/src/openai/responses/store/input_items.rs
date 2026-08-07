@@ -75,9 +75,8 @@ pub struct InputItemPage {
     /// Input items as JSON values (heterogeneous types).
     pub data: Vec<serde_json::Value>,
 
-    /// Cursor for the next page (`None` when no more pages).
-    #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on struct fields")]
-    #[allow(dead_code, reason = "pagination cursor for upcoming list endpoint")]
+    /// Cursor for the next page (`None` when no more pages). Falls
+    /// back to a numeric offset when the last item has no usable ID.
     pub next_cursor: Option<String>,
 
     /// Whether more pages exist beyond this one.
@@ -91,8 +90,9 @@ pub struct InputItemPage {
 /// Extract and paginate input items from a [`ResponseRecord`].
 ///
 /// Items are extracted from the stored `input` JSON column and
-/// paginated in memory using item ID cursors when available. Numeric
-/// offset cursors remain supported for stored inputs without item IDs.
+/// paginated in memory using item ID cursors. Numeric offset cursors
+/// remain supported as a defensive fallback for malformed, non-object
+/// entries that cannot carry a synthetic ID.
 ///
 /// # Errors
 ///
@@ -137,14 +137,43 @@ pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<
 /// `ItemResource[]`, so this function applies the same
 /// resource shape as the public API: string input becomes a
 /// synthetic user message resource, null input yields an empty list,
-/// and arrays/objects pass through as-is.
+/// and arrays/objects pass through with a stable synthetic `id`
+/// assigned to any item that doesn't already have one (see
+/// [`ensure_stable_ids`]).
 fn normalize_input_items(record: &ResponseRecord) -> Vec<serde_json::Value> {
-    match &record.input {
+    let items = match &record.input {
         serde_json::Value::Null => vec![],
         serde_json::Value::String(text) => vec![scalar_input_item(&record.id, text)],
         serde_json::Value::Array(arr) => arr.clone(),
         other => vec![other.clone()],
-    }
+    };
+    ensure_stable_ids(&record.id, items)
+}
+
+/// Assign a stable synthetic ID (`msg_{response_id}_input_{index}`) to
+/// any item missing one, keyed by its position in the original stored
+/// input order (before any order-based reversal).
+///
+/// Plain content-part objects — the common shape for array `input` —
+/// carry no `id` field. Without a synthetic one, `first_id`/`last_id`
+/// in the list response stay `null` and clients have no `after` value
+/// to resume pagination past the first page, even though `has_more`
+/// reports `true`.
+fn ensure_stable_ids(response_id: &str, items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut item)| {
+            let has_string_id = item.get("id").and_then(serde_json::Value::as_str).is_some();
+            if !has_string_id && let Some(obj) = item.as_object_mut() {
+                obj.insert(
+                    "id".to_owned(),
+                    serde_json::Value::String(format!("msg_{response_id}_input_{index}")),
+                );
+            }
+            item
+        })
+        .collect()
 }
 
 /// Build a public input message resource for scalar create input.
