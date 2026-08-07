@@ -187,6 +187,12 @@ The `anthropic_to_openai` filter:
 - Preserves `top_k` as an extra body parameter
 - Drops `thinking` blocks with a log warning
 - Transforms the response back to Anthropic format
+- Normalizes pre-stream upstream 4xx/5xx responses into
+  Anthropic error envelopes for both streaming and
+  non-streaming requests
+- Preserves the upstream status and request ID while
+  clearing stale representation headers on rewritten
+  response bodies
 - Preserves original `finish_reason` in filter
   metadata as `openai.finish_reason`
 

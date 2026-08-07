@@ -2,8 +2,8 @@
 
 ## Supported Versions
 
-| Version | Supported   |
-| ------- | ----------- |
+| Version | Supported |
+| ------- | --------- |
 | 0.1.x   | Yes (Alpha) |
 
 Praxis AI is pre-`1.0.0`. Only the latest patch release of the current
@@ -39,7 +39,8 @@ We use the following severity levels:
 
 ## Safe Harbor
 
-We consider security research conducted in good faith to be authorized.
-We will not pursue legal action against researchers who follow this policy
-and report findings responsibly. We appreciate your help making Praxis AI
-more secure.
+We consider security research conducted in good faith
+to be authorized. We will not pursue legal action
+against researchers who follow this policy and report
+findings responsibly. We appreciate your help making
+Praxis AI more secure.

@@ -83,7 +83,15 @@ fn responses_not_rejected() {
 fn invalid_json_rejected_in_reject_mode() {
     let cfg: AnthropicMessagesFormatConfig = serde_yaml::from_str("on_invalid: reject").unwrap();
     let result = handle_invalid_format(AiRequestFormat::InvalidJson, &cfg);
-    assert!(result.is_some(), "invalid JSON should be rejected in reject mode");
+    let Some(FilterAction::Reject(rejection)) = result else {
+        panic!("invalid JSON should be rejected in reject mode");
+    };
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+
+    assert_eq!(parsed["type"], "error");
+    assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    assert!(parsed.get("request_id").is_some());
+    assert!(parsed["request_id"].is_null());
 }
 
 #[test]

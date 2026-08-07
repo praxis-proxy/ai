@@ -108,7 +108,7 @@ pub(super) fn accumulate_response_object(
 }
 
 /// Saturating recursive sum for numeric token-usage fields.
-fn merge_usage(accumulated: &mut Value, current: &Value) {
+pub(crate) fn merge_usage(accumulated: &mut Value, current: &Value) {
     match (accumulated, current) {
         (Value::Object(accumulated), Value::Object(current)) => {
             for (key, value) in current {

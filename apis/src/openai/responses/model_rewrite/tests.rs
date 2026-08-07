@@ -788,25 +788,18 @@ async fn preserves_function_call_output_items() {
 }
 
 // -----------------------------------------------------------------------------
-// Content-Length Behavior
+// Content-Length Behavior — filter must NOT set it (core handles framing)
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn updates_content_length_when_mutated() {
-    let (ctx, body) = run_filter_with_body(ALIAS_CONFIG, r#"{"model":"codex-mini-latest","input":"test"}"#).await;
+async fn does_not_set_content_length_when_mutated() {
+    let (ctx, _body) = run_filter_with_body(ALIAS_CONFIG, r#"{"model":"codex-mini-latest","input":"test"}"#).await;
 
-    let cl_header = ctx
-        .extra_request_headers
-        .iter()
-        .find(|(k, _)| k.as_ref() == "content-length")
-        .map(|(_, v)| v.as_str());
-
-    assert!(cl_header.is_some(), "content-length should be set after mutation");
-    let cl_value: usize = cl_header.unwrap().parse().unwrap();
-    assert_eq!(
-        cl_value,
-        body.len(),
-        "content-length should match serialized body length"
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-length"),
+        "filter must not set content-length (core handles framing)"
     );
 }
 

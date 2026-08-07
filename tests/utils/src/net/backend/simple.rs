@@ -264,6 +264,227 @@ impl RoutedBackend {
 }
 
 // -----------------------------------------------------------------------------
+// StatefulBackend
+// -----------------------------------------------------------------------------
+
+/// A backend that returns a different response for each sequential
+/// request. Used for round-trip tests where the model backend must
+/// return tool calls on the first request and a final answer on
+/// the second.
+pub struct StatefulBackend {
+    /// Ordered responses: `(status, body)`. Each connection consumes
+    /// the next entry. Returns `(500, "exhausted")` when all entries
+    /// have been consumed.
+    responses: Vec<(u16, String)>,
+}
+
+impl StatefulBackend {
+    /// Create a stateful backend from an ordered list of
+    /// `(status, body)` responses.
+    pub fn new(responses: Vec<(u16, String)>) -> Self {
+        Self { responses }
+    }
+
+    /// Start the backend and return a [`BackendGuard`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the server fails to bind.
+    pub fn start_with_shutdown(self) -> BackendGuard {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let responses = Arc::new(self.responses);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        spawn_tcp_server_with_shutdown(move |mut stream| {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _headers = read_until_headers_complete(&mut stream);
+
+            let idx = counter.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = responses.get(idx).map_or((500, "exhausted"), |(s, b)| (*s, b.as_str()));
+            let reason = reason_phrase(status);
+
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 Server: praxis-test-backend\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            let _sent = stream.write_all(resp.as_bytes());
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// StatefulCapturingBackend
+// -----------------------------------------------------------------------------
+
+/// A captured HTTP request: method, URI, raw headers, and body.
+pub struct CapturedRequest {
+    /// HTTP method (e.g. `"POST"`).
+    pub method: String,
+    /// Request URI path (e.g. `"/v1/responses"`).
+    pub uri: String,
+    /// Raw request headers as a single string (lines separated by `\n`).
+    pub headers: String,
+    /// Request body as a string.
+    pub body: String,
+}
+
+/// Guard for a [`StatefulCapturingBackend`] that provides access to
+/// captured requests and the allocated port. Shuts down the backend
+/// on drop.
+pub struct StatefulCapturingGuard {
+    /// Inner backend guard that shuts down the listener on drop.
+    guard: BackendGuard,
+    /// All captured requests in order.
+    requests: std::sync::Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+}
+
+impl StatefulCapturingGuard {
+    /// The allocated port number.
+    pub fn port(&self) -> u16 {
+        self.guard.port()
+    }
+
+    /// Return a snapshot of all captured requests so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn requests(&self) -> Vec<CapturedRequest> {
+        let lock = self.requests.lock().expect("captured requests mutex not poisoned");
+        lock.iter()
+            .map(|r| CapturedRequest {
+                method: r.method.clone(),
+                uri: r.uri.clone(),
+                headers: r.headers.clone(),
+                body: r.body.clone(),
+            })
+            .collect()
+    }
+}
+
+/// A backend that returns sequential responses while capturing each
+/// incoming request (method, URI, headers, body).
+pub struct StatefulCapturingBackend {
+    /// Ordered responses: `(status, body)`.
+    responses: Vec<(u16, String)>,
+}
+
+impl StatefulCapturingBackend {
+    /// Create from an ordered list of `(status, body)` responses.
+    pub fn new(responses: Vec<(u16, String)>) -> Self {
+        Self { responses }
+    }
+
+    /// Start the backend and return a [`StatefulCapturingGuard`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the server fails to bind.
+    pub fn start_with_shutdown(self) -> StatefulCapturingGuard {
+        use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+
+        let responses = Arc::new(self.responses);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        let guard = spawn_tcp_server_with_shutdown(move |mut stream| {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            capture_and_respond(&mut stream, &captured_clone, &counter, &responses);
+        });
+
+        StatefulCapturingGuard {
+            guard,
+            requests: captured,
+        }
+    }
+}
+
+/// Handle a single capturing-backend connection: read the full
+/// request, store it, then write the next sequential response.
+fn capture_and_respond(
+    stream: &mut TcpStream,
+    captured: &std::sync::Mutex<Vec<CapturedRequest>>,
+    counter: &std::sync::atomic::AtomicUsize,
+    responses: &[(u16, String)],
+) {
+    use std::sync::atomic::Ordering;
+
+    let raw = read_full_request(stream);
+    let (method, uri, headers, body) = parse_raw_request(&raw);
+
+    captured.lock().expect("mutex not poisoned").push(CapturedRequest {
+        method,
+        uri,
+        headers,
+        body,
+    });
+
+    let idx = counter.fetch_add(1, Ordering::SeqCst);
+    let (status, resp_body) = responses.get(idx).map_or((500, "exhausted"), |(s, b)| (*s, b.as_str()));
+    let reason = reason_phrase(status);
+
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Length: {}\r\n\
+         Content-Type: application/json\r\n\
+         Connection: close\r\n\
+         Server: praxis-test-backend\r\n\
+         \r\n\
+         {resp_body}",
+        resp_body.len()
+    );
+    let _sent = stream.write_all(resp.as_bytes());
+}
+
+/// Read a full HTTP request (headers + body) from a TCP stream.
+fn read_full_request(stream: &mut TcpStream) -> String {
+    let mut data = Vec::new();
+    let mut buf = [0_u8; 8192];
+
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => data.extend_from_slice(&buf[..n]),
+        }
+        let raw = String::from_utf8_lossy(&data);
+        if let Some(header_section) = raw.split("\r\n\r\n").next() {
+            let content_length = super::specialized::parse_content_length(header_section);
+            let header_len = header_section.len() + 4;
+            if data.len() >= header_len + content_length {
+                break;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&data).into_owned()
+}
+
+/// Parse a raw HTTP request string into (method, uri, headers, body).
+fn parse_raw_request(raw: &str) -> (String, String, String, String) {
+    let (header_section, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+
+    let mut lines = header_section.lines();
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_owned();
+    let uri = parts.next().unwrap_or("").to_owned();
+
+    let headers: String = lines.collect::<Vec<_>>().join("\n");
+
+    (method, uri, headers, body.to_owned())
+}
+
+// -----------------------------------------------------------------------------
 // IPv6 Backend
 // -----------------------------------------------------------------------------
 

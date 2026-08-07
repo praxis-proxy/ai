@@ -49,7 +49,7 @@ use tracing::{debug, trace, warn};
 
 use self::config::{ModelRewriteConfig, OnInvalidBehavior, validate_config};
 use super::error::responses_error_rejection;
-use crate::classifier::is_responses_create;
+use crate::{classifier::is_responses_create, json_body::replace_json_body};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -157,7 +157,7 @@ impl ModelRewriteFilter {
             return Ok(FilterAction::Continue);
         }
 
-        serialize_and_update(ctx, body, &value, &result)
+        serialize_and_update(body, &value, &result, self.name())
     }
 }
 
@@ -355,22 +355,16 @@ fn noop_result() -> RewriteResult {
     }
 }
 
-/// Serialize the mutated body, update content-length, and log.
+/// Serialize the mutated body and log.
 fn serialize_and_update(
-    ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     value: &serde_json::Value,
     result: &RewriteResult,
+    filter_name: &'static str,
 ) -> Result<FilterAction, FilterError> {
-    let serialized = serde_json::to_vec(value).map_err(|e| -> FilterError {
-        format!("openai_responses_model_rewrite: failed to re-serialize rewritten request body: {e}").into()
+    replace_json_body(body, value, filter_name, "model").map_err(|e| -> FilterError {
+        format!("{filter_name}: failed to re-serialize rewritten request body: {e}").into()
     })?;
-
-    let len = serialized.len();
-    *body = Some(Bytes::from(serialized));
-
-    ctx.extra_request_headers
-        .push((Cow::Borrowed("content-length"), len.to_string()));
 
     debug!(
         original = ?result.original_model,

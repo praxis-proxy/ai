@@ -72,6 +72,19 @@ Every operation has one proxy-boundary mode:
 Only `transform` and `local` operations enter owned-contract OpenAPI
 comparison. All eight current Conversations operations are `local`.
 
+### Authentication ownership
+
+The `openai_conversations` filter terminates matching requests but does not
+authenticate clients. Authentication and authorization are deployment-owned:
+operators must place the required security filter or trusted ingress boundary
+before Conversations. The generated implementation document therefore does
+not claim OpenAI bearer authentication.
+
+Area projections exclude only inherited global security when an area declares
+it deployment-owned. Operation-specific security remains in scope. The report
+records this choice as `inherited_security: "deployment"`, so the comparison
+boundary is explicit without hiding operation contracts.
+
 ## Tooling
 
 The report requires exactly `oasdiff` 1.23.0. Install the pinned release with:
@@ -118,15 +131,20 @@ byte-compare it with the complete vendored document:
 cargo xtask openai-conformance-reference --check
 ```
 
-Area projection keeps selected path items, inherited security, path-level
-parameters, referenced security schemes, and the recursive closure of local
-component references. Remote and non-component `$ref` values are rejected.
+Area projection keeps selected path items, path-level parameters, and the
+recursive closure of local component references. Inherited global security
+and referenced security schemes are included by default but excluded when
+an area declares authentication as deployment-owned via
+`without_inherited_security()`. Remote and non-component `$ref` values are
+rejected.
 
 ## Reading the Report
 
 Report schema version 3 records the complete reference once, gives every area
-its own projection digest and implementation source, and keeps three
-independent dimensions:
+its own projection digest, implementation source, and `inherited_security`
+ownership (`"owned"` when the area includes global security in its contract,
+`"deployment"` when authentication is declared as deployment-owned and
+excluded from comparison), and keeps three independent dimensions:
 
 1. `capability_coverage` groups selected operations by handling mode and shows
    missing or stale support claims.

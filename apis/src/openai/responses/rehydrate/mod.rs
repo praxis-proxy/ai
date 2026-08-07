@@ -24,8 +24,9 @@ use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 use super::{
-    DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, canonical_openresponses_replay_item,
-    error::responses_error_rejection, state::ResponsesState,
+    DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
+    canonical_openresponses_replay_item, error::responses_error_rejection, extract_conversation_id,
+    state::ResponsesState,
 };
 use crate::store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry};
 
@@ -364,19 +365,6 @@ fn resolve_conversation_id(body: &Value, streaming: bool) -> Result<String, Filt
     })
 }
 
-/// Extract a conversation ID from the request body.
-///
-/// Accepts both string and object forms:
-/// - `"conversation": "conv_abc"`
-/// - `"conversation": {"id": "conv_abc"}`
-fn extract_conversation_id(body: &Value) -> Option<String> {
-    body.get("conversation").and_then(|c| {
-        c.as_str()
-            .or_else(|| c.get("id").and_then(Value::as_str))
-            .map(ToOwned::to_owned)
-    })
-}
-
 /// Fetch a conversation record from the store.
 async fn fetch_conversation(
     ctx: &HttpFilterContext<'_>,
@@ -442,16 +430,6 @@ fn reconstruct_messages_from_public_response(
     Ok(messages)
 }
 
-/// Append stored response input as Responses API item params.
-fn append_stored_input_items(messages: &mut Vec<Value>, input: Value) {
-    match input {
-        Value::Null => {},
-        Value::String(text) => messages.push(user_message_item(&text)),
-        Value::Array(items) => messages.extend(items),
-        other => messages.push(other),
-    }
-}
-
 /// Append stored response output items to the persisted conversation history.
 fn append_stored_output_items(messages: &mut Vec<Value>, output: &Value) {
     if let Value::Array(items) = output {
@@ -464,15 +442,6 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: &Value) {
 /// Return stored items that should be replayed as backend request input.
 fn replay_messages_from_stored(stored: &[Value]) -> Vec<Value> {
     stored.iter().filter_map(canonical_openresponses_replay_item).collect()
-}
-
-/// Build a Responses API user message item from string input.
-fn user_message_item(text: &str) -> Value {
-    serde_json::json!({
-        "type": "message",
-        "role": "user",
-        "content": text,
-    })
 }
 
 /// Parse the request body and extract `previous_response_id`.

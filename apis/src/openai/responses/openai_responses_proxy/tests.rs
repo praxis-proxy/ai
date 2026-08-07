@@ -3,6 +3,7 @@
 
 //! Unit tests for the Responses proxy filter.
 
+use base64::Engine as _;
 use bytes::Bytes;
 use http::Method;
 use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter};
@@ -113,7 +114,7 @@ async fn initialized_state_preserves_scalar_input_on_first_pass() {
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     assert!(
-        ctx.extra_request_headers.is_empty(),
+        ctx.request_headers_to_set.is_empty(),
         "byte-exact first-pass forwarding must not synthesize content-length"
     );
 }
@@ -136,7 +137,7 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(body.as_deref(), Some(original.as_slice()));
-    assert!(ctx.extra_request_headers.is_empty());
+    assert!(ctx.request_headers_to_set.is_empty());
 }
 
 #[tokio::test]
@@ -222,7 +223,7 @@ async fn rebuilds_body_with_conversation_history() {
 }
 
 #[tokio::test]
-async fn updates_content_length_header() {
+async fn does_not_set_content_length_header() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -244,25 +245,11 @@ async fn updates_content_length_header() {
     ));
     let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    let has_content_length = ctx
-        .extra_request_headers
-        .iter()
-        .any(|(k, _)| k.as_ref() == "content-length");
     assert!(
-        has_content_length,
-        "content-length header should be set after body rebuild"
-    );
-
-    let cl_value: usize = ctx
-        .extra_request_headers
-        .iter()
-        .find(|(k, _)| k.as_ref() == "content-length")
-        .map(|(_, v)| v.parse().unwrap())
-        .unwrap();
-    assert_eq!(
-        cl_value,
-        body.as_ref().unwrap().len(),
-        "content-length should match rebuilt body size"
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-length"),
+        "filter must not set content-length (core handles framing)"
     );
 }
 
@@ -404,12 +391,11 @@ async fn passthrough_strips_conversation_from_body() {
         "conversation should be stripped even without ResponsesState"
     );
     assert_eq!(parsed["model"], "gpt-4.1", "other fields should be preserved");
-    assert_eq!(
+    assert!(
         ctx.extra_request_headers
             .iter()
-            .find(|(name, _value)| name.as_ref() == "content-length")
-            .map(|(_name, value)| value.parse::<usize>().unwrap()),
-        body.as_ref().map(Bytes::len)
+            .all(|(k, _)| k.as_ref() != "content-length"),
+        "filter must not set content-length (core handles framing)"
     );
 }
 
@@ -472,6 +458,139 @@ async fn rebuild_non_object_request_body_passes_through() {
         rebuilt.is_array(),
         "non-object request_body should pass through without modification"
     );
+}
+
+#[tokio::test]
+async fn tool_choice_serialized_from_state() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "tool_choice": "auto"
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.tool_choice = json!("none");
+    state
+        .messages
+        .splice(0..0, vec![json!({"role": "user", "content": "stored"})]);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"hello","tool_choice":"auto"}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["tool_choice"], "none",
+        "tool_choice should come from state, not from original request_body"
+    );
+}
+
+#[tokio::test]
+async fn rebuild_does_not_set_content_type_header() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "previous_response_id": "resp_abc123"
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
+    state
+        .messages
+        .splice(0..0, vec![json!({"role": "user", "content": "stored"})]);
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"test","previous_response_id":"resp_abc123"}"#,
+    ));
+    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-type"),
+        "filter must not set content-type (core handles framing)"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// messages_for_backend / compaction_to_assistant_message
+// -----------------------------------------------------------------------------
+
+#[test]
+fn messages_for_backend_borrows_when_no_compaction() {
+    let msgs = vec![
+        json!({"role": "user", "content": "hello"}),
+        json!({"role": "assistant", "content": "hi"}),
+    ];
+    let result = super::messages_for_backend(&msgs);
+    assert!(
+        matches!(result, std::borrow::Cow::Borrowed(_)),
+        "should borrow when no compaction items"
+    );
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn messages_for_backend_translates_compaction_item() {
+    let encoded = base64::engine::general_purpose::STANDARD.encode("summary text");
+    let msgs = vec![json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded})];
+    let result = super::messages_for_backend(&msgs);
+    assert!(matches!(result, std::borrow::Cow::Owned(_)));
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["role"], "assistant");
+    assert!(result[0]["content"].as_str().unwrap().contains("summary text"));
+}
+
+#[test]
+fn messages_for_backend_mixed_items() {
+    let encoded = base64::engine::general_purpose::STANDARD.encode("ctx");
+    let msgs = vec![
+        json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded}),
+        json!({"role": "user", "content": "hello"}),
+    ];
+    let result = super::messages_for_backend(&msgs);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0]["role"], "assistant");
+    assert_eq!(result[1]["role"], "user");
+}
+
+#[test]
+fn compaction_to_assistant_message_decodes_encrypted_content() {
+    let encoded = base64::engine::general_purpose::STANDARD.encode("decoded summary");
+    let item = json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded});
+    let msg = super::compaction_to_assistant_message(&item);
+    assert_eq!(msg["role"], "assistant");
+    assert!(msg["content"].as_str().unwrap().contains("decoded summary"));
+}
+
+#[test]
+fn compaction_to_assistant_message_handles_missing_content() {
+    let item = json!({"type": "compaction", "id": "c_1"});
+    let msg = super::compaction_to_assistant_message(&item);
+    assert_eq!(msg["role"], "assistant");
+    assert!(
+        msg["content"]
+            .as_str()
+            .unwrap()
+            .contains("[Previous conversation summary]")
+    );
+}
+
+#[test]
+fn compaction_to_assistant_message_handles_invalid_base64() {
+    let item = json!({"type": "compaction", "id": "c_1", "encrypted_content": "not!valid!base64!!!"});
+    let msg = super::compaction_to_assistant_message(&item);
+    assert_eq!(msg["role"], "assistant");
 }
 
 // -----------------------------------------------------------------------------

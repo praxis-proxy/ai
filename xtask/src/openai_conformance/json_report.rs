@@ -104,6 +104,7 @@ fn spec_source_json(source: &SpecSourceReport) -> Value {
         "area": source.area,
         "projection_sha256": source.projection_sha256.as_str(),
         "operations": source.operations,
+        "inherited_security": if source.include_inherited_security { "owned" } else { "deployment" },
     })
 }
 

@@ -1,0 +1,56 @@
+{
+  "contract_version": "1.0.0",
+  "fixtures": {
+    "invalid-digest.json": {
+      "expected": "reject",
+      "reason": "digest_mismatch"
+    },
+    "legacy-payload.json": {
+      "expected": "accept_legacy"
+    },
+    "local-site-scope-mismatch.json": {
+      "expected": "reject",
+      "reason": "scope_mismatch"
+    },
+    "network-scope-mismatch.json": {
+      "expected": "reject",
+      "reason": "scope_mismatch"
+    },
+    "revision-digest-disagreement.json": {
+      "expected": "reject",
+      "reason": "revision_digest_mismatch"
+    },
+    "timestamp-change-same-revision.json": {
+      "expected": "accept",
+      "revision": "75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"
+    },
+    "unknown-additive-field.json": {
+      "expected": "accept",
+      "revision": "75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"
+    },
+    "unsupported-schema-version.json": {
+      "expected": "reject",
+      "reason": "unsupported_schema_version"
+    },
+    "valid-minimal.json": {
+      "content_digest": "abd5f4855454390febb53ad2085d182c465a78c5d14f0132317b4c9335aa8494",
+      "expected": "accept",
+      "revision": "abd5f4855454390febb53ad2085d182c465a78c5d14f0132317b4c9335aa8494"
+    },
+    "valid-multi-candidate.json": {
+      "content_digest": "75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056",
+      "expected": "accept",
+      "revision": "75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"
+    },
+    "malformed-envelope.json": {
+      "expected": "reject",
+      "reason": "malformed_structure"
+    },
+    "hybrid-missing-schema.json": {
+      "expected": "reject",
+      "reason": "missing_schema_version"
+    }
+  },
+  "source": "praxis-proxy/ai",
+  "source_path": "tests/fixtures/overlay-contract/v1"
+}

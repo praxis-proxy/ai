@@ -9,7 +9,8 @@ with code in this repository.
 - Rust nightly (for `rustfmt`)
 - CMake 3.31+ (for Pingora build via praxis dep)
 - Docker 29.3.0+ or Podman (for container builds)
-- Praxis core repo at `../praxis` (path dependency)
+- Optional Praxis core checkout at `../praxis` for testing local core
+  changes through `make patch-praxis`
 
 ## Rust Data Ownership
 
@@ -56,7 +57,7 @@ cargo test -p praxis-ai-proxy -- test_name
 server (praxis-ai-proxy)
   -> filters (praxis-ai-filters)
   -> apis (praxis-ai-apis)
-  -> praxis-filter (core, from ../praxis)
+  -> praxis-filter (versioned Praxis core dependency)
 ```
 
 - **server** (`praxis-ai-proxy`): binary entry point,
@@ -64,27 +65,29 @@ server (praxis-ai-proxy)
   injects `ResponseStoreRegistry` as pipeline extension
 - **apis** (`praxis-ai-apis`): provider-specific API
   types (OpenAI, Anthropic), request classification,
-  response storage backends (SQLite, PostgreSQL), SSE
-  parsing
+  response storage backends (SQLite, PostgreSQL),
+  token usage extraction, SSE parsing
 - **filters** (`praxis-ai-filters`): cross-cutting AI
   filter implementations (A2A, MCP, guardrails,
   inference routing, prompt enrichment, token usage
-  extraction and header injection)
+  header injection)
 
-**Dependencies on Praxis core** (path deps to
-`../praxis`): `praxis-filter` for `HttpFilter` trait,
-pipeline, registry; `praxis-core` for config types;
-`praxis-protocol` for HTTP/TCP adapters;
-`praxis-tls` for TLS.
+**Dependencies on Praxis core** use the versioned crates in the root
+`Cargo.toml`: `praxis-filter` for `HttpFilter`, pipeline, and registry;
+`praxis-core` for config types; `praxis-protocol` for HTTP/TCP adapters;
+and `praxis-tls` for TLS. Use `make patch-praxis` only when testing a
+local sibling checkout at `../praxis`.
 
 ## Conventions
 
 Follows the same conventions as
 [praxis core](https://github.com/praxis-proxy/praxis).
-See `CONTRIBUTING.md` for the full coding style guide,
+See [CONTRIBUTING.md] for the full coding style guide,
 including the
 [PR review process](CONTRIBUTING.md#pr-review-process)
 for handling `praxis-bot` automated review comments.
+
+[CONTRIBUTING.md]: https://github.com/praxis-proxy/ai/blob/main/CONTRIBUTING.md
 
 ## Git Workflow
 
@@ -109,8 +112,8 @@ New capabilities require:
 
 1. Create module under `filters/src/` or `apis/src/`
 2. Implement `HttpFilter` from `praxis-filter`
-3. Register in `server/src/lib.rs` via
-   `register_filters!` macro
+3. Register in `praxis_ai_filters::register_ai_filters`
+   (`filters/src/register.rs`) via `register_filters!`
 4. Add unit tests and doctests
 5. Add example config in `examples/configs/`
 
@@ -134,12 +137,14 @@ New capabilities require:
 - `apis/src/openai/` — OpenAI Responses, Conversations,
   SSE, model rewrite, store, rehydrate, validate, proxy
 - `apis/src/classifier/` — AI request format detection
+- `apis/src/json_body.rs` — Shared JSON body mutation
+  helper (serialize, replace, tracing events)
 - `apis/src/store/` — ResponseStore trait, SQLite/Postgres
 - `filters/src/agentic/` — A2A, MCP protocol filters
 - `filters/src/guardrails/` — AI content safety (NeMo)
 - `filters/src/inference/` — Model-to-header routing
 - `filters/src/prompt_enrich/` — Prompt enrichment
-- `filters/src/token_usage/` — Multi-provider token counting and token headers
+- `filters/src/token_usage/` — Token counting and headers
 
 ## Dynamic Config Reload
 

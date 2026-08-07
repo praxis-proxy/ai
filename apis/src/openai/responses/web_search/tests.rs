@@ -143,6 +143,276 @@ fn emit_status_uses_valid_key() {
 }
 
 // -----------------------------------------------------------------------------
+// on_response_body: Loop Signaling
+// -----------------------------------------------------------------------------
+
+#[test]
+fn on_response_body_signals_loop_when_web_search_calls_present() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test query"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let results = ctx
+        .filter_results
+        .get("openai_web_search")
+        .expect("should have openai_web_search entry");
+    assert_eq!(results.get("action"), Some("loop"));
+}
+
+#[test]
+fn on_response_body_signals_done_when_no_web_search_calls() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let state = ResponsesState::from_request_body(body);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let results = ctx
+        .filter_results
+        .get("openai_web_search")
+        .expect("should have openai_web_search entry");
+    assert_eq!(results.get("action"), Some("done"));
+}
+
+#[test]
+fn on_response_body_passthrough_without_state() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.filter_results.is_empty(),
+        "should not write filter_results without state"
+    );
+}
+
+#[test]
+fn on_response_body_passthrough_on_non_end_of_stream() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, false).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.filter_results.is_empty(),
+        "should not set filter_results on non-end-of-stream"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// on_request_body: Passthrough
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn on_request_body_passthrough_without_state() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test]
+async fn on_request_body_passthrough_when_no_web_search_calls() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let state = ResponsesState::from_request_body(body);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.web_search_calls.is_empty());
+}
+
+#[tokio::test]
+async fn on_request_body_passthrough_on_non_end_of_stream() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "test"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, false).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+// -----------------------------------------------------------------------------
+// on_request_body: Search Execution
+// -----------------------------------------------------------------------------
+
+fn make_filter_yaml_with_base_url(provider: &str, api_key: &str, base_url: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(&format!(
+        r#"
+provider: {provider}
+api_key: "{api_key}"
+default_context_size: medium
+timeout_ms: 5000
+base_url: "{base_url}"
+"#,
+    ))
+    .unwrap()
+}
+
+fn spawn_brave_mock(listener: std::net::TcpListener) {
+    use std::io::{Read as _, Write as _};
+    let body = serde_json::json!({
+        "web": {
+            "results": [{
+                "title": "Rust Lang",
+                "url": "https://rust-lang.org",
+                "description": "Systems programming language"
+            }]
+        }
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let _n = stream.read(&mut buf).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+}
+
+#[tokio::test]
+async fn on_request_body_executes_search_and_populates_state() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_exec_1",
+        "action": {"type": "search", "query": "rust language"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.web_search_calls.is_empty(),
+        "calls should be cleared after execution"
+    );
+    assert!(!state.messages.is_empty(), "tool result should be appended to messages");
+    assert!(
+        !state.persisted_messages.is_empty(),
+        "tool result should be appended to persisted_messages"
+    );
+    assert!(
+        !state.accumulated_output.is_empty(),
+        "output item should be appended to accumulated_output"
+    );
+
+    let output = &state.accumulated_output[0];
+    assert_eq!(output["type"], "web_search_call");
+    assert_eq!(output["id"], "ws_exec_1");
+    assert_eq!(output["status"], "completed");
+    assert_eq!(output["action"]["query"], "rust language");
+    let sources = output["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["title"], "Rust Lang");
+}
+
+#[tokio::test]
+async fn on_request_body_missing_query_produces_incomplete_status() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_no_query",
+        "action": {"type": "search"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.web_search_calls.is_empty());
+
+    let output = &state.accumulated_output[0];
+    assert_eq!(
+        output["status"], "incomplete",
+        "missing query should produce incomplete status"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Output formatting tests
 // -----------------------------------------------------------------------------
 
