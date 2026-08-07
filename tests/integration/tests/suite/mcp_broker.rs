@@ -641,7 +641,7 @@ fn mcp_stateless_missing_mcp_method_rejects_with_400_32020() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body_str = stateless_rpc_body(4, "ping", None);
+    let body_str = stateless_rpc_body(4, "tools/list", None);
     let request = format!(
         "POST /mcp HTTP/1.1\r\n\
          Host: localhost\r\n\
@@ -689,6 +689,29 @@ fn mcp_stateless_notifications_initialized_rejects_with_404_32601() {
 }
 
 #[test]
+fn mcp_stateless_ping_returns_method_not_found() {
+    let backend_guard = start_backend_with_shutdown("not-reachable-backend");
+    let proxy_port = free_port();
+
+    let yaml = stateless_broker_yaml(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body_str = stateless_rpc_body(10, "ping", None);
+    let request = stateless_post("/mcp", &body_str, "ping", None);
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 404, "stateless ping should return 404");
+    let body = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], -32601, "should return method not found");
+    assert!(
+        !body.contains("not-reachable-backend"),
+        "stateless ping must not hit backend"
+    );
+}
+
+#[test]
 fn mcp_stateless_unsupported_version_rejects_with_400_32022() {
     let backend_guard = start_backend_with_shutdown("not-reachable-backend");
     let proxy_port = free_port();
@@ -697,14 +720,14 @@ fn mcp_stateless_unsupported_version_rejects_with_400_32022() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body_str = stateless_rpc_body_with_version(5, "ping", "9999-12-31");
+    let body_str = stateless_rpc_body_with_version(5, "tools/list", "9999-12-31");
     let request = format!(
         "POST /mcp HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          MCP-Protocol-Version: 9999-12-31\r\n\
-         Mcp-Method: ping\r\n\
+         Mcp-Method: tools/list\r\n\
          Connection: close\r\n\
          \r\n\
          {body_str}",
@@ -738,8 +761,8 @@ fn mcp_stateless_malformed_client_info_rejected() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body_str = r#"{"jsonrpc":"2.0","id":6,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":"not-an-object","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
-    let request = stateless_post("/mcp", body_str, "ping", None);
+    let body_str = r#"{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":"not-an-object","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+    let request = stateless_post("/mcp", body_str, "tools/list", None);
     let raw = http_send(proxy.addr(), &request);
 
     assert_eq!(parse_status(&raw), 400, "malformed clientInfo should return 400");

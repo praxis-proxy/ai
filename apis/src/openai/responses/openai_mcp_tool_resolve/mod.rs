@@ -41,7 +41,6 @@ mod config;
 mod tests;
 
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Duration,
 };
@@ -55,7 +54,7 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
-use crate::mcp_client;
+use crate::{json_body::serialize_json_body, mcp_client};
 
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
@@ -158,7 +157,7 @@ impl McpToolResolveFilter {
         debug!(tool_count = resolution.tool_map.len(), "mcp_tool_map built");
 
         let Resolution { per_entry, tool_map } = resolution;
-        rewrite_request_body(ctx, body, &original_bytes, per_entry, &tool_map)?;
+        rewrite_request_body(body, &original_bytes, per_entry, &tool_map, self.name())?;
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
         write_state(ctx, body_for_state, tool_map);
@@ -490,11 +489,11 @@ async fn fetch_tools(
 /// or `connector_id` only) are left unchanged for upstream to
 /// handle.
 fn rewrite_request_body(
-    ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     original_bytes: &[u8],
     per_entry: Vec<Vec<serde_json::Value>>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
+    filter_name: &'static str,
 ) -> Result<(), ResolveError> {
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
         return Ok(());
@@ -520,15 +519,12 @@ fn rewrite_request_body(
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
     rewrite_tool_choice(obj, tool_map);
 
-    let serialized = serde_json::to_vec(&parsed).map_err(|e| {
+    let serialized = serialize_json_body(&parsed).map_err(|e| {
         debug!(error = %e, "failed to serialize rewritten body");
         ResolveError::Serialization(e)
     })?;
 
-    let len = serialized.len();
-    *body = Some(Bytes::from(serialized));
-    ctx.extra_request_headers
-        .push((Cow::Borrowed("content-length"), len.to_string()));
+    serialized.commit(body, filter_name, "tools");
 
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
     Ok(())

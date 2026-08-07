@@ -1,0 +1,116 @@
+# Intelligent Route: Complete Static Routing
+#
+# Demonstrates every candidate capability and selection input handled by
+# intelligent_route today:
+#
+# - inference_model and mcp_tool candidate matching;
+# - producer-rendered order for locality and freshness decisions; and
+# - configured order as the deterministic request-path selection rule.
+#
+# Queue depth, cache utilization, latency, admission, and cost are not read on
+# the request path. A control-plane producer can use those signals to decide
+# candidate eligibility and order before writing this configuration. The
+# request path preserves that order rather than recomputing those scores.
+#
+# The mcp filter classifies MCP tools/call requests and continues past non-MCP
+# bodies. json_body_field promotes the model from inference requests.
+# intelligent_route gives MCP metadata precedence when both inputs are present.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- \
+#     -c examples/configs/intelligent-route-all-capabilities.yaml
+
+listeners:
+  - name: proxy
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: mcp
+        on_invalid: continue
+
+      - filter: json_body_field
+        field: model
+        header: X-Model
+
+      - filter: intelligent_route
+        local_site: site-a
+        model_header: X-Model
+        candidates:
+          # The producer placed the eligible local model first.
+          - kind: inference_model
+            name: granite-3.3-8b
+            site: site-a
+            cluster: models-site-a
+            fresh: true
+
+          - kind: inference_model
+            name: granite-3.3-8b
+            site: site-b
+            cluster: models-site-b
+            fresh: true
+
+          # The producer placed the fresh remote model before the stale local
+          # model.
+          - kind: inference_model
+            name: llama-3.2-8b
+            site: site-b
+            cluster: models-site-b
+            fresh: true
+
+          - kind: inference_model
+            name: llama-3.2-8b
+            site: site-a
+            cluster: models-site-a
+            fresh: false
+
+          # MCP tool candidates preserve the same producer-rendered order.
+          - kind: mcp_tool
+            name: weather-lookup
+            site: site-b
+            cluster: tools-site-b
+            fresh: true
+
+          - kind: mcp_tool
+            name: weather-lookup
+            site: site-a
+            cluster: tools-site-a
+            fresh: false
+
+          # Equal score: the first configured local candidate wins.
+          - kind: mcp_tool
+            name: code-search
+            site: site-a
+            cluster: tools-site-a
+            fresh: true
+
+          - kind: mcp_tool
+            name: code-search
+            site: site-a
+            cluster: tools-site-a-secondary
+            fresh: true
+
+      - filter: load_balancer
+        clusters:
+          - name: models-site-a
+            endpoints:
+              - "127.0.0.1:8001"
+          - name: models-site-b
+            endpoints:
+              - "127.0.0.1:8002"
+          - name: tools-site-a
+            endpoints:
+              - "127.0.0.1:8003"
+          - name: tools-site-a-secondary
+            endpoints:
+              - "127.0.0.1:8004"
+          - name: tools-site-b
+            endpoints:
+              - "127.0.0.1:8005"
+
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5

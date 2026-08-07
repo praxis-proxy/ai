@@ -255,6 +255,45 @@ mod tests {
     }
 
     #[test]
+    fn compaction_input_item_translates_to_assistant_message() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("Summary of prior conversation.");
+        let mapped = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": [
+                {"type": "compaction", "id": "compact_1", "encrypted_content": encoded},
+                {"role": "user", "content": "What next?"}
+            ]
+        }));
+        let messages = mapped["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Summary of prior conversation.")
+        );
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn empty_compaction_summary_is_dropped() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("");
+        let mapped = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": [
+                {"type": "compaction", "id": "compact_2", "encrypted_content": encoded},
+                {"role": "user", "content": "Hello"}
+            ]
+        }));
+        let messages = mapped["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "empty compaction should be dropped");
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
     fn tool_history_items_map_to_chat_messages() {
         let mapped = map(&json!({
             "model": "gpt-4o-mini",

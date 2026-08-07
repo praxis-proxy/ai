@@ -119,6 +119,32 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
 }
 
 // =========================================================================
+// Cookie and forwarded header blocking
+// =========================================================================
+
+#[test]
+fn cookie_and_forwarded_headers_stripped_from_mcp_headers() {
+    let headers = serde_json::json!({
+        "cookie": "session=abc123",
+        "set-cookie": "id=xyz; Path=/",
+        "forwarded": "for=192.0.2.60;proto=http",
+        "x-forwarded-for": "203.0.113.50",
+        "x-forwarded-host": "original.example.com",
+        "x-forwarded-proto": "https",
+        "x-custom": "safe"
+    });
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
+
+    assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
+    assert!(
+        config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-custom")),
+        "x-custom should pass through"
+    );
+}
+
+// =========================================================================
 // Authorization
 // =========================================================================
 
@@ -426,7 +452,7 @@ async fn ssrf_errors_include_actionable_reason() {
         ("http://localhost/mcp", "localhost hostnames are not allowed"),
         (
             "http://127.0.0.1/mcp",
-            "address is loopback, link-local, unspecified, or cloud metadata",
+            "address is loopback, link-local, unique-local, unspecified, or cloud metadata",
         ),
     ];
 
@@ -534,6 +560,22 @@ fn ipv6_link_local_detected_by_is_ssrf_sensitive() {
     assert!(is_ssrf_sensitive(&febf), "febf::1 should be SSRF-sensitive");
     let fe00 = "fe00::1".parse::<IpAddr>().unwrap();
     assert!(!is_ssrf_sensitive(&fe00), "fe00::1 is not link-local");
+}
+
+#[tokio::test]
+async fn ssrf_blocks_ipv6_unique_local() {
+    assert!(validate_url("http://[fc00::1]/mcp").await.is_err());
+    assert!(validate_url("http://[fd00:ec2::23]/mcp").await.is_err());
+}
+
+#[test]
+fn ipv6_unique_local_detected_by_is_ssrf_sensitive() {
+    let fc00 = "fc00::1".parse::<IpAddr>().unwrap();
+    assert!(is_ssrf_sensitive(&fc00), "fc00::1 should be SSRF-sensitive");
+    let fd00 = "fd00:ec2::23".parse::<IpAddr>().unwrap();
+    assert!(is_ssrf_sensitive(&fd00), "fd00:ec2::23 should be SSRF-sensitive");
+    let fb00 = "fb00::1".parse::<IpAddr>().unwrap();
+    assert!(!is_ssrf_sensitive(&fb00), "fb00::1 is not unique-local");
 }
 
 // =========================================================================

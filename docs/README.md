@@ -1,23 +1,38 @@
 # Praxis AI Documentation
 
-AI inference filters, agentic protocol support, and provider
-API integrations built on
-[Praxis](https://github.com/praxis-proxy/praxis).
+Praxis AI provides AI inference filters, agentic protocol support, and
+provider API integrations on top of [Praxis](https://github.com/praxis-proxy/praxis).
+
+## Start here
+
+- [Quickstart](quickstart.md)
+- [Feature overview](features.md)
+- [Example configurations](../examples/README.md)
+- [Generated filter reference](filters/reference.md)
 
 ## Architecture
 
-- [AI Inference](architecture/ai-inference.md)
-- [Agentic Protocols](architecture/agentic-protocols.md)
-- [Response Store](architecture/response-store.md)
+- [AI inference](architecture/ai-inference.md)
+- [Agentic protocols](architecture/agentic-protocols.md)
+- [Response store](architecture/response-store.md)
 
-## Filters
+## Provider guides
 
-- [Filter reference](filters/)
 - [Anthropic Messages](anthropic-messages.md)
-- [Anthropic Messages replay test plan](anthropic-messages-replay-test-plan.md)
+- [Anthropic Messages replay testing](anthropic-messages-replay-test-plan.md)
+- [AI filter overview](filters/README.md)
 
-## Reference
+## Development
 
-- [Example configs](../examples/README.md)
+- [Development setup](developing/getting-started.md)
+- [Adding filters](developing/adding-filters.md)
+- [Type design](developing/type-design.md)
+- [Project management](developing/project-management.md)
+- [Proposal process](proposals.md)
+
+## Operations and releases
+
+- [Release process](release.md)
 - [Migrating to 0.2.0](migrating-to-0.2.md)
-- [Proposals](proposals/)
+- [Security policy](../SECURITY.md)
+- [Contributing](../CONTRIBUTING.md)

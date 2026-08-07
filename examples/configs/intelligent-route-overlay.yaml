@@ -1,0 +1,53 @@
+# Intelligent Route: Overlay File Mode
+#
+# Routes requests using a routing overlay file (`routing-overlay.json`)
+# instead of inline YAML candidates. The overlay is rendered by the
+# configuration producer into a Kubernetes ConfigMap and projected as a volume.
+#
+# When the overlay file changes on disk, the filter detects the change via
+# inotify, debounces filesystem events, validates the new overlay, and
+# atomically swaps the routing snapshot.  In-flight requests continue using
+# their existing snapshot.  No pod restart, rollout restart, or Kubernetes
+# API call is required.
+#
+# If the new overlay is invalid or unreadable, the previous snapshot is
+# retained and an error is logged.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/intelligent-route-overlay.yaml
+
+listeners:
+  - name: proxy
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      # Extract model name from the JSON body into a request header.
+      - filter: json_body_field
+        field: model
+        header: X-Model
+
+      # Route from the routing overlay file.
+      - filter: intelligent_route
+        overlay_file: /etc/praxis/routing/routing-overlay.json
+        model_header: X-Model
+        reload:
+          enabled: true
+          debounce_ms: 500
+
+      # Forward to whichever cluster intelligent_route selected.
+      - filter: load_balancer
+        clusters:
+          - name: granite-local
+            endpoints:
+              - "127.0.0.1:8001"
+          - name: llama-remote
+            endpoints:
+              - "127.0.0.1:8002"
+
+admin:
+  address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5

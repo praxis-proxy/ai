@@ -372,6 +372,7 @@ fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Tran
     match obj.get("type").and_then(Value::as_str) {
         Some("function_call_output") => append_tool_output(messages, obj),
         Some("message") => append_message_item(messages, obj)?,
+        Some("compaction") => append_compaction_item(messages, obj),
         None if obj.contains_key("role") || obj.contains_key("content") => append_message_item(messages, obj)?,
         None => return Err(TranslationError::UnsupportedInputItemType("unknown".to_owned())),
         Some(input_type) => return Err(TranslationError::UnsupportedInputItemType(input_type.to_owned())),
@@ -388,6 +389,26 @@ fn append_message_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> R
         .map_or_else(|| Ok(json!("")), convert_input_content)?;
     messages.push(json!({"role": role, "content": content}));
     Ok(())
+}
+
+/// Convert a Responses compaction item into a Chat Completions assistant message.
+///
+/// Uses assistant role (not system) to avoid elevating the summary's
+/// instruction priority — it is informational context, not instructions.
+fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
+    use base64::Engine as _;
+    let summary = obj
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    if !summary.is_empty() {
+        messages.push(json!({
+            "role": "assistant",
+            "content": format!("[Previous conversation summary]\n\n{summary}")
+        }));
+    }
 }
 
 /// Convert one Responses function-call item to a Chat tool-call object.

@@ -2778,6 +2778,40 @@ async fn sse_streaming_capture_clears_on_eos() {
 }
 
 #[tokio::test]
+async fn sse_streaming_capture_flushes_pending_event_at_eos_without_trailing_blank_line() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_sse_capture(&mut ctx);
+
+    let sse_data = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"task-no-trail\",\"contextId\":\"ctx-no-trail\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n";
+    let mut body = Some(Bytes::from(sse_data.to_vec()));
+    drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+    assert!(
+        store.get_by_task_id("task-no-trail").is_none(),
+        "no blank line yet, event should still be buffered"
+    );
+
+    let mut eos_body: Option<Bytes> = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap());
+
+    assert_eq!(
+        store.get_by_task_id("task-no-trail").as_deref(),
+        Some("agent-a"),
+        "EOS flush should dispatch the pending event when provider omits trailing blank line"
+    );
+    assert_eq!(
+        store.get_by_context_id("ctx-no-trail").as_deref(),
+        Some("agent-a"),
+        "EOS flush should also capture context route from the flushed event"
+    );
+    assert_sse_capture_cleared(&ctx);
+}
+
+#[tokio::test]
 async fn non_sse_response_does_not_enter_sse_capture_path() {
     let filter = make_task_routing_filter();
 

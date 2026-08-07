@@ -1,0 +1,83 @@
+{
+  "source": "Reformatted from agentic_api/web_search_nonstreaming.json; sanitized vLLM plus You.com recording.",
+  "initial_request": {
+    "model": "openai/gpt-oss-20b",
+    "max_tokens": 1024,
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Use web search to look up potato, then summarize in one sentence."
+      }
+    ],
+    "tools": [
+      {
+        "name": "WebSearch",
+        "description": "Search the web",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    ]
+  },
+  "first_model_response": {
+    "id": "msg_web_search_01",
+    "type": "message",
+    "role": "assistant",
+    "model": "openai/gpt-oss-20b",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_web_search_01",
+        "name": "WebSearch",
+        "input": {
+          "query": "potato"
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 20,
+      "output_tokens": 8
+    }
+  },
+  "search_response": {
+    "results": {
+      "web": [
+        {
+          "title": "Potato - Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Potato",
+          "description": "Potato is a starchy underground tuber native to the Americas."
+        }
+      ],
+      "news": []
+    }
+  },
+  "final_model_response": {
+    "id": "msg_web_search_02",
+    "type": "message",
+    "role": "assistant",
+    "model": "openai/gpt-oss-20b",
+    "content": [
+      {
+        "type": "text",
+        "text": "Potato is a starchy underground tuber native to the Americas and now eaten worldwide."
+      }
+    ],
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 74,
+      "output_tokens": 18
+    }
+  }
+}

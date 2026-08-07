@@ -17,10 +17,9 @@ mod config;
 )]
 mod tests;
 
-use std::borrow::Cow;
-
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_ai_apis::json_body::replace_json_body;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
@@ -148,7 +147,7 @@ impl HttpFilter for PromptEnrichFilter {
 
     async fn on_request_body(
         &self,
-        ctx: &mut HttpFilterContext<'_>,
+        _ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
@@ -175,14 +174,8 @@ impl HttpFilter for PromptEnrichFilter {
         messages.splice(0..0, self.prepend.iter().cloned());
         messages.extend(self.append.iter().cloned());
 
-        let serialized =
-            serde_json::to_vec(&value).map_err(|e| -> FilterError { format!("prompt_enrich: {e}").into() })?;
-
-        let len = serialized.len();
-        *body = Some(Bytes::from(serialized));
-
-        ctx.extra_request_headers
-            .push((Cow::Borrowed("content-length"), len.to_string()));
+        replace_json_body(body, &value, self.name(), "messages")
+            .map_err(|e| -> FilterError { format!("{}: {e}", self.name()).into() })?;
 
         Ok(FilterAction::Continue)
     }

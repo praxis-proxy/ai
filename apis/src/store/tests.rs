@@ -20,9 +20,15 @@ use crate::openai::responses::store::{ListParams, Order, list_input_items};
 
 #[tokio::test]
 async fn sqlite_store_initializes_schema() {
-    let store = SqliteResponseStore::new("sqlite::memory:", "test_responses", "test_conversation_messages", None)
-        .await
-        .expect("store creation should succeed");
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "test_responses",
+        "test_conversation_messages",
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed");
 
     let result = store
         .get_response("tenant_a", "nonexistent")
@@ -1348,7 +1354,7 @@ async fn file_backed_store_crud() {
     let db_path = dir.path().join("test.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let store = SqliteResponseStore::new(&url, "file_responses", "file_conversations", None)
+    let store = SqliteResponseStore::new(&url, "file_responses", "file_conversations", None, None)
         .await
         .expect("file-backed store creation should succeed");
 
@@ -1377,7 +1383,7 @@ async fn schema_migration_is_idempotent() {
     let db_path = dir.path().join("idempotent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let store = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"))
+    let store = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"), None)
         .await
         .expect("first init should succeed");
 
@@ -1386,7 +1392,7 @@ async fn schema_migration_is_idempotent() {
 
     drop(store);
 
-    let store2 = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"))
+    let store2 = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"), None)
         .await
         .expect("second init with same tables should succeed");
 
@@ -1400,6 +1406,163 @@ async fn schema_migration_is_idempotent() {
         fetched.id, "resp_1",
         "data should persist across schema re-initialization"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Schema Validation (missing columns)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sqlite_rejects_table_with_missing_columns() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("bad_schema.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    sqlx::query("CREATE TABLE bad_responses (tenant_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (tenant_id, id))")
+        .execute(&pool)
+        .await
+        .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "bad_responses", "ok_conversations", None, None).await;
+    let Err(err) = result else {
+        panic!("init should fail on schema mismatch");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains("bad_responses"), "error should name the table: {msg}");
+    assert!(msg.contains("created_at"), "error should list missing column: {msg}");
+    assert!(msg.contains("model"), "error should list missing column: {msg}");
+}
+
+#[tokio::test]
+async fn sqlite_rejects_items_table_with_missing_columns() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("bad_items.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    sqlx::query(
+        "CREATE TABLE bad_items (item_id TEXT NOT NULL, tenant_id TEXT NOT NULL, \
+         conversation_id TEXT NOT NULL, created_at BIGINT NOT NULL, position BIGINT NOT NULL, \
+         PRIMARY KEY (item_id, tenant_id, conversation_id))",
+    )
+    .execute(&pool)
+    .await
+    .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "ok_responses", "ok_conversations", Some("bad_items"), None).await;
+    let Err(err) = result else {
+        panic!("init should fail on items schema mismatch");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains("bad_items"), "error should name the table: {msg}");
+    assert!(msg.contains("item_data"), "error should list missing column: {msg}");
+}
+
+// -----------------------------------------------------------------------------
+// Schema Version
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sqlite_stamps_schema_version_on_fresh_db() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("version.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let _store = SqliteResponseStore::new(&url, "vr", "vc", None, None)
+        .await
+        .expect("store creation should succeed");
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse");
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    let version: i64 = sqlx::query_scalar("SELECT version FROM vr_schema_version")
+        .fetch_one(&pool)
+        .await
+        .expect("version row should exist");
+    assert_eq!(version, 1, "fresh store should stamp version 1");
+}
+
+#[tokio::test]
+async fn sqlite_rejects_schema_version_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("bad_version.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    sqlx::query("CREATE TABLE vr_schema_version (version BIGINT NOT NULL PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("create should succeed");
+    sqlx::query("INSERT INTO vr_schema_version (version) VALUES (99)")
+        .execute(&pool)
+        .await
+        .expect("insert should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "vr", "vc", None, None).await;
+    let Err(err) = result else {
+        panic!("init should fail on version mismatch");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("schema version mismatch"),
+        "error should mention version mismatch: {msg}"
+    );
+    assert!(msg.contains("99"), "error should show stored version: {msg}");
+    assert!(
+        msg.contains("migration required"),
+        "error should mention migration: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_accepts_matching_schema_version() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("good_version.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let _store = SqliteResponseStore::new(&url, "vr", "vc", None, None)
+        .await
+        .expect("first init should succeed");
+
+    let _store2 = SqliteResponseStore::new(&url, "vr", "vc", None, None)
+        .await
+        .expect("second init with matching version should succeed");
 }
 
 // -----------------------------------------------------------------------------
@@ -1621,6 +1784,7 @@ async fn pg_nonexistent_ssl_root_cert_fails() {
         None,
         Some(SslMode::VerifyCa),
         Some("/nonexistent/ca.pem"),
+        None,
     ))
     .await;
 
@@ -1633,6 +1797,121 @@ async fn pg_nonexistent_ssl_root_cert_fails() {
     );
 }
 
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_missing_columns() {
+    use sqlx::AssertSqlSafe;
+
+    let url = pg_database_url();
+    let suffix = pg_unique_suffix();
+    let table_name = format!("bad_responses_{suffix}");
+
+    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url should parse");
+    let pool = Box::pin(sqlx::PgPool::connect_with(options))
+        .await
+        .expect("pool should connect");
+    let create_sql = format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} \
+         (tenant_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (tenant_id, id))"
+    );
+    sqlx::query(AssertSqlSafe(create_sql.as_str()))
+        .execute(&pool)
+        .await
+        .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = Box::pin(PostgresResponseStore::new(
+        &url,
+        &table_name,
+        &format!("ok_conversations_{suffix}"),
+        None,
+        Some(SslMode::Disable),
+        None,
+        None,
+    ))
+    .await;
+    let Err(err) = result else {
+        panic!("init should fail on schema mismatch");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains(&table_name), "error should name the table: {msg}");
+    assert!(msg.contains("created_at"), "error should list missing column: {msg}");
+
+    let cleanup_pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("cleanup pool");
+    let conv_table = format!("ok_conversations_{suffix}");
+    let ver_table = format!("{table_name}_schema_version");
+    for table in [&table_name, &conv_table, &ver_table] {
+        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
+        sqlx::query(AssertSqlSafe(drop_sql.as_str()))
+            .execute(&cleanup_pool)
+            .await
+            .expect("cleanup should succeed");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_schema_version_mismatch() {
+    use sqlx::AssertSqlSafe;
+
+    let url = pg_database_url();
+    let suffix = pg_unique_suffix();
+    let resp_table = format!("vr_{suffix}");
+    let conv_table = format!("vc_{suffix}");
+    let ver_table = format!("{resp_table}_schema_version");
+
+    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url should parse");
+    let pool = Box::pin(sqlx::PgPool::connect_with(options))
+        .await
+        .expect("pool should connect");
+    let create_sql = format!("CREATE TABLE IF NOT EXISTS {ver_table} (version BIGINT NOT NULL PRIMARY KEY)");
+    sqlx::query(AssertSqlSafe(create_sql.as_str()))
+        .execute(&pool)
+        .await
+        .expect("create should succeed");
+    let insert_sql = format!("INSERT INTO {ver_table} (version) VALUES (99)");
+    sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+        .execute(&pool)
+        .await
+        .expect("insert should succeed");
+    pool.close().await;
+
+    let result = Box::pin(PostgresResponseStore::new(
+        &url,
+        &resp_table,
+        &conv_table,
+        None,
+        Some(SslMode::Disable),
+        None,
+        None,
+    ))
+    .await;
+    let Err(err) = result else {
+        panic!("init should fail on version mismatch");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("schema version mismatch"),
+        "error should mention version mismatch: {msg}"
+    );
+    assert!(msg.contains("99"), "error should show stored version: {msg}");
+
+    let cleanup_pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("cleanup pool");
+    for table in [&ver_table, &resp_table, &conv_table] {
+        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
+        sqlx::query(AssertSqlSafe(drop_sql.as_str()))
+            .execute(&cleanup_pool)
+            .await
+            .expect("cleanup should succeed");
+    }
+}
+
 async fn make_pg_store() -> PostgresResponseStore {
     let url = pg_database_url();
     let suffix = pg_unique_suffix();
@@ -1642,6 +1921,7 @@ async fn make_pg_store() -> PostgresResponseStore {
         &format!("test_conversations_{suffix}"),
         None,
         Some(SslMode::Disable),
+        None,
         None,
     ))
     .await
@@ -2336,15 +2616,21 @@ async fn pg_delete_conversation_preserves_items() {
 // -----------------------------------------------------------------------------
 
 async fn make_store() -> SqliteResponseStore {
-    SqliteResponseStore::new("sqlite::memory:", "test_responses", "test_conversation_messages", None)
-        .await
-        .expect("store creation should succeed")
+    SqliteResponseStore::new(
+        "sqlite::memory:",
+        "test_responses",
+        "test_conversation_messages",
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed")
 }
 
 async fn make_file_store(dir: &tempfile::TempDir) -> SqliteResponseStore {
     let db_path = dir.path().join("concurrent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None)
+    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None, None)
         .await
         .expect("file-backed store creation should succeed")
 }
@@ -2355,6 +2641,7 @@ async fn make_store_with_items() -> SqliteResponseStore {
         "test_responses",
         "test_conversation_messages",
         Some("test_conversation_items"),
+        None,
     )
     .await
     .expect("store creation should succeed")
@@ -2372,6 +2659,7 @@ async fn make_pg_store_with_items() -> PostgresResponseStore {
         &conversations_table,
         Some(&items_table),
         Some(SslMode::Disable),
+        None,
         None,
     )
     .await
