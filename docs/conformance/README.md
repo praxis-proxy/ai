@@ -35,6 +35,24 @@ and its shared contract types are the authority for what Praxis claims and
 implements. Conformance is the reproducible comparison between those two
 sources, backed by tests of the real runtime path.
 
+### Verified Conversations request behavior
+
+The Conversations create and update request-body edge cases were checked
+against `api.openai.com` on 2026-07-27.
+
+| Request | Result |
+| --- | --- |
+| Create with no body or `{}` | `200` |
+| Create with null `metadata` and `items` | `200` |
+| Update with no body or `{}` | `400 missing_required_parameter` for `metadata` |
+| Update with null `metadata` | `400 invalid_type` for `metadata` |
+| Update with object `metadata` | `200` |
+
+The pinned and current upstream OpenAPI documents omit `requestBody.required`
+for update even though the live endpoint requires the body. The implementation
+document follows the verified runtime contract, so that upstream discrepancy
+remains visible instead of declaring behavior Praxis does not implement.
+
 ## Code Map
 
 - `apis/src/openai/conversations/routes.rs` declares each operation once and

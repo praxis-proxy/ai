@@ -38,12 +38,18 @@ impl Deref for ConversationOperationSpec {
 
 /// Convert a registry request declaration into an optional schema binding.
 macro_rules! request_binding {
-    (none) => {
+    ([none]) => {
         None
     };
-    ($schema:ty) => {
+    ([required $schema:ty]) => {
         Some(RequestBodySpec {
             required: true,
+            content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($schema))],
+        })
+    };
+    ([optional $schema:ty]) => {
+        Some(RequestBodySpec {
+            required: false,
             content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($schema))],
         })
     };
@@ -152,7 +158,7 @@ conversation_operations! {
         mode: Local,
         contract: owned {
             parameters: [],
-            request: CreateConversationRequest,
+            request: [optional CreateConversationRequest],
             response: ConversationResource,
         },
     },
@@ -166,7 +172,7 @@ conversation_operations! {
                 "conversation_id",
                 "The ID of the conversation to retrieve."
             )],
-            request: none,
+            request: [none],
             response: ConversationResource,
         },
     },
@@ -180,7 +186,7 @@ conversation_operations! {
                 "conversation_id",
                 "The ID of the conversation to update."
             )],
-            request: UpdateConversationRequest,
+            request: [required UpdateConversationRequest],
             response: ConversationResource,
         },
     },
@@ -194,7 +200,7 @@ conversation_operations! {
                 "conversation_id",
                 "The ID of the conversation to delete."
             )],
-            request: none,
+            request: [none],
             response: DeletedConversationResource,
         },
     },
@@ -215,7 +221,7 @@ conversation_operations! {
                     "Additional fields to include in the response."
                 ),
             ],
-            request: CreateConversationItemsRequest,
+            request: [required CreateConversationItemsRequest],
             response: ConversationItemList,
         },
     },
@@ -239,7 +245,7 @@ conversation_operations! {
                     "Additional fields to include in the response."
                 ),
             ],
-            request: none,
+            request: [none],
             response: ConversationItemList,
         },
     },
@@ -261,7 +267,7 @@ conversation_operations! {
                     "Additional fields to include in the response."
                 ),
             ],
-            request: none,
+            request: [none],
             response: ConversationItem,
         },
     },
@@ -278,7 +284,7 @@ conversation_operations! {
                 ),
                 path_parameter!("item_id", "The ID of the item to delete."),
             ],
-            request: none,
+            request: [none],
             response: ConversationResource,
         },
     },

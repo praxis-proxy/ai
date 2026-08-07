@@ -71,7 +71,7 @@ async fn update_conversation_metadata() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn update_conversation_without_metadata_preserves_existing_metadata() {
+async fn update_conversation_without_metadata_returns_400() {
     let proxy = start_test_proxy();
     let conv_id = create_conversation(&proxy, r#"{"metadata":{"v":"1"}}"#);
 
@@ -79,17 +79,11 @@ async fn update_conversation_without_metadata_preserves_existing_metadata() {
         proxy.addr(),
         &json_post(&format!("/v1/conversations/{conv_id}"), r#"{}"#),
     );
-    assert_eq!(parse_status(&raw), 200, "update should return 200");
-    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-    assert_eq!(body["metadata"]["v"], "1");
-
-    let raw = http_send(
-        proxy.addr(),
-        &format!("GET /v1/conversations/{conv_id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "update without metadata should return 400 per OpenAI contract"
     );
-    assert_eq!(parse_status(&raw), 200, "GET after update should return 200");
-    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-    assert_eq!(body["metadata"]["v"], "1");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

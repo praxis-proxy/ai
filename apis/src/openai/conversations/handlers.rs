@@ -18,7 +18,7 @@ use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
         CreateConversationRequest, DeletedConversationResource, IncludeField, IncludeFields, ItemOrder,
-        MAX_ITEMS_PER_REQUEST, Metadata, MetadataUpdate, UpdateConversationRequest,
+        MAX_ITEMS_PER_REQUEST, Metadata, UpdateConversationRequest,
     },
     validate::validate_metadata,
 };
@@ -75,9 +75,13 @@ pub(super) async fn handle_create_conversation(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let input: CreateConversationRequest = match parse_json_body(body) {
-        Ok(v) => v,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+    let input = if body.is_empty() {
+        CreateConversationRequest::default()
+    } else {
+        match parse_json_body(body) {
+            Ok(v) => v,
+            Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        }
     };
     let metadata = match input.metadata {
         Some(metadata) => {
@@ -92,10 +96,11 @@ pub(super) async fn handle_create_conversation(
     let raw_id = ctx.id_generator.generate(ctx.time_source);
     let conversation_id = format!("conv_{raw_id}");
     let created_at = current_timestamp(ctx);
-    if let Err(msg) = validate_item_count(input.items.len()) {
+    let items = input.items.unwrap_or_default();
+    if let Err(msg) = validate_item_count(items.len()) {
         return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
-    let item_values = input.items.into_iter().map(ConversationItem::into_value);
+    let item_values = items.into_iter().map(ConversationItem::into_value);
     let item_records = match build_item_records(ctx, tenant_id, &conversation_id, created_at, 1, item_values) {
         Ok(records) => records,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
@@ -163,12 +168,16 @@ pub(super) async fn handle_update_conversation(
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
     let input: UpdateConversationRequest = match parse_json_body(body) {
         Ok(v) => v,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(msg) => {
+            return Ok(FilterAction::Reject(classify_update_error(&msg)?));
+        },
     };
-    if let MetadataUpdate::Replace(metadata) = &input.metadata
-        && let Err(msg) = validate_metadata(metadata.as_value())
-    {
-        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+    if let Err(msg) = validate_metadata(input.metadata.as_value()) {
+        return Ok(FilterAction::Reject(invalid_input_response_with(
+            &msg,
+            Some("invalid_type"),
+            Some("metadata"),
+        )?));
     }
 
     let existing = match store.get_conversation(tenant_id, conversation_id).await {
@@ -182,11 +191,7 @@ pub(super) async fn handle_update_conversation(
         ))?));
     };
 
-    let metadata = match input.metadata {
-        MetadataUpdate::Missing => existing.metadata,
-        MetadataUpdate::Clear => Value::Object(Map::new()),
-        MetadataUpdate::Replace(metadata) => metadata.into_value(),
-    };
+    let metadata = input.metadata.into_value();
 
     let record = ConversationRecord {
         conversation_id: conversation_id.to_owned(),
@@ -848,15 +853,45 @@ fn json_response<T: Serialize + ?Sized>(status: u16, body: &T) -> Result<Rejecti
 
 /// Build a 400 JSON response for invalid input.
 fn invalid_input_response(message: &str) -> Result<Rejection, FilterError> {
+    invalid_input_response_with(message, None, None)
+}
+
+/// Build a 400 JSON response with optional OpenAI error code and parameter.
+fn invalid_input_response_with(
+    message: &str,
+    code: Option<&str>,
+    param: Option<&str>,
+) -> Result<Rejection, FilterError> {
     json_response(
         400,
         &serde_json::json!({
             "error": {
                 "message": message,
                 "type": "invalid_request_error",
+                "code": code,
+                "param": param,
             }
         }),
     )
+}
+
+/// Map update deserialization errors to OpenAI-style error codes.
+fn classify_update_error(msg: &str) -> Result<Rejection, FilterError> {
+    if msg.contains("missing field") && msg.contains("metadata") {
+        return invalid_input_response_with(
+            "Missing required parameter: 'metadata'.",
+            Some("missing_required_parameter"),
+            Some("metadata"),
+        );
+    }
+    if msg.contains("metadata must be an object") {
+        return invalid_input_response_with(
+            "Invalid type for 'metadata': expected an object, but got null.",
+            Some("invalid_type"),
+            Some("metadata"),
+        );
+    }
+    invalid_input_response(msg)
 }
 
 /// Build a 404 JSON response.
