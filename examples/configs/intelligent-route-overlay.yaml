@@ -1,8 +1,8 @@
 # Intelligent Route: Overlay File Mode
 #
 # Routes requests using a routing overlay file (`routing-overlay.json`)
-# instead of inline YAML candidates. The overlay is rendered by the
-# configuration producer into a Kubernetes ConfigMap and projected as a volume.
+# instead of inline YAML candidates.  The overlay is rendered by
+# the operator into a Kubernetes ConfigMap and projected as a volume mount.
 #
 # When the overlay file changes on disk, the filter detects the change via
 # inotify, debounces filesystem events, validates the new overlay, and

@@ -59,6 +59,7 @@ impl TestCertificates {
     ///
     /// Panics if certificate generation or file I/O fails.
     pub fn generate() -> Self {
+        ensure_crypto_provider();
         let (ca_key, ca_params, ca_cert) = generate_ca("Praxis Test CA");
         let issuer = Issuer::from_params(&ca_params, &ca_key);
 
@@ -103,6 +104,7 @@ impl TestCertificates {
     ///
     /// Panics if certificate generation or file I/O fails.
     pub fn generate_for_san(san: &str) -> Self {
+        ensure_crypto_provider();
         let (ca_key, ca_params, ca_cert) = generate_ca(&format!("Praxis Test CA ({san})"));
         let issuer = Issuer::from_params(&ca_params, &ca_key);
 
@@ -284,6 +286,11 @@ pub struct ClientCert {
 // CA Generation
 // -----------------------------------------------------------------------------
 
+/// Install a process-wide default crypto provider for TLS tests.
+fn ensure_crypto_provider() {
+    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+}
+
 /// Generate a self-signed CA certificate, parameters, and key pair.
 fn generate_ca(cn: &str) -> (KeyPair, CertificateParams, rcgen::Certificate) {
     let ca_key = KeyPair::generate().expect("CA key generation");
@@ -310,6 +317,43 @@ pub fn https_get(addr: &str, path: &str, client_config: &Arc<ClientConfig>) -> (
         .expect("tokio runtime");
 
     rt.block_on(async { h2_get(addr, path, client_config).await })
+}
+
+/// Send an HTTP/1.1 request over TLS and return the raw response.
+///
+/// The request must include `Connection: close` so the server terminates the
+/// response stream. Unlike [`tls_send_recv`], this helper does not half-close
+/// TLS after writing because doing so can prevent an HTTP server from returning
+/// its response.
+///
+/// # Panics
+///
+/// Panics if the TLS connection, request write, or response read fails.
+///
+/// [`tls_send_recv`]: crate::net::tls::tls_send_recv
+pub fn https_send(addr: &str, request: &str, client_config: &Arc<ClientConfig>) -> String {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        let mut tls = tls_connect(addr, client_config).await;
+        tokio::io::AsyncWriteExt::write_all(&mut tls, request.as_bytes())
+            .await
+            .expect("TLS HTTP write");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut tls, &mut response),
+        )
+        .await
+        .expect("TLS HTTP response timeout")
+        .expect("TLS HTTP response read");
+
+        String::from_utf8_lossy(&response).into_owned()
+    })
 }
 
 /// Perform an HTTP/2 GET over TLS.

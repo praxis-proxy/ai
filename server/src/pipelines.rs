@@ -3,11 +3,15 @@
 
 //! Filter pipeline resolution for server listeners.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use praxis_core::config::{Config, InsecureOptions};
+use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry, InsecureOptions, Listener};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
+use praxis_tls::ClientCertMode;
 
 // -----------------------------------------------------------------------------
 // Pipeline Resolution
@@ -50,6 +54,7 @@ pub fn resolve_pipelines(
         let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
 
+        validate_provider_boundary(listener, &entries, &chains)?;
         validate_pipeline(&pipeline, &entries, &listener.name, &config.insecure_options)?;
 
         pipelines.insert(listener.name.clone(), Arc::new(pipeline));
@@ -88,12 +93,148 @@ fn configure_pipeline(
 // Pipeline Validation
 // -----------------------------------------------------------------------------
 
+/// Enforce the non-bypassable trust contract for AI-owned provider-hop context.
+///
+/// `x-ai-routing-*` fields are intentionally outside Praxis's reserved namespace
+/// so they can cross the upstream boundary. Every provider consumer therefore
+/// requires mandatory client certificates and an unconditional, fail-closed
+/// `peer_identity_trust` as the first filter in the provider chain.
+fn validate_provider_boundary(
+    listener: &Listener,
+    entries: &[FilterEntry],
+    chains: &HashMap<&str, &[FilterEntry]>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if provider_consumer_exists_in_branch(entries, chains, &mut HashSet::new()) {
+        return Err(format!(
+            "listener '{}': provider_route must be top-level, not branch-conditional",
+            listener.name
+        )
+        .into());
+    }
+
+    let provider_indices = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.filter_type == "provider_route").then_some(index))
+        .collect::<Vec<_>>();
+    if provider_indices.is_empty() {
+        return Ok(());
+    }
+
+    validate_provider_listener_tls(listener)?;
+    for provider_index in provider_indices {
+        validate_provider_entry(listener, entries, provider_index)?;
+    }
+
+    Ok(())
+}
+
+/// Require mutual TLS on a listener that consumes provider context.
+fn validate_provider_listener_tls(listener: &Listener) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if listener
+        .tls
+        .as_ref()
+        .is_none_or(|tls| tls.client_cert_mode != ClientCertMode::Require)
+    {
+        return Err(format!(
+            "listener '{}': provider_route requires tls.client_cert_mode: require",
+            listener.name
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Validate one provider consumer and its non-bypassable peer trust filter.
+fn validate_provider_entry(
+    listener: &Listener,
+    entries: &[FilterEntry],
+    provider_index: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let provider = entries
+        .get(provider_index)
+        .ok_or_else(|| format!("listener '{}': invalid provider_route index", listener.name))?;
+    validate_unconditional_closed(&listener.name, provider)?;
+    let peer = required_peer_identity_trust(&listener.name, entries, provider_index)?;
+    validate_unconditional_closed(&listener.name, peer)?;
+    Ok(())
+}
+
+/// Find the mandatory first-position peer trust filter for a provider consumer.
+fn required_peer_identity_trust<'a>(
+    listener_name: &str,
+    entries: &'a [FilterEntry],
+    provider_index: usize,
+) -> Result<&'a FilterEntry, Box<dyn std::error::Error + Send + Sync>> {
+    let preceding = entries
+        .get(..provider_index)
+        .ok_or_else(|| format!("listener '{listener_name}': invalid provider_route prefix"))?;
+    let (peer_index, peer) = preceding
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| entry.filter_type == "peer_identity_trust")
+        .ok_or_else(|| {
+            format!("listener '{listener_name}': provider_route requires a preceding peer_identity_trust")
+        })?;
+    if peer_index != 0 {
+        return Err(format!(
+            "listener '{listener_name}': peer_identity_trust must be the first filter in a provider chain"
+        )
+        .into());
+    }
+    Ok(peer)
+}
+
+/// Detect provider consumers nested in any reachable inline or named branch.
+fn provider_consumer_exists_in_branch(
+    entries: &[FilterEntry],
+    chains: &HashMap<&str, &[FilterEntry]>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    entries.iter().any(|entry| {
+        entry.branch_chains.as_ref().is_some_and(|branches| {
+            branches.iter().any(|branch| {
+                branch.chains.iter().any(|chain| {
+                    let nested = match chain {
+                        ChainRef::Inline { filters, .. } => filters.as_slice(),
+                        ChainRef::Named(name) => {
+                            if visited.insert(name.clone()) {
+                                chains.get(name.as_str()).copied().unwrap_or_default()
+                            } else {
+                                &[]
+                            }
+                        },
+                    };
+                    nested.iter().any(|filter| filter.filter_type == "provider_route")
+                        || provider_consumer_exists_in_branch(nested, chains, visited)
+                })
+            })
+        })
+    })
+}
+
+/// Require a security-boundary filter to execute unconditionally and fail closed.
+fn validate_unconditional_closed(
+    listener_name: &str,
+    entry: &FilterEntry,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if entry.failure_mode != FailureMode::Closed || !entry.conditions.is_empty() {
+        return Err(format!(
+            "listener '{listener_name}': {} must be unconditional and fail-closed for the provider boundary",
+            entry.filter_type
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Run pipeline ordering validation; either fail or warn depending
 /// on insecure option flags.
 #[expect(clippy::cognitive_complexity, reason = "pre-existing complexity above threshold")]
 fn validate_pipeline(
     pipeline: &FilterPipeline,
-    entries: &[praxis_core::config::FilterEntry],
+    entries: &[FilterEntry],
     listener_name: &str,
     insecure_options: &InsecureOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -365,6 +506,151 @@ filter_chains:
     }
 
     #[test]
+    fn provider_route_rejects_plaintext_listener() {
+        let (listener, entries) = provider_boundary_parts("", peer_then_provider_filters());
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("plaintext provider listener must fail");
+
+        assert!(err.to_string().contains("client_cert_mode: require"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_optional_client_certificate() {
+        let (listener, entries) = provider_boundary_parts(&provider_tls("request"), peer_then_provider_filters());
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("optional client certificate must fail");
+
+        assert!(err.to_string().contains("client_cert_mode: require"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_missing_peer_trust() {
+        let (listener, entries) = provider_boundary_parts(&provider_tls("require"), provider_filter());
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("provider route without peer trust must fail");
+
+        assert!(err.to_string().contains("preceding peer_identity_trust"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_peer_trust_after_consumer() {
+        let filters = format!("{}{}", provider_filter(), peer_filter(""));
+        let (listener, entries) = provider_boundary_parts(&provider_tls("require"), &filters);
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("peer trust after provider route must fail");
+
+        assert!(err.to_string().contains("preceding peer_identity_trust"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_open_peer_trust() {
+        let filters = format!("{}{}", peer_filter("        failure_mode: open\n"), provider_filter());
+        let (listener, entries) = provider_boundary_parts(&provider_tls("require"), &filters);
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("fail-open peer trust must fail");
+
+        assert!(err.to_string().contains("unconditional and fail-closed"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_filter_before_peer_trust() {
+        let filters = format!("      - filter: request_id\n{}{}", peer_filter(""), provider_filter());
+        let (listener, entries) = provider_boundary_parts(&provider_tls("require"), &filters);
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("an earlier filter could branch around peer trust");
+
+        assert!(err.to_string().contains("must be the first filter"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_open_provider_consumer() {
+        let provider = provider_filter().replacen(
+            "        provider_id:",
+            "        failure_mode: open\n        provider_id:",
+            1,
+        );
+        let filters = format!("{}{}", peer_filter(""), provider);
+        let (listener, entries) = provider_boundary_parts(&provider_tls("require"), &filters);
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("fail-open provider consumer must fail");
+
+        assert!(err.to_string().contains("unconditional and fail-closed"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_conditional_peer_trust() {
+        let filters = format!(
+            "{}{}",
+            peer_filter("        conditions:\n          - when:\n              path_prefix: /v1\n"),
+            provider_filter()
+        );
+        let (listener, entries) = provider_boundary_parts(&provider_tls("require"), &filters);
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("conditional peer trust must fail");
+
+        assert!(err.to_string().contains("unconditional and fail-closed"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_conditional_provider_consumer() {
+        let provider = provider_filter().replacen(
+            "        provider_id:",
+            "        conditions:\n          - when:\n              path_prefix: /v1\n        provider_id:",
+            1,
+        );
+        let filters = format!("{}{}", peer_filter(""), provider);
+        let (listener, entries) = provider_boundary_parts(&provider_tls("require"), &filters);
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("conditional provider consumer must fail");
+
+        assert!(err.to_string().contains("unconditional and fail-closed"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_rejects_branch_conditional_consumer() {
+        let (listener, entries) = provider_boundary_parts(
+            &provider_tls("require"),
+            "      - filter: peer_identity_trust
+        trusted_peers:
+          - organization: ai-grid
+        branch_chains:
+          - name: provider-branch
+            chains:
+              - name: inline-provider
+                filters:
+                  - filter: provider_route
+                    provider_id: test-provider
+                    routes:
+                      - candidate_id: candidate-a
+                        cluster: backend
+                        model: model-a
+                        paths: [/v1/chat/completions]
+",
+        );
+
+        let err = validate_provider_boundary(&listener, &entries, &HashMap::new())
+            .expect_err("branch-conditional provider consumer must fail");
+
+        assert!(err.to_string().contains("must be top-level"), "{err}");
+    }
+
+    #[test]
+    fn provider_route_accepts_required_mtls_and_preceding_peer_trust() {
+        let (listener, entries) = provider_boundary_parts(&provider_tls("require"), peer_then_provider_filters());
+
+        validate_provider_boundary(&listener, &entries, &HashMap::new()).expect("valid provider boundary");
+    }
+
+    #[test]
     fn resolve_pipelines_rejects_misaligned_clusters() {
         let config = Config::from_yaml(
             r#"
@@ -572,5 +858,76 @@ filter_chains:
 "#,
         )
         .unwrap()
+    }
+
+    /// Parse one listener and return its resolved top-level filter entries.
+    fn provider_boundary_parts(tls: &str, filters: &str) -> (Listener, Vec<FilterEntry>) {
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: provider
+    address: "127.0.0.1:8443"
+    filter_chains: [provider]{tls}
+filter_chains:
+  - name: provider
+    filters:
+{filters}
+"#
+        ))
+        .expect("provider boundary config should parse");
+        (config.listeners[0].clone(), config.filter_chains[0].filters.clone())
+    }
+
+    /// Listener TLS block with the requested downstream client-cert mode.
+    fn provider_tls(mode: &str) -> String {
+        format!(
+            r#"
+    tls:
+      certificates:
+        - cert_path: "/tmp/provider.crt"
+          key_path: "/tmp/provider.key"
+      client_ca:
+        ca_path: "/tmp/grid-ca.crt"
+      client_cert_mode: {mode}"#
+        )
+    }
+
+    /// Fail-closed peer filter followed by the provider consumer.
+    fn peer_then_provider_filters() -> &'static str {
+        concat!(
+            "      - filter: peer_identity_trust\n",
+            "        trusted_peers:\n",
+            "          - organization: ai-grid\n",
+            "      - filter: provider_route\n",
+            "        provider_id: test-provider\n",
+            "        routes:\n",
+            "          - candidate_id: candidate-a\n",
+            "            cluster: backend\n",
+            "            model: model-a\n",
+            "            paths: [/v1/chat/completions]\n",
+        )
+    }
+
+    /// Peer filter YAML with optional entry-level fields.
+    fn peer_filter(entry_fields: &str) -> String {
+        format!(
+            "      - filter: peer_identity_trust\n\
+             {entry_fields}\
+             \x20       trusted_peers:\n\
+             \x20         - organization: ai-grid\n"
+        )
+    }
+
+    /// Provider consumer filter YAML.
+    fn provider_filter() -> &'static str {
+        concat!(
+            "      - filter: provider_route\n",
+            "        provider_id: test-provider\n",
+            "        routes:\n",
+            "          - candidate_id: candidate-a\n",
+            "            cluster: backend\n",
+            "            model: model-a\n",
+            "            paths: [/v1/chat/completions]\n",
+        )
     }
 }
