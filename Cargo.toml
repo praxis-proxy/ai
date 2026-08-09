@@ -90,6 +90,13 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 cargo_metadata = "0.23.1"
 
+[patch.crates-io]
+praxis-proxy = { git = "https://github.com/praxis-proxy/praxis.git", rev = "0d3347c634ab4e09d882c02bf01767a1667c82db" }
+praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "0d3347c634ab4e09d882c02bf01767a1667c82db" }
+praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis.git", rev = "0d3347c634ab4e09d882c02bf01767a1667c82db" }
+praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis.git", rev = "0d3347c634ab4e09d882c02bf01767a1667c82db" }
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis.git", rev = "0d3347c634ab4e09d882c02bf01767a1667c82db" }
+
 [profile.release]
 codegen-units = 1
 lto = true
