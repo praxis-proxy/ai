@@ -395,6 +395,23 @@ async fn list_items_with_limit_zero_returns_empty_page() {
     );
 }
 
+#[test]
+fn list_items_with_invalid_query_on_nonexistent_conversation_returns_400() {
+    let proxy = start_test_proxy();
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/conversations/conv_nonexistent/items?limit=abc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "invalid query should return 400 even when conversation does not exist"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
 // -----------------------------------------------------------------------------
 // Test Helpers
 // -----------------------------------------------------------------------------
