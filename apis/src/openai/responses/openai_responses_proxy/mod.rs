@@ -248,10 +248,8 @@ impl serde::Serialize for OutboundBody<'_> {
                     map.serialize_entry(name, backend_messages.as_ref())?;
                     wrote_input = true;
                 },
-                "previous_response_id" | "conversation" => {},
-                "tool_choice" => {
-                    map.serialize_entry(name, &self.state.tool_choice)?;
-                },
+                "previous_response_id" if self.state.history_rehydrated => {},
+                "conversation" => {},
                 _ => map.serialize_entry(name, value)?,
             }
         }
@@ -304,6 +302,7 @@ fn compaction_to_assistant_message(m: &serde_json::Value) -> serde_json::Value {
         "content": format!("[Previous conversation summary]\n\n{summary}")
     })
 }
+
 
 /// Count the exact bytes the proxy will serialize for an outbound body.
 pub(super) fn serialized_outbound_body_len(state: &ResponsesState) -> Result<usize, serde_json::Error> {

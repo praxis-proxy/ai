@@ -6,7 +6,7 @@
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
 #[allow(
     dead_code,
-    reason = "api_base_url and timeout are wired in by the vector-store search client (#312)"
+    reason = "the shared API client intentionally exposes operations used by different OpenAI filters"
 )]
 pub(crate) mod api_client;
 pub(crate) mod conversations;
@@ -27,8 +27,8 @@ pub use conversations::{
 };
 pub use operation::{OpenAiHandlingMode, OpenAiOperationSpec};
 pub use responses::{
-    AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, McpDispatchFilter, McpToolResolveFilter,
-    ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter, ResponsesFormatFilter,
-    ToolParseFilter, WebSearchFilter, openai_responses_proxy::ResponsesProxyFilter,
+    AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, FileSearchCalloutFilter, McpDispatchFilter,
+    McpToolResolveFilter, ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter,
+    ResponsesFormatFilter, ToolParseFilter, WebSearchFilter, openai_responses_proxy::ResponsesProxyFilter,
     responses_to_chat_completions::ResponsesToChatCompletionsFilter, stream_events::OpenaiStreamEventsFilter,
 };
