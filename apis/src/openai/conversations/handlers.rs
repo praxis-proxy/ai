@@ -794,6 +794,10 @@ fn decode_query_component_strict(value: &str) -> Result<Cow<'_, str>, String> {
 }
 
 /// Parse and validate cursor-based pagination parameters from a query string.
+#[expect(
+    clippy::too_many_lines,
+    reason = "query parser benefits from single-function locality"
+)]
 fn parse_item_list_params(query: Option<&str>) -> Result<ItemListParams, String> {
     let Some(qs) = query else {
         return Ok(ItemListParams::default());
@@ -858,7 +862,7 @@ fn parse_item_list_params(query: Option<&str>) -> Result<ItemListParams, String>
 fn parse_limit(value: &str) -> Result<u32, String> {
     let n: u32 = value
         .parse()
-        .map_err(|_| format!("Invalid value for 'limit': '{value}' is not a valid integer."))?;
+        .map_err(|_e| format!("Invalid value for 'limit': '{value}' is not a valid integer."))?;
     if n > MAX_PAGE_LIMIT {
         return Err(format!(
             "Invalid value for 'limit': must be between 0 and {MAX_PAGE_LIMIT}, got {n}."
