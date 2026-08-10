@@ -19,7 +19,7 @@ mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use guardrails::AiGuardrailsFilter;
-pub use inference::ModelToHeaderFilter;
+pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
 pub use routing::IntelligentRouteFilter;

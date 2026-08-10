@@ -7,8 +7,8 @@ use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
-    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter,
+    ModelToHeaderFilter, PromptEnrichFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -76,6 +76,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "model_to_header" => ModelToHeaderFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "llmisvc_model_provider_resolver" => LlmisvcModelProviderResolverFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -334,6 +338,10 @@ mod tests {
         let registry = build_ai_registry();
         let names = registry.available_filters();
         assert!(names.contains(&"ai_guardrails"), "expected ai_guardrails in registry");
+        assert!(
+            names.contains(&"llmisvc_model_provider_resolver"),
+            "expected llmisvc_model_provider_resolver in registry"
+        );
         assert!(
             names.contains(&"openai_responses_validate"),
             "expected openai_responses_validate in registry"
