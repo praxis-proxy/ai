@@ -114,7 +114,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
@@ -160,7 +161,6 @@ const META_STATUS: &str = "responses.status";
 /// ```yaml
 /// filter: agentic_loop
 /// max_infer_iters: 10
-/// max_body_bytes: 10485760
 /// ```
 ///
 /// # Example
@@ -206,8 +206,10 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap for each direction.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -216,8 +218,10 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap for each direction.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 

@@ -62,7 +62,6 @@ default_model: "llama-3.3-70b"
 model_aliases:
   codex-mini-latest: "llama-3.3-70b"
   gpt-4.1-mini: "qwen-2.5-72b"
-max_body_bytes: 65536
 on_invalid: reject
 headers:
   effective_model: x-custom-effective
@@ -149,32 +148,19 @@ model_aliases:
 }
 
 #[test]
-fn from_config_rejects_zero_max_body_bytes() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-default_model: "test"
-max_body_bytes: 0
-"#,
-    )
-    .unwrap();
-    let result = ModelRewriteFilter::from_config(&yaml);
-    assert!(result.is_err(), "zero max_body_bytes should be rejected");
-}
-
-#[test]
-fn from_config_rejects_oversized_max_body_bytes() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-default_model: "test"
-max_body_bytes: 67108865
-"#,
-    )
-    .unwrap();
-    let result = ModelRewriteFilter::from_config(&yaml);
-    assert!(
-        result.is_err(),
-        "max_body_bytes above 64 MiB ceiling should be rejected"
-    );
+fn from_config_rejects_legacy_max_body_bytes() {
+    // Raw body size is governed by body_limits, not per-filter. Model
+    // rewriting is size-neutral, so the knob was removed entirely and is
+    // now rejected as an unknown field.
+    for yaml in [
+        "default_model: \"test\"\nmax_body_bytes: 1048576",
+        "default_model: \"test\"\nmax_body_bytes: 0",
+        "default_model: \"test\"\nmax_body_bytes: 67108865",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let result = ModelRewriteFilter::from_config(&value);
+        assert!(result.is_err(), "legacy max_body_bytes should be rejected: {yaml}");
+    }
 }
 
 #[test]

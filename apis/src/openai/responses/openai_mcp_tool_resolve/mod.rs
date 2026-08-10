@@ -48,7 +48,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use tracing::debug;
 
@@ -83,15 +84,16 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// ```yaml
 /// filter: openai_mcp_tool_resolve
 /// timeout_ms: 5000
-/// max_body_bytes: 67108864
+/// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
 /// ```
 pub struct McpToolResolveFilter {
     /// Allow connections to loopback addresses.
     allow_loopback: bool,
 
-    /// Maximum request body bytes for `StreamBuffer`.
-    max_body_bytes: usize,
+    /// Maximum size in bytes of the body produced after expanding
+    /// `mcp` tool entries into `function` entries.
+    max_rewritten_body_bytes: usize,
 
     /// Maximum number of distinct MCP servers per request.
     max_servers: usize,
@@ -114,7 +116,7 @@ impl McpToolResolveFilter {
         let validated = build_config(cfg)?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
-            max_body_bytes: validated.max_body_bytes,
+            max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_servers: validated.max_servers,
             max_tools: validated.max_tools,
             timeout: Duration::from_millis(validated.timeout_ms),
@@ -125,6 +127,7 @@ impl McpToolResolveFilter {
     /// `tools/list`, build `mcp_tool_map`, rewrite the request
     /// body to replace `type: "mcp"` entries with `type: "function"`,
     /// and synchronize the rewritten body into `ResponsesState`.
+    #[expect(clippy::too_many_lines, reason = "sequential resolve, rewrite, and size-check flow")]
     async fn resolve_mcp_tools(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -157,7 +160,13 @@ impl McpToolResolveFilter {
         debug!(tool_count = resolution.tool_map.len(), "mcp_tool_map built");
 
         let Resolution { per_entry, tool_map } = resolution;
-        rewrite_request_body(body, &original_bytes, per_entry, &tool_map, self.name())?;
+        rewrite_request_body(
+            body,
+            &original_bytes,
+            per_entry,
+            &tool_map,
+            self.max_rewritten_body_bytes,
+        )?;
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
         write_state(ctx, body_for_state, tool_map);
@@ -250,8 +259,11 @@ impl HttpFilter for McpToolResolveFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. max_rewritten_body_bytes bounds only
+        // the post-expansion body produced during resolution.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -306,6 +318,16 @@ enum ResolveError {
     #[error("failed to serialize rewritten request body: {0}")]
     Serialization(serde_json::Error),
 
+    /// The rewritten body (after `mcp`→`function` expansion) exceeds
+    /// the configured `max_rewritten_body_bytes`.
+    #[error("rewritten request body ({len} bytes) exceeds maximum ({max} bytes)")]
+    RewrittenTooLarge {
+        /// Serialized rewritten body length.
+        len: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+
     /// Duplicate `server_label` among resolvable MCP entries.
     #[error("duplicate server_label \"{0}\" in MCP tools array")]
     DuplicateLabel(String),
@@ -339,6 +361,7 @@ fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction 
         ResolveError::DuplicateLabel(_) | ResolveError::TooManyServers { .. } | ResolveError::NameCollision(_) => {
             (400, "invalid_request_error")
         },
+        ResolveError::RewrittenTooLarge { .. } => (413, "invalid_request_error"),
         ResolveError::Client(_) => (502, "server_error"),
         ResolveError::Serialization(_) => (500, "server_error"),
     };
@@ -488,12 +511,16 @@ async fn fetch_tools(
 /// MCP entries that were not resolved (no `server_url`, deferred,
 /// or `connector_id` only) are left unchanged for upstream to
 /// handle.
+#[expect(
+    clippy::too_many_lines,
+    reason = "entry rewrite, tool_choice translation, and size check"
+)]
 fn rewrite_request_body(
     body: &mut Option<Bytes>,
     original_bytes: &[u8],
     per_entry: Vec<Vec<serde_json::Value>>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-    filter_name: &'static str,
+    max_rewritten_body_bytes: usize,
 ) -> Result<(), ResolveError> {
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
         return Ok(());
@@ -524,7 +551,19 @@ fn rewrite_request_body(
         ResolveError::Serialization(e)
     })?;
 
-    serialized.commit(body, filter_name, "tools");
+    if serialized.len() > max_rewritten_body_bytes {
+        debug!(
+            body_bytes = serialized.len(),
+            max_bytes = max_rewritten_body_bytes,
+            "rewritten request body exceeds configured limit"
+        );
+        return Err(ResolveError::RewrittenTooLarge {
+            len: serialized.len(),
+            max: max_rewritten_body_bytes,
+        });
+    }
+
+    serialized.commit(body, "openai_mcp_tool_resolve", "tools");
 
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
     Ok(())

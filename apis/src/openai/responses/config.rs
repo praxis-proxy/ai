@@ -5,11 +5,7 @@
 
 use praxis_filter::{
     FilterError,
-    body::DEFAULT_JSON_BODY_MAX_BYTES,
-    builtins::http::payload_processing::{
-        OnInvalidBehavior,
-        config_validation::{validate_header_name, validate_max_body_bytes},
-    },
+    builtins::http::payload_processing::{OnInvalidBehavior, config_validation::validate_header_name},
 };
 use serde::Deserialize;
 
@@ -103,18 +99,9 @@ pub(crate) struct ResponsesFormatConfig {
     #[serde(default = "OnInvalidBehavior::default_continue")]
     pub on_invalid: OnInvalidBehavior,
 
-    /// Maximum body size in bytes for `StreamBuffer` mode.
-    #[serde(default = "default_max_body_bytes")]
-    pub max_body_bytes: usize,
-
     /// Header names for promoted classification facts.
     #[serde(default)]
     pub headers: ResponsesFormatHeaders,
-}
-
-/// Default max body bytes.
-fn default_max_body_bytes() -> usize {
-    DEFAULT_JSON_BODY_MAX_BYTES
 }
 
 // -----------------------------------------------------------------------------
@@ -123,8 +110,6 @@ fn default_max_body_bytes() -> usize {
 
 /// Validate the parsed configuration.
 pub(crate) fn build_config(cfg: ResponsesFormatConfig) -> Result<ResponsesFormatConfig, FilterError> {
-    validate_max_body_bytes("openai_responses_format", cfg.max_body_bytes)?;
-
     validate_header_name("openai_responses_format", "format", cfg.headers.format.as_deref())?;
     validate_header_name("openai_responses_format", "model", cfg.headers.model.as_deref())?;
     validate_header_name("openai_responses_format", "stream", cfg.headers.stream.as_deref())?;
@@ -155,7 +140,6 @@ mod tests {
     fn serde_defaults_responses_format_config() {
         let cfg: ResponsesFormatConfig = serde_yaml::from_str("{}").unwrap();
 
-        assert_eq!(cfg.max_body_bytes, DEFAULT_JSON_BODY_MAX_BYTES);
         assert_eq!(cfg.on_invalid, OnInvalidBehavior::Continue);
     }
 
@@ -200,24 +184,9 @@ extra: true
     }
 
     #[test]
-    fn build_config_zero_max_body_bytes_rejected() {
-        let cfg = ResponsesFormatConfig {
-            on_invalid: OnInvalidBehavior::default_continue(),
-            max_body_bytes: 0,
-            headers: ResponsesFormatHeaders::default(),
-        };
-        let err = build_config(cfg).unwrap_err();
-        assert!(
-            err.to_string().contains("must be greater than 0"),
-            "expected 'must be greater than 0' error, got: {err}"
-        );
-    }
-
-    #[test]
     fn build_config_invalid_header_name_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
             headers: ResponsesFormatHeaders {
                 format: Some("not a valid header!".into()),
                 model: default_model_header(),
@@ -236,7 +205,6 @@ extra: true
     fn build_config_valid_custom_headers_ok() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
             headers: ResponsesFormatHeaders {
                 format: Some("x-custom-format".into()),
                 model: Some("x-custom-model".into()),

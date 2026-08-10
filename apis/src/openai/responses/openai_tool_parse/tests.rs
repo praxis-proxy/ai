@@ -20,13 +20,6 @@ fn default_config_parses() {
 }
 
 #[test]
-fn full_config_parses() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
-    let filter = ToolParseFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_tool_parse", "filter name");
-}
-
-#[test]
 fn unknown_field_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("typo_field: true").unwrap();
     let result = ToolParseFilter::from_config(&yaml);
@@ -34,17 +27,18 @@ fn unknown_field_rejected() {
 }
 
 #[test]
-fn zero_max_body_bytes_rejected() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 0").unwrap();
-    let result = ToolParseFilter::from_config(&yaml);
-    assert!(result.is_err(), "max_body_bytes=0 should be rejected");
-}
-
-#[test]
-fn oversized_max_body_bytes_rejected() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 999999999999").unwrap();
-    let result = ToolParseFilter::from_config(&yaml);
-    assert!(result.is_err(), "oversized max_body_bytes should be rejected");
+fn max_body_bytes_now_rejected_as_unknown_field() {
+    // Raw body size is governed by body_limits, not per-filter, so the
+    // filter no longer accepts max_body_bytes at all.
+    for yaml in [
+        "max_body_bytes: 1048576",
+        "max_body_bytes: 0",
+        "max_body_bytes: 999999999999",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let result = ToolParseFilter::from_config(&value);
+        assert!(result.is_err(), "max_body_bytes is no longer a valid field: {yaml}");
+    }
 }
 
 // =============================================================================
@@ -64,10 +58,16 @@ fn body_access_is_read_only() {
 #[test]
 fn body_mode_is_stream_buffer() {
     let filter = make_filter("{}");
-    assert!(
-        matches!(filter.request_body_mode(), BodyMode::StreamBuffer { .. }),
-        "should use StreamBuffer body mode"
-    );
+    match filter.request_body_mode() {
+        BodyMode::StreamBuffer { max_bytes } => {
+            assert_eq!(
+                max_bytes,
+                Some(67_108_864),
+                "StreamBuffer should default to the 64 MiB ceiling; the raw cap is governed by body_limits"
+            );
+        },
+        other => panic!("expected StreamBuffer, got {other:?}"),
+    }
 }
 
 // =============================================================================

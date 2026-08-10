@@ -59,28 +59,38 @@ async fn non_create_request_continues_without_rewriting_or_arming() {
 }
 
 #[test]
-fn custom_body_limit_parses() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
+fn custom_rewritten_body_limit_parses() {
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 1048576").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
 
+    // The configured limit bounds only the translated body this filter
+    // produces; the buffer still accepts up to the absolute ceiling because
+    // the pipeline's body_limits governs the raw transport cap.
     assert!(matches!(
         filter.request_body_mode(),
         BodyMode::StreamBuffer {
-            max_bytes: Some(1_048_576)
+            max_bytes: Some(67_108_864)
         }
     ));
 }
 
 #[test]
-fn zero_body_limit_is_rejected() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 0").unwrap();
+fn zero_rewritten_body_limit_is_rejected() {
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 0").unwrap();
 
     assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
 }
 
 #[test]
-fn oversized_body_limit_is_rejected() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 67108865").unwrap();
+fn oversized_rewritten_body_limit_is_rejected() {
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 67108865").unwrap();
+
+    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn legacy_max_body_bytes_is_rejected() {
+    let yaml = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
 
     assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
 }
@@ -217,7 +227,7 @@ async fn canonical_state_is_translated_and_arms_response() {
 
 #[tokio::test]
 async fn translated_request_over_configured_limit_is_rejected() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 32").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 32").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -363,7 +373,7 @@ async fn successful_sse_response_stays_streaming() {
 
 #[tokio::test]
 async fn non_streaming_success_upgrades_to_bounded_buffer() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
+    let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -390,7 +400,7 @@ async fn non_streaming_success_upgrades_to_bounded_buffer() {
     assert!(matches!(
         context.response_body_mode,
         BodyMode::StreamBuffer {
-            max_bytes: Some(1_048_576)
+            max_bytes: Some(67_108_864)
         }
     ));
     assert!(
@@ -681,7 +691,7 @@ async fn finite_provider_error_uses_captured_status_without_mutable_headers() {
 
 #[tokio::test]
 async fn expanded_provider_error_falls_back_within_configured_limit() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 150").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 150").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -718,7 +728,7 @@ async fn expanded_provider_error_falls_back_within_configured_limit() {
 
 #[tokio::test]
 async fn oversized_translated_success_aborts_after_headers_are_sent() {
-    let yaml = serde_yaml::from_str("max_body_bytes: 512").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 512").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);

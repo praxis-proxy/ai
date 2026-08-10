@@ -37,13 +37,14 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use serde::ser::SerializeMap as _;
 use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
-use super::{error::responses_error_rejection, state::ResponsesState};
+use super::{body_limits::reject_rewritten_body_too_large, state::ResponsesState};
 use crate::json_body::{SerializedJson, serialize_json_body};
 
 // -----------------------------------------------------------------------------
@@ -71,7 +72,7 @@ use crate::json_body::{SerializedJson, serialize_json_body};
 ///
 /// ```yaml
 /// filter: openai_responses_proxy
-/// max_body_bytes: 67108864
+/// max_rewritten_body_bytes: 67108864
 /// ```
 ///
 /// # Example
@@ -114,18 +115,17 @@ impl ResponsesProxyFilter {
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let serialized = serialize_outbound_body(state)
             .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
-        if serialized.len() > self.config.max_body_bytes {
+        if serialized.len() > self.config.max_rewritten_body_bytes {
             debug!(
                 body_bytes = serialized.len(),
-                max_bytes = self.config.max_body_bytes,
+                max_bytes = self.config.max_rewritten_body_bytes,
                 "rebuilt request body exceeds maximum size"
             );
-            return Ok(Err(FilterAction::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
-                "request body exceeds maximum size",
+            return Ok(Err(reject_rewritten_body_too_large(
+                serialized.len(),
+                self.config.max_rewritten_body_bytes,
                 streaming,
-            ))));
+            )));
         }
 
         debug!(
@@ -149,8 +149,11 @@ impl HttpFilter for ResponsesProxyFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. max_rewritten_body_bytes bounds only
+        // the body rebuilt from ResponsesState.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
