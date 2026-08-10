@@ -345,7 +345,11 @@ async fn on_request_body_executes_search_and_populates_state() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "include": ["web_search_call.action.sources"],
+    });
     let mut state = ResponsesState::from_request_body(body);
     state.web_search_calls = vec![serde_json::json!({
         "type": "web_search_call",
@@ -385,6 +389,39 @@ async fn on_request_body_executes_search_and_populates_state() {
 }
 
 #[tokio::test]
+async fn on_request_body_omits_sources_without_include() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_exec_2",
+        "action": {"type": "search", "query": "rust language"}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let output = &state.accumulated_output[0];
+    assert_eq!(output["action"]["query"], "rust language");
+    assert!(
+        output["action"].get("sources").is_none(),
+        "sources omitted when not in include"
+    );
+}
+
+#[tokio::test]
 async fn on_request_body_missing_query_produces_incomplete_status() {
     let yaml = make_filter_yaml("brave", "test-key");
     let filter = WebSearchFilter::from_config(&yaml).unwrap();
@@ -419,8 +456,8 @@ async fn on_request_body_missing_query_produces_incomplete_status() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn build_output_item_completed() {
-    let item = build_output_item("ws_123", "completed", "test query", &[]);
+fn build_output_item_completed_with_sources_included() {
+    let item = build_output_item("ws_123", "completed", "test query", &[], true);
     assert_eq!(item["type"], "web_search_call");
     assert_eq!(item["id"], "ws_123");
     assert_eq!(item["status"], "completed");
@@ -428,6 +465,22 @@ fn build_output_item_completed() {
     assert_eq!(item["action"]["query"], "test query");
     let sources = item["action"]["sources"].as_array().unwrap();
     assert!(sources.is_empty(), "no sources when results empty");
+}
+
+#[test]
+fn build_output_item_omits_sources_when_not_included() {
+    let results = vec![SearchResult {
+        title: "Rust Lang".into(),
+        url: "https://rust-lang.org".into(),
+        snippet: "Systems".into(),
+    }];
+    let item = build_output_item("ws_123", "completed", "test query", &results, false);
+    assert_eq!(item["action"]["type"], "search");
+    assert_eq!(item["action"]["query"], "test query");
+    assert!(
+        item["action"].get("sources").is_none(),
+        "sources omitted when include_sources is false"
+    );
 }
 
 #[test]
@@ -444,7 +497,7 @@ fn build_output_item_with_results() {
             snippet: "Packages".into(),
         },
     ];
-    let item = build_output_item("ws_123", "completed", "search query", &results);
+    let item = build_output_item("ws_123", "completed", "search query", &results, true);
     assert!(item.get("sources").is_none(), "no top-level sources");
     let sources = item["action"]["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 2);

@@ -278,9 +278,17 @@ impl HttpFilter for WebSearchFilter {
     }
 }
 
+/// Include value that gates `action.sources` in the output item.
+const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
+
 /// Append search results to [`ResponsesState`].
 fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str, query: &str, results: &[SearchResult]) {
-    let output_item = build_output_item(call_id, status, query, results);
+    let include_sources = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES));
+
+    let output_item = build_output_item(call_id, status, query, results, include_sources);
     let tool_result = build_tool_result_message(call_id, results);
 
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
@@ -334,26 +342,41 @@ pub(crate) fn emit_status(ctx: &mut HttpFilterContext<'_>, call_id: &str, status
 }
 
 /// Build a `web_search_call` output item for the response.
-pub(crate) fn build_output_item(call_id: &str, status: &str, query: &str, results: &[SearchResult]) -> Value {
-    let sources: Vec<Value> = results
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "type": "url",
-                "url": r.url,
+///
+/// `action.sources` is only included when `include_sources` is true,
+/// matching the `web_search_call.action.sources` include gate.
+pub(crate) fn build_output_item(
+    call_id: &str,
+    status: &str,
+    query: &str,
+    results: &[SearchResult],
+    include_sources: bool,
+) -> Value {
+    let mut action = serde_json::json!({
+        "type": "search",
+        "query": query,
+    });
+
+    if include_sources {
+        let sources: Vec<Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "type": "url",
+                    "url": r.url,
+                })
             })
-        })
-        .collect();
+            .collect();
+        if let Some(obj) = action.as_object_mut() {
+            obj.insert("sources".to_owned(), Value::Array(sources));
+        }
+    }
 
     serde_json::json!({
         "type": "web_search_call",
         "id": call_id,
         "status": status,
-        "action": {
-            "type": "search",
-            "query": query,
-            "sources": sources,
-        },
+        "action": action,
     })
 }
 
