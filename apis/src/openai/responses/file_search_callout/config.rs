@@ -110,8 +110,12 @@ pub(crate) struct ValidatedConfig {
     pub timeout: Duration,
 }
 
-/// Build validated config from filter config.
-pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConfig, FilterError> {
+/// Build validated config from filter config with a shared sub-request
+/// client.
+pub(crate) fn build_config_with_client(
+    cfg: &FileSearchFilterConfig,
+    client: SubRequestClient,
+) -> Result<ValidatedConfig, FilterError> {
     let vector_store_url = parse_vector_store_url(&cfg.vector_store_url, cfg.allow_private_url)?;
     let on_error = cfg.on_error.unwrap_or(OnError::Reject);
     let (max_response_bytes, max_total_response_bytes) =
@@ -119,7 +123,7 @@ pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConf
     let max_state_bytes = validated_state_limit(cfg.max_state_bytes)?;
     let timeout_ms = validated_timeout(cfg.timeout_ms)?;
 
-    let api_client = build_api_client(&vector_store_url, max_response_bytes, timeout_ms);
+    let api_client = build_api_client(&vector_store_url, client, max_response_bytes, timeout_ms);
 
     Ok(ValidatedConfig {
         api_client,
@@ -129,6 +133,14 @@ pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConf
         max_state_bytes,
         timeout: Duration::from_millis(timeout_ms),
     })
+}
+
+/// Build validated config with a dedicated per-filter sub-request client.
+pub(crate) fn build_config(cfg: &FileSearchFilterConfig) -> Result<ValidatedConfig, FilterError> {
+    build_config_with_client(
+        cfg,
+        SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -147,11 +159,16 @@ fn validated_state_limit(configured: Option<usize>) -> Result<usize, FilterError
     Ok(limit)
 }
 
-/// Build the shared API client with a dedicated sub-request client.
-fn build_api_client(vector_store_url: &Url, max_response_bytes: usize, timeout_ms: u64) -> ApiClient {
+/// Build the shared API client from the validated URL and sub-request client.
+fn build_api_client(
+    vector_store_url: &Url,
+    client: SubRequestClient,
+    max_response_bytes: usize,
+    timeout_ms: u64,
+) -> ApiClient {
     ApiClient::new(ApiClientConfig {
         api_base_url: vector_store_url.as_str().to_owned(),
-        client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+        client,
         timeout: Duration::from_millis(timeout_ms),
         max_response_bytes,
         forward_header_names: Vec::new(),

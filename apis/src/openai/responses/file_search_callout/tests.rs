@@ -21,7 +21,7 @@ use super::{
         MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchResult, VectorStoreSearchRequest,
         VectorStoreSearchResponse, request_error,
     },
-    config::{FileSearchFilterConfig, build_config},
+    config::{FileSearchFilterConfig, ValidatedConfig, build_config},
     *,
 };
 // -----------------------------------------------------------------------------
@@ -1805,7 +1805,7 @@ async fn translate_end_to_end_executes_search() {
 // Test helpers
 // -----------------------------------------------------------------------------
 
-fn parse_config(yaml: &str) -> Result<config::ValidatedConfig, FilterError> {
+fn parse_config(yaml: &str) -> Result<ValidatedConfig, FilterError> {
     let raw: FileSearchFilterConfig =
         serde_yaml::from_str(yaml).map_err(|error| -> FilterError { error.to_string().into() })?;
     build_config(&raw)

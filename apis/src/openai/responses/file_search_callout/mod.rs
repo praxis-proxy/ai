@@ -36,14 +36,17 @@ use self::{
         FileSearchClient, FileSearchClientConfig, MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES,
         SearchBatch, SearchFailure, SearchSpec, request_error,
     },
-    config::{FileSearchFilterConfig, OnError, build_config},
+    config::{FileSearchFilterConfig, OnError, ValidatedConfig, build_config, build_config_with_client},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
-use crate::openai::responses::{
-    bounded_json_size,
-    error::responses_error_rejection,
-    state::{MAX_CITATION_FILES, ResponsesState},
-    stream_events::accumulator::merge_usage,
+use crate::{
+    openai::responses::{
+        bounded_json_size,
+        error::responses_error_rejection,
+        state::{MAX_CITATION_FILES, ResponsesState},
+        stream_events::accumulator::merge_usage,
+    },
+    subrequest::SubRequestClient,
 };
 
 /// Hard cap on vector-store/query fan-out per filter execution.
@@ -85,13 +88,39 @@ struct StreamingRequest;
 impl FileSearchCalloutFilter {
     /// Create a filter from parsed YAML configuration.
     ///
+    /// Falls back to a dedicated per-filter sub-request connector with a
+    /// pool size of 4. Prefer [`from_config_with_client`] when a shared
+    /// server-level sub-request client is available.
+    ///
     /// # Errors
     ///
     /// Returns [`FilterError`] when configuration or callout client
     /// construction fails.
+    ///
+    /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_callout", config)?;
         let validated = build_config(&cfg)?;
+        Ok(Self::build(validated))
+    }
+
+    /// Create a filter using a shared sub-request client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] when configuration or callout client
+    /// construction fails.
+    pub fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_callout", config)?;
+        let validated = build_config_with_client(&cfg, client)?;
+        Ok(Self::build(validated))
+    }
+
+    /// Assemble a filter from validated config.
+    fn build(validated: ValidatedConfig) -> Box<dyn HttpFilter> {
         let client = FileSearchClient::new(FileSearchClientConfig {
             api_client: validated.api_client,
             on_error: validated.on_error,
@@ -100,11 +129,11 @@ impl FileSearchCalloutFilter {
             timeout: validated.timeout,
         });
 
-        Ok(Box::new(Self {
+        Box::new(Self {
             client,
             max_state_bytes: validated.max_state_bytes,
             on_error: validated.on_error,
-        }))
+        })
     }
 
     /// Apply one completed search batch to request-scoped response state.
