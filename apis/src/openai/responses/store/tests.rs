@@ -3010,6 +3010,75 @@ async fn get_unrelated_path_continues() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_rejects_stream_true() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_stream", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_stream?stream=true");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "stream=true should return 400");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_rejects_include() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_inc", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_inc?include[]=usage");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "include[] should return 400");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_accepts_stream_false() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_sf",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_sf?stream=false");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "stream=false should return 200");
+    assert_has_json_content_type(&rejection);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_no_query_still_returns_200() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_nq",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_nq");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "no query should still return 200");
+}
+
 // -----------------------------------------------------------------------------
 // GET /v1/responses/{id}/input_items
 // -----------------------------------------------------------------------------
@@ -3757,10 +3826,8 @@ fn validate_get_response_query_params_stream_invalid_value_rejected() {
 
 #[test]
 fn validate_get_response_query_params_include_bracket_rejected() {
-    let err = super::filter::validate_get_response_query_params(
-        Some("include[]=file_search_call_results.results"),
-    )
-    .unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("include[]=file_search_call_results.results"))
+        .unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "include[] should be rejected: {err}"
@@ -3769,8 +3836,7 @@ fn validate_get_response_query_params_include_bracket_rejected() {
 
 #[test]
 fn validate_get_response_query_params_include_percent_encoded_rejected() {
-    let err =
-        super::filter::validate_get_response_query_params(Some("include%5B%5D=usage")).unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("include%5B%5D=usage")).unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "percent-encoded include[] should be rejected: {err}"
@@ -3779,8 +3845,7 @@ fn validate_get_response_query_params_include_percent_encoded_rejected() {
 
 #[test]
 fn validate_get_response_query_params_include_bare_rejected() {
-    let err =
-        super::filter::validate_get_response_query_params(Some("include=usage")).unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("include=usage")).unwrap_err();
     assert!(
         err.contains("'include' parameter is not supported"),
         "bare include should be rejected: {err}"
@@ -3789,8 +3854,7 @@ fn validate_get_response_query_params_include_bare_rejected() {
 
 #[test]
 fn validate_get_response_query_params_starting_after_rejected() {
-    let err =
-        super::filter::validate_get_response_query_params(Some("starting_after=5")).unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("starting_after=5")).unwrap_err();
     assert!(
         err.contains("'starting_after' parameter is not supported"),
         "starting_after should be rejected: {err}"
@@ -3799,8 +3863,7 @@ fn validate_get_response_query_params_starting_after_rejected() {
 
 #[test]
 fn validate_get_response_query_params_include_obfuscation_rejected() {
-    let err = super::filter::validate_get_response_query_params(Some("include_obfuscation=true"))
-        .unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("include_obfuscation=true")).unwrap_err();
     assert!(
         err.contains("'include_obfuscation' parameter is not supported"),
         "include_obfuscation should be rejected: {err}"
@@ -3809,8 +3872,7 @@ fn validate_get_response_query_params_include_obfuscation_rejected() {
 
 #[test]
 fn validate_get_response_query_params_unknown_param_rejected() {
-    let err =
-        super::filter::validate_get_response_query_params(Some("foo=bar")).unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("foo=bar")).unwrap_err();
     assert!(
         err.contains("Unknown query parameter"),
         "unknown param should be rejected: {err}"
@@ -3819,8 +3881,7 @@ fn validate_get_response_query_params_unknown_param_rejected() {
 
 #[test]
 fn validate_get_response_query_params_key_only_known_rejected() {
-    let err =
-        super::filter::validate_get_response_query_params(Some("stream")).unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("stream")).unwrap_err();
     assert!(
         err.contains("Missing value"),
         "key-only known param should be rejected: {err}"
@@ -3829,8 +3890,7 @@ fn validate_get_response_query_params_key_only_known_rejected() {
 
 #[test]
 fn validate_get_response_query_params_key_only_include_rejected() {
-    let err =
-        super::filter::validate_get_response_query_params(Some("include")).unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("include")).unwrap_err();
     assert!(
         err.contains("Missing value"),
         "key-only include should be rejected: {err}"
@@ -3839,8 +3899,7 @@ fn validate_get_response_query_params_key_only_include_rejected() {
 
 #[test]
 fn validate_get_response_query_params_key_only_unknown_rejected() {
-    let err =
-        super::filter::validate_get_response_query_params(Some("foo")).unwrap_err();
+    let err = super::filter::validate_get_response_query_params(Some("foo")).unwrap_err();
     assert!(
         err.contains("Unknown query parameter"),
         "key-only unknown param should be rejected: {err}"
