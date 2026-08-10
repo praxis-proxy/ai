@@ -1,0 +1,78 @@
+# Lakera Guard Content Safety
+#
+# Screens every request body through Lakera Guard for
+# content moderation before forwarding to the upstream.
+# Flagged requests are rejected with 403; clean requests
+# continue to the backend.
+#
+# The target.body option uses JSONPath to send only the
+# "messages" array to Lakera, stripping provider-specific
+# fields like "model" that Lakera rejects. The full
+# downstream body reaches the upstream untouched.
+#
+# Requires the LLAMA_GUARD_OPENROUTER_API_KEY environment variable.
+#
+# Usage:
+#   LLAMA_GUARD_OPENROUTER_API_KEY=... cargo run -p praxis-ai-proxy -- -c examples/configs/llama-guard.yaml
+
+listeners:
+  - name: web
+    address: "0.0.0.0:8080"
+    filter_chains: [safety-check, routing]
+
+filter_chains:
+  - name: safety-check
+    filters:
+      - filter: http_callout
+        target:
+          url: "https://openrouter.ai/api/v1/chat/completions"
+          timeout: "2s"
+          headers:
+            - name: "Authorization"
+              value: "Bearer ${LLAMA_GUARD_OPENROUTER_API_KEY}"
+            - name: "Content-Type"
+              value: "application/json"
+          body:
+            model: "$.model"
+            messages: "$.messages"
+        request:
+          phase: request_body
+          max_body_bytes: 1048576
+        response:
+          extract:
+            - json_path: "$.choices[0].message.content"
+              result_key: "llama_guard_output"
+        on_failure: closed
+        status_on_error: 403
+        circuit_breaker:
+          failure_threshold: 5
+          recovery_timeout: "30s"
+        conditions:
+          - when:
+              methods: [POST]
+        branch_chains:
+          - name: block_unsafe
+            on_result:
+              filter: http_callout
+              key: llama_guard_output
+              result: "unsafe"
+            rejoin: terminal
+            chains:
+              - name: reject_flagged
+                filters:
+                  - filter: static_response
+                    status: 403
+                    body: "request blocked by content safety"
+
+  - name: routing
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"

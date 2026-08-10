@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use praxis_filter::{FilterError, FilterResultSet};
 use serde_json::Value;
 use serde_json_path::JsonPath;
-use tracing::debug;
+use tracing::{debug, warn};
 
 // -----------------------------------------------------------------------------
 // Compiled Extraction
@@ -142,9 +142,56 @@ fn coerce_value(value: &Value) -> Option<String> {
         Value::Null => None,
         Value::Bool(b) => Some(b.to_string()),
         Value::Number(n) => Some(n.to_string()),
-        Value::String(s) => Some(s.clone()),
-        Value::Array(_) | Value::Object(_) => Some(value.to_string()),
+        Value::String(s) => sanitize_string(s),
+        Value::Array(_) | Value::Object(_) => sanitize_string(&value.to_string()),
     }
+}
+
+pub(crate) fn sanitize_string(raw: &str) -> Option<String> {
+
+    // 1. Skip leading control characters and whitespace (e.g., leading \n\n)
+    let trimmed = raw.trim_start_matches(|c: char| c < '\x20' || c == '\x7F' || c.is_whitespace());
+
+    let mut sanitized = String::new();
+    let mut rest_of_str = "";
+
+    // 2. Collect chars until the first control character (e.g., \n)
+    for (idx, c) in trimmed.char_indices() {
+        if c < '\x20' || c == '\x7F' {
+            rest_of_str = &trimmed[idx..];
+            break; // Stop at trailing control character, but collect them to show code
+        }
+        if c != '/' && c != '\\' {
+            sanitized.push(c);
+        }
+    }
+
+    // 3. Log a warning if there were lines/content after the first \n
+    let remaining_content = rest_of_str.trim();
+    if !remaining_content.is_empty() {
+        warn!(
+            flagged_category = %remaining_content,
+            verdict = %sanitized,
+            "Callout flagged request with category detail"
+        );
+    }
+
+    let result = if sanitized.is_empty() {
+        None
+    } else if sanitized.len() <= 255 {
+        Some(sanitized)
+    } else {
+        // Find the last valid UTF-8 boundary within 255 bytes
+        let mut len = 255;
+        while len > 0 && !sanitized.is_char_boundary(len) {
+            len -= 1;
+        }
+        sanitized
+            .get(..len)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    result
 }
 
 // -----------------------------------------------------------------------------
@@ -252,6 +299,31 @@ mod tests {
         let mut rs = FilterResultSet::new();
         ext.evaluate(&json, &mut rs).unwrap();
         assert!(rs.get("key").is_none(), "no-match should be skipped");
+    }
+
+    // -------------------------------------------------------------------------
+    // Sanitize String
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_sanitize_string_leading_and_trailing_newlines() {
+        // Leading newlines stripped, trailing category stripped -> "unsafe"
+        let input = "\n\nunsafe\nS02";
+        let result = sanitize_string(input);
+        assert_eq!(result, Some("unsafe".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_string_safe() {
+        let input = "safe";
+        let result = sanitize_string(input);
+        assert_eq!(result, Some("safe".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_string_empty_or_only_control_chars() {
+        let input = "\n\n\r\t";
+        let result = sanitize_string(input);
+        assert_eq!(result, None);
     }
 
     // -------------------------------------------------------------------------

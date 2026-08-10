@@ -75,7 +75,7 @@ fn lakera_guard_passes_clean() {
 
 /// Load and patch the Lakera Guard example config.
 fn load_lakera_config(proxy_port: u16, lakera_port: u16, backend_port: u16) -> praxis_core::config::Config {
-    let path = example_config_path("lakera-guard.yaml");
+    let path = example_config_path("http_callout/lakera-guard.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
 
     // Replace the real Lakera API URL with our mock and remove
