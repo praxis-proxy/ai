@@ -377,9 +377,11 @@ async fn on_request_body_executes_search_and_populates_state() {
     assert_eq!(output["id"], "ws_exec_1");
     assert_eq!(output["status"], "completed");
     assert_eq!(output["action"]["query"], "rust language");
-    let sources = output["sources"].as_array().unwrap();
+    assert!(output.get("sources").is_none(), "no top-level sources");
+    let sources = output["action"]["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0]["title"], "Rust Lang");
+    assert_eq!(sources[0]["type"], "url");
+    assert_eq!(sources[0]["url"], "https://rust-lang.org");
 }
 
 #[tokio::test]
@@ -424,7 +426,8 @@ fn build_output_item_completed() {
     assert_eq!(item["status"], "completed");
     assert_eq!(item["action"]["type"], "search");
     assert_eq!(item["action"]["query"], "test query");
-    assert!(item.get("sources").is_none(), "no sources when results empty");
+    let sources = item["action"]["sources"].as_array().unwrap();
+    assert!(sources.is_empty(), "no sources when results empty");
 }
 
 #[test]
@@ -442,10 +445,14 @@ fn build_output_item_with_results() {
         },
     ];
     let item = build_output_item("ws_123", "completed", "search query", &results);
-    let sources = item["sources"].as_array().unwrap();
+    assert!(item.get("sources").is_none(), "no top-level sources");
+    let sources = item["action"]["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 2);
-    assert_eq!(sources[0]["title"], "Rust Lang");
+    assert_eq!(sources[0]["type"], "url");
     assert_eq!(sources[0]["url"], "https://rust-lang.org");
+    assert!(sources[0].get("title").is_none(), "title excluded from url source");
+    assert_eq!(sources[1]["type"], "url");
+    assert_eq!(sources[1]["url"], "https://crates.io");
 }
 
 #[test]

@@ -335,32 +335,26 @@ pub(crate) fn emit_status(ctx: &mut HttpFilterContext<'_>, call_id: &str, status
 
 /// Build a `web_search_call` output item for the response.
 pub(crate) fn build_output_item(call_id: &str, status: &str, query: &str, results: &[SearchResult]) -> Value {
-    let mut item = serde_json::json!({
+    let sources: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "type": "url",
+                "url": r.url,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
         "type": "web_search_call",
         "id": call_id,
         "status": status,
         "action": {
             "type": "search",
             "query": query,
+            "sources": sources,
         },
-    });
-
-    if !results.is_empty() {
-        let sources: Vec<Value> = results
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "title": r.title,
-                    "url": r.url,
-                })
-            })
-            .collect();
-        if let Some(obj) = item.as_object_mut() {
-            obj.insert("sources".to_owned(), Value::Array(sources));
-        }
-    }
-
-    item
+    })
 }
 
 /// Build a tool result message to append to conversation history.
