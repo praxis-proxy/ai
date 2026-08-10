@@ -402,9 +402,8 @@ impl FileSearchClient {
 
         while next_spec < specs.len() {
             if execution_started.elapsed() >= self.timeout {
-                if let Some(remaining_specs) = specs.get(next_spec..) {
-                    append_deadline_failures(&mut batch.failures, remaining_specs);
-                }
+                append_unprocessed_deadline_failures(&mut batch.failures, specs, next_spec);
+                deadline_recorded = true;
                 break;
             }
 
@@ -433,10 +432,7 @@ impl FileSearchClient {
 
             next_spec = next_spec.saturating_add(chunk_len);
             if execution_started.elapsed() >= self.timeout {
-                let chunk_start = next_spec.saturating_sub(chunk_len);
-                if let Some(current_and_remaining) = specs.get(chunk_start..) {
-                    append_deadline_failures(&mut batch.failures, current_and_remaining);
-                }
+                append_unprocessed_deadline_failures(&mut batch.failures, specs, next_spec);
                 deadline_recorded = true;
                 break;
             }
@@ -449,11 +445,8 @@ impl FileSearchClient {
         }
 
         batch.sort_results();
-        if !deadline_recorded
-            && execution_started.elapsed() >= self.timeout
-            && let Some(unprocessed) = specs.get(next_spec..)
-        {
-            append_deadline_failures(&mut batch.failures, unprocessed);
+        if !deadline_recorded && execution_started.elapsed() >= self.timeout {
+            append_unprocessed_deadline_failures(&mut batch.failures, specs, next_spec);
         }
         batch
     }
@@ -990,6 +983,13 @@ fn append_deadline_failures(failures: &mut Vec<SearchFailure>, specs: &[SearchSp
     }));
 }
 
+/// Mark only specs at or after the scheduler's first unprocessed position.
+fn append_unprocessed_deadline_failures(failures: &mut Vec<SearchFailure>, specs: &[SearchSpec<'_>], next_spec: usize) {
+    if let Some(unprocessed) = specs.get(next_spec..) {
+        append_deadline_failures(failures, unprocessed);
+    }
+}
+
 /// Mark specs deliberately not scheduled after a fail-closed chunk failed.
 fn append_fail_closed_failures(failures: &mut Vec<SearchFailure>, specs: &[SearchSpec<'_>]) {
     failures.extend(specs.iter().map(|spec| SearchFailure {
@@ -1058,8 +1058,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SearchResult, VectorStoreSearchRequest, deserialize_search_results, merge_top_results, parse_response_body,
-        response_admission_units,
+        FileSearchError, SearchResult, SearchSpec, VectorStoreSearchRequest, append_unprocessed_deadline_failures,
+        deserialize_search_results, merge_top_results, parse_response_body, response_admission_units,
     };
 
     fn decode(body: &[u8], limit: usize) -> Result<Vec<SearchResult>, serde_json::Error> {
@@ -1075,6 +1075,44 @@ mod tests {
             "score": score,
         }))
         .expect("test result must deserialize")
+    }
+
+    fn search_spec(call_index: usize, store_id: &str) -> SearchSpec<'_> {
+        SearchSpec {
+            call_index,
+            filters: None,
+            max_num_results: None,
+            query: "query",
+            ranking_options: None,
+            store_id,
+        }
+    }
+
+    #[test]
+    fn deadline_failures_only_cover_unprocessed_specs() {
+        let specs = [
+            search_spec(0, "vs-completed-a"),
+            search_spec(1, "vs-completed-b"),
+            search_spec(2, "vs-unprocessed"),
+        ];
+        let mut failures = Vec::new();
+
+        append_unprocessed_deadline_failures(&mut failures, &specs, 2);
+
+        assert_eq!(failures.len(), 1);
+        let failure = failures.first().expect("one unprocessed spec must fail");
+        assert_eq!(failure.call_index, 2);
+        assert!(matches!(
+            &failure.error,
+            FileSearchError::Callout { store_id, .. } if store_id == "vs-unprocessed"
+        ));
+
+        failures.clear();
+        append_unprocessed_deadline_failures(&mut failures, &specs, specs.len());
+        assert!(
+            failures.is_empty(),
+            "a completed final chunk must not be failed retroactively"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
