@@ -41,7 +41,6 @@ mod config;
 mod tests;
 
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Duration,
 };
@@ -55,7 +54,7 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
-use crate::mcp_client;
+use crate::{json_body::serialize_json_body, mcp_client};
 
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
@@ -68,6 +67,10 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// Resolves MCP tool entries from the Responses API `tools` array
 /// into concrete tool definitions by calling `tools/list` on each
 /// upstream MCP server.
+///
+/// Rejects the request with HTTP 400 before any callouts if two or
+/// more resolvable MCP entries share the same `server_label`
+/// (including entries that differ only by credentials).
 ///
 /// # YAML
 ///
@@ -141,6 +144,8 @@ impl McpToolResolveFilter {
             });
         }
 
+        check_duplicate_labels(&mcp_entries)?;
+
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
 
         let resolution = self.resolve_all_entries(&mcp_entries, previous_tools).await?;
@@ -152,7 +157,7 @@ impl McpToolResolveFilter {
         debug!(tool_count = resolution.tool_map.len(), "mcp_tool_map built");
 
         let Resolution { per_entry, tool_map } = resolution;
-        rewrite_request_body(ctx, body, &original_bytes, per_entry, &tool_map)?;
+        rewrite_request_body(body, &original_bytes, per_entry, &tool_map, self.name())?;
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
         write_state(ctx, body_for_state, tool_map);
@@ -161,17 +166,32 @@ impl McpToolResolveFilter {
 
     /// Resolve all MCP entries, building both the global dispatch
     /// map and pre-built function tools for body rewriting.
+    ///
+    /// Server resolutions run concurrently via
+    /// [`futures::future::try_join_all`]. Non-credentialed entries
+    /// sharing the same `(server_label, server_url)` are
+    /// deduplicated to a single resolution task; credentialed
+    /// entries always resolve independently.
     async fn resolve_all_entries(
         &self,
         entries: &[serde_json::Value],
         previous_tools: Option<&Vec<serde_json::Value>>,
     ) -> Result<Resolution, ResolveError> {
+        let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries);
+
+        let futures: Vec<_> = task_entries
+            .iter()
+            .zip(&task_allowed_names)
+            .map(|(entry, allowed)| self.resolve_entry(entry, previous_tools, allowed.as_deref()))
+            .collect();
+        let task_results = futures::future::try_join_all(futures).await?;
+
         let mut tool_map = HashMap::new();
         let mut per_entry = Vec::with_capacity(entries.len());
-        let mut fetched: HashMap<(&str, &str), Vec<serde_json::Value>> = HashMap::new();
 
-        for entry in entries {
-            let Some(tools) = self.resolve_entry(entry, previous_tools, &mut fetched).await? else {
+        for (entry, task_idx) in entries.iter().zip(&entry_to_task) {
+            let tools_opt = task_idx.and_then(|idx| task_results.get(idx)?.clone());
+            let Some(tools) = tools_opt else {
                 per_entry.push(Vec::new());
                 continue;
             };
@@ -189,36 +209,32 @@ impl McpToolResolveFilter {
         Ok(Resolution { per_entry, tool_map })
     }
 
-    /// Resolve tools for a single entry, reusing within-request
-    /// cached results for the same `(label, url)`.
-    async fn resolve_entry<'a>(
+    /// Resolve tools for a single MCP entry independently.
+    ///
+    /// `cache_allowed_names` is the union of `allowed_tools` names
+    /// across all entries sharing this resolution task; it is passed
+    /// to [`find_cached_listing`] so the cache is only used when it
+    /// covers every entry in the group.
+    async fn resolve_entry(
         &self,
-        entry: &'a serde_json::Value,
+        entry: &serde_json::Value,
         previous_tools: Option<&Vec<serde_json::Value>>,
-        fetched: &mut HashMap<(&'a str, &'a str), Vec<serde_json::Value>>,
+        cache_allowed_names: Option<&[String]>,
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
         let Some(server_url) = resolvable_server_url(entry) else {
             return Ok(None);
         };
         let label = server_label(entry);
-        let has_credentials = has_entry_credentials(entry);
-        if !has_credentials && let Some(cached) = fetched.get(&(label, server_url)) {
-            return Ok(Some(cached.clone()));
-        }
         mcp_client::validate_mcp_url(server_url, self.timeout, self.allow_loopback)
             .await
             .map_err(ResolveError::Client)?;
-        let allowed = extract_allowed_tools(entry);
-        if !has_credentials
-            && let Some(cached) = find_cached_listing(previous_tools, label, server_url, allowed.as_names())
+        if !has_entry_credentials(entry)
+            && let Some(cached) = find_cached_listing(previous_tools, label, server_url, cache_allowed_names)
         {
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
         let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools, self.allow_loopback).await?;
-        if !has_credentials {
-            fetched.insert((label, server_url), tools.clone());
-        }
         Ok(Some(tools))
     }
 }
@@ -290,6 +306,10 @@ enum ResolveError {
     #[error("failed to serialize rewritten request body: {0}")]
     Serialization(serde_json::Error),
 
+    /// Duplicate `server_label` among resolvable MCP entries.
+    #[error("duplicate server_label \"{0}\" in MCP tools array")]
+    DuplicateLabel(String),
+
     /// Too many distinct MCP servers in one request.
     #[error("too many MCP servers: {count} exceeds limit of {max}")]
     TooManyServers {
@@ -316,7 +336,9 @@ struct Resolution {
 /// Map a [`ResolveError`] to an appropriate rejection response.
 fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction {
     let (status, error_type) = match err {
-        ResolveError::TooManyServers { .. } | ResolveError::NameCollision(_) => (400, "invalid_request_error"),
+        ResolveError::DuplicateLabel(_) | ResolveError::TooManyServers { .. } | ResolveError::NameCollision(_) => {
+            (400, "invalid_request_error")
+        },
         ResolveError::Client(_) => (502, "server_error"),
         ResolveError::Serialization(_) => (500, "server_error"),
     };
@@ -343,6 +365,86 @@ fn resolvable_server_url(entry: &serde_json::Value) -> Option<&str> {
         return None;
     }
     Some(server_url)
+}
+
+/// Reject requests containing more than one resolvable MCP entry
+/// with the same `server_label`.
+///
+/// Without this check, duplicate credentialed entries bypass the
+/// within-request cache (which is keyed on `(label, url)` and
+/// skipped when the entry carries `authorization` or `headers`),
+/// causing one `tools/list` callout per duplicate regardless of
+/// the `max_servers` bound.
+fn check_duplicate_labels(entries: &[serde_json::Value]) -> Result<(), ResolveError> {
+    let mut seen = HashSet::new();
+    for entry in entries {
+        if resolvable_server_url(entry).is_none() {
+            continue;
+        }
+        let label = server_label(entry);
+        if !seen.insert(label) {
+            return Err(ResolveError::DuplicateLabel(label.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// Return type for [`dedup_entries`]: `(entry_to_task, task_entries, task_allowed_names)`.
+type DedupResult<'a> = (Vec<Option<usize>>, Vec<&'a serde_json::Value>, Vec<Option<Vec<String>>>);
+
+/// Deduplicate MCP entries into resolution tasks. Non-credentialed
+/// entries sharing the same `(label, url)` map to a single task;
+/// credentialed entries always get their own task.
+fn dedup_entries(entries: &[serde_json::Value]) -> DedupResult<'_> {
+    let mut entry_to_task: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut task_entries: Vec<&serde_json::Value> = Vec::new();
+    let mut task_allowed_names: Vec<Option<Vec<String>>> = Vec::new();
+    let mut seen: HashMap<(&str, &str), usize> = HashMap::new();
+
+    for (slot, entry) in entry_to_task.iter_mut().zip(entries) {
+        let Some(url) = resolvable_server_url(entry) else {
+            continue;
+        };
+        let allowed = extract_allowed_tools(entry);
+        let existing = if has_entry_credentials(entry) {
+            None
+        } else {
+            seen.get(&(server_label(entry), url)).copied()
+        };
+        if let Some(task_idx) = existing {
+            if let Some(merged) = task_allowed_names.get_mut(task_idx) {
+                merge_allowed_names(merged, &allowed.names);
+            }
+            *slot = Some(task_idx);
+        } else {
+            let task_idx = task_entries.len();
+            if !has_entry_credentials(entry) {
+                seen.insert((server_label(entry), url), task_idx);
+            }
+            task_entries.push(entry);
+            task_allowed_names.push(allowed.names);
+            *slot = Some(task_idx);
+        }
+    }
+
+    (entry_to_task, task_entries, task_allowed_names)
+}
+
+/// Merge `new` into `existing` as a union. If either side is
+/// unrestricted (`None`), the result is unrestricted.
+fn merge_allowed_names(existing: &mut Option<Vec<String>>, new: &Option<Vec<String>>) {
+    let Some(new_names) = new else {
+        *existing = None;
+        return;
+    };
+    let Some(existing_names) = existing.as_mut() else {
+        return;
+    };
+    for name in new_names {
+        if !existing_names.contains(name) {
+            existing_names.push(name.clone());
+        }
+    }
 }
 
 /// Count distinct resolvable `(server_label, server_url)` pairs.
@@ -387,11 +489,11 @@ async fn fetch_tools(
 /// or `connector_id` only) are left unchanged for upstream to
 /// handle.
 fn rewrite_request_body(
-    ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     original_bytes: &[u8],
     per_entry: Vec<Vec<serde_json::Value>>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
+    filter_name: &'static str,
 ) -> Result<(), ResolveError> {
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
         return Ok(());
@@ -417,15 +519,12 @@ fn rewrite_request_body(
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
     rewrite_tool_choice(obj, tool_map);
 
-    let serialized = serde_json::to_vec(&parsed).map_err(|e| {
+    let serialized = serialize_json_body(&parsed).map_err(|e| {
         debug!(error = %e, "failed to serialize rewritten body");
         ResolveError::Serialization(e)
     })?;
 
-    let len = serialized.len();
-    *body = Some(Bytes::from(serialized));
-    ctx.extra_request_headers
-        .push((Cow::Borrowed("content-length"), len.to_string()));
+    serialized.commit(body, filter_name, "tools");
 
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
     Ok(())

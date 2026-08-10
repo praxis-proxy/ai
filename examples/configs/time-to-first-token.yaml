@@ -1,0 +1,41 @@
+# Time to First Token (TTFT)
+#
+# Measures the elapsed time from request receipt to the first non-empty
+# SSE body chunk and records a praxis_ai_ttft_seconds Prometheus
+# histogram labeled by model.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/time-to-first-token.yaml
+#   curl http://localhost:8080/v1/responses -d '{"model":"gpt-4o","input":"hi","stream":true}'
+#
+# The time_to_first_token filter activates only for successful text/event-stream
+# responses. Non-streaming and non-success responses pass through
+# without measurement.
+#
+# A format filter (openai_responses_format, anthropic_messages_format, or
+# anthropic_to_openai) must run upstream to set model metadata in the request
+# path. Without one, all TTFT samples are labeled "unknown".
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_format
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: time_to_first_token
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"

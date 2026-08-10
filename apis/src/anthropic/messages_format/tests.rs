@@ -83,7 +83,15 @@ fn responses_not_rejected() {
 fn invalid_json_rejected_in_reject_mode() {
     let cfg: AnthropicMessagesFormatConfig = serde_yaml::from_str("on_invalid: reject").unwrap();
     let result = handle_invalid_format(AiRequestFormat::InvalidJson, &cfg);
-    assert!(result.is_some(), "invalid JSON should be rejected in reject mode");
+    let Some(FilterAction::Reject(rejection)) = result else {
+        panic!("invalid JSON should be rejected in reject mode");
+    };
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+
+    assert_eq!(parsed["type"], "error");
+    assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    assert!(parsed.get("request_id").is_some());
+    assert!(parsed["request_id"].is_null());
 }
 
 #[test]
@@ -342,6 +350,30 @@ async fn null_header_config_suppresses_headers() {
             .map(String::as_str),
         Some("anthropic_messages"),
         "metadata should still be written even with null header config"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Oversized / Unsafe Model Values
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn oversized_model_not_promoted_to_header_or_results_or_metadata() {
+    let long_model = "x".repeat(300);
+    let body_str =
+        format!(r#"{{"model":"{long_model}","max_tokens":1024,"messages":[{{"role":"user","content":"Hi"}}]}}"#,);
+    let ctx = run_filter("{}", &body_str).await;
+    let headers = collect_headers(&ctx);
+
+    assert!(
+        !headers.contains_key("x-praxis-ai-model"),
+        "oversized model not in header"
+    );
+    let results = ctx.filter_results.get("anthropic_messages_format").unwrap();
+    assert!(results.get("model").is_none(), "oversized model not in results");
+    assert!(
+        !ctx.filter_metadata.contains_key("anthropic_messages_format.model"),
+        "oversized model not in metadata"
     );
 }
 

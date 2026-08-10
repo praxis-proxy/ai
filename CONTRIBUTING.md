@@ -21,10 +21,11 @@
 - **cargo-audit**: Check for vulnerable dependencies
 - **cargo-deny**: Enforce supply chain safety policies
 - **cargo-machete**: Detect unused dependencies
-- **cargo-semver-checks**: Lint for SemVer violations
 - **rustdoc**: Generate the API documentation
-- **cargo xtask**: Developer task runner for benchmarks, flamegraphs, and debug utilities
-- **benchmarks**: Criterion microbenchmarks and scenario-based load tests ([Fortio], [Vegeta])
+- **cargo xtask**: Developer checks for dependency versions,
+  generated docs, example coverage, Markdown links, and debug utilities
+- **load testing**: Scenario-based evidence with tools such as
+  [Fortio] or [Vegeta] when a change affects a performance-critical path
 
 [Fortio]: https://github.com/fortio/fortio
 [Vegeta]: https://github.com/tsenart/vegeta
@@ -128,8 +129,8 @@ Security is enforced at the lint level. See lints in
 - `cargo audit` and `cargo deny check` enforce supply
   chain safety (see [getting-started.md])
 
-[Cargo.toml]:../../Cargo.toml
-[getting-started.md]:./getting-started.md
+[Cargo.toml]:Cargo.toml
+[getting-started.md]:docs/developing/getting-started.md
 
 ### Lint Suppression Policy
 
@@ -271,7 +272,7 @@ use std::io::Write;
   the human-readable size or meaning (e.g.
   `const MAX_BODY: usize = 10_485_760; // 10 MiB`).
 
-See also [Type Design](type-design.md) for serde patterns
+See also [Type Design](docs/developing/type-design.md) for serde patterns
 and data modeling conventions.
 
 ## Code Responsibility

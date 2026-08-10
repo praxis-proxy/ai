@@ -130,10 +130,93 @@ fn anthropic_to_openai_transforms_response_body() {
         transformed["content"][0]["text"], "Hello from a Chat Completions backend.",
         "Chat Completions response text should map to Anthropic content"
     );
+    assert!(
+        transformed["content"][0].get("citations").is_some(),
+        "text content should include citations"
+    );
+    assert!(
+        transformed["content"][0]["citations"].is_null(),
+        "text content citations should be null"
+    );
     assert_eq!(
         transformed["usage"]["input_tokens"], 11,
         "prompt tokens should map to input tokens"
     );
+    for field in ["container", "stop_details"] {
+        assert!(transformed.get(field).is_some(), "response should include {field}");
+        assert!(transformed[field].is_null(), "response {field} should be null");
+    }
+    for field in [
+        "cache_creation",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "inference_geo",
+        "server_tool_use",
+        "service_tier",
+    ] {
+        assert!(
+            transformed["usage"].get(field).is_some(),
+            "usage should include {field}"
+        );
+        assert!(transformed["usage"][field].is_null(), "usage {field} should be null");
+    }
+    assert!(
+        transformed["usage"].get("output_tokens_details").is_none(),
+        "usage should omit output_tokens_details"
+    );
+}
+
+fn run_anthropic_to_openai_error(status: u16, response_body: &str, stream: bool) -> (u16, serde_json::Value) {
+    let backend = Backend::status(status, response_body)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "anthropic/messages-to-openai.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request_body = serde_json::json!({
+        "model": "claude-opus-4-8",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": stream,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request_body.to_string()));
+    let parsed = serde_json::from_str(&parse_body(&raw)).expect("error response should be JSON");
+
+    (parse_status(&raw), parsed)
+}
+
+#[test]
+fn anthropic_to_openai_normalizes_upstream_error() {
+    let (status, parsed) = run_anthropic_to_openai_error(
+        429,
+        r#"{"error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req_01"}"#,
+        false,
+    );
+
+    assert_eq!(status, 429);
+    assert_eq!(parsed["type"], "error");
+    assert_eq!(parsed["error"]["type"], "rate_limit_error");
+    assert_eq!(parsed["error"]["message"], "slow down");
+    assert_eq!(parsed["request_id"], "req_01");
+}
+
+#[test]
+fn anthropic_to_openai_normalizes_pre_stream_error_for_streaming_request() {
+    let (status, parsed) = run_anthropic_to_openai_error(
+        503,
+        r#"{"error":{"type":"server_error","message":"unavailable"}}"#,
+        true,
+    );
+
+    assert_eq!(status, 503);
+    assert_eq!(parsed["type"], "error");
+    assert_eq!(parsed["error"]["type"], "api_error");
+    assert_eq!(parsed["error"]["message"], "unavailable");
+    assert!(parsed["request_id"].is_null());
 }
 
 #[test]

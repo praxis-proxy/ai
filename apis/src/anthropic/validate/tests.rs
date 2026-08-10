@@ -36,8 +36,13 @@ fn missing_backend_owned_fields_pass() {
 #[test]
 fn invalid_json_rejected() {
     let body = b"not json {{{";
-    let rejection = validate_request(body);
-    assert!(rejection.is_some(), "invalid JSON should be rejected");
+    let rejection = validate_request(body).expect("invalid JSON should be rejected");
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+
+    assert_eq!(parsed["type"], "error");
+    assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    assert!(parsed.get("request_id").is_some());
+    assert!(parsed["request_id"].is_null());
 }
 
 #[test]

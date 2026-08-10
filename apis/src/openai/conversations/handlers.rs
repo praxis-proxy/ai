@@ -240,6 +240,7 @@ pub(super) async fn handle_delete_conversation(
 
 /// Handle `POST /v1/conversations/{id}/items` — create items.
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
+#[expect(clippy::large_stack_frames, reason = "Pingora context types are large")]
 pub(super) async fn handle_create_items(
     ctx: &HttpFilterContext<'_>,
     store: &dyn ConversationItemStore,

@@ -60,9 +60,10 @@ broker.
 
 From the JSON-RPC envelope, the filter extracts:
 
-- **Method**: 14 known MCP methods
+- **Method**: known MCP methods
   (`initialize`, `tools/list`, `tools/call`,
-  `resources/read`, `prompts/get`, `ping`, etc.)
+  `resources/read`, `prompts/get`, current/legacy
+  `ping`, etc.)
   plus `Other(String)` for extensions
 - **Name**: tool, resource, or prompt name from
   `params` (for methods like `tools/call`)
@@ -91,7 +92,7 @@ Client --> MCP Broker Filter
              |                negotiation
              +-- tools/list:  aggregated catalog
              |                from all servers
-             +-- ping:        local response
+             +-- ping:        local response (current profile only)
              +-- tools/call:  stateless routes by
              |                configured catalog tool
              |                current profile returns -32601

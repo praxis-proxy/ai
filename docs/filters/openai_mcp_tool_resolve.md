@@ -5,6 +5,10 @@
 
 Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server.
 
+## Configuration Notes
+
+Rejects the request with HTTP 400 before any callouts if two or more resolvable MCP entries share the same `server_label` (including entries that differ only by credentials).
+
 ## Configuration
 
 | Field | Type | Required | Description |

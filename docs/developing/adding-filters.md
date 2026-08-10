@@ -9,8 +9,8 @@ first.
 2. Implement `HttpFilter` (from `praxis-filter`). Add a
    `from_config` factory that deserializes a
    `serde_yaml::Value` into your config struct.
-3. Register it in `server/src/lib.rs` inside the
-   `register_ai_filters` function.
+3. Register it in `praxis_ai_filters::register_ai_filters`
+   (in `filters/src/register.rs`).
 4. Add unit tests and doctests.
 5. Add an example config in the appropriate category
    under `examples/configs/`.

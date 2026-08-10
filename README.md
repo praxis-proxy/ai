@@ -102,17 +102,17 @@ filters and protocol support. Before opening a pull request, please read the
 [contributing guide](CONTRIBUTING.md) and
 [development setup](docs/developing/getting-started.md).
 
-For larger changes, start a [discussion] and follow the
+For larger changes, open a [feature request] and follow the
 [proposal process](docs/proposals.md) so we can shape the idea together.
 
-[Open an issue][issues] · [Start a discussion][discussion] ·
+[Open an issue][issues] · [Request a feature][feature request] ·
 [Open a pull request][pull requests]
 
 [issues]: https://github.com/praxis-proxy/ai/issues/new
 [pull requests]: https://github.com/praxis-proxy/ai/compare
-[discussion]: https://github.com/praxis-proxy/praxis/discussions
 [container images]: https://github.com/praxis-proxy/ai/pkgs/container/ai
 [development guide]: docs/developing/getting-started.md
+[feature request]: https://github.com/praxis-proxy/ai/issues/new?template=feature-request.yml
 [quickstart]: docs/quickstart.md
 [release documentation]: docs/release.md
 [security policy]: SECURITY.md

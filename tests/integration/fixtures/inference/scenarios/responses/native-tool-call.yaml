@@ -1,0 +1,46 @@
+version: 1
+id: responses/native-tool-call
+description: Forced OpenAI Responses function call passed through to a native backend.
+protocol: openai_responses
+example_config: openai/responses/responses-proxy.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.native.request
+  - responses.native.tool_call
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: What is the weather in Boston? Use the get_weather function.
+          max_output_tokens: 64
+          store: false
+          stream: false
+          tools:
+            - type: function
+              name: get_weather
+              description: Get the current weather for a city.
+              parameters:
+                type: object
+                properties:
+                  city:
+                    type: string
+                required:
+                  - city
+          tool_choice:
+            type: function
+            name: get_weather
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

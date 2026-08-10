@@ -29,6 +29,13 @@
 //! passthrough`. No content-part validation — the inference backend
 //! handles that.
 //!
+//! `on_missing` only governs `file_id` availability gaps. A `file_url`
+//! fetch failure is always rejected, regardless of `on_missing`: the
+//! resolver's SSRF, redirect, and size checks may have just rejected
+//! an attacker-controlled target, and that outcome must never be
+//! downgraded into forwarding the original URL for the backend to
+//! fetch itself without the same protections.
+//!
 //! This filter resolves the file transport reference but does not
 //! interpret document contents. The inference backend must already
 //! support the resulting inline `input_file` / `file_data` or
@@ -60,11 +67,8 @@ pub(crate) mod resolve_url;
 )]
 mod tests;
 
-use std::borrow::Cow;
-
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_core::callout::{CalloutConfig, FailureMode};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
@@ -80,7 +84,9 @@ use self::{
 use super::{openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState};
 use crate::{
     classifier::is_responses_create,
+    json_body::serialize_json_body,
     openai::api_client::{ApiClient, ApiClientConfig},
+    subrequest::SubRequestClient,
 };
 
 /// Resolves `file_id` and `file_url` references in Responses API input
@@ -145,27 +151,58 @@ pub struct FileResolveFilter {
 impl FileResolveFilter {
     /// Create a filter from parsed YAML config.
     ///
+    /// Uses an isolated [`SubRequestClient`] with a default pool
+    /// size of 4. Prefer [`from_config_with_client`] when a shared
+    /// client is available.
+    ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid or the
     /// callout client cannot be constructed.
-    #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
+    ///
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        Self::build(config, client)
+    }
+
+    /// Create a filter using the shared [`SubRequestClient`].
+    ///
+    /// The shared client inherits the server-level pool size and
+    /// connection limits from the runtime configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid or the
+    /// callout client cannot be constructed.
+    ///
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    pub fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::build(config, client)
+    }
+
+    /// Shared constructor body for [`from_config`](Self::from_config) and
+    /// [`from_config_with_client`](Self::from_config_with_client).
+    #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
+    fn build(
+        config: &serde_yaml::Value,
+        subrequest_client: SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
         let validated = validate_config(cfg)?;
         let forward_header_names = prepare_forward_header_names(&validated.forward_headers)?;
 
         let api_client = ApiClient::new(ApiClientConfig {
             api_base_url: validated.files_api_url.clone(),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms: validated.timeout_ms,
-                status_on_error: 502,
-                ..CalloutConfig::default()
-            },
+            client: subrequest_client,
+            timeout: std::time::Duration::from_millis(validated.timeout_ms),
+            max_response_bytes: 1_048_576,
             forward_header_names,
-        })
-        .map_err(|e| -> FilterError { format!("openai_file_resolve: {e}").into() })?;
+        });
 
         let client = FilesApiClient::new(
             api_client,
@@ -291,7 +328,7 @@ async fn resolve_and_rewrite(
     }
 
     debug!(count, "resolved file_id references");
-    if let Some(rejection) = rewrite_body(body, parsed, ctx, filter.config.max_body_bytes)? {
+    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
@@ -373,18 +410,15 @@ async fn update_state(
 fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
-    ctx: &mut HttpFilterContext<'_>,
     max_body_bytes: usize,
+    filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
-    let rewritten = serde_json::to_vec(parsed)
-        .map_err(|e| -> FilterError { format!("openai_file_resolve: failed to serialize body: {e}").into() })?;
-    let len = rewritten.len();
-    if len > max_body_bytes {
-        return Ok(Some(reject_rewritten_body_too_large(len, max_body_bytes)));
+    let rewritten = serialize_json_body(parsed)
+        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
+    if rewritten.len() > max_body_bytes {
+        return Ok(Some(reject_rewritten_body_too_large(rewritten.len(), max_body_bytes)));
     }
-    *body = Some(Bytes::from(rewritten));
-    ctx.extra_request_headers
-        .push((Cow::Borrowed("content-length"), len.to_string()));
+    rewritten.commit(body, filter_name, "input");
     Ok(None)
 }
 

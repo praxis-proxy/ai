@@ -198,7 +198,7 @@ async fn stream_events_incremental_accumulation_before_terminal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_events_processes_validate_reformatted_error() {
+async fn stream_events_forwards_backend_error_transparently() {
     let error_body =
         r#"{"error":{"message":"model not found","type":"invalid_request_error","code":"model_not_found"}}"#;
     let backend_guard = Backend::status(404, error_body)
@@ -225,17 +225,17 @@ async fn stream_events_processes_validate_reformatted_error() {
         ),
     );
 
+    assert_eq!(parse_status(&raw), 404, "backend 404 should be forwarded unchanged");
     assert_eq!(
-        parse_status(&raw),
-        200,
-        "validate filter reformats 404 to 200 SSE for streaming requests"
+        parse_header(&raw, "content-type").as_deref(),
+        Some("application/json"),
+        "backend content-type should be forwarded unchanged"
     );
 
     let body = parse_body(&raw);
-    assert!(
-        body.contains("model not found") || body.contains("model_not_found"),
-        "error details should be preserved through validate+stream_events: {body}"
-    );
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("backend JSON should be forwarded intact");
+    assert_eq!(parsed["error"]["message"], "model not found");
+    assert_eq!(parsed["error"]["code"], "model_not_found");
 
     drop(proxy);
     cleanup_sqlite_files(&db_path);

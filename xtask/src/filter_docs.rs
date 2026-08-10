@@ -224,7 +224,7 @@ impl ModuleItems {
     fn clone_for_filter(&self) -> Self {
         Self {
             module_docs: Vec::new(),
-            configs: Vec::new(),
+            configs: self.configs.clone(),
             struct_docs: Vec::new(),
             structs: self.structs.clone(),
             enums: self.enums.clone(),
@@ -330,7 +330,20 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
     items.configs.clear();
     items.module_docs.clear();
     items.struct_docs.clear();
+    parse_local_shared_config(root, &mut items);
     items
+}
+
+/// Parse local configuration types shared by filters in separate API categories.
+fn parse_local_shared_config(root: &Path, items: &mut ModuleItems) {
+    let path = root.join("apis/src/web_search/config.rs");
+    let Ok(source) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(file) = syn::parse_file(&source) else {
+        return;
+    };
+    parse_file_items(&file, items);
 }
 
 /// Resolve praxis crate source directories from the cargo registry via
@@ -491,10 +504,11 @@ fn extract_filters(category_dir: &Path, shared_items: &ModuleItems) -> Vec<Filte
 }
 
 /// Parse non-anchor `.rs` files directly in the category root for shared
-/// enum/struct types. Only struct field info and enums survive
-/// `clone_for_filter`, so module docs and config structs from these
-/// files do not leak into individual filter docs.
+/// enum/struct types. Category-local module docs and config structs
+/// do not leak into individual filter docs, while global shared
+/// config structs remain available for cross-category filters.
 fn parse_category_shared_types(category_dir: &Path, anchors: &[FilterAnchor], out: &mut ModuleItems) {
+    let shared_configs = out.configs.clone();
     let Ok(entries) = fs::read_dir(category_dir) else {
         return;
     };
@@ -517,7 +531,7 @@ fn parse_category_shared_types(category_dir: &Path, anchors: &[FilterAnchor], ou
         };
         parse_file_items(&file, out);
     }
-    out.configs.clear();
+    out.configs = shared_configs;
     out.module_docs.clear();
     out.struct_docs.clear();
 }
@@ -1187,16 +1201,37 @@ fn has_from_config_method(imp: &syn::ItemImpl) -> bool {
 }
 
 /// Extract the config type name from `let cfg: T = parse_filter_config(...)`.
+///
+/// Scans `from_config` first. When `from_config` delegates to a
+/// private helper (e.g. `build`), the `parse_filter_config` call
+/// lives there instead, so we fall back to scanning other methods
+/// in the same impl block.
 fn extract_config_type_name(imp: &syn::ItemImpl) -> Option<String> {
-    let method = imp.items.iter().find_map(|item| {
-        if let syn::ImplItem::Fn(m) = item
-            && m.sig.ident == "from_config"
-        {
-            return Some(m);
-        }
-        None
-    })?;
+    let methods: Vec<&syn::ImplItemFn> = imp
+        .items
+        .iter()
+        .filter_map(|item| if let syn::ImplItem::Fn(m) = item { Some(m) } else { None })
+        .collect();
 
+    let from_config = methods.iter().find(|m| m.sig.ident == "from_config")?;
+
+    if let Some(name) = scan_method_for_config_type(from_config) {
+        return Some(name);
+    }
+
+    for method in &methods {
+        if method.sig.ident == "from_config" {
+            continue;
+        }
+        if let Some(name) = scan_method_for_config_type(method) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Scan a method body for `let cfg: T = parse_filter_config(...)` and return `T`.
+fn scan_method_for_config_type(method: &syn::ImplItemFn) -> Option<String> {
     for stmt in &method.block.stmts {
         if let syn::Stmt::Local(local) = stmt {
             let Some(init) = local.init.as_ref() else {
@@ -2364,6 +2399,36 @@ mod tests {
     }
 
     #[test]
+    fn extract_config_type_from_delegated_build() {
+        let source = r#"
+            impl MyFilter {
+                fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+                    let client = SubRequestClient::new();
+                    Self::build(config, client)
+                }
+
+                fn build(
+                    config: &serde_yaml::Value,
+                    client: SubRequestClient,
+                ) -> Result<Box<dyn HttpFilter>, FilterError> {
+                    let cfg: MyFilterConfig = parse_filter_config("my_filter", config)?;
+                    Ok(Box::new(Self { timeout: cfg.timeout }))
+                }
+            }
+        "#;
+        let file: syn::File = syn::parse_str(source).unwrap();
+        if let syn::Item::Impl(imp) = &file.items[0] {
+            assert_eq!(
+                extract_config_type_name(imp),
+                Some("MyFilterConfig".to_owned()),
+                "should find config type in delegated build method"
+            );
+        } else {
+            panic!("expected impl");
+        }
+    }
+
+    #[test]
     fn extract_config_type_none_without_parse() {
         let source = "
             impl MyFilter {
@@ -2427,6 +2492,37 @@ mod tests {
             field_names.contains(&"servers"),
             "mcp docs should include broker-mode servers field"
         );
+    }
+
+    #[test]
+    fn web_search_filters_render_shared_provider_config_fields() {
+        let root = workspace_root();
+        let shared_items = parse_shared_config_items(&root);
+        let filters = discover_all_filters(&root, &shared_items);
+
+        for filter_name in ["anthropic_web_search", "openai_web_search"] {
+            let filter = filters
+                .iter()
+                .find(|entry| entry.filter.name == filter_name)
+                .expect("web-search filter should be discovered");
+            let api_key = filter
+                .filter
+                .fields
+                .iter()
+                .find(|field| field.name == "api_key")
+                .expect("web-search filter should document api_key");
+            assert_eq!(
+                api_key.required,
+                RequiredKind::Yes,
+                "{filter_name} should document api_key as required"
+            );
+            for expected in ["provider", "provider_failure_mode", "status_on_error", "base_url"] {
+                assert!(
+                    filter.filter.fields.iter().any(|field| field.name == expected),
+                    "{filter_name} should document {expected}"
+                );
+            }
+        }
     }
 
     #[test]
