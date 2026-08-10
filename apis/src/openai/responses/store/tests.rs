@@ -3030,7 +3030,10 @@ async fn get_response_rejects_include() {
     let filter = make_filter();
     init_store_and_seed(&filter, "resp_inc", "default", json!([])).await;
 
-    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_inc?include[]=usage");
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_inc?include%5B%5D=reasoning.encrypted_content",
+    );
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -3903,6 +3906,32 @@ fn validate_get_response_query_params_key_only_unknown_rejected() {
     assert!(
         err.contains("Unknown query parameter"),
         "key-only unknown param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_percent_encoded_stream_false_accepted() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("stream=%66alse")).is_ok(),
+        "percent-encoded stream=false should be accepted"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_invalid_utf8_key_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("%FF=x")).unwrap_err();
+    assert!(
+        err.contains("Invalid percent-encoding in query parameter key"),
+        "invalid UTF-8 key should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_invalid_utf8_value_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=%FF")).unwrap_err();
+    assert!(
+        err.contains("Invalid percent-encoding in value"),
+        "invalid UTF-8 value should be rejected: {err}"
     );
 }
 

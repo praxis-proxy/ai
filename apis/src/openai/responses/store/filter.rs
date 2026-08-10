@@ -834,6 +834,7 @@ impl ResponseStoreFilter {
     }
 
     /// Serve `GET /v1/responses/{id}`.
+    #[expect(clippy::cognitive_complexity, reason = "query validation adds one early-return branch")]
     async fn handle_get_response(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
         if let Err(msg) = validate_get_response_query_params(ctx.request.uri.query()) {
             debug!(response_id = id, error = %msg, "invalid get-response query parameter");
@@ -847,11 +848,6 @@ impl ResponseStoreFilter {
         let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
         debug!(response_id = id, tenant_id, "retrieving stored response");
 
-        Self::retrieve_and_respond(store, tenant_id, id).await
-    }
-
-    /// Retrieve a response from the store and build the appropriate rejection.
-    async fn retrieve_and_respond(store: Arc<dyn ResponseStore>, tenant_id: &str, id: &str) -> FilterAction {
         match store.get_response(tenant_id, id).await {
             Ok(Some(record)) => {
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
@@ -1079,28 +1075,38 @@ pub(super) fn validate_get_response_query_params(query: Option<&str>) -> Result<
         }
 
         let Some((raw_key, raw_value)) = pair.split_once('=') else {
-            let key = percent_decode_key(pair)?;
-            if GET_RESPONSE_KNOWN_PARAMS.contains(&key.as_str()) {
+            let key = percent_encoding::percent_decode_str(pair)
+                .decode_utf8()
+                .map_err(|_e| format!("Invalid percent-encoding in query parameter key '{pair}'."))?;
+            if GET_RESPONSE_KNOWN_PARAMS.contains(&&*key) {
                 return Err(format!("Missing value for query parameter '{key}'."));
             }
             return Err(format!("Unknown query parameter: '{key}'."));
         };
 
-        let key = percent_decode_key(raw_key)?;
+        let key = percent_encoding::percent_decode_str(raw_key)
+            .decode_utf8()
+            .map_err(|_e| format!("Invalid percent-encoding in query parameter key '{raw_key}'."))?;
         let value = percent_encoding::percent_decode_str(raw_value)
             .decode_utf8()
             .map_err(|_e| format!("Invalid percent-encoding in value for '{key}'."))?;
 
-        validate_param(&key, &value)?;
+        validate_get_response_param(&key, &value)?;
     }
 
     Ok(())
 }
 
-/// Validate a single query parameter key-value pair.
-fn validate_param(key: &str, value: &str) -> Result<(), String> {
+/// Validate a single decoded query parameter for `GET /v1/responses/{id}`.
+fn validate_get_response_param(key: &str, value: &str) -> Result<(), String> {
     match key {
-        "stream" => validate_stream(value),
+        "stream" => match value {
+            "false" => Ok(()),
+            "true" => Err("The 'stream' parameter is not supported by the local response store.".to_owned()),
+            _ => Err(format!(
+                "Invalid value for 'stream': must be 'true' or 'false', got '{value}'."
+            )),
+        },
         "include" | "include[]" => {
             Err("The 'include' parameter is not supported by the local response store.".to_owned())
         },
@@ -1111,27 +1117,6 @@ fn validate_param(key: &str, value: &str) -> Result<(), String> {
             Err("The 'include_obfuscation' parameter is not supported by the local response store.".to_owned())
         },
         _ => Err(format!("Unknown query parameter: '{key}'.")),
-    }
-}
-
-/// Percent-decode a query parameter key, returning a 400-suitable error
-/// on malformed encoding.
-fn percent_decode_key(raw: &str) -> Result<String, String> {
-    percent_encoding::percent_decode_str(raw)
-        .decode_utf8()
-        .map(std::borrow::Cow::into_owned)
-        .map_err(|_e| format!("Invalid percent-encoding in query parameter key '{raw}'."))
-}
-
-/// Validate the `stream` query parameter: `false` is accepted,
-/// `true` is rejected as unsupported, anything else is an invalid value.
-fn validate_stream(value: &str) -> Result<(), String> {
-    match value {
-        "false" => Ok(()),
-        "true" => Err("The 'stream' parameter is not supported by the local response store.".to_owned()),
-        _ => Err(format!(
-            "Invalid value for 'stream': must be 'true' or 'false', got '{value}'."
-        )),
     }
 }
 
