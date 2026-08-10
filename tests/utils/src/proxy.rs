@@ -67,10 +67,14 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
             config.insecure_options.allow_unbounded_body,
         )
         .unwrap();
-    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
+    let pool_size = config
+        .runtime
+        .subrequest_pool_size
+        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
     pipeline.set_subrequest_client(praxis_core::subrequest::SubRequestClient::new(
-        praxis_core::subrequest::SubRequestConnector::new(8, None),
+        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections),
     ));
+    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
     Arc::new(pipeline)
 }
 

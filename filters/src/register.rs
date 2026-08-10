@@ -161,6 +161,10 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
         http "openai_responses_rehydrate" => praxis_ai_apis::openai::RehydrateFilter::from_config
     );
     register_compact(registry, subrequest_client);
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_file_search_callout" => praxis_ai_apis::openai::FileSearchCalloutFilter::from_config
+    );
     register_openai_response_filters(registry, subrequest_client);
 }
 
