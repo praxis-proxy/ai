@@ -834,7 +834,10 @@ impl ResponseStoreFilter {
     }
 
     /// Serve `GET /v1/responses/{id}`.
-    #[expect(clippy::cognitive_complexity, reason = "query validation adds one early-return branch")]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "query validation adds one early-return branch"
+    )]
     async fn handle_get_response(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
         if let Err(msg) = validate_get_response_query_params(ctx.request.uri.query()) {
             debug!(response_id = id, error = %msg, "invalid get-response query parameter");
