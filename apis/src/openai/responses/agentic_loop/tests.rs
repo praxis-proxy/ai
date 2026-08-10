@@ -230,6 +230,33 @@ async fn forces_parallel_tool_calls_false() {
         state.request_body["parallel_tool_calls"], false,
         "request_body should contain parallel_tool_calls=false for proxy serialization"
     );
+    assert!(
+        state.request_body_requires_rebuild(),
+        "inserting parallel_tool_calls must require proxy serialization"
+    );
+}
+
+#[tokio::test]
+async fn preserves_unmodified_parallel_tool_calls_false() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let body = json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "parallel_tool_calls": false,
+        "tools": [{"type": "function"}]
+    });
+    ctx.extensions.insert(ResponsesState::from_request_body(body));
+
+    drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        !state.request_body_requires_rebuild(),
+        "an already-disabled request should retain byte-exact passthrough"
+    );
 }
 
 // -----------------------------------------------------------------------------
