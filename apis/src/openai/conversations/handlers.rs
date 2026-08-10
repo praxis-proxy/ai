@@ -168,11 +168,14 @@ pub(super) async fn handle_update_conversation(
         },
     };
     if let Err(msg) = validate_metadata(input.metadata.as_value()) {
-        return Ok(FilterAction::Reject(invalid_input_response_with(
-            &msg,
-            Some("invalid_type"),
-            Some("metadata"),
-        )?));
+        if msg.contains("must be") {
+            return Ok(FilterAction::Reject(invalid_input_response_with(
+                &msg,
+                Some("invalid_type"),
+                Some("metadata"),
+            )?));
+        }
+        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
 
     let existing = match store.get_conversation(tenant_id, conversation_id).await {
@@ -903,7 +906,15 @@ fn json_response<T: Serialize + ?Sized>(status: u16, body: &T) -> Result<Rejecti
 
 /// Build a 400 JSON response for invalid input.
 fn invalid_input_response(message: &str) -> Result<Rejection, FilterError> {
-    invalid_input_response_with(message, None, None)
+    json_response(
+        400,
+        &serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+            }
+        }),
+    )
 }
 
 /// Build a 400 JSON response with optional OpenAI error code and parameter.
@@ -936,7 +947,7 @@ fn classify_update_error(msg: &str) -> Result<Rejection, FilterError> {
     }
     if msg.contains("metadata must be an object") {
         return invalid_input_response_with(
-            "Invalid type for 'metadata': expected an object, but got null.",
+            "Invalid type for 'metadata': expected an object.",
             Some("invalid_type"),
             Some("metadata"),
         );
