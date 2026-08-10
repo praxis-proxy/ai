@@ -15,7 +15,9 @@
 #   timeout_ms:               Whole-call timeout in milliseconds
 #   max_response_bytes:       Maximum response bytes retained per callout
 #   max_total_response_bytes: Maximum successful bytes across one fan-out
-#   on_error:                 reject (fail closed) or ignore (fail open)
+#   callout_failure_mode:     closed (fail closed) or open (fail open)
+#   forward_headers:          Headers to forward from the client request
+#                             (e.g. Authorization) to the vector store API
 
 listeners:
   - name: ai-gateway
@@ -45,9 +47,12 @@ filter_chains:
                 timeout_ms: 5000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
-                # Must match the enclosing iterative router's state budget.
+                # The filter and the enclosing iterative router may use
+                # different values; the smaller limit wins at runtime.
                 max_state_bytes: 136314880
-                on_error: reject
+                callout_failure_mode: closed
+                forward_headers:
+                  - authorization
               - filter: openai_responses_proxy
                 name: inference
               - filter: headers

@@ -777,7 +777,9 @@ filter_chains:
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
                 max_state_bytes: 136314880
-                on_error: reject
+                callout_failure_mode: closed
+                forward_headers:
+                  - authorization
               - filter: openai_responses_proxy
                 name: inference
               - filter: headers

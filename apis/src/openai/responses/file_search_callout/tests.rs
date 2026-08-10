@@ -42,7 +42,7 @@ fn minimal_config_uses_safe_defaults() {
     assert_eq!(config.max_response_bytes, 10_485_760);
     assert_eq!(config.max_total_response_bytes, 67_108_864);
     assert_eq!(config.max_state_bytes, 52_428_800);
-    assert_eq!(config.on_error, OnError::Reject);
+    assert_eq!(config.failure_mode, FailureMode::Closed);
 }
 
 #[test]
@@ -406,7 +406,7 @@ fn continuation_header_replay_excludes_stale_request_metadata() {
 
 #[test]
 fn continuation_header_replay_excludes_connection_nominated_headers() {
-    let mut headers = http::HeaderMap::new();
+    let mut headers = HeaderMap::new();
     headers.insert(
         http::header::CONNECTION,
         http::HeaderValue::from_static("keep-alive, X-Request-Hop"),
@@ -1159,9 +1159,9 @@ async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_vector_store()
 }
 
 #[tokio::test]
-async fn ignore_and_reject_error_modes_are_distinct() {
+async fn open_and_closed_failure_modes_are_distinct() {
     let closed_server = MockServer::json(500, &json!({"error":"failed"}));
-    let closed = make_filter(closed_server.port, "on_error: reject\n");
+    let closed = make_filter(closed_server.port, "callout_failure_mode: closed\n");
     let mut closed_ctx = make_context(Some(one_pending_state(&["vs-a"])));
     assert!(matches!(
         closed.on_request(&mut closed_ctx).await.unwrap(),
@@ -1173,7 +1173,7 @@ async fn ignore_and_reject_error_modes_are_distinct() {
     );
 
     let open_server = MockServer::json(500, &json!({"error":"failed"}));
-    let open = make_filter(open_server.port, "on_error: ignore\n");
+    let open = make_filter(open_server.port, "callout_failure_mode: open\n");
     let mut open_ctx = make_context(Some(one_pending_state(&["vs-a"])));
     assert!(matches!(
         open.on_request(&mut open_ctx).await.unwrap(),
@@ -1190,7 +1190,7 @@ async fn aggregate_budget_stops_later_searches_and_marks_call_incomplete() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, "small"));
     let filter = make_filter(
         server.port,
-        "on_error: ignore\nmax_response_bytes: 512\nmax_total_response_bytes: 512\n",
+        "callout_failure_mode: open\nmax_response_bytes: 512\nmax_total_response_bytes: 512\n",
     );
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b"])));
 
@@ -1219,7 +1219,7 @@ async fn malformed_success_bodies_are_charged_to_the_aggregate_budget() {
     });
     let filter = make_filter(
         server.port,
-        "on_error: ignore\nmax_response_bytes: 1\nmax_total_response_bytes: 4\n",
+        "callout_failure_mode: open\nmax_response_bytes: 1\nmax_total_response_bytes: 4\n",
     );
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b", "vs-c", "vs-d", "vs-e"])));
 
@@ -1301,7 +1301,7 @@ async fn one_execution_deadline_covers_later_concurrency_chunks() {
 #[tokio::test]
 async fn fail_closed_stops_scheduling_after_the_current_chunk() {
     let server = MockServer::json(500, &json!({"error": "failed"}));
-    let filter = make_filter(server.port, "on_error: reject\n");
+    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
     let store_ids: Vec<String> = (0..=MAX_CONCURRENT_SEARCHES)
         .map(|index| format!("vs-{index}"))
         .collect();
@@ -1354,7 +1354,7 @@ async fn aggregate_results_are_score_sorted_and_limited_to_top_k() {
             Duration::ZERO,
         ),
     ]);
-    let filter = make_filter(server.port, "on_error: ignore\n");
+    let filter = make_filter(server.port, "callout_failure_mode: open\n");
     let mut state = one_pending_state(&["vs-a", "vs-b"]);
     state.tools[0]["max_num_results"] = json!(3);
     state.include.push("file_search_call.results".to_owned());
@@ -1384,7 +1384,7 @@ async fn fail_open_retains_successful_results_from_a_partial_fan_out() {
         ),
         ("vs-b", 500, json!({"error": "failed"}), Duration::ZERO),
     ]);
-    let filter = make_filter(server.port, "on_error: ignore\n");
+    let filter = make_filter(server.port, "callout_failure_mode: open\n");
     let mut state = one_pending_state(&["vs-a", "vs-b"]);
     state.include.push("file_search_call.results".to_owned());
     let mut ctx = make_context(Some(state));
@@ -1403,7 +1403,7 @@ async fn fail_open_retains_successful_results_from_a_partial_fan_out() {
 #[tokio::test]
 async fn outbound_query_store_id_and_request_body_are_bounded() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "on_error: ignore\n");
+    let filter = make_filter(server.port, "callout_failure_mode: open\n");
 
     let oversized_store = "s".repeat(MAX_VECTOR_STORE_ID_BYTES + 1);
     let mut store_ctx = make_context(Some(one_pending_state(&[&oversized_store])));
@@ -1437,7 +1437,7 @@ async fn outbound_query_store_id_and_request_body_are_bounded() {
 #[tokio::test]
 async fn malformed_execution_fields_fail_without_silent_normalization() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "on_error: reject\n");
+    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
 
     let mut invalid_stores = one_pending_state(&["vs-a"]);
     invalid_stores.tools[0]["vector_store_ids"] = json!(["vs-a", 7]);
@@ -1469,7 +1469,7 @@ async fn malformed_execution_fields_fail_without_silent_normalization() {
 #[tokio::test]
 async fn missing_file_search_tool_fields_fail_closed() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "on_error: reject\n");
+    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
 
     let mut missing_ids = one_pending_state(&["vs-a"]);
     missing_ids.tools[0].as_object_mut().unwrap().remove("vector_store_ids");
@@ -1493,7 +1493,7 @@ async fn missing_file_search_tool_fields_fail_closed() {
 #[tokio::test]
 async fn fail_open_isolates_a_malformed_pending_call() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "on_error: ignore\n");
+    let filter = make_filter(server.port, "callout_failure_mode: open\n");
     let malformed = json!({
         "type":"file_search_call","id":"fs-bad","status":"searching","queries":["valid", 7]
     });
@@ -1821,7 +1821,7 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
     let validated = build_config(&raw).unwrap();
     let client = FileSearchClient::new(FileSearchClientConfig {
         api_client: validated.api_client,
-        on_error: validated.on_error,
+        failure_mode: validated.failure_mode,
         max_response_bytes: validated.max_response_bytes,
         max_total_response_bytes: validated.max_total_response_bytes,
         timeout: validated.timeout,
@@ -1829,7 +1829,7 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
     FileSearchCalloutFilter {
         client,
         max_state_bytes: validated.max_state_bytes,
-        on_error: validated.on_error,
+        failure_mode: validated.failure_mode,
     }
 }
 

@@ -11,7 +11,10 @@ use serde::Deserialize;
 
 use super::client::MAX_CONCURRENT_SEARCHES;
 use crate::{
-    openai::api_client::{self, ApiClient, ApiClientConfig},
+    openai::{
+        api_client::{self, ApiClient, ApiClientConfig},
+        responses::config_validation::FailureMode,
+    },
     subrequest::SubRequestClient,
 };
 
@@ -55,22 +58,25 @@ pub(crate) struct FileSearchFilterConfig {
     #[serde(default)]
     pub allow_private_url: bool,
 
+    /// Behaviour when a vector-store callout fails.
+    pub callout_failure_mode: Option<FailureMode>,
+
+    /// Headers to forward from the original request to the
+    /// vector store API for authentication and tenant isolation.
+    /// No downstream headers are forwarded by default.
+    #[serde(default)]
+    pub forward_headers: Vec<String>,
+
     /// Maximum response body size in bytes per callout.
     pub max_response_bytes: Option<usize>,
 
     /// Maximum cumulative successful response bytes per filter execution.
     pub max_total_response_bytes: Option<usize>,
 
-    /// Maximum combined iterative-router and file-search continuation bytes.
-    ///
-    /// Configure the same value on the enclosing `iterative_request_router`.
+    /// Maximum combined iterative-router and file-search continuation
+    /// bytes. The filter's value may differ from the enclosing
+    /// `iterative_request_router`; the smaller limit wins at runtime.
     pub max_state_bytes: Option<usize>,
-
-    /// Behaviour when a vector-store callout fails.
-    ///
-    /// Named `on_error` because `parse_filter_config` strips
-    /// `failure_mode` as a pipeline-structural key.
-    pub on_error: Option<OnError>,
 
     /// Whole-call timeout in milliseconds.
     pub timeout_ms: Option<u64>,
@@ -79,23 +85,13 @@ pub(crate) struct FileSearchFilterConfig {
     pub vector_store_url: String,
 }
 
-/// Callout error handling policy.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum OnError {
-    /// Log and continue with partial or empty results.
-    Ignore,
-    /// Return a 502 error to the client.
-    Reject,
-}
-
 /// Validated configuration.
 pub(crate) struct ValidatedConfig {
     /// Shared OpenAI-compatible API client.
     pub api_client: ApiClient,
 
     /// Search failure handling policy.
-    pub on_error: OnError,
+    pub failure_mode: FailureMode,
 
     /// Maximum response body size per callout.
     pub max_response_bytes: usize,
@@ -117,17 +113,25 @@ pub(crate) fn build_config_with_client(
     client: SubRequestClient,
 ) -> Result<ValidatedConfig, FilterError> {
     let vector_store_url = parse_vector_store_url(&cfg.vector_store_url, cfg.allow_private_url)?;
-    let on_error = cfg.on_error.unwrap_or(OnError::Reject);
+    let failure_mode = cfg.callout_failure_mode.unwrap_or(FailureMode::Closed);
     let (max_response_bytes, max_total_response_bytes) =
         response_limits(cfg.max_response_bytes, cfg.max_total_response_bytes)?;
     let max_state_bytes = validated_state_limit(cfg.max_state_bytes)?;
     let timeout_ms = validated_timeout(cfg.timeout_ms)?;
+    let mut forward_headers = cfg.forward_headers.clone();
+    api_client::validate_forward_headers("openai_file_search_callout", &mut forward_headers)?;
 
-    let api_client = build_api_client(&vector_store_url, client, max_response_bytes, timeout_ms);
+    let api_client = build_api_client(
+        &vector_store_url,
+        client,
+        &forward_headers,
+        max_response_bytes,
+        timeout_ms,
+    );
 
     Ok(ValidatedConfig {
         api_client,
-        on_error,
+        failure_mode,
         max_response_bytes,
         max_total_response_bytes,
         max_state_bytes,
@@ -163,6 +167,7 @@ fn validated_state_limit(configured: Option<usize>) -> Result<usize, FilterError
 fn build_api_client(
     vector_store_url: &Url,
     client: SubRequestClient,
+    forward_headers: &[String],
     max_response_bytes: usize,
     timeout_ms: u64,
 ) -> ApiClient {
@@ -171,7 +176,10 @@ fn build_api_client(
         client,
         timeout: Duration::from_millis(timeout_ms),
         max_response_bytes,
-        forward_header_names: Vec::new(),
+        forward_header_names: forward_headers
+            .iter()
+            .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+            .collect(),
     })
 }
 

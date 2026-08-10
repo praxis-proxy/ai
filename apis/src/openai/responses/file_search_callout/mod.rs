@@ -22,6 +22,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::HeaderMap;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
     body::MAX_JSON_BODY_BYTES, parse_filter_config,
@@ -36,12 +37,13 @@ use self::{
         FileSearchClient, FileSearchClientConfig, MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES,
         SearchBatch, SearchFailure, SearchSpec, request_error,
     },
-    config::{FileSearchFilterConfig, OnError, ValidatedConfig, build_config, build_config_with_client},
+    config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
     openai::responses::{
         bounded_json_size,
+        config_validation::FailureMode,
         error::responses_error_rejection,
         state::{MAX_CITATION_FILES, ResponsesState},
         stream_events::accumulator::merge_usage,
@@ -79,7 +81,7 @@ pub struct FileSearchCalloutFilter {
     max_state_bytes: usize,
 
     /// Whether a failed callout rejects or produces an incomplete result.
-    on_error: OnError,
+    failure_mode: FailureMode,
 }
 
 /// Request-local marker used to reject streaming before the first subrequest.
@@ -123,7 +125,7 @@ impl FileSearchCalloutFilter {
     fn build(validated: ValidatedConfig) -> Box<dyn HttpFilter> {
         let client = FileSearchClient::new(FileSearchClientConfig {
             api_client: validated.api_client,
-            on_error: validated.on_error,
+            failure_mode: validated.failure_mode,
             max_response_bytes: validated.max_response_bytes,
             max_total_response_bytes: validated.max_total_response_bytes,
             timeout: validated.timeout,
@@ -132,7 +134,7 @@ impl FileSearchCalloutFilter {
         Box::new(Self {
             client,
             max_state_bytes: validated.max_state_bytes,
-            on_error: validated.on_error,
+            failure_mode: validated.failure_mode,
         })
     }
 
@@ -226,7 +228,7 @@ impl FileSearchCalloutFilter {
         clippy::too_many_lines,
         reason = "separates global, per-call, and transport planning failures"
     )]
-    async fn execute_plan(&self, plan: &SearchPlan) -> SearchBatch {
+    async fn execute_plan(&self, plan: &SearchPlan, request_headers: &HeaderMap) -> SearchBatch {
         if let Some(message) = plan.planning_error {
             return SearchBatch::with_failures(
                 plan.calls.len(),
@@ -255,7 +257,7 @@ impl FileSearchCalloutFilter {
         let mut batch = if specs.is_empty() {
             SearchBatch::new(plan.calls.len())
         } else {
-            self.client.search(&specs, plan.calls.len()).await
+            self.client.search(&specs, plan.calls.len(), request_headers).await
         };
         batch.failures.extend(planning_failures);
         batch
@@ -270,7 +272,7 @@ impl FileSearchCalloutFilter {
                 "vector store search failed"
             );
         }
-        let failure = (self.on_error == OnError::Reject)
+        let failure = (self.failure_mode == FailureMode::Closed)
             .then(|| batch.failures.first())
             .flatten()?;
         Some(FilterAction::Reject(responses_error_rejection(
@@ -295,7 +297,7 @@ impl FileSearchCalloutFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let batch = self.execute_plan(&plan).await;
+        let batch = self.execute_plan(&plan, &ctx.request.headers).await;
         if let Some(rejection) = self.failure_rejection(&batch) {
             return Ok(rejection);
         }
@@ -523,7 +525,7 @@ fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
 }
 
 /// Whether `Connection` marks a request header as specific to one hop.
-fn connection_nominates_header(headers: &http::HeaderMap, name: &http::header::HeaderName) -> bool {
+fn connection_nominates_header(headers: &HeaderMap, name: &http::header::HeaderName) -> bool {
     headers
         .get_all(http::header::CONNECTION)
         .iter()

@@ -14,8 +14,7 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize, de::Visitor};
 use serde_json::Value;
 
-use super::config::OnError;
-use crate::openai::api_client::ApiClient;
+use crate::openai::{api_client::ApiClient, responses::config_validation::FailureMode};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -338,7 +337,7 @@ pub(crate) struct FileSearchClientConfig {
     pub api_client: ApiClient,
 
     /// Whether one failed chunk stops scheduling later callouts.
-    pub on_error: OnError,
+    pub failure_mode: FailureMode,
 
     /// Maximum response body size enforced by the core client.
     pub max_response_bytes: usize,
@@ -356,7 +355,7 @@ pub(crate) struct FileSearchClient {
     api_client: ApiClient,
 
     /// Whether one failed chunk stops scheduling later callouts.
-    on_error: OnError,
+    failure_mode: FailureMode,
 
     /// Maximum response body size enforced by the core client.
     max_response_bytes: usize,
@@ -373,7 +372,7 @@ impl FileSearchClient {
     pub fn new(config: FileSearchClientConfig) -> Self {
         Self {
             api_client: config.api_client,
-            on_error: config.on_error,
+            failure_mode: config.failure_mode,
             max_response_bytes: config.max_response_bytes,
             max_total_response_bytes: config.max_total_response_bytes,
             timeout: config.timeout,
@@ -385,7 +384,12 @@ impl FileSearchClient {
         clippy::too_many_lines,
         reason = "deadline, budget, and failure policy share one scheduling loop"
     )]
-    pub async fn search(&self, specs: &[SearchSpec<'_>], call_count: usize) -> SearchBatch {
+    pub async fn search(
+        &self,
+        specs: &[SearchSpec<'_>],
+        call_count: usize,
+        request_headers: &HeaderMap,
+    ) -> SearchBatch {
         let mut batch = SearchBatch::new(call_count);
         let mut consumed_response_bytes = 0_usize;
         let mut deadline_recorded = false;
@@ -420,7 +424,7 @@ impl FileSearchClient {
             };
             let futures = chunk
                 .iter()
-                .map(|spec| self.search_one(spec, execution_started, Arc::clone(&admission)));
+                .map(|spec| self.search_one(spec, execution_started, Arc::clone(&admission), request_headers));
             let chunk_results = futures::future::join_all(futures).await;
             let chunk_failed = merge_chunk_results(
                 &mut batch,
@@ -436,7 +440,7 @@ impl FileSearchClient {
                 deadline_recorded = true;
                 break;
             }
-            if chunk_failed && self.on_error == OnError::Reject {
+            if chunk_failed && self.failure_mode == FailureMode::Closed {
                 if let Some(remaining_specs) = specs.get(next_spec..) {
                     append_fail_closed_failures(&mut batch.failures, remaining_specs);
                 }
@@ -457,11 +461,14 @@ impl FileSearchClient {
         spec: &SearchSpec<'_>,
         execution_started: Instant,
         response_admission: Arc<ResponseAdmission>,
+        request_headers: &HeaderMap,
     ) -> Result<SearchResponse, FileSearchError> {
         deadline_remaining(self.timeout, execution_started, spec.store_id)?;
         let request = self.build_request(spec, execution_started)?;
         deadline_remaining(self.timeout, execution_started, spec.store_id)?;
-        let body = self.execute_request(request, spec.store_id, execution_started).await?;
+        let body = self
+            .execute_request(request, spec.store_id, execution_started, request_headers)
+            .await?;
         parse_response_body_with_deadline(
             body,
             spec.store_id,
@@ -526,12 +533,13 @@ impl FileSearchClient {
         request: PreparedSearchRequest,
         store_id: &str,
         execution_started: Instant,
+        request_headers: &HeaderMap,
     ) -> Result<Bytes, FileSearchError> {
         let remaining = deadline_remaining(self.timeout, execution_started, store_id)?;
         tokio::time::timeout(
             remaining,
             self.api_client
-                .post_json_bytes(request.url, request.body, &HeaderMap::new()),
+                .post_json_bytes(request.url, request.body, request_headers),
         )
         .await
         .map_err(|_elapsed| execution_deadline_error(store_id))
