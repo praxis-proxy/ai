@@ -35,6 +35,7 @@ use crate::{
 // -----------------------------------------------------------------------------
 
 /// Cursor pagination parameters for conversation item listing.
+#[derive(Debug)]
 struct ItemListParams {
     /// Item ID to page after.
     after_item_id: Option<String>,
@@ -1049,39 +1050,35 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn parse_params_skips_pair_without_separator() {
-        let params = parse_item_list_params(Some("noseparator&limit=5"));
-        assert_eq!(params.limit, 5);
-        assert!(params.after_item_id.is_none());
-    }
-
-    #[test]
-    fn parse_params_unknown_order_stays_default() {
-        let params = parse_item_list_params(Some("order=random"));
+    fn parse_params_unknown_key_only_rejected() {
+        let err = parse_item_list_params(Some("noseparator&limit=5")).unwrap_err();
         assert!(
-            !params.order.is_ascending(),
-            "unknown order should keep default descending"
+            err.contains("Unknown query parameter"),
+            "unknown key-only component should be rejected: {err}"
         );
     }
 
     #[test]
-    fn parse_params_non_numeric_limit_uses_default() {
-        let params = parse_item_list_params(Some("limit=abc"));
-        assert_eq!(params.limit, DEFAULT_PAGE_LIMIT);
-    }
-
-    // -------------------------------------------------------------------------
-    // decode_query_component / decode_item_id_path_segment
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn decode_query_component_invalid_utf8_uses_lossy() {
-        let result = decode_query_component("%FF%FE");
+    fn parse_params_unknown_order_rejected() {
+        let err = parse_item_list_params(Some("order=random")).unwrap_err();
         assert!(
-            result.contains('\u{FFFD}'),
-            "invalid UTF-8 should produce replacement characters"
+            err.contains("must be 'asc' or 'desc'"),
+            "unknown order should be rejected: {err}"
         );
     }
+
+    #[test]
+    fn parse_params_non_numeric_limit_rejected() {
+        let err = parse_item_list_params(Some("limit=abc")).unwrap_err();
+        assert!(
+            err.contains("not a valid integer"),
+            "non-numeric limit should be rejected: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // decode_item_id_path_segment
+    // -------------------------------------------------------------------------
 
     #[test]
     fn decode_item_id_path_segment_invalid_utf8_returns_error() {
@@ -1091,37 +1088,6 @@ mod tests {
             result.unwrap_err().contains("valid UTF-8"),
             "error should mention UTF-8 requirement"
         );
-    }
-
-    // -------------------------------------------------------------------------
-    // ItemListParams::effective_limit
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn effective_limit_clamps_zero_to_one() {
-        let params = ItemListParams {
-            limit: 0,
-            ..ItemListParams::default()
-        };
-        assert_eq!(params.effective_limit(), 1);
-    }
-
-    #[test]
-    fn effective_limit_clamps_above_max() {
-        let params = ItemListParams {
-            limit: MAX_PAGE_LIMIT + 50,
-            ..ItemListParams::default()
-        };
-        assert_eq!(params.effective_limit(), MAX_PAGE_LIMIT);
-    }
-
-    #[test]
-    fn effective_limit_returns_value_within_range() {
-        let params = ItemListParams {
-            limit: 50,
-            ..ItemListParams::default()
-        };
-        assert_eq!(params.effective_limit(), 50);
     }
 
     // -------------------------------------------------------------------------
@@ -1154,7 +1120,7 @@ mod tests {
 
     #[test]
     fn parse_params_none_query_returns_defaults() {
-        let params = parse_item_list_params(None);
+        let params = parse_item_list_params(None).unwrap();
         assert_eq!(params.limit, DEFAULT_PAGE_LIMIT);
         assert!(!params.order.is_ascending());
         assert!(params.after_item_id.is_none());
@@ -1162,39 +1128,153 @@ mod tests {
 
     #[test]
     fn parse_params_valid_after_parameter() {
-        let params = parse_item_list_params(Some("after=item_abc123&limit=10"));
+        let params = parse_item_list_params(Some("after=item_abc123&limit=10")).unwrap();
         assert_eq!(params.after_item_id.as_deref(), Some("item_abc123"));
         assert_eq!(params.limit, 10);
     }
 
     #[test]
     fn parse_params_asc_order() {
-        let params = parse_item_list_params(Some("order=asc"));
+        let params = parse_item_list_params(Some("order=asc")).unwrap();
         assert!(params.order.is_ascending(), "order=asc should set ascending");
     }
 
     #[test]
     fn parse_params_desc_order() {
-        let params = parse_item_list_params(Some("order=desc"));
+        let params = parse_item_list_params(Some("order=desc")).unwrap();
         assert!(!params.order.is_ascending(), "order=desc should set descending");
     }
 
     #[test]
-    fn parse_params_negative_limit_uses_default() {
-        let params = parse_item_list_params(Some("limit=-5"));
-        assert_eq!(
-            params.limit, DEFAULT_PAGE_LIMIT,
-            "negative limit should not parse as u32"
+    fn parse_params_negative_limit_rejected() {
+        let err = parse_item_list_params(Some("limit=-5")).unwrap_err();
+        assert!(
+            err.contains("not a valid integer"),
+            "negative limit should be rejected: {err}"
         );
     }
 
     #[test]
     fn parse_params_percent_encoded_after() {
-        let params = parse_item_list_params(Some("after=item%20with+space"));
+        let params = parse_item_list_params(Some("after=item%20with+space")).unwrap();
         assert_eq!(
             params.after_item_id.as_deref(),
             Some("item with space"),
             "percent-encoded and plus-encoded values should decode"
+        );
+    }
+
+    #[test]
+    fn parse_params_limit_zero_accepted() {
+        let params = parse_item_list_params(Some("limit=0")).unwrap();
+        assert_eq!(params.limit, 0, "limit=0 should be accepted");
+    }
+
+    #[test]
+    fn parse_params_limit_above_max_rejected() {
+        let err = parse_item_list_params(Some(&format!("limit={}", MAX_PAGE_LIMIT + 1))).unwrap_err();
+        assert!(
+            err.contains("must be between 0 and"),
+            "limit above max should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_duplicate_limit_rejected() {
+        let err = parse_item_list_params(Some("limit=5&limit=10")).unwrap_err();
+        assert!(
+            err.contains("Duplicate query parameter: 'limit'"),
+            "duplicate limit should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_duplicate_order_rejected() {
+        let err = parse_item_list_params(Some("order=asc&order=desc")).unwrap_err();
+        assert!(
+            err.contains("Duplicate query parameter: 'order'"),
+            "duplicate order should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_duplicate_after_rejected() {
+        let err = parse_item_list_params(Some("after=a&after=b")).unwrap_err();
+        assert!(
+            err.contains("Duplicate query parameter: 'after'"),
+            "duplicate after should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_unknown_param_rejected() {
+        let err = parse_item_list_params(Some("foo=bar")).unwrap_err();
+        assert!(
+            err.contains("Unknown query parameter: 'foo'"),
+            "unknown parameter should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_known_key_only_rejected() {
+        let err = parse_item_list_params(Some("limit")).unwrap_err();
+        assert!(
+            err.contains("Missing value for query parameter 'limit'"),
+            "key-only known param should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_empty_after_rejected() {
+        let err = parse_item_list_params(Some("after=")).unwrap_err();
+        assert!(
+            err.contains("cursor must not be empty"),
+            "empty after should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_invalid_utf8_key_rejected() {
+        let err = parse_item_list_params(Some("%FF=1")).unwrap_err();
+        assert!(
+            err.contains("valid UTF-8"),
+            "invalid UTF-8 key should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_invalid_utf8_value_rejected() {
+        let err = parse_item_list_params(Some("limit=%FF")).unwrap_err();
+        assert!(
+            err.contains("valid UTF-8"),
+            "invalid UTF-8 value should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_params_repeated_include_allowed() {
+        let params = parse_item_list_params(Some(
+            "include=reasoning.encrypted_content&include=message.output_text.logprobs",
+        ))
+        .unwrap();
+        assert_eq!(
+            params.limit, DEFAULT_PAGE_LIMIT,
+            "repeated include should not affect other defaults"
+        );
+    }
+
+    #[test]
+    fn parse_params_empty_components_ignored() {
+        let params = parse_item_list_params(Some("&&limit=5&")).unwrap();
+        assert_eq!(params.limit, 5, "empty components should be silently ignored");
+    }
+
+    #[test]
+    fn parse_params_encoded_duplicate_key_rejected() {
+        let err = parse_item_list_params(Some("limit=5&%6Cimit=10")).unwrap_err();
+        assert!(
+            err.contains("Duplicate query parameter: 'limit'"),
+            "encoded duplicate key should be rejected: {err}"
         );
     }
 
