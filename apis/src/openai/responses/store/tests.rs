@@ -3710,6 +3710,144 @@ fn parse_query_params_key_only_unknown_ignored() {
 }
 
 // -----------------------------------------------------------------------------
+// validate_get_response_query_params
+// -----------------------------------------------------------------------------
+
+#[test]
+fn validate_get_response_query_params_no_query() {
+    assert!(
+        super::filter::validate_get_response_query_params(None).is_ok(),
+        "no query string should be valid"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_empty_query() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("")).is_ok(),
+        "empty query string should be valid"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_false_accepted() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("stream=false")).is_ok(),
+        "stream=false should be accepted"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_true_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=true")).unwrap_err();
+    assert!(
+        err.contains("'stream' parameter is not supported"),
+        "stream=true should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_invalid_value_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=maybe")).unwrap_err();
+    assert!(
+        err.contains("must be 'true' or 'false'"),
+        "stream=maybe should be rejected as invalid boolean: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_bracket_rejected() {
+    let err = super::filter::validate_get_response_query_params(
+        Some("include[]=file_search_call_results.results"),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "include[] should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_percent_encoded_rejected() {
+    let err =
+        super::filter::validate_get_response_query_params(Some("include%5B%5D=usage")).unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "percent-encoded include[] should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_bare_rejected() {
+    let err =
+        super::filter::validate_get_response_query_params(Some("include=usage")).unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "bare include should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_starting_after_rejected() {
+    let err =
+        super::filter::validate_get_response_query_params(Some("starting_after=5")).unwrap_err();
+    assert!(
+        err.contains("'starting_after' parameter is not supported"),
+        "starting_after should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_obfuscation_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include_obfuscation=true"))
+        .unwrap_err();
+    assert!(
+        err.contains("'include_obfuscation' parameter is not supported"),
+        "include_obfuscation should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_unknown_param_rejected() {
+    let err =
+        super::filter::validate_get_response_query_params(Some("foo=bar")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "unknown param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_known_rejected() {
+    let err =
+        super::filter::validate_get_response_query_params(Some("stream")).unwrap_err();
+    assert!(
+        err.contains("Missing value"),
+        "key-only known param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_include_rejected() {
+    let err =
+        super::filter::validate_get_response_query_params(Some("include")).unwrap_err();
+    assert!(
+        err.contains("Missing value"),
+        "key-only include should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_unknown_rejected() {
+    let err =
+        super::filter::validate_get_response_query_params(Some("foo")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "key-only unknown param should be rejected: {err}"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // list_input_items (direct unit tests)
 // -----------------------------------------------------------------------------
 
