@@ -56,12 +56,6 @@ impl Default for ItemListParams {
     }
 }
 
-impl ItemListParams {
-    /// Return the effective limit clamped to the API bounds.
-    fn effective_limit(&self) -> u32 {
-        self.limit.clamp(1, MAX_PAGE_LIMIT)
-    }
-}
 
 // -----------------------------------------------------------------------------
 // Conversation Lifecycle
@@ -332,6 +326,10 @@ pub(super) async fn handle_list_items(
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
+    let params = match parse_item_list_params(ctx.request.uri.query()) {
+        Ok(params) => params,
+        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+    };
     match store.get_conversation(tenant_id, conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
@@ -343,8 +341,7 @@ pub(super) async fn handle_list_items(
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
 
-    let params = parse_item_list_params(ctx.request.uri.query());
-    let limit = params.effective_limit();
+    let limit = params.limit;
     let rows = match store
         .list_conversation_items(
             tenant_id,
@@ -795,41 +792,89 @@ fn decode_query_component_strict(value: &str) -> Result<Cow<'_, str>, String> {
         .map_err(|e| format!("query parameter must be valid UTF-8: {e}"))
 }
 
-/// Parse cursor-based pagination parameters from a query string.
-fn parse_item_list_params(query: Option<&str>) -> ItemListParams {
+/// Parse and validate cursor-based pagination parameters from a query string.
+fn parse_item_list_params(query: Option<&str>) -> Result<ItemListParams, String> {
     let Some(qs) = query else {
-        return ItemListParams::default();
+        return Ok(ItemListParams::default());
     };
 
     let mut params = ItemListParams::default();
+    let mut seen_limit = false;
+    let mut seen_order = false;
+    let mut seen_after = false;
+
     for pair in qs.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
+        if pair.is_empty() {
             continue;
+        }
+        let Some((raw_key, raw_value)) = pair.split_once('=') else {
+            let key = decode_query_component_strict(pair)?;
+            if matches!(key.as_ref(), "include" | "include[]") {
+                continue;
+            }
+            if matches!(key.as_ref(), "limit" | "order" | "after") {
+                return Err(format!("Missing value for query parameter '{key}'."));
+            }
+            return Err(format!("Unknown query parameter: '{key}'."));
         };
-        match key {
+        let key = decode_query_component_strict(raw_key)?;
+        match key.as_ref() {
             "after" => {
-                params.after_item_id = Some(decode_query_component(value));
+                if seen_after {
+                    return Err("Duplicate query parameter: 'after'.".to_owned());
+                }
+                seen_after = true;
+                let value = decode_query_component_strict(raw_value)?;
+                if value.is_empty() {
+                    return Err("Invalid value for 'after': cursor must not be empty.".to_owned());
+                }
+                params.after_item_id = Some(value.into_owned());
             },
             "limit" => {
-                if let Ok(n) = value.parse::<u32>() {
-                    params.limit = n;
+                if seen_limit {
+                    return Err("Duplicate query parameter: 'limit'.".to_owned());
                 }
+                seen_limit = true;
+                let value = decode_query_component_strict(raw_value)?;
+                params.limit = parse_limit(&value)?;
             },
-            "order" => match value {
-                "asc" => params.order = ItemOrder::Asc,
-                "desc" => params.order = ItemOrder::Desc,
-                _ => {},
+            "order" => {
+                if seen_order {
+                    return Err("Duplicate query parameter: 'order'.".to_owned());
+                }
+                seen_order = true;
+                let value = decode_query_component_strict(raw_value)?;
+                params.order = parse_order(&value)?;
             },
-            _ => {},
+            "include" | "include[]" => {},
+            _ => return Err(format!("Unknown query parameter: '{key}'.")),
         }
     }
-    params
+    Ok(params)
 }
 
-/// Decode one application/x-www-form-urlencoded query component.
-fn decode_query_component(value: &str) -> String {
-    let normalized = value.replace('+', " ");
-    percent_decode_str(&normalized).decode_utf8_lossy().into_owned()
+/// Parse and validate a `limit` query-string value.
+fn parse_limit(value: &str) -> Result<u32, String> {
+    let n: u32 = value
+        .parse()
+        .map_err(|_| format!("Invalid value for 'limit': '{value}' is not a valid integer."))?;
+    if n > MAX_PAGE_LIMIT {
+        return Err(format!(
+            "Invalid value for 'limit': must be between 0 and {MAX_PAGE_LIMIT}, got {n}."
+        ));
+    }
+    Ok(n)
+}
+
+/// Parse and validate an `order` query-string value.
+fn parse_order(value: &str) -> Result<ItemOrder, String> {
+    match value {
+        "asc" => Ok(ItemOrder::Asc),
+        "desc" => Ok(ItemOrder::Desc),
+        _ => Err(format!(
+            "Invalid value for 'order': must be 'asc' or 'desc', got '{value}'."
+        )),
+    }
 }
 
 /// Return the current Unix timestamp as an `i64`.
