@@ -74,8 +74,8 @@ use tracing::{debug, trace};
 use self::config::{ResponsesFormatConfig, build_config};
 use crate::{
     classifier::{
-        AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_create, is_responses_path,
-        is_responses_websocket_handshake,
+        AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_create,
+        is_responses_path, is_responses_websocket_handshake,
     },
     promotion::is_promotable_value,
 };
