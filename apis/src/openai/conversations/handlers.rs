@@ -1184,6 +1184,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_params_limit_at_max_accepted() {
+        let params = parse_item_list_params(Some(&format!("limit={MAX_PAGE_LIMIT}"))).unwrap();
+        assert_eq!(params.limit, MAX_PAGE_LIMIT, "limit at MAX_PAGE_LIMIT should be accepted");
+    }
+
+    #[test]
     fn parse_params_duplicate_limit_rejected() {
         let err = parse_item_list_params(Some("limit=5&limit=10")).unwrap_err();
         assert!(
