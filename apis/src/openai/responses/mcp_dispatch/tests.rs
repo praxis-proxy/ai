@@ -12,8 +12,8 @@ use serde_json::json;
 use super::{
     McpDispatchFilter, build_error_result, build_success_result, content_blocks_to_text, encode_function_name,
     execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls,
-    find_approval_required, find_by_encoded_name, is_mcp_tool_call, parse_call_arguments, process_call_result,
-    resolve_tool_entry,
+    find_approval_required, find_by_encoded_name, is_mcp_tool_call, normalize_arguments, parse_call_arguments,
+    process_call_result, resolve_tool_entry,
 };
 use crate::{
     openai::responses::{
@@ -672,6 +672,40 @@ fn process_call_result_transport_error() {
 }
 
 // =========================================================================
+// normalize_arguments
+// =========================================================================
+
+#[test]
+fn normalize_arguments_parses_json_string() {
+    let raw = serde_json::json!("{\"city\":\"Paris\"}");
+    let (parsed, canonical) = normalize_arguments(&raw).unwrap();
+    assert_eq!(parsed["city"], "Paris");
+    assert_eq!(canonical, "{\"city\":\"Paris\"}");
+}
+
+#[test]
+fn normalize_arguments_object_passthrough() {
+    let raw = serde_json::json!({"city": "Paris"});
+    let (parsed, canonical) = normalize_arguments(&raw).unwrap();
+    assert_eq!(parsed["city"], "Paris");
+    assert!(canonical.contains("Paris"));
+}
+
+#[test]
+fn normalize_arguments_malformed_string_returns_error() {
+    let raw = serde_json::json!("not-json");
+    assert!(normalize_arguments(&raw).is_err());
+}
+
+#[test]
+fn normalize_arguments_empty_object_string() {
+    let raw = serde_json::json!("{}");
+    let (parsed, canonical) = normalize_arguments(&raw).unwrap();
+    assert!(parsed.is_object());
+    assert_eq!(canonical, "{}");
+}
+
+// =========================================================================
 // extract_call_id / extract_arguments
 // =========================================================================
 
@@ -704,6 +738,23 @@ fn extract_arguments_present() {
 fn extract_arguments_absent() {
     let tc = serde_json::json!({});
     assert_eq!(extract_arguments(&tc), "");
+}
+
+#[test]
+fn extract_arguments_string_not_double_encoded() {
+    let tc = serde_json::json!({"arguments": "{\"city\":\"Paris\"}"});
+    let args = extract_arguments(&tc);
+    assert_eq!(
+        args, "{\"city\":\"Paris\"}",
+        "string arguments must not be double-encoded"
+    );
+}
+
+#[test]
+fn extract_arguments_malformed_string_passes_through() {
+    let tc = serde_json::json!({"arguments": "not-json"});
+    let args = extract_arguments(&tc);
+    assert_eq!(args, "not-json", "malformed string should pass through unchanged");
 }
 
 // =========================================================================
@@ -952,6 +1003,34 @@ fn on_response_body_approval_required_sets_done_metadata() {
         Some(&"done".to_owned())
     );
     assert_dispatch_action(&ctx, "done");
+}
+
+#[test]
+fn on_response_body_approval_emits_correct_arguments() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "c1",
+            "arguments": "{\"city\":\"Paris\"}"
+        })],
+        ..ResponsesState::default()
+    };
+    ctx.extensions.insert(state);
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.accumulated_output.len(), 1);
+    let event = &state.accumulated_output[0];
+    assert_eq!(event["type"], "mcp_approval_request");
+    assert_eq!(
+        event["arguments"], "{\"city\":\"Paris\"}",
+        "approval event arguments must not be double-encoded"
+    );
 }
 
 // =========================================================================

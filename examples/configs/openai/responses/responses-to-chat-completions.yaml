@@ -1,0 +1,57 @@
+# Responses API to Chat Completions
+#
+# Accepts OpenAI Responses create requests while targeting an inference
+# backend that only implements /v1/chat/completions.
+#
+# Pipeline order:
+#   1. openai_responses_format classifies the client request.
+#   2. openai_responses_validate performs the canonical JSON parse and
+#      creates ResponsesState for downstream enrichment and translation.
+#   3. responses_to_chat_completions converts the canonical request to
+#      Chat Completions and converts finite JSON responses back to a
+#      Responses resource.
+#   4. path_rewrite changes the upstream endpoint explicitly.
+#
+# Streaming Chat Completions SSE is intentionally passed through byte-for-byte
+# by this base filter. Pair this pipeline with the incremental Responses stream
+# converter when that filter is available.
+
+listeners:
+  - name: responses-chat-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-chat-translation]
+
+filter_chains:
+  - name: responses-chat-translation
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: responses_to_chat_completions
+        max_body_bytes: 67108864
+
+      - filter: path_rewrite
+        replace:
+          pattern: "^/v1/responses/?$"
+          replacement: "/v1/chat/completions"
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+              methods: [POST]
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "chat-completions-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "chat-completions-backend"
+            endpoints:
+              - "127.0.0.1:3001"

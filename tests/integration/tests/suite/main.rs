@@ -45,6 +45,7 @@ mod conversations_rehydrate;
 mod examples;
 mod failure_mode;
 mod guardrails;
+mod inference_fixtures;
 mod mcp;
 mod mcp_broker;
 mod openai_mcp_tool_resolve;

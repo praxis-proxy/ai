@@ -17,7 +17,10 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::config::{FailureMode, SearchContextSize, SearchProvider, ValidatedConfig};
+use super::{
+    ValidatedConfig,
+    config::{FailureMode, SearchContextSize, SearchProvider},
+};
 use crate::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
 
 /// Response body cap for search callouts (1 MiB). Distinct from
@@ -106,11 +109,12 @@ impl SearchClient {
     /// Returns [`FilterError`] if the API key header value is
     /// not valid ASCII.
     pub(crate) fn from_config(
+        filter_name: &'static str,
         config: &ValidatedConfig,
         subrequest_client: SubRequestClient,
     ) -> Result<Self, FilterError> {
         http::HeaderValue::from_str(config.api_key.expose_secret())
-            .map_err(|e| FilterError::from(format!("invalid API key header value: {e}")))?;
+            .map_err(|e| FilterError::from(format!("{filter_name}: invalid API key header value: {e}")))?;
         Ok(Self {
             client: subrequest_client,
             timeout: Duration::from_millis(config.timeout_ms),
@@ -127,7 +131,12 @@ impl SearchClient {
     pub(crate) async fn search(&self, query: &str, context_size: Option<SearchContextSize>) -> SearchOutcome {
         let size = context_size.unwrap_or(self.default_context_size);
         let count = size.result_count();
-        debug!(provider = self.provider.as_str(), query, count, "executing web search");
+        debug!(
+            provider = self.provider.as_str(),
+            query_bytes = query.len(),
+            count,
+            "executing web search"
+        );
         let (url, request) = match self.provider {
             SearchProvider::Brave => self.build_brave_request(query, count),
             SearchProvider::Tavily => self.build_tavily_request(query, size),
@@ -500,7 +509,7 @@ mod tests {
             status_on_error: 502,
             base_url: None,
         };
-        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
 
         let (url, request) = client.build_you_request("Praxis proxy", 5);
 
@@ -555,8 +564,31 @@ mod tests {
             status_on_error: 502,
             base_url: None,
         };
-        let client = SearchClient::from_config(&config, test_subrequest_client());
+        let client = SearchClient::from_config("test", &config, test_subrequest_client());
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn invalid_api_key_diagnostic_names_owner() {
+        let config = ValidatedConfig {
+            provider: SearchProvider::Brave,
+            api_key: SecretString::from("invalid\nkey".to_owned()),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            failure_mode: FailureMode::Closed,
+            status_on_error: 502,
+            base_url: None,
+        };
+
+        let error = SearchClient::from_config("anthropic_web_search", &config, test_subrequest_client()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("anthropic_web_search: invalid API key header value"),
+            "diagnostic should name the owning filter: {error}"
+        );
     }
 
     #[test]
@@ -571,7 +603,7 @@ mod tests {
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
-        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_brave_request("test query", 5);
         assert!(
             url.starts_with("http://localhost:9999/"),
@@ -591,7 +623,7 @@ mod tests {
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
-        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_tavily_request("test query", SearchContextSize::Medium);
         assert!(
             url.starts_with("http://localhost:9999/"),
@@ -611,7 +643,7 @@ mod tests {
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
-        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_you_request("test query", 5);
         assert!(
             url.starts_with("http://localhost:9999/"),
@@ -631,7 +663,7 @@ mod tests {
             status_on_error: 502,
             base_url: None,
         };
-        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
         assert!(
             matches!(outcome, SearchOutcome::Rejected { status: 502 }),
@@ -651,7 +683,7 @@ mod tests {
             status_on_error: 502,
             base_url: None,
         };
-        let client = SearchClient::from_config(&config, test_subrequest_client()).unwrap();
+        let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
         assert!(
             matches!(outcome, SearchOutcome::Skipped),
@@ -670,7 +702,7 @@ mod tests {
             status_on_error: 502,
             base_url: None,
         };
-        SearchClient::from_config(&config, test_subrequest_client()).unwrap()
+        SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
     }
 
     fn spawn_http_server(listener: TcpListener, status: u16, body: &str) {
