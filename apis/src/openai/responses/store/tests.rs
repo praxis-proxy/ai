@@ -3935,6 +3935,21 @@ fn validate_get_response_query_params_invalid_utf8_value_rejected() {
     );
 }
 
+#[test]
+fn known_params_and_validator_match_arms_in_sync() {
+    for &param in super::filter::GET_RESPONSE_KNOWN_PARAMS {
+        let result = super::filter::validate_get_response_param(param, "__probe__");
+        assert!(
+            result.is_err(),
+            "known param '{param}' should be handled by validate_get_response_param"
+        );
+        assert!(
+            !result.unwrap_err().contains("Unknown"),
+            "known param '{param}' should not produce an 'Unknown' error"
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // list_input_items (direct unit tests)
 // -----------------------------------------------------------------------------

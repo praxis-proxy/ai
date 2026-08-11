@@ -1053,7 +1053,7 @@ fn reject_known_key_only_param(key: &str) -> Result<(), String> {
 }
 
 /// Known query parameters for `GET /v1/responses/{id}`, per the OpenAI spec.
-const GET_RESPONSE_KNOWN_PARAMS: &[&str] = &[
+pub(super) const GET_RESPONSE_KNOWN_PARAMS: &[&str] = &[
     "stream",
     "include",
     "include[]",
@@ -1101,7 +1101,7 @@ pub(super) fn validate_get_response_query_params(query: Option<&str>) -> Result<
 }
 
 /// Validate a single decoded query parameter for `GET /v1/responses/{id}`.
-fn validate_get_response_param(key: &str, value: &str) -> Result<(), String> {
+pub(super) fn validate_get_response_param(key: &str, value: &str) -> Result<(), String> {
     match key {
         "stream" => match value {
             "false" => Ok(()),
