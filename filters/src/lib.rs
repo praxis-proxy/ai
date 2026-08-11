@@ -80,6 +80,7 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            metrics_route: None,
             peer_identity: None,
             request: req,
             request_body_bytes: 0,

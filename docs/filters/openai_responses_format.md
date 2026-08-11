@@ -9,6 +9,8 @@ Classifies AI API request bodies and promotes routing facts to headers, metadata
 
 Classification formats: `openai_responses`, `openai_chat_completions`, `unknown_json`, `invalid_json`, `non_json`.
 
+`POST /v1/responses` (create) is authoritative: a valid create body may omit every discriminator the body heuristics key on (`input`, `prompt` object, `previous_response_id`, `conversation`) — for example `{"model":"gpt-5"}` — and would otherwise classify as `unknown_json`. On this endpoint such a body is classified as `openai_responses` instead, while body-derived facts (model, stream, store, …) are preserved. Bodies carrying positive signals for another format (`openai_chat_completions`, `anthropic_messages`) and genuine parse failures (`invalid_json`, `non_json`) are left untouched, so `on_invalid: reject` still rejects real errors.
+
 A `GET /v1/responses` request with valid HTTP `WebSocket` upgrade headers is classified as `openai_responses` without inspecting a body. This handshake classification promotes only the format: model, stream, store, and mode facts remain absent. An ordinary bodyless `GET /v1/responses` remains unclassified.
 
 Routing mode for Responses API: `stateful` when the request contains `previous_response_id`, non-empty `tools`, `store=true` (default when omitted), `background=true`, `conversation`, or `prompt.id`; `stateless` when `store=false` with no other stateful markers.
