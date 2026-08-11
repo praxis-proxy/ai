@@ -13,9 +13,9 @@ use crate::GcpAdcFilter;
 #[cfg(feature = "http-callout-filter")]
 use crate::HttpCalloutFilter;
 use crate::{
-    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
-    PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
-    TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IdentityHeaderGuardFilter, IntelligentRouteFilter,
+    McpFilter, ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter,
+    TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -106,6 +106,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "http_callout" => HttpCalloutFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "identity_header_guard" => IdentityHeaderGuardFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
