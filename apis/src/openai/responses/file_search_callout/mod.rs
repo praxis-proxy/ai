@@ -46,7 +46,7 @@ use crate::{
         config_validation::FailureMode,
         error::responses_error_rejection,
         state::{MAX_CITATION_FILES, ResponsesState},
-        stream_events::accumulator::merge_usage,
+        usage::merge_usage,
     },
     subrequest::SubRequestClient,
 };
