@@ -10,6 +10,7 @@
 
 pub mod agentic;
 pub mod guardrails;
+mod identity_guard;
 pub mod inference;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
@@ -21,6 +22,7 @@ mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use guardrails::AiGuardrailsFilter;
+pub use identity_guard::IdentityHeaderGuardFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
