@@ -141,7 +141,7 @@ jobs:
                                      curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
             if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
               echo "::error::vLLM container exited unexpectedly"
-              docker logs vllm 2>&1 | tail -30
+              docker logs vllm 2>&1
               exit 1
             fi
             sleep 5
