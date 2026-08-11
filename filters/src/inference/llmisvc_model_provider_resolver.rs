@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! LLMISvc model-provider resolver: rewrites KServe publisher-ID body
+//! `LLMISvc` model-provider resolver: rewrites `KServe` publisher-ID body
 //! `model` values to the short model name while leaving the routing
 //! header untouched.
 
@@ -28,7 +28,7 @@ const DEFAULT_HEADER: &str = "X-Model";
 /// Filter metadata key for the original publisher ID (for metering).
 const META_PUBLISHER_ID: &str = "llmisvc_model_provider_resolver.publisher_id";
 
-/// Prefix that identifies a KServe / LLMISvc publisher model ID.
+/// Prefix that identifies a `KServe` / `LLMISvc` publisher model ID.
 const PUBLISHERS_PREFIX: &str = "publishers/";
 
 /// Separator between the publisher path and the short model name.
@@ -38,11 +38,11 @@ const MODELS_SEPARATOR: &str = "/models/";
 // Config
 // -----------------------------------------------------------------------------
 
-/// Deserialized YAML config for the LLMISvc model-provider resolver.
+/// Deserialized YAML config for the `LLMISvc` model-provider resolver.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LlmisvcModelProviderResolverConfig {
-    /// Request header that carries the publisher ID for KServe routing.
+    /// Request header that carries the publisher ID for `KServe` routing.
     ///
     /// Defaults to `X-Model` (same as `model_to_header`).
     #[serde(default = "default_header")]
@@ -67,16 +67,16 @@ fn default_max_body_bytes() -> usize {
 // LlmisvcModelProviderResolverFilter
 // -----------------------------------------------------------------------------
 
-/// Ports the LLMISvc / KServe BBR body-rewrite branch from IPP's
+/// Ports the `LLMISvc` / `KServe` BBR body-rewrite branch from IPP's
 /// `model-provider-resolver`.
 ///
 /// Prefer the configured request header (default `X-Model`) for the
 /// model name, falling back to the JSON body `"model"` field. When the
 /// resolved name is a publisher ID (`publishers/.../models/<name>`),
 /// rewrite the body `"model"` to `<name>` only. The routing header is
-/// never modified — KServe routes on the publisher ID.
+/// never modified — `KServe` routes on the publisher ID.
 ///
-/// Does **not** resolve ExternalModel / ExternalProvider CRDs, perform
+/// Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform
 /// weighted provider selection, rewrite `Host`, or inject credentials.
 ///
 /// # YAML configuration
@@ -96,7 +96,7 @@ fn default_max_body_bytes() -> usize {
 /// assert_eq!(filter.name(), "llmisvc_model_provider_resolver");
 /// ```
 pub struct LlmisvcModelProviderResolverFilter {
-    /// Header that carries the publisher ID used for KServe routing.
+    /// Header that carries the publisher ID used for `KServe` routing.
     header: HeaderName,
 
     /// Maximum request body size to buffer.
@@ -268,7 +268,7 @@ fn header_model_name(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> Option
     }
 }
 
-/// Extract the short model name from a KServe publisher ID.
+/// Extract the short model name from a `KServe` publisher ID.
 ///
 /// Mirrors IPP: require `publishers/` prefix, then take the segment
 /// after the first `/models/` when non-empty.
@@ -394,36 +394,21 @@ mod tests {
             HeaderValue::from_static("publishers/rhoai/models/granite-3.1-8b"),
         );
         let mut ctx = crate::test_utils::make_filter_context(&req);
-
-        let json = br#"{"model":"publishers/rhoai/models/granite-3.1-8b","messages":[]}"#;
-        let mut body = Some(Bytes::from_static(json));
+        let mut body =
+            Some(Bytes::from_static(br#"{"model":"publishers/rhoai/models/granite-3.1-8b","messages":[]}"#));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "rewrite should continue");
 
         let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            parsed["model"].as_str(),
-            Some("granite-3.1-8b"),
-            "body model should be rewritten to short name"
-        );
+        assert_eq!(parsed["model"].as_str(), Some("granite-3.1-8b"));
         assert_eq!(
             ctx.filter_metadata.get(META_PUBLISHER_ID).map(String::as_str),
             Some("publishers/rhoai/models/granite-3.1-8b"),
-            "publisher ID should be stashed in filter metadata"
         );
-        assert!(
-            ctx.extra_request_headers.is_empty(),
-            "routing header must not be modified"
-        );
-        assert!(
-            ctx.request_headers_to_set.is_empty(),
-            "routing header must not be overwritten via request_headers_to_set"
-        );
-        assert!(
-            ctx.request_headers_to_remove.is_empty(),
-            "routing header must not be removed"
-        );
+        assert!(ctx.extra_request_headers.is_empty());
+        assert!(ctx.request_headers_to_set.is_empty());
+        assert!(ctx.request_headers_to_remove.is_empty());
     }
 
     #[tokio::test]

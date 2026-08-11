@@ -3,19 +3,19 @@
 
 # `llmisvc_model_provider_resolver`
 
-Ports the LLMISvc / KServe BBR body-rewrite branch from IPP's `model-provider-resolver`.
+Ports the `LLMISvc` / `KServe` BBR body-rewrite branch from IPP's `model-provider-resolver`.
 
 ## Configuration Notes
 
-Prefer the configured request header (default `X-Model`) for the model name, falling back to the JSON body `"model"` field. When the resolved name is a publisher ID (`publishers/.../models/<name>`), rewrite the body `"model"` to `<name>` only. The routing header is never modified — KServe routes on the publisher ID.
+Prefer the configured request header (default `X-Model`) for the model name, falling back to the JSON body `"model"` field. When the resolved name is a publisher ID (`publishers/.../models/<name>`), rewrite the body `"model"` to `<name>` only. The routing header is never modified — `KServe` routes on the publisher ID.
 
-Does **not** resolve ExternalModel / ExternalProvider CRDs, perform weighted provider selection, rewrite `Host`, or inject credentials.
+Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform weighted provider selection, rewrite `Host`, or inject credentials.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `header` | string | no | Request header that carries the publisher ID for KServe routing. Defaults to `X-Model` (same as `model_to_header`). |
+| `header` | string | no | Request header that carries the publisher ID for `KServe` routing. Defaults to `X-Model` (same as `model_to_header`). |
 | `max_body_bytes` | integer | no | Maximum request body size to buffer before parsing. |
 
 ## Example

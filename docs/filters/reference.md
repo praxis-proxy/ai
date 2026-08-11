@@ -64,7 +64,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`llmisvc_model_provider_resolver`](llmisvc_model_provider_resolver.md) | Ports the LLMISvc / KServe BBR body-rewrite branch from IPP's `model-provider-resolver`. |
+| [`llmisvc_model_provider_resolver`](llmisvc_model_provider_resolver.md) | Ports the `LLMISvc` / `KServe` BBR body-rewrite branch from IPP's `model-provider-resolver`. |
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
 
 ### Prompt Enrich
