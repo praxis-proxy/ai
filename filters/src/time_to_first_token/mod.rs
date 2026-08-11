@@ -32,18 +32,14 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::histogram;
-use praxis_ai_apis::is_event_stream_content_type;
+use praxis_ai_apis::{is_event_stream_content_type, promotion::is_promotable_value};
 use praxis_filter::{
-    BodyAccess, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::value_safety::is_safe_promoted_value, parse_filter_config,
+    BodyAccess, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
 use tracing::debug;
 
 /// Prometheus histogram name for time-to-first-token measurements.
 const METRIC_TTFT_SECONDS: &str = "praxis_ai_ttft_seconds";
-
-/// Maximum length of a body-derived value promoted to metric labels.
-const MAX_PROMOTED_VALUE_LEN: usize = 256;
 
 /// Metadata key indicating this request is an active TTFT candidate.
 /// Present after `on_response` detects SSE; removed once TTFT is recorded.
@@ -149,7 +145,7 @@ fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
     ctx.get_metadata("openai_responses_format.model")
         .or_else(|| ctx.get_metadata("anthropic_messages_format.model"))
         .or_else(|| ctx.get_metadata("anthropic_to_openai.model"))
-        .filter(|v| v.len() <= MAX_PROMOTED_VALUE_LEN && is_safe_promoted_value(v))
+        .filter(|v| is_promotable_value(v))
         .unwrap_or("unknown")
         .to_owned()
 }

@@ -1,0 +1,59 @@
+# Anthropic Messages Web Search
+#
+# Runs a non-streaming native Messages model -> You.com search -> model
+# loop through Praxis core's iterative_request_router.
+# Requires WEB_SEARCH_API_KEY. The Messages backend listens on 127.0.0.1:8000.
+#
+# Run the deterministic model mock:
+#   cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
+#
+# In a second terminal, run Praxis:
+#   WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" cargo run -p praxis-ai-proxy -- \
+#     -c examples/configs/anthropic/messages-web-search.yaml
+#
+# Then send the Messages request:
+#   curl http://127.0.0.1:8080/v1/messages \
+#     -H 'content-type: application/json' \
+#     -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":"Use web search to look up potato, then summarize in one sentence."}],"tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}'
+
+listeners:
+  - name: anthropic-web-search
+    address: "127.0.0.1:8080"
+    filter_chains: [messages-web-search]
+
+filter_chains:
+  - name: messages-web-search
+    filters:
+      - filter: anthropic_messages_format
+        on_invalid: reject
+      - filter: anthropic_validate
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 6
+        timeout_ms: 90000
+        steps:
+          - name: inference
+            filters:
+              - filter: anthropic_web_search
+                provider: you
+                api_key: ${WEB_SEARCH_API_KEY}
+                default_context_size: medium
+                timeout_ms: 10000
+                provider_failure_mode: closed
+              - filter: anthropic_messages_protocol
+                default_version: "2023-06-01"
+              - filter: router
+                routes:
+                  - path_prefix: "/v1/messages"
+                    cluster: messages-backend
+              - filter: load_balancer
+                clusters:
+                  - name: messages-backend
+                    endpoints: ["127.0.0.1:8000"]
+            on_result:
+              - filter: anthropic_web_search
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true

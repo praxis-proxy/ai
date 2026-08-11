@@ -31,7 +31,10 @@ mod config;
 )]
 mod tests;
 
+use std::borrow::Cow;
+
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
@@ -236,23 +239,22 @@ impl serde::Serialize for OutboundBody<'_> {
             return self.state.request_body.serialize(serializer);
         };
 
+        let backend_messages = messages_for_backend(&self.state.messages);
         let mut map = serializer.serialize_map(None)?;
         let mut wrote_input = false;
         for (name, value) in object {
             match name.as_str() {
                 "input" => {
-                    map.serialize_entry(name, &self.state.messages)?;
+                    map.serialize_entry(name, backend_messages.as_ref())?;
                     wrote_input = true;
                 },
-                "previous_response_id" | "conversation" => {},
-                "tool_choice" => {
-                    map.serialize_entry(name, &self.state.tool_choice)?;
-                },
+                "previous_response_id" if self.state.history_rehydrated => {},
+                "conversation" => {},
                 _ => map.serialize_entry(name, value)?,
             }
         }
         if !wrote_input {
-            map.serialize_entry("input", &self.state.messages)?;
+            map.serialize_entry("input", backend_messages.as_ref())?;
         }
         map.end()
     }
@@ -262,6 +264,45 @@ impl serde::Serialize for OutboundBody<'_> {
 fn serialize_outbound_body(state: &ResponsesState) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&OutboundBody { state })
 }
+
+/// Translate compaction items to backend-compatible messages.
+///
+/// Returns `Cow::Borrowed` when no compaction items are present, avoiding
+/// allocation. When compaction items exist, returns `Cow::Owned` with each
+/// `{"type": "compaction", "encrypted_content": "<base64>"}` translated to an assistant
+/// message — backends do not understand our internal compaction format.
+fn messages_for_backend(messages: &[serde_json::Value]) -> Cow<'_, [serde_json::Value]> {
+    let mut translated: Option<Vec<serde_json::Value>> = None;
+
+    for (i, m) in messages.iter().enumerate() {
+        if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
+            let vec = translated.get_or_insert_with(|| messages.get(..i).unwrap_or(&[]).to_vec());
+            vec.push(compaction_to_assistant_message(m));
+        } else if let Some(vec) = &mut translated {
+            vec.push(m.clone());
+        }
+    }
+
+    match translated {
+        Some(vec) => Cow::Owned(vec),
+        None => Cow::Borrowed(messages),
+    }
+}
+
+/// Translate a compaction item to a Chat Completions assistant message.
+fn compaction_to_assistant_message(m: &serde_json::Value) -> serde_json::Value {
+    let summary = m
+        .get("encrypted_content")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+    serde_json::json!({
+        "role": "assistant",
+        "content": format!("[Previous conversation summary]\n\n{summary}")
+    })
+}
+
 
 /// Count the exact bytes the proxy will serialize for an outbound body.
 pub(super) fn serialized_outbound_body_len(state: &ResponsesState) -> Result<usize, serde_json::Error> {

@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "scenario_id": "messages/basic-nonstream",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "imported",
+    "provider": "openai",
+    "model": "gpt-4o",
+    "source_id": "tests/integration/messages/test_messages.py::test_messages_non_streaming_basic[txt=openai/gpt-4o]"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_rec-ea06271f90cc": "msg_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "gpt-4o",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "container": null,
+              "content": [
+                {
+                  "citations": null,
+                  "text": "4",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0001",
+              "model": "gpt-4o-2024-08-06",
+              "role": "assistant",
+              "stop_details": null,
+              "stop_reason": "end_turn",
+              "stop_sequence": null,
+              "type": "message",
+              "usage": {
+                "cache_creation": null,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": 0,
+                "inference_geo": null,
+                "input_tokens": 20,
+                "output_tokens": 1,
+                "server_tool_use": null,
+                "service_tier": null
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "gpt-4o",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "logprobs": null,
+                  "message": {
+                    "annotations": [],
+                    "audio": null,
+                    "content": "4",
+                    "function_call": null,
+                    "refusal": null,
+                    "role": "assistant",
+                    "tool_calls": null
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "rec-ea06271f90cc",
+              "model": "gpt-4o-2024-08-06",
+              "object": "chat.completion",
+              "service_tier": "default",
+              "usage": {
+                "completion_tokens": 1,
+                "completion_tokens_details": {
+                  "accepted_prediction_tokens": 0,
+                  "audio_tokens": 0,
+                  "reasoning_tokens": 0,
+                  "rejected_prediction_tokens": 0
+                },
+                "prompt_tokens": 20,
+                "prompt_tokens_details": {
+                  "audio_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "total_tokens": 21
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

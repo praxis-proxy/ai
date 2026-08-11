@@ -21,21 +21,27 @@
 //! rejecting provider-owned parameter combinations.
 
 pub(crate) mod agentic_loop;
+pub(crate) mod compact;
 mod config;
+pub(crate) mod config_validation;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
+/// Executes hosted file-search calls against an OGX vector store API.
+pub(crate) mod file_search_callout;
 pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
 pub(crate) mod openai_mcp_tool_resolve;
 pub(crate) mod openai_responses_proxy;
 pub(crate) mod openai_tool_parse;
+pub(crate) mod responses_to_chat_completions;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;
 
 pub use doc_extract::DocExtractFilter;
 pub use file_resolve::FileResolveFilter;
+pub use file_search_callout::FileSearchCalloutFilter;
 pub use mcp_dispatch::McpDispatchFilter;
 pub use model_rewrite::ModelRewriteFilter;
 pub use openai_mcp_tool_resolve::McpToolResolveFilter;
@@ -56,29 +62,77 @@ pub use store::ResponseStoreFilter;
 )]
 mod tests;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::{payload_processing::OnInvalidBehavior, value_safety::is_safe_promoted_value},
-    parse_filter_config,
+    builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
 };
 use tracing::{debug, trace};
 
 use self::config::{ResponsesFormatConfig, build_config};
-use crate::classifier::{
-    AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path,
-    is_responses_websocket_handshake,
+use crate::{
+    classifier::{
+        AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path,
+        is_responses_websocket_handshake,
+    },
+    promotion::is_promotable_value,
 };
+
+/// Count compact JSON bytes without retaining the serialized representation.
+///
+/// Returns `Ok(None)` as soon as serialization would exceed `max_bytes`.
+pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<Option<usize>, serde_json::Error> {
+    let mut counter = BoundedJsonCounter {
+        bytes: 0,
+        exceeded: false,
+        max_bytes,
+    };
+    let result = serde_json::to_writer(&mut counter, value);
+    if counter.exceeded {
+        return Ok(None);
+    }
+    result?;
+    Ok(Some(counter.bytes))
+}
+
+/// JSON writer that counts bytes and stops at a fixed ceiling.
+struct BoundedJsonCounter {
+    /// Bytes accepted so far.
+    bytes: usize,
+    /// Whether a write crossed the configured ceiling.
+    exceeded: bool,
+    /// Maximum accepted bytes.
+    max_bytes: usize,
+}
+
+impl io::Write for BoundedJsonCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(next_bytes) = self.bytes.checked_add(buf.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte count overflow"));
+        };
+        if next_bytes > self.max_bytes {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte limit exceeded"));
+        }
+        self.bytes = next_bytes;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Maximum length of a body-derived value promoted to headers or filter results.
-const MAX_PROMOTED_VALUE_LEN: usize = 256;
 
 /// Default store name used when registering the response store in the
 /// per-request registry.
@@ -293,7 +347,7 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
 /// Write optional string and boolean-option metadata fields.
 fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     if let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
+        && is_promotable_value(model)
     {
         ctx.set_metadata("openai_responses_format.model", model.clone());
     }
@@ -352,8 +406,7 @@ fn promote_headers(
 
     if let Some(header) = &config.headers.model
         && let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
-        && model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(model)
     {
         ctx.extra_request_headers
             .push((Cow::Owned(header.clone()), model.clone()));
@@ -400,8 +453,7 @@ fn promote_optional_results(
     classified: &ClassifiedRequest,
 ) -> Result<(), FilterError> {
     if let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
-        && model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(model)
     {
         results.set("model", model.clone())?;
     }
@@ -487,11 +539,48 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
     }
 }
 
+// -----------------------------------------------------------------------------
+// Shared Utilities
+// -----------------------------------------------------------------------------
+
+/// Extract a conversation ID from a request body.
+///
+/// Accepts both string and object forms:
+/// - `"conversation": "conv_abc"`
+/// - `"conversation": {"id": "conv_abc"}`
+pub(crate) fn extract_conversation_id(body: &serde_json::Value) -> Option<String> {
+    body.get("conversation").and_then(|c| {
+        c.as_str()
+            .or_else(|| c.get("id").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned)
+    })
+}
+
+/// Append stored response input as valid Responses API item params.
+pub(crate) fn append_stored_input_items(messages: &mut Vec<serde_json::Value>, input: serde_json::Value) {
+    match input {
+        serde_json::Value::Null => {},
+        serde_json::Value::String(text) => messages.push(user_message_item(&text)),
+        serde_json::Value::Array(items) => messages.extend(items),
+        other => messages.push(other),
+    }
+}
+
+/// Build a Responses API user message item from string input.
+pub(crate) fn user_message_item(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": text,
+    })
+}
+
 pub(crate) mod rehydrate;
 pub(crate) mod validate;
 pub(crate) mod web_search;
 
 pub use agentic_loop::AgenticLoopFilter;
+pub use compact::CompactFilter;
 pub use rehydrate::RehydrateFilter;
 pub use validate::OpenaiResponsesValidateFilter;
 pub use web_search::WebSearchFilter;

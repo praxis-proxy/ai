@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "scenario_id": "messages/native-basic-nonstream",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "live",
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5-20251001",
+    "source_id": null
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_011Cdmpr6jE68y5gwiH8r4nc": "msg_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 8,
+              "messages": [
+                {
+                  "content": "Reply with exactly `4` and nothing else.",
+                  "role": "user"
+                }
+              ],
+              "model": "claude-haiku-4-5-20251001",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ],
+            "request-id": [
+              "req_011Cdmpr5RqgrZEbu1bfStCF"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "4",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0001",
+              "model": "claude-haiku-4-5-20251001",
+              "role": "assistant",
+              "stop_details": null,
+              "stop_reason": "end_turn",
+              "stop_sequence": null,
+              "type": "message",
+              "usage": {
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "inference_geo": "not_available",
+                "input_tokens": 17,
+                "output_tokens": 5,
+                "service_tier": "standard"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 8,
+              "messages": [
+                {
+                  "content": "Reply with exactly `4` and nothing else.",
+                  "role": "user"
+                }
+              ],
+              "model": "claude-haiku-4-5-20251001",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ],
+            "request-id": [
+              "req_011Cdmpr5RqgrZEbu1bfStCF"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "4",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0001",
+              "model": "claude-haiku-4-5-20251001",
+              "role": "assistant",
+              "stop_details": null,
+              "stop_reason": "end_turn",
+              "stop_sequence": null,
+              "type": "message",
+              "usage": {
+                "cache_creation": {
+                  "ephemeral_1h_input_tokens": 0,
+                  "ephemeral_5m_input_tokens": 0
+                },
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "inference_geo": "not_available",
+                "input_tokens": 17,
+                "output_tokens": 5,
+                "service_tier": "standard"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

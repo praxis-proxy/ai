@@ -29,7 +29,7 @@ use praxis_filter::{
 };
 use tracing::{debug, trace};
 
-use super::{error::responses_error_rejection, state::ResponsesState};
+use super::{error::responses_error_rejection, extract_conversation_id, state::ResponsesState};
 
 // -----------------------------------------------------------------------------
 // OpenaiResponsesValidateFilter
@@ -164,10 +164,10 @@ fn is_bodyless_responses_request(method: &http::Method, path: &str) -> bool {
         http::Method::GET | http::Method::DELETE => true,
         http::Method::POST => {
             let path = path.strip_suffix('/').unwrap_or(path);
-            matches!(
-                path.split('/').collect::<Vec<_>>().as_slice(),
-                ["", "v1", "responses", _, "cancel"]
-            )
+            path.strip_prefix("/v1/responses/").is_some_and(|rest| {
+                rest.strip_suffix("/cancel")
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+            })
         },
         _ => false,
     }
@@ -181,17 +181,6 @@ fn reject_invalid(message: &str, streaming: bool) -> FilterAction {
         message,
         streaming,
     ))
-}
-
-/// Extract conversation ID from the request body.
-///
-/// Handles both `"conversation": "conv_id"` and `"conversation": {"id": "conv_id"}`.
-fn extract_conversation_id(body: &serde_json::Value) -> Option<String> {
-    body.get("conversation").and_then(|c| {
-        c.as_str()
-            .or_else(|| c.get("id").and_then(serde_json::Value::as_str))
-            .map(str::to_owned)
-    })
 }
 
 /// Extract or generate a conversation ID for the request.

@@ -292,6 +292,7 @@ impl HttpFilter for A2aFilter {
                 process_sse_response_chunk(ctx, chunk, store, &self.config.task_routing);
             }
             if end_of_stream {
+                flush_pending_sse_payloads(ctx, store, &self.config.task_routing);
                 clear_sse_capture_metadata(ctx);
             }
         }
@@ -767,6 +768,23 @@ fn process_sse_response_chunk(
         clear_sse_capture_metadata(ctx);
     } else {
         save_sse_scan_state(ctx, &state);
+    }
+}
+
+/// Drains any incomplete SSE event buffered in `filter_metadata` at
+/// end-of-stream so the last event is not silently dropped when the
+/// provider omits the trailing blank line before closing the connection.
+fn flush_pending_sse_payloads(
+    ctx: &HttpFilterContext<'_>,
+    store: &LocalTaskRouteStore,
+    config: &config::TaskRoutingConfig,
+) {
+    let mut state = load_sse_scan_state(ctx);
+    let mut payloads = Vec::new();
+    sse::flush_sse_state(&mut state, &mut payloads);
+
+    for payload in &payloads {
+        try_extract_task_from_sse_payload(payload, ctx, store, config);
     }
 }
 

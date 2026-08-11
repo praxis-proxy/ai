@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration for the `openai_web_search` filter.
+//! Configuration for protocol-neutral web-search providers.
 
 use praxis_filter::{
     FilterError, body::MAX_JSON_BODY_BYTES,
@@ -108,38 +108,37 @@ pub(crate) enum FailureMode {
 /// Raw YAML config, deserialized then validated.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct WebSearchFilterConfig {
+pub(crate) struct WebSearchFilterConfig {
     /// Search backend provider.
-    pub provider: SearchProvider,
+    pub(crate) provider: SearchProvider,
 
     /// API key for the search provider (supports `${ENV_VAR}`).
     /// Wrapped in [`SecretString`] to prevent accidental logging.
-    #[serde(default)]
-    pub api_key: Option<SecretString>,
+    pub(crate) api_key: SecretString,
 
     /// Default search context size when the client omits it.
     #[serde(default)]
-    pub default_context_size: Option<String>,
+    pub(crate) default_context_size: Option<String>,
 
     /// Callout timeout in milliseconds.
     #[serde(default)]
-    pub timeout_ms: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
 
     /// Maximum request body bytes to buffer.
     #[serde(default)]
-    pub max_body_bytes: Option<usize>,
+    pub(crate) max_body_bytes: Option<usize>,
 
-    /// Failure mode for search callouts.
+    /// Failure mode for search provider callouts.
     #[serde(default)]
-    pub failure_mode: Option<FailureMode>,
+    pub(crate) provider_failure_mode: Option<FailureMode>,
 
     /// HTTP status code to return when rejecting on error.
     #[serde(default)]
-    pub status_on_error: Option<u16>,
+    pub(crate) status_on_error: Option<u16>,
 
     /// Override the provider's default API base URL.
     #[serde(default)]
-    pub base_url: Option<String>,
+    pub(crate) base_url: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -195,49 +194,52 @@ impl std::fmt::Debug for ValidatedConfig {
 ///
 /// Returns [`FilterError`] if the API key is empty or cannot be
 /// resolved from environment variables.
-pub(super) fn build_config(raw: &WebSearchFilterConfig) -> Result<ValidatedConfig, FilterError> {
-    let raw_key = raw
-        .api_key
-        .as_ref()
-        .ok_or_else(|| FilterError::from("openai_web_search: api_key is required".to_owned()))?;
-    let api_key = resolve_api_key(raw_key.expose_secret())?;
+pub(crate) fn build_config(
+    filter_name: &'static str,
+    raw: &WebSearchFilterConfig,
+) -> Result<ValidatedConfig, FilterError> {
+    let api_key = resolve_api_key(filter_name, raw.api_key.expose_secret())?;
     if api_key.is_empty() {
-        return Err(FilterError::from(
-            "openai_web_search: api_key must not be empty".to_owned(),
-        ));
+        return Err(FilterError::from(format!("{filter_name}: api_key must not be empty")));
     }
-    let default_context_size = validate_context_size(raw.default_context_size.as_deref())?;
-    let timeout_ms = validate_timeout_ms(raw.timeout_ms)?;
-    let status_on_error = validate_status_on_error(raw.status_on_error)?;
+    build_validated_config(filter_name, raw, api_key)
+}
+
+/// Apply defaults after resolving and validating the API key.
+fn build_validated_config(
+    filter_name: &'static str,
+    raw: &WebSearchFilterConfig,
+    api_key: String,
+) -> Result<ValidatedConfig, FilterError> {
     Ok(ValidatedConfig {
         provider: raw.provider,
         api_key: SecretString::from(api_key),
-        default_context_size,
-        timeout_ms,
-        max_body_bytes: validate_max_body_bytes_field(raw.max_body_bytes)?,
-        failure_mode: raw.failure_mode.unwrap_or(FailureMode::Closed),
-        status_on_error,
+        default_context_size: validate_context_size(filter_name, raw.default_context_size.as_deref())?,
+        timeout_ms: validate_timeout_ms(filter_name, raw.timeout_ms)?,
+        max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
+        failure_mode: raw.provider_failure_mode.unwrap_or(FailureMode::Closed),
+        status_on_error: validate_status_on_error(filter_name, raw.status_on_error)?,
         base_url: raw.base_url.clone(),
     })
 }
 
 /// Validate timeout, applying the default and rejecting zero.
-fn validate_timeout_ms(raw: Option<u64>) -> Result<u64, FilterError> {
+fn validate_timeout_ms(filter_name: &'static str, raw: Option<u64>) -> Result<u64, FilterError> {
     let value = raw.unwrap_or(DEFAULT_TIMEOUT_MS);
     if value == 0 {
-        return Err(FilterError::from(
-            "openai_web_search: timeout_ms must be greater than 0".to_owned(),
-        ));
+        return Err(FilterError::from(format!(
+            "{filter_name}: timeout_ms must be greater than 0"
+        )));
     }
     Ok(value)
 }
 
 /// Validate HTTP status code, applying the default and rejecting out-of-range.
-fn validate_status_on_error(raw: Option<u16>) -> Result<u16, FilterError> {
+fn validate_status_on_error(filter_name: &'static str, raw: Option<u16>) -> Result<u16, FilterError> {
     let value = raw.unwrap_or(DEFAULT_STATUS_ON_ERROR);
     if !(100..=599).contains(&value) {
         return Err(FilterError::from(format!(
-            "openai_web_search: status_on_error must be between 100 and 599, got {value}"
+            "{filter_name}: status_on_error must be between 100 and 599, got {value}"
         )));
     }
     Ok(value)
@@ -245,12 +247,12 @@ fn validate_status_on_error(raw: Option<u16>) -> Result<u16, FilterError> {
 
 /// Validate `default_context_size`, defaulting to `Medium` when
 /// absent and rejecting unknown values.
-fn validate_context_size(raw: Option<&str>) -> Result<SearchContextSize, FilterError> {
+fn validate_context_size(filter_name: &'static str, raw: Option<&str>) -> Result<SearchContextSize, FilterError> {
     match raw {
         None => Ok(SearchContextSize::Medium),
         Some(s) => SearchContextSize::from_str(s).ok_or_else(|| {
             FilterError::from(format!(
-                "openai_web_search: default_context_size must be low, medium, or high, got '{s}'"
+                "{filter_name}: default_context_size must be low, medium, or high, got '{s}'"
             ))
         }),
     }
@@ -258,19 +260,19 @@ fn validate_context_size(raw: Option<&str>) -> Result<SearchContextSize, FilterE
 
 /// Validate `max_body_bytes`, applying the default and delegating
 /// to the standard validator that rejects 0 and oversized values.
-fn validate_max_body_bytes_field(raw: Option<usize>) -> Result<usize, FilterError> {
+fn validate_max_body_bytes_field(filter_name: &'static str, raw: Option<usize>) -> Result<usize, FilterError> {
     let value = raw.unwrap_or(MAX_JSON_BODY_BYTES);
-    validate_max_body_bytes("openai_web_search", value)?;
+    validate_max_body_bytes(filter_name, value)?;
     Ok(value)
 }
 
 /// Resolve `${ENV_VAR}` references in the API key string.
-fn resolve_api_key(raw: &str) -> Result<String, FilterError> {
+fn resolve_api_key(filter_name: &'static str, raw: &str) -> Result<String, FilterError> {
     let trimmed = raw.trim();
     if let Some(var_name) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
         std::env::var(var_name).map_err(|e| {
             FilterError::from(format!(
-                "openai_web_search: environment variable {var_name} not set for api_key: {e}"
+                "{filter_name}: environment variable {var_name} not set for api_key: {e}"
             ))
         })
     } else {
@@ -292,6 +294,7 @@ fn resolve_api_key(raw: &str) -> Result<String, FilterError> {
     reason = "tests"
 )]
 mod tests {
+    use praxis_filter::parse_filter_config;
     use secrecy::{ExposeSecret as _, SecretString};
 
     use super::*;
@@ -299,11 +302,11 @@ mod tests {
     fn base_config() -> WebSearchFilterConfig {
         WebSearchFilterConfig {
             provider: SearchProvider::Brave,
-            api_key: Some(SecretString::from("test-key-123".to_owned())),
+            api_key: SecretString::from("test-key-123".to_owned()),
             default_context_size: None,
             timeout_ms: None,
             max_body_bytes: None,
-            failure_mode: None,
+            provider_failure_mode: None,
             status_on_error: None,
             base_url: None,
         }
@@ -311,7 +314,7 @@ mod tests {
 
     #[test]
     fn build_config_applies_defaults() {
-        let cfg = build_config(&base_config()).unwrap();
+        let cfg = build_config("openai_web_search", &base_config()).unwrap();
         assert_eq!(cfg.provider, SearchProvider::Brave);
         assert_eq!(cfg.api_key.expose_secret(), "test-key-123");
         assert_eq!(cfg.default_context_size, SearchContextSize::Medium);
@@ -324,22 +327,39 @@ mod tests {
     #[test]
     fn build_config_rejects_empty_api_key() {
         let mut cfg = base_config();
-        cfg.api_key = Some(SecretString::from(String::new()));
-        assert!(build_config(&cfg).is_err());
+        cfg.api_key = SecretString::from(String::new());
+        assert!(build_config("openai_web_search", &cfg).is_err());
     }
 
     #[test]
-    fn build_config_rejects_missing_api_key() {
-        let mut cfg = base_config();
-        cfg.api_key = None;
-        assert!(build_config(&cfg).is_err(), "None api_key should be rejected");
+    fn parse_config_uses_owner_name_for_missing_api_key() {
+        let yaml = serde_yaml::from_str("provider: brave").unwrap();
+        let error = parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml)
+            .err()
+            .expect("missing api_key should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("anthropic_web_search: missing field `api_key`"),
+            "diagnostic should name the owning filter: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_config_preserves_provider_failure_mode() {
+        let yaml = serde_yaml::from_str("\nprovider: brave\napi_key: test-key\nprovider_failure_mode: open\n").unwrap();
+
+        let raw: WebSearchFilterConfig = parse_filter_config("openai_web_search", &yaml).unwrap();
+        let validated = build_config("openai_web_search", &raw).unwrap();
+
+        assert_eq!(validated.failure_mode, FailureMode::Open);
     }
 
     #[test]
     fn build_config_rejects_zero_timeout() {
         let mut cfg = base_config();
         cfg.timeout_ms = Some(0);
-        assert!(build_config(&cfg).is_err());
+        assert!(build_config("openai_web_search", &cfg).is_err());
     }
 
     #[test]
@@ -347,7 +367,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("xlarge".into());
         assert!(
-            build_config(&cfg).is_err(),
+            build_config("openai_web_search", &cfg).is_err(),
             "unknown default_context_size should be rejected"
         );
     }
@@ -356,7 +376,7 @@ mod tests {
     fn build_config_rejects_invalid_status() {
         let mut cfg = base_config();
         cfg.status_on_error = Some(999);
-        assert!(build_config(&cfg).is_err());
+        assert!(build_config("openai_web_search", &cfg).is_err());
     }
 
     #[test]
@@ -364,9 +384,9 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("high".into());
         cfg.timeout_ms = Some(15_000);
-        cfg.failure_mode = Some(FailureMode::Open);
+        cfg.provider_failure_mode = Some(FailureMode::Open);
         cfg.status_on_error = Some(503);
-        let validated = build_config(&cfg).unwrap();
+        let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.default_context_size, SearchContextSize::High);
         assert_eq!(validated.timeout_ms, 15_000);
         assert_eq!(validated.failure_mode, FailureMode::Open);
@@ -377,37 +397,37 @@ mod tests {
     fn build_config_base_url_threaded_through() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://localhost:9999".into());
-        let validated = build_config(&cfg).unwrap();
+        let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://localhost:9999"));
     }
 
     #[test]
     fn build_config_base_url_none_by_default() {
-        let validated = build_config(&base_config()).unwrap();
+        let validated = build_config("openai_web_search", &base_config()).unwrap();
         assert!(validated.base_url.is_none());
     }
 
     #[test]
     fn resolve_literal_api_key() {
-        let result = resolve_api_key("my-literal-key").unwrap();
+        let result = resolve_api_key("openai_web_search", "my-literal-key").unwrap();
         assert_eq!(result, "my-literal-key");
     }
 
     #[test]
     fn resolve_literal_api_key_trimmed() {
-        let result = resolve_api_key("  spaced-key  ").unwrap();
+        let result = resolve_api_key("openai_web_search", "  spaced-key  ").unwrap();
         assert_eq!(result, "spaced-key");
     }
 
     #[test]
     fn resolve_env_var_syntax_detected() {
-        let result = resolve_api_key("${DEFINITELY_NOT_SET_KEY_12345}");
+        let result = resolve_api_key("openai_web_search", "${DEFINITELY_NOT_SET_KEY_12345}");
         assert!(result.is_err(), "missing env var should fail");
     }
 
     #[test]
     fn resolve_partial_env_syntax_treated_as_literal() {
-        let result = resolve_api_key("${INCOMPLETE").unwrap();
+        let result = resolve_api_key("openai_web_search", "${INCOMPLETE").unwrap();
         assert_eq!(result, "${INCOMPLETE", "unclosed brace should be literal");
     }
 
@@ -415,7 +435,10 @@ mod tests {
     fn build_config_rejects_zero_max_body_bytes() {
         let mut cfg = base_config();
         cfg.max_body_bytes = Some(0);
-        assert!(build_config(&cfg).is_err(), "max_body_bytes=0 should be rejected");
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "max_body_bytes=0 should be rejected"
+        );
     }
 
     #[test]
@@ -423,14 +446,14 @@ mod tests {
         let mut cfg = base_config();
         cfg.max_body_bytes = Some(999_999_999_999);
         assert!(
-            build_config(&cfg).is_err(),
+            build_config("openai_web_search", &cfg).is_err(),
             "max_body_bytes above limit should be rejected"
         );
     }
 
     #[test]
     fn debug_impl_redacts_api_key() {
-        let cfg = build_config(&base_config()).unwrap();
+        let cfg = build_config("openai_web_search", &base_config()).unwrap();
         let debug_output = format!("{cfg:?}");
         assert!(
             debug_output.contains("[REDACTED]"),

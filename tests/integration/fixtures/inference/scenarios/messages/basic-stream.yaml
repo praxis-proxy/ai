@@ -1,0 +1,41 @@
+version: 1
+id: messages/basic-stream
+description: Minimal streaming Anthropic Messages request translated to Chat Completions.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.request.minimal
+  - messages.response.text
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: true
+          messages:
+            - role: user
+              content: Say hello in one sentence.
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events:
+        - message_start
+        - content_block_start
+        - content_block_delta
+        - content_block_stop
+        - message_delta
+        - message_stop
+      client_sse_repeatable_events:
+        - content_block_delta
+      upstream_sse_events: []

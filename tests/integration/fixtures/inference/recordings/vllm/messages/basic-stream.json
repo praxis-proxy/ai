@@ -1,0 +1,257 @@
+{
+  "version": 1,
+  "scenario_id": "messages/basic-stream",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "live",
+    "provider": "vllm",
+    "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+    "source_id": null
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-be013f80b6e67fab": "chatcmpl-recorded-0002",
+      "msg_18c8cada960fd558": "msg_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "Say hello in one sentence.",
+                  "role": "user"
+                }
+              ],
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"message\":{\"container\":null,\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"role\":\"assistant\",\"stop_details\":null,\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation\":null,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"inference_geo\":null,\"input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":null,\"service_tier\":null}},\"type\":\"message_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"citations\":null,\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"Hello\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"!\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" How\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" can\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" I\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" help\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" you\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" today\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"?\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"container\":null,\"stop_details\":null,\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"input_tokens\":null,\"output_tokens\":0,\"server_tool_use\":null}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "content": "Say hello in one sentence.",
+                  "role": "user"
+                }
+              ],
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream; charset=utf-8"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\",\"prompt_text\":null,\"prompt_token_ids\":null}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" How\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" can\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" I\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" help\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" you\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" today\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"?\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null,\"stop_reason\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      }
+    }
+  ]
+}

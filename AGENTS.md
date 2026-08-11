@@ -108,6 +108,24 @@ New capabilities require:
 4. Functional integration test for the example config
 5. Generated example and filter documentation kept in sync
 
+## Inference Fixture Maintenance
+
+When an inference transformation behavior changes, update its tests and
+fixture coverage in the same change:
+
+1. Add or update the scenario and its focused unit/integration tests.
+2. Add truthful provider recordings or controlled synthetic evidence.
+3. Update `tests/integration/fixtures/inference/coverage.yaml`, including its
+   feature, scope, scenario, provider, and status links.
+4. Run `cargo xtask sync-inference-readme --fix`; do not hand-edit the
+   generated coverage block in the inference fixture README.
+5. Run `cargo xtask check-inference` and `make test-inference-fixtures`.
+
+Do not enumerate Rust test function names in the README. The manifest is the
+stable coverage inventory; test names may change without changing behavior.
+Credentialed live recordings require explicit authorization and must retain
+truthful provider, model, and provenance metadata.
+
 ## Adding a Filter
 
 1. Create module under `filters/src/` or `apis/src/`
