@@ -124,7 +124,7 @@ jobs:
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
             --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.7
+            --gpu-memory-utilization 0.5
 
       - name: Start OGX
         run: |
@@ -139,6 +139,11 @@ jobs:
           echo "Waiting for vLLM health and model endpoints..."
           timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
                                      curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+            if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
+              echo "::error::vLLM container exited unexpectedly"
+              docker logs vllm 2>&1
+              exit 1
+            fi
             sleep 5
           done'
           echo "vLLM is ready"

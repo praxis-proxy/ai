@@ -47,6 +47,7 @@ tikv-jemallocator = { workspace = true }
 
 [build-dependencies]
 cargo_metadata = { workspace = true }
+praxis-ai-build-support = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

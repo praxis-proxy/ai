@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "server",
+    "server/build_support",
     "filters",
     "apis",
     "xtask",
@@ -67,18 +68,19 @@ utoipa = "5.5.0"
 wiremock = "0.6.5"
 zeroize = "1.9.0"
 
-# Praxis core dependencies
-praxis-core = { version = "0.5.1", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.5.1", package = "praxis-proxy-filter" }
-praxis-protocol = { version = "0.5.1", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.5.1", package = "praxis-proxy-tls" }
-praxis = { version = "0.5.1", package = "praxis-proxy" }
+# Praxis core dependencies (git tag until v0.5.2 is published on crates.io)
+praxis-core = { git = "https://github.com/praxis-proxy/praxis.git", tag = "v0.5.2", package = "praxis-proxy-core" }
+praxis-filter = { git = "https://github.com/praxis-proxy/praxis.git", tag = "v0.5.2", package = "praxis-proxy-filter" }
+praxis-protocol = { git = "https://github.com/praxis-proxy/praxis.git", tag = "v0.5.2", package = "praxis-proxy-protocol" }
+praxis-tls = { git = "https://github.com/praxis-proxy/praxis.git", tag = "v0.5.2", package = "praxis-proxy-tls" }
+praxis = { git = "https://github.com/praxis-proxy/praxis.git", tag = "v0.5.2", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
 
 # Praxis AI workspace dependencies
 praxis-ai-proxy = { version = "0.2.0", path = "server" }
 praxis-ai-filters = { version = "0.2.0", path = "filters" }
 praxis-ai-apis = { version = "0.2.0", path = "apis" }
+praxis-ai-build-support = { version = "0.2.0", path = "server/build_support" }
 
 # Pingora (temporary fork)
 pingora-core = { version = "0.8.2", package = "quixotic-plecostomus-core", features = ["rustls"] }

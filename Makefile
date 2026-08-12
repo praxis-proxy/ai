@@ -69,6 +69,7 @@ test-unit:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
+	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
 
 test-schema:
 	cargo test -p praxis-tests-schema $(_NOCAPTURE)

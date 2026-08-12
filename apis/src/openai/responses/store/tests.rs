@@ -3010,6 +3010,78 @@ async fn get_unrelated_path_continues() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_rejects_stream_true() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_stream", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_stream?stream=true");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "stream=true should return 400");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_rejects_include() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_inc", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_inc?include%5B%5D=reasoning.encrypted_content",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "include[] should return 400");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_accepts_stream_false() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_sf",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_sf?stream=false");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "stream=false should return 200");
+    assert_has_json_content_type(&rejection);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_no_query_still_returns_200() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_nq",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_nq");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "no query should still return 200");
+}
+
 // -----------------------------------------------------------------------------
 // GET /v1/responses/{id}/input_items
 // -----------------------------------------------------------------------------
@@ -3707,6 +3779,175 @@ fn parse_query_params_key_only_unknown_ignored() {
         Order::Ascending,
         "unknown key-only param should be ignored"
     );
+}
+
+// -----------------------------------------------------------------------------
+// validate_get_response_query_params
+// -----------------------------------------------------------------------------
+
+#[test]
+fn validate_get_response_query_params_no_query() {
+    assert!(
+        super::filter::validate_get_response_query_params(None).is_ok(),
+        "no query string should be valid"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_empty_query() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("")).is_ok(),
+        "empty query string should be valid"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_false_accepted() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("stream=false")).is_ok(),
+        "stream=false should be accepted"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_true_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=true")).unwrap_err();
+    assert!(
+        err.contains("'stream' parameter is not supported"),
+        "stream=true should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_invalid_value_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=maybe")).unwrap_err();
+    assert!(
+        err.contains("must be 'true' or 'false'"),
+        "stream=maybe should be rejected as invalid boolean: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_bracket_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include[]=file_search_call_results.results"))
+        .unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "include[] should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_percent_encoded_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include%5B%5D=usage")).unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "percent-encoded include[] should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_bare_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include=usage")).unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "bare include should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_starting_after_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("starting_after=5")).unwrap_err();
+    assert!(
+        err.contains("'starting_after' parameter is not supported"),
+        "starting_after should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_obfuscation_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include_obfuscation=true")).unwrap_err();
+    assert!(
+        err.contains("'include_obfuscation' parameter is not supported"),
+        "include_obfuscation should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_unknown_param_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("foo=bar")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "unknown param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_known_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream")).unwrap_err();
+    assert!(
+        err.contains("Missing value"),
+        "key-only known param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_include_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include")).unwrap_err();
+    assert!(
+        err.contains("Missing value"),
+        "key-only include should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_unknown_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("foo")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "key-only unknown param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_percent_encoded_stream_false_accepted() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("stream=%66alse")).is_ok(),
+        "percent-encoded stream=false should be accepted"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_invalid_utf8_key_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("%FF=x")).unwrap_err();
+    assert!(
+        err.contains("Invalid percent-encoding in query parameter key"),
+        "invalid UTF-8 key should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_invalid_utf8_value_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=%FF")).unwrap_err();
+    assert!(
+        err.contains("Invalid percent-encoding in value"),
+        "invalid UTF-8 value should be rejected: {err}"
+    );
+}
+
+#[test]
+fn known_params_and_validator_match_arms_in_sync() {
+    for &param in super::filter::GET_RESPONSE_KNOWN_PARAMS {
+        let result = super::filter::validate_get_response_param(param, "__probe__");
+        assert!(
+            result.is_err(),
+            "known param '{param}' should be handled by validate_get_response_param"
+        );
+        assert!(
+            !result.unwrap_err().contains("Unknown"),
+            "known param '{param}' should not produce an 'Unknown' error"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
