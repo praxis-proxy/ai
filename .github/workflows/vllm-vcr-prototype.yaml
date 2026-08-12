@@ -55,7 +55,7 @@ jobs:
       - name: Pull CPU-only vLLM frontend
         run: docker pull "$VLLM_FRONTEND_IMAGE"
 
-      - name: Start vLLM frontend and vllm-vcr
+      - name: Start vLLM frontend
         run: |
           docker run --detach --name vllm-vcr-frontend --network host \
             "$VLLM_FRONTEND_IMAGE" \
@@ -68,6 +68,29 @@ jobs:
             --port=8000 \
             --max-model-len=4096
 
+      - name: Build Praxis while frontend starts
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Start vllm-vcr
+        run: |
+          echo "Waiting for the vLLM data-plane handshake listener..."
+          handshake_ready=false
+          for _ in {1..180}; do
+            if ss -H -ltn "sport = :29550" | grep -q .; then
+              handshake_ready=true
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' vllm-vcr-frontend)" != true ]; then
+              echo "vLLM frontend exited before opening the handshake listener" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$handshake_ready" != true ]; then
+            echo "vLLM frontend did not open the handshake listener within 180 seconds" >&2
+            exit 1
+          fi
+
           inference-sim \
             --handshake-address tcp://127.0.0.1:29550 \
             --vllm-version v0.22.0 \
@@ -77,16 +100,31 @@ jobs:
             > /tmp/vllm-vcr.log 2>&1 &
           echo $! > /tmp/vllm-vcr.pid
 
-      - name: Build Praxis while frontend starts
-        run: cargo build -p praxis-ai-proxy
-
       - name: Wait for vLLM frontend readiness
         run: |
           echo "Waiting for the frontend-only vLLM server..."
-          timeout 180 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+          simulator_pid=$(cat /tmp/vllm-vcr.pid)
+          frontend_ready=false
+          for _ in {1..90}; do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+               curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; then
+              frontend_ready=true
+              break
+            fi
+            if ! kill -0 "$simulator_pid" 2>/dev/null; then
+              echo "vllm-vcr exited before the frontend became ready" >&2
+              exit 1
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' vllm-vcr-frontend)" != true ]; then
+              echo "vLLM frontend exited before becoming ready" >&2
+              exit 1
+            fi
             sleep 2
-          done'
+          done
+          if [ "$frontend_ready" != true ]; then
+            echo "vLLM frontend did not become ready within 180 seconds" >&2
+            exit 1
+          fi
           echo "vLLM frontend is ready"
 
       - name: Run protocol-safe Responses tests
