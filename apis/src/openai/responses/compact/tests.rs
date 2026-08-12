@@ -15,6 +15,7 @@ fn base_config() -> CompactFilterConfig {
         inference_url: "http://localhost:11434/v1/chat/completions".to_owned(),
         default_model: "gpt-4o-mini".to_owned(),
         tiktoken_encoding: "cl100k_base".to_owned(),
+        summary_prefix: None,
         timeout_ms: None,
         callout_failure_mode: None,
         status_on_error: None,
@@ -155,12 +156,39 @@ fn extract_compaction_config_zero_threshold_compacts_immediately() {
 #[test]
 fn compaction_item_has_correct_shape() {
     use base64::Engine as _;
-    let item = build_compaction_item("compact_abc123", "This is a summary.");
+    let item = build_compaction_item("compact_abc123", "This is a summary.", DEFAULT_SUMMARY_PREFIX);
     assert_eq!(item["type"], "compaction");
     assert_eq!(item["id"], "compact_abc123");
     let encoded = item["encrypted_content"].as_str().unwrap();
     let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
     assert_eq!(String::from_utf8(decoded).unwrap(), "This is a summary.");
+    assert!(
+        item.get("summary_prefix").is_none(),
+        "default prefix should not be stored in the item"
+    );
+}
+
+#[test]
+fn compaction_item_with_custom_prefix() {
+    let item = build_compaction_item("compact_custom", "Summary.", "Context:\n");
+    assert_eq!(
+        item["summary_prefix"], "Context:\n",
+        "custom prefix should be stored in the item"
+    );
+}
+
+#[test]
+fn build_config_applies_default_summary_prefix() {
+    let cfg = build_config(&base_config()).unwrap();
+    assert_eq!(cfg.summary_prefix, DEFAULT_SUMMARY_PREFIX);
+}
+
+#[test]
+fn build_config_applies_custom_summary_prefix() {
+    let mut cfg = base_config();
+    cfg.summary_prefix = Some("Summary:\n".to_owned());
+    let validated = build_config(&cfg).unwrap();
+    assert_eq!(validated.summary_prefix, "Summary:\n");
 }
 
 // =============================================================================
@@ -331,7 +359,7 @@ fn replace_messages_preserves_current_input() {
         .persisted_messages
         .insert(1, json!({"role": "assistant", "content": "old answer"}));
 
-    let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.");
+    let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.", DEFAULT_SUMMARY_PREFIX);
     replace_messages(&mut state, compaction_item);
 
     assert_eq!(state.messages.len(), 2, "should have compaction + current input");
@@ -410,7 +438,7 @@ fn conversation_text_full_tool_round_trip() {
 
 #[test]
 fn conversation_text_includes_compaction_summary() {
-    let item = build_compaction_item("compact_1", "Prior context about widgets.");
+    let item = build_compaction_item("compact_1", "Prior context about widgets.", DEFAULT_SUMMARY_PREFIX);
     let messages = vec![item, json!({"role": "user", "content": "Tell me more"})];
     let text = build_conversation_text(&messages);
     assert!(text.contains("[previous context summary]: Prior context about widgets."));
@@ -419,7 +447,7 @@ fn conversation_text_includes_compaction_summary() {
 
 #[test]
 fn conversation_text_skips_empty_compaction_summary() {
-    let item = build_compaction_item("compact_2", "");
+    let item = build_compaction_item("compact_2", "", DEFAULT_SUMMARY_PREFIX);
     let messages = vec![item, json!({"role": "user", "content": "Hello"})];
     let text = build_conversation_text(&messages);
     assert!(!text.contains("context summary"));
@@ -598,13 +626,63 @@ fn should_compact_accounts_for_overhead() {
 }
 
 // =============================================================================
+// previous_usage fast-path
+// =============================================================================
+
+#[test]
+fn previous_usage_total_returns_total_tokens() {
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "Hi"}));
+    state.previous_usage = Some(json!({"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}));
+    assert_eq!(previous_usage_total(&state), Some(150));
+}
+
+#[test]
+fn previous_usage_total_returns_none_when_absent() {
+    let state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "Hi"}));
+    assert_eq!(previous_usage_total(&state), None);
+}
+
+#[test]
+fn previous_usage_total_returns_none_when_null() {
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "Hi"}));
+    state.previous_usage = Some(json!({"input_tokens": 100}));
+    assert_eq!(previous_usage_total(&state), None);
+}
+
+#[test]
+fn should_compact_uses_previous_usage_when_available() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "Hello",
+        "context_management": [{"type": "compaction", "compact_threshold": 100}]
+    }));
+    state.messages = vec![json!({"role": "user", "content": "Hi"})];
+    state.previous_usage = Some(json!({"total_tokens": 200}));
+    let result = should_compact(&state, "cl100k_base");
+    assert!(result.is_some(), "should compact when previous_usage exceeds threshold");
+}
+
+#[test]
+fn should_compact_skips_when_previous_usage_below_threshold() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "Hello",
+        "context_management": [{"type": "compaction", "compact_threshold": 500}]
+    }));
+    state.messages = vec![json!({"role": "user", "content": "Hi"})];
+    state.previous_usage = Some(json!({"total_tokens": 50}));
+    let result = should_compact(&state, "cl100k_base");
+    assert!(result.is_none(), "should skip when previous_usage is below threshold");
+}
+
+// =============================================================================
 // canonical round-trip
 // =============================================================================
 
 #[test]
 fn compaction_item_round_trips_through_canonical_replay() {
     use crate::openai::responses::canonical_openresponses_replay_item;
-    let item = build_compaction_item("compact_rt", "Summary text.");
+    let item = build_compaction_item("compact_rt", "Summary text.", DEFAULT_SUMMARY_PREFIX);
     let replayed = canonical_openresponses_replay_item(&item);
     assert!(replayed.is_some(), "compaction item should be replayable");
     let replayed = replayed.unwrap();

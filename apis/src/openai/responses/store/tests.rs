@@ -3339,6 +3339,41 @@ async fn get_input_items_pagination_usable_for_id_less_array_items() {
     assert_eq!(follow_up_body["has_more"], false);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_hides_compaction_items() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_compact_hidden",
+        "default",
+        json!([
+            {"type": "compaction", "id": "compact_1", "encrypted_content": "c3VtbWFyeQ=="},
+            {"type": "message", "role": "user", "content": "hello"}
+        ]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_compact_hidden/input_items?order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "compaction item should be hidden");
+    assert_eq!(data[0]["content"], "hello");
+    assert!(
+        !data
+            .iter()
+            .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("compaction")),
+        "no compaction items should appear in input_items"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // DELETE
 // -----------------------------------------------------------------------------

@@ -48,6 +48,7 @@ use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
 use crate::{
     openai::responses::config_validation::FailureMode,
+    store::{ResponseRecord, ResponseStoreRegistry},
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
@@ -65,6 +66,10 @@ Preserve all key facts, decisions, code snippets, \
 user preferences, and important context. The summary \
 will replace the full conversation history, so it must \
 capture everything needed to continue coherently.";
+
+/// Default prefix prepended to the summary when translating
+/// compaction items to backend-compatible messages.
+pub const DEFAULT_SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
 
 // -----------------------------------------------------------------------------
 // CompactionParams
@@ -108,6 +113,7 @@ struct CompactionParams {
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// default_model: gpt-4o-mini
 /// tiktoken_encoding: cl100k_base
+/// summary_prefix: "[Previous conversation summary]\n\n"
 /// timeout_ms: 30000
 /// callout_failure_mode: closed
 /// status_on_error: 502
@@ -204,6 +210,37 @@ impl CompactFilter {
         }
     }
 
+    /// Run a summarization callout for an explicit compact request.
+    async fn summarize_messages(
+        &self,
+        req: &ExplicitCompactRequest,
+        messages: &[Value],
+    ) -> Result<String, FilterAction> {
+        let conversation_text = build_conversation_text(messages);
+        let model = req.model.as_deref().unwrap_or(&self.config.default_model);
+        let instructions = req.instructions.as_deref();
+        let request = build_summarization_request(&conversation_text, instructions, model);
+        let timeout = Duration::from_millis(self.config.callout.timeout_ms);
+        let result = subrequest::execute_url(
+            &self.client,
+            &self.config.inference_url,
+            request,
+            MAX_SUMMARIZATION_RESPONSE_BYTES,
+            timeout,
+        )
+        .await;
+        match self.handle_subrequest_result(result, false) {
+            Ok(Some(s)) => Ok(s),
+            Ok(None) => Err(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                "compaction callout failed",
+                false,
+            ))),
+            Err(action) => Err(action),
+        }
+    }
+
     /// Apply the configured open/closed policy on a callout error.
     fn on_callout_error(&self, message: &str, streaming: bool) -> Result<Option<String>, FilterAction> {
         match self.config.callout.failure_mode {
@@ -216,9 +253,45 @@ impl CompactFilter {
             ))),
         }
     }
+
+    /// Handle an explicit `POST /v1/responses/compact` request.
+    ///
+    /// Loads a stored conversation by `response_id`, compacts it via
+    /// a summarization callout, stores the compacted result, and
+    /// returns the new response.
+    async fn handle_explicit_compact(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
+        match self.do_explicit_compact(ctx, body).await {
+            Ok(action) | Err(action) => Ok(action),
+        }
+    }
+
+    /// Inner logic for explicit compact, using `FilterAction` as the error type.
+    async fn do_explicit_compact(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+    ) -> Result<FilterAction, FilterAction> {
+        let req = parse_compact_request_body(body)?;
+        let (store, tenant_id) = resolve_store_and_tenant(ctx)?;
+        let record = fetch_response_blocking(&*store, &tenant_id, &req)?;
+        let messages = extract_stored_messages(&record)?;
+        let summary = self.summarize_messages(&req, &messages).await?;
+        let response_object = build_and_persist_compaction(self, ctx, &*store, &tenant_id, &req, &summary)?;
+        let body_bytes = serde_json::to_vec(&response_object).unwrap_or_default();
+        Ok(FilterAction::Reject(
+            praxis_filter::Rejection::status(200)
+                .with_header("content-type", "application/json")
+                .with_body(Bytes::from(body_bytes)),
+        ))
+    }
 }
 
 #[async_trait]
+#[expect(clippy::too_many_lines, reason = "filter pipeline method with sequential stages")]
 impl HttpFilter for CompactFilter {
     fn name(&self) -> &'static str {
         "openai_responses_compact"
@@ -247,6 +320,9 @@ impl HttpFilter for CompactFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+        if is_explicit_compact_request(ctx) {
+            return self.handle_explicit_compact(ctx, _body).await;
+        }
         if !is_responses_request(ctx) {
             return Ok(FilterAction::Release);
         }
@@ -266,11 +342,29 @@ impl HttpFilter for CompactFilter {
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
             Err(action) => return Ok(action),
         };
+        let model = params
+            .compaction_model
+            .as_deref()
+            .unwrap_or(&self.config.default_model)
+            .to_owned();
+        let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
+        let compaction_resp_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
+        let created_at = i64::try_from(ctx.time_source.now().as_secs()).unwrap_or(i64::MAX);
+        let store = ctx
+            .extensions
+            .get::<ResponseStoreRegistry>()
+            .and_then(|r| r.get("default"));
+        let tenant_id = ctx.get_metadata("responses.tenant_id").unwrap_or("default").to_owned();
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Release);
         };
-        let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
-        replace_messages(state, build_compaction_item(&compaction_id, &summary));
+        replace_messages(
+            state,
+            build_compaction_item(&compaction_id, &summary, &self.config.summary_prefix),
+        );
+        if let Some(store) = store.as_deref() {
+            persist_compaction_response(store, &compaction_resp_id, &model, &tenant_id, created_at, state);
+        }
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
@@ -285,6 +379,10 @@ impl HttpFilter for CompactFilter {
 /// Returns `None` if there is no compaction config, the encoding is
 /// unknown, or the token count is below the threshold.
 ///
+/// When `previous_usage` is available from the rehydrated response,
+/// its `total_tokens` is used directly — avoiding the cost of BPE
+/// tokenization. Falls back to tiktoken estimation otherwise.
+///
 /// The token estimate includes instructions and tool definitions in
 /// addition to conversation messages, since all three contribute to
 /// the rendered context sent to the model.
@@ -292,7 +390,9 @@ fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(Co
     let params = extract_compaction_config(&state.context_management)?;
 
     let conversation_text = build_conversation_text(&state.messages);
-    let message_tokens = get_token_count(&conversation_text, tiktoken_encoding)?;
+
+    let message_tokens =
+        previous_usage_total(state).or_else(|| get_token_count(&conversation_text, tiktoken_encoding))?;
 
     let overhead_text = build_context_overhead_text(state);
     let overhead_tokens = if overhead_text.is_empty() {
@@ -322,6 +422,17 @@ fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(Co
     Some((params, conversation_text))
 }
 
+/// Extract `total_tokens` from the previous response's usage object.
+fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
+    let total = state.previous_usage.as_ref()?.get("total_tokens")?.as_u64()?;
+    debug!(
+        count = total,
+        source = "previous_usage",
+        "token count from prior response"
+    );
+    Some(total)
+}
+
 /// Build the text for instructions and tool definitions that live
 /// outside the message list but still consume context window tokens.
 fn build_context_overhead_text(state: &ResponsesState) -> String {
@@ -338,6 +449,11 @@ fn build_context_overhead_text(state: &ResponsesState) -> String {
     buf
 }
 
+/// Check whether this is an explicit `POST /v1/responses/compact` request.
+fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+}
+
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
@@ -347,6 +463,136 @@ fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
 fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.stream")
         .is_some_and(|v| v == "true")
+}
+
+// -----------------------------------------------------------------------------
+// Explicit Compact Endpoint Helpers
+// -----------------------------------------------------------------------------
+
+/// Parsed body for `POST /v1/responses/compact`.
+struct ExplicitCompactRequest {
+    /// The stored response to compact.
+    response_id: String,
+    /// Optional model override for the summarization call.
+    model: Option<String>,
+    /// Optional instructions to prepend to the summarization prompt.
+    instructions: Option<String>,
+}
+
+/// Parse and validate the `POST /v1/responses/compact` body.
+fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactRequest, FilterAction> {
+    let bytes = body
+        .as_ref()
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| reject_compact(400, "invalid_request_error", "request body is empty"))?;
+    let parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
+        debug!(error = %e, "compact request body parse failed");
+        reject_compact(400, "invalid_request_error", "invalid JSON body")
+    })?;
+    let response_id = parsed
+        .get("response_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| reject_compact(400, "invalid_request_error", "missing required field: response_id"))?
+        .to_owned();
+    Ok(ExplicitCompactRequest {
+        response_id,
+        model: parsed.get("model").and_then(Value::as_str).map(ToOwned::to_owned),
+        instructions: parsed
+            .get("instructions")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+/// Look up the store and tenant from the request context.
+fn resolve_store_and_tenant(
+    ctx: &HttpFilterContext<'_>,
+) -> Result<(std::sync::Arc<dyn crate::store::ResponseStore>, String), FilterAction> {
+    let store = ctx
+        .extensions
+        .get::<ResponseStoreRegistry>()
+        .and_then(|r| r.get("default"))
+        .ok_or_else(|| reject_compact(500, "server_error", "response store not available"))?;
+    let tenant_id = ctx.get_metadata("responses.tenant_id").unwrap_or("default").to_owned();
+    Ok((store, tenant_id))
+}
+
+/// Fetch a stored response, blocking the current thread.
+fn fetch_response_blocking(
+    store: &dyn crate::store::ResponseStore,
+    tenant_id: &str,
+    req: &ExplicitCompactRequest,
+) -> Result<ResponseRecord, FilterAction> {
+    let handle = tokio::runtime::Handle::current();
+    match tokio::task::block_in_place(|| handle.block_on(store.get_response(tenant_id, &req.response_id))) {
+        Ok(Some(r)) => Ok(r),
+        Ok(None) => Err(reject_compact(404, "not_found_error", "response not found")),
+        Err(e) => {
+            warn!(error = %e, "failed to fetch response for compact");
+            Err(reject_compact(500, "server_error", "failed to fetch response"))
+        },
+    }
+}
+
+/// Extract messages from a stored response.
+fn extract_stored_messages(record: &ResponseRecord) -> Result<Vec<Value>, FilterAction> {
+    let messages: Vec<Value> = match &record.messages {
+        Value::Array(arr) => arr.clone(),
+        _ => Vec::new(),
+    };
+    if messages.is_empty() {
+        return Err(reject_compact(
+            400,
+            "invalid_request_error",
+            "response has no messages to compact",
+        ));
+    }
+    Ok(messages)
+}
+
+/// Build and persist the compaction result for an explicit compact request.
+#[expect(clippy::too_many_arguments, reason = "all parameters are needed")]
+fn build_and_persist_compaction(
+    filter: &CompactFilter,
+    ctx: &HttpFilterContext<'_>,
+    store: &dyn crate::store::ResponseStore,
+    tenant_id: &str,
+    req: &ExplicitCompactRequest,
+    summary: &str,
+) -> Result<Value, FilterAction> {
+    let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
+    let resp_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
+    let created_at = i64::try_from(ctx.time_source.now().as_secs()).unwrap_or(i64::MAX);
+    let model = req.model.as_deref().unwrap_or(&filter.config.default_model);
+    let compaction_item = build_compaction_item(&compaction_id, summary, &filter.config.summary_prefix);
+    let compacted_messages = Value::Array(vec![compaction_item]);
+    let response_object = serde_json::json!({
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "previous_response_id": req.response_id,
+    });
+
+    let record = ResponseRecord {
+        id: resp_id,
+        tenant_id: tenant_id.to_owned(),
+        created_at,
+        model: model.to_owned(),
+        response_object: response_object.clone(),
+        input: compacted_messages.clone(),
+        messages: compacted_messages,
+    };
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| handle.block_on(store.upsert_response(&record))).map_err(|e| {
+        warn!(error = %e, "failed to persist explicit compaction response");
+        reject_compact(500, "server_error", "failed to persist compaction response")
+    })?;
+    Ok(response_object)
+}
+
+/// Build a `FilterAction::Reject` for an explicit compact error.
+fn reject_compact(status: u16, code: &str, message: &str) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(status, code, message, false))
 }
 
 /// Parse the `context_management` JSON to find a compaction config.
@@ -485,17 +731,24 @@ fn parse_summarization_response(body: &[u8]) -> Result<String, String> {
 /// Build the compaction output item.
 ///
 /// Returns: `{"type": "compaction", "id": "<id>", "encrypted_content": "<base64>"}`
+/// with an optional `"summary_prefix"` when it differs from the default.
 ///
 /// The summary is base64-encoded into `encrypted_content` to match the
 /// OpenAI Responses API compaction item shape and make the content opaque
 /// to clients.
-fn build_compaction_item(id: &str, summary: &str) -> Value {
+fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value {
     let encrypted_content = base64::engine::general_purpose::STANDARD.encode(summary);
-    serde_json::json!({
+    let mut item = serde_json::json!({
         "type": "compaction",
         "id": id,
         "encrypted_content": encrypted_content
-    })
+    });
+    if summary_prefix != DEFAULT_SUMMARY_PREFIX
+        && let Some(obj) = item.as_object_mut()
+    {
+        obj.insert("summary_prefix".to_owned(), Value::String(summary_prefix.to_owned()));
+    }
+    item
 }
 
 /// Replace conversation history with the compaction item.
@@ -513,6 +766,40 @@ fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
     new_messages.extend(state.input.iter().cloned());
     state.persisted_messages = new_messages.clone();
     state.messages = new_messages;
+}
+
+/// Persist a hidden compaction response to the store so that it can
+/// be referenced via `previous_response_id` in future requests.
+///
+/// Best-effort: a store failure is logged but does not block the
+/// request — the main response's store filter will still persist
+/// the compacted messages as part of the regular response record.
+#[expect(clippy::too_many_arguments, reason = "all fields are needed for the record")]
+fn persist_compaction_response(
+    store: &dyn crate::store::ResponseStore,
+    response_id: &str,
+    model: &str,
+    tenant_id: &str,
+    created_at: i64,
+    state: &ResponsesState,
+) {
+    let record = ResponseRecord {
+        id: response_id.to_owned(),
+        tenant_id: tenant_id.to_owned(),
+        created_at,
+        model: model.to_owned(),
+        response_object: serde_json::json!({
+            "id": response_id,
+            "object": "response",
+            "status": "completed",
+        }),
+        input: Value::Array(state.persisted_messages.clone()),
+        messages: Value::Array(state.persisted_messages.clone()),
+    };
+    let handle = tokio::runtime::Handle::current();
+    if let Err(e) = tokio::task::block_in_place(|| handle.block_on(store.upsert_response(&record))) {
+        warn!(error = %e, id = %response_id, "failed to persist compaction response");
+    }
 }
 
 /// Format a message array as readable text for the summarization prompt.
