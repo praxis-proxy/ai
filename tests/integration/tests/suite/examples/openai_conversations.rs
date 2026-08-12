@@ -276,6 +276,142 @@ fn unmatched_path_passes_through() {
     assert_eq!(parse_body(&raw), "ok");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_items_with_invalid_limit_returns_400() {
+    let proxy = start_test_proxy();
+    let conv_id = create_conversation(&proxy, r#"{"metadata":{},"items":[]}"#);
+
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "GET /v1/conversations/{conv_id}/items?limit=abc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(parse_status(&raw), 400, "non-integer limit should return 400");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a valid integer"),
+        "error message should mention invalid integer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_items_with_invalid_order_returns_400() {
+    let proxy = start_test_proxy();
+    let conv_id = create_conversation(&proxy, r#"{"metadata":{},"items":[]}"#);
+
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "GET /v1/conversations/{conv_id}/items?order=random HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(parse_status(&raw), 400, "invalid order should return 400");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must be 'asc' or 'desc'"),
+        "error message should mention valid order values"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_items_with_unknown_param_returns_400() {
+    let proxy = start_test_proxy();
+    let conv_id = create_conversation(&proxy, r#"{"metadata":{},"items":[]}"#);
+
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "GET /v1/conversations/{conv_id}/items?foo=bar HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(parse_status(&raw), 400, "unknown param should return 400");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown query parameter"),
+        "error message should mention unknown parameter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_items_with_duplicate_limit_returns_400() {
+    let proxy = start_test_proxy();
+    let conv_id = create_conversation(&proxy, r#"{"metadata":{},"items":[]}"#);
+
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "GET /v1/conversations/{conv_id}/items?limit=5&limit=10 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(parse_status(&raw), 400, "duplicate limit should return 400");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Duplicate query parameter"),
+        "error message should mention duplicate parameter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_items_with_limit_zero_returns_empty_page() {
+    let proxy = start_test_proxy();
+    let conv_id = create_conversation(
+        &proxy,
+        r#"{"metadata":{},"items":[{"id":"item_one","type":"message","role":"user","content":"hello"}]}"#,
+    );
+
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "GET /v1/conversations/{conv_id}/items?limit=0 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "limit=0 should return 200");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["data"].as_array().unwrap().len(),
+        0,
+        "limit=0 should return empty data array"
+    );
+    assert_eq!(
+        body["has_more"], true,
+        "limit=0 with existing items should report has_more=true"
+    );
+}
+
+#[test]
+fn list_items_with_invalid_query_on_nonexistent_conversation_returns_400() {
+    let proxy = start_test_proxy();
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/conversations/conv_nonexistent/items?limit=abc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "invalid query should return 400 even when conversation does not exist"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
 // -----------------------------------------------------------------------------
 // Test Helpers
 // -----------------------------------------------------------------------------
