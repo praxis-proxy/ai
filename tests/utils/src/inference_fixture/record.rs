@@ -378,7 +378,9 @@ pub(super) async fn record_live(
     let client_limit = LIVE_CAPTURE_BUDGET;
     let mut operation_error = None;
     let mut attempts = 0_usize;
-    for turn in bound.turns {
+    let mut previous_response_id = None;
+    for mut turn in bound.turns {
+        turn.bind_previous_response_id(previous_response_id.as_deref())?;
         attempts = attempts.saturating_add(1);
         match send_recorded_request_with_header(
             &client,
@@ -390,6 +392,7 @@ pub(super) async fn record_live(
         .await
         {
             Ok(client_response) => {
+                previous_response_id = client_response.response_id().map(str::to_owned);
                 let exchange = BorrowedRecordedExchange {
                     request: &turn.request,
                     response: &client_response,
