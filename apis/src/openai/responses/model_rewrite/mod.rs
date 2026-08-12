@@ -42,7 +42,8 @@ use std::{borrow::Cow, collections::HashMap};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -75,7 +76,6 @@ use crate::{classifier::is_responses_create, json_body::replace_json_body, promo
 /// model_aliases:
 ///   "codex-mini-latest": "llama-3.3-70b"
 ///   "gpt-4.1-*": "qwen-2.5-72b"
-/// max_body_bytes: 10485760
 /// on_invalid: continue
 /// headers:
 ///   effective_model: x-praxis-ai-effective-model
@@ -87,9 +87,6 @@ pub struct ModelRewriteFilter {
 
     /// Configurable header names for promoted model values.
     headers: config::ModelRewriteHeaders,
-
-    /// Maximum request body size for `StreamBuffer` mode.
-    max_body_bytes: usize,
 
     /// Map from client-facing model names or single-wildcard patterns
     /// to backend model names. Quote wildcard keys in YAML.
@@ -113,7 +110,6 @@ impl ModelRewriteFilter {
         Ok(Box::new(Self {
             default_model: cfg.default_model,
             headers: cfg.headers,
-            max_body_bytes: cfg.max_body_bytes,
             model_aliases: cfg.model_aliases,
             on_invalid: cfg.on_invalid,
         }))
@@ -164,8 +160,11 @@ impl HttpFilter for ModelRewriteFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. Model rewriting is size-neutral, so
+        // no per-filter produced-body limit is needed.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
