@@ -182,6 +182,46 @@ fn parse_traceparent_accepts_future_versions() {
 }
 
 // -----------------------------------------------------------------------------
+// Defensive ID sanitization
+// -----------------------------------------------------------------------------
+
+#[test]
+fn sanitized_ids_are_never_all_zero() {
+    // Inputs a future core generator could plausibly produce, none of
+    // which may yield the all-zero ID W3C section 2.2.2 forbids.
+    let degenerate = ["", "0", "00000000000000000000000000000000", "----", "zzzz"];
+
+    for id in degenerate {
+        let trace_id = sanitize_trace_id(id);
+        assert_eq!(trace_id.len(), TRACE_ID_LEN, "trace-id should be 32 chars: {id:?}");
+        assert!(is_lower_hex(&trace_id), "trace-id should be lowercase hex: {trace_id}");
+        assert!(!is_all_zero(&trace_id), "trace-id must not be all zeros: {id:?}");
+
+        let span_id = span_id_from(&trace_id);
+        assert_eq!(span_id.len(), SPAN_ID_LEN, "span-id should be 16 chars: {id:?}");
+        assert!(!is_all_zero(&span_id), "span-id must not be all zeros: {id:?}");
+    }
+}
+
+#[test]
+fn sanitize_preserves_a_well_formed_generated_id() {
+    let id = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    assert_eq!(sanitize_trace_id(id), id, "a valid generated ID should pass through");
+}
+
+#[test]
+fn span_id_falls_back_when_the_trace_id_tail_is_zero() {
+    // A trace-id that is itself valid can still end in 16 zeros.
+    let trace_id = "4bf92f3577b34da60000000000000000";
+
+    let span_id = span_id_from(trace_id);
+
+    assert!(!is_all_zero(&span_id), "span-id must not be all zeros: {span_id}");
+    assert_eq!(span_id.len(), SPAN_ID_LEN, "span-id should be 16 chars: {span_id}");
+}
+
+// -----------------------------------------------------------------------------
 // Forwarded and delegated legs share one trace
 // -----------------------------------------------------------------------------
 
@@ -216,6 +256,31 @@ fn delegated_call_joins_trace_injected_for_the_forwarded_request() {
         header(&map, "x-request-id"),
         forwarded.request_id(),
         "both legs must carry the same request ID"
+    );
+}
+
+#[test]
+fn init_makes_repeated_resolutions_share_one_trace() {
+    let req = request_with(&[]);
+    let mut ctx = make_filter_context(&req);
+    drop(TraceContext::get_or_init(&mut ctx));
+
+    // Two resolution phases of one filter, e.g. current input and
+    // rehydrated history.
+    let first = applied(&Correlation::from_filter_context(&ctx));
+    let second = applied(&Correlation::from_filter_context(&ctx));
+
+    let first_parts: Vec<String> = header(&first, "traceparent").split('-').map(str::to_owned).collect();
+    let second_parts: Vec<String> = header(&second, "traceparent").split('-').map(str::to_owned).collect();
+
+    assert_eq!(
+        first_parts[1], second_parts[1],
+        "callouts of one request must share a trace-id once initialized"
+    );
+    assert_eq!(
+        header(&first, "x-request-id"),
+        header(&second, "x-request-id"),
+        "callouts of one request must share a request ID"
     );
 }
 

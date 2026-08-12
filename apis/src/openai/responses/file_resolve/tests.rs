@@ -640,6 +640,60 @@ async fn resolves_history_when_current_input_has_no_file_id() {
 }
 
 #[tokio::test]
+async fn current_input_and_history_callouts_share_one_span() {
+    // Distinct file ids, so the request-wide cache cannot hide a
+    // second correlation resolution behind a cache hit: current input
+    // and rehydrated history each make real callouts.
+    let (files_api_url, seen) = start_recording_files_api_stub();
+    let filter = make_filter_for_url(&files_api_url);
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+    let request_body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-current"}]
+        }]
+    });
+    let history = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_file", "file_id": "file-history"}]
+    });
+    let mut state = ResponsesState::from_request_body(request_body.clone());
+    state.messages.insert(0, history.clone());
+    state.persisted_messages.insert(0, history);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "resolution across input and history should continue the request"
+    );
+
+    let traceparents = seen.lock().unwrap().clone();
+    assert!(
+        traceparents.len() > 1,
+        "expected callouts for both current input and history, saw {traceparents:?}"
+    );
+    let spans: std::collections::HashSet<&str> = traceparents
+        .iter()
+        .map(|value| value.split('-').nth(2).unwrap_or_default())
+        .collect();
+    assert_eq!(
+        spans.len(),
+        1,
+        "file resolution is one delegation hop, so every phase's callouts must share a span-id, saw {traceparents:?}"
+    );
+}
+
+#[tokio::test]
 async fn mirrored_history_has_independent_inline_budget() {
     let files_api_url = start_files_api_stub();
     let client = make_client_for_url_with_max(&files_api_url, 16);
@@ -659,10 +713,18 @@ async fn mirrored_history_has_independent_inline_budget() {
     state.persisted_messages.push(history);
     ctx.extensions.insert(state);
     let mut budget = client.resolution_budget();
+    let callout_headers = client.callout_headers(&ctx);
 
-    resolve_state_history(&mut ctx, &client, OnMissing::Reject, None, &mut budget)
-        .await
-        .unwrap();
+    resolve_state_history(
+        &mut ctx,
+        &client,
+        OnMissing::Reject,
+        None,
+        &callout_headers,
+        &mut budget,
+    )
+    .await
+    .unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.messages[0]["content"][0]["file_data"], "aGlzdG9yeQ==");
@@ -811,6 +873,58 @@ fn start_files_api_stub() -> String {
     });
 
     format!("http://{address}")
+}
+
+/// Files API stub that also records the `traceparent` of every
+/// callout it serves.
+fn start_recording_files_api_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&seen);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let recorder = std::sync::Arc::clone(&recorder);
+            std::thread::spawn(move || serve_and_record(stream, &recorder));
+        }
+    });
+
+    (format!("http://{address}"), seen)
+}
+
+fn serve_and_record(mut stream: std::net::TcpStream, seen: &std::sync::Mutex<Vec<String>>) {
+    let mut request = [0_u8; 4096];
+    let read = stream.read(&mut request).unwrap();
+    let raw = String::from_utf8_lossy(&request[..read]).into_owned();
+
+    let traceparent = raw
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("traceparent"))
+        .map(|(_, value)| value.trim().to_owned())
+        .unwrap_or_default();
+    seen.lock().unwrap().push(traceparent);
+
+    let path = raw
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap();
+    let (content_type, body): (&str, &[u8]) = if path.ends_with("/content") {
+        ("text/plain", b"history")
+    } else {
+        (
+            "application/json",
+            br#"{"id":"file-history","filename":"history.txt","content_type":"text/plain","bytes":7}"#,
+        )
+    };
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
 }
 
 fn serve_file_request(mut stream: std::net::TcpStream) {

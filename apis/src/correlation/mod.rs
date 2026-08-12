@@ -55,7 +55,7 @@ mod tests;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use praxis_filter::HttpFilterContext;
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// Header carrying the request correlation ID.
 const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -74,6 +74,13 @@ const TRACE_ID_LEN: usize = 32;
 
 /// Hex length of a W3C span-id.
 const SPAN_ID_LEN: usize = 16;
+
+/// Last-resort trace-id when sanitization would yield all zeros,
+/// which W3C Trace Context section 2.2.2 forbids.
+const FALLBACK_TRACE_ID: &str = "00000000000000000000000000000001";
+
+/// Last-resort span-id, for the same reason as [`FALLBACK_TRACE_ID`].
+const FALLBACK_SPAN_ID: &str = "0000000000000001";
 
 /// Correlation identifiers for one downstream request.
 ///
@@ -118,13 +125,24 @@ impl TraceContext {
     /// Read the request's shared trace context.
     ///
     /// Falls back to resolving a fresh context when no hop has
-    /// initialized one yet, so correlation still works in a chain
-    /// with no `trace_context` filter.
+    /// initialized one yet, so a callout still carries correlation
+    /// headers in a chain that never called [`Self::get_or_init`].
+    ///
+    /// The fallback resolves *without storing*, so repeated calls on a
+    /// request with no client-supplied `traceparent` produce different
+    /// trace-ids. Callers that make more than one hop must therefore
+    /// call [`Self::get_or_init`] first — every callsite does today,
+    /// from the filter's `on_request_body` entry point.
     pub(crate) fn from_filter_context(ctx: &HttpFilterContext<'_>) -> Self {
-        ctx.extensions
-            .get::<Self>()
-            .cloned()
-            .unwrap_or_else(|| Self::resolve(ctx))
+        if let Some(shared) = ctx.extensions.get::<Self>() {
+            return shared.clone();
+        }
+
+        debug!(
+            "no shared trace context in extensions; resolving independently \
+             — call `get_or_init` first for stable correlation"
+        );
+        Self::resolve(ctx)
     }
 
     /// Resolve identifiers from the request, ignoring any shared
@@ -306,13 +324,28 @@ fn parse_traceparent(value: &str) -> Option<InboundTrace> {
 /// (`{micros:012x}{seed:08x}{seq:012x}`), which is the W3C
 /// trace-id width.
 fn generate_trace_id(ctx: &HttpFilterContext<'_>) -> String {
-    let id = ctx.id_generator.generate(ctx.time_source);
-    if id.len() == TRACE_ID_LEN && is_lower_hex(&id) && !is_all_zero(&id) {
-        return id;
+    sanitize_trace_id(&ctx.id_generator.generate(ctx.time_source))
+}
+
+/// Coerce a generated ID into a W3C-valid trace-id.
+///
+/// Defensive: keeps emitting a well-formed trace-id if the core
+/// generator's format ever changes. An all-zero value is invalid per
+/// W3C Trace Context section 2.2.2, so sanitization that would erase
+/// every digit falls back to a fixed non-zero ID rather than emitting
+/// one a collector must reject.
+fn sanitize_trace_id(id: &str) -> String {
+    if id.len() == TRACE_ID_LEN && is_lower_hex(id) && !is_all_zero(id) {
+        return id.to_owned();
     }
-    // Defensive: keep emitting a well-formed trace-id if the core
-    // generator's format ever changes.
-    format!("{id:0>TRACE_ID_LEN$.TRACE_ID_LEN$}").replace(|c: char| !c.is_ascii_hexdigit(), "0")
+
+    let sanitized = format!("{id:0>TRACE_ID_LEN$.TRACE_ID_LEN$}")
+        .to_ascii_lowercase()
+        .replace(|c: char| !c.is_ascii_hexdigit(), "0");
+    if sanitized.len() != TRACE_ID_LEN || is_all_zero(&sanitized) {
+        return FALLBACK_TRACE_ID.to_owned();
+    }
+    sanitized
 }
 
 /// Generate a 16-hex-character span-id for one hop.
@@ -321,8 +354,17 @@ fn generate_trace_id(ctx: &HttpFilterContext<'_>) -> String {
 /// call, so each hop's span-id differs even when drawn within the
 /// same microsecond.
 fn generate_span_id(ctx: &HttpFilterContext<'_>) -> String {
-    let id = generate_trace_id(ctx);
-    id.get(TRACE_ID_LEN - SPAN_ID_LEN..).unwrap_or("").to_owned()
+    span_id_from(&generate_trace_id(ctx))
+}
+
+/// Take the span-id from the tail of a trace-id, guarding the same
+/// all-zero case as [`sanitize_trace_id`].
+fn span_id_from(trace_id: &str) -> String {
+    let span_id = trace_id.get(TRACE_ID_LEN - SPAN_ID_LEN..).unwrap_or("");
+    if span_id.len() != SPAN_ID_LEN || is_all_zero(span_id) {
+        return FALLBACK_SPAN_ID.to_owned();
+    }
+    span_id.to_owned()
 }
 
 /// Check that every character is a lowercase hex digit.
