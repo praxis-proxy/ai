@@ -227,7 +227,7 @@ def _write_agentic_config(
     config = config.replace(
         '- "127.0.0.1:3001"',
         f'- "{vllm}"\n'
-        "                    read_timeout_ms: 120000",
+        "                    read_timeout_ms: 300000",
     )
     config = config.replace(
         "sqlite://responses.db?mode=rwc",
@@ -248,8 +248,8 @@ def _write_agentic_config(
     config = config.replace(
         "max_iterations: 11\n",
         "max_iterations: 11\n"
-        "        timeout_ms: 120000\n"
-        "        step_timeout_ms: 120000\n",
+        "        timeout_ms: 300000\n"
+        "        step_timeout_ms: 300000\n",
     )
     config = config.replace(
         "- filter: openai_web_search\n"
@@ -318,7 +318,7 @@ def openai_client(praxis_proxy):
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         api_key="test",
         max_retries=0,
-        timeout=180,
+        timeout=300,
     )
 
 
@@ -634,7 +634,7 @@ def agentic_client(agentic_proxy):
         base_url=f"http://127.0.0.1:{proxy_port}/v1",
         api_key="test",
         max_retries=0,
-        timeout=180,
+        timeout=300,
     )
 
 
@@ -943,7 +943,7 @@ def file_search_client(file_search_proxy):
         base_url=f"http://127.0.0.1:{file_search_proxy}/v1",
         api_key="test",
         max_retries=0,
-        timeout=180,
+        timeout=300,
     )
 
 
