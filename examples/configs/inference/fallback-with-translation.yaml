@@ -6,25 +6,54 @@
 # retries against a fallback provider. Both backends receive translated
 # Chat Completions requests with isolated credentials.
 #
-# Pipeline ordering (pre-IRR, runs once):
-#   1. openai_responses_format classifies the client request and
-#      promotes header metadata. Rejects non-Responses requests early.
-#   2. openai_responses_validate validates parameters, generates the
-#      ResponsesState extension shared across steps, and rejects
-#      malformed bodies before entering the IRR.
+# Step boundary: the IRR resets per-step metadata for credential
+# isolation but preserves extensions across steps. This means:
 #
-# IRR steps (each step re-runs openai_responses_format and
-# openai_responses_validate because the IRR resets per-step metadata
-# for credential isolation; extensions persist across steps):
-#   primary: classifies, validates, translates Responses to Chat
-#            Completions, rewrites path, routes, injects primary
-#            credentials, load-balances to primary backend.
-#   fallback: same pipeline, injects fallback credentials, routes
-#             to fallback backend.
+#   - ResponsesState (extension, set by openai_responses_validate)
+#     survives step transitions.
+#   - openai_responses_format.format (metadata) does not.
 #
-# Transition rules:
-#   status [429, 502, 503, 504] -> next: fallback
-#   default                     -> done (return to client)
+# Because responses_to_chat_completions reads both metadata and
+# extensions, each step must re-run openai_responses_format and
+# openai_responses_validate to repopulate its metadata. Without
+# them the translation filter returns 500: "request pipeline state
+# is unavailable".
+#
+# Filter ordering within each step:
+#
+#   1. openai_responses_format         classify, set metadata
+#   2. openai_responses_model_rewrite  rewrite model (optional)
+#   3. openai_responses_validate       parse body, set metadata + extension
+#   4. responses_to_chat_completions   translate body using both
+#   5. path_rewrite                    /v1/responses -> /v1/chat/completions
+#   6. router                          select cluster
+#   7. credential_injection            inject per-cluster credentials
+#   8. load_balancer                   select endpoint
+#
+# Key ordering constraints:
+#   - 1 before 2: model rewrite reads openai_responses_format.stream
+#   - 2 before 3: validate parses after rewrite, so ResponsesState
+#     carries the effective model
+#   - 3 before 4: translation reads responses.response_id metadata
+#     and ResponsesState extension, both set by validate
+#   - 6 before 7: credential injection matches on ctx.cluster,
+#     which the router sets
+#
+# Pre-IRR filters:
+#   openai_responses_format rejects non-Responses requests early.
+#   openai_responses_validate rejects malformed bodies before the
+#   IRR allocates sub-request resources.
+#
+# Adapting for real providers:
+#   - Add openai_responses_model_rewrite between format and validate
+#     in the fallback step to map model names across providers.
+#   - Use env_var instead of value in credential_injection to read
+#     API keys from the environment at startup.
+#   - Add a headers filter (request_set Host) before load_balancer
+#     for external HTTPS upstreams.
+#   - Add tls: { sni: "hostname" } to the cluster for HTTPS.
+#   - Adjust the path_rewrite replacement per provider (e.g.
+#     /api/v1/chat/completions for OpenRouter).
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/inference/fallback-with-translation.yaml

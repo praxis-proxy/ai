@@ -78,6 +78,13 @@ All promoted values are validated against a 256-byte
 length limit and checked for control characters
 before propagation.
 
+Inside `iterative_request_router` steps, metadata is
+reset for credential isolation but extensions persist.
+Filters that read classifier metadata must have the
+classifier re-run inside their step. See
+`examples/configs/inference/fallback-with-translation.yaml`
+for the full pattern.
+
 ### Stateful vs Stateless
 
 Responses API requests are classified as "stateful"
