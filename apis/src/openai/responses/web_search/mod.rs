@@ -64,6 +64,9 @@ const ACTION_LOOP: &str = "loop";
 /// Action value signalling no web search dispatch needed.
 const ACTION_DONE: &str = "done";
 
+/// Include value that gates `action.sources` in the output item.
+const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
+
 // -----------------------------------------------------------------------------
 // WebSearchFilter
 // -----------------------------------------------------------------------------
@@ -277,9 +280,6 @@ impl HttpFilter for WebSearchFilter {
         Ok(FilterAction::Continue)
     }
 }
-
-/// Include value that gates `action.sources` in the output item.
-const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 
 /// Append search results to [`ResponsesState`].
 fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str, query: &str, results: &[SearchResult]) {
