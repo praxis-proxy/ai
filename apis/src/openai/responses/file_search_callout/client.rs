@@ -14,7 +14,10 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize, de::Visitor};
 use serde_json::Value;
 
-use crate::openai::{api_client::ApiClient, responses::config_validation::FailureMode};
+use crate::openai::{
+    api_client::{ApiClient, Correlation},
+    responses::config_validation::FailureMode,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -379,6 +382,18 @@ impl FileSearchClient {
         }
     }
 
+    /// Build the header set sent on every vector-store callout for
+    /// one downstream request.
+    ///
+    /// Resolved once per request at the filter boundary — the only
+    /// place with access to the filter context — then threaded into
+    /// each callout of the fan-out, so correlation is established
+    /// once rather than per vector store.
+    pub(crate) fn callout_headers(&self, ctx: &praxis_filter::HttpFilterContext<'_>) -> HeaderMap {
+        self.api_client
+            .callout_headers(&ctx.request.headers, &Correlation::from_filter_context(ctx))
+    }
+
     /// Search multiple vector stores with bounded concurrency and aggregation.
     #[expect(
         clippy::too_many_lines,
@@ -388,7 +403,7 @@ impl FileSearchClient {
         &self,
         specs: &[SearchSpec<'_>],
         call_count: usize,
-        request_headers: &HeaderMap,
+        callout_headers: &HeaderMap,
     ) -> SearchBatch {
         let mut batch = SearchBatch::new(call_count);
         let mut consumed_response_bytes = 0_usize;
@@ -424,7 +439,7 @@ impl FileSearchClient {
             };
             let futures = chunk
                 .iter()
-                .map(|spec| self.search_one(spec, execution_started, Arc::clone(&admission), request_headers));
+                .map(|spec| self.search_one(spec, execution_started, Arc::clone(&admission), callout_headers));
             let chunk_results = futures::future::join_all(futures).await;
             let chunk_failed = merge_chunk_results(
                 &mut batch,
@@ -461,13 +476,13 @@ impl FileSearchClient {
         spec: &SearchSpec<'_>,
         execution_started: Instant,
         response_admission: Arc<ResponseAdmission>,
-        request_headers: &HeaderMap,
+        callout_headers: &HeaderMap,
     ) -> Result<SearchResponse, FileSearchError> {
         deadline_remaining(self.timeout, execution_started, spec.store_id)?;
         let request = self.build_request(spec, execution_started)?;
         deadline_remaining(self.timeout, execution_started, spec.store_id)?;
         let body = self
-            .execute_request(request, spec.store_id, execution_started, request_headers)
+            .execute_request(request, spec.store_id, execution_started, callout_headers)
             .await?;
         parse_response_body_with_deadline(
             body,
@@ -533,13 +548,13 @@ impl FileSearchClient {
         request: PreparedSearchRequest,
         store_id: &str,
         execution_started: Instant,
-        request_headers: &HeaderMap,
+        callout_headers: &HeaderMap,
     ) -> Result<Bytes, FileSearchError> {
         let remaining = deadline_remaining(self.timeout, execution_started, store_id)?;
         tokio::time::timeout(
             remaining,
             self.api_client
-                .post_json_bytes(request.url, request.body, request_headers),
+                .post_json_bytes(request.url, request.body, callout_headers),
         )
         .await
         .map_err(|_elapsed| execution_deadline_error(store_id))
