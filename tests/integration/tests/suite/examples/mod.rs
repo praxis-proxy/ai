@@ -13,6 +13,7 @@ mod anthropic_messages;
 mod anthropic_messages_web_search;
 mod compact;
 mod credential_injection;
+mod file_search_callout;
 mod full_flow;
 mod guardrails;
 mod mcp_broker;
