@@ -1,0 +1,217 @@
+{
+  "version": 1,
+  "scenario_id": "responses/native-basic-nonstream",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "live",
+    "provider": "vllm",
+    "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+    "source_id": null
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_9fc24586f2098e9c": "msg_recorded_0002",
+      "resp_b3d5d2a3324d314c": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Reply with exactly `4` and nothing else.",
+              "max_output_tokens": 16,
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "created_at": "1970-01-01T00:00:00Z",
+              "ec_transfer_params": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input_messages": null,
+              "instructions": null,
+              "kv_transfer_params": null,
+              "max_output_tokens": 16,
+              "max_tool_calls": null,
+              "metadata": null,
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": null,
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "phase": null,
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "output_messages": null,
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt": null,
+              "reasoning": null,
+              "service_tier": "auto",
+              "status": "completed",
+              "temperature": 1.0,
+              "text": null,
+              "tool_choice": "none",
+              "tools": [],
+              "top_logprobs": null,
+              "top_p": 0.95,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 18,
+                "input_tokens_details": {
+                  "cached_tokens": 0,
+                  "cached_tokens_per_turn": [],
+                  "input_tokens_per_turn": []
+                },
+                "output_tokens": 2,
+                "output_tokens_details": {
+                  "output_tokens_per_turn": [],
+                  "reasoning_tokens": 0,
+                  "tool_output_tokens": 0,
+                  "tool_output_tokens_per_turn": []
+                },
+                "total_tokens": 20
+              },
+              "user": null
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Reply with exactly `4` and nothing else.",
+              "max_output_tokens": 16,
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "created_at": "1970-01-01T00:00:00Z",
+              "ec_transfer_params": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input_messages": null,
+              "instructions": null,
+              "kv_transfer_params": null,
+              "max_output_tokens": 16,
+              "max_tool_calls": null,
+              "metadata": null,
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": null,
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "phase": null,
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "output_messages": null,
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt": null,
+              "reasoning": null,
+              "service_tier": "auto",
+              "status": "completed",
+              "temperature": 1.0,
+              "text": null,
+              "tool_choice": "none",
+              "tools": [],
+              "top_logprobs": null,
+              "top_p": 0.95,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 18,
+                "input_tokens_details": {
+                  "cached_tokens": 0,
+                  "cached_tokens_per_turn": [],
+                  "input_tokens_per_turn": []
+                },
+                "output_tokens": 2,
+                "output_tokens_details": {
+                  "output_tokens_per_turn": [],
+                  "reasoning_tokens": 0,
+                  "tool_output_tokens": 0,
+                  "tool_output_tokens_per_turn": []
+                },
+                "total_tokens": 20
+              },
+              "user": null
+            }
+          }
+        }
+      }
+    }
+  ]
+}

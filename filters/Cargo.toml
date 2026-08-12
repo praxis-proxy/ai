@@ -21,22 +21,31 @@ praxis-main = []
 workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
+notify = { workspace = true }
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 reqwest.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 metrics-util = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 wiremock = { workspace = true }

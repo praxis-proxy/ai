@@ -224,7 +224,7 @@ impl ModuleItems {
     fn clone_for_filter(&self) -> Self {
         Self {
             module_docs: Vec::new(),
-            configs: Vec::new(),
+            configs: self.configs.clone(),
             struct_docs: Vec::new(),
             structs: self.structs.clone(),
             enums: self.enums.clone(),
@@ -330,7 +330,20 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
     items.configs.clear();
     items.module_docs.clear();
     items.struct_docs.clear();
+    parse_local_shared_config(root, &mut items);
     items
+}
+
+/// Parse local configuration types shared by filters in separate API categories.
+fn parse_local_shared_config(root: &Path, items: &mut ModuleItems) {
+    let path = root.join("apis/src/web_search/config.rs");
+    let Ok(source) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(file) = syn::parse_file(&source) else {
+        return;
+    };
+    parse_file_items(&file, items);
 }
 
 /// Resolve praxis crate source directories from the cargo registry via
@@ -491,10 +504,11 @@ fn extract_filters(category_dir: &Path, shared_items: &ModuleItems) -> Vec<Filte
 }
 
 /// Parse non-anchor `.rs` files directly in the category root for shared
-/// enum/struct types. Only struct field info and enums survive
-/// `clone_for_filter`, so module docs and config structs from these
-/// files do not leak into individual filter docs.
+/// enum/struct types. Category-local module docs and config structs
+/// do not leak into individual filter docs, while global shared
+/// config structs remain available for cross-category filters.
 fn parse_category_shared_types(category_dir: &Path, anchors: &[FilterAnchor], out: &mut ModuleItems) {
+    let shared_configs = out.configs.clone();
     let Ok(entries) = fs::read_dir(category_dir) else {
         return;
     };
@@ -517,7 +531,7 @@ fn parse_category_shared_types(category_dir: &Path, anchors: &[FilterAnchor], ou
         };
         parse_file_items(&file, out);
     }
-    out.configs.clear();
+    out.configs = shared_configs;
     out.module_docs.clear();
     out.struct_docs.clear();
 }
@@ -2478,6 +2492,37 @@ mod tests {
             field_names.contains(&"servers"),
             "mcp docs should include broker-mode servers field"
         );
+    }
+
+    #[test]
+    fn web_search_filters_render_shared_provider_config_fields() {
+        let root = workspace_root();
+        let shared_items = parse_shared_config_items(&root);
+        let filters = discover_all_filters(&root, &shared_items);
+
+        for filter_name in ["anthropic_web_search", "openai_web_search"] {
+            let filter = filters
+                .iter()
+                .find(|entry| entry.filter.name == filter_name)
+                .expect("web-search filter should be discovered");
+            let api_key = filter
+                .filter
+                .fields
+                .iter()
+                .find(|field| field.name == "api_key")
+                .expect("web-search filter should document api_key");
+            assert_eq!(
+                api_key.required,
+                RequiredKind::Yes,
+                "{filter_name} should document api_key as required"
+            );
+            for expected in ["provider", "provider_failure_mode", "status_on_error", "base_url"] {
+                assert!(
+                    filter.filter.fields.iter().any(|field| field.name == expected),
+                    "{filter_name} should document {expected}"
+                );
+            }
+        }
     }
 
     #[test]

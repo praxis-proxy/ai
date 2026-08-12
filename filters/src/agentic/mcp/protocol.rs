@@ -16,7 +16,7 @@ use serde::Deserialize;
 /// Protocol version implemented by the current broker behavior.
 pub(crate) const PROTOCOL_VERSION_CURRENT: &str = "2025-03-26";
 
-/// Protocol version for the MCP 2026-07-28 stateless profile (release candidate).
+/// Protocol version for the final MCP 2026-07-28 stateless profile.
 pub(crate) const PROTOCOL_VERSION_STATELESS_2026_07_28: &str = "2026-07-28";
 
 /// Protocol versions supported by the current profile.

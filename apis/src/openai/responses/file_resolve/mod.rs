@@ -29,6 +29,13 @@
 //! passthrough`. No content-part validation — the inference backend
 //! handles that.
 //!
+//! `on_missing` only governs `file_id` availability gaps. A `file_url`
+//! fetch failure is always rejected, regardless of `on_missing`: the
+//! resolver's SSRF, redirect, and size checks may have just rejected
+//! an attacker-controlled target, and that outcome must never be
+//! downgraded into forwarding the original URL for the backend to
+//! fetch itself without the same protections.
+//!
 //! This filter resolves the file transport reference but does not
 //! interpret document contents. The inference backend must already
 //! support the resulting inline `input_file` / `file_data` or

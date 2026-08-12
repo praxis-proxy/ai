@@ -22,6 +22,10 @@ mod tests {
         super::chat_completions::responses_request_to_chat_request(request).unwrap()
     }
 
+    fn map_state(request: &Value, messages: &[Value], tools: &[Value], tool_choice: &Value) -> Value {
+        super::chat_completions::responses_state_to_chat_request(request, messages, tools, tool_choice).unwrap()
+    }
+
     fn map_error(request: &Value) -> String {
         super::chat_completions::responses_request_to_chat_request(request)
             .unwrap_err()
@@ -36,6 +40,42 @@ mod tests {
     fn non_object_responses_request_returns_expected_object_error() {
         let error = super::chat_completions::responses_request_to_chat_request(&json!("hello")).unwrap_err();
         assert_eq!(error.to_string(), "Responses request must be a JSON object");
+    }
+
+    #[test]
+    fn state_overrides_supply_enriched_messages_tools_and_tool_choice() {
+        let request = json!({
+            "model": "gpt-4.1-mini",
+            "input": "client input",
+            "tools": [],
+            "tool_choice": "none"
+        });
+        let messages = vec![json!({"role": "user", "content": "rehydrated input"})];
+        let tools = vec![json!({
+            "type": "function",
+            "name": "lookup",
+            "parameters": {"type": "object"}
+        })];
+
+        let mapped = map_state(&request, &messages, &tools, &json!("required"));
+
+        assert_eq!(mapped["messages"][0]["content"], "rehydrated input");
+        assert_eq!(mapped["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(mapped["tool_choice"], "required");
+    }
+
+    #[test]
+    fn state_default_tool_choice_is_omitted_without_tools() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "hello"});
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+
+        let mapped = map_state(&request, &messages, &[], &json!("auto"));
+
+        assert!(mapped.get("tools").is_none());
+        assert!(
+            mapped.get("tool_choice").is_none(),
+            "Chat Completions backends may reject tool_choice when no tools are present"
+        );
     }
 
     #[test]
@@ -87,6 +127,31 @@ mod tests {
     }
 
     #[test]
+    fn streaming_request_preserves_options_and_forces_usage() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "stream": true,
+            "stream_options": {
+                "include_usage": false,
+                "include_obfuscation": false
+            }
+        }));
+
+        assert_eq!(mapped["stream"], true);
+        assert_eq!(mapped["stream_options"]["include_usage"], true);
+        assert_eq!(mapped["stream_options"]["include_obfuscation"], false);
+    }
+
+    #[test]
+    fn non_streaming_request_does_not_invent_stream_options() {
+        let mapped = map(&json!({"model": "m", "input": "hello", "stream": false}));
+
+        assert_eq!(mapped["stream"], false);
+        assert!(mapped.get("stream_options").is_none());
+    }
+
+    #[test]
     fn simple_inputs_map_or_drop_cleanly() {
         let string_input = map(&json!({"model": "gpt-4o-mini", "instructions": "", "input": "Hello"}));
         let object_input = map(&json!({"model": "gpt-4o-mini", "input": {"role": "developer", "content": "terse"}}));
@@ -103,33 +168,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_choices_map_without_widening() {
+    fn function_tool_choice_maps_without_widening() {
         let function_choice = map(&json!({
             "model": "gpt-4o-mini", "input": "hello",
             "tool_choice": {"type": "function", "name": "lookup_weather"}
-        }));
-        let allowed_tools = map(&json!({
-            "model": "gpt-4o-mini", "input": "hello",
-            "tool_choice": {
-                "type": "allowed_tools",
-                "mode": "auto",
-                "tools": [{"type": "function", "name": "lookup_weather"}]
-            }
         }));
 
         assert_eq!(
             function_choice["tool_choice"],
             json!({"type": "function", "function": {"name": "lookup_weather"}})
-        );
-        assert_eq!(
-            allowed_tools["tool_choice"],
-            json!({
-                "type": "allowed_tools",
-                "allowed_tools": {
-                    "mode": "auto",
-                    "tools": [{"type": "function", "function": {"name": "lookup_weather"}}]
-                }
-            })
         );
     }
 
@@ -154,18 +201,21 @@ mod tests {
     }
 
     #[test]
-    fn non_function_allowed_tools_are_rejected() {
+    fn allowed_tools_choice_is_rejected_until_policy_filter_lands() {
         let error = map_error(&json!({
-            "model": "gpt-4o-mini",
+            "model": "m",
             "input": "hello",
             "tool_choice": {
                 "type": "allowed_tools",
                 "mode": "auto",
-                "tools": [{"type": "file_search"}]
+                "tools": [{"type": "function", "name": "lookup"}]
             }
         }));
 
-        assert!(error.contains("file_search"));
+        assert_eq!(
+            error,
+            "unsupported Responses tool_choice type for Chat Completions translation: allowed_tools"
+        );
     }
 
     #[test]
@@ -484,6 +534,23 @@ mod tests {
     }
 
     #[test]
+    fn responses_text_format_is_omitted_when_tools_are_translated() {
+        let mapped = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "look up the weather",
+            "text": {"format": {"type": "json_object"}},
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"}
+            }]
+        }));
+
+        assert!(mapped.get("response_format").is_none());
+        assert_eq!(mapped["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
     fn responses_request_maps_semantic_chat_parameters() {
         let mapped = map(&json!({
             "model": "gpt-4o-mini",
@@ -533,31 +600,17 @@ mod tests {
     fn recorded_chat_response_maps_to_schema_complete_response_resource() {
         let fixture = chat_completion_response_fixture();
         let response = &fixture["response"];
-        let context = super::chat_completions::ResponseContext {
-            response_id: "resp_123".to_owned(),
-            created_at: 0,
-            completed_at: None,
-            model: "gpt-4o-mini".to_owned(),
-            instructions: Some("Reply tersely.".to_owned()),
-            input: json!("Remember the code word: ember."),
-            metadata: json!({"provider": "recording"}),
-            text: json!({"format": {"type": "text"}}),
-            temperature: Some(json!(1.0)),
-            top_p: Some(json!(1.0)),
-            max_output_tokens: None,
-            max_tool_calls: None,
-            parallel_tool_calls: true,
-            previous_response_id: None,
-            store: true,
-            tools: Vec::new(),
-            tool_choice: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            top_logprobs: None,
-            service_tier: None,
-            safety_identifier: None,
-            prompt_cache_key: None,
-        };
+        let request = json!({
+            "model": "gpt-4o-mini",
+            "instructions": "Reply tersely.",
+            "input": "Remember the code word: ember.",
+            "metadata": {"provider": "recording"},
+            "text": {"format": {"type": "text"}},
+            "temperature": 1.0,
+            "top_p": 1.0
+        });
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_123".to_owned(), 0);
 
         let mapped = super::chat_completions::chat_response_to_response_resource(response, &context).unwrap();
 
@@ -747,25 +800,25 @@ mod tests {
         assert_eq!(ctx.created_at, 42);
         assert!(ctx.completed_at.is_none());
         assert_eq!(ctx.model, "gpt-4o");
-        assert_eq!(ctx.instructions.as_deref(), Some("Be helpful."));
-        assert_eq!(ctx.input, json!([{"role": "user", "content": "hi"}]));
-        assert_eq!(ctx.metadata, json!({"key": "value"}));
-        assert_eq!(ctx.text, json!({"format": {"type": "json_object"}}));
-        assert_eq!(ctx.temperature, Some(json!(0.7)));
-        assert_eq!(ctx.top_p, Some(json!(0.95)));
+        assert_eq!(ctx.instructions, Some("Be helpful."));
+        assert_eq!(ctx.input.cloned(), Some(json!([{"role": "user", "content": "hi"}])));
+        assert_eq!(ctx.metadata.cloned(), Some(json!({"key": "value"})));
+        assert_eq!(ctx.text.cloned(), Some(json!({"format": {"type": "json_object"}})));
+        assert_eq!(ctx.temperature.cloned(), Some(json!(0.7)));
+        assert_eq!(ctx.top_p.cloned(), Some(json!(0.95)));
         assert_eq!(ctx.max_output_tokens, Some(256));
         assert_eq!(ctx.max_tool_calls, Some(5));
         assert!(!ctx.parallel_tool_calls);
-        assert_eq!(ctx.previous_response_id.as_deref(), Some("resp_prev"));
+        assert_eq!(ctx.previous_response_id, Some("resp_prev"));
         assert!(!ctx.store);
         assert_eq!(ctx.tools.len(), 1);
-        assert_eq!(ctx.tool_choice, Some(json!("required")));
-        assert_eq!(ctx.presence_penalty, Some(json!(0.1)));
-        assert_eq!(ctx.frequency_penalty, Some(json!(0.2)));
+        assert_eq!(ctx.tool_choice.cloned(), Some(json!("required")));
+        assert_eq!(ctx.presence_penalty.cloned(), Some(json!(0.1)));
+        assert_eq!(ctx.frequency_penalty.cloned(), Some(json!(0.2)));
         assert_eq!(ctx.top_logprobs, Some(3));
-        assert_eq!(ctx.service_tier, Some(json!("flex")));
-        assert_eq!(ctx.safety_identifier, Some(json!("safe-1")));
-        assert_eq!(ctx.prompt_cache_key, Some(json!("cache-1")));
+        assert_eq!(ctx.service_tier.cloned(), Some(json!("flex")));
+        assert_eq!(ctx.safety_identifier.cloned(), Some(json!("safe-1")));
+        assert_eq!(ctx.prompt_cache_key.cloned(), Some(json!("cache-1")));
     }
 
     #[test]
@@ -775,9 +828,9 @@ mod tests {
 
         assert_eq!(ctx.model, "");
         assert!(ctx.instructions.is_none());
-        assert_eq!(ctx.input, Value::Null);
-        assert_eq!(ctx.metadata, json!({}));
-        assert_eq!(ctx.text, json!({"format": {"type": "text"}}));
+        assert!(ctx.input.is_none());
+        assert!(ctx.metadata.is_none());
+        assert!(ctx.text.is_none());
         assert!(ctx.temperature.is_none());
         assert!(ctx.top_p.is_none());
         assert!(ctx.max_output_tokens.is_none());
@@ -797,11 +850,8 @@ mod tests {
 
     #[test]
     fn response_context_from_non_object_uses_defaults() {
-        let ctx = super::chat_completions::ResponseContext::from_responses_request(
-            &json!("not an object"),
-            "resp_str".to_owned(),
-            0,
-        );
+        let request = json!("not an object");
+        let ctx = super::chat_completions::ResponseContext::from_responses_request(&request, "resp_str".to_owned(), 0);
 
         assert_eq!(ctx.model, "");
         assert!(ctx.instructions.is_none());
@@ -809,12 +859,9 @@ mod tests {
 
     #[test]
     fn response_context_with_completed_at_sets_timestamp() {
-        let ctx = super::chat_completions::ResponseContext::from_responses_request(
-            &json!({"model": "m"}),
-            "resp_1".to_owned(),
-            10,
-        )
-        .with_completed_at(20);
+        let request = json!({"model": "m"});
+        let ctx = super::chat_completions::ResponseContext::from_responses_request(&request, "resp_1".to_owned(), 10)
+            .with_completed_at(20);
 
         assert_eq!(ctx.completed_at, Some(20));
     }
@@ -1142,35 +1189,37 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_non_string_non_object_is_dropped() {
-        let mapped = map(&json!({"model": "m", "input": "hello", "tool_choice": 42}));
+    fn non_string_non_object_tool_choice_is_rejected() {
+        let error = map_error(&json!({"model": "m", "input": "hello", "tool_choice": 42}));
 
-        assert!(mapped.get("tool_choice").is_none());
+        assert_eq!(
+            error,
+            "unsupported Responses tool_choice type for Chat Completions translation: number"
+        );
     }
 
     #[test]
-    fn tool_choice_object_without_type_is_dropped() {
-        let mapped = map(&json!({"model": "m", "input": "hello", "tool_choice": {"name": "f"}}));
+    fn tool_choice_object_without_type_is_rejected() {
+        let error = map_error(&json!({"model": "m", "input": "hello", "tool_choice": {"name": "f"}}));
 
-        assert!(mapped.get("tool_choice").is_none());
+        assert_eq!(
+            error,
+            "unsupported Responses tool_choice type for Chat Completions translation: unknown"
+        );
     }
 
     #[test]
-    fn allowed_tools_choice_with_nested_allowed_tools_key() {
-        let mapped = map(&json!({
+    fn mcp_tool_choice_is_rejected_in_base_converter() {
+        let error = map_error(&json!({
             "model": "m",
             "input": "hello",
             "tool_choice": {
-                "type": "allowed_tools",
-                "allowed_tools": {
-                    "mode": "auto",
-                    "tools": [{"type": "function", "name": "f"}]
-                }
+                "type": "mcp",
+                "server_label": "docs"
             }
         }));
 
-        assert_eq!(mapped["tool_choice"]["type"], "allowed_tools");
-        assert_eq!(mapped["tool_choice"]["allowed_tools"]["mode"], "auto");
+        assert!(error.ends_with(": mcp"));
     }
 
     // -------------------------------------------------------------------------
@@ -1911,7 +1960,7 @@ mod tests {
     // Test Utilities
     // -------------------------------------------------------------------------
 
-    fn make_response_context(request: &Value) -> super::chat_completions::ResponseContext {
+    fn make_response_context(request: &Value) -> super::chat_completions::ResponseContext<'_> {
         super::chat_completions::ResponseContext::from_responses_request(request, "resp_test".to_owned(), 100)
             .with_completed_at(200)
     }

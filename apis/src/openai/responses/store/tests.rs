@@ -3010,6 +3010,78 @@ async fn get_unrelated_path_continues() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_rejects_stream_true() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_stream", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_stream?stream=true");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "stream=true should return 400");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_rejects_include() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_inc", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_inc?include%5B%5D=reasoning.encrypted_content",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "include[] should return 400");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_accepts_stream_false() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_sf",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_sf?stream=false");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "stream=false should return 200");
+    assert_has_json_content_type(&rejection);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_no_query_still_returns_200() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_nq",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_nq");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "no query should still return 200");
+}
+
 // -----------------------------------------------------------------------------
 // GET /v1/responses/{id}/input_items
 // -----------------------------------------------------------------------------
@@ -3194,6 +3266,77 @@ async fn get_input_items_with_malformed_cursor_returns_400() {
             .is_some_and(|message| message.contains("invalid input_items cursor")),
         "error message should explain the invalid input_items cursor"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_last_id_falls_back_to_numeric_cursor_for_non_object_items() {
+    let filter = make_filter();
+    // Plain string entries can't carry a synthetic `id` (there's no
+    // object to attach it to), so `last_id` must fall back to the
+    // page's numeric cursor instead of staying `null`.
+    init_store_and_seed(&filter, "resp_non_object", "default", json!(["first", "second"])).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_non_object/input_items?limit=1&order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["has_more"], true);
+    assert_eq!(
+        body["last_id"], "1",
+        "last_id should fall back to the numeric cursor when the last item has no ID"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_pagination_usable_for_id_less_array_items() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_no_ids",
+        "default",
+        json!([
+            {"type": "message", "role": "user", "content": "first"},
+            {"type": "message", "role": "assistant", "content": "second"}
+        ]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_no_ids/input_items?limit=1&order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["has_more"], true, "second item should remain on the next page");
+    let last_id = body["last_id"]
+        .as_str()
+        .expect("last_id must be a usable cursor, not null, even when input items have no ID field");
+
+    let follow_up = crate::test_utils::make_request(
+        http::Method::GET,
+        &format!("/v1/responses/resp_no_ids/input_items?limit=1&order=asc&after={last_id}"),
+    );
+    let mut follow_up_ctx = crate::test_utils::make_filter_context(&follow_up);
+    let follow_up_action = filter.on_request(&mut follow_up_ctx).await.unwrap();
+    let follow_up_rejection = expect_reject(follow_up_action);
+    assert_eq!(follow_up_rejection.status, 200);
+
+    let follow_up_body: serde_json::Value =
+        serde_json::from_slice(follow_up_rejection.body.as_deref().unwrap()).unwrap();
+    let data = follow_up_body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "the after cursor should resolve to the second item");
+    assert_eq!(data[0]["content"], "second");
+    assert_eq!(follow_up_body["has_more"], false);
 }
 
 // -----------------------------------------------------------------------------
@@ -3639,6 +3782,175 @@ fn parse_query_params_key_only_unknown_ignored() {
 }
 
 // -----------------------------------------------------------------------------
+// validate_get_response_query_params
+// -----------------------------------------------------------------------------
+
+#[test]
+fn validate_get_response_query_params_no_query() {
+    assert!(
+        super::filter::validate_get_response_query_params(None).is_ok(),
+        "no query string should be valid"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_empty_query() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("")).is_ok(),
+        "empty query string should be valid"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_false_accepted() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("stream=false")).is_ok(),
+        "stream=false should be accepted"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_true_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=true")).unwrap_err();
+    assert!(
+        err.contains("'stream' parameter is not supported"),
+        "stream=true should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_invalid_value_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=maybe")).unwrap_err();
+    assert!(
+        err.contains("must be 'true' or 'false'"),
+        "stream=maybe should be rejected as invalid boolean: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_bracket_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include[]=file_search_call_results.results"))
+        .unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "include[] should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_percent_encoded_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include%5B%5D=usage")).unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "percent-encoded include[] should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_bare_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include=usage")).unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "bare include should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_starting_after_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("starting_after=5")).unwrap_err();
+    assert!(
+        err.contains("'starting_after' parameter is not supported"),
+        "starting_after should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_obfuscation_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include_obfuscation=true")).unwrap_err();
+    assert!(
+        err.contains("'include_obfuscation' parameter is not supported"),
+        "include_obfuscation should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_unknown_param_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("foo=bar")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "unknown param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_known_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream")).unwrap_err();
+    assert!(
+        err.contains("Missing value"),
+        "key-only known param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_include_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include")).unwrap_err();
+    assert!(
+        err.contains("Missing value"),
+        "key-only include should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_unknown_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("foo")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "key-only unknown param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_percent_encoded_stream_false_accepted() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("stream=%66alse")).is_ok(),
+        "percent-encoded stream=false should be accepted"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_invalid_utf8_key_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("%FF=x")).unwrap_err();
+    assert!(
+        err.contains("Invalid percent-encoding in query parameter key"),
+        "invalid UTF-8 key should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_invalid_utf8_value_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=%FF")).unwrap_err();
+    assert!(
+        err.contains("Invalid percent-encoding in value"),
+        "invalid UTF-8 value should be rejected: {err}"
+    );
+}
+
+#[test]
+fn known_params_and_validator_match_arms_in_sync() {
+    for &param in super::filter::GET_RESPONSE_KNOWN_PARAMS {
+        let result = super::filter::validate_get_response_param(param, "__probe__");
+        assert!(
+            result.is_err(),
+            "known param '{param}' should be handled by validate_get_response_param"
+        );
+        assert!(
+            !result.unwrap_err().contains("Unknown"),
+            "known param '{param}' should not produce an 'Unknown' error"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
 // list_input_items (direct unit tests)
 // -----------------------------------------------------------------------------
 
@@ -3849,7 +4161,84 @@ fn list_input_items_next_cursor_uses_item_id() {
 }
 
 #[test]
-fn list_input_items_next_cursor_falls_back_to_numeric_offset() {
+fn list_input_items_assigns_synthetic_ids_to_id_less_array_items() {
+    let record = make_record_with_input(json!([
+        {"type": "message", "role": "user", "content": "hi"},
+        {"type": "message", "role": "assistant", "content": "hello"}
+    ]));
+    // Default order is descending, but synthetic IDs must stay tied to
+    // each item's original stored position, not its display position.
+    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    assert_eq!(
+        page.data[0]["id"], "msg_resp_test_input_1",
+        "the assistant message (original index 1) should surface first in descending order"
+    );
+    assert_eq!(
+        page.data[1]["id"], "msg_resp_test_input_0",
+        "the user message (original index 0) should surface second in descending order"
+    );
+}
+
+#[test]
+fn list_input_items_mixed_existing_and_synthetic_ids_paginate_correctly() {
+    let record = make_record_with_input(json!([
+        {"id": "a", "type": "message"},
+        {"type": "message", "content": "hi"}
+    ]));
+    let base_params = ListParams {
+        limit: 1,
+        order: Order::Ascending,
+        ..Default::default()
+    };
+
+    let page1 = list_input_items(&record, &base_params).unwrap();
+    assert_eq!(
+        page1.data[0]["id"], "a",
+        "the item's existing id must be preserved, not overwritten"
+    );
+    assert!(page1.has_more);
+    let cursor_after_a = page1.next_cursor.clone();
+    assert_eq!(
+        cursor_after_a.as_deref(),
+        Some("a"),
+        "next_cursor should reuse the item's existing id"
+    );
+
+    let page2 = list_input_items(
+        &record,
+        &ListParams {
+            cursor: cursor_after_a,
+            ..base_params.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        page2.data[0]["id"], "msg_resp_test_input_1",
+        "the id-less second item should get a synthetic id keyed by its original index"
+    );
+    assert!(!page2.has_more, "the mixed array is exhausted after the second item");
+    assert!(page2.next_cursor.is_none());
+
+    // Paginating again using the synthetic id itself as the cursor must still resolve it as an
+    // ID-based cursor (not fall through to the numeric fallback), correctly yielding an empty
+    // page since it was the last item.
+    let page3 = list_input_items(
+        &record,
+        &ListParams {
+            cursor: Some("msg_resp_test_input_1".to_owned()),
+            ..base_params
+        },
+    )
+    .unwrap();
+    assert!(
+        page3.data.is_empty(),
+        "cursor after the synthetic id of the last item should yield an empty page"
+    );
+    assert!(!page3.has_more);
+}
+
+#[test]
+fn list_input_items_next_cursor_uses_synthetic_id_when_input_lacks_ids() {
     let record = make_record_with_input(json!([
         {"val": 1},
         {"val": 2},
@@ -3865,9 +4254,32 @@ fn list_input_items_next_cursor_falls_back_to_numeric_offset() {
     assert!(page.has_more);
     assert_eq!(
         page.next_cursor.as_deref(),
-        Some("2"),
-        "next_cursor should fall back to numeric offset when items lack IDs"
+        Some("msg_resp_test_input_1"),
+        "next_cursor should use the synthetic ID assigned to ID-less items, not a raw numeric offset"
     );
+}
+
+#[test]
+fn list_input_items_numeric_cursor_still_works_as_fallback_for_synthetic_ids() {
+    let record = make_record_with_input(json!([
+        {"val": 1},
+        {"val": 2},
+        {"val": 3},
+        {"val": 4}
+    ]));
+    let params = ListParams {
+        cursor: Some("2".to_owned()),
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(
+        page.data.len(),
+        2,
+        "numeric offset cursor should still work even though items now carry synthetic IDs"
+    );
+    assert_eq!(page.data[0]["val"], 3);
+    assert_eq!(page.data[1]["val"], 4);
 }
 
 #[test]

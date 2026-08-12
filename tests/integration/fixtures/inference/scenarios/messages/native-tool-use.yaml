@@ -1,0 +1,46 @@
+version: 1
+id: messages/native-tool-use
+description: Forced Anthropic tool use passed through to a native backend.
+protocol: anthropic_messages
+example_config: anthropic/messages-protocol.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - messages.native.request
+  - messages.native.tool_use
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          messages:
+            - role: user
+              content: What is the weather in San Francisco? Use the get_weather tool.
+          tools:
+            - name: get_weather
+              description: Get the current weather for a city.
+              input_schema:
+                type: object
+                properties:
+                  city:
+                    type: string
+                required:
+                  - city
+          tool_choice:
+            type: tool
+            name: get_weather
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

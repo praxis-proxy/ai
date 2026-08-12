@@ -59,8 +59,8 @@ use tracing::{debug, trace, warn};
 
 use super::{
     super::{
-        DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, error::responses_error_rejection,
-        state::ResponsesState,
+        DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
+        error::responses_error_rejection, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
@@ -384,25 +384,6 @@ fn assemble_stored_messages(input: &Value, output: &Value) -> Value {
     Value::Array(messages)
 }
 
-/// Append stored response input as valid Responses API item params.
-fn append_stored_input_items(messages: &mut Vec<Value>, input: Value) {
-    match input {
-        Value::Null => {},
-        Value::String(text) => messages.push(user_message_item(&text)),
-        Value::Array(items) => messages.extend(items),
-        other => messages.push(other),
-    }
-}
-
-/// Build a Responses API user message item from string input.
-fn user_message_item(text: &str) -> Value {
-    serde_json::json!({
-        "type": "message",
-        "role": "user",
-        "content": text
-    })
-}
-
 // -----------------------------------------------------------------------------
 // Path Extraction
 // -----------------------------------------------------------------------------
@@ -412,12 +393,8 @@ fn user_message_item(text: &str) -> Value {
 /// Returns `None` if the path does not match the expected pattern.
 pub(super) fn extract_response_id(path: &str) -> Option<&str> {
     let path = path.strip_suffix('/').unwrap_or(path);
-    let segments: Vec<&str> = path.split('/').collect();
-
-    match segments.as_slice() {
-        ["", "v1", "responses", id] if !id.is_empty() => Some(id),
-        _ => None,
-    }
+    let id = path.strip_prefix("/v1/responses/")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
 // -----------------------------------------------------------------------------
@@ -835,15 +812,20 @@ impl ResponseStoreFilter {
     async fn try_get_retrieval(&self, ctx: &HttpFilterContext<'_>) -> Result<Option<FilterAction>, FilterError> {
         let path = ctx.request.uri.path();
         let path = path.strip_suffix('/').filter(|p| !p.is_empty()).unwrap_or(path);
-        let segments: Vec<&str> = path.split('/').collect();
+        let rest = match path.strip_prefix("/v1/responses/") {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
 
-        match segments.as_slice() {
-            ["", "v1", "responses", id] if !id.is_empty() => Ok(Some(self.handle_get_response(ctx, id).await)),
-            ["", "v1", "responses", id, "input_items"] if !id.is_empty() => {
-                Ok(Some(self.handle_get_input_items(ctx, id).await))
-            },
-            _ => Ok(None),
+        if let Some(id) = rest.strip_suffix("/input_items") {
+            if !id.is_empty() && !id.contains('/') {
+                return Ok(Some(self.handle_get_input_items(ctx, id).await));
+            }
+        } else if !rest.contains('/') {
+            return Ok(Some(self.handle_get_response(ctx, rest).await));
         }
+
+        Ok(None)
     }
 
     /// Lazily initialize the store and return a clone of the `Arc`.
@@ -852,7 +834,16 @@ impl ResponseStoreFilter {
     }
 
     /// Serve `GET /v1/responses/{id}`.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "query validation adds one early-return branch"
+    )]
     async fn handle_get_response(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
+        if let Err(msg) = validate_get_response_query_params(ctx.request.uri.query()) {
+            debug!(response_id = id, error = %msg, "invalid get-response query parameter");
+            return FilterAction::Reject(reject_invalid_input(&msg));
+        }
+
         let Some(store) = self.ensure_store().await else {
             return FilterAction::Reject(reject_store_error());
         };
@@ -943,7 +934,17 @@ fn build_input_items_response(id: &str, record: &ResponseRecord, params: &ListPa
 /// Serialize a successful input items page into a 200 JSON response.
 fn build_input_items_ok(id: &str, page: &InputItemPage) -> FilterAction {
     let first_id = page.data.first().and_then(|v| v.get("id")).and_then(|v| v.as_str());
-    let last_id = page.data.last().and_then(|v| v.get("id")).and_then(|v| v.as_str());
+    // Items normally carry a synthetic ID (see `normalize_input_items`),
+    // but non-object array entries can't be tagged with one. Fall back
+    // to the page's numeric cursor so `after`-based pagination stays
+    // usable even for that edge case, instead of exposing a `null`
+    // `last_id` clients have no way to resume from.
+    let last_id = page
+        .data
+        .last()
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .or(page.next_cursor.as_deref());
 
     let body = serde_json::json!({
         "object": "list",
@@ -1048,6 +1049,77 @@ fn reject_known_key_only_param(key: &str) -> Result<(), String> {
             Err(format!("Missing value for query parameter '{key}'."))
         },
         _ => Ok(()),
+    }
+}
+
+/// Known query parameters for `GET /v1/responses/{id}`, per the OpenAI spec.
+pub(super) const GET_RESPONSE_KNOWN_PARAMS: &[&str] = &[
+    "stream",
+    "include",
+    "include[]",
+    "starting_after",
+    "include_obfuscation",
+];
+
+/// Validate query parameters for `GET /v1/responses/{id}`.
+///
+/// Returns `Ok(())` when the query string is absent, empty, or contains
+/// only `stream=false`. Returns an error message suitable for a 400
+/// response when any parameter is unsupported, invalid, or unknown.
+/// Keys and values are percent-decoded before validation.
+pub(super) fn validate_get_response_query_params(query: Option<&str>) -> Result<(), String> {
+    let Some(qs) = query else {
+        return Ok(());
+    };
+
+    for pair in qs.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = pair.split_once('=') else {
+            let key = percent_encoding::percent_decode_str(pair)
+                .decode_utf8()
+                .map_err(|_e| format!("Invalid percent-encoding in query parameter key '{pair}'."))?;
+            if GET_RESPONSE_KNOWN_PARAMS.contains(&&*key) {
+                return Err(format!("Missing value for query parameter '{key}'."));
+            }
+            return Err(format!("Unknown query parameter: '{key}'."));
+        };
+
+        let key = percent_encoding::percent_decode_str(raw_key)
+            .decode_utf8()
+            .map_err(|_e| format!("Invalid percent-encoding in query parameter key '{raw_key}'."))?;
+        let value = percent_encoding::percent_decode_str(raw_value)
+            .decode_utf8()
+            .map_err(|_e| format!("Invalid percent-encoding in value for '{key}'."))?;
+
+        validate_get_response_param(&key, &value)?;
+    }
+
+    Ok(())
+}
+
+/// Validate a single decoded query parameter for `GET /v1/responses/{id}`.
+pub(super) fn validate_get_response_param(key: &str, value: &str) -> Result<(), String> {
+    match key {
+        "stream" => match value {
+            "false" => Ok(()),
+            "true" => Err("The 'stream' parameter is not supported by the local response store.".to_owned()),
+            _ => Err(format!(
+                "Invalid value for 'stream': must be 'true' or 'false', got '{value}'."
+            )),
+        },
+        "include" | "include[]" => {
+            Err("The 'include' parameter is not supported by the local response store.".to_owned())
+        },
+        "starting_after" => {
+            Err("The 'starting_after' parameter is not supported by the local response store.".to_owned())
+        },
+        "include_obfuscation" => {
+            Err("The 'include_obfuscation' parameter is not supported by the local response store.".to_owned())
+        },
+        _ => Err(format!("Unknown query parameter: '{key}'.")),
     }
 }
 

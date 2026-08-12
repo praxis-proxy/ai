@@ -15,9 +15,11 @@ pub mod correlation;
 pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
+pub mod promotion;
 #[cfg(feature = "store")]
 pub mod store;
 pub(crate) mod subrequest;
+pub(crate) mod web_search;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -84,6 +86,7 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            metrics_route: None,
             peer_identity: None,
             request: req,
             request_body_bytes: 0,

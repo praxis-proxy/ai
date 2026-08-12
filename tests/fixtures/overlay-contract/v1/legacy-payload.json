@@ -1,0 +1,33 @@
+{
+  "network": "glb-demo",
+  "local_site": "east-edge",
+  "candidates": [
+    {
+      "kind": "inference_model",
+      "name": "model-east",
+      "site": "east-provider",
+      "cluster": "sim-east-provider",
+      "fresh": true,
+      "credential": {
+        "strategy": "bearer_token",
+        "secretRef": {
+          "name": "east-cred",
+          "namespace": "grid-system",
+          "key": "token"
+        }
+      },
+      "stable_id": "east1234",
+      "rank": 0
+    },
+    {
+      "kind": "inference_model",
+      "name": "model-west",
+      "site": "west-provider",
+      "cluster": "sim-west-provider",
+      "fresh": true,
+      "stable_id": "west5678",
+      "rank": 1
+    }
+  ],
+  "generated_at": "2026-07-29T01:00:00Z"
+}

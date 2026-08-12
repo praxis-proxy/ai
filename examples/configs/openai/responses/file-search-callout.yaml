@@ -1,0 +1,77 @@
+# File Search Callout Filter
+#
+# Demonstrates the `openai_file_search_callout` filter configuration.
+# The filter validates its URL, timeout, and response-size
+# settings at startup. The iterative request router sends the request to the
+# model, executes any returned `file_search_call` through the vector store, and sends the
+# search context through a second model inference before returning the final
+# Responses API object.
+# Model responses that combine `file_search_call` with a client-executed
+# `function_call` are rejected until cross-request continuation state exists.
+#
+# Configuration:
+#   vector_store_url:         Vector store API base URL
+#   allow_private_url:        Permit local-sensitive targets for development only
+#   timeout_ms:               Whole-call timeout in milliseconds
+#   max_response_bytes:       Maximum response bytes retained per callout
+#   max_total_response_bytes: Maximum successful bytes across one fan-out
+#   callout_failure_mode:     closed (fail closed) or open (fail open)
+#   forward_headers:          Headers to forward from the client request
+#                             (e.g. Authorization) to the vector store API
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [file-search-callout-pipeline]
+
+filter_chains:
+  - name: file-search-callout-pipeline
+    filters:
+      - filter: openai_responses_format
+      - filter: openai_responses_validate
+      - filter: openai_tool_parse
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 8
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_response_bytes: 67108864
+        # Retains one 64 MiB request plus one 64 MiB response and metadata.
+        max_state_bytes: 136314880
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_file_search_callout
+                vector_store_url: http://127.0.0.1:8001
+                allow_private_url: true
+                timeout_ms: 5000
+                max_response_bytes: 10485760
+                max_total_response_bytes: 67108864
+                # The filter and the enclosing iterative router may use
+                # different values; the smaller limit wins at runtime.
+                max_state_bytes: 136314880
+                callout_failure_mode: closed
+                forward_headers:
+                  - authorization
+              - filter: openai_responses_proxy
+                name: inference
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_file_search_callout
+                key: pending
+                value: "true"
+                next: inference
+              - default: true
+                done: true

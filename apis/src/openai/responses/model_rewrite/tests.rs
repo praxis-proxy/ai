@@ -914,6 +914,38 @@ headers:
     );
 }
 
+#[tokio::test]
+async fn oversized_model_not_promoted_to_header_or_results_or_metadata() {
+    let long_model = "x".repeat(300);
+    let body_str = format!(r#"{{"model":"{long_model}","input":"test"}}"#);
+    let ctx = run_filter(ALIAS_CONFIG, &body_str).await;
+    let headers = collect_headers(&ctx);
+    let results = ctx.filter_results.get("openai_responses_model_rewrite").unwrap();
+
+    assert!(
+        !headers.contains_key("x-praxis-ai-effective-model"),
+        "oversized model not in effective header"
+    );
+    assert!(
+        !headers.contains_key("x-praxis-ai-original-model"),
+        "oversized model not in original header"
+    );
+    assert!(
+        results.get("effective_model").is_none(),
+        "oversized model not in results"
+    );
+    assert!(
+        !ctx.filter_metadata
+            .contains_key("openai_responses_model_rewrite.effective_model"),
+        "oversized model not in effective metadata"
+    );
+    assert!(
+        !ctx.filter_metadata
+            .contains_key("openai_responses_model_rewrite.original_model"),
+        "oversized model not in original metadata"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Filter Results
 // -----------------------------------------------------------------------------

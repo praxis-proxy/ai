@@ -13,7 +13,7 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit test-schema test-integration \
+	test test-unit test-schema test-integration test-inference-fixtures \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
@@ -69,12 +69,18 @@ test-unit:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
+	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
 
 test-schema:
 	cargo test -p praxis-tests-schema $(_NOCAPTURE)
 
 test-integration:
 	cargo test -p praxis-tests-integration $(_NOCAPTURE)
+
+test-inference-fixtures:
+	cargo test -p praxis-test-utils $(_NOCAPTURE)
+	cargo test -p xtask inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --test suite inference_fixtures $(_NOCAPTURE)
 
 openai-conformance:
 	cargo xtask openai-conformance $(OPENAI_CONFORMANCE_ARGS)
@@ -98,7 +104,9 @@ lint:
 	cargo xtask lint-example-tests
 	cargo xtask lint-markdown-links
 	cargo xtask sync-example-readme
+	cargo xtask sync-inference-readme
 	cargo xtask sync-responses-readme
+	cargo xtask check-inference
 
 fmt:
 	cargo +nightly fmt --all
@@ -181,6 +189,7 @@ help:
 	@echo "  test-unit            unit tests (providers, filters, server)"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
+	@echo "  test-inference-fixtures  inference fixture and replay tests"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
 	@echo ""

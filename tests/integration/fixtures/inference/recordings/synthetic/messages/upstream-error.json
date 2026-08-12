@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "scenario_id": "messages/upstream-error",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-rate-limit-model",
+    "source_id": "controlled-upstream-429"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-rate-limit-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 429,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "slow down",
+                "type": "rate_limit_error"
+              },
+              "request_id": null,
+              "type": "error"
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-rate-limit-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 429,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "slow down",
+                "type": "rate_limit_error"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

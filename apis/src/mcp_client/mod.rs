@@ -469,7 +469,7 @@ fn check_ip(ip: IpAddr, url: &McpDisplayUrl, allow_loopback: bool) -> Result<(),
     if is_ssrf_sensitive(&ip) {
         return Err(ssrf_blocked(
             url.clone(),
-            "address is loopback, link-local, unspecified, or cloud metadata",
+            "address is loopback, link-local, unique-local, unspecified, or cloud metadata",
         ));
     }
     Ok(())
@@ -532,19 +532,22 @@ fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
     if matches!(
         *name,
         http::header::AUTHORIZATION
-            | http::header::HOST
-            | http::header::CONTENT_LENGTH
-            | http::header::TRANSFER_ENCODING
             | http::header::CONNECTION
+            | http::header::CONTENT_LENGTH
+            | http::header::COOKIE
+            | http::header::FORWARDED
+            | http::header::HOST
+            | http::header::PROXY_AUTHORIZATION
+            | http::header::SET_COOKIE
             | http::header::TE
             | http::header::TRAILER
+            | http::header::TRANSFER_ENCODING
             | http::header::UPGRADE
-            | http::header::PROXY_AUTHORIZATION
     ) {
         return true;
     }
     let s = name.as_str();
-    s.starts_with("x-praxis-") || s.starts_with("x-mcp-") || s.starts_with("x-a2a-")
+    s.starts_with("x-forwarded-") || s.starts_with("x-praxis-") || s.starts_with("x-mcp-") || s.starts_with("x-a2a-")
 }
 
 /// Hostnames that resolve to loopback.
@@ -553,8 +556,8 @@ fn is_blocked_hostname(host: &str) -> bool {
     lower == "localhost" || lower.ends_with(".localhost")
 }
 
-/// Loopback, link-local, unspecified, and known cloud
-/// metadata addresses are SSRF-sensitive.
+/// Loopback, link-local, unique-local, unspecified, and
+/// known cloud metadata addresses are SSRF-sensitive.
 fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -562,15 +565,9 @@ fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
         },
         IpAddr::V6(v6) => {
             let [a, b, ..] = v6.octets();
-            v6.is_loopback() || v6.is_unspecified() || (a == 0xFE && (b & 0xC0) == 0x80) || is_cloud_metadata_v6(v6)
+            v6.is_loopback() || v6.is_unspecified() || (a == 0xFE && (b & 0xC0) == 0x80) || (a & 0xFE) == 0xFC
         },
     }
-}
-
-/// AWS EC2 IMDS IPv6 endpoint.
-fn is_cloud_metadata_v6(v6: &std::net::Ipv6Addr) -> bool {
-    const AWS_IMDS_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
-    *v6 == AWS_IMDS_V6
 }
 
 /// Convert `rmcp::model::Tool` values to opaque JSON.
