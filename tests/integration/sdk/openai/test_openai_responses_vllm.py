@@ -8,11 +8,16 @@
 # ]
 # ///
 """
-OpenAI Responses API integration tests against a real vLLM CPU backend.
+OpenAI Responses API integration tests against a vLLM backend.
 
 Starts a Praxis proxy with the full responses pipeline backed by vLLM,
 then exercises stateless requests, persistence, rehydration, and streaming
 using the official OpenAI Python SDK.
+
+The default backend is a real vLLM CPU engine. The experimental
+``VLLM_TEST_BACKEND=vcr-random`` mode runs only protocol-safe smoke tests
+against a real vLLM frontend backed by vllm-vcr random tokens. Tests that
+need model semantics or deterministic tool-call tokens are skipped.
 
 Usage:
     cargo build -p praxis-ai-proxy
@@ -40,11 +45,28 @@ from openai import OpenAI
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
+VLLM_TEST_BACKEND = os.environ.get("VLLM_TEST_BACKEND", "live")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
+
+if VLLM_TEST_BACKEND not in {"live", "vcr-random"}:
+    raise RuntimeError(
+        "VLLM_TEST_BACKEND must be either 'live' or 'vcr-random'; "
+        f"got {VLLM_TEST_BACKEND!r}"
+    )
+
+VLLM_VCR_RANDOM = VLLM_TEST_BACKEND == "vcr-random"
+requires_live_inference = pytest.mark.skipif(
+    VLLM_VCR_RANDOM,
+    reason="test requires real model inference, not vllm-vcr random tokens",
+)
+requires_replayed_tool_tokens = pytest.mark.skipif(
+    VLLM_VCR_RANDOM,
+    reason="test requires a captured vllm-vcr tool-call token trace",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -351,8 +373,12 @@ class TestOpenAIResponsesVLLM:
             max_output_tokens=128,
         )
 
-        assert response.status == "completed"
-        assert "HELLO-PRAXIS" in response.output_text
+        if VLLM_VCR_RANDOM:
+            assert response.status in ("completed", "incomplete")
+            assert response.output_text
+        else:
+            assert response.status == "completed"
+            assert "HELLO-PRAXIS" in response.output_text
 
     def test_store_and_retrieve(self, openai_client):
         response = openai_client.responses.create(
@@ -362,14 +388,18 @@ class TestOpenAIResponsesVLLM:
             max_output_tokens=128,
         )
 
-        assert response.status == "completed"
+        if VLLM_VCR_RANDOM:
+            assert response.status in ("completed", "incomplete")
+        else:
+            assert response.status == "completed"
         assert response.id
 
         retrieved = openai_client.responses.retrieve(response.id)
 
         assert retrieved.id == response.id
-        assert retrieved.status == "completed"
+        assert retrieved.status == response.status
 
+    @requires_live_inference
     def test_rehydrated_second_turn(self, openai_client):
         first = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -397,6 +427,7 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert "VIOLET-7319" in second.output_text
 
+    @requires_live_inference
     def test_doc_extract_inline_file_to_input_text(self, openai_client):
         """Issue #397: inline file_data is extracted to input_text and
         consumed by vLLM inference.
@@ -449,6 +480,7 @@ class TestOpenAIResponsesVLLM:
             f"marker '{marker}'; got: {response.output_text}"
         )
 
+    @requires_live_inference
     def test_file_id_resolution_through_ogx(self, openai_client):
         """End-to-end: upload to OGX via Praxis, reference by file_id,
         verify vLLM output contains the file content.
@@ -503,6 +535,7 @@ class TestOpenAIResponsesVLLM:
             except Exception:
                 pass
 
+    @requires_replayed_tool_tokens
     def test_client_function_call_returns_to_client(self, openai_client):
         """Client-side function tools are returned without auto-execution.
 
@@ -564,13 +597,21 @@ class TestOpenAIResponsesVLLM:
             event_types.append(event.type)
             if event.type == "response.output_text.delta":
                 text_parts.append(event.delta)
-            if event.type == "response.completed":
+            if event.type in ("response.completed", "response.incomplete"):
                 final_status = event.response.status
 
         assert event_types[0] == "response.created"
-        assert event_types[-1] == "response.completed"
-        assert final_status == "completed"
-        assert "STREAM-OK" in "".join(text_parts)
+        if VLLM_VCR_RANDOM:
+            assert event_types[-1] in (
+                "response.completed",
+                "response.incomplete",
+            )
+            assert final_status in ("completed", "incomplete")
+            assert text_parts
+        else:
+            assert event_types[-1] == "response.completed"
+            assert final_status == "completed"
+            assert "STREAM-OK" in "".join(text_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +697,7 @@ def agentic_client(agentic_proxy):
 # ---------------------------------------------------------------------------
 
 
+@requires_replayed_tool_tokens
 class TestAgenticLoopVLLM:
     """Integration tests for the agentic loop against a vLLM backend."""
 
@@ -960,6 +1002,7 @@ def file_search_client(file_search_proxy):
     )
 
 
+@requires_replayed_tool_tokens
 class TestFileSearchVLLM:
     """File search integration tests: vLLM -> Praxis -> OGX -> vLLM."""
 
