@@ -1985,3 +1985,157 @@ async fn duplicate_label_entries_rejected_at_filter_level() {
         "response body should mention the duplicate: {body_str}"
     );
 }
+
+// =========================================================================
+// Body Size Limit After MCP Tool Expansion
+// =========================================================================
+
+/// Build a filter with a specific `max_body_bytes` limit.
+fn filter_with_max_body_bytes(limit: usize) -> Box<dyn HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_body_bytes: {limit}")).unwrap();
+    McpToolResolveFilter::from_config(&yaml).unwrap()
+}
+
+/// Build a cached tool listing with a schema large enough to
+/// expand a small request body past a given byte threshold.
+fn large_cached_tools(desc_len: usize) -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "name": "get_weather",
+        "description": "x".repeat(desc_len),
+        "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
+    })]
+}
+
+/// Expansion past `max_body_bytes` produces a 413 rejection with
+/// `invalid_request_error`. Body and `ResponsesState` are unchanged.
+#[tokio::test]
+async fn expanded_body_exceeding_limit_returns_413() {
+    let filter = filter_with_max_body_bytes(256);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url,
+        "tools": large_cached_tools(4096),
+    })];
+    ctx.extensions.insert(state);
+
+    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(body_bytes.clone()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 413, "should be HTTP 413");
+    let resp = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(resp.contains("invalid_request_error"), "error type: {resp}");
+    assert_eq!(body.as_deref(), Some(body_bytes.as_slice()), "body must be unchanged");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.mcp_tool_map.is_empty(),
+        "tool map must not be populated on rejection"
+    );
+}
+
+/// Expansion within `max_body_bytes` continues and commits the
+/// rewritten body to `ResponsesState`.
+#[tokio::test]
+async fn expanded_body_within_limit_continues() {
+    let filter = filter_with_max_body_bytes(1_048_576);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url,
+        "tools": [{"name": "get_weather", "description": "Get weather"}],
+    })];
+    ctx.extensions.insert(state);
+
+    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(body_bytes.clone()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "should continue");
+    assert_ne!(body.as_deref(), Some(body_bytes.as_slice()), "body should be rewritten");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(!state.mcp_tool_map.is_empty(), "tool map should be populated");
+}
+
+/// Run MCP tool expansion through the filter and return the
+/// expanded body length.
+async fn measure_expanded_body_len(server_url: &str, cached: &[serde_json::Value]) -> usize {
+    let filter = filter_with_max_body_bytes(1_048_576);
+    let body_json = mcp_body(server_url);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url, "tools": cached,
+    })];
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    body.as_ref().unwrap().len()
+}
+
+/// Expanded body whose length equals `max_body_bytes` exactly is
+/// accepted (the guard rejects strictly *over* the limit).
+#[tokio::test]
+async fn expanded_body_at_exact_limit_continues() {
+    let server_url = "http://10.0.0.5/mcp";
+    let cached = vec![serde_json::json!({
+        "name": "get_weather", "description": "Get weather",
+        "inputSchema": {"type": "object"},
+    })];
+    let expanded_len = measure_expanded_body_len(server_url, &cached).await;
+
+    let filter_exact = filter_with_max_body_bytes(expanded_len);
+    let body_json = mcp_body(server_url);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url, "tools": cached,
+    })];
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter_exact.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "body at exact limit ({expanded_len} bytes) should be accepted"
+    );
+}
+
+/// `BodyTooLarge` maps to HTTP 413 with `invalid_request_error`.
+#[test]
+fn body_too_large_maps_to_413() {
+    let err = ResolveError::BodyTooLarge {
+        actual: 1_000_000,
+        limit: 65_536,
+    };
+    let action = resolve_error_rejection(&err, false);
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 413, "should be HTTP 413");
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(
+        body_str.contains("invalid_request_error"),
+        "error type should be invalid_request_error: {body_str}"
+    );
+    assert!(body_str.contains("1000000"), "should include actual size: {body_str}");
+}
