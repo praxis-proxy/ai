@@ -54,7 +54,10 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
-use crate::{json_body::serialize_json_body, mcp_client};
+use crate::{
+    json_body::{SerializedJson, serialize_json_body},
+    mcp_client,
+};
 
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
@@ -157,7 +160,11 @@ impl McpToolResolveFilter {
         debug!(tool_count = resolution.tool_map.len(), "mcp_tool_map built");
 
         let Resolution { per_entry, tool_map } = resolution;
-        rewrite_request_body(body, &original_bytes, per_entry, &tool_map, self.name())?;
+        let Some(serialized) = rewrite_request_body(&original_bytes, per_entry, &tool_map)? else {
+            return Ok(FilterAction::Continue);
+        };
+        check_body_size(&serialized, self.max_body_bytes)?;
+        serialized.commit(body, self.name(), "tools");
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
         write_state(ctx, body_for_state, tool_map);
@@ -318,6 +325,15 @@ enum ResolveError {
         /// Configured maximum.
         max: usize,
     },
+
+    /// Expanded request body exceeds `max_body_bytes`.
+    #[error("expanded request body is {actual} bytes, exceeding the {limit} byte limit")]
+    BodyTooLarge {
+        /// Serialized body size after MCP tool expansion.
+        actual: usize,
+        /// Configured `max_body_bytes` limit.
+        limit: usize,
+    },
 }
 
 /// Result of resolving all MCP entries.
@@ -333,12 +349,29 @@ struct Resolution {
 // Private Helpers
 // -----------------------------------------------------------------------------
 
+/// Reject the expanded body if it exceeds `max_body_bytes`.
+fn check_body_size(serialized: &SerializedJson, max_body_bytes: usize) -> Result<(), ResolveError> {
+    if serialized.len() > max_body_bytes {
+        debug!(
+            actual = serialized.len(),
+            limit = max_body_bytes,
+            "expanded request body exceeds configured limit"
+        );
+        return Err(ResolveError::BodyTooLarge {
+            actual: serialized.len(),
+            limit: max_body_bytes,
+        });
+    }
+    Ok(())
+}
+
 /// Map a [`ResolveError`] to an appropriate rejection response.
 fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction {
     let (status, error_type) = match err {
         ResolveError::DuplicateLabel(_) | ResolveError::TooManyServers { .. } | ResolveError::NameCollision(_) => {
             (400, "invalid_request_error")
         },
+        ResolveError::BodyTooLarge { .. } => (413, "invalid_request_error"),
         ResolveError::Client(_) => (502, "server_error"),
         ResolveError::Serialization(_) => (500, "server_error"),
     };
@@ -485,34 +518,29 @@ async fn fetch_tools(
 /// entries with `type: "function"` entries and translating any
 /// MCP `tool_choice` references.
 ///
-/// MCP entries that were not resolved (no `server_url`, deferred,
-/// or `connector_id` only) are left unchanged for upstream to
-/// handle.
+/// Returns `None` when no rewrite is needed (unparseable body,
+/// empty tools array, or no resolved entries). The caller is
+/// responsible for checking the serialized size against
+/// `max_body_bytes` before committing.
 fn rewrite_request_body(
-    body: &mut Option<Bytes>,
     original_bytes: &[u8],
     per_entry: Vec<Vec<serde_json::Value>>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-    filter_name: &'static str,
-) -> Result<(), ResolveError> {
+) -> Result<Option<SerializedJson>, ResolveError> {
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
-        return Ok(());
+        return Ok(None);
     };
-
     let Some(obj) = parsed.as_object_mut() else {
-        return Ok(());
+        return Ok(None);
     };
-
     let Some(serde_json::Value::Array(tools)) = obj.remove("tools") else {
-        return Ok(());
+        return Ok(None);
     };
 
     let (rewritten, generated_names) = rewrite_tools_array(tools, per_entry);
-
     if rewritten.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-
     detect_name_collisions(&rewritten, &generated_names)?;
 
     let rewritten_count = rewritten.len();
@@ -523,11 +551,8 @@ fn rewrite_request_body(
         debug!(error = %e, "failed to serialize rewritten body");
         ResolveError::Serialization(e)
     })?;
-
-    serialized.commit(body, filter_name, "tools");
-
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
-    Ok(())
+    Ok(Some(serialized))
 }
 
 /// Rewrite a tools array, replacing resolved MCP entries with
