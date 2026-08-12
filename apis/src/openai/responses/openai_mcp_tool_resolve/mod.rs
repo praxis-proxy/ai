@@ -93,6 +93,9 @@ pub struct McpToolResolveFilter {
     /// Allow connections to loopback addresses.
     allow_loopback: bool,
 
+    /// Connector ID to server URL mapping.
+    connectors: HashMap<String, url::Url>,
+
     /// Maximum request body bytes for `StreamBuffer`.
     max_body_bytes: usize,
 
@@ -115,8 +118,18 @@ impl McpToolResolveFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: McpToolResolveConfig = parse_filter_config("openai_mcp_tool_resolve", config)?;
         let validated = build_config(cfg)?;
+        let connectors = validated
+            .connectors
+            .iter()
+            .map(|c| {
+                let url = url::Url::parse(&c.server_url)
+                    .map_err(|e| FilterError::from(format!("openai_mcp_tool_resolve: connector \"{}\": {e}", c.id)))?;
+                Ok((c.id.clone(), url))
+            })
+            .collect::<Result<HashMap<String, url::Url>, FilterError>>()?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
+            connectors,
             max_body_bytes: validated.max_body_bytes,
             max_servers: validated.max_servers,
             max_tools: validated.max_tools,
@@ -134,33 +147,31 @@ impl McpToolResolveFilter {
         body: &mut Option<Bytes>,
         original_bytes: Bytes,
     ) -> Result<FilterAction, ResolveError> {
-        let mcp_entries = extract_mcp_entries(&original_bytes);
+        let mut mcp_entries = extract_mcp_entries(&original_bytes);
         if mcp_entries.is_empty() {
             return Ok(FilterAction::Continue);
         }
 
-        let server_count = count_distinct_servers(&mcp_entries);
-        if server_count > self.max_servers {
-            return Err(ResolveError::TooManyServers {
-                count: server_count,
-                max: self.max_servers,
-            });
-        }
-
-        check_duplicate_labels(&mcp_entries)?;
+        resolve_connector_ids(&self.connectors, &mut mcp_entries)?;
+        self.validate_entries(&mcp_entries)?;
 
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
 
         let resolution = self.resolve_all_entries(&mcp_entries, previous_tools).await?;
 
-        if resolution.tool_map.is_empty() {
+        if !resolution.has_resolved {
             return Ok(FilterAction::Continue);
         }
 
         debug!(tool_count = resolution.tool_map.len(), "mcp_tool_map built");
 
-        let Resolution { per_entry, tool_map } = resolution;
-        let Some(serialized) = rewrite_request_body(&original_bytes, per_entry, &tool_map)? else {
+        let Resolution {
+            per_entry,
+            tool_map,
+            resolved_labels,
+            ..
+        } = resolution;
+        let Some(serialized) = rewrite_request_body(&original_bytes, per_entry, &tool_map, &resolved_labels)? else {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_body_bytes)?;
@@ -169,6 +180,18 @@ impl McpToolResolveFilter {
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
         write_state(ctx, body_for_state, tool_map);
         Ok(FilterAction::Continue)
+    }
+
+    /// Validate MCP entries: check server count and duplicate labels.
+    fn validate_entries(&self, entries: &[serde_json::Value]) -> Result<(), ResolveError> {
+        let server_count = count_distinct_servers(entries);
+        if server_count > self.max_servers {
+            return Err(ResolveError::TooManyServers {
+                count: server_count,
+                max: self.max_servers,
+            });
+        }
+        check_duplicate_labels(entries)
     }
 
     /// Resolve all MCP entries, building both the global dispatch
@@ -189,31 +212,14 @@ impl McpToolResolveFilter {
         let futures: Vec<_> = task_entries
             .iter()
             .zip(&task_allowed_names)
-            .map(|(entry, allowed)| self.resolve_entry(entry, previous_tools, allowed.as_deref()))
+            .map(|(entry, allowed)| async {
+                let result = self.resolve_entry(entry, previous_tools, allowed.as_deref()).await;
+                redact_connector_client_error(result, entry)
+            })
             .collect();
         let task_results = futures::future::try_join_all(futures).await?;
 
-        let mut tool_map = HashMap::new();
-        let mut per_entry = Vec::with_capacity(entries.len());
-
-        for (entry, task_idx) in entries.iter().zip(&entry_to_task) {
-            let tools_opt = task_idx.and_then(|idx| task_results.get(idx)?.clone());
-            let Some(tools) = tools_opt else {
-                per_entry.push(Vec::new());
-                continue;
-            };
-            let allowed = extract_allowed_tools(entry);
-            let filtered = apply_allowed_tools_filter(tools, &allowed);
-            let label = server_label(entry);
-            let function_tools: Vec<serde_json::Value> = filtered
-                .iter()
-                .map(|def| mcp_tool_to_function_tool(label, def))
-                .collect();
-            insert_tools(filtered, entry, &mut tool_map);
-            per_entry.push(function_tools);
-        }
-
-        Ok(Resolution { per_entry, tool_map })
+        Ok(collect_resolutions(entries, &entry_to_task, &task_results))
     }
 
     /// Resolve tools for a single MCP entry independently.
@@ -232,11 +238,13 @@ impl McpToolResolveFilter {
             return Ok(None);
         };
         let label = server_label(entry);
+        let is_connector = entry.get("connector_id").is_some();
         mcp_client::validate_mcp_url(server_url, self.timeout, self.allow_loopback)
             .await
             .map_err(ResolveError::Client)?;
         if !has_entry_credentials(entry)
-            && let Some(cached) = find_cached_listing(previous_tools, label, server_url, cache_allowed_names)
+            && let Some(cached) =
+                find_cached_listing(previous_tools, label, server_url, cache_allowed_names, is_connector)
         {
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
@@ -334,15 +342,59 @@ enum ResolveError {
         /// Configured `max_body_bytes` limit.
         limit: usize,
     },
+
+    /// Unknown `connector_id` was referenced.
+    #[error("unknown connector_id \"{0}\"")]
+    UnknownConnector(String),
+
+    /// Both `connector_id` and `server_url` were provided.
+    #[error("connector_id and server_url are mutually exclusive on entry \"{0}\"")]
+    MutuallyExclusiveTarget(String),
+
+    /// Connector ID combined with `defer_loading`.
+    #[error("connector_id cannot be combined with defer_loading on entry \"{0}\"")]
+    DeferredConnector(String),
+
+    /// Invalid `connector_id` value (not a non-empty string).
+    #[error("connector_id must be a non-empty string")]
+    InvalidConnectorId,
+
+    /// Connector entry missing required `server_label`.
+    #[error("connector_id requires a non-empty server_label on entry \"{0}\"")]
+    MissingConnectorLabel(String),
+
+    /// Connector-backed MCP resolution failed (URL redacted).
+    #[error("connector \"{connector_id}\" failed to resolve for server_label \"{label}\"")]
+    ConnectorClient {
+        /// The connector ID from the request.
+        connector_id: String,
+        /// The server label from the request.
+        label: String,
+    },
+
+    /// A `tool_choice` references a resolved server with zero tools.
+    #[error("tool_choice references server_label \"{0}\" which resolved to zero eligible tools")]
+    EmptyResolvedToolChoice(String),
+}
+
+/// Per-entry resolution outcome.
+enum EntryResolution {
+    /// Entry was not resolved (deferred or no `server_url`).
+    PassThrough,
+    /// Entry was resolved to zero or more function tools.
+    Resolved(Vec<serde_json::Value>),
 }
 
 /// Result of resolving all MCP entries.
 struct Resolution {
-    /// Pre-built function tools parallel to the input MCP entries.
-    /// Empty vec means the entry was not resolved.
-    per_entry: Vec<Vec<serde_json::Value>>,
+    /// Per-entry resolution outcomes parallel to the input MCP entries.
+    per_entry: Vec<EntryResolution>,
     /// Global dispatch map keyed by `(server_label, tool_name)`.
     tool_map: HashMap<(String, String), serde_json::Value>,
+    /// Whether any entry was resolved (used to skip body rewrite when nothing resolved).
+    has_resolved: bool,
+    /// Labels of entries that were resolved (including those that produced zero tools).
+    resolved_labels: HashSet<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -365,14 +417,147 @@ fn check_body_size(serialized: &SerializedJson, max_body_bytes: usize) -> Result
     Ok(())
 }
 
+/// Collect per-entry resolutions from task results.
+fn collect_resolutions(
+    entries: &[serde_json::Value],
+    entry_to_task: &[Option<usize>],
+    task_results: &[Option<Vec<serde_json::Value>>],
+) -> Resolution {
+    let mut tool_map = HashMap::new();
+    let mut per_entry = Vec::with_capacity(entries.len());
+    let mut has_resolved = false;
+    let mut resolved_labels = HashSet::new();
+    for (entry, task_idx) in entries.iter().zip(entry_to_task) {
+        if let Some(resolution) = build_entry_resolution(entry, *task_idx, task_results, &mut tool_map) {
+            has_resolved = true;
+            resolved_labels.insert(server_label(entry).to_owned());
+            per_entry.push(resolution);
+        } else {
+            per_entry.push(EntryResolution::PassThrough);
+        }
+    }
+    Resolution {
+        per_entry,
+        tool_map,
+        has_resolved,
+        resolved_labels,
+    }
+}
+
+/// Resolve connector IDs to server URLs for MCP tool entries.
+///
+/// Mutates entries in place, replacing `connector_id` with the
+/// corresponding `server_url` from the configured connectors map.
+fn resolve_connector_ids(
+    connectors: &HashMap<String, url::Url>,
+    entries: &mut [serde_json::Value],
+) -> Result<(), ResolveError> {
+    for entry in entries.iter_mut() {
+        let Some(connector_id_value) = entry.get("connector_id") else {
+            continue;
+        };
+
+        let connector_id = match connector_id_value.as_str() {
+            Some(s) if !s.is_empty() && s.len() <= config::MAX_CONNECTOR_ID_LEN => s.to_owned(),
+            _ => return Err(ResolveError::InvalidConnectorId),
+        };
+
+        validate_connector_entry(entry, &connector_id)?;
+
+        let resolved_url = connectors
+            .get(&connector_id)
+            .ok_or(ResolveError::UnknownConnector(connector_id))?;
+
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert(
+                "server_url".to_owned(),
+                serde_json::Value::String(resolved_url.to_string()),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a connector entry has required fields and no conflicts.
+fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Result<(), ResolveError> {
+    let label = entry
+        .get("server_label")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    if label.is_none() {
+        return Err(ResolveError::MissingConnectorLabel(connector_id.to_owned()));
+    }
+
+    if entry.get("server_url").is_some() {
+        return Err(ResolveError::MutuallyExclusiveTarget(connector_id.to_owned()));
+    }
+
+    if entry
+        .get("defer_loading")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(ResolveError::DeferredConnector(connector_id.to_owned()));
+    }
+
+    Ok(())
+}
+
+/// Build resolution for a single entry given task results.
+fn build_entry_resolution(
+    entry: &serde_json::Value,
+    task_idx: Option<usize>,
+    task_results: &[Option<Vec<serde_json::Value>>],
+    tool_map: &mut HashMap<(String, String), serde_json::Value>,
+) -> Option<EntryResolution> {
+    let tools = task_idx.and_then(|idx| task_results.get(idx)?.clone())?;
+    let allowed = extract_allowed_tools(entry);
+    let filtered = apply_allowed_tools_filter(tools, &allowed);
+    let label = server_label(entry);
+    let function_tools: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|def| mcp_tool_to_function_tool(label, def))
+        .collect();
+    insert_tools(filtered, entry, tool_map);
+    Some(EntryResolution::Resolved(function_tools))
+}
+
+/// Replace a [`ResolveError::Client`] with [`ResolveError::ConnectorClient`]
+/// when the failing entry was connector-resolved, preventing internal URLs
+/// from leaking to clients.
+fn redact_connector_client_error(
+    result: Result<Option<Vec<serde_json::Value>>, ResolveError>,
+    entry: &serde_json::Value,
+) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
+    match result {
+        Err(ResolveError::Client(client_err)) if entry.get("connector_id").is_some() => {
+            debug!(error = %client_err, "connector resolution failed (redacting URL for client)");
+            let connector_id = entry
+                .get("connector_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_owned();
+            let label = server_label(entry).to_owned();
+            Err(ResolveError::ConnectorClient { connector_id, label })
+        },
+        other => other,
+    }
+}
+
 /// Map a [`ResolveError`] to an appropriate rejection response.
 fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction {
     let (status, error_type) = match err {
-        ResolveError::DuplicateLabel(_) | ResolveError::TooManyServers { .. } | ResolveError::NameCollision(_) => {
-            (400, "invalid_request_error")
-        },
+        ResolveError::DuplicateLabel(_)
+        | ResolveError::TooManyServers { .. }
+        | ResolveError::NameCollision(_)
+        | ResolveError::UnknownConnector(_)
+        | ResolveError::MutuallyExclusiveTarget(_)
+        | ResolveError::DeferredConnector(_)
+        | ResolveError::InvalidConnectorId
+        | ResolveError::MissingConnectorLabel(_)
+        | ResolveError::EmptyResolvedToolChoice(_) => (400, "invalid_request_error"),
         ResolveError::BodyTooLarge { .. } => (413, "invalid_request_error"),
-        ResolveError::Client(_) => (502, "server_error"),
+        ResolveError::Client(_) | ResolveError::ConnectorClient { .. } => (502, "server_error"),
         ResolveError::Serialization(_) => (500, "server_error"),
     };
     let msg = err.to_string();
@@ -522,10 +707,14 @@ async fn fetch_tools(
 /// empty tools array, or no resolved entries). The caller is
 /// responsible for checking the serialized size against
 /// `max_body_bytes` before committing.
+///
+/// MCP entries that were not resolved (no `server_url` or deferred)
+/// are left unchanged for upstream to handle.
 fn rewrite_request_body(
     original_bytes: &[u8],
-    per_entry: Vec<Vec<serde_json::Value>>,
+    per_entry: Vec<EntryResolution>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
+    resolved_labels: &HashSet<String>,
 ) -> Result<Option<SerializedJson>, ResolveError> {
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
         return Ok(None);
@@ -545,7 +734,7 @@ fn rewrite_request_body(
 
     let rewritten_count = rewritten.len();
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
-    rewrite_tool_choice(obj, tool_map);
+    rewrite_tool_choice(obj, tool_map, resolved_labels)?;
 
     let serialized = serialize_json_body(&parsed).map_err(|e| {
         debug!(error = %e, "failed to serialize rewritten body");
@@ -559,7 +748,7 @@ fn rewrite_request_body(
 /// pre-built function tools from `per_entry`.
 fn rewrite_tools_array(
     tools: Vec<serde_json::Value>,
-    per_entry: Vec<Vec<serde_json::Value>>,
+    per_entry: Vec<EntryResolution>,
 ) -> (Vec<serde_json::Value>, HashSet<String>) {
     let mut result = Vec::with_capacity(tools.len());
     let mut generated_names = HashSet::new();
@@ -571,18 +760,20 @@ fn rewrite_tools_array(
             continue;
         }
 
-        let function_tools = entries.next().unwrap_or_default();
+        let resolution = entries.next().unwrap_or(EntryResolution::PassThrough);
 
-        if function_tools.is_empty() {
-            result.push(tool);
-            continue;
-        }
-
-        for ft in function_tools {
-            if let Some(name) = ft.get("name").and_then(serde_json::Value::as_str) {
-                generated_names.insert(name.to_owned());
-            }
-            result.push(ft);
+        match resolution {
+            EntryResolution::PassThrough => {
+                result.push(tool);
+            },
+            EntryResolution::Resolved(function_tools) => {
+                for ft in function_tools {
+                    if let Some(name) = ft.get("name").and_then(serde_json::Value::as_str) {
+                        generated_names.insert(name.to_owned());
+                    }
+                    result.push(ft);
+                }
+            },
         }
     }
 
@@ -624,25 +815,33 @@ fn detect_name_collisions(tools: &[serde_json::Value], generated_names: &HashSet
 fn rewrite_tool_choice(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-) {
+    resolved_labels: &HashSet<String>,
+) -> Result<(), ResolveError> {
     let Some(serde_json::Value::Object(choice_obj)) = obj.get("tool_choice").cloned() else {
-        return;
+        return Ok(());
     };
     let choice_type = choice_obj.get("type").and_then(serde_json::Value::as_str);
 
     match choice_type {
-        Some("mcp") => rewrite_mcp_tool_choice(obj, &choice_obj, tool_map),
-        Some("allowed_tools") => rewrite_allowed_tools_choice(obj, &choice_obj, tool_map),
-        _ => {},
+        Some("mcp") => rewrite_mcp_tool_choice(obj, &choice_obj, tool_map, resolved_labels),
+        Some("allowed_tools") => {
+            rewrite_allowed_tools_choice(obj, &choice_obj, tool_map);
+            Ok(())
+        },
+        _ => Ok(()),
     }
 }
 
 /// Rewrite an MCP-typed `tool_choice` to its function equivalent.
+///
+/// Returns [`ResolveError::EmptyResolvedToolChoice`] when the
+/// targeted label was resolved but produced zero eligible tools.
 fn rewrite_mcp_tool_choice(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     choice_obj: &serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-) {
+    resolved_labels: &HashSet<String>,
+) -> Result<(), ResolveError> {
     let label = choice_obj
         .get("server_label")
         .and_then(serde_json::Value::as_str)
@@ -655,8 +854,10 @@ fn rewrite_mcp_tool_choice(
                 "tool_choice".to_owned(),
                 serde_json::json!({"type": "function", "name": function_name}),
             );
+        } else if resolved_labels.contains(label) {
+            return Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()));
         }
-        return;
+        return Ok(());
     }
 
     let function_refs = collect_function_refs_for_label(label, tool_map);
@@ -665,7 +866,10 @@ fn rewrite_mcp_tool_choice(
             "tool_choice".to_owned(),
             serde_json::json!({"type": "allowed_tools", "mode": "required", "tools": function_refs}),
         );
+    } else if resolved_labels.contains(label) {
+        return Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()));
     }
+    Ok(())
 }
 
 /// Rewrite MCP selectors inside an `allowed_tools`-typed
@@ -968,6 +1172,7 @@ fn find_cached_listing(
     label: &str,
     server_url: &str,
     allowed_tools: Option<&[String]>,
+    require_url_match: bool,
 ) -> Option<Vec<serde_json::Value>> {
     let previous = previous_tools?;
     let allowed = allowed_tools?;
@@ -976,7 +1181,7 @@ fn find_cached_listing(
         let label_matches = pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label);
         let url_ok = match pt.get("server_url").and_then(serde_json::Value::as_str) {
             Some(cached_url) => cached_url == server_url,
-            None => true,
+            None => !require_url_match,
         };
         label_matches && url_ok
     })?;
@@ -1047,6 +1252,7 @@ fn insert_tools(
     let headers = entry.get("headers").cloned();
     let authorization = entry.get("authorization").cloned();
     let require_approval = entry.get("require_approval").cloned();
+    let connector_id = entry.get("connector_id").cloned();
 
     for tool in tools {
         let tool_name = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned);
@@ -1063,6 +1269,7 @@ fn insert_tools(
                 "headers": headers,
                 "authorization": authorization,
                 "require_approval": require_approval,
+                "connector_id": connector_id,
                 "tool_definition": tool,
             }),
         );
