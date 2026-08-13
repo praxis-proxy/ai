@@ -17,13 +17,13 @@ use praxis_filter::FilterError;
 
 /// Which phase of the proxy pipeline is being evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once provider evaluation is wired (#578)")
-)]
 pub enum GuardPhase {
     /// Inspecting the client request before it reaches the upstream.
     Request,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used once response-side evaluation is implemented (#580)")
+    )]
     /// Inspecting the upstream response before it reaches the client.
     Response,
 }
@@ -43,10 +43,6 @@ impl fmt::Display for GuardPhase {
 
 /// Normalized verdict from an external guardrail provider evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once provider evaluation is wired (#578)")
-)]
 pub enum GuardResult {
     /// Content is safe — forward unchanged.
     Pass,
@@ -68,10 +64,6 @@ impl GuardResult {
     /// Returns the status label written to [`FilterResultSet`].
     ///
     /// [`FilterResultSet`]: praxis_filter::FilterResultSet
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used once provider evaluation emits results (#578)")
-    )]
     pub fn status_label(&self) -> &'static str {
         match self {
             Self::Pass => "passed",
@@ -99,7 +91,6 @@ impl GuardResult {
 /// `Err(FilterError)`. The pipeline's per-filter `failure_mode`
 /// (open/closed) handles what happens next.
 #[async_trait]
-#[expect(dead_code, reason = "called once NeMo provider is wired in on_request_body (#578)")]
 pub trait GuardProvider: Send + Sync {
     /// Evaluate the extracted messages against the external guard service.
     async fn evaluate(&self, messages: Vec<serde_json::Value>, phase: GuardPhase) -> Result<GuardResult, FilterError>;

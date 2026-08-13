@@ -1,0 +1,193 @@
+{
+  "version": 1,
+  "scenario_id": "messages/native-basic-stream",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "live",
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5-20251001",
+    "source_id": null
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_011Cdn61zuknXFNF9U4CB7cm": "msg_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Reply with exactly `hello` and nothing else.",
+                  "role": "user"
+                }
+              ],
+              "model": "claude-haiku-4-5-20251001",
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream; charset=utf-8"
+            ],
+            "request-id": [
+              "req_011Cdn61zPkMBSYB7wvzQqHa"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"claude-haiku-4-5-20251001\",\"role\":\"assistant\",\"stop_details\":null,\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"inference_geo\":\"not_available\",\"input_tokens\":17,\"output_tokens\":1,\"service_tier\":\"standard\"}},\"type\":\"message_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "ping",
+                "data": "{\"type\":\"ping\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"hello\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"stop_details\":null,\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":17,\"output_tokens\":4}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Reply with exactly `hello` and nothing else.",
+                  "role": "user"
+                }
+              ],
+              "model": "claude-haiku-4-5-20251001",
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream; charset=utf-8"
+            ],
+            "request-id": [
+              "req_011Cdn61zPkMBSYB7wvzQqHa"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"message\":{\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"claude-haiku-4-5-20251001\",\"role\":\"assistant\",\"stop_details\":null,\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"inference_geo\":\"not_available\",\"input_tokens\":17,\"output_tokens\":1,\"service_tier\":\"standard\"}},\"type\":\"message_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "ping",
+                "data": "{\"type\":\"ping\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"hello\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"stop_details\":null,\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":17,\"output_tokens\":4}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      }
+    }
+  ]
+}

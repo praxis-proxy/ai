@@ -32,21 +32,21 @@ use std::borrow::Cow;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    builtins::http::{payload_processing::OnInvalidBehavior, value_safety::is_safe_promoted_value},
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
 };
 use tracing::{debug, trace};
 
 use self::config::{AnthropicMessagesFormatConfig, build_config};
-use crate::classifier::{AiRequestFormat, ClassifiedRequest, classify_request_body};
+use crate::{
+    anthropic::wire,
+    classifier::{AiRequestFormat, ClassifiedRequest, classify_request_body},
+    promotion::is_promotable_value,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Maximum length of a body-derived value promoted to headers or filter results.
-const MAX_PROMOTED_VALUE_LEN: usize = 256;
 
 /// Header name sent by Anthropic SDK clients.
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
@@ -181,13 +181,7 @@ fn handle_invalid_format(format: AiRequestFormat, config: &AnthropicMessagesForm
             };
 
             trace!(reason = message, "rejecting unrecognized body");
-            Some(FilterAction::Reject(
-                Rejection::status(400)
-                    .with_header("content-type", "application/json")
-                    .with_body(Bytes::from(format!(
-                        r#"{{"error":{{"message":"{message}","type":"invalid_request_error"}}}}"#
-                    ))),
-            ))
+            Some(FilterAction::Reject(wire::invalid_request_rejection(message)))
         },
     }
 }
@@ -197,7 +191,7 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
     ctx.set_metadata("anthropic_messages_format.format", classified.format.as_str());
 
     if let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
+        && is_promotable_value(model)
     {
         ctx.set_metadata("anthropic_messages_format.model", model.clone());
     }
@@ -231,8 +225,7 @@ fn promote_headers(
 
     if let Some(header) = &config.headers.model
         && let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
-        && model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(model)
     {
         ctx.extra_request_headers
             .push((Cow::Owned(header.clone()), model.clone()));
@@ -261,8 +254,7 @@ fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, classified: &Classifi
     results.set("format", classified.format.as_str())?;
 
     if let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
-        && model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(model)
     {
         results.set("model", model.clone())?;
     }

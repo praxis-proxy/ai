@@ -7,10 +7,15 @@ mod test_utils;
 #[expect(unreachable_pub)]
 pub use test_utils::load_example_config;
 
+mod agentic_loop;
 mod agentic_routing;
 mod anthropic_messages;
+mod anthropic_messages_web_search;
+mod compact;
 mod credential_injection;
+mod file_search_callout;
 mod full_flow;
+mod guardrails;
 mod mcp_broker;
 mod model_to_header;
 mod openai_conversations;
@@ -31,7 +36,9 @@ mod openai_tool_parse;
 mod prompt_enrichment;
 mod rehydrate;
 mod responses_routing;
+mod responses_to_chat_completions;
 mod session_replay;
+mod time_to_first_token;
 mod token_count;
 mod token_counting;
 mod token_usage_headers;

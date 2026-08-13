@@ -388,7 +388,7 @@ impl FilesApiClient {
         request_headers: &http::HeaderMap,
         max_content_bytes: usize,
         max_resolved_bytes: usize,
-    ) -> Result<Vec<u8>, ResolveError> {
+    ) -> Result<bytes::Bytes, ResolveError> {
         let url = self
             .client
             .resource_url(FILES_PATH_PREFIX, file_id, Some("content"))
@@ -619,6 +619,14 @@ async fn resolve_content_part(
 }
 
 /// Resolve one reference and apply the configured missing-file policy.
+///
+/// `on_missing: continue` only governs `file_id` availability gaps.
+/// `file_url` failures of any kind are always propagated: a failed
+/// fetch is security-relevant (the resolver's SSRF/redirect/size
+/// checks may have just rejected an attacker-controlled target), so
+/// it must never be downgraded into an implicit passthrough that
+/// hands the original URL to a backend that might fetch it itself
+/// without the same protections.
 async fn resolve_reference(
     source: &ReferenceSource,
     part_type: &str,
@@ -638,7 +646,8 @@ async fn resolve_reference(
         .await
     {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(e @ (ResolveError::TooManyReferences { .. } | ResolveError::FileUrlBlocked { .. })) => Err(e),
+        Err(e @ ResolveError::TooManyReferences { .. }) => Err(e),
+        Err(e) if matches!(source, ReferenceSource::FileUrl(_)) => Err(e),
         Err(e) if resolver.on_missing == OnMissing::Continue => {
             warn!(source = %source, error = %e, "file resolution failed, passing through");
             Ok(None)
@@ -834,10 +843,11 @@ mod tests {
         net::TcpListener,
     };
 
-    use praxis_core::callout::{CalloutConfig, FailureMode};
-
     use super::*;
-    use crate::openai::api_client::{ApiClient, ApiClientConfig};
+    use crate::{
+        openai::api_client::{ApiClient, ApiClientConfig},
+        subrequest::SubRequestClient,
+    };
 
     #[test]
     fn infer_mime_pdf() {
@@ -970,14 +980,11 @@ mod tests {
     fn test_api_client(api_base_url: &str, timeout_ms: u64) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: api_base_url.to_owned(),
-            callout_config: CalloutConfig {
-                failure_mode: FailureMode::Closed,
-                timeout_ms,
-                ..CalloutConfig::default()
-            },
+            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+            timeout: std::time::Duration::from_millis(timeout_ms),
+            max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
         })
-        .unwrap()
     }
 
     fn test_client(api_base_url: &str) -> FilesApiClient {

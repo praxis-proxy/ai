@@ -1,0 +1,8 @@
+{
+  "schema_version": "1.0.0",
+  "revision": "not_an_object",
+  "overlay": {
+    "local_site": "a",
+    "candidates": []
+  }
+}

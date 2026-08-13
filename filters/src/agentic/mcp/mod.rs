@@ -190,8 +190,12 @@ impl HttpFilter for McpFilter {
 // Private Utilities
 // -----------------------------------------------------------------------------
 
-/// Build a `JsonRpcConfig` for the shared parser with MCP-appropriate defaults.
-fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
+/// Build a [`JsonRpcConfig`] for the shared parser with MCP-appropriate defaults.
+///
+/// Used by both the classifier filter and the broker filter.
+///
+/// [`JsonRpcConfig`]: praxis_filter::builtins::http::payload_processing::json_rpc::config::JsonRpcConfig
+pub(crate) fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
     use praxis_filter::builtins::http::payload_processing::json_rpc::config::{BatchPolicy, JsonRpcHeaders};
 
     let headers = JsonRpcHeaders {
@@ -371,11 +375,13 @@ fn write_metadata(
     }
     if let Some(sid) = &mcp.session_id
         && !contains_control_chars(sid)
+        && sid.len() <= max_len
     {
         ctx.set_metadata("mcp.session_id", sid.clone());
     }
     if let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
+        && pv.len() <= max_len
     {
         ctx.set_metadata("mcp.protocol_version", pv.clone());
     }
@@ -408,6 +414,7 @@ fn promote_mcp_headers(
     if let Some(header_name) = &config.headers.protocol_version
         && let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
+        && pv.len() <= max_len
     {
         headers.push((Cow::Owned(header_name.clone()), pv.clone()));
     }
@@ -430,18 +437,20 @@ fn promote_filter_results(
 ) -> Result<(), FilterError> {
     let results = ctx.filter_results.entry("mcp").or_default();
     let method_str = mcp.method.as_str();
-    if !contains_control_chars(method_str) {
+    if !contains_control_chars(method_str) && method_str.len() <= MAX_DYNAMIC_VALUE_LEN {
         results.set("method", method_str.to_owned())?;
     }
 
     if let Some(name) = &mcp.name
         && !contains_control_chars(name)
+        && name.len() <= MAX_DYNAMIC_VALUE_LEN
     {
         results.set("name", name.clone())?;
     }
 
     if let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
+        && pv.len() <= MAX_DYNAMIC_VALUE_LEN
     {
         results.set("protocol_version", pv.clone())?;
     }

@@ -667,41 +667,6 @@ fn on_response_body_releases_skipped_non_end_of_stream() {
     );
 }
 
-#[test]
-fn on_response_body_buffers_when_error_reformat_is_armed() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("responses.skip_persist", "true");
-    ctx.set_metadata("responses._reformat_error", "502");
-    let mut body = Some(Bytes::from_static(b"partial"));
-
-    let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "error reformat should keep skipped chunks buffered"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_buffers_streaming_chunks_when_error_reformat_is_armed() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
-    ctx.set_metadata("responses._reformat_error", "502");
-    run_request_phase(&filter, &mut ctx).await;
-
-    let mut body = Some(Bytes::from_static(b"upstream error body"));
-    let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "streaming chunks should buffer when error reformat is armed"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_skips_streaming_persist_on_parse_error() {
     let filter = make_filter();
@@ -1351,7 +1316,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     let record = store
@@ -1463,7 +1428,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
         "EOS should persist from accumulated state and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     let record = store
@@ -1547,7 +1512,7 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_rehydrated_messages");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     seeded_store
@@ -1641,7 +1606,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     let record = store
@@ -1672,7 +1637,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_fallback_mcp_metadata");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     seeded_store
@@ -1771,7 +1736,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     let record = store
@@ -1857,7 +1822,7 @@ async fn postgres_store_init_failure_is_not_cached() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host={}"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -1898,7 +1863,7 @@ async fn postgres_store_init_failure_is_not_cached_on_get() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host={}"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -1934,7 +1899,7 @@ async fn postgres_store_init_failure_is_not_cached_on_delete() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host={}"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -1983,7 +1948,7 @@ fn valid_postgres_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2002,7 +1967,7 @@ fn postgres_config_accepts_postgresql_scheme() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgresql://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgresql://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2159,7 +2124,7 @@ fn postgres_config_rejects_hostaddr_loopback_override() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=127.0.0.1"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=127.0.0.1"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2174,7 +2139,7 @@ fn postgres_config_rejects_host_loopback_override() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=127.0.0.1"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=127.0.0.1"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2195,10 +2160,7 @@ fn postgres_config_rejects_legacy_ipv4_host_override() {
         "0xa9fea9fe",
         "0x0a000005",
     ] {
-        let yaml = postgres_config_yaml(
-            &format!("postgres://user:pass@203.0.113.10:5432/praxis?host={host}"),
-            "",
-        );
+        let yaml = postgres_config_yaml(&format!("postgres://user:pass@1.2.3.4:5432/praxis?host={host}"), "");
         let result = ResponseStoreFilter::from_config(&yaml);
         assert!(
             result.is_err(),
@@ -2212,7 +2174,7 @@ fn postgres_config_rejects_host_localhost_override() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=localhost"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=localhost"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2227,7 +2189,7 @@ fn postgres_config_rejects_mixed_case_host_query_as_missing_explicit_host() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres:///?HoSt=203.0.113.10"
+database_url: "postgres:///?HoSt=1.2.3.4"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2245,7 +2207,7 @@ fn postgres_config_rejects_hostaddr_unspecified_override() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=::"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=::"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2260,7 +2222,7 @@ fn postgres_config_rejects_ipv4_mapped_link_local_hostaddr() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=::ffff:169.254.169.254"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=::ffff:169.254.169.254"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2360,7 +2322,7 @@ fn postgres_config_rejects_socket_host_without_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=%2Fvar%2Frun%2Fpostgresql"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=%2Fvar%2Frun%2Fpostgresql"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2378,7 +2340,7 @@ fn postgres_config_allows_socket_host_with_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=%2Fvar%2Frun%2Fpostgresql"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=%2Fvar%2Frun%2Fpostgresql"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -2416,7 +2378,7 @@ fn postgres_config_rejects_socket_host_path_traversal_with_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=%2Fvar%2Frun%2F..%2Fpostgresql"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=%2Fvar%2Frun%2F..%2Fpostgresql"
 responses_table: responses
 conversations_table: conversations
 allow_private_database_url: true
@@ -2453,7 +2415,7 @@ fn postgres_config_with_ssl_mode_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: require
@@ -2469,7 +2431,7 @@ fn postgres_config_with_ssl_root_cert_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: verify-ca
@@ -2489,7 +2451,7 @@ fn postgres_config_with_url_verify_sslmode_and_ssl_root_cert_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full"
 responses_table: responses
 conversations_table: conversations
 ssl_root_cert: /path/to/ca.pem
@@ -2505,7 +2467,7 @@ fn postgres_config_with_url_sslrootcert_and_verified_sslmode_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2523,7 +2485,7 @@ fn postgres_config_with_url_ssl_root_cert_alias_and_verified_sslmode_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?ssl-mode=verify-ca&ssl-root-cert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?ssl-mode=verify-ca&ssl-root-cert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2537,12 +2499,31 @@ conversations_table: conversations
 }
 
 #[test]
-fn postgres_config_rejects_ssl_root_cert_without_verified_ssl_mode() {
-    for ssl_mode in ["", "ssl_mode: disable", "ssl_mode: prefer", "ssl_mode: require"] {
+fn postgres_config_accepts_ssl_root_cert_without_explicit_ssl_mode() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_root_cert: /path/to/ca.pem
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_ok(),
+        "ssl_root_cert should be accepted when default ssl_mode is verify-full"
+    );
+}
+
+#[test]
+fn postgres_config_rejects_ssl_root_cert_with_non_verified_ssl_mode() {
+    for ssl_mode in ["ssl_mode: disable", "ssl_mode: prefer", "ssl_mode: require"] {
         let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
             r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 {ssl_mode}
@@ -2563,7 +2544,7 @@ fn postgres_config_rejects_ssl_root_cert_with_non_verified_url_sslmode() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require"
 responses_table: responses
 conversations_table: conversations
 ssl_root_cert: /path/to/ca.pem
@@ -2575,11 +2556,11 @@ ssl_root_cert: /path/to/ca.pem
 }
 
 #[test]
-fn postgres_config_does_not_treat_mixed_case_sslmode_as_effective() {
+fn postgres_config_mixed_case_url_sslmode_falls_through_to_verified_default() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?SSLMODE=verify-full&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?SSLMODE=verify-full&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2587,8 +2568,8 @@ conversations_table: conversations
     .unwrap();
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(
-        result.is_err(),
-        "mixed-case sslmode query should not satisfy sslrootcert validation"
+        result.is_ok(),
+        "mixed-case SSLMODE is not recognized but default verify-full satisfies sslrootcert"
     );
 }
 
@@ -2597,7 +2578,7 @@ fn postgres_config_rejects_url_sslrootcert_without_verified_ssl_mode() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2615,7 +2596,7 @@ fn postgres_config_rejects_url_sslrootcert_when_last_sslmode_is_not_verified() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full&sslmode=require&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full&sslmode=require&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2633,7 +2614,7 @@ fn postgres_config_explicit_ssl_mode_overrides_url_sslmode() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: require
@@ -2653,7 +2634,7 @@ fn postgres_config_explicit_verified_ssl_mode_allows_url_sslrootcert() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&sslrootcert=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&sslrootcert=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: verify-full
@@ -2672,7 +2653,7 @@ fn postgres_config_rejects_ssl_root_cert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 ssl_mode: verify-ca
@@ -2689,7 +2670,7 @@ fn postgres_config_rejects_url_sslrootcert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full&sslrootcert=../ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full&sslrootcert=../ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2704,7 +2685,7 @@ fn postgres_config_rejects_url_encoded_sslrootcert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full&sslrootcert=%2e%2e%2fca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full&sslrootcert=%2e%2e%2fca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2722,7 +2703,7 @@ fn postgres_config_rejects_url_sslcert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&sslcert=../client.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&sslcert=../client.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2737,7 +2718,7 @@ fn postgres_config_rejects_url_sslkey_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&sslkey=../client.key"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&sslkey=../client.key"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -2753,7 +2734,7 @@ fn postgres_config_rejects_long_responses_table() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: {responses_table}
 conversations_table: conversations
 "#
@@ -2772,7 +2753,7 @@ fn postgres_config_rejects_long_conversations_table_for_index_name() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: {conversations_table}
 "#
@@ -2891,7 +2872,7 @@ fn postgres_config_rejects_ipv6_bracketed_loopback() {
 #[test]
 fn postgres_config_rejects_socket_path_with_traversal() {
     let yaml = postgres_config_yaml(
-        "postgres://user@203.0.113.10/db?host=%2Fvar%2Frun%2F..%2F..%2Fetc%2Fdb",
+        "postgres://user@1.2.3.4/db?host=%2Fvar%2Frun%2F..%2F..%2Fetc%2Fdb",
         "allow_private_database_url: true",
     );
     let result = ResponseStoreFilter::from_config(&yaml);
@@ -3029,6 +3010,78 @@ async fn get_unrelated_path_continues() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_rejects_stream_true() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_stream", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_stream?stream=true");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "stream=true should return 400");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_rejects_include() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_inc", "default", json!([])).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_inc?include%5B%5D=reasoning.encrypted_content",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "include[] should return 400");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_accepts_stream_false() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_sf",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_sf?stream=false");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "stream=false should return 200");
+    assert_has_json_content_type(&rejection);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_response_no_query_still_returns_200() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_nq",
+        "default",
+        json!([{"id": "item_1", "type": "message"}]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_nq");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "no query should still return 200");
+}
+
 // -----------------------------------------------------------------------------
 // GET /v1/responses/{id}/input_items
 // -----------------------------------------------------------------------------
@@ -3075,6 +3128,36 @@ async fn get_input_items_returns_404_when_not_found() {
         rejection.status, 404,
         "should return 404 when response not found for input_items"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_rejects_invalid_query_params() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_qp", "default", json!(["hello"])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_qp/input_items?limit=abc");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "should return 400 for invalid limit");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_rejects_key_only_query_param() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_ko", "default", json!(["hello"])).await;
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_ko/input_items?limit");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400, "should return 400 for key-only param");
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3183,6 +3266,77 @@ async fn get_input_items_with_malformed_cursor_returns_400() {
             .is_some_and(|message| message.contains("invalid input_items cursor")),
         "error message should explain the invalid input_items cursor"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_last_id_falls_back_to_numeric_cursor_for_non_object_items() {
+    let filter = make_filter();
+    // Plain string entries can't carry a synthetic `id` (there's no
+    // object to attach it to), so `last_id` must fall back to the
+    // page's numeric cursor instead of staying `null`.
+    init_store_and_seed(&filter, "resp_non_object", "default", json!(["first", "second"])).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_non_object/input_items?limit=1&order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["has_more"], true);
+    assert_eq!(
+        body["last_id"], "1",
+        "last_id should fall back to the numeric cursor when the last item has no ID"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_pagination_usable_for_id_less_array_items() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_no_ids",
+        "default",
+        json!([
+            {"type": "message", "role": "user", "content": "first"},
+            {"type": "message", "role": "assistant", "content": "second"}
+        ]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_no_ids/input_items?limit=1&order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["has_more"], true, "second item should remain on the next page");
+    let last_id = body["last_id"]
+        .as_str()
+        .expect("last_id must be a usable cursor, not null, even when input items have no ID field");
+
+    let follow_up = crate::test_utils::make_request(
+        http::Method::GET,
+        &format!("/v1/responses/resp_no_ids/input_items?limit=1&order=asc&after={last_id}"),
+    );
+    let mut follow_up_ctx = crate::test_utils::make_filter_context(&follow_up);
+    let follow_up_action = filter.on_request(&mut follow_up_ctx).await.unwrap();
+    let follow_up_rejection = expect_reject(follow_up_action);
+    assert_eq!(follow_up_rejection.status, 200);
+
+    let follow_up_body: serde_json::Value =
+        serde_json::from_slice(follow_up_rejection.body.as_deref().unwrap()).unwrap();
+    let data = follow_up_body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "the after cursor should resolve to the second item");
+    assert_eq!(data[0]["content"], "second");
+    assert_eq!(follow_up_body["has_more"], false);
 }
 
 // -----------------------------------------------------------------------------
@@ -3500,7 +3654,7 @@ fn extract_response_id_empty_id_segment() {
 
 #[test]
 fn parse_query_params_empty() {
-    let params = super::filter::parse_query_params(None);
+    let params = super::filter::parse_query_params(None).unwrap();
     assert!(params.cursor.is_none(), "cursor should be None for empty query");
     assert_eq!(params.limit, 20, "limit should default to 20");
     assert_eq!(params.order, Order::Descending, "order should default to Descending");
@@ -3508,7 +3662,7 @@ fn parse_query_params_empty() {
 
 #[test]
 fn parse_query_params_all_fields() {
-    let params = super::filter::parse_query_params(Some("after=5&limit=10&order=asc"));
+    let params = super::filter::parse_query_params(Some("after=5&limit=10&order=asc")).unwrap();
     assert_eq!(
         params.cursor.as_deref(),
         Some("5"),
@@ -3519,14 +3673,32 @@ fn parse_query_params_all_fields() {
 }
 
 #[test]
-fn parse_query_params_invalid_limit_ignored() {
-    let params = super::filter::parse_query_params(Some("limit=abc"));
-    assert_eq!(params.limit, 20, "invalid limit should keep default");
+fn parse_query_params_invalid_limit_rejected() {
+    let err = super::filter::parse_query_params(Some("limit=abc")).unwrap_err();
+    assert!(
+        err.contains("Invalid value for 'limit'"),
+        "should reject non-numeric limit: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_zero_limit_rejected() {
+    let err = super::filter::parse_query_params(Some("limit=0")).unwrap_err();
+    assert!(err.contains("must be between 1 and"), "should reject zero limit: {err}");
+}
+
+#[test]
+fn parse_query_params_above_max_limit_rejected() {
+    let err = super::filter::parse_query_params(Some("limit=101")).unwrap_err();
+    assert!(
+        err.contains("must be between 1 and"),
+        "should reject above-max limit: {err}"
+    );
 }
 
 #[test]
 fn parse_query_params_decodes_percent_encoded_cursor() {
-    let params = super::filter::parse_query_params(Some("after=item%5F1"));
+    let params = super::filter::parse_query_params(Some("after=item%5F1")).unwrap();
     assert_eq!(
         params.cursor.as_deref(),
         Some("item_1"),
@@ -3535,13 +3707,247 @@ fn parse_query_params_decodes_percent_encoded_cursor() {
 }
 
 #[test]
-fn parse_query_params_unknown_order_ignored() {
-    let params = super::filter::parse_query_params(Some("order=random"));
+fn parse_query_params_empty_after_rejected() {
+    let err = super::filter::parse_query_params(Some("after=")).unwrap_err();
+    assert!(
+        err.contains("cursor must not be empty"),
+        "should reject empty after: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_unknown_order_rejected() {
+    let err = super::filter::parse_query_params(Some("order=random")).unwrap_err();
+    assert!(
+        err.contains("Invalid value for 'order'"),
+        "should reject unknown order value: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_include_bracket_rejected() {
+    let err = super::filter::parse_query_params(Some("include[]=reasoning.encrypted_content")).unwrap_err();
+    assert!(
+        err.contains("not supported"),
+        "should reject include[] parameter: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_include_bare_rejected() {
+    let err = super::filter::parse_query_params(Some("include=reasoning.encrypted_content")).unwrap_err();
+    assert!(
+        err.contains("not supported"),
+        "should reject bare include parameter: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_unknown_parameter_rejected() {
+    let err = super::filter::parse_query_params(Some("foo=bar")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "should reject unknown parameter: {err}"
+    );
+}
+
+#[test]
+fn parse_query_params_boundary_limits_accepted() {
+    let one = super::filter::parse_query_params(Some("limit=1")).unwrap();
+    assert_eq!(one.limit, 1, "limit=1 should be accepted");
+    let max = super::filter::parse_query_params(Some("limit=100")).unwrap();
+    assert_eq!(max.limit, 100, "limit=100 should be accepted");
+}
+
+#[test]
+fn parse_query_params_key_only_limit_rejected() {
+    let err = super::filter::parse_query_params(Some("limit")).unwrap_err();
+    assert!(err.contains("Missing value"), "should reject key-only limit: {err}");
+}
+
+#[test]
+fn parse_query_params_key_only_order_rejected() {
+    let err = super::filter::parse_query_params(Some("order")).unwrap_err();
+    assert!(err.contains("Missing value"), "should reject key-only order: {err}");
+}
+
+#[test]
+fn parse_query_params_key_only_unknown_ignored() {
+    let params = super::filter::parse_query_params(Some("order=asc&foo")).unwrap();
     assert_eq!(
         params.order,
-        Order::Descending,
-        "unknown order value should keep default"
+        Order::Ascending,
+        "unknown key-only param should be ignored"
     );
+}
+
+// -----------------------------------------------------------------------------
+// validate_get_response_query_params
+// -----------------------------------------------------------------------------
+
+#[test]
+fn validate_get_response_query_params_no_query() {
+    assert!(
+        super::filter::validate_get_response_query_params(None).is_ok(),
+        "no query string should be valid"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_empty_query() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("")).is_ok(),
+        "empty query string should be valid"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_false_accepted() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("stream=false")).is_ok(),
+        "stream=false should be accepted"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_true_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=true")).unwrap_err();
+    assert!(
+        err.contains("'stream' parameter is not supported"),
+        "stream=true should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_stream_invalid_value_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=maybe")).unwrap_err();
+    assert!(
+        err.contains("must be 'true' or 'false'"),
+        "stream=maybe should be rejected as invalid boolean: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_bracket_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include[]=file_search_call_results.results"))
+        .unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "include[] should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_percent_encoded_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include%5B%5D=usage")).unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "percent-encoded include[] should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_bare_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include=usage")).unwrap_err();
+    assert!(
+        err.contains("'include' parameter is not supported"),
+        "bare include should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_starting_after_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("starting_after=5")).unwrap_err();
+    assert!(
+        err.contains("'starting_after' parameter is not supported"),
+        "starting_after should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_include_obfuscation_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include_obfuscation=true")).unwrap_err();
+    assert!(
+        err.contains("'include_obfuscation' parameter is not supported"),
+        "include_obfuscation should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_unknown_param_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("foo=bar")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "unknown param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_known_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream")).unwrap_err();
+    assert!(
+        err.contains("Missing value"),
+        "key-only known param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_include_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("include")).unwrap_err();
+    assert!(
+        err.contains("Missing value"),
+        "key-only include should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_key_only_unknown_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("foo")).unwrap_err();
+    assert!(
+        err.contains("Unknown query parameter"),
+        "key-only unknown param should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_percent_encoded_stream_false_accepted() {
+    assert!(
+        super::filter::validate_get_response_query_params(Some("stream=%66alse")).is_ok(),
+        "percent-encoded stream=false should be accepted"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_invalid_utf8_key_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("%FF=x")).unwrap_err();
+    assert!(
+        err.contains("Invalid percent-encoding in query parameter key"),
+        "invalid UTF-8 key should be rejected: {err}"
+    );
+}
+
+#[test]
+fn validate_get_response_query_params_invalid_utf8_value_rejected() {
+    let err = super::filter::validate_get_response_query_params(Some("stream=%FF")).unwrap_err();
+    assert!(
+        err.contains("Invalid percent-encoding in value"),
+        "invalid UTF-8 value should be rejected: {err}"
+    );
+}
+
+#[test]
+fn known_params_and_validator_match_arms_in_sync() {
+    for &param in super::filter::GET_RESPONSE_KNOWN_PARAMS {
+        let result = super::filter::validate_get_response_param(param, "__probe__");
+        assert!(
+            result.is_err(),
+            "known param '{param}' should be handled by validate_get_response_param"
+        );
+        assert!(
+            !result.unwrap_err().contains("Unknown"),
+            "known param '{param}' should not produce an 'Unknown' error"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -3755,7 +4161,84 @@ fn list_input_items_next_cursor_uses_item_id() {
 }
 
 #[test]
-fn list_input_items_next_cursor_falls_back_to_numeric_offset() {
+fn list_input_items_assigns_synthetic_ids_to_id_less_array_items() {
+    let record = make_record_with_input(json!([
+        {"type": "message", "role": "user", "content": "hi"},
+        {"type": "message", "role": "assistant", "content": "hello"}
+    ]));
+    // Default order is descending, but synthetic IDs must stay tied to
+    // each item's original stored position, not its display position.
+    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    assert_eq!(
+        page.data[0]["id"], "msg_resp_test_input_1",
+        "the assistant message (original index 1) should surface first in descending order"
+    );
+    assert_eq!(
+        page.data[1]["id"], "msg_resp_test_input_0",
+        "the user message (original index 0) should surface second in descending order"
+    );
+}
+
+#[test]
+fn list_input_items_mixed_existing_and_synthetic_ids_paginate_correctly() {
+    let record = make_record_with_input(json!([
+        {"id": "a", "type": "message"},
+        {"type": "message", "content": "hi"}
+    ]));
+    let base_params = ListParams {
+        limit: 1,
+        order: Order::Ascending,
+        ..Default::default()
+    };
+
+    let page1 = list_input_items(&record, &base_params).unwrap();
+    assert_eq!(
+        page1.data[0]["id"], "a",
+        "the item's existing id must be preserved, not overwritten"
+    );
+    assert!(page1.has_more);
+    let cursor_after_a = page1.next_cursor.clone();
+    assert_eq!(
+        cursor_after_a.as_deref(),
+        Some("a"),
+        "next_cursor should reuse the item's existing id"
+    );
+
+    let page2 = list_input_items(
+        &record,
+        &ListParams {
+            cursor: cursor_after_a,
+            ..base_params.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        page2.data[0]["id"], "msg_resp_test_input_1",
+        "the id-less second item should get a synthetic id keyed by its original index"
+    );
+    assert!(!page2.has_more, "the mixed array is exhausted after the second item");
+    assert!(page2.next_cursor.is_none());
+
+    // Paginating again using the synthetic id itself as the cursor must still resolve it as an
+    // ID-based cursor (not fall through to the numeric fallback), correctly yielding an empty
+    // page since it was the last item.
+    let page3 = list_input_items(
+        &record,
+        &ListParams {
+            cursor: Some("msg_resp_test_input_1".to_owned()),
+            ..base_params
+        },
+    )
+    .unwrap();
+    assert!(
+        page3.data.is_empty(),
+        "cursor after the synthetic id of the last item should yield an empty page"
+    );
+    assert!(!page3.has_more);
+}
+
+#[test]
+fn list_input_items_next_cursor_uses_synthetic_id_when_input_lacks_ids() {
     let record = make_record_with_input(json!([
         {"val": 1},
         {"val": 2},
@@ -3771,9 +4254,32 @@ fn list_input_items_next_cursor_falls_back_to_numeric_offset() {
     assert!(page.has_more);
     assert_eq!(
         page.next_cursor.as_deref(),
-        Some("2"),
-        "next_cursor should fall back to numeric offset when items lack IDs"
+        Some("msg_resp_test_input_1"),
+        "next_cursor should use the synthetic ID assigned to ID-less items, not a raw numeric offset"
     );
+}
+
+#[test]
+fn list_input_items_numeric_cursor_still_works_as_fallback_for_synthetic_ids() {
+    let record = make_record_with_input(json!([
+        {"val": 1},
+        {"val": 2},
+        {"val": 3},
+        {"val": 4}
+    ]));
+    let params = ListParams {
+        cursor: Some("2".to_owned()),
+        order: Order::Ascending,
+        ..Default::default()
+    };
+    let page = list_input_items(&record, &params).unwrap();
+    assert_eq!(
+        page.data.len(),
+        2,
+        "numeric offset cursor should still work even though items now carry synthetic IDs"
+    );
+    assert_eq!(page.data[0]["val"], 3);
+    assert_eq!(page.data[1]["val"], 4);
 }
 
 #[test]
@@ -4288,7 +4794,7 @@ conversations_table: conversations
 
 #[test]
 fn postgres_config_accepts_public_ipv4_host() {
-    let yaml = postgres_config_yaml("postgres://user:pass@203.0.113.10:5432/praxis", "");
+    let yaml = postgres_config_yaml("postgres://user:pass@1.2.3.4:5432/praxis", "");
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(result.is_ok(), "public IPv4 postgres host should be accepted");
 }
@@ -4323,7 +4829,7 @@ fn postgres_config_rejects_ipv4_mapped_loopback_in_authority() {
 #[test]
 fn postgres_config_url_fragment_not_treated_as_query() {
     let yaml = postgres_config_yaml(
-        "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=verify-full#sslrootcert=/path/to/ca.pem",
+        "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=verify-full#sslrootcert=/path/to/ca.pem",
         "ssl_root_cert: /path/to/ca.pem",
     );
     let result = ResponseStoreFilter::from_config(&yaml);
@@ -4335,7 +4841,7 @@ fn postgres_config_rejects_ssl_cert_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&ssl-cert=../client.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&ssl-cert=../client.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4350,7 +4856,7 @@ fn postgres_config_rejects_ssl_key_path_traversal() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?sslmode=require&ssl-key=../client.key"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?sslmode=require&ssl-key=../client.key"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4365,7 +4871,7 @@ fn postgres_config_with_ssl_ca_alias_and_verified_sslmode_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?ssl-mode=verify-full&ssl-ca=/path/to/ca.pem"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?ssl-mode=verify-full&ssl-ca=/path/to/ca.pem"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4418,7 +4924,7 @@ fn revalidate_postgres_host_rejects_hostaddr_query_param() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=127.0.0.1"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=127.0.0.1"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4437,7 +4943,7 @@ fn revalidate_postgres_host_accepts_public_ip() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4453,7 +4959,7 @@ fn revalidate_postgres_host_rejects_host_query_param_loopback() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?host=127.0.0.1"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=127.0.0.1"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4472,7 +4978,7 @@ fn postgres_config_rejects_hostaddr_with_invalid_ip() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
-database_url: "postgres://user:pass@203.0.113.10:5432/praxis?hostaddr=not-an-ip"
+database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=not-an-ip"
 responses_table: responses
 conversations_table: conversations
 "#,
@@ -4484,7 +4990,7 @@ conversations_table: conversations
 
 #[test]
 fn postgres_config_accepts_ipv6_public_host() {
-    let yaml = postgres_config_yaml("postgres://user:pass@[2001:db8::1]:5432/praxis", "");
+    let yaml = postgres_config_yaml("postgres://user:pass@[2606:4700::1]:5432/praxis", "");
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(result.is_ok(), "public IPv6 postgres host should be accepted");
 }
@@ -4582,4 +5088,73 @@ fn assert_has_json_content_type(rejection: &praxis_filter::Rejection) {
         .iter()
         .any(|(k, v)| k == "content-type" && v == "application/json");
     assert!(has_ct, "rejection should have application/json content-type");
+}
+
+// -----------------------------------------------------------------------------
+// Pool Config
+// -----------------------------------------------------------------------------
+
+#[test]
+fn config_accepts_pool_options() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+pool:
+  max_connections: 20
+  min_connections: 2
+  idle_timeout_secs: 300
+  acquire_timeout_secs: 15
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+
+    let pool = cfg.pool.expect("pool config should be present");
+    assert_eq!(pool.max_connections, Some(20));
+    assert_eq!(pool.min_connections, Some(2));
+    assert_eq!(pool.idle_timeout_secs, Some(300));
+    assert_eq!(pool.acquire_timeout_secs, Some(15));
+}
+
+#[test]
+fn config_accepts_partial_pool_options() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+pool:
+  max_connections: 50
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+
+    let pool = cfg.pool.expect("pool config should be present");
+    assert_eq!(pool.max_connections, Some(50));
+    assert!(pool.min_connections.is_none());
+    assert!(pool.idle_timeout_secs.is_none());
+    assert!(pool.acquire_timeout_secs.is_none());
+}
+
+#[test]
+fn config_omitted_pool_yields_none() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+    assert!(cfg.pool.is_none(), "omitted pool should be None");
 }

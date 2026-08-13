@@ -12,12 +12,18 @@ pub mod agentic;
 pub mod guardrails;
 pub mod inference;
 pub mod prompt_enrich;
+mod register;
+pub mod routing;
+mod time_to_first_token;
 mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
+pub use register::{build_ai_registry, register_ai_filters};
+pub use routing::IntelligentRouteFilter;
+pub use time_to_first_token::TimeToFirstTokenFilter;
 pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
 
 // -----------------------------------------------------------------------------
@@ -54,6 +60,7 @@ pub(crate) mod test_utils {
     )]
     pub(crate) fn make_filter_context(req: &Request) -> HttpFilterContext<'_> {
         HttpFilterContext {
+            buffered_request_body: None,
             body_done_indices: Vec::new(),
             branch_iterations: std::collections::HashMap::new(),
             client_addr: None,
@@ -73,6 +80,7 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            metrics_route: None,
             peer_identity: None,
             request: req,
             request_body_bytes: 0,
@@ -82,6 +90,7 @@ pub(crate) mod test_utils {
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
             response_headers_modified: false,
+            subrequest_client: None,
             rewritten_path: None,
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,

@@ -14,7 +14,11 @@ use sqlx::{
 use tracing::info;
 
 use super::{
-    schemas::{TableNames, generate_ddl, validate_postgres_identifiers},
+    pool::{PoolConfig, apply_pool_config},
+    schemas::{
+        ColumnCheck, SCHEMA_VERSION, TableNames, VERSION_COLUMNS, check_column_presence, expected_table_columns,
+        generate_ddl, schema_version_table, validate_postgres_identifiers,
+    },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, ResponseRecord, StoreError},
 };
@@ -25,10 +29,13 @@ use super::{
 
 /// TLS mode for `PostgreSQL` connections.
 ///
-/// Maps to [`PgSslMode`] from sqlx. Defaults to [`Prefer`] which
-/// attempts TLS but falls back to plaintext if the server does not
-/// support it.
+/// Maps to [`PgSslMode`] from sqlx. Defaults to [`VerifyFull`] which
+/// requires TLS and verifies both the server certificate chain and
+/// hostname. Use [`Disable`] or [`Prefer`] only for local development
+/// with an explicit opt-in.
 ///
+/// [`VerifyFull`]: SslMode::VerifyFull
+/// [`Disable`]: SslMode::Disable
 /// [`Prefer`]: SslMode::Prefer
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -37,7 +44,6 @@ pub enum SslMode {
     Disable,
 
     /// Attempt TLS, fall back to plaintext.
-    #[default]
     Prefer,
 
     /// Require TLS (reject plaintext).
@@ -47,6 +53,7 @@ pub enum SslMode {
     VerifyCa,
 
     /// Require TLS and verify both certificate chain and hostname.
+    #[default]
     VerifyFull,
 }
 
@@ -91,8 +98,9 @@ impl PostgresResponseStore {
     /// `items_table`, when provided, enables the conversation items
     /// table for storing individual conversation entries.
     ///
-    /// `ssl_mode`, when provided, overrides any `sslmode` in the
-    /// URL. Use [`SslMode::VerifyCa`] or [`SslMode::VerifyFull`]
+    /// `ssl_mode` always overrides any `sslmode` in the URL —
+    /// explicitly when provided, or with the [`SslMode::VerifyFull`]
+    /// default when omitted. Use [`SslMode::VerifyCa`] or [`SslMode::VerifyFull`]
     /// with `ssl_root_cert` to verify the server against a custom
     /// CA. Certificate path existence is validated at connection
     /// time, not at construction.
@@ -103,7 +111,7 @@ impl PostgresResponseStore {
     /// initialization, or table name validation fails.
     #[expect(
         clippy::too_many_arguments,
-        reason = "constructor mirrors SqliteResponseStore::new with SSL additions"
+        reason = "constructor mirrors SqliteResponseStore::new with SSL and pool additions"
     )]
     pub async fn new(
         database_url: &str,
@@ -112,6 +120,7 @@ impl PostgresResponseStore {
         items_table: Option<&str>,
         ssl_mode: Option<SslMode>,
         ssl_root_cert: Option<&str>,
+        pool_config: Option<&PoolConfig>,
     ) -> Result<Self, StoreError> {
         let tables = TableNames {
             responses: responses_table.to_owned(),
@@ -122,7 +131,7 @@ impl PostgresResponseStore {
         let ddl = generate_ddl(&tables)?;
 
         let options = pg_connect_options(database_url, ssl_mode, ssl_root_cert)?;
-        let pool = Box::pin(PgPoolOptions::new().connect_with(options))
+        let pool = Box::pin(apply_pool_config(PgPoolOptions::new(), pool_config).connect_with(options))
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
@@ -132,6 +141,9 @@ impl PostgresResponseStore {
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;
         }
+
+        validate_schema(&pool, &tables).await?;
+        check_schema_version(&pool, &tables).await?;
 
         info!(
             responses = responses_table,
@@ -212,6 +224,10 @@ impl PostgresResponseStore {
 }
 
 /// Build `PostgreSQL` connection options from URL and optional TLS overrides.
+///
+/// Always applies an SSL mode: the explicit override when provided,
+/// otherwise [`SslMode::VerifyFull`]. This overrides any `sslmode`
+/// embedded in the URL to ensure TLS-verified connections by default.
 fn pg_connect_options(
     database_url: &str,
     ssl_mode: Option<SslMode>,
@@ -221,15 +237,78 @@ fn pg_connect_options(
         .parse()
         .map_err(|e: sqlx::Error| StoreError::Database(e.to_string()))?;
 
-    if let Some(mode) = ssl_mode {
-        options = options.ssl_mode(PgSslMode::from(mode));
-    }
+    let effective_mode = ssl_mode.unwrap_or_default();
+    options = options.ssl_mode(PgSslMode::from(effective_mode));
 
     if let Some(cert_path) = ssl_root_cert {
         options = options.ssl_root_cert(Path::new(cert_path));
     }
 
     Ok(options)
+}
+
+/// Query column metadata for each table and verify expected columns exist.
+async fn validate_schema(pool: &sqlx::PgPool, tables: &TableNames) -> Result<(), StoreError> {
+    let version_table = schema_version_table(&tables.responses);
+    let expected = expected_table_columns(tables);
+    let mut results = Vec::with_capacity(expected.len() + 1);
+
+    for (table_name, expected_cols) in &expected {
+        let actual: Vec<String> = sqlx::query_scalar::<_, String>(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1",
+        )
+        .bind(*table_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        results.push((*table_name, *expected_cols, actual));
+    }
+
+    let actual: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(version_table.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| StoreError::Database(e.to_string()))?;
+    results.push((version_table.as_str(), VERSION_COLUMNS, actual));
+
+    let refs: Vec<ColumnCheck<'_>> = results
+        .iter()
+        .map(|(name, expected, actual)| (*name, *expected, actual.as_slice()))
+        .collect();
+
+    check_column_presence(&refs)
+}
+
+/// Stamp or validate the schema version.
+async fn check_schema_version(pool: &sqlx::PgPool, tables: &TableNames) -> Result<(), StoreError> {
+    let vt = schema_version_table(&tables.responses);
+    let select = format!("SELECT version FROM {vt}");
+    let row: Option<i64> = sqlx::query_scalar(AssertSqlSafe(select.as_str()))
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    match row {
+        None => {
+            let insert = format!("INSERT INTO {vt} (version) VALUES ($1) ON CONFLICT (version) DO NOTHING");
+            sqlx::query(AssertSqlSafe(insert.as_str()))
+                .bind(SCHEMA_VERSION)
+                .execute(pool)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            Ok(())
+        },
+        Some(v) if v == SCHEMA_VERSION => Ok(()),
+        Some(v) => Err(StoreError::Database(format!(
+            "schema version mismatch in '{vt}': stored version {v}, \
+             expected {SCHEMA_VERSION}; database migration required"
+        ))),
+    }
 }
 
 #[async_trait]
@@ -708,13 +787,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connect_options_preserves_url_sslmode_without_override() {
-        let options = pg_connect_options("postgres://user:pass@example.com/db?sslmode=verify-full", None, None)
+    fn connect_options_defaults_to_verify_full() {
+        let options = pg_connect_options("postgres://user:pass@example.com/db", None, None)
+            .expect("URL without sslmode should parse");
+
+        assert!(
+            matches!(options.get_ssl_mode(), PgSslMode::VerifyFull),
+            "default ssl_mode should be VerifyFull"
+        );
+    }
+
+    #[test]
+    fn connect_options_default_overrides_url_sslmode() {
+        let options = pg_connect_options("postgres://user:pass@example.com/db?sslmode=prefer", None, None)
             .expect("URL with sslmode should parse");
 
         assert!(
             matches!(options.get_ssl_mode(), PgSslMode::VerifyFull),
-            "URL sslmode should be preserved"
+            "default VerifyFull should override URL sslmode"
         );
     }
 
@@ -731,5 +821,11 @@ mod tests {
             matches!(options.get_ssl_mode(), PgSslMode::Disable),
             "explicit ssl_mode should override URL sslmode"
         );
+    }
+
+    #[test]
+    fn connect_options_applies_ssl_root_cert() {
+        pg_connect_options("postgres://user:pass@example.com/db", None, Some("/path/to/ca.pem"))
+            .expect("ssl_root_cert path should be accepted");
     }
 }

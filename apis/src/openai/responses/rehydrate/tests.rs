@@ -221,7 +221,7 @@ async fn validates_previous_response_and_sets_metadata() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_validates_during_cold_request_body_pre_read() {
     let (db_url, db_path) = temp_sqlite_url("rehydrate_cold_pre_read");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
         .await
         .unwrap();
     seeded_store

@@ -13,9 +13,12 @@ use bytes::Bytes;
 use serde_json::json;
 
 use super::*;
-use crate::openai::{
-    api_client::{ApiClient, ApiClientConfig},
-    responses::state::ResponsesState,
+use crate::{
+    openai::{
+        api_client::{ApiClient, ApiClientConfig},
+        responses::state::ResponsesState,
+    },
+    subrequest::SubRequestClient,
 };
 
 // -----------------------------------------------------------------------------
@@ -783,10 +786,11 @@ fn make_client() -> FilesApiClient {
 fn make_client_for_url_with_max(files_api_url: &str, max_resolved_bytes: usize) -> FilesApiClient {
     let api = ApiClient::new(ApiClientConfig {
         api_base_url: files_api_url.to_owned(),
-        callout_config: CalloutConfig::default(),
+        client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+        timeout: Duration::from_secs(5),
+        max_response_bytes: 1_048_576,
         forward_header_names: vec![],
-    })
-    .unwrap();
+    });
     FilesApiClient::new(
         api,
         FilesApiClientOptions {
@@ -1196,6 +1200,129 @@ async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
     assert!(
         result.is_err(),
         "FileUrlBlocked must propagate even with on_missing: continue"
+    );
+}
+
+#[tokio::test]
+async fn file_url_failed_is_not_swallowed_by_on_missing_continue() {
+    use crate::openai::responses::file_resolve::{
+        config::OnMissing, resolve::resolve_input, resolve_url::FileUrlResolver,
+    };
+
+    // Regression test for #542: simulate an attacker-controlled origin
+    // that redirects to a metadata-style target. Praxis's resolver
+    // never follows the redirect and reports FileUrlFailed for the
+    // 302. That failure must reject the request instead of silently
+    // forwarding the original attacker file_url to the backend.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _read = stream.read(&mut request).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+    });
+
+    let attacker_url = format!("http://{address}/file.pdf");
+    let mut body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": attacker_url,
+            }]
+        }]
+    });
+    let original = body.clone();
+
+    let client = make_client_for_url_with_max("http://unused:9999", 64 * 1024 * 1024);
+    // Default posture: file_url: resolve, on_missing: continue.
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{address}")).unwrap()],
+    };
+
+    let err = resolve_input(
+        &mut body,
+        &client,
+        OnMissing::Continue,
+        &http::HeaderMap::new(),
+        Some(&resolver),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ResolveError::FileUrlFailed { .. }),
+        "FileUrlFailed must propagate even with on_missing: continue, got {err}"
+    );
+    assert_eq!(
+        body, original,
+        "the request body must be left untouched (and therefore never proxied) when file_url resolution fails"
+    );
+}
+
+#[tokio::test]
+async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
+    use crate::openai::responses::file_resolve::{
+        config::OnMissing, resolve::resolve_input, resolve_url::FileUrlResolver,
+    };
+
+    // Regression test for #542: an oversized file_url response must
+    // also reject the request under on_missing: continue, not just
+    // under on_missing: reject.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _read = stream.read(&mut request).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+    });
+
+    let url = format!("http://{address}/file.pdf");
+    let mut body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": url,
+            }]
+        }]
+    });
+    let original = body.clone();
+
+    let client = make_client_for_url_with_max("http://unused:9999", 64);
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{address}")).unwrap()],
+    };
+
+    let err = resolve_input(
+        &mut body,
+        &client,
+        OnMissing::Continue,
+        &http::HeaderMap::new(),
+        Some(&resolver),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ResolveError::TooLarge { .. }),
+        "TooLarge must propagate even with on_missing: continue, got {err}"
+    );
+    assert_eq!(
+        body, original,
+        "the request body must be left untouched when an oversized file_url response is rejected"
     );
 }
 

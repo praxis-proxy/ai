@@ -5,7 +5,14 @@
 - Rust stable 1.96+
 - Rust nightly
 - CMake 3.31+
-- Docker 29.3.0+
+- Docker 29.3.0+ or Podman
+
+Install the development-only Cargo tools used by the Make targets:
+
+```console
+cargo install cargo-audit cargo-deny cargo-machete
+rustup toolchain install nightly --component rustfmt
+```
 
 ## Conventions
 
@@ -61,7 +68,7 @@ binding or protocol registration. If you need to
 bind ports below 1024, prefer one of these approaches:
 
 - Grant `CAP_NET_BIND_SERVICE` to the binary:
-  `sudo setcap cap_net_bind_service=+ep ./target/release/praxis`
+  `sudo setcap cap_net_bind_service=+ep ./target/release/praxis-ai`
 - Run behind a reverse proxy or load balancer that
   handles port 80/443.
 - Use socket activation (systemd) to pass pre-bound
