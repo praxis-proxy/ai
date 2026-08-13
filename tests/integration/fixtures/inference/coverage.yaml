@@ -2,6 +2,7 @@ version: 1
 scope:
   - messages_to_chat_completions
   - messages_native_passthrough
+  - responses_agentic_loop
   - responses_native_passthrough
   - responses_to_chat_completions
 features:
@@ -119,6 +120,15 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.agentic.parallel_tool_calls
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/agentic-parallel-tool-calls
     providers:
       synthetic:
         status: synthetic_only
