@@ -29,7 +29,11 @@
 //! `extra_request_headers` (a pending mutation applied to the
 //! upstream request) rather than back into `ctx.request.headers`,
 //! so reading the downstream headers alone finds an injected value
-//! only when the client happened to supply one.
+//! only when the client happened to supply one. It is also why the
+//! `request_id` builtin must be registered *before* any filter that
+//! resolves correlation: it reads only the downstream headers, so a
+//! later `request_id` generates a second, different ID that wins on
+//! the forwarded request while the delegated calls keep the first.
 //!
 //! # Agreement across hops
 //!
@@ -42,20 +46,13 @@
 //! extensions: whichever hop asks first initializes it, and every
 //! later hop reuses it regardless of filter order.
 
-#[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    reason = "tests"
-)]
-mod tests;
-
 use http::{HeaderMap, HeaderName, HeaderValue};
 use praxis_filter::HttpFilterContext;
 use tracing::{debug, trace};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
 /// Header carrying the request correlation ID.
 const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -69,11 +66,17 @@ const VERSION: &str = "00";
 /// Trace-flags emitted when starting a new trace: sampled.
 const SAMPLED: &str = "01";
 
+/// The only trace-flags bit defined by the current specification.
+const SAMPLED_BIT: u8 = 0x01;
+
 /// Hex length of a W3C trace-id.
 const TRACE_ID_LEN: usize = 32;
 
 /// Hex length of a W3C span-id.
 const SPAN_ID_LEN: usize = 16;
+
+/// Number of fixed fields every `traceparent` version begins with.
+const BASE_FIELDS: usize = 4;
 
 /// Last-resort trace-id when sanitization would yield all zeros,
 /// which W3C Trace Context section 2.2.2 forbids.
@@ -81,6 +84,10 @@ const FALLBACK_TRACE_ID: &str = "00000000000000000000000000000001";
 
 /// Last-resort span-id, for the same reason as [`FALLBACK_TRACE_ID`].
 const FALLBACK_SPAN_ID: &str = "0000000000000001";
+
+// -----------------------------------------------------------------------------
+// TraceContext
+// -----------------------------------------------------------------------------
 
 /// Correlation identifiers for one downstream request.
 ///
@@ -98,30 +105,17 @@ const FALLBACK_SPAN_ID: &str = "0000000000000001";
 /// [`RequestExtensions`]: praxis_filter::RequestExtensions
 #[derive(Clone)]
 pub struct TraceContext {
-    /// Value for the `x-request-id` header.
-    request_id: String,
-    /// 32 lowercase hex characters shared by every hop.
-    trace_id: String,
     /// 2 lowercase hex characters of W3C trace-flags.
     flags: String,
+
+    /// Value for the `x-request-id` header.
+    request_id: String,
+
+    /// 32 lowercase hex characters shared by every hop.
+    trace_id: String,
 }
 
 impl TraceContext {
-    /// Return the request's shared trace context, resolving and
-    /// storing it if this is the first hop to ask.
-    ///
-    /// Prefer this wherever the context is available mutably: it is
-    /// what makes every hop of one request agree on a trace-id.
-    pub fn get_or_init(ctx: &mut HttpFilterContext<'_>) -> Self {
-        if let Some(shared) = ctx.extensions.get::<Self>() {
-            return shared.clone();
-        }
-
-        let resolved = Self::resolve(ctx);
-        ctx.extensions.insert(resolved.clone());
-        resolved
-    }
-
     /// Read the request's shared trace context.
     ///
     /// Falls back to resolving a fresh context when no hop has
@@ -145,36 +139,19 @@ impl TraceContext {
         Self::resolve(ctx)
     }
 
-    /// Resolve identifiers from the request, ignoring any shared
-    /// context.
-    fn resolve(ctx: &HttpFilterContext<'_>) -> Self {
-        let request_id = resolve_request_id(ctx);
-        let (trace_id, flags) = resolve_trace(ctx);
-
-        trace!(%request_id, %trace_id, "resolved correlation for request");
-
-        Self {
-            request_id,
-            trace_id,
-            flags,
-        }
-    }
-
-    /// The resolved request correlation ID.
-    #[must_use]
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    /// Build a `traceparent` for one hop, with a fresh span-id.
+    /// Return the request's shared trace context, resolving and
+    /// storing it if this is the first hop to ask.
     ///
-    /// Called once per outbound leg. The forwarded request and each
-    /// delegated call are separate spans of the same trace, which is
-    /// what makes their latencies separable.
-    fn traceparent_for_hop(&self, ctx: &HttpFilterContext<'_>) -> String {
-        let span_id = generate_span_id(ctx);
-        let Self { trace_id, flags, .. } = self;
-        format!("{VERSION}-{trace_id}-{span_id}-{flags}")
+    /// Prefer this wherever the context is available mutably: it is
+    /// what makes every hop of one request agree on a trace-id.
+    pub fn get_or_init(ctx: &mut HttpFilterContext<'_>) -> Self {
+        if let Some(shared) = ctx.extensions.get::<Self>() {
+            return shared.clone();
+        }
+
+        let resolved = Self::resolve(ctx);
+        ctx.extensions.insert(resolved.clone());
+        resolved
     }
 
     /// Build the correlation headers for one hop.
@@ -185,7 +162,43 @@ impl TraceContext {
             (TRACEPARENT, self.traceparent_for_hop(ctx)),
         ]
     }
+
+    /// The resolved request correlation ID.
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Resolve identifiers from the request, ignoring any shared
+    /// context.
+    fn resolve(ctx: &HttpFilterContext<'_>) -> Self {
+        let request_id = resolve_request_id(ctx);
+        let (trace_id, flags) = resolve_trace(ctx);
+
+        trace!(%request_id, %trace_id, "resolved correlation for request");
+
+        Self {
+            flags,
+            request_id,
+            trace_id,
+        }
+    }
+
+    /// Build a `traceparent` for one hop, with a fresh span-id.
+    ///
+    /// Called once per outbound leg. The forwarded request and each
+    /// delegated call are separate spans of the same trace, which is
+    /// what makes their latencies separable.
+    fn traceparent_for_hop(&self, ctx: &HttpFilterContext<'_>) -> String {
+        let span_id = generate_span_id(ctx);
+        let Self { flags, trace_id, .. } = self;
+        format!("{VERSION}-{trace_id}-{span_id}-{flags}")
+    }
 }
+
+// -----------------------------------------------------------------------------
+// Correlation
+// -----------------------------------------------------------------------------
 
 /// Correlation headers for the delegated calls of one request.
 ///
@@ -195,11 +208,21 @@ impl TraceContext {
 pub(crate) struct Correlation {
     /// Value for the `x-request-id` header.
     request_id: HeaderValue,
+
     /// Value for the `traceparent` header.
     traceparent: HeaderValue,
 }
 
 impl Correlation {
+    /// Insert correlation headers into an outbound callout map.
+    ///
+    /// Inserts rather than appends, so correlation overwrites any
+    /// same-named header copied from the downstream request.
+    pub(crate) fn apply(&self, map: &mut HeaderMap) {
+        map.insert(REQUEST_ID, self.request_id.clone());
+        map.insert(TRACEPARENT, self.traceparent.clone());
+    }
+
     /// Resolve correlation headers for this request's delegated calls.
     pub(crate) fn from_filter_context(ctx: &HttpFilterContext<'_>) -> Self {
         let context = TraceContext::from_filter_context(ctx);
@@ -214,15 +237,113 @@ impl Correlation {
             traceparent: to_value(&context.traceparent_for_hop(ctx)),
         }
     }
+}
 
-    /// Insert correlation headers into an outbound callout map.
-    ///
-    /// Inserts rather than appends, so correlation overwrites any
-    /// same-named header copied from the downstream request.
-    pub(crate) fn apply(&self, map: &mut HeaderMap) {
-        map.insert(REQUEST_ID, self.request_id.clone());
-        map.insert(TRACEPARENT, self.traceparent.clone());
+// -----------------------------------------------------------------------------
+// InboundTrace
+// -----------------------------------------------------------------------------
+
+/// Trace-id and flags carried forward from a valid `traceparent`.
+struct InboundTrace {
+    /// 2 lowercase hex characters.
+    flags: String,
+
+    /// 32 lowercase hex characters.
+    trace_id: String,
+}
+
+// -----------------------------------------------------------------------------
+// Utility Functions
+// -----------------------------------------------------------------------------
+
+/// Generate a 16-hex-character span-id for one hop.
+///
+/// The generator's trailing sequence counter advances on every
+/// call, so each hop's span-id differs even when drawn within the
+/// same microsecond.
+fn generate_span_id(ctx: &HttpFilterContext<'_>) -> String {
+    span_id_from(&generate_trace_id(ctx))
+}
+
+/// Generate a 32-hex-character trace-id.
+///
+/// The core ID generator emits exactly 32 hex characters
+/// (`{micros:012x}{seed:08x}{seq:012x}`), which is the W3C
+/// trace-id width.
+fn generate_trace_id(ctx: &HttpFilterContext<'_>) -> String {
+    sanitize_trace_id(&ctx.id_generator.generate(ctx.time_source))
+}
+
+/// Look up a header injected by an earlier filter into
+/// `extra_request_headers`.
+fn injected_header(ctx: &HttpFilterContext<'_>, name: &str) -> Option<String> {
+    ctx.extra_request_headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+/// Check that a hex string is entirely zeros.
+fn is_all_zero(value: &str) -> bool {
+    value.bytes().all(|b| b == b'0')
+}
+
+/// Check that every character is a lowercase hex digit.
+fn is_lower_hex(value: &str) -> bool {
+    value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Clear every trace-flags bit this version does not define.
+///
+/// Only the sampled bit is specified today. Re-emitting reserved bits
+/// under version `00` would give them a meaning the specification has
+/// not assigned, so they are dropped rather than carried downstream.
+fn mask_flags(flags: &str) -> String {
+    let bits = u8::from_str_radix(flags, 16).unwrap_or(0);
+    format!("{:02x}", bits & SAMPLED_BIT)
+}
+
+/// Parse and validate a W3C `traceparent`.
+///
+/// Returns `None` for anything not matching
+/// `<version>-<trace-id>-<span-id>-<flags>` with lowercase hex
+/// fields, an all-zero trace-id or span-id, or the forbidden
+/// version `ff`.
+///
+/// A higher version may append fields after the flags. Those are
+/// ignored and the base fields are still continued, as the
+/// [versioning rules] require — a trace must survive a future-version
+/// rollout upstream. Version `00` accepts no trailing fields.
+///
+/// [versioning rules]: https://www.w3.org/TR/trace-context/#versioning-of-traceparent
+fn parse_traceparent(value: &str) -> Option<InboundTrace> {
+    let fields: Vec<&str> = value.split('-').collect();
+    let [version, trace_id, span_id, flags] = fields.get(..BASE_FIELDS)? else {
+        return None;
+    };
+
+    if version.len() != 2 || !is_lower_hex(version) || *version == "ff" {
+        return None;
     }
+    // Only a future version may carry extension fields; version 00 is
+    // exactly four.
+    if fields.len() > BASE_FIELDS && *version == VERSION {
+        return None;
+    }
+    if trace_id.len() != TRACE_ID_LEN || !is_lower_hex(trace_id) || is_all_zero(trace_id) {
+        return None;
+    }
+    if span_id.len() != SPAN_ID_LEN || !is_lower_hex(span_id) || is_all_zero(span_id) {
+        return None;
+    }
+    if flags.len() != 2 || !is_lower_hex(flags) {
+        return None;
+    }
+
+    Some(InboundTrace {
+        flags: mask_flags(flags),
+        trace_id: (*trace_id).to_owned(),
+    })
 }
 
 /// Resolve the request ID, generating one if nothing upstream
@@ -258,73 +379,11 @@ fn resolve_trace(ctx: &HttpFilterContext<'_>) -> (String, String) {
                 .and_then(parse_traceparent)
         });
 
-    if let Some(InboundTrace { trace_id, flags }) = inbound {
+    if let Some(InboundTrace { flags, trace_id }) = inbound {
         return (trace_id, flags);
     }
 
     (generate_trace_id(ctx), SAMPLED.to_owned())
-}
-
-/// Look up a header injected by an earlier filter into
-/// `extra_request_headers`.
-fn injected_header(ctx: &HttpFilterContext<'_>, name: &str) -> Option<String> {
-    ctx.extra_request_headers
-        .iter()
-        .find(|(header, _)| header.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.clone())
-}
-
-/// Trace-id and flags carried forward from a valid `traceparent`.
-struct InboundTrace {
-    /// 32 lowercase hex characters.
-    trace_id: String,
-    /// 2 lowercase hex characters.
-    flags: String,
-}
-
-/// Parse and validate a W3C `traceparent`.
-///
-/// Returns `None` for anything not matching
-/// `<version>-<trace-id>-<span-id>-<flags>` with lowercase hex
-/// fields, an all-zero trace-id or span-id, or the forbidden
-/// version `ff`.
-fn parse_traceparent(value: &str) -> Option<InboundTrace> {
-    let mut parts = value.split('-');
-    let version = parts.next()?;
-    let trace_id = parts.next()?;
-    let span_id = parts.next()?;
-    let flags = parts.next()?;
-
-    if parts.next().is_some() {
-        return None;
-    }
-
-    if version.len() != 2 || !is_lower_hex(version) || version == "ff" {
-        return None;
-    }
-    if trace_id.len() != TRACE_ID_LEN || !is_lower_hex(trace_id) || is_all_zero(trace_id) {
-        return None;
-    }
-    if span_id.len() != SPAN_ID_LEN || !is_lower_hex(span_id) || is_all_zero(span_id) {
-        return None;
-    }
-    if flags.len() != 2 || !is_lower_hex(flags) {
-        return None;
-    }
-
-    Some(InboundTrace {
-        trace_id: trace_id.to_owned(),
-        flags: flags.to_owned(),
-    })
-}
-
-/// Generate a 32-hex-character trace-id.
-///
-/// The core ID generator emits exactly 32 hex characters
-/// (`{micros:012x}{seed:08x}{seq:012x}`), which is the W3C
-/// trace-id width.
-fn generate_trace_id(ctx: &HttpFilterContext<'_>) -> String {
-    sanitize_trace_id(&ctx.id_generator.generate(ctx.time_source))
 }
 
 /// Coerce a generated ID into a W3C-valid trace-id.
@@ -348,15 +407,6 @@ fn sanitize_trace_id(id: &str) -> String {
     sanitized
 }
 
-/// Generate a 16-hex-character span-id for one hop.
-///
-/// The generator's trailing sequence counter advances on every
-/// call, so each hop's span-id differs even when drawn within the
-/// same microsecond.
-fn generate_span_id(ctx: &HttpFilterContext<'_>) -> String {
-    span_id_from(&generate_trace_id(ctx))
-}
-
 /// Take the span-id from the tail of a trace-id, guarding the same
 /// all-zero case as [`sanitize_trace_id`].
 fn span_id_from(trace_id: &str) -> String {
@@ -367,12 +417,17 @@ fn span_id_from(trace_id: &str) -> String {
     span_id.to_owned()
 }
 
-/// Check that every character is a lowercase hex digit.
-fn is_lower_hex(value: &str) -> bool {
-    value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
-/// Check that a hex string is entirely zeros.
-fn is_all_zero(value: &str) -> bool {
-    value.bytes().all(|b| b == b'0')
-}
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "tests"
+)]
+mod tests;

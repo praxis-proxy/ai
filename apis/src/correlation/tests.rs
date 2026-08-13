@@ -8,33 +8,6 @@ use http::{HeaderMap, HeaderValue, Method};
 use super::*;
 use crate::test_utils::{make_filter_context, make_request};
 
-/// Build a request carrying the given headers.
-fn request_with(headers: &[(&'static str, &str)]) -> praxis_filter::Request {
-    let mut req = make_request(Method::POST, "/v1/responses");
-    for (name, value) in headers {
-        req.headers.insert(
-            HeaderName::from_static(name),
-            HeaderValue::from_str(value).expect("valid test header value"),
-        );
-    }
-    req
-}
-
-/// Apply correlation to an empty map and return it.
-fn applied(correlation: &Correlation) -> HeaderMap {
-    let mut map = HeaderMap::new();
-    correlation.apply(&mut map);
-    map
-}
-
-/// Read a header as a string.
-fn header(map: &HeaderMap, name: &str) -> String {
-    map.get(name)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned()
-}
-
 // -----------------------------------------------------------------------------
 // Request ID resolution
 // -----------------------------------------------------------------------------
@@ -178,6 +151,50 @@ fn parse_traceparent_accepts_future_versions() {
     assert_eq!(
         parsed.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736",
         "trace-id should be extracted from a future version"
+    );
+}
+
+#[test]
+fn parse_traceparent_ignores_future_version_extension_fields() {
+    // A higher version may append fields after the flags. Dropping the
+    // trace because of them would restart traces during an upstream
+    // version rollout.
+    let parsed = parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extension")
+        .expect("extension fields of a future version should be ignored");
+
+    assert_eq!(
+        parsed.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736",
+        "base fields of a future version should still be continued"
+    );
+    assert_eq!(parsed.flags, "01", "base flags should survive the extension field");
+}
+
+#[test]
+fn masks_trace_flags_this_version_does_not_define() {
+    // Only the sampled bit is specified; the rest are reserved and
+    // must not be re-emitted with an invented meaning.
+    for (inbound, expected) in [("ff", "01"), ("fe", "00"), ("03", "01"), ("02", "00")] {
+        let value = format!("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-{inbound}");
+        let parsed = parse_traceparent(&value).expect("well-formed flags should parse");
+
+        assert_eq!(
+            parsed.flags, expected,
+            "flags {inbound} should be masked to the sampled bit"
+        );
+    }
+}
+
+#[test]
+fn masked_flags_reach_the_outbound_header() {
+    let req = request_with(&[("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff")]);
+    let ctx = make_filter_context(&req);
+
+    let map = applied(&Correlation::from_filter_context(&ctx));
+    let outbound = header(&map, "traceparent");
+
+    assert!(
+        outbound.ends_with("-01"),
+        "reserved flag bits must not be forwarded: {outbound}"
     );
 }
 
@@ -332,4 +349,35 @@ fn correlation_overwrites_forwarded_value_of_same_name() {
         1,
         "correlation should not leave duplicate header values"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Test Utilities
+// -----------------------------------------------------------------------------
+
+/// Apply correlation to an empty map and return it.
+fn applied(correlation: &Correlation) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    correlation.apply(&mut map);
+    map
+}
+
+/// Read a header as a string.
+fn header(map: &HeaderMap, name: &str) -> String {
+    map.get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Build a request carrying the given headers.
+fn request_with(headers: &[(&'static str, &str)]) -> praxis_filter::Request {
+    let mut req = make_request(Method::POST, "/v1/responses");
+    for (name, value) in headers {
+        req.headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_str(value).expect("valid test header value"),
+        );
+    }
+    req
 }

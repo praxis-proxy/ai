@@ -24,6 +24,12 @@
 # calls read the injected values, so anything running before it
 # resolves trace context independently and lands in a different trace.
 #
+# The one exception is the request_id core builtin: when it is used, it
+# must come before trace_context. It reads only the client's headers,
+# so running it later mints a second ID that wins on the forwarded
+# request while the delegated calls keep the first. Ordered as below,
+# trace_context adopts the ID request_id injected and every leg agrees.
+#
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/trace-context.yaml
 #
@@ -44,6 +50,11 @@ listeners:
 filter_chains:
   - name: traced
     filters:
+      # Before trace_context: it adopts the ID injected here, so the
+      # forwarded request, the delegated calls, and the echoed
+      # response header all carry one x-request-id.
+      - filter: request_id
+
       # Early: everything downstream reads what this injects.
       - filter: trace_context
 
