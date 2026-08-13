@@ -384,10 +384,12 @@ fn validate_replay_filter_entries(filters: &[FilterEntry]) -> Result<(), Fixture
     for filter in filters {
         if !matches!(
             filter.filter_type.as_str(),
-            "anthropic_messages_format"
+            "agentic_loop"
+                | "anthropic_messages_format"
                 | "anthropic_messages_protocol"
                 | "anthropic_to_openai"
                 | "anthropic_stream_events"
+                | "iterative_request_router"
                 | "openai_responses_proxy"
                 | "path_rewrite"
                 | "openai_responses_format"
@@ -2494,6 +2496,7 @@ mod tests {
         }
 
         for path in [
+            "openai/responses/agentic-loop.yaml",
             "openai/responses/mcp-tool-resolve.yaml",
             "openai/responses/mcp-dispatch.yaml",
             "openai/responses/file-resolve.yaml",
@@ -2511,18 +2514,23 @@ mod tests {
     }
 
     #[test]
-    fn replay_config_rejects_runtime_reentry_and_endpoint_selection() {
-        for filter in ["iterative_request_router", "endpoint_selector"] {
-            let config: Config = serde_yaml::from_str(&format!(
-                "listeners:\n  - name: replay\n    address: 127.0.0.1:19001\n    filter_chains: [replay]\nfilter_chains:\n  - name: replay\n    filters:\n      - filter: {filter}\n"
-            ))
-            .unwrap();
+    fn replay_config_rejects_endpoint_selection() {
+        let config: Config = serde_yaml::from_str(
+            "listeners:\n  - name: replay\n    address: 127.0.0.1:19001\n    filter_chains: [replay]\nfilter_chains:\n  - name: replay\n    filters:\n      - filter: endpoint_selector\n"
+        )
+        .unwrap();
 
-            let error = validate_replay_filters(&config)
-                .expect_err("runtime routing must not escape replay-owned request accounting");
+        let error = validate_replay_filters(&config)
+            .expect_err("endpoint selection must not escape replay-owned request accounting");
 
-            assert_eq!(error.to_string(), "scenario filter is not replay-contained", "{filter}");
-        }
+        assert_eq!(error.to_string(), "scenario filter is not replay-contained");
+    }
+
+    #[test]
+    fn replay_config_allows_agentic_loop_fixture() {
+        let source = replay_config_source("openai/responses/agentic-loop-fixture.yaml");
+        let config = Config::from_yaml(&source).expect("agentic-loop-fixture config should parse");
+        validate_replay_filters(&config).expect("agentic-loop-fixture contains only replay-safe filters");
     }
 
     #[test]

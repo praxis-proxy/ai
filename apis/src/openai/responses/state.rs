@@ -122,6 +122,9 @@ pub(crate) struct ResponsesState {
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
+    /// Whether provider-visible request fields require outbound serialization.
+    pub request_body_rebuild: RequestBodyRebuild,
+
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
 
@@ -164,6 +167,17 @@ pub(crate) struct ResponsesState {
     pub accumulated_output: Vec<serde_json::Value>,
 }
 
+/// Whether the proxy can preserve the original request bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RequestBodyRebuild {
+    /// No provider-visible state has changed.
+    #[default]
+    PreserveOriginal,
+
+    /// Provider-visible state must be serialized before inference.
+    Required,
+}
+
 impl Default for ResponsesState {
     fn default() -> Self {
         Self {
@@ -184,6 +198,7 @@ impl Default for ResponsesState {
             previous_tools: Vec::new(),
             previous_usage: None,
             request_body: serde_json::Value::Null,
+            request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             tool_calls: Vec::new(),
             web_search_calls: Vec::new(),
@@ -224,6 +239,11 @@ impl ResponsesState {
         }
     }
 
+    /// Require the proxy to serialize provider-visible request state.
+    pub(crate) fn mark_request_body_for_rebuild(&mut self) {
+        self.request_body_rebuild = RequestBodyRebuild::Required;
+    }
+
     /// Borrow the public output owned by [`Self::response_object`].
     pub(crate) fn output_items(&self) -> &[serde_json::Value] {
         self.response_object
@@ -251,6 +271,11 @@ impl ResponsesState {
             unreachable!("output was normalized to an array")
         };
         items
+    }
+
+    /// Return whether provider-visible request state requires serialization.
+    pub(crate) fn request_body_requires_rebuild(&self) -> bool {
+        self.request_body_rebuild == RequestBodyRebuild::Required
     }
 }
 

@@ -11,8 +11,7 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, build_pipeline, example_config_path, free_port, http_send,
-    json_post, parse_body, parse_status, patch_yaml, start_backend_with_shutdown, start_mcp_mock_server_with_config,
-    start_proxy,
+    json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -31,7 +30,8 @@ fn example_config_builds_pipeline() {
 
 #[test]
 fn single_pass_completes_through_irr() {
-    let model = start_backend_with_shutdown(r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#);
+    let response = r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
 
     let config = load_agentic_config(proxy_port, model.port());
@@ -44,6 +44,36 @@ fn single_pass_completes_through_irr() {
         parse_status(&raw),
         200,
         "single-pass request through IRR should return 200"
+    );
+
+    let model_reqs = model.requests();
+    assert_eq!(model_reqs.len(), 1, "model backend should receive one request");
+    let model_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[0].body).expect("model request body should be valid JSON");
+    assert_eq!(
+        model_body["parallel_tool_calls"], false,
+        "first inference must disable parallel tool calls when the client omits the field"
+    );
+}
+
+#[test]
+fn explicit_false_preserves_original_request_bytes() {
+    let response = r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+
+    let config = load_agentic_config(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let body = r#"{ "model": "gpt-4.1", "input": [{"role":"user","content":"Hello"}], "parallel_tool_calls": false }"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 200);
+    let model_reqs = model.requests();
+    assert_eq!(model_reqs.len(), 1, "model backend should receive one request");
+    assert_eq!(
+        model_reqs[0].body, body,
+        "an already-disabled request should retain byte-exact passthrough"
     );
 }
 
@@ -160,6 +190,7 @@ fn round_trip_captures_tool_and_model_requests() {
     let request_body = serde_json::json!({
         "model": "gpt-4.1",
         "input": "What is the weather in SF?",
+        "parallel_tool_calls": true,
         "tools": [{
             "type": "mcp",
             "server_label": "weather",
@@ -207,6 +238,10 @@ fn round_trip_captures_tool_and_model_requests() {
 
     let first_model_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("first model request body should be valid JSON");
+    assert_eq!(
+        first_model_body["parallel_tool_calls"], false,
+        "first inference must override parallel_tool_calls=true"
+    );
     let resolved_tools = first_model_body["tools"]
         .as_array()
         .expect("first model request should contain resolved tools");

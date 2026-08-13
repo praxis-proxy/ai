@@ -30,6 +30,8 @@ const NATIVE_RESPONSES_SCENARIOS: [&str; 3] = [
 const NATIVE_RESPONSES_TEXT_SCENARIO: &str = "responses/native-basic-nonstream";
 const NATIVE_RESPONSES_STREAM_SCENARIO: &str = "responses/native-basic-stream";
 const NATIVE_RESPONSES_TOOL_SCENARIO: &str = "responses/native-tool-call";
+const AGENTIC_PARALLEL_TOOL_CALLS_SCENARIO: &str = "responses/agentic-parallel-tool-calls";
+const AGENTIC_PARALLEL_TOOL_CALLS_PROVIDER: &str = "synthetic";
 
 #[tokio::test]
 async fn all_inference_fixtures_replay() {
@@ -48,6 +50,7 @@ async fn all_inference_fixtures_replay() {
     let mut native_responses_recordings = BTreeSet::new();
     let mut saw_stream_representative = false;
     let mut saw_error_representative = false;
+    let mut saw_agentic_parallel_tool_calls = false;
 
     for recording in recordings {
         let scenario_id = recording.scenario_id.as_str();
@@ -91,6 +94,10 @@ async fn all_inference_fixtures_replay() {
                 assert_native_tool_use(&report.actual, scenario_id, provider);
             }
         }
+        if scenario_id == AGENTIC_PARALLEL_TOOL_CALLS_SCENARIO && provider == AGENTIC_PARALLEL_TOOL_CALLS_PROVIDER {
+            assert_agentic_parallel_tool_calls(&report.actual, scenario_id, provider);
+            saw_agentic_parallel_tool_calls = true;
+        }
         if NATIVE_RESPONSES_PROVIDERS.contains(&provider) && NATIVE_RESPONSES_SCENARIOS.contains(&scenario_id) {
             native_responses_recordings.insert((scenario_id.to_owned(), provider.to_owned()));
             assert_native_responses_passthrough(&report.actual, scenario_id, provider);
@@ -121,6 +128,10 @@ async fn all_inference_fixtures_replay() {
     assert!(
         saw_error_representative,
         "missing representative recording for scenario `{ERROR_SCENARIO}` and provider `{ERROR_PROVIDER}`"
+    );
+    assert!(
+        saw_agentic_parallel_tool_calls,
+        "missing representative recording for scenario `{AGENTIC_PARALLEL_TOOL_CALLS_SCENARIO}` and provider `{AGENTIC_PARALLEL_TOOL_CALLS_PROVIDER}`"
     );
     for scenario_id in NATIVE_ANTHROPIC_SCENARIOS {
         assert!(
@@ -342,5 +353,25 @@ fn assert_native_responses_tool_call(actual: &WireFixture, scenario_id: &str, pr
     assert!(
         decoded.is_object(),
         "function arguments changed shape for scenario `{scenario_id}` and provider `{provider}`"
+    );
+}
+
+fn assert_agentic_parallel_tool_calls(actual: &WireFixture, scenario_id: &str, provider: &str) {
+    let turn = actual.turns.first().unwrap_or_else(|| {
+        panic!("scenario `{scenario_id}` and provider `{provider}` replayed without a turn");
+    });
+    let RecordedBody::Json { value: upstream_body } = &turn.upstream.request.body else {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay a JSON upstream request body");
+    };
+    assert_eq!(
+        upstream_body["parallel_tool_calls"], false,
+        "agentic loop must inject parallel_tool_calls=false for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let RecordedBody::Json { value: client_body } = &turn.client.request.body else {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay a JSON client request body");
+    };
+    assert!(
+        client_body.get("parallel_tool_calls").is_none(),
+        "client request must not contain parallel_tool_calls for scenario `{scenario_id}` and provider `{provider}`"
     );
 }

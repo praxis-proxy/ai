@@ -1,0 +1,55 @@
+# Agentic Loop Fixture
+#
+# Minimal agentic loop pipeline for inference fixture replay.
+# Exercises the parallel_tool_calls transformation without external
+# callout filters (no web_search, MCP dispatch, or MCP tool resolve).
+#
+# This config proves that the agentic_loop filter injects
+# parallel_tool_calls=false into the upstream request body.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [agentic-fixture]
+
+filter_chains:
+  - name: agentic-fixture
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 2
+        steps:
+          - name: inference
+            filters:
+              - filter: agentic_loop
+                max_infer_iters: 1
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference-backend"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true

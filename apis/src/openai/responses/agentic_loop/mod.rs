@@ -299,17 +299,24 @@ fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState
     state.tool_calls.clear();
     state.web_search_calls.clear();
     state.parallel_tool_calls = false;
-    if let Some(obj) = state.request_body.as_object_mut() {
-        obj.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
-    }
+    set_request_body_field(state, "parallel_tool_calls", Value::Bool(false));
 
     if state.iteration > 0 {
         state.tool_choice = json!("auto");
-        if let Some(obj) = state.request_body.as_object_mut() {
-            obj.insert("tool_choice".to_owned(), json!("auto"));
-        }
+        set_request_body_field(state, "tool_choice", json!("auto"));
         ctx.request_headers_to_set
             .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));
+    }
+}
+
+/// Set a provider-visible request field and record whether its value changed.
+fn set_request_body_field(state: &mut ResponsesState, name: &str, value: Value) {
+    let Some(obj) = state.request_body.as_object_mut() else {
+        return;
+    };
+    if obj.get(name) != Some(&value) {
+        obj.insert(name.to_owned(), value);
+        state.mark_request_body_for_rebuild();
     }
 }
 
