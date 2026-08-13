@@ -528,6 +528,160 @@ fn duplicate_server_label_rejected_before_callout() {
 }
 
 // =============================================================================
+// Connector Resolution
+// =============================================================================
+
+#[test]
+fn connector_resolves_to_mock_mcp_server() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("search").with_description("Search files")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!("        connectors:\n          - id: corp_drive\n            server_url: {mcp_url}");
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"drive","connector_id":"corp_drive","allowed_tools":["search"]}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 200, "connector resolution should succeed");
+
+    let echoed = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tools = parsed["tools"].as_array().expect("tools should be an array");
+    assert_eq!(tools.len(), 1, "should have 1 resolved function tool");
+    assert_eq!(tools[0]["type"], "function", "MCP tool rewritten to function");
+    assert_eq!(tools[0]["name"], "drive__search", "name prefixed with server_label");
+
+    assert!(
+        !echoed.contains("connector_id"),
+        "connector_id must not appear in rewritten body"
+    );
+    assert!(
+        !echoed.contains(&mcp_url),
+        "resolved server_url must not appear in rewritten body"
+    );
+
+    assert!(
+        mcp_server.method_count("tools/list") >= 1,
+        "should have called tools/list on the resolved MCP server"
+    );
+}
+
+#[test]
+fn unknown_connector_rejected_before_callout() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"s","connector_id":"nonexistent"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 400, "unknown connector should be 400");
+    let response_body = parse_body(&raw);
+    assert!(
+        response_body.contains("unknown connector_id"),
+        "response: {response_body}"
+    );
+
+    assert_eq!(
+        mcp_server.method_count("initialize"),
+        0,
+        "no MCP calls should be made for unknown connectors"
+    );
+}
+
+#[test]
+fn connector_with_authorization_forwarded() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!("        connectors:\n          - id: authed\n            server_url: {mcp_url}");
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"s","connector_id":"authed","authorization":"Bearer tok_test","allowed_tools":["tool_a"]}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 200, "connector with auth should succeed");
+
+    assert!(
+        mcp_server.method_count("tools/list") >= 1,
+        "should have called tools/list with forwarded auth"
+    );
+
+    let requests = mcp_server.received_requests();
+    let has_auth = requests.iter().any(|r| {
+        r.headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value.contains("tok_test"))
+    });
+    assert!(has_auth, "authorization token should be forwarded to MCP server");
+}
+
+#[test]
+fn direct_url_alongside_connector_both_resolved() {
+    let mcp_config_a = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server_a = start_mcp_mock_server_with_config(mcp_config_a);
+
+    let mcp_config_b = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_b")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server_b = start_mcp_mock_server_with_config(mcp_config_b);
+
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url_a = format!("http://127.0.0.1:{}/mcp", mcp_server_a.port());
+    let connectors = format!("        connectors:\n          - id: c1\n            server_url: {mcp_url_a}");
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let mcp_url_b = format!("http://127.0.0.1:{}/mcp", mcp_server_b.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"conn","connector_id":"c1","allowed_tools":["tool_a"]}},{{"type":"mcp","server_label":"direct","server_url":"{mcp_url_b}","allowed_tools":["tool_b"]}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 200, "mixed connector + direct should succeed");
+
+    let echoed = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tools = parsed["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 2, "should have 2 resolved function tools");
+
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"conn__tool_a"), "connector tool resolved");
+    assert!(names.contains(&"direct__tool_b"), "direct URL tool resolved");
+}
+
+// =============================================================================
 // YAML Helpers
 // =============================================================================
 
@@ -664,6 +818,41 @@ filter_chains:
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
         allow_loopback: true
+      - filter: openai_responses_proxy
+        name: inference
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "backend"
+      - filter: load_balancer
+        clusters:
+          - name: "backend"
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+"#
+    )
+}
+
+fn resolve_yaml_loopback_with_connectors_and_proxy(
+    proxy_port: u16,
+    backend_port: u16,
+    connectors_yaml: &str,
+) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
+        allow_loopback: true
+{connectors_yaml}
       - filter: openai_responses_proxy
         name: inference
       - filter: router

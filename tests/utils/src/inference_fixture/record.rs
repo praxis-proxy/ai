@@ -378,7 +378,9 @@ pub(super) async fn record_live(
     let client_limit = LIVE_CAPTURE_BUDGET;
     let mut operation_error = None;
     let mut attempts = 0_usize;
-    for turn in bound.turns {
+    let mut previous_response_id = None;
+    for mut turn in bound.turns {
+        turn.bind_previous_response_id(previous_response_id.as_deref())?;
         attempts = attempts.saturating_add(1);
         match send_recorded_request_with_header(
             &client,
@@ -390,6 +392,7 @@ pub(super) async fn record_live(
         .await
         {
             Ok(client_response) => {
+                previous_response_id = client_response.response_id().map(str::to_owned);
                 let exchange = BorrowedRecordedExchange {
                     request: &turn.request,
                     response: &client_response,
@@ -3307,6 +3310,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_live_binds_previous_response_id_across_responses_turns() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let provider = LocalProvider::start(handler({
+            let request_count = Arc::clone(&request_count);
+            move |_request| {
+                let request_count = Arc::clone(&request_count);
+                async move {
+                    let index = request_count.fetch_add(1, Ordering::SeqCst);
+                    chat_response(index)
+                }
+            }
+        }))
+        .await;
+        let scenario = live_responses_scenario();
+        let target = target(provider.http_url("/"), secret_headers());
+
+        let fixture = ScenarioRunner::record_live(&scenario, target).await.unwrap();
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "both turns should reach the backend"
+        );
+        assert_eq!(fixture.turns.len(), 2, "fixture should contain both turns");
+        let first_client_response = &fixture.turns[0].client.response;
+        let first_response_id = first_client_response.response_id();
+        assert!(
+            first_response_id.is_some(),
+            "first Responses turn should produce a resp_-prefixed ID"
+        );
+        let RecordedBody::Json {
+            value: second_request_body,
+        } = &fixture.turns[1].client.request.body
+        else {
+            panic!("second turn client request should be JSON");
+        };
+        assert_eq!(
+            second_request_body["previous_response_id"],
+            first_response_id.unwrap(),
+            "second turn must bind ${{PREVIOUS_RESPONSE_ID}} to the first turn's response ID"
+        );
+        provider.finish().await;
+    }
+
+    #[tokio::test]
     async fn record_live_rejects_configured_credential_in_scenario_request() {
         let secret = "scenario-request-credential";
         let provider = LocalProvider::start(handler(move |_request| async move { chat_response(0) })).await;
@@ -3866,6 +3914,55 @@ mod tests {
                         "messages": [{"role": "user", "content": prompt}],
                     }),
                 },
+            },
+            expect: ScenarioExpectation {
+                client_status: 200,
+                client_body_kind: BodyKind::Json,
+                upstream_path: "/v1/chat/completions".to_owned(),
+                upstream_body_kind: BodyKind::Json,
+                client_sse_events: Vec::new(),
+                client_sse_repeatable_events: Vec::new(),
+                client_sse_interleaved_events: Vec::new(),
+                upstream_sse_events: Vec::new(),
+                upstream_sse_repeatable_events: Vec::new(),
+                upstream_sse_interleaved_events: Vec::new(),
+            },
+        }
+    }
+
+    fn live_responses_scenario() -> InferenceScenario {
+        InferenceScenario {
+            version: 1,
+            id: "responses/live-record".to_owned(),
+            description: "two-turn Responses live recording with continuation".to_owned(),
+            protocol: InferenceProtocol::OpenaiResponses,
+            example_config: "openai/responses/responses-to-chat-completions.yaml".to_owned(),
+            upstream_authority: "127.0.0.1:3001".to_owned(),
+            features: vec!["responses.chat.continuation".to_owned()],
+            turns: vec![
+                live_responses_turn("initial", "first prompt", None),
+                live_responses_turn("continuation", "second prompt", Some("${PREVIOUS_RESPONSE_ID}")),
+            ],
+        }
+    }
+
+    fn live_responses_turn(name: &str, prompt: &str, previous_response_id: Option<&str>) -> ScenarioTurn {
+        let mut value = json!({
+            "model": "${MODEL}",
+            "input": prompt,
+            "store": true,
+            "stream": false,
+        });
+        if let Some(prev_id) = previous_response_id {
+            value["previous_response_id"] = json!(prev_id);
+        }
+        ScenarioTurn {
+            name: name.to_owned(),
+            request: RecordedRequest {
+                method: "POST".to_owned(),
+                path: "/v1/responses".to_owned(),
+                headers: BTreeMap::from([("content-type".to_owned(), vec!["application/json".to_owned()])]),
+                body: RecordedBody::Json { value },
             },
             expect: ScenarioExpectation {
                 client_status: 200,

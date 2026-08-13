@@ -115,8 +115,11 @@ impl ScenarioRunner {
             .build()
             .map_err(|_source| FixtureError::ReplayHttp)?;
         let mut pending = Vec::with_capacity(bound.turns.len());
-        for (turn_index, turn) in bound.turns.into_iter().enumerate() {
+        let mut previous_response_id = None;
+        for (turn_index, mut turn) in bound.turns.into_iter().enumerate() {
+            turn.bind_previous_response_id(previous_response_id.as_deref())?;
             let response = send_recorded_request(&client, proxy.addr(), &turn.request).await?;
+            previous_response_id = response.response_id().map(str::to_owned);
             pending.push(PendingTurn {
                 scenario: turn,
                 client_response: response,
@@ -388,7 +391,10 @@ fn validate_replay_filter_entries(filters: &[FilterEntry]) -> Result<(), Fixture
                 | "openai_responses_proxy"
                 | "path_rewrite"
                 | "openai_responses_format"
+                | "openai_responses_validate"
                 | "openai_response_store"
+                | "openai_responses_rehydrate"
+                | "responses_to_chat_completions"
                 | "router"
                 | "load_balancer"
         ) {
@@ -2471,8 +2477,9 @@ mod tests {
             ))
             .expect("test filter config should parse")
         };
-        let safe_config: Config =
-            parse_config("      - filter: openai_responses_proxy\n      - filter: load_balancer\n");
+        let safe_config: Config = parse_config(
+            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
+        );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
 
         for filters in [

@@ -3,6 +3,7 @@ scope:
   - messages_to_chat_completions
   - messages_native_passthrough
   - responses_native_passthrough
+  - responses_to_chat_completions
 features:
   - id: messages.request.minimal
     scopes:
@@ -103,3 +104,30 @@ features:
         status: live_covered
       vllm:
         status: live_covered
+  - id: responses.chat.request
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.response.text
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.continuation
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only

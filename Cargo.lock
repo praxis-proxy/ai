@@ -3141,6 +3141,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "praxis-ai-build-support"
+version = "0.2.0"
+dependencies = [
+ "cargo_metadata",
+ "tempfile",
+]
+
+[[package]]
 name = "praxis-ai-filters"
 version = "0.2.0"
 dependencies = [
@@ -3180,6 +3188,7 @@ dependencies = [
  "nix",
  "notify",
  "praxis-ai-apis",
+ "praxis-ai-build-support",
  "praxis-ai-filters",
  "praxis-proxy-core",
  "praxis-proxy-filter",

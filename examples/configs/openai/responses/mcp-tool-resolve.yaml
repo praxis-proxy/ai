@@ -41,6 +41,20 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"model": "gpt-4.1", "input": "Hello, world!"}'
 #
+#   # Request with connector_id (resolved from filter config)
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "Search for quarterly reports",
+#       "tools": [{
+#         "type": "mcp",
+#         "server_label": "drive",
+#         "connector_id": "corp_drive",
+#         "allowed_tools": ["search"]
+#       }]
+#     }'
+#
 # Build:
 #   cargo build -p praxis-ai-proxy
 
@@ -64,6 +78,11 @@ filter_chains:
 
       - filter: openai_mcp_tool_resolve
         timeout_ms: 5000
+        connectors:
+          - id: corp_drive
+            server_url: https://drive-mcp.internal:8443/mcp
+          - id: internal_search
+            server_url: https://search-mcp.internal:8443/mcp
 
       - filter: openai_responses_proxy
         name: inference
