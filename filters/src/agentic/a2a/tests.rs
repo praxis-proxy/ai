@@ -1655,7 +1655,7 @@ async fn task_route_hit_records_bounded_route_metadata() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn json_response_split_across_chunks_captures_opportunistically() {
+async fn json_response_split_across_chunks_defers_capture_until_eos() {
     let filter = make_task_routing_filter();
     let store = filter.task_route_store.as_ref().unwrap();
     let req = make_a2a_request(&[]);
@@ -1675,11 +1675,96 @@ async fn json_response_split_across_chunks_captures_opportunistically() {
 
     let mut body2 = Some(Bytes::from(chunk2.to_owned()));
     drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+    assert_tentative_pending(store, &ctx, "task-split");
 
+    let mut eos = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
     assert_eq!(
         store.get_by_task_id("task-split").as_deref(),
         Some("agent-a"),
-        "route should be captured as soon as JSON is complete, before EOS"
+        "route must be committed once EOS confirms no trailing bytes"
+    );
+    assert_capture_scratch_cleared(&ctx);
+}
+
+#[tokio::test]
+async fn complete_json_prefix_then_garbage_does_not_capture_route() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-poison","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+    let mut body1 = Some(Bytes::from(json));
+    drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+    assert!(
+        store.get_by_task_id("task-poison").is_none(),
+        "fnd_sig-feat-custom-ai-agentic-class_e1322f3e62: route must not be committed before EOS"
+    );
+
+    let mut body2 = Some(Bytes::from_static(b"garbage!"));
+    drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
+    assert!(
+        store.get_by_task_id("task-poison").is_none(),
+        "trailing garbage must prevent the route from being committed"
+    );
+    assert_capture_scratch_cleared(&ctx);
+}
+
+#[tokio::test]
+async fn tentative_survives_whitespace_chunk_before_eos() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-ws-wait","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+    let mut body1 = Some(Bytes::from(json));
+    drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+    let mut ws = Some(Bytes::from_static(b"  \n"));
+    drop(filter.on_response_body(&mut ctx, &mut ws, false).unwrap());
+    assert!(
+        store.get_by_task_id("task-ws-wait").is_none(),
+        "route must not be committed while EOS has not arrived"
+    );
+    assert!(
+        ctx.filter_metadata.contains_key("a2a.response.tentative_json"),
+        "tentative must survive a whitespace-only intermediate chunk"
+    );
+
+    let mut eos = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+    assert_eq!(
+        store.get_by_task_id("task-ws-wait").as_deref(),
+        Some("agent-a"),
+        "route must be committed once EOS arrives after whitespace-only intermediate chunks"
+    );
+    assert_capture_scratch_cleared(&ctx);
+}
+
+#[tokio::test]
+async fn complete_json_followed_by_whitespace_at_eos_captures_route() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json = r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-ws","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+    let mut body1 = Some(Bytes::from(json));
+    drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+    let mut eos = Some(Bytes::from_static(b"   \n"));
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+    assert_eq!(
+        store.get_by_task_id("task-ws").as_deref(),
+        Some("agent-a"),
+        "whitespace at EOS must confirm the tentative route"
     );
     assert_capture_scratch_cleared(&ctx);
 }
@@ -1856,7 +1941,7 @@ async fn mixed_case_sse_content_type_skips_capture() {
 }
 
 #[tokio::test]
-async fn many_single_byte_chunks_still_capture_route_before_eos() {
+async fn many_single_byte_chunks_capture_route_at_eos() {
     let filter = make_task_routing_filter();
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -1871,11 +1956,18 @@ async fn many_single_byte_chunks_still_capture_route_before_eos() {
         drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
     }
 
+    assert!(
+        store.get_by_task_id("task-many-chunks").is_none(),
+        "route must not be committed until EOS is confirmed"
+    );
+
+    let mut eos = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+
     assert_eq!(
         store.get_by_task_id("task-many-chunks").as_deref(),
         Some("agent-a"),
-        "route should be captured once the JSON is balanced, even when delivered as many \
-         single-byte chunks, without waiting for end_of_stream"
+        "route should be captured at EOS even when delivered as many single-byte chunks"
     );
     assert_capture_scratch_cleared(&ctx);
 }
@@ -2326,11 +2418,17 @@ async fn split_json_response_with_context_stores_context_route() {
 
     let mut body2 = Some(Bytes::from(chunk2.to_owned()));
     drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+    assert!(
+        store.get_by_context_id("ctx-split").is_none(),
+        "context route must not be committed before EOS is confirmed"
+    );
 
+    let mut eos = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
     assert_eq!(
         store.get_by_context_id("ctx-split").as_deref(),
         Some("agent-a"),
-        "context route should be captured once JSON completes"
+        "context route should be captured at EOS"
     );
 }
 
@@ -3363,6 +3461,17 @@ fn seed_response_capture(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
         .insert("a2a.response.cluster".to_owned(), "agent-a".to_owned());
 }
 
+fn assert_tentative_pending(store: &LocalTaskRouteStore, ctx: &praxis_filter::HttpFilterContext<'_>, task_id: &str) {
+    assert!(
+        store.get_by_task_id(task_id).is_none(),
+        "route must not be committed before EOS is confirmed"
+    );
+    assert!(
+        ctx.filter_metadata.contains_key("a2a.response.tentative_json"),
+        "tentative parse must be held pending EOS"
+    );
+}
+
 #[expect(clippy::too_many_lines, reason = "repetitive per-key cleared assertions")]
 fn assert_capture_scratch_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
     assert!(
@@ -3400,6 +3509,10 @@ fn assert_capture_scratch_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
     assert!(
         !ctx.filter_metadata.contains_key("a2a.response.json_invalid"),
         "json_invalid not cleared"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("a2a.response.tentative_json"),
+        "tentative_json not cleared"
     );
 }
 
