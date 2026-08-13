@@ -15,6 +15,7 @@ name = "praxis_ai_filters"
 [features]
 default = ["apis"]
 apis = ["praxis-ai-apis/default"]
+opentelemetry = []
 praxis-main = []
 
 [lints]
