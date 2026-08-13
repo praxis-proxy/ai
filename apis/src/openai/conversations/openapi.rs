@@ -87,10 +87,6 @@ mod tests {
         let document = serde_json::to_value(implementation_openapi()).unwrap();
 
         assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/type"),
-            Some(&Value::String("array".to_owned()))
-        );
-        assert_eq!(
             document.pointer("/components/schemas/CreateConversationItemsRequest/properties/items/type"),
             Some(&Value::String("array".to_owned()))
         );
@@ -151,6 +147,76 @@ mod tests {
                 Some(&Value::Array(expected.clone()))
             );
         }
+    }
+
+    #[test]
+    fn generated_create_request_contract_matches_runtime() {
+        let document = serde_json::to_value(implementation_openapi()).unwrap();
+
+        assert_eq!(
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/0/type"),
+            Some(&Value::String("array".to_owned()))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/1/type"),
+            Some(&Value::String("null".to_owned()))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/0/maxItems"),
+            Some(&Value::Number(serde_json::Number::from(20_u64))),
+            "items array should preserve the 20-item bound"
+        );
+        assert!(
+            document
+                .pointer("/paths/~1conversations/post/requestBody/required")
+                .is_none_or(|required| required == &Value::Bool(false)),
+            "create request body should be optional"
+        );
+    }
+
+    #[test]
+    fn generated_create_metadata_has_two_layer_nullable_anyof() {
+        let document = serde_json::to_value(implementation_openapi()).unwrap();
+        let base = "/components/schemas/CreateConversationRequest/properties/metadata";
+
+        assert_eq!(
+            document.pointer(&format!("{base}/anyOf/1/type")),
+            Some(&Value::String("null".to_owned()))
+        );
+        assert_eq!(
+            document.pointer(&format!("{base}/anyOf/0/anyOf/0/type")),
+            Some(&Value::String("object".to_owned())),
+            "inner anyOf should contain the string-map object type"
+        );
+        assert_eq!(
+            document.pointer(&format!("{base}/anyOf/0/anyOf/0/additionalProperties/type")),
+            Some(&Value::String("string".to_owned())),
+            "metadata values should be strings"
+        );
+        assert_eq!(
+            document.pointer(&format!("{base}/anyOf/0/anyOf/1/type")),
+            Some(&Value::String("null".to_owned())),
+            "inner anyOf should include null"
+        );
+    }
+
+    #[test]
+    fn generated_update_request_contract_matches_runtime() {
+        let document = serde_json::to_value(implementation_openapi()).unwrap();
+
+        assert_eq!(
+            document.pointer("/components/schemas/UpdateConversationRequest/required/0"),
+            Some(&Value::String("metadata".to_owned()))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/UpdateConversationRequest/properties/metadata/$ref"),
+            Some(&Value::String("#/components/schemas/Metadata".to_owned()))
+        );
+        assert_eq!(
+            document.pointer("/paths/~1conversations~1{conversation_id}/post/requestBody/required"),
+            Some(&Value::Bool(true)),
+            "live OpenAI behavior requires an update request body"
+        );
     }
 
     fn collect_component_references<'a>(value: &'a Value, references: &mut Vec<&'a str>) {
