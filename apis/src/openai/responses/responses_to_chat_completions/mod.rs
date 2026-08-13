@@ -73,11 +73,11 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// Configure `path_rewrite` after this filter when the upstream endpoint must
 /// change from `/v1/responses` to `/v1/chat/completions`.
 ///
-/// Finite requests using `previous_response_id` require
+/// Requests using `previous_response_id` require
 /// `openai_response_store` and `openai_responses_rehydrate` earlier in the
 /// request pipeline. The filter fails closed if stored history has not been
 /// resolved, preventing a continuation from silently losing prior turns.
-/// Streaming continuation translation is tracked separately in
+/// Chat Completions SSE response conversion is tracked separately in
 /// [issue #36](https://github.com/praxis-proxy/ai/issues/36).
 ///
 /// # YAML
@@ -312,7 +312,7 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Re
         );
         return Err(missing_pipeline_state(streaming));
     };
-    ensure_finite_previous_response_rehydrated(state, streaming)?;
+    ensure_previous_response_rehydrated(state, streaming)?;
     responses_state_to_chat_request(&state.request_body, &state.messages, &state.tools, &state.tool_choice).map_err(
         |error| {
             debug!(error = %error, "Responses request cannot be represented by Chat Completions");
@@ -326,14 +326,14 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Re
     )
 }
 
-/// Require stored history before translating a finite continuation request.
-fn ensure_finite_previous_response_rehydrated(state: &ResponsesState, streaming: bool) -> Result<(), FilterAction> {
-    if !streaming && state.previous_response_id.is_some() && !state.history_rehydrated {
+/// Require stored history before translating a continuation request.
+fn ensure_previous_response_rehydrated(state: &ResponsesState, streaming: bool) -> Result<(), FilterAction> {
+    if state.previous_response_id.is_some() && !state.history_rehydrated {
         warn!(
             prerequisite = "openai_responses_rehydrate",
             "previous_response_id was not resolved before Chat Completions translation"
         );
-        return Err(missing_pipeline_state(false));
+        return Err(missing_pipeline_state(streaming));
     }
     Ok(())
 }

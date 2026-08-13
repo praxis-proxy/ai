@@ -170,7 +170,7 @@ async fn unresolved_previous_response_id_fails_closed() {
 }
 
 #[tokio::test]
-async fn unresolved_streaming_previous_response_id_remains_in_streaming_scope() {
+async fn unresolved_streaming_previous_response_id_fails_closed_with_sse_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -182,18 +182,30 @@ async fn unresolved_streaming_previous_response_id_remains_in_streaming_scope() 
         "previous_response_id": "resp_previous",
         "stream": true
     })));
-    let mut body = Some(Bytes::from_static(
+    let original = Bytes::from_static(
         br#"{"model":"gpt-4.1-mini","input":"current input","previous_response_id":"resp_previous","stream":true}"#,
-    ));
+    );
+    let mut body = Some(original.clone());
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
-    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
-    assert_eq!(translated["stream"], true);
-    assert_eq!(translated["messages"][0]["content"], "current input");
-    assert!(translated.get("previous_response_id").is_none());
-    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected rejection");
+    };
+    assert_eq!(rejection.status, 500);
+    assert_eq!(
+        rejection.headers.iter().find(|(name, _)| name == "content-type"),
+        Some(&("content-type".to_owned(), "text/event-stream".to_owned()))
+    );
+    let event = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(event.starts_with("event: error\ndata: "));
+    let data = event.strip_prefix("event: error\ndata: ").unwrap().trim_end();
+    let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(parsed["error"]["code"], "server_error");
+    assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
+    assert_eq!(body.as_deref(), Some(original.as_ref()));
+    assert!(context.get_metadata(ARMED_KEY).is_none());
+    assert!(context.get_metadata(CREATED_AT_KEY).is_none());
 }
 
 #[tokio::test]
