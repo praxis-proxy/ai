@@ -2333,6 +2333,7 @@ dependencies = [
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
