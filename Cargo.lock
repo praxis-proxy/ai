@@ -2696,6 +2696,7 @@ dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "quixotic-plecostomus-core",
+  "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
