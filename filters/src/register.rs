@@ -360,6 +360,7 @@ mod tests {
     fn build_ai_registry_includes_ai_and_builtin_filters() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
+<<<<<<< HEAD
         let expected = [
             "ai_guardrails",
             "openai_responses_validate",
@@ -377,5 +378,37 @@ mod tests {
         }
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
+=======
+        assert!(names.contains(&"ai_guardrails"), "expected ai_guardrails in registry");
+        assert!(
+            names.contains(&"openai_responses_validate"),
+            "expected openai_responses_validate in registry"
+        );
+        assert!(
+            names.contains(&"responses_to_chat_completions"),
+            "expected responses_to_chat_completions in registry"
+        );
+        assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
+        assert!(
+            names.contains(&"intelligent_route"),
+            "expected intelligent_route in registry"
+        );
+        assert!(
+            names.contains(&"anthropic_validate"),
+            "expected anthropic filter in registry"
+        );
+        assert!(
+            names.contains(&"anthropic_web_search"),
+            "expected anthropic_web_search in registry"
+        );
+        assert!(
+            names.contains(&"identity_header_guard"),
+            "expected identity_header_guard in registry"
+        );
+        assert!(
+            names.contains(&"request_id"),
+            "expected core builtin request_id in registry"
+        );
+>>>>>>> bcb9409 (fix: address praxis-bot review findings)
     }
 }
