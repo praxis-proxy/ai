@@ -503,6 +503,11 @@ fn parse_to_tentative(ctx: &mut HttpFilterContext<'_>) {
             if let Ok(json_str) = serde_json::to_string(&value) {
                 ctx.filter_metadata
                     .insert("a2a.response.tentative_json".to_owned(), json_str);
+            } else {
+                // Serialization failure is effectively infallible for a Value
+                // that was just deserialized, but clear state defensively so
+                // the tentative guard cannot be bypassed on subsequent chunks.
+                clear_capture_metadata(ctx);
             }
         }
         None => {
