@@ -391,22 +391,12 @@ fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(Co
 
     let conversation_text = build_conversation_text(&state.messages);
 
-    let message_tokens =
+    let token_count =
         previous_usage_total(state).or_else(|| get_token_count(&conversation_text, tiktoken_encoding))?;
 
-    let overhead_text = build_context_overhead_text(state);
-    let overhead_tokens = if overhead_text.is_empty() {
-        0
-    } else {
-        get_token_count(&overhead_text, tiktoken_encoding).unwrap_or(0)
-    };
-
-    let token_count = message_tokens + overhead_tokens;
     if token_count <= params.compact_threshold {
         debug!(
             token_count,
-            message_tokens,
-            overhead_tokens,
             threshold = params.compact_threshold,
             "under threshold, skipping"
         );
@@ -414,8 +404,6 @@ fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(Co
     }
     debug!(
         token_count,
-        message_tokens,
-        overhead_tokens,
         threshold = params.compact_threshold,
         "threshold exceeded, compacting"
     );
@@ -431,22 +419,6 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
         "token count from prior response"
     );
     Some(total)
-}
-
-/// Build the text for instructions and tool definitions that live
-/// outside the message list but still consume context window tokens.
-fn build_context_overhead_text(state: &ResponsesState) -> String {
-    let mut buf = String::new();
-    if let Some(instructions) = state.request_body.get("instructions").and_then(Value::as_str) {
-        buf.push_str(instructions);
-    }
-    for tool in &state.tools {
-        if !buf.is_empty() {
-            buf.push('\n');
-        }
-        buf.push_str(&tool.to_string());
-    }
-    buf
 }
 
 /// Check whether this is an explicit `POST /v1/responses/compact` request.
