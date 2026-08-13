@@ -252,8 +252,8 @@ async fn duplicate_headers_last_value_wins() {
         .get("identity.x-tenant-username")
         .expect("should capture the header");
     assert_eq!(
-        captured, "unprivileged",
-        "last value should win when duplicate headers are present"
+        captured, "admin",
+        "first value should win when duplicate headers are present"
     );
 }
 

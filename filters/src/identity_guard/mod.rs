@@ -103,9 +103,17 @@ impl HttpFilter for IdentityHeaderGuardFilter {
                 // verified claims, and overwriting them here would
                 // launder client-spoofed headers into the trusted
                 // metadata namespace.
+                //
+                // First-wins: if the key already exists (from an
+                // earlier auth filter or a prior header iteration),
+                // trust the first value. Prevents a client from
+                // appending a duplicate header to override a
+                // legitimate value set by an upstream proxy.
                 let namespaced = format!("{}.{}", self.namespace, name_lower);
-                ctx.set_metadata(namespaced, val.to_owned());
-                captured += 1;
+                if !ctx.filter_metadata.contains_key(&namespaced) {
+                    ctx.set_metadata(namespaced, val.to_owned());
+                    captured += 1;
+                }
             }
 
             ctx.request_headers_to_remove.push(name.clone());
