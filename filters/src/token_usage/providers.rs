@@ -252,7 +252,11 @@ mod tests {
     fn openai_responses_api_completed_event() {
         let json = br#"{"type":"response.completed","response":{"id":"resp_123","usage":{"input_tokens":150,"output_tokens":42,"total_tokens":192}}}"#;
         let usage = parse_openai(json).unwrap();
-        assert_eq!(usage.input_tokens(), 150, "should parse input_tokens from Responses API");
+        assert_eq!(
+            usage.input_tokens(),
+            150,
+            "should parse input_tokens from Responses API"
+        );
         assert_eq!(usage.output_tokens(), 42);
         assert_eq!(usage.total_tokens(), 192);
     }
