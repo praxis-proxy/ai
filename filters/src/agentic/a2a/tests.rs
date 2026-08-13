@@ -1673,8 +1673,6 @@ async fn json_response_split_across_chunks_defers_capture_until_eos() {
         "incomplete JSON should not capture"
     );
 
-    // chunk2 completes the JSON structure but end_of_stream is false:
-    // the route must be held as tentative, not yet committed.
     let mut body2 = Some(Bytes::from(chunk2.to_owned()));
     drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
     assert!(
@@ -1686,7 +1684,6 @@ async fn json_response_split_across_chunks_defers_capture_until_eos() {
         "tentative parse must be held pending EOS"
     );
 
-    // EOS arrives with no further bytes: confirm and commit.
     let mut eos = None;
     drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
     assert_eq!(

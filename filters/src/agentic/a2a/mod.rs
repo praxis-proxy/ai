@@ -382,6 +382,33 @@ fn lookup_task_route(
     }
 }
 
+/// Advances or abandons a pending tentative route. Returns `true` if the
+/// caller should return early (tentative guard handled this chunk).
+fn handle_pending_tentative(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    end_of_stream: bool,
+    store: &LocalTaskRouteStore,
+    config: &config::TaskRoutingConfig,
+) -> bool {
+    if !ctx.filter_metadata.contains_key("a2a.response.tentative_json") {
+        return false;
+    }
+    let has_new_content = body
+        .as_ref()
+        .is_some_and(|b| b.iter().any(|byte| !byte.is_ascii_whitespace()));
+    if has_new_content {
+        debug!("tentative route discarded: trailing non-whitespace after balanced JSON prefix");
+        clear_capture_metadata(ctx);
+    } else if end_of_stream {
+        debug!("tentative route confirmed at EOS: no trailing content");
+        commit_tentative_capture(ctx, store, config);
+        clear_capture_metadata(ctx);
+    }
+    // else: whitespace-only chunk, EOS not yet seen — keep waiting.
+    true
+}
+
 /// Drives non-streaming A2A task-route capture for one `on_response_body`
 /// call: accumulate the chunk, update the [`JsonBalanceState`] scanner,
 /// and either abandon capture (invalid buffer), attempt a parse (buffer
@@ -393,26 +420,7 @@ fn handle_non_streaming_capture(
     store: &LocalTaskRouteStore,
     config: &config::TaskRoutingConfig,
 ) {
-    // If a previous chunk reached a structurally complete JSON value without
-    // EOS, a tentative parse was stored. Any non-whitespace bytes arriving
-    // afterward prove the response is not valid JSON — the complete prefix
-    // would have been a poisoned route. Abandon or confirm now.
-    if ctx.filter_metadata.contains_key("a2a.response.tentative_json") {
-        let has_new_content = body
-            .as_ref()
-            .is_some_and(|b| b.iter().any(|byte| !byte.is_ascii_whitespace()));
-
-        if has_new_content {
-            // Non-whitespace bytes after the balanced prefix: the full response
-            // is not valid JSON. Discard the tentative route.
-            clear_capture_metadata(ctx);
-        } else if end_of_stream {
-            // EOS with no further non-whitespace bytes: the prefix is the
-            // complete response. Commit the tentative route.
-            commit_tentative_capture(ctx, store, config);
-            clear_capture_metadata(ctx);
-        }
-        // else: whitespace-only chunk, EOS not yet seen — keep waiting.
+    if handle_pending_tentative(ctx, body, end_of_stream, store, config) {
         return;
     }
 
@@ -509,7 +517,7 @@ fn parse_to_tentative(ctx: &mut HttpFilterContext<'_>) {
 /// Called only after [`handle_non_streaming_capture`] confirms EOS arrived
 /// with no non-whitespace bytes following the balanced JSON prefix.
 fn commit_tentative_capture(
-    ctx: &mut HttpFilterContext<'_>,
+    ctx: &HttpFilterContext<'_>,
     store: &LocalTaskRouteStore,
     config: &config::TaskRoutingConfig,
 ) {
