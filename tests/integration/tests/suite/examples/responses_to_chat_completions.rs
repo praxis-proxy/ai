@@ -156,7 +156,10 @@ fn responses_to_chat_completions_translates_streaming_request_body() {
     assert_eq!(forwarded["stream"], true);
     assert!(forwarded["messages"].is_array());
     assert_eq!(forwarded["messages"][0]["content"], "Hello");
-    assert!(forwarded.get("input").is_none());
+    assert!(
+        forwarded.get("input").is_none(),
+        "Responses-only field `input` must not reach the Chat Completions backend"
+    );
 }
 
 #[test]
@@ -237,8 +240,14 @@ fn responses_to_chat_completions_rehydrates_finite_continuation() {
             {"role": "user", "content": "Follow up"}
         ])
     );
-    assert!(forwarded.get("input").is_none());
-    assert!(forwarded.get("previous_response_id").is_none());
+    assert!(
+        forwarded.get("input").is_none(),
+        "Responses-only field `input` must not reach the Chat Completions backend"
+    );
+    assert!(
+        forwarded.get("previous_response_id").is_none(),
+        "Responses-only field `previous_response_id` must not reach the Chat Completions backend"
+    );
 
     let (first_get_status, _) = http_get(proxy.addr(), &format!("/v1/responses/{first_response_id}"), None);
     assert_eq!(first_get_status, 200, "store=true response should remain retrievable");

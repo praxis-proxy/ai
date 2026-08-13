@@ -1648,8 +1648,14 @@ mod tests {
         assert_eq!(value["store"], true);
         assert_eq!(value["stream"], false);
         assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
-        assert!(turn.expect.client_sse_events.is_empty());
-        assert!(turn.expect.upstream_sse_events.is_empty());
+        assert!(
+            turn.expect.client_sse_events.is_empty(),
+            "non-streaming initial turn must have no client SSE events"
+        );
+        assert!(
+            turn.expect.upstream_sse_events.is_empty(),
+            "non-streaming initial turn must have no upstream SSE events"
+        );
 
         let continuation = &responses_chat.turns[1];
         assert_eq!(continuation.name, "continuation");
@@ -1670,8 +1676,14 @@ mod tests {
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], false);
         assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
-        assert!(continuation.expect.client_sse_events.is_empty());
-        assert!(continuation.expect.upstream_sse_events.is_empty());
+        assert!(
+            continuation.expect.client_sse_events.is_empty(),
+            "non-streaming continuation turn must have no client SSE events"
+        );
+        assert!(
+            continuation.expect.upstream_sse_events.is_empty(),
+            "non-streaming continuation turn must have no upstream SSE events"
+        );
     }
 
     #[cfg(unix)]
