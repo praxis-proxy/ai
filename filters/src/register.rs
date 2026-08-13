@@ -395,6 +395,7 @@ mod tests {
         let names = registry.available_filters();
         let expected = [
             "ai_guardrails",
+            "identity_header_guard",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",
