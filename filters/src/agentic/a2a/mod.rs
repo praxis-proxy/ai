@@ -450,11 +450,12 @@ fn handle_non_streaming_capture(
     }
 }
 
-/// Called when EOS is confirmed (either `end_of_stream=true` on the current
-/// call, or after a tentative parse was promoted by a whitespace-only EOS
-/// callback). Parses the full accumulated buffer and, on success, stores the
-/// extracted routes. A failed parse is unconditionally terminal and clears
-/// capture state.
+/// Called from the `is_complete || end_of_stream` branch of
+/// [`handle_non_streaming_capture`] -- either the fast path where both
+/// conditions are true simultaneously, or the fallback where EOS arrives
+/// with an incomplete buffer. Parses the full accumulated hex buffer and,
+/// on success, stores the extracted routes. A failed parse is
+/// unconditionally terminal and clears capture state.
 fn try_capture_from_buffer(
     ctx: &mut HttpFilterContext<'_>,
     store: &LocalTaskRouteStore,
