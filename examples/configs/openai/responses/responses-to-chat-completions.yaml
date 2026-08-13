@@ -1,16 +1,24 @@
 # Responses API to Chat Completions
 #
-# Accepts OpenAI Responses create requests while targeting an inference
-# backend that only implements /v1/chat/completions.
+# Accepts OpenAI Responses create requests, including finite stored
+# continuations, while targeting a backend that only implements
+# /v1/chat/completions.
 #
-# Pipeline order:
+# Request order:
 #   1. openai_responses_format classifies the client request.
 #   2. openai_responses_validate performs the canonical JSON parse and
 #      creates ResponsesState for downstream enrichment and translation.
-#   3. responses_to_chat_completions converts the canonical request to
+#   3. openai_response_store initializes the shared response store.
+#   4. openai_responses_rehydrate resolves previous_response_id into the
+#      complete message history required by Chat Completions.
+#   5. responses_to_chat_completions converts the canonical request to
 #      Chat Completions and converts finite JSON responses back to a
 #      Responses resource.
-#   4. path_rewrite changes the upstream endpoint explicitly.
+#   6. path_rewrite changes the upstream endpoint explicitly.
+#
+# Response filters run in reverse order. The Chat response is therefore
+# translated into a client-visible Responses resource before
+# openai_response_store decides whether to persist it.
 #
 # Streaming Chat Completions SSE is intentionally passed through byte-for-byte
 # by this base filter. Pair this pipeline with the incremental Responses stream
@@ -32,6 +40,14 @@ filter_chains:
           stream: x-praxis-ai-stream
 
       - filter: openai_responses_validate
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
 
       - filter: responses_to_chat_completions
         max_body_bytes: 67108864

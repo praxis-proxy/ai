@@ -11,6 +11,8 @@ The filter consumes the classification metadata and `ResponsesState` produced by
 
 Configure `path_rewrite` after this filter when the upstream endpoint must change from `/v1/responses` to `/v1/chat/completions`.
 
+Requests using `previous_response_id` require `openai_response_store` and `openai_responses_rehydrate` earlier in the request pipeline. The filter fails closed if stored history has not been resolved, preventing a continuation from silently losing prior turns. Chat Completions SSE response conversion is tracked separately in [issue #36](https://github.com/praxis-proxy/ai/issues/36).
+
 ## Examples
 
 ### Example 1
