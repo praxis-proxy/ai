@@ -161,6 +161,11 @@ mod tests {
             document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/1/type"),
             Some(&Value::String("null".to_owned()))
         );
+        assert_eq!(
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/0/maxItems"),
+            Some(&Value::Number(serde_json::Number::from(20_u64))),
+            "items array should preserve the 20-item bound"
+        );
         assert!(
             document
                 .pointer("/paths/~1conversations/post/requestBody/required")

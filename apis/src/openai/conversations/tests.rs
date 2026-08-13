@@ -1073,7 +1073,7 @@ fn null_metadata_is_valid() {
 fn reject_non_object_metadata() {
     let metadata = serde_json::json!("string");
     let err = validate_metadata(&metadata).unwrap_err();
-    assert!(err.contains("must be a JSON object"), "got: {err}");
+    assert!(err.to_string().contains("must be a JSON object"), "got: {err}");
 }
 
 #[test]
@@ -1083,7 +1083,7 @@ fn reject_too_many_keys() {
         map.insert(format!("key{i}"), Value::String("val".to_owned()));
     }
     let err = validate_metadata(&Value::Object(map)).unwrap_err();
-    assert!(err.contains("at most 16 keys"), "got: {err}");
+    assert!(err.to_string().contains("at most 16 keys"), "got: {err}");
 }
 
 #[test]
@@ -1091,7 +1091,7 @@ fn reject_long_key() {
     let long_key = "k".repeat(65);
     let metadata = serde_json::json!({long_key: "value"});
     let err = validate_metadata(&metadata).unwrap_err();
-    assert!(err.contains("exceeds 64 bytes"), "got: {err}");
+    assert!(err.to_string().contains("exceeds 64 bytes"), "got: {err}");
 }
 
 #[test]
@@ -1099,14 +1099,14 @@ fn reject_long_value() {
     let long_value = "v".repeat(513);
     let metadata = serde_json::json!({"key": long_value});
     let err = validate_metadata(&metadata).unwrap_err();
-    assert!(err.contains("exceeds 512 bytes"), "got: {err}");
+    assert!(err.to_string().contains("exceeds 512 bytes"), "got: {err}");
 }
 
 #[test]
 fn reject_non_string_value() {
     let metadata = serde_json::json!({"key": 42});
     let err = validate_metadata(&metadata).unwrap_err();
-    assert!(err.contains("must be a string"), "got: {err}");
+    assert!(err.to_string().contains("must be a string"), "got: {err}");
 }
 
 // -----------------------------------------------------------------------------
@@ -1257,7 +1257,10 @@ async fn update_conversation_without_body_returns_400() {
         panic!("expected Reject, got {action:?}");
     };
     assert_eq!(rejection.status, 400);
-    assert_eq!(rejection_body(&rejection)["error"]["type"], "invalid_request_error");
+    let error = &rejection_body(&rejection)["error"];
+    assert_eq!(error["type"], "invalid_request_error");
+    assert_eq!(error["code"], "missing_required_parameter");
+    assert_eq!(error["param"], "metadata");
 }
 
 #[tokio::test]

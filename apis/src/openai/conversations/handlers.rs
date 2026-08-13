@@ -20,7 +20,7 @@ use super::{
         CreateConversationRequest, DeletedConversationResource, IncludeField, IncludeFields, ItemOrder,
         MAX_ITEMS_PER_REQUEST, Metadata, UpdateConversationRequest,
     },
-    validate::validate_metadata,
+    validate::{MetadataError, validate_metadata},
 };
 use crate::{
     openai::responses::{
@@ -80,8 +80,8 @@ pub(super) async fn handle_create_conversation(
     };
     let metadata = match input.metadata {
         Some(metadata) => {
-            if let Err(msg) = validate_metadata(metadata.as_value()) {
-                return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+            if let Err(e) = validate_metadata(metadata.as_value()) {
+                return Ok(FilterAction::Reject(invalid_input_response(&e.to_string())?));
             }
             metadata.into_value()
         },
@@ -161,21 +161,26 @@ pub(super) async fn handle_update_conversation(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    if body.is_empty() {
+        return Ok(FilterAction::Reject(invalid_input_response_with(
+            "Missing required parameter: 'metadata'.",
+            Some("missing_required_parameter"),
+            Some("metadata"),
+        )?));
+    }
     let input: UpdateConversationRequest = match parse_json_body(body) {
         Ok(v) => v,
         Err(msg) => {
             return Ok(FilterAction::Reject(classify_update_error(&msg)?));
         },
     };
-    if let Err(msg) = validate_metadata(input.metadata.as_value()) {
-        if msg.contains("must be") {
-            return Ok(FilterAction::Reject(invalid_input_response_with(
-                &msg,
-                Some("invalid_type"),
-                Some("metadata"),
-            )?));
-        }
-        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+    if let Err(e) = validate_metadata(input.metadata.as_value()) {
+        return Ok(FilterAction::Reject(match e {
+            MetadataError::InvalidType(_) => {
+                invalid_input_response_with(&e.to_string(), Some("invalid_type"), Some("metadata"))?
+            },
+            MetadataError::ConstraintViolation(_) => invalid_input_response(&e.to_string())?,
+        }));
     }
 
     let existing = match store.get_conversation(tenant_id, conversation_id).await {
