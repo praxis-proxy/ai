@@ -58,7 +58,6 @@ fn fallback_on_primary_503() {
 
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &responses_request()));
 
-    // -- Primary assertions --
     let primary_requests = primary.requests();
     assert_eq!(primary_requests.len(), 1, "primary should receive exactly one request");
     let primary_req = &primary_requests[0];
@@ -77,7 +76,6 @@ fn fallback_on_primary_503() {
         "primary should receive primary credentials"
     );
 
-    // -- Fallback assertions --
     let fallback_requests = fallback.requests();
     assert_eq!(
         fallback_requests.len(),
@@ -100,7 +98,6 @@ fn fallback_on_primary_503() {
         "fallback should receive fallback credentials"
     );
 
-    // -- Client response assertions --
     let status = parse_status(&raw);
     assert_eq!(status, 200, "client should receive 200 after fallback succeeds");
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
@@ -112,8 +109,14 @@ fn fallback_on_primary_503() {
         response["output"][0]["content"][0]["text"], "Hello from fallback.",
         "response text should match fallback backend"
     );
-    assert_eq!(response["usage"]["input_tokens"], 5);
-    assert_eq!(response["usage"]["output_tokens"], 4);
+    assert_eq!(
+        response["usage"]["input_tokens"], 5,
+        "input token count should match fallback backend"
+    );
+    assert_eq!(
+        response["usage"]["output_tokens"], 4,
+        "output token count should match fallback backend"
+    );
 }
 
 #[test]
@@ -144,15 +147,12 @@ fn primary_succeeds_no_fallback() {
 
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &responses_request()));
 
-    // -- Primary assertions --
     let primary_requests = primary.requests();
     assert_eq!(primary_requests.len(), 1, "primary should receive exactly one request");
 
-    // -- Fallback assertions --
     let fallback_requests = fallback.requests();
     assert_eq!(fallback_requests.len(), 0, "fallback should receive zero requests");
 
-    // -- Client response assertions --
     let status = parse_status(&raw);
     assert_eq!(status, 200, "client should receive 200 from primary");
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
@@ -164,6 +164,43 @@ fn primary_succeeds_no_fallback() {
         response["output"][0]["content"][0]["text"], "Hello from primary.",
         "response text should match primary backend"
     );
-    assert_eq!(response["usage"]["input_tokens"], 3);
-    assert_eq!(response["usage"]["output_tokens"], 2);
+    assert_eq!(
+        response["usage"]["input_tokens"], 3,
+        "input token count should match primary backend"
+    );
+    assert_eq!(
+        response["usage"]["output_tokens"], 2,
+        "output token count should match primary backend"
+    );
+}
+
+#[test]
+fn both_backends_fail_returns_last_error() {
+    let primary = StatefulCapturingBackend::new(vec![(503, r#"{"error":"primary unavailable"}"#.to_owned())])
+        .start_with_shutdown();
+    let fallback = StatefulCapturingBackend::new(vec![(503, r#"{"error":"fallback unavailable"}"#.to_owned())])
+        .start_with_shutdown();
+
+    let proxy_port = free_port();
+    let config = load_example_config(
+        EXAMPLE,
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", primary.port()), ("127.0.0.1:3002", fallback.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &responses_request()));
+
+    let primary_requests = primary.requests();
+    assert_eq!(primary_requests.len(), 1, "primary should receive exactly one request");
+
+    let fallback_requests = fallback.requests();
+    assert_eq!(
+        fallback_requests.len(),
+        1,
+        "fallback should receive exactly one request"
+    );
+
+    let status = parse_status(&raw);
+    assert_eq!(status, 503, "client should receive 503 when both backends fail");
 }

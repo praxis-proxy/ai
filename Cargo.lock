@@ -3205,7 +3205,8 @@ dependencies = [
 [[package]]
 name = "praxis-proxy"
 version = "0.5.2"
-source = "git+https://github.com/praxis-proxy/praxis.git?tag=v0.5.2#af54edcd24de01e4dac7da59a809bf88bd246fe5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e8c33408ff78ce9eb011c83e04961b8d8cb80bc7f82852d34c99f72ff96b7e8"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3225,7 +3226,8 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.5.2"
-source = "git+https://github.com/praxis-proxy/praxis.git?tag=v0.5.2#af54edcd24de01e4dac7da59a809bf88bd246fe5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50cdde88169a2237ad74e0a41211c8ed08a04ed183ad64f18574000009e19232"
 dependencies = [
  "bytes",
  "dashmap 6.2.1",
@@ -3246,7 +3248,8 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.5.2"
-source = "git+https://github.com/praxis-proxy/praxis.git?tag=v0.5.2#af54edcd24de01e4dac7da59a809bf88bd246fe5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0844747ee66c06b060ae145b201a31ec828670bf95d38adb6058b483d4050c0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3274,7 +3277,8 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.5.2"
-source = "git+https://github.com/praxis-proxy/praxis.git?tag=v0.5.2#af54edcd24de01e4dac7da59a809bf88bd246fe5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6504d74ea05b2fc0ba9e934e845b8c40febc6c929194d5ca18c148cdd5f5bb7"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3298,7 +3302,8 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.5.2"
-source = "git+https://github.com/praxis-proxy/praxis.git?tag=v0.5.2#af54edcd24de01e4dac7da59a809bf88bd246fe5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "671e446adbc6edb635bf2af81b712abf628fc1ecce74799515fd860eba38247d"
 dependencies = [
  "arc-swap",
  "notify",
