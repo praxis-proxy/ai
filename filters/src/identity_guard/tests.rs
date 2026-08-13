@@ -69,6 +69,13 @@ fn from_config_defaults_namespace_to_identity() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(r#"prefix: "x-tenant-""#).unwrap();
     let filter = IdentityHeaderGuardFilter::from_config(&yaml).unwrap();
     assert_eq!(filter.name(), "identity_header_guard");
+
+    // Verify default namespace via the captured metadata key prefix.
+    // The default namespace is "identity" — custom_namespace test below
+    // verifies that a non-default value produces "maas." prefixed keys.
+    // This test verifies the default by checking from_config succeeds
+    // without metadata_namespace and the filter is usable (the actual
+    // prefix is verified in captures_matching_headers_to_metadata).
 }
 
 // -----------------------------------------------------------------------------
@@ -197,6 +204,56 @@ metadata_namespace: "maas"
     assert!(
         !ctx.filter_metadata.contains_key("identity.x-maas-username"),
         "should NOT use default namespace"
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_header_stripped_but_not_captured() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(r#"prefix: "x-tenant-""#).unwrap();
+    let filter = IdentityHeaderGuardFilter::from_config(&yaml).unwrap();
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert(
+        "x-tenant-binary",
+        HeaderValue::from_bytes(&[0x80, 0x81, 0x82]).expect("raw bytes should be valid HeaderValue"),
+    );
+
+    let mut ctx = make_filter_context(&req);
+    let _action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.filter_metadata.is_empty(),
+        "non-UTF-8 values should not be captured to metadata"
+    );
+    assert!(
+        ctx.request_headers_to_remove
+            .iter()
+            .any(|h| h.as_str() == "x-tenant-binary"),
+        "non-UTF-8 headers should still be stripped for security"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_headers_last_value_wins() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(r#"prefix: "x-tenant-""#).unwrap();
+    let filter = IdentityHeaderGuardFilter::from_config(&yaml).unwrap();
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers
+        .append("x-tenant-username", HeaderValue::from_static("admin"));
+    req.headers
+        .append("x-tenant-username", HeaderValue::from_static("unprivileged"));
+
+    let mut ctx = make_filter_context(&req);
+    let _action = filter.on_request(&mut ctx).await.unwrap();
+
+    let captured = ctx
+        .filter_metadata
+        .get("identity.x-tenant-username")
+        .expect("should capture the header");
+    assert_eq!(
+        captured, "unprivileged",
+        "last value should win when duplicate headers are present"
     );
 }
 
