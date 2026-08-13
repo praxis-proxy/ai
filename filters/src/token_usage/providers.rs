@@ -49,10 +49,21 @@ pub(super) fn parse_openai(body: &[u8]) -> Option<TokenUsage> {
         ));
     }
 
-    // Responses API format (usage nested under response wrapper).
+    // Responses API streaming (usage nested under response wrapper).
     if let Ok(wrapper) = serde_json::from_slice::<ResponsesApiEvent>(body)
         && let Some(inner) = wrapper.response
         && let Some(usage) = inner.usage
+    {
+        return Some(TokenUsage::new(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+        ));
+    }
+
+    // Responses API non-streaming (top-level usage with input_tokens/output_tokens).
+    if let Ok(resp) = serde_json::from_slice::<ResponsesApiDirectResponse>(body)
+        && let Some(usage) = resp.usage
     {
         return Some(TokenUsage::new(
             usage.input_tokens,
@@ -75,6 +86,13 @@ struct ResponsesApiEvent {
 #[derive(Deserialize)]
 struct ResponsesApiResponse {
     /// Token usage statistics.
+    usage: Option<ResponsesApiUsage>,
+}
+
+/// Non-streaming Responses API response with top-level usage.
+#[derive(Deserialize)]
+struct ResponsesApiDirectResponse {
+    /// Token usage (same format as streaming, at top level).
     usage: Option<ResponsesApiUsage>,
 }
 
@@ -268,6 +286,19 @@ mod tests {
         assert_eq!(usage.input_tokens(), 10);
         assert_eq!(usage.output_tokens(), 20);
         assert_eq!(usage.total_tokens(), 30, "should compute total when absent");
+    }
+
+    #[test]
+    fn openai_responses_api_non_streaming() {
+        let json = br#"{"id":"resp_123","object":"response","usage":{"input_tokens":150,"output_tokens":42,"total_tokens":192}}"#;
+        let usage = parse_openai(json).unwrap();
+        assert_eq!(
+            usage.input_tokens(),
+            150,
+            "should parse non-streaming Responses API with top-level usage"
+        );
+        assert_eq!(usage.output_tokens(), 42);
+        assert_eq!(usage.total_tokens(), 192);
     }
 
     #[test]
