@@ -11,6 +11,8 @@
 pub mod agentic;
 pub mod guardrails;
 pub mod inference;
+#[cfg(feature = "opentelemetry")]
+mod opentelemetry;
 pub mod prompt_enrich;
 mod register;
 pub mod routing;

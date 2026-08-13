@@ -56,6 +56,7 @@ before sending requests.
 | [conversations.yaml](configs/openai/conversations/conversations.yaml) | Local /v1/conversations endpoints for conversation lifecycle, backed by the ConversationItemStore |
 | [embeddings-routing.yaml](configs/openai/embeddings/embeddings-routing.yaml) | Routes OpenAI Embeddings API requests to a dedicated Embeddings API backend |
 | [prompts-routing.yaml](configs/openai/prompts/prompts-routing.yaml) | Routes OpenAI Prompts API requests to a dedicated Prompts API backend |
+| [agentic-loop-fixture.yaml](configs/openai/responses/agentic-loop-fixture.yaml) | Minimal agentic loop pipeline for inference fixture replay |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates the compaction flow: store a response, rehydrate it on the next turn, and count tokens to check if compaction is needed |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
@@ -71,7 +72,7 @@ before sending requests.
 | [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists non-streaming Responses API responses to a database and serves stored data via GET endpoints and handles DELETE /v1/responses/{id} locally |
 | [responses-proxy.yaml](configs/openai/responses/responses-proxy.yaml) | Proxies OpenAI Responses API requests to a native /v1/responses backend |
 | [responses-routing.yaml](configs/openai/responses/responses-routing.yaml) | Routes Responses API traffic by detected mode |
-| [responses-to-chat-completions.yaml](configs/openai/responses/responses-to-chat-completions.yaml) | Accepts OpenAI Responses create requests while targeting an inference backend that only implements /v1/chat/completions |
+| [responses-to-chat-completions.yaml](configs/openai/responses/responses-to-chat-completions.yaml) | Accepts OpenAI Responses create requests, including finite stored continuations, while targeting a backend that only implements /v1/chat/completions |
 | [stream-events.yaml](configs/openai/responses/stream-events.yaml) | Demonstrates the `openai_stream_events` filter, which observes SSE chunks from the backend without modification, accumulates state (response object, output items, tool calls, usage), and writes it to ResponsesState metadata |
 | [tool-routing.yaml](configs/openai/responses/tool-routing.yaml) | Demonstrates using `openai_tool_parse` to route Responses API requests by their tool composition |
 | [vector-stores-routing.yaml](configs/openai/responses/vector-stores-routing.yaml) | Routes /v1/vector_stores traffic and all its subresources to a dedicated backend (any server compatible with the OpenAI Files / Vector Stores API), while sending everything else to a default backend |

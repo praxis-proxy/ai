@@ -54,8 +54,14 @@ async fn non_create_request_continues_without_rewriting_or_arming() {
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(body.as_deref(), Some(original.as_ref()));
-    assert!(context.get_metadata(ARMED_KEY).is_none());
-    assert!(context.get_metadata(CREATED_AT_KEY).is_none());
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "non-create request must not arm response processing"
+    );
+    assert!(
+        context.get_metadata(CREATED_AT_KEY).is_none(),
+        "non-create request must not set created_at"
+    );
 }
 
 #[test]
@@ -139,6 +145,91 @@ async fn classified_responses_create_without_state_fails_closed() {
 }
 
 #[tokio::test]
+async fn unresolved_previous_response_id_fails_closed() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_format.stream", "false");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "current input",
+        "previous_response_id": "resp_previous"
+    })));
+    let original = Bytes::from_static(
+        br#"{"model":"gpt-4.1-mini","input":"current input","previous_response_id":"resp_previous"}"#,
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected rejection");
+    };
+    assert_eq!(rejection.status, 500);
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(parsed["error"]["code"], "server_error");
+    assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
+    assert_eq!(body.as_deref(), Some(original.as_ref()));
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "unresolved previous_response_id must not arm response processing"
+    );
+    assert!(
+        context.get_metadata(CREATED_AT_KEY).is_none(),
+        "unresolved previous_response_id must not set created_at"
+    );
+}
+
+#[tokio::test]
+async fn unresolved_streaming_previous_response_id_fails_closed_with_sse_error() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_format.stream", "true");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "current input",
+        "previous_response_id": "resp_previous",
+        "stream": true
+    })));
+    let original = Bytes::from_static(
+        br#"{"model":"gpt-4.1-mini","input":"current input","previous_response_id":"resp_previous","stream":true}"#,
+    );
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected rejection");
+    };
+    assert_eq!(rejection.status, 500);
+    assert_eq!(
+        rejection.headers.iter().find(|(name, _)| name == "content-type"),
+        Some(&("content-type".to_owned(), "text/event-stream".to_owned()))
+    );
+    let event = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(
+        event.starts_with("event: error\ndata: "),
+        "streaming rejection must use SSE error event format"
+    );
+    let data = event.strip_prefix("event: error\ndata: ").unwrap().trim_end();
+    let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(parsed["error"]["code"], "server_error");
+    assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
+    assert_eq!(body.as_deref(), Some(original.as_ref()));
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "unresolved streaming request must not arm response processing"
+    );
+    assert!(
+        context.get_metadata(CREATED_AT_KEY).is_none(),
+        "unresolved streaming request must not set created_at"
+    );
+}
+
+#[tokio::test]
 async fn streaming_responses_create_without_state_uses_sse_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -158,7 +249,10 @@ async fn streaming_responses_create_without_state_uses_sse_error() {
         Some(&("content-type".to_owned(), "text/event-stream".to_owned()))
     );
     let event = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
-    assert!(event.starts_with("event: error\ndata: "));
+    assert!(
+        event.starts_with("event: error\ndata: "),
+        "stateless streaming rejection must use SSE error event format"
+    );
     let data = event.strip_prefix("event: error\ndata: ").unwrap().trim_end();
     let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
     assert_eq!(parsed["error"]["code"], "server_error");
@@ -200,7 +294,10 @@ async fn canonical_state_is_translated_and_arms_response() {
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "canonical Responses request should translate successfully"
+    );
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(translated["model"], "gpt-4.1-mini");
     assert_eq!(translated["messages"][0]["content"], "earlier history");
@@ -209,10 +306,62 @@ async fn canonical_state_is_translated_and_arms_response() {
     assert!(
         context
             .request_headers_to_remove
-            .contains(&http::header::ACCEPT_ENCODING)
+            .contains(&http::header::ACCEPT_ENCODING),
+        "translation must strip accept-encoding to prevent opaque responses"
     );
     assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
     assert_eq!(context.get_metadata(CREATED_AT_KEY), Some("1700000000"));
+}
+
+#[tokio::test]
+async fn rehydrated_previous_response_id_translates_full_history() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_format.stream", "false");
+    let request_body = json!({
+        "model": "gpt-4.1-mini",
+        "input": "current input",
+        "previous_response_id": "resp_previous",
+        "stream": false
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
+    state.messages = vec![
+        json!({"role": "user", "content": "earlier question"}),
+        json!({"role": "assistant", "content": "earlier answer"}),
+        json!({"role": "user", "content": "current input"}),
+    ];
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1-mini","input":"current input","previous_response_id":"resp_previous","stream":false}"#,
+    ));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "rehydrated continuation should translate successfully"
+    );
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["messages"],
+        json!([
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier answer"},
+            {"role": "user", "content": "current input"}
+        ])
+    );
+    assert!(
+        translated.get("input").is_none(),
+        "Responses-only field `input` must be stripped from translated body"
+    );
+    assert!(
+        translated.get("previous_response_id").is_none(),
+        "Responses-only field `previous_response_id` must be stripped from translated body"
+    );
+    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
 }
 
 #[tokio::test]
@@ -236,8 +385,14 @@ async fn translated_request_over_configured_limit_is_rejected() {
     assert_eq!(rejection.status, 413);
     let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], "invalid_request_error");
-    assert!(context.get_metadata(ARMED_KEY).is_none());
-    assert!(context.get_metadata(CREATED_AT_KEY).is_none());
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "oversized request must not arm response processing"
+    );
+    assert!(
+        context.get_metadata(CREATED_AT_KEY).is_none(),
+        "oversized request must not set created_at"
+    );
 }
 
 #[tokio::test]
@@ -263,8 +418,14 @@ async fn unsupported_responses_tool_is_rejected_at_filter_boundary() {
     assert_eq!(rejection.status, 400);
     let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], "invalid_request_error");
-    assert!(context.get_metadata(ARMED_KEY).is_none());
-    assert!(context.get_metadata(CREATED_AT_KEY).is_none());
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "unsupported tool rejection must not arm response processing"
+    );
+    assert!(
+        context.get_metadata(CREATED_AT_KEY).is_none(),
+        "unsupported tool rejection must not set created_at"
+    );
 }
 
 #[tokio::test]
@@ -290,8 +451,14 @@ async fn streaming_translation_error_uses_responses_sse_error_event() {
         panic!("expected rejection");
     };
     assert_responses_sse_translation_error(&rejection);
-    assert!(context.get_metadata(ARMED_KEY).is_none());
-    assert!(context.get_metadata(CREATED_AT_KEY).is_none());
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "streaming translation error must not arm response processing"
+    );
+    assert!(
+        context.get_metadata(CREATED_AT_KEY).is_none(),
+        "streaming translation error must not set created_at"
+    );
 }
 
 fn assert_responses_sse_translation_error(rejection: &praxis_filter::Rejection) {
@@ -543,11 +710,12 @@ async fn non_streaming_chat_response_becomes_response_resource() {
     let request_value = json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
+        "previous_response_id": "resp_previous",
         "stream": false
     });
-    context
-        .extensions
-        .insert(ResponsesState::from_request_body(request_value));
+    let mut state = ResponsesState::from_request_body(request_value);
+    state.history_rehydrated = true;
+    context.extensions.insert(state);
     let mut request_body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":false}"#,
     ));
@@ -586,6 +754,7 @@ async fn non_streaming_chat_response_becomes_response_resource() {
     let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
     assert_eq!(translated["id"], "resp_test_123");
     assert_eq!(translated["object"], "response");
+    assert_eq!(translated["previous_response_id"], "resp_previous");
     assert_eq!(translated["output"][0]["content"][0]["text"], "Hello");
     assert_eq!(translated["usage"]["input_tokens"], 3);
     assert_eq!(translated["usage"]["output_tokens"], 2);
