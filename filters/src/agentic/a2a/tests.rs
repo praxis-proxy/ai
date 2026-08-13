@@ -1729,6 +1729,42 @@ async fn complete_json_prefix_then_garbage_does_not_capture_route() {
 }
 
 #[tokio::test]
+async fn tentative_survives_whitespace_chunk_before_eos() {
+    let filter = make_task_routing_filter();
+    let store = filter.task_route_store.as_ref().unwrap();
+    let req = make_a2a_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    seed_response_capture(&mut ctx);
+
+    let json =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"task-ws-wait","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+    let mut body1 = Some(Bytes::from(json));
+    drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+    // Whitespace-only chunk with EOS=false: tentative must survive, route not yet committed.
+    let mut ws = Some(Bytes::from_static(b"  \n"));
+    drop(filter.on_response_body(&mut ctx, &mut ws, false).unwrap());
+    assert!(
+        store.get_by_task_id("task-ws-wait").is_none(),
+        "route must not be committed while EOS has not arrived"
+    );
+    assert!(
+        ctx.filter_metadata.contains_key("a2a.response.tentative_json"),
+        "tentative must survive a whitespace-only intermediate chunk"
+    );
+
+    // EOS with no body: commit.
+    let mut eos = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+    assert_eq!(
+        store.get_by_task_id("task-ws-wait").as_deref(),
+        Some("agent-a"),
+        "route must be committed once EOS arrives after whitespace-only intermediate chunks"
+    );
+    assert_capture_scratch_cleared(&ctx);
+}
+
+#[tokio::test]
 async fn complete_json_followed_by_whitespace_at_eos_captures_route() {
     // EOS arriving with only whitespace after a tentative capture must
     // confirm and commit the route — whitespace is not a trailing-content
