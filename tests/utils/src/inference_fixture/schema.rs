@@ -319,6 +319,40 @@ pub struct ScenarioTurn {
     pub expect: ScenarioExpectation,
 }
 
+impl ScenarioTurn {
+    /// Binds exact `${PREVIOUS_RESPONSE_ID}` JSON values to the immediately
+    /// preceding client response identifier.
+    pub(super) fn bind_previous_response_id(&mut self, previous_response_id: Option<&str>) -> Result<(), FixtureError> {
+        let RecordedBody::Json { value } = &mut self.request.body else {
+            return Ok(());
+        };
+        let has_placeholder = contains_exact_string(value, "${PREVIOUS_RESPONSE_ID}");
+        if !has_placeholder {
+            return Ok(());
+        }
+        let Some(previous_response_id) = previous_response_id else {
+            return Err(FixtureError::ReplayRuntime {
+                message: "scenario previous response ID placeholder has no preceding response",
+            });
+        };
+        bind_exact_string(value, "${PREVIOUS_RESPONSE_ID}", previous_response_id);
+        Ok(())
+    }
+}
+
+impl RecordedResponse {
+    /// Returns the top-level Responses resource identifier, when present.
+    pub(super) fn response_id(&self) -> Option<&str> {
+        let RecordedBody::Json { value } = &self.body else {
+            return None;
+        };
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("resp_"))
+    }
+}
+
 /// The expected observable outcomes for a scenario turn.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2450,6 +2484,34 @@ fn bind_model_value(value: &mut Value, model: &str) {
     }
 }
 
+/// Returns whether a JSON tree contains an exact string value.
+fn contains_exact_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(current) => current == expected,
+        Value::Array(values) => values.iter().any(|value| contains_exact_string(value, expected)),
+        Value::Object(values) => values.values().any(|value| contains_exact_string(value, expected)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// Replaces exact string values in a JSON tree without rewriting substrings.
+fn bind_exact_string(value: &mut Value, expected: &str, replacement: &str) {
+    match value {
+        Value::String(current) if current == expected => replacement.clone_into(current),
+        Value::Array(values) => {
+            for value in values {
+                bind_exact_string(value, expected, replacement);
+            }
+        },
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                bind_exact_string(value, expected, replacement);
+            }
+        },
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -4104,5 +4166,47 @@ turns:
             panic!("the original scenario request should have a JSON body");
         };
         assert_eq!(original["model"], "${MODEL}");
+    }
+
+    #[test]
+    fn scenario_turn_binds_only_exact_previous_response_id_values() {
+        let temporary_file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(temporary_file.path(), COMPLETE_SCENARIO).unwrap();
+        let mut scenario = InferenceScenario::load(temporary_file.path()).unwrap();
+        let RecordedBody::Json { value } = &mut scenario.turns[0].request.body else {
+            panic!("the scenario request should have a JSON body");
+        };
+        value["previous_response_id"] = json!("${PREVIOUS_RESPONSE_ID}");
+        value["nested"]["literal"] = json!("prefix-${PREVIOUS_RESPONSE_ID}");
+
+        scenario.turns[0]
+            .bind_previous_response_id(Some("resp_previous"))
+            .unwrap();
+
+        let RecordedBody::Json { value } = &scenario.turns[0].request.body else {
+            panic!("the scenario request should have a JSON body");
+        };
+        assert_eq!(value["previous_response_id"], "resp_previous");
+        assert_eq!(value["nested"]["literal"], "prefix-${PREVIOUS_RESPONSE_ID}");
+    }
+
+    #[test]
+    fn scenario_turn_rejects_previous_response_placeholder_without_prior_response() {
+        let temporary_file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(temporary_file.path(), COMPLETE_SCENARIO).unwrap();
+        let mut scenario = InferenceScenario::load(temporary_file.path()).unwrap();
+        let RecordedBody::Json { value } = &mut scenario.turns[0].request.body else {
+            panic!("the scenario request should have a JSON body");
+        };
+        value["previous_response_id"] = json!("${PREVIOUS_RESPONSE_ID}");
+
+        let error = scenario.turns[0]
+            .bind_previous_response_id(None)
+            .expect_err("the first turn cannot reference a preceding response");
+
+        assert_eq!(
+            error.to_string(),
+            "scenario previous response ID placeholder has no preceding response"
+        );
     }
 }

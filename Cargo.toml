@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "server",
+    "server/build_support",
     "filters",
     "apis",
     "xtask",
@@ -79,6 +80,7 @@ praxis-test-utils = { path = "tests/utils" }
 praxis-ai-proxy = { version = "0.2.0", path = "server" }
 praxis-ai-filters = { version = "0.2.0", path = "filters" }
 praxis-ai-apis = { version = "0.2.0", path = "apis" }
+praxis-ai-build-support = { version = "0.2.0", path = "server/build_support" }
 
 # Pingora (temporary fork)
 pingora-core = { version = "0.8.2", package = "quixotic-plecostomus-core", features = ["rustls"] }
