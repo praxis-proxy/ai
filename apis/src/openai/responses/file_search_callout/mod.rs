@@ -284,6 +284,10 @@ impl FileSearchCalloutFilter {
     }
 
     /// Execute pending calls before the next inference body is serialized.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear sequence: plan → callout → apply → size check"
+    )]
     async fn execute_pending(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if let Some(rejection) = unsupported_streaming_rejection(ctx) {
             return Ok(rejection);
@@ -291,17 +295,15 @@ impl FileSearchCalloutFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-
         let plan = build_search_plan(state);
         if !plan.has_pending_calls {
             return Ok(FilterAction::Continue);
         }
-
-        let batch = self.execute_plan(&plan, &ctx.request.headers).await;
+        let hdrs = callout_request_headers(ctx);
+        let batch = self.execute_plan(&plan, &hdrs).await;
         if let Some(rejection) = self.failure_rejection(&batch) {
             return Ok(rejection);
         }
-
         let framework_bytes = retained_iteration_bytes(ctx);
         let state = ctx
             .extensions
@@ -313,10 +315,8 @@ impl FileSearchCalloutFilter {
         if !continuation_state_fits(framework_bytes, state, self.max_state_bytes, 0) {
             return Ok(continuation_state_rejection());
         }
-
         reset_tool_choice(state);
         state.iteration = state.iteration.saturating_add(1);
-
         Ok(FilterAction::Continue)
     }
 
@@ -500,6 +500,24 @@ impl HttpFilter for FileSearchCalloutFilter {
         }
         Self::capture_response(ctx, body, self.max_state_bytes)
     }
+}
+
+/// On IRR continuation iterations the synthetic request lacks client
+/// credentials; return the original request headers so `forward_headers`
+/// can reach the vector store. Borrows on the first iteration; on
+/// continuations filters out headers nominated by `Connection`.
+fn callout_request_headers<'a>(ctx: &'a HttpFilterContext<'_>) -> Cow<'a, HeaderMap> {
+    let Some(state) = ctx.extensions.get::<IterationState>().filter(|s| s.iteration() > 0) else {
+        return Cow::Borrowed(&ctx.request.headers);
+    };
+    let original = &state.original_request.headers;
+    let mut filtered = HeaderMap::with_capacity(original.len());
+    for (name, value) in original {
+        if !connection_nominates_header(original, name) {
+            filtered.append(name.clone(), value.clone());
+        }
+    }
+    Cow::Owned(filtered)
 }
 
 /// Restore end-to-end client headers after the iterative router isolates a

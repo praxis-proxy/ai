@@ -15,6 +15,7 @@ mod compact;
 mod credential_injection;
 mod file_search_callout;
 mod full_flow;
+mod full_flow_agentic;
 mod guardrails;
 mod mcp_broker;
 mod model_to_header;
