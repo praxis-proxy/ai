@@ -70,7 +70,7 @@ fn main() {
 
     let config_path = praxis_ai::resolve_config_path(explicit.as_deref());
     let config = praxis_ai::load_config(explicit.as_deref()).unwrap_or_else(|e| praxis_ai::fatal(&e));
-    praxis_ai::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e));
+    let _tracing_guard = praxis_ai::init_tracing(&config).unwrap_or_else(|e| praxis_ai::fatal(&e));
     info!("starting server");
     praxis_ai::run_server(config, config_path)
 }
