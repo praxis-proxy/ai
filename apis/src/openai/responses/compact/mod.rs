@@ -12,12 +12,12 @@
 //!
 //! # Scope
 //!
-//! Compaction only applies to **multi-turn requests** where
-//! `openai_responses_rehydrate` has loaded stored conversation history
-//! — i.e. requests that include `previous_response_id` or
-//! `conversation`. Single-turn requests (no stored history, even with
-//! `context_management` set) are released without compaction because
-//! there is no prior history to summarize.
+//! Compaction runs whenever the request carries a `context_management`
+//! compaction entry and the token count exceeds the configured
+//! threshold. The conversation may come from stored history loaded
+//! by `openai_responses_rehydrate` (via `previous_response_id` or
+//! `conversation`) or directly from the client's `input` array when
+//! no stored history is referenced.
 
 pub(super) mod config;
 
@@ -254,6 +254,58 @@ impl CompactFilter {
         }
     }
 
+    /// Apply compaction results: replace messages and persist the
+    /// compaction response to the store.
+    fn apply_compaction(&self, ctx: &mut HttpFilterContext<'_>, summary: &str, model: &str) {
+        let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
+        let resp_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
+        let created_at = i64::try_from(ctx.time_source.now().as_secs()).unwrap_or(i64::MAX);
+        let store = ctx
+            .extensions
+            .get::<ResponseStoreRegistry>()
+            .and_then(|r| r.get("default"));
+        let tenant_id = ctx.get_metadata("responses.tenant_id").unwrap_or("default").to_owned();
+
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            warn!("ResponsesState missing in apply_compaction");
+            return;
+        };
+        replace_messages(
+            state,
+            build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
+        );
+        if let Some(store) = store.as_deref() {
+            persist_compaction_response(store, &resp_id, model, &tenant_id, created_at, state);
+        }
+    }
+
+    /// Check threshold and run summarization if exceeded.
+    ///
+    /// Returns `Ok(Some((summary, model)))` when compaction ran,
+    /// `Ok(None)` when skipped, or `Err(FilterAction)` to
+    /// short-circuit.
+    async fn check_and_summarize(
+        &self,
+        state: &ResponsesState,
+        streaming: bool,
+    ) -> Result<Option<(String, String)>, FilterAction> {
+        let Some((params, conversation_text)) = should_compact(state, &self.config.tiktoken_encoding) else {
+            return Ok(None);
+        };
+        let summary = match self
+            .execute_compaction(state, &params, streaming, &conversation_text)
+            .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(None),
+            Err(action) => return Err(action),
+        };
+        let model = params
+            .compaction_model
+            .unwrap_or_else(|| self.config.default_model.clone());
+        Ok(Some((summary, model)))
+    }
+
     /// Handle an explicit `POST /v1/responses/compact` request.
     ///
     /// Loads a stored conversation by `response_id`, compacts it via
@@ -278,7 +330,7 @@ impl CompactFilter {
         let req = parse_compact_request_body(body)?;
         let (store, tenant_id) = resolve_store_and_tenant(ctx)?;
         let record = fetch_response_blocking(&*store, &tenant_id, &req)?;
-        let messages = extract_stored_messages(&record)?;
+        let messages = extract_stored_messages(record)?;
         let summary = self.summarize_messages(&req, &messages).await?;
         let response_object = build_and_persist_compaction(self, ctx, &*store, &tenant_id, &req, &summary)?;
         let body_bytes = serde_json::to_vec(&response_object).unwrap_or_default();
@@ -291,7 +343,6 @@ impl CompactFilter {
 }
 
 #[async_trait]
-#[expect(clippy::too_many_lines, reason = "filter pipeline method with sequential stages")]
 impl HttpFilter for CompactFilter {
     fn name(&self) -> &'static str {
         "openai_responses_compact"
@@ -327,44 +378,19 @@ impl HttpFilter for CompactFilter {
             return Ok(FilterAction::Release);
         }
         let streaming = is_streaming(ctx);
-        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
-            return Ok(FilterAction::Release);
-        };
-        if !state.history_rehydrated {
+        if !ensure_compactable_state(ctx) {
             return Ok(FilterAction::Release);
         }
-        let Some((params, conversation_text)) = should_compact(state, &self.config.tiktoken_encoding) else {
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            warn!("ResponsesState missing after ensure_compactable_state");
             return Ok(FilterAction::Release);
         };
-        let compaction = self.execute_compaction(state, &params, streaming, &conversation_text);
-        let summary = match compaction.await {
-            Ok(Some(s)) => s,
+        let (summary, model) = match self.check_and_summarize(state, streaming).await {
+            Ok(Some(result)) => result,
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
             Err(action) => return Ok(action),
         };
-        let model = params
-            .compaction_model
-            .as_deref()
-            .unwrap_or(&self.config.default_model)
-            .to_owned();
-        let compaction_id = format!("compact_{}", ctx.id_generator.generate(ctx.time_source));
-        let compaction_resp_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
-        let created_at = i64::try_from(ctx.time_source.now().as_secs()).unwrap_or(i64::MAX);
-        let store = ctx
-            .extensions
-            .get::<ResponseStoreRegistry>()
-            .and_then(|r| r.get("default"));
-        let tenant_id = ctx.get_metadata("responses.tenant_id").unwrap_or("default").to_owned();
-        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
-            return Ok(FilterAction::Release);
-        };
-        replace_messages(
-            state,
-            build_compaction_item(&compaction_id, &summary, &self.config.summary_prefix),
-        );
-        if let Some(store) = store.as_deref() {
-            persist_compaction_response(store, &compaction_resp_id, &model, &tenant_id, created_at, state);
-        }
+        self.apply_compaction(ctx, &summary, &model);
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
@@ -373,6 +399,21 @@ impl HttpFilter for CompactFilter {
 // -----------------------------------------------------------------------------
 // Compaction Logic
 // -----------------------------------------------------------------------------
+
+/// Returns `true` when compaction should proceed.
+fn ensure_compactable_state(ctx: &HttpFilterContext<'_>) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return false;
+    };
+    if state.history_rehydrated {
+        return true;
+    }
+    if extract_compaction_config(&state.context_management).is_some() {
+        debug!("direct input compaction path, no rehydration");
+        return true;
+    }
+    false
+}
 
 /// Check whether compaction should run and return the params + text.
 ///
@@ -383,31 +424,43 @@ impl HttpFilter for CompactFilter {
 /// its `total_tokens` is used directly — avoiding the cost of BPE
 /// tokenization. Falls back to tiktoken estimation otherwise.
 ///
-/// The token estimate includes instructions and tool definitions in
-/// addition to conversation messages, since all three contribute to
-/// the rendered context sent to the model.
+/// The check is reactive: the token count reflects the *previous*
+/// turn's usage, not the current one. If the previous turn exceeded
+/// the threshold, we compact before sending this turn.
 fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(CompactionParams, String)> {
     let params = extract_compaction_config(&state.context_management)?;
 
+    if let Some(token_count) = previous_usage_total(state) {
+        if !exceeds_threshold(token_count, &params) {
+            return None;
+        }
+        return Some((params, build_conversation_text(&state.messages)));
+    }
+
     let conversation_text = build_conversation_text(&state.messages);
+    let token_count = get_token_count(&conversation_text, tiktoken_encoding)?;
+    if !exceeds_threshold(token_count, &params) {
+        return None;
+    }
+    Some((params, conversation_text))
+}
 
-    let token_count =
-        previous_usage_total(state).or_else(|| get_token_count(&conversation_text, tiktoken_encoding))?;
-
+/// Log and return whether `token_count` exceeds the compaction threshold.
+fn exceeds_threshold(token_count: u64, params: &CompactionParams) -> bool {
     if token_count <= params.compact_threshold {
         debug!(
             token_count,
             threshold = params.compact_threshold,
             "under threshold, skipping"
         );
-        return None;
+        return false;
     }
     debug!(
         token_count,
         threshold = params.compact_threshold,
         "threshold exceeded, compacting"
     );
-    Some((params, conversation_text))
+    true
 }
 
 /// Extract `total_tokens` from the previous response's usage object.
@@ -507,19 +560,15 @@ fn fetch_response_blocking(
 }
 
 /// Extract messages from a stored response.
-fn extract_stored_messages(record: &ResponseRecord) -> Result<Vec<Value>, FilterAction> {
-    let messages: Vec<Value> = match &record.messages {
-        Value::Array(arr) => arr.clone(),
-        _ => Vec::new(),
-    };
-    if messages.is_empty() {
-        return Err(reject_compact(
+fn extract_stored_messages(record: ResponseRecord) -> Result<Vec<Value>, FilterAction> {
+    match record.messages {
+        Value::Array(arr) if !arr.is_empty() => Ok(arr),
+        _ => Err(reject_compact(
             400,
             "invalid_request_error",
             "response has no messages to compact",
-        ));
+        )),
     }
-    Ok(messages)
 }
 
 /// Build and persist the compaction result for an explicit compact request.
@@ -725,18 +774,25 @@ fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value
 
 /// Replace conversation history with the compaction item.
 ///
-/// After replacement:
-/// - `state.messages` = `[compaction_item, ...state.input]`
-/// - `state.persisted_messages` = `[compaction_item, ...state.input]`
+/// In the **rehydrated** path `state.input` holds only the current
+/// turn's messages (rehydrate prepends history to `state.messages`
+/// but leaves `input` untouched). Result:
+/// `[compaction_item, ...current_turn_input]`.
 ///
-/// The compaction item is `{"type": "compaction", "encrypted_content": "<base64>"}`.
-/// `state.input` holds the current request's input items (unchanged
-/// by rehydrate), so the current turn's messages are preserved.
+/// In the **direct input** path `state.input == state.messages`
+/// (no rehydration). Preserving `input` would duplicate the entire
+/// conversation after the summary. Result: `[compaction_item]`.
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
-    let mut new_messages = Vec::with_capacity(state.input.len() + 1);
-    new_messages.push(compaction_item);
-    new_messages.extend(state.input.iter().cloned());
-    state.persisted_messages = new_messages.clone();
+    let direct_input = !state.history_rehydrated;
+    let new_messages = if direct_input {
+        vec![compaction_item]
+    } else {
+        let mut msgs = Vec::with_capacity(state.input.len() + 1);
+        msgs.push(compaction_item);
+        msgs.extend(state.input.iter().cloned());
+        msgs
+    };
+    state.persisted_messages.clone_from(&new_messages);
     state.messages = new_messages;
 }
 
@@ -755,6 +811,7 @@ fn persist_compaction_response(
     created_at: i64,
     state: &ResponsesState,
 ) {
+    let persisted = Value::Array(state.persisted_messages.clone());
     let record = ResponseRecord {
         id: response_id.to_owned(),
         tenant_id: tenant_id.to_owned(),
@@ -765,8 +822,8 @@ fn persist_compaction_response(
             "object": "response",
             "status": "completed",
         }),
-        input: Value::Array(state.persisted_messages.clone()),
-        messages: Value::Array(state.persisted_messages.clone()),
+        input: persisted.clone(),
+        messages: persisted,
     };
     let handle = tokio::runtime::Handle::current();
     if let Err(e) = tokio::task::block_in_place(|| handle.block_on(store.upsert_response(&record))) {
@@ -868,11 +925,19 @@ fn extract_content(msg: &Value) -> Cow<'_, str> {
         return Cow::Borrowed(s);
     }
     if let Some(arr) = content.as_array() {
-        let texts: Vec<&str> = arr
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect();
-        return Cow::Owned(texts.join(" "));
+        let mut joined = String::new();
+        for part in arr {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if !joined.is_empty() {
+                    joined.push(' ');
+                }
+                joined.push_str(text);
+            }
+        }
+        if !joined.is_empty() {
+            return Cow::Owned(joined);
+        }
+        return Cow::Borrowed("");
     }
     Cow::Borrowed("")
 }

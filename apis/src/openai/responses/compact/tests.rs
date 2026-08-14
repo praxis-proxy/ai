@@ -149,6 +149,15 @@ fn extract_compaction_config_zero_threshold_compacts_immediately() {
     assert_eq!(params.compact_threshold, 0, "explicit zero should still compact");
 }
 
+#[test]
+fn extract_compaction_config_float_threshold_skips_compaction() {
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": 0.9}]));
+    assert!(
+        extract_compaction_config(&cm).is_none(),
+        "float threshold should skip compaction (as_u64 returns None)"
+    );
+}
+
 // =============================================================================
 // build_compaction_item tests
 // =============================================================================
@@ -346,6 +355,7 @@ fn replace_messages_preserves_current_input() {
         "model": "gpt-4o",
         "input": "What's next?"
     }));
+    state.history_rehydrated = true;
     state
         .messages
         .insert(0, json!({"role": "user", "content": "old question"}));
@@ -368,6 +378,26 @@ fn replace_messages_preserves_current_input() {
     assert!(state.messages[0].get("encrypted_content").is_some());
     assert_eq!(state.persisted_messages.len(), 2);
     assert_eq!(state.persisted_messages[0]["type"], "compaction");
+}
+
+#[test]
+fn replace_messages_direct_input_does_not_duplicate_conversation() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"}
+        ]
+    }));
+    assert_eq!(state.input, state.messages, "direct input: input == messages");
+
+    let compaction_item = build_compaction_item("compact_direct", "Summary.", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, compaction_item);
+
+    assert_eq!(state.messages.len(), 1, "direct input should only have compaction item");
+    assert_eq!(state.messages[0]["type"], "compaction");
+    assert_eq!(state.persisted_messages.len(), 1);
 }
 
 // =============================================================================
@@ -584,6 +614,37 @@ fn should_compact_skips_when_previous_usage_below_threshold() {
     state.previous_usage = Some(json!({"total_tokens": 50}));
     let result = should_compact(&state, "cl100k_base");
     assert!(result.is_none(), "should skip when previous_usage is below threshold");
+}
+
+// =============================================================================
+// direct input should_compact
+// =============================================================================
+
+#[test]
+fn direct_input_should_compact_uses_tiktoken() {
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [
+            {"role": "user", "content": "x".repeat(5000)}
+        ],
+        "context_management": [{"type": "compaction", "compact_threshold": 50}]
+    }));
+    let result = should_compact(&state, "cl100k_base");
+    assert!(
+        result.is_some(),
+        "direct input exceeding threshold should trigger compaction"
+    );
+}
+
+#[test]
+fn direct_input_should_not_compact_below_threshold() {
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": "Hi"}],
+        "context_management": [{"type": "compaction", "compact_threshold": 50000}]
+    }));
+    let result = should_compact(&state, "cl100k_base");
+    assert!(result.is_none(), "direct input below threshold should skip compaction");
 }
 
 // =============================================================================

@@ -275,3 +275,56 @@ async fn compact_verifies_summarization_call_and_compacted_state() {
         "second item should be the current user input"
     );
 }
+
+#[test]
+fn compact_direct_input_compacts_full_conversation() {
+    let (backend_port, captured_inference_body) =
+        start_sequenced_backend(CHAT_COMPLETIONS_RESPONSE, INFERENCE_RESPONSE);
+    let proxy_port = free_port();
+
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    let config = load_compact_config(&yaml, "sqlite::memory:", proxy_port, backend_port);
+    let proxy = start_proxy(&config);
+
+    // Send a full conversation in `input` with context_management but
+    // no previous_response_id — the direct input compaction path.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":[{"role":"user","content":"Explain TCP vs UDP in detail"},{"role":"assistant","content":"TCP is a connection-oriented protocol that ensures reliable ordered delivery of data through a three-way handshake. UDP is connectionless and unreliable but faster with lower overhead."},{"role":"user","content":"What about flow control?"},{"role":"assistant","content":"TCP implements flow control via sliding window protocol and congestion control through algorithms like slow start and congestion avoidance. UDP has no built-in flow or congestion control."},{"role":"user","content":"Compare with QUIC"}],"context_management":[{"type":"compaction","compact_threshold":50}]}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "direct input compaction should succeed");
+    drop(proxy);
+
+    // Verify the inference request received the compacted input.
+    let inference_body = captured_inference_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("inference request body should have been captured");
+    let inference_json: serde_json::Value =
+        serde_json::from_str(&inference_body).expect("inference body should be valid JSON");
+
+    // Direct input compaction replaces all messages with [compaction_item],
+    // which the proxy filter translates to an assistant message.
+    let input = inference_json["input"].as_array().expect("input should be an array");
+    assert_eq!(
+        input.len(),
+        1,
+        "direct input compaction should produce a single compacted item"
+    );
+    assert_eq!(
+        input[0]["role"], "assistant",
+        "compacted item should be translated to an assistant message"
+    );
+    let content = input[0]["content"]
+        .as_str()
+        .expect("summary content should be a string");
+    assert!(
+        content.contains("Previous conversation summary"),
+        "summary should include the default prefix"
+    );
+}
