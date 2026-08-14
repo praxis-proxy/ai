@@ -22,7 +22,8 @@ const OVERSIZED_METADATA: &str = r#"{"id":"huge-file","object":"file","bytes":99
 const FILE_CONTENT: &str = "Hello, world!";
 const IMAGE_CONTENT: &[u8] = b"\x89PNG";
 const MISSING_FILE_ERROR: &str = r#"{"error":{"message":"No such File object: nonexistent-file","type":"invalid_request_error","code":"file_not_found"}}"#;
-const FILES_API_RATE_LIMIT: &str = r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#;
+const FILES_API_RATE_LIMIT: &str =
+    r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#;
 
 #[test]
 fn example_config_resolves_input_file_to_openai_shape() {
