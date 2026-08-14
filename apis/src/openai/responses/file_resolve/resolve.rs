@@ -1018,6 +1018,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the metadata and content matrices keep non-success body shapes explicit"
+    )]
     async fn non_success_files_responses_fail_before_body_decoding() {
         for body in [r#"{"error":{"message":"missing"}}"#, "not-json", "", "plain text"] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
