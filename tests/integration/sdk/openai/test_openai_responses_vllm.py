@@ -240,10 +240,10 @@ def _write_agentic_config(
     )
     config = config.replace(
         "- filter: openai_mcp_dispatch\n"
-        "              - filter: agentic_loop",
+        "              - filter: openai_agentic_loop",
         "- filter: openai_mcp_dispatch\n"
         "                allow_loopback: true\n"
-        "              - filter: agentic_loop",
+        "              - filter: openai_agentic_loop",
     )
     config = config.replace(
         "max_iterations: 11\n",
@@ -701,11 +701,11 @@ class TestAgenticLoopVLLM:
             f"rounds; got: {output_types}"
         )
 
-    def test_client_function_exits_agentic_loop(self, agentic_client):
+    def test_client_function_exits_openai_agentic_loop(self, agentic_client):
         """Client-side function tools exit the agentic loop without
         auto-execution, even when the IRR is active.
 
-        This proves the IRR + agentic_loop + mcp_dispatch correctly
+        This proves the IRR + openai_agentic_loop + mcp_dispatch correctly
         distinguish MCP tools (auto-loop) from client functions
         (return to caller).
         """
