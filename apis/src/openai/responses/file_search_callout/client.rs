@@ -536,14 +536,22 @@ impl FileSearchClient {
         request_headers: &HeaderMap,
     ) -> Result<Bytes, FileSearchError> {
         let remaining = deadline_remaining(self.timeout, execution_started, store_id)?;
-        tokio::time::timeout(
+        let response = tokio::time::timeout(
             remaining,
             self.api_client
                 .post_json_bytes(request.url, request.body, request_headers),
         )
         .await
-        .map_err(|_elapsed| execution_deadline_error(store_id))
-        .and_then(|result| result.map_err(|error| request_error(store_id, error.to_string())))
+        .map_err(|_elapsed| execution_deadline_error(store_id))?
+        .map_err(|_error| request_error(store_id, "vector-store transport request failed"))?;
+        if !(200..300).contains(&response.status) {
+            return Err(request_error(
+                store_id,
+                format!("vector-store returned status {}", response.status),
+            ));
+        }
+
+        Ok(response.body)
     }
 
     /// Calculate a chunk whose worst-case bodies fit the remaining budget.
