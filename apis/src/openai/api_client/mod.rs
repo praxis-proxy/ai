@@ -206,6 +206,10 @@ impl ApiClient {
 
     /// Parse the URL, build a [`SubRequest`], and execute it with
     /// the caller's response-size limit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the request's independently owned transport fields stay explicit"
+    )]
     async fn execute_url(
         &self,
         url: &str,
@@ -606,6 +610,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the status matrix keeps every response-preservation case visible"
+    )]
     async fn get_preserves_valid_http_statuses_and_bounded_bodies() {
         for (status, location) in [
             (301_u16, Some("https://example.invalid/redirect")),
@@ -649,6 +657,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the header policy test lists the allowed and rejected boundary values"
+    )]
     async fn get_exposes_only_safe_response_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -688,6 +700,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "each typed transport variant needs an independent source-redaction assertion"
+    )]
     fn transport_errors_preserve_kind_without_rendering_source_details() {
         let connect = map_subrequest_error(SubRequestError::Connect("attacker-controlled".to_owned()));
         assert!(matches!(
