@@ -54,7 +54,7 @@ async fn response_store_persists_response_to_postgres() {
             .replace(
                 "        conversations_table: openai_conversations",
                 &format!(
-                    "        conversations_table: {conversations_table}\n        allow_private_database_url: true"
+                    "        conversations_table: {conversations_table}\n        allow_private_database_url: true\n        ssl_mode: disable"
                 ),
             ),
         proxy_port,
@@ -151,7 +151,7 @@ async fn response_store_postgres_passes_through_non_responses_traffic() {
             .replace(
                 "        conversations_table: openai_conversations",
                 &format!(
-                    "        conversations_table: {conversations_table}\n        allow_private_database_url: true"
+                    "        conversations_table: {conversations_table}\n        allow_private_database_url: true\n        ssl_mode: disable"
                 ),
             ),
         proxy_port,
@@ -187,5 +187,7 @@ fn unique_suffix() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tid = std::thread::current().id();
-    format!("{id}_{tid:?}").replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
+    format!("{id}_{tid:?}")
+        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
+        .to_lowercase()
 }

@@ -9,7 +9,9 @@ on:
     branches: [main]
     paths:
       - "apis/src/openai/responses/**"
+      - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
+      - "apis/src/store/**"
       - "server/**"
       - "tests/integration/sdk/openai/**"
       - "examples/configs/openai/responses/**"
@@ -22,7 +24,9 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - "apis/src/openai/responses/**"
+      - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
+      - "apis/src/store/**"
       - "server/**"
       - "tests/integration/sdk/openai/**"
       - "examples/configs/openai/responses/**"
@@ -68,7 +72,9 @@ jobs:
           CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
                                          "${{ github.event.merge_group.head_sha }}" -- \
             'apis/src/openai/responses/' \
+            'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
+            'apis/src/store/' \
             'server/' \
             'tests/integration/sdk/openai/' \
             'examples/configs/openai/responses/' \
@@ -157,6 +163,119 @@ jobs:
           echo "OGX is ready"
 
       - name: Run vLLM integration tests
+        run: |
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+
+      - name: vLLM container logs
+        if: failure()
+        run: docker logs vllm
+
+      - name: OGX logs
+        if: failure()
+        run: cat /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+
+      - name: Stop vLLM
+        if: always()
+        run: docker rm -f vllm || true
+
+      - name: Stop OGX
+        if: always()
+        run: |
+          if [ -f /tmp/ogx.pid ]; then
+            kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
+          fi
+
+  # ----------------------------------------------------------------------------
+  # Responses API integration tests with PostgreSQL store backend
+  # ----------------------------------------------------------------------------
+
+  vllm-responses-postgres:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: praxis
+          POSTGRES_PASSWORD: praxis
+          POSTGRES_DB: praxis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U praxis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af --filter "label!=com.github.actions.runner"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Pull vLLM CPU image
+        run: docker pull "$VLLM_IMAGE"
+
+      - name: Start vLLM
+        run: |
+          docker run -d --name vllm \
+            -p 8000:8000 \
+            --privileged=true \
+            "$VLLM_IMAGE" \
+            --model /root/.cache/Qwen/Qwen3-0.6B \
+            --max-model-len 4096 \
+            --served-model-name "$VLLM_MODEL" \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            --reasoning-parser deepseek_r1 \
+            --gpu-memory-utilization 0.5
+
+      - name: Start OGX
+        run: |
+          uv run --with 'ogx[starter]' ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          echo $! > /tmp/ogx.pid
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Wait for vLLM readiness
+        run: |
+          echo "Waiting for vLLM health and model endpoints..."
+          timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+            if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
+              echo "::error::vLLM container exited unexpectedly"
+              docker logs vllm 2>&1
+              exit 1
+            fi
+            sleep 5
+          done'
+          echo "vLLM is ready"
+
+      - name: Wait for OGX readiness
+        run: |
+          echo "Waiting for OGX server..."
+          timeout 120 bash -c 'until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+            sleep 2
+          done'
+          echo "OGX is ready"
+
+      - name: Run vLLM integration tests (PostgreSQL store)
+        env:
+          DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
         run: |
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 
