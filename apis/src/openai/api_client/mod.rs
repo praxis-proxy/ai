@@ -168,9 +168,9 @@ impl ApiClient {
     /// Send a GET request and return the response body with
     /// bounded reads.
     ///
-    /// The Pingora connector does not follow redirects (it
-    /// connects to a specific peer), matching the redirect-
-    /// rejection behavior of the previous `reqwest` path.
+    /// The Pingora connector does not follow redirects because it
+    /// connects to a specific peer. Redirect responses are returned
+    /// to the caller as bounded HTTP responses.
     pub(crate) async fn get_bytes(
         &self,
         url: &str,
