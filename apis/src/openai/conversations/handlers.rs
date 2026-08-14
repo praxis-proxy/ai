@@ -18,7 +18,7 @@ use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
         CreateConversationRequest, DeletedConversationResource, IncludeField, IncludeFields, InputItem, ItemOrder,
-        MAX_ITEMS_PER_REQUEST, Metadata, MetadataUpdate, UpdateConversationRequest,
+        MAX_ITEMS_PER_REQUEST, Metadata, UpdateConversationRequest,
     },
     item_schema::validate_output_item,
     validate::{MetadataError, validate_metadata},

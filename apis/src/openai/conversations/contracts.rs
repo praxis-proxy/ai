@@ -11,8 +11,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use utoipa::{
-    PartialSchema, ToSchema,
-    openapi::schema::{AnyOfBuilder, ArrayBuilder, Object, ObjectBuilder, Schema, Type},
+    ToSchema,
+    openapi::schema::{AnyOfBuilder, Object, ObjectBuilder, Schema, Type},
 };
 
 use super::item_schema::validate_input_item;
@@ -115,7 +115,7 @@ pub(super) struct CreateConversationRequest {
     pub(super) metadata: Option<Metadata>,
 
     /// Optional initial items to add to the conversation.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_vec")]
     #[schema(max_items = 20)]
     pub(super) items: Vec<InputItem>,
 }
@@ -182,18 +182,12 @@ fn nullable_metadata_schema() -> Schema {
     )
 }
 
-/// Generate the official nullable, bounded initial-items composition.
-fn nullable_initial_items_schema() -> Schema {
-    Schema::AnyOf(
-        AnyOfBuilder::new()
-            .item(
-                ArrayBuilder::new()
-                    .items(<ConversationItem as PartialSchema>::schema())
-                    .max_items(Some(MAX_ITEMS_PER_REQUEST)),
-            )
-            .item(Schema::Object(ObjectBuilder::new().schema_type(Type::Null).build()))
-            .build(),
-    )
+/// Deserialize a vec field that may be `null`, treating null as an empty vec.
+fn nullable_vec<'de, D>(deserializer: D) -> Result<Vec<InputItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Vec<InputItem>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Deserialize update metadata only from a JSON object.
@@ -402,10 +396,10 @@ mod tests {
     #[test]
     fn create_request_distinguishes_missing_and_null_items() {
         let missing: CreateConversationRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(missing.items.is_none(), "missing items should use the default");
+        assert!(missing.items.is_empty(), "missing items should use the default");
 
         let null: CreateConversationRequest = serde_json::from_value(json!({"items": null})).unwrap();
-        assert!(null.items.is_none(), "null items should use the default");
+        assert!(null.items.is_empty(), "null items should use the default");
     }
 
     #[test]

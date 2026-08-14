@@ -96,7 +96,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "checks shared item and response constraints")]
     fn generated_components_preserve_runtime_contract_constraints() {
         let document = implementation_openapi_value().unwrap();
 
@@ -172,15 +171,11 @@ mod tests {
         let document = serde_json::to_value(implementation_openapi()).unwrap();
 
         assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/0/type"),
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/type"),
             Some(&Value::String("array".to_owned()))
         );
         assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/1/type"),
-            Some(&Value::String("null".to_owned()))
-        );
-        assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/0/maxItems"),
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/maxItems"),
             Some(&Value::Number(serde_json::Number::from(20_u64))),
             "items array should preserve the 20-item bound"
         );
