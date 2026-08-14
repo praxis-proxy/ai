@@ -118,8 +118,7 @@ fn llmisvc_passes_non_publisher_model_through() {
     );
 
     assert_eq!(parse_status(&raw), 200, "passthrough should return 200");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&parse_body(&raw)).expect("backend should echo valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("backend should echo valid JSON");
     assert_eq!(
         parsed["model"].as_str(),
         Some("mistral-large-latest"),

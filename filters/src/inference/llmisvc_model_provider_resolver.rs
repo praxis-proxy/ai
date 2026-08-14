@@ -70,11 +70,15 @@ fn default_max_body_bytes() -> usize {
 /// Ports the `LLMISvc` / `KServe` BBR body-rewrite branch from IPP's
 /// `model-provider-resolver`.
 ///
-/// Prefer the configured request header (default `X-Model`) for the
-/// model name, falling back to the JSON body `"model"` field. When the
-/// resolved name is a publisher ID (`publishers/.../models/<name>`),
-/// rewrite the body `"model"` to `<name>` only. The routing header is
-/// never modified — `KServe` routes on the publisher ID.
+/// Reads the model name from the configured request header (default
+/// `X-Model`, typically set by an earlier `model_to_header`). When that
+/// value is a publisher ID (`publishers/.../models/<name>`), rewrite the
+/// body `"model"` field to `<name>` only. The routing header is never
+/// modified -- `KServe` routes on the publisher ID.
+///
+/// If the header is absent/empty, this filter is a no-op (it does not
+/// fall back to the body `"model"` field). If the body has no `"model"`
+/// field, it also no-ops rather than inventing one.
 ///
 /// Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform
 /// weighted provider selection, rewrite `Host`, or inject credentials.
@@ -141,12 +145,23 @@ impl LlmisvcModelProviderResolverFilter {
         }))
     }
 
-    /// Resolve model name, rewrite publisher-ID body field when needed.
+    /// Resolve model name from the routing header, rewrite publisher-ID
+    /// body field when needed.
     fn rewrite_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
+        // Require the routing header (usually from `model_to_header`); no
+        // body fallback -- missing header means no-op.
+        let Some(model_name) = header_model_name(ctx, &self.header) else {
+            return Ok(FilterAction::Continue);
+        };
+
+        let Some(short_name) = llmisvc_short_model_name(&model_name) else {
+            return Ok(FilterAction::Continue);
+        };
+
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
@@ -160,13 +175,11 @@ impl LlmisvcModelProviderResolverFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let Some(model_name) = resolve_model_name(ctx, &self.header, obj) else {
+        // Only rewrite an existing body field -- never invent `"model"`
+        // when the publisher ID came solely from the routing header.
+        if !obj.contains_key("model") {
             return Ok(FilterAction::Continue);
-        };
-
-        let Some(short_name) = llmisvc_short_model_name(&model_name) else {
-            return Ok(FilterAction::Continue);
-        };
+        }
 
         // Stash the original publisher ID for later metering.
         ctx.set_metadata(META_PUBLISHER_ID, model_name.as_str());
@@ -228,23 +241,6 @@ impl HttpFilter for LlmisvcModelProviderResolverFilter {
 // -----------------------------------------------------------------------------
 // Private Utilities
 // -----------------------------------------------------------------------------
-
-/// Prefer the configured header, then the body `"model"` string.
-fn resolve_model_name(
-    ctx: &HttpFilterContext<'_>,
-    header: &HeaderName,
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Option<String> {
-    if let Some(from_header) = header_model_name(ctx, header) {
-        return Some(from_header);
-    }
-
-    obj.get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-}
 
 /// Read a non-empty model name from the request headers or pending
 /// mutations (e.g. `extra_request_headers` from an earlier
@@ -377,7 +373,7 @@ mod tests {
         assert_eq!(
             llmisvc_short_model_name("publishers/ns/models/a/b"),
             Some("a/b"),
-            "SplitN keeps remainder after first /models/"
+            "split_once keeps remainder after first /models/"
         );
         assert_eq!(llmisvc_short_model_name("publishers/ns/models/"), None);
         assert_eq!(llmisvc_short_model_name("publishers/ns/foo"), None);
@@ -394,8 +390,9 @@ mod tests {
             HeaderValue::from_static("publishers/rhoai/models/granite-3.1-8b"),
         );
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        let mut body =
-            Some(Bytes::from_static(br#"{"model":"publishers/rhoai/models/granite-3.1-8b","messages":[]}"#));
+        let mut body = Some(Bytes::from_static(
+            br#"{"model":"publishers/rhoai/models/granite-3.1-8b","messages":[]}"#,
+        ));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "rewrite should continue");
@@ -412,20 +409,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_to_body_model_when_header_absent() {
+    async fn noops_when_header_absent() {
         let filter = filter_default();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let json = br#"{"model":"publishers/ns/models/mistral","prompt":"hi"}"#;
         let mut body = Some(Bytes::from_static(json));
+        let original = body.clone();
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
         assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(body, original, "missing routing header must not rewrite body");
+        assert!(
+            !ctx.filter_metadata.contains_key(META_PUBLISHER_ID),
+            "no rewrite means no publisher metadata"
+        );
+    }
 
-        let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-        assert_eq!(parsed["model"].as_str(), Some("mistral"));
-        assert_eq!(parsed["prompt"].as_str(), Some("hi"), "other fields preserved");
+    #[tokio::test]
+    async fn leaves_body_unchanged_when_header_publisher_id_but_no_body_model() {
+        let filter = filter_default();
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        req.headers.insert(
+            "X-Model",
+            HeaderValue::from_static("publishers/rhoai/models/granite-3.1-8b"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let json = br#"{"messages":[]}"#;
+        let mut body = Some(Bytes::from_static(json));
+        let original = body.clone();
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(body, original, "must not invent a body model field");
+        assert!(
+            !ctx.filter_metadata.contains_key(META_PUBLISHER_ID),
+            "no rewrite means no publisher metadata"
+        );
     }
 
     #[tokio::test]
@@ -477,7 +499,9 @@ mod tests {
     #[tokio::test]
     async fn leaves_non_publisher_model_unchanged() {
         let filter = filter_default();
-        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        req.headers
+            .insert("X-Model", HeaderValue::from_static("mistral-large-latest"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let json = br#"{"model":"mistral-large-latest"}"#;
@@ -511,7 +535,9 @@ mod tests {
     #[tokio::test]
     async fn continues_on_invalid_json() {
         let filter = filter_default();
-        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        req.headers
+            .insert("X-Model", HeaderValue::from_static("publishers/ns/models/granite"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let mut body = Some(Bytes::from_static(b"not-json"));
@@ -552,7 +578,9 @@ mod tests {
     #[tokio::test]
     async fn waits_for_end_of_stream() {
         let filter = filter_default();
-        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        req.headers
+            .insert("X-Model", HeaderValue::from_static("publishers/ns/models/granite"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
         let json = br#"{"model":"publishers/ns/models/granite"}"#;
