@@ -329,10 +329,11 @@ impl CompactFilter {
     ) -> Result<FilterAction, FilterAction> {
         let req = parse_compact_request_body(body)?;
         let (store, tenant_id) = resolve_store_and_tenant(ctx)?;
-        let record = fetch_response_blocking(&*store, &tenant_id, &req)?;
+        let record = fetch_response(&*store, &tenant_id, &req).await?;
         let messages = extract_stored_messages(record)?;
         let summary = self.summarize_messages(&req, &messages).await?;
-        let response_object = build_and_persist_compaction(self, ctx, &*store, &tenant_id, &req, &summary)?;
+        let response_object =
+            build_and_persist_compaction(self, ctx, &*store, &tenant_id, &req, &summary).await?;
         let body_bytes = serde_json::to_vec(&response_object).unwrap_or_default();
         Ok(FilterAction::Reject(
             praxis_filter::Rejection::status(200)
@@ -365,14 +366,14 @@ impl HttpFilter for CompactFilter {
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        _body: &mut Option<Bytes>,
+        body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
         if is_explicit_compact_request(ctx) {
-            return self.handle_explicit_compact(ctx, _body).await;
+            return self.handle_explicit_compact(ctx, body).await;
         }
         if !is_responses_request(ctx) {
             return Ok(FilterAction::Release);
@@ -517,6 +518,7 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
     let response_id = parsed
         .get("response_id")
         .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| reject_compact(400, "invalid_request_error", "missing required field: response_id"))?
         .to_owned();
     Ok(ExplicitCompactRequest {
@@ -542,14 +544,13 @@ fn resolve_store_and_tenant(
     Ok((store, tenant_id))
 }
 
-/// Fetch a stored response, blocking the current thread.
-fn fetch_response_blocking(
+/// Fetch a stored response.
+async fn fetch_response(
     store: &dyn crate::store::ResponseStore,
     tenant_id: &str,
     req: &ExplicitCompactRequest,
 ) -> Result<ResponseRecord, FilterAction> {
-    let handle = tokio::runtime::Handle::current();
-    match tokio::task::block_in_place(|| handle.block_on(store.get_response(tenant_id, &req.response_id))) {
+    match store.get_response(tenant_id, &req.response_id).await {
         Ok(Some(r)) => Ok(r),
         Ok(None) => Err(reject_compact(404, "not_found_error", "response not found")),
         Err(e) => {
@@ -573,7 +574,7 @@ fn extract_stored_messages(record: ResponseRecord) -> Result<Vec<Value>, FilterA
 
 /// Build and persist the compaction result for an explicit compact request.
 #[expect(clippy::too_many_arguments, reason = "all parameters are needed")]
-fn build_and_persist_compaction(
+async fn build_and_persist_compaction(
     filter: &CompactFilter,
     ctx: &HttpFilterContext<'_>,
     store: &dyn crate::store::ResponseStore,
@@ -603,8 +604,7 @@ fn build_and_persist_compaction(
         input: compacted_messages.clone(),
         messages: compacted_messages,
     };
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| handle.block_on(store.upsert_response(&record))).map_err(|e| {
+    store.upsert_response(&record).await.map_err(|e| {
         warn!(error = %e, "failed to persist explicit compaction response");
         reject_compact(500, "server_error", "failed to persist compaction response")
     })?;

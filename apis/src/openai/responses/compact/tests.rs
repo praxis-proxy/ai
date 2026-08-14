@@ -647,6 +647,25 @@ fn direct_input_should_not_compact_below_threshold() {
     assert!(result.is_none(), "direct input below threshold should skip compaction");
 }
 
+#[test]
+fn tiktoken_fallback_counts_messages_only_not_instructions_or_tools() {
+    // The tiktoken path (used when previous_usage is unavailable) intentionally
+    // counts only message content tokens. Instructions and tool definitions are
+    // excluded so that the threshold reflects conversation size, not schema overhead.
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": "short"}],
+        "instructions": "Very long system prompt ".repeat(5000),
+        "tools": [{"type": "function", "name": "f", "description": "d ".repeat(5000)}],
+        "context_management": [{"type": "compaction", "compact_threshold": 50}]
+    }));
+    let result = should_compact(&state, "cl100k_base");
+    assert!(
+        result.is_none(),
+        "tiktoken path should count only messages, not instructions or tool definitions"
+    );
+}
+
 // =============================================================================
 // parse_compact_request_body
 // =============================================================================
@@ -692,6 +711,14 @@ fn parse_compact_request_body_invalid_json() {
 #[test]
 fn parse_compact_request_body_missing_response_id() {
     let body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-4o"})).unwrap()));
+    assert!(parse_compact_request_body(&body).is_err());
+}
+
+#[test]
+fn parse_compact_request_body_empty_response_id() {
+    let body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"response_id": "", "model": "gpt-4o"})).unwrap(),
+    ));
     assert!(parse_compact_request_body(&body).is_err());
 }
 
