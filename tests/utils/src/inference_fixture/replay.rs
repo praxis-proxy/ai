@@ -384,7 +384,7 @@ fn validate_replay_filter_entries(filters: &[FilterEntry]) -> Result<(), Fixture
     for filter in filters {
         if !matches!(
             filter.filter_type.as_str(),
-            "agentic_loop"
+            "openai_agentic_loop"
                 | "anthropic_messages_format"
                 | "anthropic_messages_protocol"
                 | "anthropic_to_openai"

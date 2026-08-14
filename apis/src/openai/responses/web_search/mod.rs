@@ -12,7 +12,7 @@
 //!
 //! # Pipeline dependencies
 //!
-//! - **`agentic_loop`** must run before this filter in the response phase (after in YAML order) to extract
+//! - **`openai_agentic_loop`** must run before this filter in the response phase (after in YAML order) to extract
 //!   `web_search_call` items from the model response into [`ResponsesState::web_search_calls`].
 //! - The IRR transition must match `openai_web_search.action = "loop"` and target the same inference step.
 //!
