@@ -661,6 +661,8 @@ fn apply_reused(
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
     write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)?;
+    #[cfg(feature = "opentelemetry")]
+    crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
     ctx.set_metadata("intelligent_route.session.bound", "true");
     ctx.set_metadata("intelligent_route.session.reused", "true");
     ctx.set_metadata("intelligent_route.session.failover", "false");
@@ -677,7 +679,10 @@ fn apply_route(
 ) -> Result<(), FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
-    write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)
+    write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)?;
+    #[cfg(feature = "opentelemetry")]
+    crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
+    Ok(())
 }
 
 /// Record session-affinity metadata and store a binding.

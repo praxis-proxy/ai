@@ -16,8 +16,8 @@
 //!
 //! Writes `filter_results` during `on_response_body` where
 //! `iterative_request_router` evaluates step transitions:
-//!   - `agentic_loop.action = "loop"` — tool calls present, loop back
-//!   - `agentic_loop.action = "done"` — exit to client
+//!   - `openai_agentic_loop.action = "loop"` — tool calls present, loop back
+//!   - `openai_agentic_loop.action = "done"` — exit to client
 //!
 //! # Non-streaming tool call extraction
 //!
@@ -58,7 +58,7 @@
 //!         provider: brave
 //!         api_key: ${WEB_SEARCH_API_KEY}
 //!       - filter: openai_mcp_dispatch
-//!       - filter: agentic_loop
+//!       - filter: openai_agentic_loop
 //!         max_infer_iters: 10
 //!       - filter: openai_responses_proxy
 //!       - filter: router
@@ -127,7 +127,7 @@ use super::{error::responses_error_rejection, state::ResponsesState, stream_even
 // -----------------------------------------------------------------------------
 
 /// Filter results key for the loop control action.
-const FILTER_RESULT_KEY: &str = "agentic_loop";
+const FILTER_RESULT_KEY: &str = "openai_agentic_loop";
 
 /// Action value signalling a loop-back to `responses_proxy`.
 const ACTION_LOOP: &str = "loop";
@@ -152,13 +152,13 @@ const META_STATUS: &str = "responses.status";
 /// # YAML
 ///
 /// ```yaml
-/// filter: agentic_loop
+/// filter: openai_agentic_loop
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: agentic_loop
+/// filter: openai_agentic_loop
 /// max_infer_iters: 10
 /// max_body_bytes: 10485760
 /// ```
@@ -170,7 +170,7 @@ const META_STATUS: &str = "responses.status";
 ///
 /// let yaml = serde_yaml::Value::Null;
 /// let filter = AgenticLoopFilter::from_config(&yaml).unwrap();
-/// assert_eq!(filter.name(), "agentic_loop");
+/// assert_eq!(filter.name(), "openai_agentic_loop");
 /// ```
 pub struct AgenticLoopFilter {
     /// Parsed and validated configuration.
@@ -188,7 +188,7 @@ impl AgenticLoopFilter {
         let cfg: AgenticLoopConfig = if config.is_null() {
             AgenticLoopConfig::default()
         } else {
-            parse_filter_config("agentic_loop", config)?
+            parse_filter_config("openai_agentic_loop", config)?
         };
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
@@ -198,7 +198,7 @@ impl AgenticLoopFilter {
 #[async_trait]
 impl HttpFilter for AgenticLoopFilter {
     fn name(&self) -> &'static str {
-        "agentic_loop"
+        "openai_agentic_loop"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -244,13 +244,13 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Reject(responses_error_rejection(
                 400,
                 "invalid_request_error",
-                "streaming is not supported with agentic_loop",
+                "streaming is not supported with openai_agentic_loop",
                 false,
             )));
         }
 
         prepare_iteration(ctx, &mut state);
-        trace!(iteration = state.iteration, "agentic_loop on_request_body");
+        trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
         ctx.extensions.insert(state);
         Ok(FilterAction::Continue)
     }
@@ -299,17 +299,24 @@ fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState
     state.tool_calls.clear();
     state.web_search_calls.clear();
     state.parallel_tool_calls = false;
-    if let Some(obj) = state.request_body.as_object_mut() {
-        obj.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
-    }
+    set_request_body_field(state, "parallel_tool_calls", Value::Bool(false));
 
     if state.iteration > 0 {
         state.tool_choice = json!("auto");
-        if let Some(obj) = state.request_body.as_object_mut() {
-            obj.insert("tool_choice".to_owned(), json!("auto"));
-        }
+        set_request_body_field(state, "tool_choice", json!("auto"));
         ctx.request_headers_to_set
             .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));
+    }
+}
+
+/// Set a provider-visible request field and record whether its value changed.
+fn set_request_body_field(state: &mut ResponsesState, name: &str, value: Value) {
+    let Some(obj) = state.request_body.as_object_mut() else {
+        return;
+    };
+    if obj.get(name) != Some(&value) {
+        obj.insert(name.to_owned(), value);
+        state.mark_request_body_for_rebuild();
     }
 }
 
@@ -379,7 +386,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Res
     }
     state.response_object = response;
     if state.tool_calls.len() > 1 {
-        return Err("agentic_loop supports exactly one function call per round");
+        return Err("openai_agentic_loop supports exactly one function call per round");
     }
     Ok(())
 }

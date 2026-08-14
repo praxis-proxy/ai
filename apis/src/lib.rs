@@ -85,7 +85,6 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
-            #[cfg(feature = "praxis-main")]
             metrics_route: None,
             peer_identity: None,
             request: req,

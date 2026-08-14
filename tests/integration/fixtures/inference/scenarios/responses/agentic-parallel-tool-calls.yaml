@@ -1,0 +1,30 @@
+version: 1
+id: responses/agentic-parallel-tool-calls
+description: Agentic loop injects parallel_tool_calls=false into the upstream request when the client omits the field.
+protocol: openai_responses
+example_config: openai/responses/agentic-loop-fixture.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.agentic.parallel_tool_calls
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Reply with exactly `4` and nothing else.
+          store: false
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

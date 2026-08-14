@@ -9,7 +9,9 @@
 //! `/v1/responses/{id}/input_items`, `/v1/responses/{id}/cancel`,
 //! `/v1/responses/input_tokens`, `/v1/responses/compact`) are
 //! classified by method and path without inspecting the body.
-//! `POST /v1/responses` (create) is classified by body content. A
+//! `POST /v1/responses` (create) is classified from body content, with
+//! the endpoint treated as authoritative: a body carrying no format
+//! discriminator is a Responses request rather than unknown JSON. A
 //! `GET /v1/responses` `WebSocket` upgrade is classified from the method,
 //! path, and upgrade headers without inferring body-derived facts.
 //! Promotes classification facts to configurable headers, durable
@@ -75,8 +77,8 @@ use tracing::{debug, trace};
 use self::config::{ResponsesFormatConfig, build_config};
 use crate::{
     classifier::{
-        AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path,
-        is_responses_websocket_handshake,
+        AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_create,
+        is_responses_path, is_responses_websocket_handshake,
     },
     promotion::is_promotable_value,
 };
@@ -153,6 +155,17 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 ///
 /// Classification formats: `openai_responses`, `openai_chat_completions`,
 /// `unknown_json`, `invalid_json`, `non_json`.
+///
+/// `POST /v1/responses` (create) is authoritative: a valid create body may
+/// omit every discriminator the body heuristics key on (`input`, `prompt`
+/// object, `previous_response_id`, `conversation`) — for example
+/// `{"model":"gpt-5"}` — and would otherwise classify as `unknown_json`. On
+/// this endpoint such a body is classified as `openai_responses` instead,
+/// while body-derived facts (model, stream, store, …) are preserved. Bodies
+/// carrying positive signals for another format (`openai_chat_completions`,
+/// `anthropic_messages`) and genuine parse failures (`invalid_json`,
+/// `non_json`) are left untouched, so `on_invalid: reject` still rejects
+/// real errors.
 ///
 /// A `GET /v1/responses` request with valid HTTP `WebSocket` upgrade headers
 /// is classified as `openai_responses` without inspecting a body. This
@@ -273,19 +286,31 @@ impl HttpFilter for ResponsesFormatFilter {
 
 /// Classify a request from a recognized path/handshake or its body.
 fn classify_request(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> (ClassifiedRequest, bool) {
-    let websocket_handshake =
-        is_responses_websocket_handshake(&ctx.request.method, ctx.request.uri.path(), &ctx.request.headers);
-    if websocket_handshake || is_responses_path(&ctx.request.method, ctx.request.uri.path()) {
+    let method = &ctx.request.method;
+    let path = ctx.request.uri.path();
+
+    let websocket_handshake = is_responses_websocket_handshake(method, path, &ctx.request.headers);
+    if websocket_handshake || is_responses_path(method, path) {
         debug!(
-            method = %ctx.request.method,
-            path = ctx.request.uri.path(),
+            method = %method,
+            path = path,
             websocket_handshake,
             "classified request by method and path"
         );
-        (empty_result(AiRequestFormat::Responses), websocket_handshake)
-    } else {
-        (classify_request_body(bytes), false)
+        return (empty_result(AiRequestFormat::Responses), websocket_handshake);
     }
+
+    let mut classified = classify_request_body(bytes);
+
+    // POST /v1/responses (create) is authoritative: a valid create body may
+    // omit the discriminator fields that body heuristics rely on (e.g.
+    // `{"model":"gpt-5"}`) and classify as UnknownJson, but on this endpoint
+    // it is a Responses request.
+    if classified.format == AiRequestFormat::UnknownJson && is_responses_create(method, path) {
+        classified.format = AiRequestFormat::Responses;
+    }
+
+    (classified, false)
 }
 
 /// Check whether the format requires rejection.

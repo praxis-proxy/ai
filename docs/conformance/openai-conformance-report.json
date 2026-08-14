@@ -313,16 +313,7 @@
               "has_response_drift": false,
               "has_other_drift": false,
               "request_details": [
-                "requestBody.required.from",
-                "requestBody.required.to",
-                "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
-                "requestBody.content.application/json.schema.properties.items.type.added",
-                "requestBody.content.application/json.schema.properties.items.maxItems.from",
-                "requestBody.content.application/json.schema.properties.items.maxItems.to",
-                "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
-                "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted",
-                "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
-                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
+                "requestBody.content.application/json.schema.properties.items.anyOf.modified"
               ],
               "response_details": [],
               "other_details": []
@@ -339,9 +330,11 @@
               "request_details": [
                 "requestBody.required.from",
                 "requestBody.required.to",
-                "requestBody.content.application/json.schema.required.deleted",
-                "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
-                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
+                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted",
+                "requestBody.content.application/json.schema.properties.metadata.type.added",
+                "requestBody.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "requestBody.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+                "requestBody.content.application/json.schema.properties.metadata.listOfTypes.deleted"
               ],
               "response_details": [],
               "other_details": []
@@ -615,16 +608,7 @@
               "kind": "request_body_schema",
               "summary": "Align the request body schema with the OpenAI spec.",
               "detail_paths": [
-                "requestBody.required.from",
-                "requestBody.required.to",
-                "requestBody.content.application/json.schema.properties.items.anyOf.deleted",
-                "requestBody.content.application/json.schema.properties.items.type.added",
-                "requestBody.content.application/json.schema.properties.items.maxItems.from",
-                "requestBody.content.application/json.schema.properties.items.maxItems.to",
-                "requestBody.content.application/json.schema.properties.items.items.schemaAdded",
-                "requestBody.content.application/json.schema.properties.items.listOfTypes.deleted",
-                "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
-                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
+                "requestBody.content.application/json.schema.properties.items.anyOf.modified"
               ]
             }
           ]
@@ -643,9 +627,11 @@
               "detail_paths": [
                 "requestBody.required.from",
                 "requestBody.required.to",
-                "requestBody.content.application/json.schema.required.deleted",
-                "requestBody.content.application/json.schema.properties.metadata.oneOf.added",
-                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"
+                "requestBody.content.application/json.schema.properties.metadata.anyOf.deleted",
+                "requestBody.content.application/json.schema.properties.metadata.type.added",
+                "requestBody.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+                "requestBody.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+                "requestBody.content.application/json.schema.properties.metadata.listOfTypes.deleted"
               ]
             }
           ]

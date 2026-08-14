@@ -77,6 +77,8 @@
 #   IRR fully buffers responses, which is incompatible with streaming
 #   and WebSocket. For MCP-driven agentic tool loops, see
 #   agentic-loop.yaml which wraps the inference step in an IRR.
+#   For file-search callout (vector store backed) with the full
+#   pipeline, see full-flow-agentic.yaml.
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer

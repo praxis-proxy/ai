@@ -7,7 +7,6 @@ mod test_utils;
 #[expect(unreachable_pub)]
 pub use test_utils::load_example_config;
 
-mod agentic_loop;
 mod agentic_routing;
 mod anthropic_messages;
 mod anthropic_messages_web_search;
@@ -15,10 +14,13 @@ mod compact;
 mod credential_injection;
 mod file_search_callout;
 mod full_flow;
+mod full_flow_agentic;
 mod guardrails;
+mod inference_fallback;
 mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
+mod openai_agentic_loop;
 mod openai_conversations;
 mod openai_doc_extract;
 mod openai_embeddings_routing;

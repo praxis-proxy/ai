@@ -331,7 +331,8 @@ impl std::io::Write for ByteCounter {
 
 /// Return whether state requires parsing and rebuilding the outbound body.
 fn request_needs_rebuild(state: &ResponsesState) -> bool {
-    state.messages != state.input
+    state.request_body_requires_rebuild()
+        || state.messages != state.input
         || (state.history_rehydrated
             && (state.previous_response_id.is_some()
                 || state.conversation.is_some()

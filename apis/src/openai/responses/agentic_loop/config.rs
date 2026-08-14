@@ -36,7 +36,7 @@ fn default_max_body_bytes() -> usize {
 /// Deserialized YAML config for the agentic loop filter.
 ///
 /// ```yaml
-/// filter: agentic_loop
+/// filter: openai_agentic_loop
 /// max_infer_iters: 10
 /// ```
 #[derive(Debug, Deserialize)]
@@ -69,10 +69,10 @@ impl Default for AgenticLoopConfig {
 /// Validate the parsed configuration.
 pub(super) fn build_config(cfg: AgenticLoopConfig) -> Result<AgenticLoopConfig, FilterError> {
     if cfg.max_infer_iters == 0 {
-        return Err("agentic_loop: max_infer_iters must be > 0".into());
+        return Err("openai_agentic_loop: max_infer_iters must be > 0".into());
     }
     if cfg.max_body_bytes == 0 {
-        return Err("agentic_loop: max_body_bytes must be > 0".into());
+        return Err("openai_agentic_loop: max_body_bytes must be > 0".into());
     }
     Ok(cfg)
 }

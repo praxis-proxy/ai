@@ -18,6 +18,9 @@ Rejects the request with HTTP 400 before any callouts if two or more resolvable 
 | `max_servers` | integer | no | Maximum number of distinct MCP servers per request. |
 | `max_tools` | integer | no | Maximum number of tools returned by a single MCP server. |
 | `allow_loopback` | bool | no | Allow connections to loopback addresses (`127.0.0.0/8`, `::1`, `localhost`). Disabled by default for SSRF protection; enable for development environments where MCP servers run locally. |
+| `connectors` | ConnectorConfig[] | no | Named connectors mapping connector IDs to server URLs. |
+| `connectors[].id` | string | yes | Connector identifier referenced in requests. |
+| `connectors[].server_url` | string | yes | MCP server URL for this connector. |
 
 ## Examples
 

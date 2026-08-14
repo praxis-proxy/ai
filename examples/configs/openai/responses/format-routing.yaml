@@ -5,6 +5,13 @@
 # (Responses API), `openai_chat_completions` (Chat Completions API), or
 # `unknown` (valid JSON but unrecognized format).
 #
+# POST /v1/responses (create) is authoritative: a valid create body that
+# omits every discriminator the body heuristics key on (`input`, `prompt`
+# object, `previous_response_id`, `conversation`) — e.g. `{"model":"gpt-5"}` —
+# is classified as `openai_responses` on that endpoint rather than
+# `unknown`, so it routes to the responses cluster below instead of
+# falling through to the default one.
+#
 # Classification facts are promoted to internal routing headers
 # (x-praxis-ai-*) that the router matches for cluster selection.
 # These internal headers are stripped before upstream by header hygiene.
@@ -12,7 +19,8 @@
 # Non-JSON, invalid JSON, and unrecognized JSON bodies continue by
 # default so mixed-traffic listeners do not reject non-AI requests.
 # Set `on_invalid: reject` for listeners that only accept AI API
-# traffic (rejects anything without `input` or `messages`).
+# traffic (rejects anything without `input` or `messages`, except on
+# the authoritative POST /v1/responses create endpoint).
 
 listeners:
   - name: ai-gateway

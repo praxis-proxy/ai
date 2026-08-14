@@ -22,6 +22,7 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
+opentelemetry = ["praxis-ai-filters/opentelemetry"]
 praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
 
 [lints]
@@ -47,6 +48,7 @@ tikv-jemallocator = { workspace = true }
 
 [build-dependencies]
 cargo_metadata = { workspace = true }
+praxis-ai-build-support = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

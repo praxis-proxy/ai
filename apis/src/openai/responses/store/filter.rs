@@ -834,7 +834,16 @@ impl ResponseStoreFilter {
     }
 
     /// Serve `GET /v1/responses/{id}`.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "query validation adds one early-return branch"
+    )]
     async fn handle_get_response(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
+        if let Err(msg) = validate_get_response_query_params(ctx.request.uri.query()) {
+            debug!(response_id = id, error = %msg, "invalid get-response query parameter");
+            return FilterAction::Reject(reject_invalid_input(&msg));
+        }
+
         let Some(store) = self.ensure_store().await else {
             return FilterAction::Reject(reject_store_error());
         };
@@ -1040,6 +1049,77 @@ fn reject_known_key_only_param(key: &str) -> Result<(), String> {
             Err(format!("Missing value for query parameter '{key}'."))
         },
         _ => Ok(()),
+    }
+}
+
+/// Known query parameters for `GET /v1/responses/{id}`, per the OpenAI spec.
+pub(super) const GET_RESPONSE_KNOWN_PARAMS: &[&str] = &[
+    "stream",
+    "include",
+    "include[]",
+    "starting_after",
+    "include_obfuscation",
+];
+
+/// Validate query parameters for `GET /v1/responses/{id}`.
+///
+/// Returns `Ok(())` when the query string is absent, empty, or contains
+/// only `stream=false`. Returns an error message suitable for a 400
+/// response when any parameter is unsupported, invalid, or unknown.
+/// Keys and values are percent-decoded before validation.
+pub(super) fn validate_get_response_query_params(query: Option<&str>) -> Result<(), String> {
+    let Some(qs) = query else {
+        return Ok(());
+    };
+
+    for pair in qs.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = pair.split_once('=') else {
+            let key = percent_encoding::percent_decode_str(pair)
+                .decode_utf8()
+                .map_err(|_e| format!("Invalid percent-encoding in query parameter key '{pair}'."))?;
+            if GET_RESPONSE_KNOWN_PARAMS.contains(&&*key) {
+                return Err(format!("Missing value for query parameter '{key}'."));
+            }
+            return Err(format!("Unknown query parameter: '{key}'."));
+        };
+
+        let key = percent_encoding::percent_decode_str(raw_key)
+            .decode_utf8()
+            .map_err(|_e| format!("Invalid percent-encoding in query parameter key '{raw_key}'."))?;
+        let value = percent_encoding::percent_decode_str(raw_value)
+            .decode_utf8()
+            .map_err(|_e| format!("Invalid percent-encoding in value for '{key}'."))?;
+
+        validate_get_response_param(&key, &value)?;
+    }
+
+    Ok(())
+}
+
+/// Validate a single decoded query parameter for `GET /v1/responses/{id}`.
+pub(super) fn validate_get_response_param(key: &str, value: &str) -> Result<(), String> {
+    match key {
+        "stream" => match value {
+            "false" => Ok(()),
+            "true" => Err("The 'stream' parameter is not supported by the local response store.".to_owned()),
+            _ => Err(format!(
+                "Invalid value for 'stream': must be 'true' or 'false', got '{value}'."
+            )),
+        },
+        "include" | "include[]" => {
+            Err("The 'include' parameter is not supported by the local response store.".to_owned())
+        },
+        "starting_after" => {
+            Err("The 'starting_after' parameter is not supported by the local response store.".to_owned())
+        },
+        "include_obfuscation" => {
+            Err("The 'include_obfuscation' parameter is not supported by the local response store.".to_owned())
+        },
+        _ => Err(format!("Unknown query parameter: '{key}'.")),
     }
 }
 

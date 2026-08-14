@@ -4,7 +4,7 @@
 //! Unit tests for the MCP filter.
 
 use bytes::Bytes;
-use praxis_filter::{FilterAction, HttpFilter as _};
+use praxis_filter::{FilterAction, HttpFilter as _, builtins::http::payload_processing::MAX_DYNAMIC_VALUE_LEN};
 
 use super::{
     McpFilter,
@@ -1015,6 +1015,105 @@ async fn initialize_promotes_protocol_version_header_and_result() {
 }
 
 #[tokio::test]
+async fn dynamic_values_at_length_limit_are_promoted() {
+    let filter = make_default_filter();
+    let protocol_version = "v".repeat(MAX_DYNAMIC_VALUE_LEN);
+    let session_id = "s".repeat(MAX_DYNAMIC_VALUE_LEN);
+    let body_str = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": protocol_version},
+    })
+    .to_string();
+    let mut req = make_mcp_request(&[]);
+    req.headers.insert("mcp-session-id", session_id.parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "256-byte values should release"
+    );
+    assert_dynamic_values_promoted(&ctx, &session_id, &protocol_version);
+}
+
+#[tokio::test]
+async fn dynamic_values_over_length_limit_are_omitted() {
+    let filter = make_default_filter();
+    let protocol_version = "v".repeat(MAX_DYNAMIC_VALUE_LEN + 1);
+    let session_id = "s".repeat(MAX_DYNAMIC_VALUE_LEN + 1);
+    let body_str = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": protocol_version},
+    })
+    .to_string();
+    let mut req = make_mcp_request(&[]);
+    req.headers.insert("mcp-session-id", session_id.parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "257-byte values should release"
+    );
+    assert_dynamic_values_omitted(&ctx);
+}
+
+#[tokio::test]
+async fn oversized_custom_method_is_omitted_from_filter_results() {
+    let filter = make_default_filter();
+    let method = "m".repeat(MAX_DYNAMIC_VALUE_LEN + 1);
+    let body_str = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+    })
+    .to_string();
+    let req = make_mcp_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "oversized custom methods should release"
+    );
+    assert_oversized_value_is_omitted(&ctx, "mcp.method", "x-praxis-mcp-method", "method");
+}
+
+#[tokio::test]
+async fn oversized_resource_uri_is_omitted_from_filter_results() {
+    let filter = make_default_filter();
+    let uri = "u".repeat(MAX_DYNAMIC_VALUE_LEN + 1);
+    let body_str = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": {"uri": uri},
+    })
+    .to_string();
+    let req = make_mcp_request(&[]);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(body_str));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "oversized resource URIs should release"
+    );
+    assert_oversized_value_is_omitted(&ctx, "mcp.name", "x-praxis-mcp-name", "name");
+}
+
+#[tokio::test]
 async fn non_initialize_promotes_protocol_version_from_header() {
     let filter = make_default_filter();
     let body_str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
@@ -1129,6 +1228,106 @@ async fn null_protocol_version_header_skips_header_promotion() {
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
+
+fn assert_dynamic_values_omitted(ctx: &praxis_filter::HttpFilterContext<'_>) {
+    assert_eq!(
+        ctx.get_metadata("mcp.session_id"),
+        None,
+        "257-byte session ID should be omitted from metadata"
+    );
+    assert_eq!(
+        ctx.get_metadata("mcp.protocol_version"),
+        None,
+        "257-byte protocol version should be omitted from metadata"
+    );
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key("x-praxis-mcp-protocol-version"),
+        "257-byte protocol version should be omitted from headers"
+    );
+
+    let results = ctx.filter_results.get("mcp").unwrap();
+    assert_eq!(
+        results.get("protocol_version"),
+        None,
+        "257-byte protocol version should be omitted from filter results"
+    );
+    assert_eq!(
+        results.get("session_present"),
+        Some("true"),
+        "oversized session ID should still count as present"
+    );
+}
+
+fn assert_dynamic_values_promoted(
+    ctx: &praxis_filter::HttpFilterContext<'_>,
+    session_id: &str,
+    protocol_version: &str,
+) {
+    assert_eq!(
+        ctx.get_metadata("mcp.session_id"),
+        Some(session_id),
+        "256-byte session ID should be in metadata"
+    );
+    assert_eq!(
+        ctx.get_metadata("mcp.protocol_version"),
+        Some(protocol_version),
+        "256-byte protocol version should be in metadata"
+    );
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_str()))
+        .collect();
+    assert_eq!(
+        headers.get("x-praxis-mcp-protocol-version"),
+        Some(&protocol_version),
+        "256-byte protocol version should be promoted to a header"
+    );
+
+    let results = ctx.filter_results.get("mcp").unwrap();
+    assert_eq!(
+        results.get("protocol_version"),
+        Some(protocol_version),
+        "256-byte protocol version should be in filter results"
+    );
+}
+
+fn assert_oversized_value_is_omitted(
+    ctx: &praxis_filter::HttpFilterContext<'_>,
+    metadata_key: &str,
+    header_name: &str,
+    result_key: &str,
+) {
+    assert_eq!(
+        ctx.get_metadata(metadata_key),
+        None,
+        "oversized value should be omitted from metadata"
+    );
+
+    let headers: std::collections::HashMap<_, _> = ctx
+        .extra_request_headers
+        .iter()
+        .map(|(key, value)| (key.as_ref(), value.as_str()))
+        .collect();
+    assert!(
+        !headers.contains_key(header_name),
+        "oversized value should be omitted from headers"
+    );
+
+    let results = ctx.filter_results.get("mcp").unwrap();
+    assert_eq!(
+        results.get(result_key),
+        None,
+        "oversized value should be omitted from filter results"
+    );
+}
 
 fn assert_invalid_params_rejection(action: &FilterAction, expected_id: &serde_json::Value) {
     let FilterAction::Reject(rejection) = action else {

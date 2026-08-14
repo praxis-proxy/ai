@@ -6,7 +6,7 @@
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
 //! across filter phases. It holds the heavy data needed by the
 //! validate → rehydrate → `openai_tool_parse` → `openai_responses_proxy` →
-//! `stream_events` → `agentic_loop` pipeline.
+//! `stream_events` → `openai_agentic_loop` pipeline.
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
@@ -69,7 +69,7 @@ pub(crate) struct ResponsesState {
     pub input: Vec<serde_json::Value>,
 
     /// Current agentic loop iteration (0-indexed). Incremented by
-    /// `agentic_loop` at the start of each new inference round.
+    /// `openai_agentic_loop` at the start of each new inference round.
     pub iteration: u32,
 
     /// Maximum number of built-in tool invocations.
@@ -90,7 +90,7 @@ pub(crate) struct ResponsesState {
     ///
     /// Initialized from the current request's input. When
     /// `previous_response_id` is set, `rehydrate` prepends stored
-    /// history. `agentic_loop` appends tool results during agentic
+    /// history. `openai_agentic_loop` appends tool results during agentic
     /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
@@ -122,12 +122,15 @@ pub(crate) struct ResponsesState {
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
+    /// Whether provider-visible request fields require outbound serialization.
+    pub request_body_rebuild: RequestBodyRebuild,
+
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
 
     /// Tool calls from the current inference response only.
     ///
-    /// Cleared by `agentic_loop` at the start of each iteration
+    /// Cleared by `openai_agentic_loop` at the start of each iteration
     /// before `stream_events` writes new ones. Without explicit
     /// clearing, stale tool calls from a previous iteration cause
     /// duplicate dispatch.
@@ -135,14 +138,14 @@ pub(crate) struct ResponsesState {
 
     /// Web search calls from the current inference response only.
     ///
-    /// Cleared by `agentic_loop` at the start of each iteration.
+    /// Cleared by `openai_agentic_loop` at the start of each iteration.
     /// Stored separately from `tool_calls` because `web_search_call`
     /// items have a different shape (`action.query` instead of
     /// `name`/`arguments`) and must not trigger the
     /// one-function-call-per-round limit.
     pub web_search_calls: Vec<serde_json::Value>,
 
-    /// Tool choice setting. Reset to `"auto"` by `agentic_loop`
+    /// Tool choice setting. Reset to `"auto"` by `openai_agentic_loop`
     /// after the first iteration; the original value from the
     /// request only applies to the first inference call.
     pub tool_choice: serde_json::Value,
@@ -159,9 +162,20 @@ pub(crate) struct ResponsesState {
     ///
     /// Each round's model output items and MCP execution results are
     /// appended here so the final response contains the complete
-    /// trace. `agentic_loop` writes model items, `mcp_dispatch`
+    /// trace. `openai_agentic_loop` writes model items, `mcp_dispatch`
     /// writes `mcp_call` and `mcp_approval_request` items.
     pub accumulated_output: Vec<serde_json::Value>,
+}
+
+/// Whether the proxy can preserve the original request bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RequestBodyRebuild {
+    /// No provider-visible state has changed.
+    #[default]
+    PreserveOriginal,
+
+    /// Provider-visible state must be serialized before inference.
+    Required,
 }
 
 impl Default for ResponsesState {
@@ -184,6 +198,7 @@ impl Default for ResponsesState {
             previous_tools: Vec::new(),
             previous_usage: None,
             request_body: serde_json::Value::Null,
+            request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             tool_calls: Vec::new(),
             web_search_calls: Vec::new(),
@@ -224,6 +239,11 @@ impl ResponsesState {
         }
     }
 
+    /// Require the proxy to serialize provider-visible request state.
+    pub(crate) fn mark_request_body_for_rebuild(&mut self) {
+        self.request_body_rebuild = RequestBodyRebuild::Required;
+    }
+
     /// Borrow the public output owned by [`Self::response_object`].
     pub(crate) fn output_items(&self) -> &[serde_json::Value] {
         self.response_object
@@ -251,6 +271,11 @@ impl ResponsesState {
             unreachable!("output was normalized to an array")
         };
         items
+    }
+
+    /// Return whether provider-visible request state requires serialization.
+    pub(crate) fn request_body_requires_rebuild(&self) -> bool {
+        self.request_body_rebuild == RequestBodyRebuild::Required
     }
 }
 

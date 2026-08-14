@@ -382,6 +382,33 @@ fn lookup_task_route(
     }
 }
 
+/// Advances or abandons a pending tentative route. Returns `true` if the
+/// caller should return early (tentative guard handled this chunk).
+fn handle_pending_tentative(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    end_of_stream: bool,
+    store: &LocalTaskRouteStore,
+    config: &config::TaskRoutingConfig,
+) -> bool {
+    if !ctx.filter_metadata.contains_key("a2a.response.tentative_json") {
+        return false;
+    }
+    let has_new_content = body
+        .as_ref()
+        .is_some_and(|b| b.iter().any(|&byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r')));
+    if has_new_content {
+        debug!("tentative route discarded: trailing non-whitespace after balanced JSON prefix");
+        clear_capture_metadata(ctx);
+    } else if end_of_stream {
+        debug!("tentative route confirmed at EOS: no trailing content");
+        commit_tentative_capture(ctx, store, config);
+        clear_capture_metadata(ctx);
+    }
+    // else: whitespace-only chunk, EOS not yet seen — keep waiting.
+    true
+}
+
 /// Drives non-streaming A2A task-route capture for one `on_response_body`
 /// call: accumulate the chunk, update the [`JsonBalanceState`] scanner,
 /// and either abandon capture (invalid buffer), attempt a parse (buffer
@@ -393,6 +420,10 @@ fn handle_non_streaming_capture(
     store: &LocalTaskRouteStore,
     config: &config::TaskRoutingConfig,
 ) {
+    if handle_pending_tentative(ctx, body, end_of_stream, store, config) {
+        return;
+    }
+
     if let Some(chunk) = body.as_ref()
         && !accumulate_response_hex(ctx, chunk, config.max_response_body_bytes)
     {
@@ -414,26 +445,25 @@ fn handle_non_streaming_capture(
         // remaining chunk up to max_response_body_bytes only to hit
         // this same dead end at end_of_stream.
         clear_capture_metadata(ctx);
+    } else if is_complete && !end_of_stream {
+        // Structurally complete but EOS not yet confirmed. Parse tentatively
+        // and hold: the route is committed only when EOS arrives with no
+        // further non-whitespace bytes. This prevents a valid JSON prefix
+        // followed by trailing garbage from poisoning task-route ownership.
+        parse_to_tentative(ctx);
     } else if is_complete || end_of_stream {
+        // EOS is confirmed (either directly or together with is_complete):
+        // the full response is in the buffer; commit immediately.
         try_capture_from_buffer(ctx, store, config);
     }
 }
 
-/// Pingora may not deliver a separate EOS callback after the final data
-/// chunk, so callers attempt this as soon as [`JsonBalanceState`] reports
-/// the buffer holds a balanced top-level JSON value, rather than waiting
-/// for `end_of_stream`. This avoids repeating a full hex-decode and
-/// `serde_json` parse of the whole accumulated buffer on every chunk.
-///
-/// [`JsonBalanceState`] is a heuristic gate, not a validator: a buffer
-/// can be balanced and type-matched yet still fail to parse (e.g.
-/// trailing bytes after a complete object, or a trailing comma). Bytes
-/// already accumulated up to a structurally-closed offset cannot become
-/// parseable by appending more bytes afterward — any further data can
-/// only add trailing content, which `serde_json` rejects just the same.
-/// So a failed parse here is unconditionally terminal: clear capture
-/// state immediately rather than holding the (still-growing) buffer and
-/// re-attempting the same doomed parse at `end_of_stream`.
+/// Called from the `is_complete || end_of_stream` branch of
+/// [`handle_non_streaming_capture`] -- either the fast path where both
+/// conditions are true simultaneously, or the fallback where EOS arrives
+/// with an incomplete buffer. Parses the full accumulated hex buffer and,
+/// on success, stores the extracted routes. A failed parse is
+/// unconditionally terminal and clears capture state.
 fn try_capture_from_buffer(
     ctx: &mut HttpFilterContext<'_>,
     store: &LocalTaskRouteStore,
@@ -451,6 +481,61 @@ fn try_capture_from_buffer(
         store_task_route(&value, cluster, store, config);
     }
     clear_capture_metadata(ctx);
+}
+
+/// Parse the accumulated buffer and, on success, store the result in filter
+/// metadata under `a2a.response.tentative_json` without committing to the
+/// route store. The route is committed only once
+/// [`handle_non_streaming_capture`] receives EOS with no further
+/// non-whitespace bytes, proving no trailing content follows.
+///
+/// A failed parse clears capture state immediately — a balanced-but-invalid
+/// buffer (e.g. trailing comma) cannot be salvaged by later bytes.
+fn parse_to_tentative(ctx: &mut HttpFilterContext<'_>) {
+    let parsed = ctx
+        .filter_metadata
+        .get("a2a.response.buffer_hex")
+        .and_then(|hex| decode_hex(hex))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+
+    match parsed {
+        Some(value) => {
+            if let Ok(json_str) = serde_json::to_string(&value) {
+                ctx.filter_metadata
+                    .insert("a2a.response.tentative_json".to_owned(), json_str);
+            } else {
+                // Serialization failure is effectively infallible for a Value
+                // that was just deserialized, but clear state defensively so
+                // the tentative guard cannot be bypassed on subsequent chunks.
+                clear_capture_metadata(ctx);
+            }
+        },
+        None => {
+            // Balanced but unparseable: unconditionally terminal.
+            clear_capture_metadata(ctx);
+        },
+    }
+}
+
+/// Commit a previously tentative capture to the route store.
+///
+/// Called only after [`handle_non_streaming_capture`] confirms EOS arrived
+/// with no non-whitespace bytes following the balanced JSON prefix.
+fn commit_tentative_capture(
+    ctx: &HttpFilterContext<'_>,
+    store: &LocalTaskRouteStore,
+    config: &config::TaskRoutingConfig,
+) {
+    let Some(json_str) = ctx.filter_metadata.get("a2a.response.tentative_json") else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return;
+    };
+    let Some(cluster) = ctx.filter_metadata.get("a2a.response.cluster") else {
+        return;
+    };
+    store_task_route(&value, cluster, store, config);
 }
 
 /// Store task and context routes extracted from a response body.
@@ -517,6 +602,7 @@ fn clear_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.json_in_string");
     ctx.filter_metadata.remove("a2a.response.json_escaped");
     ctx.filter_metadata.remove("a2a.response.json_invalid");
+    ctx.filter_metadata.remove("a2a.response.tentative_json");
 }
 
 /// Accumulate raw bytes as hex to avoid corruption when chunk boundaries
