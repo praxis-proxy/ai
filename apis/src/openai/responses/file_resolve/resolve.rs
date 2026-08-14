@@ -1018,6 +1018,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_success_files_responses_fail_before_body_decoding() {
+        for body in [r#"{"error":{"message":"missing"}}"#, "not-json", "", "plain text"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = body.to_owned();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _read = stream.read(&mut request).unwrap();
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let client = test_client(&format!("http://{address}"));
+            let Err(err) = client.fetch_metadata("file-missing", &http::HeaderMap::new()).await else {
+                panic!("metadata response must fail for a non-success status");
+            };
+            assert!(
+                matches!(err, ResolveError::CalloutFailed { .. }),
+                "metadata status must win over body shape: {err}"
+            );
+        }
+
+        for body in [r#"{"error":{"message":"failed"}}"#, "not-json", "", "plain text"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = body.to_owned();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _read = stream.read(&mut request).unwrap();
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let client = test_client(&format!("http://{address}"));
+            let err = client
+                .fetch_content("file-failed", &http::HeaderMap::new(), 1024, 1024)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ResolveError::CalloutFailed { .. }),
+                "content status must win over body shape: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn content_download_does_not_follow_redirects() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
