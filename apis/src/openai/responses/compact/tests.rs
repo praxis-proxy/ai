@@ -648,6 +648,104 @@ fn direct_input_should_not_compact_below_threshold() {
 }
 
 // =============================================================================
+// parse_compact_request_body
+// =============================================================================
+
+#[test]
+fn parse_compact_request_body_valid() {
+    let body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "response_id": "resp_abc",
+            "model": "gpt-4o",
+            "instructions": "Be concise"
+        }))
+        .unwrap(),
+    ));
+    let req = parse_compact_request_body(&body).unwrap();
+    assert_eq!(req.response_id, "resp_abc");
+    assert_eq!(req.model.as_deref(), Some("gpt-4o"));
+    assert_eq!(req.instructions.as_deref(), Some("Be concise"));
+}
+
+#[test]
+fn parse_compact_request_body_minimal() {
+    let body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"response_id": "resp_xyz"})).unwrap(),
+    ));
+    let req = parse_compact_request_body(&body).unwrap();
+    assert_eq!(req.response_id, "resp_xyz");
+    assert!(req.model.is_none());
+    assert!(req.instructions.is_none());
+}
+
+#[test]
+fn parse_compact_request_body_empty() {
+    assert!(parse_compact_request_body(&None).is_err());
+}
+
+#[test]
+fn parse_compact_request_body_invalid_json() {
+    let body = Some(Bytes::from_static(b"not json"));
+    assert!(parse_compact_request_body(&body).is_err());
+}
+
+#[test]
+fn parse_compact_request_body_missing_response_id() {
+    let body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-4o"})).unwrap()));
+    assert!(parse_compact_request_body(&body).is_err());
+}
+
+// =============================================================================
+// extract_stored_messages
+// =============================================================================
+
+#[test]
+fn extract_stored_messages_returns_messages() {
+    let record = ResponseRecord {
+        id: "resp_1".to_owned(),
+        tenant_id: "default".to_owned(),
+        created_at: 0,
+        model: "gpt-4o".to_owned(),
+        response_object: json!({}),
+        input: json!([]),
+        messages: json!([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"}
+        ]),
+    };
+    let msgs = extract_stored_messages(record).unwrap();
+    assert_eq!(msgs.len(), 2);
+}
+
+#[test]
+fn extract_stored_messages_empty_array() {
+    let record = ResponseRecord {
+        id: "resp_1".to_owned(),
+        tenant_id: "default".to_owned(),
+        created_at: 0,
+        model: "gpt-4o".to_owned(),
+        response_object: json!({}),
+        input: json!([]),
+        messages: json!([]),
+    };
+    assert!(extract_stored_messages(record).is_err());
+}
+
+#[test]
+fn extract_stored_messages_not_array() {
+    let record = ResponseRecord {
+        id: "resp_1".to_owned(),
+        tenant_id: "default".to_owned(),
+        created_at: 0,
+        model: "gpt-4o".to_owned(),
+        response_object: json!({}),
+        input: json!([]),
+        messages: json!("not an array"),
+    };
+    assert!(extract_stored_messages(record).is_err());
+}
+
+// =============================================================================
 // canonical round-trip
 // =============================================================================
 
