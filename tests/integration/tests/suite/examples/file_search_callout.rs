@@ -235,3 +235,69 @@ fn file_search_callout_example_rejects_parallel_client_function_call() {
         "client function output must arrive before reinference"
     );
 }
+
+#[test]
+fn file_search_callout_example_rejects_non_success_search_response() {
+    let first_model_response = json!({
+        "id": "resp_search",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "fs_1",
+            "type": "file_search_call",
+            "status": "searching",
+            "queries": ["What were the Q4 results?"]
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    });
+    let model = start_stateful_backend(vec![
+        (200, r#"{"status":"ready"}"#.to_owned()),
+        (200, first_model_response.to_string()),
+        (200, r#"{"id":"resp_should_not_run"}"#.to_owned()),
+    ]);
+    let search_error = json!({
+        "error": {
+            "message": "Rate limit reached for vector store search",
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded"
+        }
+    })
+    .to_string();
+    let search = start_stateful_backend(vec![(429, search_error)]);
+    let proxy_port = free_port();
+    let config = load_file_search_callout_config(
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:8001", search.port())]),
+    );
+    let proxy = start_file_search_proxy(&config);
+
+    let request = json!({
+        "model": "llama-3.3-70b",
+        "input": "What do the uploaded documents say about Q4 results?",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}]
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 502, "closed search failure should reject: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("rejection should be JSON");
+    assert_eq!(response["error"]["type"], "server_error");
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("openai_file_search_callout"),
+        "closed failure should keep the existing filter error: {response}"
+    );
+    assert!(
+        !message.contains("Rate limit reached for vector store search"),
+        "search error body must not leak into the outer rejection: {response}"
+    );
+    let inference_calls = model
+        .requests()
+        .into_iter()
+        .filter(|request| request.starts_with("POST /v1/responses "))
+        .count();
+    assert_eq!(inference_calls, 1, "closed search failure must not reinfer");
+    assert!(
+        !search.requests().is_empty(),
+        "the vector-store callout should still fire before the closed rejection"
+    );
+}
