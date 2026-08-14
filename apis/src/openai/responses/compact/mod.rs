@@ -438,8 +438,11 @@ fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(Co
         return Some((params, build_conversation_text(&state.messages)));
     }
 
+    debug!("previous_usage unavailable, falling back to tiktoken estimation");
     let conversation_text = build_conversation_text(&state.messages);
-    let token_count = get_token_count(&conversation_text, tiktoken_encoding)?;
+    let overhead = build_context_overhead_text(&state.request_body);
+    let full_text = format!("{conversation_text}\n\n{overhead}");
+    let token_count = get_token_count(&full_text, tiktoken_encoding)?;
     if !exceeds_threshold(token_count, &params) {
         return None;
     }
@@ -829,6 +832,27 @@ fn persist_compaction_response(
     if let Err(e) = tokio::task::block_in_place(|| handle.block_on(store.upsert_response(&record))) {
         warn!(error = %e, id = %response_id, "failed to persist compaction response");
     }
+}
+
+/// Build a text representation of instructions and tool definitions for token counting.
+///
+/// Returns an empty string when neither field is present. The result is
+/// concatenated with conversation text so tiktoken counts the full context
+/// window overhead, matching the behavior of `previous_usage.total_tokens`.
+fn build_context_overhead_text(request_body: &Value) -> String {
+    let mut buf = String::new();
+    if let Some(instructions) = request_body.get("instructions").and_then(Value::as_str)
+        && !instructions.is_empty()
+    {
+        append_line(&mut buf, "instructions", instructions);
+    }
+    if let Some(tools) = request_body.get("tools").and_then(Value::as_array)
+        && !tools.is_empty()
+    {
+        let serialized = serde_json::to_string(tools).unwrap_or_default();
+        append_line(&mut buf, "tools", &serialized);
+    }
+    buf
 }
 
 /// Format a message array as readable text for the summarization prompt.

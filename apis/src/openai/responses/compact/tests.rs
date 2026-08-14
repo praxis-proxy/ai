@@ -648,10 +648,7 @@ fn direct_input_should_not_compact_below_threshold() {
 }
 
 #[test]
-fn tiktoken_fallback_counts_messages_only_not_instructions_or_tools() {
-    // The tiktoken path (used when previous_usage is unavailable) intentionally
-    // counts only message content tokens. Instructions and tool definitions are
-    // excluded so that the threshold reflects conversation size, not schema overhead.
+fn tiktoken_fallback_includes_instructions_and_tools_in_count() {
     let state = ResponsesState::from_request_body(json!({
         "model": "gpt-4o",
         "input": [{"role": "user", "content": "short"}],
@@ -661,8 +658,8 @@ fn tiktoken_fallback_counts_messages_only_not_instructions_or_tools() {
     }));
     let result = should_compact(&state, "cl100k_base");
     assert!(
-        result.is_none(),
-        "tiktoken path should count only messages, not instructions or tool definitions"
+        result.is_some(),
+        "tiktoken path should include instructions and tool definitions in token count"
     );
 }
 
