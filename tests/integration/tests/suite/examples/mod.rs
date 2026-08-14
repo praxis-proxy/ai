@@ -16,6 +16,7 @@ mod file_search_callout;
 mod full_flow;
 mod full_flow_agentic;
 mod guardrails;
+mod inference_fallback;
 mod mcp_broker;
 mod model_to_header;
 mod openai_agentic_loop;

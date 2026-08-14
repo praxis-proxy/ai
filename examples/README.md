@@ -48,6 +48,12 @@ before sending requests.
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
 
+### Inference
+
+| File | Description |
+| ------ | ------------- |
+| [fallback-with-translation.yaml](configs/inference/fallback-with-translation.yaml) | Demonstrates provider failover with Responses-to-Chat Completions protocol translation using the iterative_request_router |
+
 ### OpenAI
 
 | File | Description |
