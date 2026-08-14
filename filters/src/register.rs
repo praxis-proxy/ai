@@ -203,7 +203,7 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config
+        http "openai_agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config
     );
 }
 

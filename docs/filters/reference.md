@@ -26,7 +26,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`agentic_loop`](agentic_loop.md) | Agentic loop controller for the Responses API pipeline. |
+| [`openai_agentic_loop`](openai_agentic_loop.md) | Agentic loop controller for the Responses API pipeline. |
 | [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
 | [`openai_doc_extract`](openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |
 | [`openai_file_resolve`](openai_file_resolve.md) | Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field. |

@@ -6,8 +6,8 @@
 //! Operates in two phases within an
 //! `iterative_request_router` inference step:
 //!
-//! 1. **Response path** (`on_response_body`): after `agentic_loop` extracts model-produced function calls, identifies
-//!    calls backed by [`ResponsesState::mcp_tool_map`], checks approval policies, and writes
+//! 1. **Response path** (`on_response_body`): after `openai_agentic_loop` extracts model-produced function calls,
+//!    identifies calls backed by [`ResponsesState::mcp_tool_map`], checks approval policies, and writes
 //!    `openai_mcp_dispatch.action = "loop"` to filter results.
 //! 2. **Request-body path** (`on_request_body`, next IRR iteration): executes pending MCP calls via
 //!    [`mcp_client::call_tool`] and appends results to `messages`, `persisted_messages`, and `output_items` before
@@ -19,8 +19,8 @@
 //! - **`openai_stream_events`** (or equivalent accumulator) must populate [`ResponsesState::tool_calls`] from the
 //!   upstream response. Currently only `function_call` events are accumulated; native `mcp_call` events require either
 //!   `mcp_tool_resolve` rewriting MCP tools into function tools or the accumulator adding `mcp_call` support.
-//! - **`agentic_loop`** must run after this filter in request order, so response order is `agentic_loop` then
-//!   `openai_mcp_dispatch`.
+//! - **`openai_agentic_loop`** must run after this filter in request order, so response order is `openai_agentic_loop`
+//!   then `openai_mcp_dispatch`.
 //! - The IRR transition must match `openai_mcp_dispatch.action = "loop"` and target the same inference step.
 //!
 //! Ordinary client-side function calls do not match the MCP tool map,
