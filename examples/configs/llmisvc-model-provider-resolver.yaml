@@ -1,0 +1,46 @@
+# LLMISvc Model Provider Resolver
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+#
+# Ports the LLMISvc / KServe BBR body-rewrite path: when the model
+# name is a publisher ID (`publishers/{ns}/models/{name}`), rewrite
+# the JSON body `"model"` field to `{name}` so vLLM receives the
+# short name. The routing header (default `X-Model`) is left
+# unchanged so KServe can still route on the publisher ID.
+#
+# Typical chain: `model_to_header` promotes the body model to
+# `X-Model`, then `llmisvc_model_provider_resolver` strips the
+# publisher prefix from the body only.
+#
+# Example request:
+#
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"publishers/rhoai/models/granite-3.1-8b","messages":[{"role":"user","content":"hi"}]}'
+#
+# Upstream body model becomes `granite-3.1-8b` while `X-Model`
+# remains `publishers/rhoai/models/granite-3.1-8b`.
+
+listeners:
+  - name: llmisvc-gateway
+    address: "0.0.0.0:8080" # dev value; binds all interfaces
+    filter_chains:
+      - rewrite-and-route
+
+filter_chains:
+  - name: rewrite-and-route
+    filters:
+      - filter: model_to_header
+        header: X-Model
+      - filter: llmisvc_model_provider_resolver
+        header: X-Model
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: provider
+      - filter: load_balancer
+        clusters:
+          - name: provider
+            endpoints:
+              - "127.0.0.1:3000"

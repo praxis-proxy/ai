@@ -7,8 +7,8 @@ use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
-    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter,
+    ModelToHeaderFilter, PromptEnrichFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -76,6 +76,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "model_to_header" => ModelToHeaderFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "llmisvc_model_provider_resolver" => LlmisvcModelProviderResolverFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -333,31 +337,18 @@ mod tests {
     fn build_ai_registry_includes_ai_and_builtin_filters() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
-        assert!(names.contains(&"ai_guardrails"), "expected ai_guardrails in registry");
-        assert!(
-            names.contains(&"openai_responses_validate"),
-            "expected openai_responses_validate in registry"
-        );
-        assert!(
-            names.contains(&"responses_to_chat_completions"),
-            "expected responses_to_chat_completions in registry"
-        );
-        assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
-        assert!(
-            names.contains(&"intelligent_route"),
-            "expected intelligent_route in registry"
-        );
-        assert!(
-            names.contains(&"anthropic_validate"),
-            "expected anthropic filter in registry"
-        );
-        assert!(
-            names.contains(&"anthropic_web_search"),
-            "expected anthropic_web_search in registry"
-        );
-        assert!(
-            names.contains(&"request_id"),
-            "expected core builtin request_id in registry"
-        );
+        for expected in [
+            "ai_guardrails",
+            "llmisvc_model_provider_resolver",
+            "openai_responses_validate",
+            "responses_to_chat_completions",
+            "a2a",
+            "intelligent_route",
+            "anthropic_validate",
+            "anthropic_web_search",
+            "request_id",
+        ] {
+            assert!(names.contains(&expected), "expected {expected} in registry");
+        }
     }
 }
