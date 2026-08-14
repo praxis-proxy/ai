@@ -1,0 +1,151 @@
+name: Tests (PostgreSQL Store)
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apis/src/store/**"
+      - "apis/src/openai/responses/store/**"
+      - "apis/src/openai/conversations/**"
+      - "examples/configs/openai/responses/response-store.yaml"
+      - "tests/utils/src/net/postgres.rs"
+      - "tests/integration/tests/suite/examples/openai_response_store_postgres.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/postgres.yaml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "apis/src/store/**"
+      - "apis/src/openai/responses/store/**"
+      - "apis/src/openai/conversations/**"
+      - "examples/configs/openai/responses/response-store.yaml"
+      - "tests/utils/src/net/postgres.rs"
+      - "tests/integration/tests/suite/examples/openai_response_store_postgres.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/postgres.yaml"
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable verbose test output (V=1)"
+        required: false
+        type: boolean
+        default: false
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  V: ${{ inputs.debug && '1' || '' }}
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Path filter for merge_group (which does not support on.paths)
+  # ----------------------------------------------------------------------------
+
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant path changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
+                                         "${{ github.event.merge_group.head_sha }}" -- \
+            'apis/src/store/' \
+            'apis/src/openai/responses/store/' \
+            'apis/src/openai/conversations/' \
+            'examples/configs/openai/responses/response-store.yaml' \
+            'tests/utils/src/net/postgres.rs' \
+            'tests/integration/tests/suite/examples/openai_response_store_postgres.rs' \
+            'Cargo.toml' \
+            'Cargo.lock' \
+            'Makefile' \
+            '.github/workflows/postgres.yaml')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ----------------------------------------------------------------------------
+  # PostgreSQL store unit tests (ignored tests requiring DATABASE_URL)
+  # ----------------------------------------------------------------------------
+
+  unit:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: praxis
+          POSTGRES_PASSWORD: praxis
+          POSTGRES_DB: praxis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U praxis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: PostgreSQL store unit tests
+        run: make test-postgres-unit
+
+  # ----------------------------------------------------------------------------
+  # PostgreSQL store integration tests (spawn their own container)
+  # ----------------------------------------------------------------------------
+
+  integration:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Pull PostgreSQL image
+        run: docker pull docker.io/library/postgres:17-alpine
+
+      - name: PostgreSQL store integration tests
+        run: make test-postgres-integration
