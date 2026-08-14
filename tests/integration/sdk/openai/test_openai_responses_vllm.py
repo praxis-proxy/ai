@@ -42,8 +42,7 @@ VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
-STORE_BACKEND = os.environ.get("STORE_BACKEND", "sqlite")
-STORE_DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 
@@ -88,10 +87,10 @@ def _ogx_endpoint() -> str:
 
 
 def _patch_store_backend(config: str, db_path: str) -> str:
-    if STORE_BACKEND == "postgres" and STORE_DATABASE_URL:
+    if DATABASE_URL.startswith("postgres"):
         config = config.replace(
             'database_url: "sqlite://responses.db?mode=rwc"',
-            f'database_url: "{STORE_DATABASE_URL}"\n'
+            f'database_url: "{DATABASE_URL}"\n'
             "        allow_private_database_url: true\n"
             "        ssl_mode: disable",
         )

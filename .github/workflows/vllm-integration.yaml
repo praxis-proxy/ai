@@ -275,7 +275,6 @@ jobs:
 
       - name: Run vLLM integration tests (PostgreSQL store)
         env:
-          STORE_BACKEND: postgres
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
         run: |
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
