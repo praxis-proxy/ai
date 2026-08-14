@@ -76,9 +76,8 @@ fn default_max_body_bytes() -> usize {
 /// body `"model"` field to `<name>` only. The routing header is never
 /// modified -- `KServe` routes on the publisher ID.
 ///
-/// If the header is absent/empty, this filter is a no-op (it does not
-/// fall back to the body `"model"` field). If the body has no `"model"`
-/// field, it also no-ops rather than inventing one.
+/// If the header is absent/empty, or the body has no `"model"` field,
+/// this filter is a no-op (it does not invent a body `"model"`).
 ///
 /// Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform
 /// weighted provider selection, rewrite `Host`, or inject credentials.
@@ -152,8 +151,8 @@ impl LlmisvcModelProviderResolverFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
-        // Require the routing header (usually from `model_to_header`); no
-        // body fallback -- missing header means no-op.
+        // Require the routing header (usually from `model_to_header`);
+        // missing header means no-op.
         let Some(model_name) = header_model_name(ctx, &self.header) else {
             return Ok(FilterAction::Continue);
         };

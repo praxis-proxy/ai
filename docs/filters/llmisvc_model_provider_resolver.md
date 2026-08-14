@@ -9,7 +9,7 @@ Ports the `LLMISvc` / `KServe` BBR body-rewrite branch from IPP's `model-provide
 
 Reads the model name from the configured request header (default `X-Model`, typically set by an earlier `model_to_header`). When that value is a publisher ID (`publishers/.../models/<name>`), rewrite the body `"model"` field to `<name>` only. The routing header is never modified -- `KServe` routes on the publisher ID.
 
-If the header is absent/empty, this filter is a no-op (it does not fall back to the body `"model"` field). If the body has no `"model"` field, it also no-ops rather than inventing one.
+If the header is absent/empty, or the body has no `"model"` field, this filter is a no-op (it does not invent a body `"model"`).
 
 Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform weighted provider selection, rewrite `Host`, or inject credentials.
 
