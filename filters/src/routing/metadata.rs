@@ -47,8 +47,8 @@ pub(crate) const ROUTE_NAME: &str = "intelligent_route.name";
 pub(crate) const ROUTE_RANK: &str = "intelligent_route.rank";
 /// Producer-defined group used for this selection.
 pub(crate) const ROUTE_SELECTION_GROUP: &str = "intelligent_route.selection_group";
-/// Request-time picker applied within the selected group.
-pub(crate) const ROUTE_PICKER_POLICY: &str = "intelligent_route.picker_policy";
+/// Request-time selection mode applied within the selected group.
+pub(crate) const ROUTE_SELECTION_MODE: &str = "intelligent_route.selection_mode";
 /// Selection tier (primary, fallback, etc.).
 pub(crate) const ROUTE_SELECTION_TIER: &str = "intelligent_route.selection_tier";
 /// Remote site name of the selected candidate.

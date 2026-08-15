@@ -221,16 +221,16 @@ pub(crate) struct OverlayDocument {
     #[serde(default)]
     pub(super) network: Option<String>,
 
-    /// Optional request-time selection policy. Missing preserves legacy order.
+    /// Optional request-time selection policy.
     #[serde(default)]
     pub(crate) selection_policy: Option<SelectionPolicy>,
 }
 
-/// Request-time picker applied within the first viable selection group.
+/// Request-time selection algorithm used within the first viable group.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum PickerPolicy {
-    /// Preserve the first-admitted behavior used by older overlays.
+    /// Select the first admitted candidate.
     #[default]
     Deterministic,
     /// Rotate equally through candidates in the active group.
@@ -254,8 +254,8 @@ impl PickerPolicy {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SelectionPolicy {
-    /// Picker applied locally by `intelligent_route`.
-    pub(crate) picker: PickerPolicy,
+    /// Selection mode applied locally by `intelligent_route`.
+    pub(crate) mode: PickerPolicy,
 }
 
 /// A single routing candidate from the overlay.
@@ -360,11 +360,11 @@ pub(crate) struct RouteSnapshot {
     /// Validated route candidates.
     pub(crate) candidates: Vec<RouteCandidate>,
 
-    /// Validated lookup and snapshot-scoped picker state.
+    /// Validated lookup and snapshot-scoped selection state.
     pub(crate) group_index: GroupIndex,
 
-    /// Missing on older overlays means deterministic selection.
-    pub(crate) selection_policy: PickerPolicy,
+    /// Effective request-time selection mode.
+    pub(crate) selection_mode: PickerPolicy,
 
     /// Whether this snapshot was loaded from an envelope or legacy payload.
     pub(crate) contract_format: ContractFormat,
@@ -517,15 +517,15 @@ impl RouteSnapshot {
         let candidates = overlay_to_candidates(&envelope.overlay)?;
         let group_index = group_index::build(&candidates)?;
         let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
-        let selection_policy = envelope
+        let selection_mode = envelope
             .overlay
             .selection_policy
-            .map_or(PickerPolicy::Deterministic, |policy| policy.picker);
+            .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
 
         Ok(Self {
             candidates,
             group_index,
-            selection_policy,
+            selection_mode,
             contract_format: ContractFormat::Envelope,
             content_hash,
             generated_at,
@@ -544,14 +544,14 @@ impl RouteSnapshot {
         let candidates = overlay_to_candidates(&doc)?;
         let group_index = group_index::build(&candidates)?;
         let generated_at = doc.generated_at.map(|s| Arc::from(s.as_str()));
-        let selection_policy = doc
+        let selection_mode = doc
             .selection_policy
-            .map_or(PickerPolicy::Deterministic, |policy| policy.picker);
+            .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
 
         Ok(Self {
             candidates,
             group_index,
-            selection_policy,
+            selection_mode,
             contract_format: ContractFormat::Legacy,
             content_hash,
             generated_at,
@@ -568,7 +568,7 @@ impl RouteSnapshot {
         Self {
             candidates,
             group_index: GroupIndex::new(),
-            selection_policy: PickerPolicy::Deterministic,
+            selection_mode: PickerPolicy::Deterministic,
             contract_format: ContractFormat::Legacy,
             content_hash: [0; 32],
             generated_at: None,
@@ -1227,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_selection_policy_preserves_deterministic_compatibility() {
+    fn missing_selection_policy_uses_deterministic_mode() {
         let json = r#"{
             "local_site": "site-a",
             "candidates": [{
@@ -1238,7 +1238,7 @@ mod tests {
             }]
         }"#;
         let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
-        assert_eq!(snapshot.selection_policy, PickerPolicy::Deterministic);
+        assert_eq!(snapshot.selection_mode, PickerPolicy::Deterministic);
         assert!(snapshot.group_index.is_empty());
     }
 
@@ -1246,7 +1246,7 @@ mod tests {
     fn round_robin_policy_and_group_survive_overlay_load() {
         let json = r#"{
             "local_site": "site-a",
-            "selection_policy": {"picker": "roundRobin"},
+            "selection_policy": {"mode": "roundRobin"},
             "candidates": [{
                 "kind": "inference_model",
                 "name": "llama-3",
@@ -1256,7 +1256,7 @@ mod tests {
             }]
         }"#;
         let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
-        assert_eq!(snapshot.selection_policy, PickerPolicy::RoundRobin);
+        assert_eq!(snapshot.selection_mode, PickerPolicy::RoundRobin);
         assert_eq!(snapshot.candidates[0].selection_group, Some(0));
     }
 
@@ -2317,7 +2317,7 @@ mod tests {
             &snapshot.group_index,
             CapabilityKind::InferenceModel,
             "m",
-            snapshot.selection_policy,
+            snapshot.selection_mode,
         )
         .unwrap()
         .0
@@ -2329,7 +2329,7 @@ mod tests {
     fn new_snapshot_has_independent_picker_state() {
         let json_v1 = r#"{
             "local_site":"site-a",
-            "selection_policy":{"picker":"roundRobin"},
+            "selection_policy":{"mode":"roundRobin"},
             "candidates":[
                 {"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0},
                 {"kind":"inference_model","name":"m","site":"b","cluster":"b","selection_group":0}
