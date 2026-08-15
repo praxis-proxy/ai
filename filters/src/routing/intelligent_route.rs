@@ -14,9 +14,10 @@
 //! MCP metadata takes precedence over the model header to prevent a
 //! client-supplied model name from hijacking MCP routing.
 //!
-//! Candidate selection preserves deterministic ordering for static and legacy
-//! configurations. A versioned overlay may define priority groups and a local
-//! deterministic, random, or round-robin picker within the first viable group.
+//! Candidate selection preserves deterministic ordering when no selection
+//! policy is configured. A versioned overlay may define priority groups and a
+//! local deterministic, random, or round-robin mode within the first viable
+//! group.
 //! The filter does not recompute source geography, load, or scoring.
 //!
 //! No request-time metrics or control-plane lookups are performed.
@@ -39,8 +40,8 @@ use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     metadata::{
         OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
-        ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PICKER_POLICY, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK,
-        ROUTE_SELECTION_GROUP, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER,
+        ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_GROUP,
+        ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER,
         set_credential_metadata,
     },
     overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, PickerPolicy, RouteSnapshot},
@@ -294,8 +295,8 @@ enum AffinityOutcome<'a> {
 /// - If no matching candidate is found, the filter rejects with 404.
 ///
 /// **Selection:** session affinity is resolved first. New requests use the
-/// overlay's picker within the lowest viable producer-defined selection group.
-/// Missing group or policy metadata preserves legacy first-admitted ordering.
+/// overlay's selection mode within the first viable producer-defined group.
+/// Missing group or policy metadata uses deterministic first-admitted ordering.
 /// Praxis AI does not recompute source geography, load, or score.
 /// `admission_state=none` is never eligible. `existing_only` is eligible only
 /// through an already-bound session affinity entry.
@@ -303,7 +304,7 @@ enum AffinityOutcome<'a> {
 /// **Metadata:** on successful selection, bounded in-process filter
 /// metadata is written under the `intelligent_route.` namespace (`kind`, `name`,
 /// `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and
-/// optionally `rank`, `selection_group`, `picker_policy`, and
+/// optionally `rank`, `selection_group`, `selection_mode`, and
 /// `selection_tier`). When session affinity is enabled,
 /// `session.bound`, `session.reused`, and `session.failover` keys are also
 /// written. When the selected cluster is present in `provider_hop_clusters`,
@@ -495,12 +496,12 @@ impl IntelligentRouteFilter {
                 c,
                 &self.provider_hop_clusters,
                 snap.semantic_revision.as_ref(),
-                snap.selection_policy,
+                snap.selection_mode,
             );
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
         let Some((c, selection_group)) =
-            picker::select_candidate(&snap.candidates, &snap.group_index, kind, name, snap.selection_policy)
+            picker::select_candidate(&snap.candidates, &snap.group_index, kind, name, snap.selection_mode)
         else {
             tracing::debug!(kind = kind.as_str(), name = %name, "intelligent_route: no candidate");
             return Ok(FilterAction::Reject(Rejection::status(404)));
@@ -512,7 +513,7 @@ impl IntelligentRouteFilter {
             &self.provider_hop_clusters,
             snap.semantic_revision.as_ref(),
             selection_group,
-            snap.selection_policy,
+            snap.selection_mode,
         )?;
         if let Some(aff) = &self.session_affinity {
             record_session(aff, ctx, &c.stable_id, session_key.as_deref(), failover);
@@ -675,14 +676,14 @@ fn apply_reused(
     candidate: &RouteCandidate,
     provider_hop_clusters: &BTreeSet<String>,
     semantic_revision: Option<&Arc<str>>,
-    picker: PickerPolicy,
+    mode: PickerPolicy,
 ) -> Result<FilterAction, FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
     write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)?;
     #[cfg(feature = "opentelemetry")]
     crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
-    record_picker_metadata(ctx, candidate.selection_group, picker);
+    record_selection_metadata(ctx, candidate.selection_group, mode);
     ctx.set_metadata("intelligent_route.session.bound", "true");
     ctx.set_metadata("intelligent_route.session.reused", "true");
     ctx.set_metadata("intelligent_route.session.failover", "false");
@@ -701,14 +702,14 @@ fn apply_route(
     provider_hop_clusters: &BTreeSet<String>,
     semantic_revision: Option<&Arc<str>>,
     selection_group: Option<u32>,
-    picker: PickerPolicy,
+    mode: PickerPolicy,
 ) -> Result<(), FilterError> {
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
     write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)?;
     #[cfg(feature = "opentelemetry")]
     crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
-    record_picker_metadata(ctx, selection_group, picker);
+    record_selection_metadata(ctx, selection_group, mode);
     Ok(())
 }
 
@@ -925,14 +926,14 @@ fn evict_expired(affinity: &SessionAffinity) {
 }
 
 // -----------------------------------------------------------------------------
-// Picker Evidence
+// Selection Evidence
 // -----------------------------------------------------------------------------
 
 /// Record bounded request metadata without changing forwarding headers.
-fn record_picker_metadata(ctx: &mut HttpFilterContext<'_>, group: Option<u32>, picker: PickerPolicy) {
+fn record_selection_metadata(ctx: &mut HttpFilterContext<'_>, group: Option<u32>, mode: PickerPolicy) {
     if let Some(group) = group {
         ctx.set_metadata(ROUTE_SELECTION_GROUP, group.to_string());
-        ctx.set_metadata(ROUTE_PICKER_POLICY, picker.as_str());
+        ctx.set_metadata(ROUTE_SELECTION_MODE, mode.as_str());
     }
 }
 
