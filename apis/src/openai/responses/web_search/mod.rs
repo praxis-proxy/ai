@@ -206,9 +206,7 @@ impl HttpFilter for WebSearchFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
-        }
+        BodyMode::Stream
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {

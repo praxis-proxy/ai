@@ -1233,6 +1233,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
             ]
         );
@@ -1256,11 +1257,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 13);
-        assert_eq!(report.scenarios_total, 11);
-        assert_eq!(report.recordings_total, 16);
+        assert_eq!(report.features_total, 14);
+        assert_eq!(report.scenarios_total, 12);
+        assert_eq!(report.recordings_total, 17);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1272,12 +1274,13 @@ mod tests {
                 "messages/upstream-error",
                 "responses/agentic-parallel-tool-calls",
                 "responses/chat-basic-nonstream",
+                "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 13);
+        assert_eq!(manifest.features.len(), 14);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1353,6 +1356,10 @@ mod tests {
                 (
                     &"responses.agentic.parallel_tool_calls".to_owned(),
                     &vec!["responses/agentic-parallel-tool-calls".to_owned()]
+                ),
+                (
+                    &"responses.agentic.irr_terminal_streaming".to_owned(),
+                    &vec!["responses/irr-terminal-streaming".to_owned()]
                 ),
                 (
                     &"responses.chat.continuation".to_owned(),

@@ -17,6 +17,7 @@ use serde::Deserialize;
 ///
 /// ```yaml
 /// filter: openai_responses_proxy
+/// terminal_streaming: false
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,12 +25,19 @@ pub(super) struct ResponsesProxyConfig {
     /// Maximum body size in bytes for `StreamBuffer` mode.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+
+    /// Select Praxis streaming transport for effective `stream: true`
+    /// requests. IRR may resume the same downstream stream after a step
+    /// transition when its response filters use streaming body mode.
+    #[serde(default)]
+    pub terminal_streaming: bool,
 }
 
 impl Default for ResponsesProxyConfig {
     fn default() -> Self {
         Self {
             max_body_bytes: MAX_JSON_BODY_BYTES,
+            terminal_streaming: false,
         }
     }
 }

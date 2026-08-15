@@ -274,6 +274,13 @@ lossy_float_literal = "deny"
 semicolon_inside_block = "deny"
 disallowed_methods = "deny"
 
+[patch.crates-io]
+praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2" }
+praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2" }
+praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2" }
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2" }
+praxis-proxy = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2" }
+
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"

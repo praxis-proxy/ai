@@ -19,16 +19,16 @@
 //!   - `openai_agentic_loop.action = "loop"` — tool calls present, loop back
 //!   - `openai_agentic_loop.action = "done"` — exit to client
 //!
-//! # Non-streaming tool call extraction
+//! # Tool call extraction
 //!
-//! For non-streaming responses (the only mode supported by IRR),
+//! For non-streaming responses,
 //! this filter parses the response body JSON and extracts
 //! `function_call` items from the `output` array into
 //! `state.tool_calls` and `web_search_call` items into
 //! `state.web_search_calls`. It also appends these items to
 //! `state.messages` so the model sees its own calls on re-entry.
 //!
-//! For streaming responses (future), `stream_events` populates
+//! For streaming responses, `stream_events` populates
 //! `state.tool_calls` via SSE event parsing. When the body is
 //! `None` at end-of-stream (consumed by streaming filters), this
 //! filter skips body parsing and checks `state.tool_calls` as-is.
@@ -80,12 +80,6 @@
 //!       - default: true
 //!         done: true
 //! ```
-//!
-//! # Streaming limitation
-//!
-//! Streaming requests (`stream: true`) are rejected with a 400
-//! error. `iterative_request_router` fully buffers all responses
-//! within the loop and cannot forward incremental SSE events.
 //!
 //! # State dependency
 //!
@@ -216,9 +210,7 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
-        }
+        BodyMode::Stream
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -238,16 +230,6 @@ impl HttpFilter for AgenticLoopFilter {
         let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-
-        if state.request_body.get("stream") == Some(&Value::Bool(true)) {
-            ctx.extensions.insert(state);
-            return Ok(FilterAction::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "streaming is not supported with openai_agentic_loop",
-                false,
-            )));
-        }
 
         prepare_iteration(ctx, &mut state);
         trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
@@ -269,22 +251,73 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         };
 
-        if let Some(bytes) = body.as_ref()
-            && let Err(msg) = extract_tool_calls_from_body(bytes, &mut state)
-        {
+        if let Some(bytes) = body.as_ref() {
+            if let Err(msg) = extract_tool_calls_from_body(bytes, &mut state) {
+                return Ok(reject_invalid_function_cardinality(ctx, state, msg));
+            }
+        } else if !prepare_streamed_round(ctx, &mut state)? {
             ctx.extensions.insert(state);
-            return Ok(FilterAction::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                msg,
-                false,
-            )));
+            return Ok(FilterAction::Continue);
         }
 
         let result = evaluate_loop_decision(ctx, &mut state, body, &self.config)?;
         ctx.extensions.insert(state);
         Ok(result)
     }
+}
+
+/// Preserve state while rejecting a buffered round with invalid cardinality.
+fn reject_invalid_function_cardinality(
+    ctx: &mut HttpFilterContext<'_>,
+    state: ResponsesState,
+    message: &'static str,
+) -> FilterAction {
+    ctx.extensions.insert(state);
+    FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message, false))
+}
+
+/// Only a successfully terminated stream may authorize external side effects.
+fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &ResponsesState) -> bool {
+    state.request_body.get("stream").and_then(Value::as_bool) != Some(true)
+        || (ctx.get_metadata("responses.stream_completion") == Some("terminal")
+            && state.response_object.get("status").and_then(Value::as_str) == Some("completed")
+            && ctx.get_metadata("responses.stream_parse_error") != Some("true"))
+}
+
+/// Collect an authoritative successful stream or terminate without dispatch.
+fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<bool, FilterError> {
+    if !streamed_round_is_dispatchable(ctx, state) {
+        collect_streaming_output_items(state);
+        state.tool_calls.clear();
+        state.web_search_calls.clear();
+        set_action(ctx, ACTION_DONE)?;
+        return Ok(false);
+    }
+    collect_streaming_output_items(state);
+    if state.tool_calls.len() > 1 {
+        end_stream_with_error(
+            ctx,
+            state,
+            "invalid_request_error",
+            "openai_agentic_loop supports exactly one function call per round",
+        )?;
+    }
+    Ok(true)
+}
+
+/// End an already-committed stream with a local SSE error and no side effects.
+fn end_stream_with_error(
+    ctx: &mut HttpFilterContext<'_>,
+    state: &mut ResponsesState,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), FilterError> {
+    state.tool_calls.clear();
+    state.web_search_calls.clear();
+    ctx.set_metadata("responses.stream_error_code", code);
+    ctx.set_metadata("responses.stream_error_message", message);
+    ctx.set_metadata("responses.skip_persist", "true");
+    set_action(ctx, ACTION_DONE)
 }
 
 // -----------------------------------------------------------------------------
@@ -344,12 +377,7 @@ fn evaluate_loop_decision(
             set_action(ctx, ACTION_DONE)?;
             Ok(FilterAction::Continue)
         },
-        Some(ExitReason::IterationLimit) => Ok(FilterAction::Reject(responses_error_rejection(
-            508,
-            "server_error",
-            "agentic loop iteration limit exceeded",
-            false,
-        ))),
+        Some(ExitReason::IterationLimit) => end_at_iteration_limit(ctx, state),
         None => {
             state.iteration += 1;
             let (tc, wsc) = (state.tool_calls.len(), state.web_search_calls.len());
@@ -359,6 +387,23 @@ fn evaluate_loop_decision(
             Ok(FilterAction::Continue)
         },
     }
+}
+
+/// Terminate at the iteration cap using the transport that is still writable.
+fn end_at_iteration_limit(
+    ctx: &mut HttpFilterContext<'_>,
+    state: &mut ResponsesState,
+) -> Result<FilterAction, FilterError> {
+    if state.request_body.get("stream").and_then(Value::as_bool) == Some(true) {
+        end_stream_with_error(ctx, state, "server_error", "agentic loop iteration limit exceeded")?;
+        return Ok(FilterAction::Continue);
+    }
+    Ok(FilterAction::Reject(responses_error_rejection(
+        508,
+        "server_error",
+        "agentic loop iteration limit exceeded",
+        false,
+    )))
 }
 
 // -----------------------------------------------------------------------------
@@ -412,6 +457,27 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
                 state.web_search_calls.push(item.clone());
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Retain the current streamed round after `openai_stream_events` has built
+/// its authoritative response object and tool-call list incrementally.
+fn collect_streaming_output_items(state: &mut ResponsesState) {
+    let output = state.output_items().to_vec();
+    for item in output {
+        state.accumulated_output.push(item.clone());
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "reasoning") => {
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item);
+            },
+            Some("web_search_call") => {
+                state.web_search_calls.push(item.clone());
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item);
             },
             _ => {},
         }
