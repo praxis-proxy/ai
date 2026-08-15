@@ -1241,6 +1241,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
             ]
         );
@@ -1269,11 +1270,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 18);
-        assert_eq!(report.scenarios_total, 16);
-        assert_eq!(report.recordings_total, 21);
+        assert_eq!(report.features_total, 19);
+        assert_eq!(report.scenarios_total, 17);
+        assert_eq!(report.recordings_total, 22);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1290,12 +1292,13 @@ mod tests {
                 "responses/chat-basic-nonstream",
                 "responses/chat-file-search",
                 "responses/chat-web-search",
+                "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 18);
+        assert_eq!(manifest.features.len(), 19);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1391,6 +1394,10 @@ mod tests {
                 (
                     &"responses.agentic.parallel_tool_calls".to_owned(),
                     &vec!["responses/agentic-parallel-tool-calls".to_owned()]
+                ),
+                (
+                    &"responses.agentic.irr_terminal_streaming".to_owned(),
+                    &vec!["responses/irr-terminal-streaming".to_owned()]
                 ),
                 (
                     &"responses.chat.continuation".to_owned(),

@@ -10,7 +10,7 @@
 )]
 
 use bytes::Bytes;
-use praxis_filter::{FilterAction, HttpFilter};
+use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::json;
 
 use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object};
@@ -34,6 +34,11 @@ fn make_armed_context() -> (Box<dyn HttpFilter>, praxis_filter::HttpFilterContex
     (filter, ctx)
 }
 
+fn make_logical_filter() -> Box<dyn HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("logical_stream: true").unwrap();
+    OpenaiStreamEventsFilter::from_config(&yaml).unwrap()
+}
+
 #[test]
 fn default_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
@@ -47,6 +52,16 @@ fn custom_config_overrides_apply() {
         serde_yaml::from_str("max_buffer_bytes: 1048576\nmax_events: 500\ntimeout_secs: 60").unwrap();
     let filter = OpenaiStreamEventsFilter::from_config(&yaml);
     assert!(filter.is_ok(), "custom config should parse");
+}
+
+#[test]
+fn logical_stream_requires_response_write_access() {
+    let filter = make_logical_filter();
+    assert_eq!(
+        filter.response_body_access(),
+        praxis_filter::BodyAccess::ReadWrite,
+        "logical lifecycle normalization rewrites emitted SSE frames"
+    );
 }
 
 #[test]
@@ -105,10 +120,33 @@ fn oversized_max_tool_call_argument_bytes_rejected() {
 async fn arms_for_streaming_responses_request() {
     let (filter, mut ctx) = make_armed_context();
     let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "metadata-selected streaming request should continue"
+    );
     assert!(
         ctx.get_filter_state::<StreamEventsState>().is_some(),
         "filter should be armed"
+    );
+}
+
+#[tokio::test]
+async fn arms_for_typed_streaming_selection_without_classifier_metadata() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "typed terminal streaming selection should continue"
+    );
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>().is_some(),
+        "typed terminal streaming selection should arm the SSE parser"
     );
 }
 
@@ -159,7 +197,10 @@ async fn does_not_arm_for_other_responses_routes() {
 
         let action = filter.on_request(&mut ctx).await.unwrap();
 
-        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "non-create Responses route should continue"
+        );
         assert!(
             ctx.get_filter_state::<StreamEventsState>().is_none(),
             "filter should not arm for {path}"
@@ -176,7 +217,10 @@ fn unarmed_filter_passes_through_body() {
 
     let mut body = Some(Bytes::from("data: {}\n\n"));
     let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "unarmed response body should continue"
+    );
     assert!(body.is_some(), "body should not be consumed");
 }
 
@@ -188,6 +232,210 @@ fn make_sse_chunk(event_type: &str, data: &serde_json::Value) -> Bytes {
         .or_insert_with(|| serde_json::Value::String(event_type.to_owned()));
     let data_str = serde_json::to_string(&obj).unwrap();
     Bytes::from(format!("event: {event_type}\ndata: {data_str}\n\n"))
+}
+
+#[tokio::test]
+async fn logical_stream_suppresses_intermediate_terminal_and_normalizes_resumed_turn() {
+    let filter = make_logical_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_first", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+    assert!(
+        String::from_utf8_lossy(created.as_ref().unwrap()).contains("resp_first"),
+        "the first response lifecycle should be emitted"
+    );
+
+    let function_call = json!({
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "weather__get",
+        "arguments": "{}",
+        "status": "completed"
+    });
+    let mut terminal = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {"id": "resp_first", "status": "completed", "output": [function_call.clone()]},
+            "sequence_number": 1
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(terminal.is_none(), "the per-turn terminal must be withheld");
+    ctx.filter_results
+        .entry("openai_mcp_dispatch")
+        .or_default()
+        .set("action", "loop")
+        .unwrap();
+    let mut first_eos = None;
+    filter.on_response_body(&mut ctx, &mut first_eos, true).unwrap();
+    assert!(
+        first_eos.is_none(),
+        "an agentic transition must suppress the intermediate terminal"
+    );
+
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.iteration = 1;
+    state.accumulated_output = vec![function_call, json!({"type": "mcp_call", "id": "mcp_1"})];
+    ctx.filter_results.remove("openai_mcp_dispatch");
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let mut resumed_created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_second", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut resumed_created, false).unwrap();
+    assert!(
+        resumed_created.is_none(),
+        "resumed lifecycle creation must be suppressed"
+    );
+
+    let mut delta = Some(make_sse_chunk(
+        "response.output_text.delta",
+        &json!({
+            "response_id": "resp_second",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "done",
+            "sequence_number": 1
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut delta, false).unwrap();
+    let delta = String::from_utf8(delta.unwrap().to_vec()).unwrap();
+    assert!(
+        delta.contains(r#""response_id":"resp_first""#),
+        "logical response ID should remain stable: {delta}"
+    );
+    assert!(
+        delta.contains(r#""output_index":2"#),
+        "resumed output index should include prior tool items: {delta}"
+    );
+
+    let final_message = json!({
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "done"}]
+    });
+    let mut final_terminal = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {
+                "id": "resp_second",
+                "status": "completed",
+                "output": [final_message.clone()],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+            },
+            "sequence_number": 2
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut final_terminal, false).unwrap();
+    assert!(final_terminal.is_none(), "final terminal should be held until EOS");
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .accumulated_output
+        .push(final_message);
+    let mut final_eos = None;
+    filter.on_response_body(&mut ctx, &mut final_eos, true).unwrap();
+    let final_eos = String::from_utf8(final_eos.unwrap().to_vec()).unwrap();
+    assert!(
+        final_eos.contains("event: response.completed"),
+        "final terminal should be emitted: {final_eos}"
+    );
+    assert!(
+        final_eos.contains(r#""id":"resp_first""#),
+        "terminal response ID should remain stable: {final_eos}"
+    );
+    assert!(
+        final_eos.contains("mcp_1"),
+        "terminal output should contain the accumulated tool result: {final_eos}"
+    );
+    assert!(
+        final_eos.contains("msg_1"),
+        "terminal output should contain the final message: {final_eos}"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.response_object["id"], "resp_first",
+        "the persisted response object must use the client-visible logical ID"
+    );
+    assert_eq!(
+        state.response_object["output"].as_array().map(Vec::len),
+        Some(3),
+        "the persisted response object must contain every logical-stream output item"
+    );
+}
+
+#[tokio::test]
+async fn logical_stream_suppresses_malformed_chunk_and_emits_terminal_error() {
+    let filter = make_logical_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_first", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    let mut malformed = Some(Bytes::from(
+        "event: response.output_text.delta\ndata: {\"response_id\":\"resp_second\",bad}\n\n",
+    ));
+    filter.on_response_body(&mut ctx, &mut malformed, false).unwrap();
+    assert!(
+        malformed.is_none(),
+        "a malformed logical-stream chunk must never bypass normalization"
+    );
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let eos = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    assert!(
+        eos.contains("event: error"),
+        "the logical stream should terminate with an SSE error: {eos}"
+    );
+    assert!(
+        !eos.contains("resp_second"),
+        "the malformed resumed response identity must not leak downstream: {eos}"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "parse-error streams must not be persisted"
+    );
 }
 
 fn make_done_chunk() -> Bytes {
@@ -221,6 +469,51 @@ async fn terminal_event_writes_response_object() {
     assert_eq!(ctx.get_metadata("responses.status"), Some("completed"),);
 }
 
+#[tokio::test]
+async fn terminal_event_authoritatively_populates_completed_function_calls() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+    ctx.extensions.insert(ResponsesState::default());
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .tool_calls
+        .push(json!({
+            "type": "function_call",
+            "id": "fc_stale",
+            "call_id": "call_stale",
+            "name": "stale",
+            "arguments": "{}",
+            "status": "completed"
+        }));
+
+    let completed = json!({
+        "id": "resp_123",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_final",
+            "call_id": "call_final",
+            "name": "lookup",
+            "arguments": r#"{"query":"Praxis"}"#,
+            "status": "completed"
+        }]
+    });
+    let mut body = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.tool_calls.len(),
+        1,
+        "the authoritative terminal response must replace incremental tool calls"
+    );
+    assert_eq!(
+        state.tool_calls[0]["call_id"], "call_final",
+        "a terminal-only completed function call must be dispatchable"
+    );
+}
+
 #[test]
 fn response_accumulation_sums_usage_across_iterations() {
     let req = make_request(http::Method::POST, "/v1/responses");
@@ -247,8 +540,14 @@ fn response_accumulation_sums_usage_across_iterations() {
         }
     });
 
-    assert!(!accumulate_response_object(&mut ctx, first, None));
-    assert!(accumulate_response_object(&mut ctx, second, None));
+    assert!(
+        !accumulate_response_object(&mut ctx, first, None),
+        "in-progress response must not report terminal completion"
+    );
+    assert!(
+        accumulate_response_object(&mut ctx, second, None),
+        "completed response must report terminal completion"
+    );
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.usage["input_tokens"], 17);
     assert_eq!(state.usage["output_tokens"], 6);
@@ -257,7 +556,10 @@ fn response_accumulation_sums_usage_across_iterations() {
     assert_eq!(state.response_object["usage"], state.usage);
 
     let final_without_usage = json!({"status":"completed","output":[]});
-    assert!(accumulate_response_object(&mut ctx, final_without_usage, None));
+    assert!(
+        accumulate_response_object(&mut ctx, final_without_usage, None),
+        "completed response without usage must remain terminal"
+    );
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.response_object["usage"], state.usage);
     assert_eq!(state.usage["total_tokens"], 23);
@@ -422,6 +724,46 @@ async fn eos_without_terminal_sets_incomplete() {
     );
 }
 
+#[tokio::test]
+async fn logical_eos_without_terminal_emits_error() {
+    let filter = make_logical_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let mut delta = Some(make_sse_chunk(
+        "response.output_text.delta",
+        &json!({
+            "response_id": "resp_partial",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "partial",
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut delta, false).unwrap();
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let eos = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    assert!(
+        eos.contains("event: error"),
+        "a logical stream must explicitly terminate when upstream omits its terminal event: {eos}"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a stream missing its terminal event must not be persisted"
+    );
+}
+
 #[test]
 fn body_passes_through_unchanged() {
     let (filter, mut ctx) = make_armed_context();
@@ -436,6 +778,11 @@ fn body_passes_through_unchanged() {
         tool_call_args: std::collections::HashMap::new(),
         rejected_tool_call_args: std::collections::HashSet::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
+        logical_stream: false,
+        iteration: 0,
+        output_index_offset: 0,
+        deferred_terminal: None,
+        deferred_done: false,
     });
 
     let original = Bytes::from("event: response.created\ndata: {\"type\":\"response.created\",\"id\":\"r1\"}\n\n");
@@ -463,6 +810,11 @@ fn parse_error_sets_metadata() {
         tool_call_args: std::collections::HashMap::new(),
         rejected_tool_call_args: std::collections::HashSet::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
+        logical_stream: false,
+        iteration: 0,
+        output_index_offset: 0,
+        deferred_terminal: None,
+        deferred_done: false,
     });
 
     let large_chunk =
@@ -935,7 +1287,10 @@ async fn tool_call_argument_bytes_within_limit() {
 async fn on_response_disarms_for_non_2xx_status() {
     let (filter, mut ctx) = make_armed_context();
     filter.on_request(&mut ctx).await.unwrap();
-    assert!(ctx.get_filter_state::<StreamEventsState>().is_some());
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>().is_some(),
+        "test setup should arm the SSE parser"
+    );
 
     let resp = Box::leak(Box::new(crate::test_utils::make_response()));
     resp.status = http::StatusCode::BAD_REQUEST;

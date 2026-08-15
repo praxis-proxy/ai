@@ -1,0 +1,69 @@
+# Terminal Responses Streaming through IRR
+#
+# Demonstrates a single-step iterative_request_router pipeline that exposes a
+# native OpenAI Responses SSE body incrementally. `terminal_streaming: true`
+# lets the final serializer select Praxis's typed streaming transport for an
+# effective `"stream": true` request. It is not a Praxis IRR YAML transport
+# mode.
+#
+# `openai_responses_format` publishes descriptive client intent. The final
+# outbound serializer, `openai_responses_proxy`, independently keeps the
+# provider-visible `"stream": true` field aligned with Praxis's typed
+# `SubRequestResponseMode::Streaming` selection.
+#
+# Every response filter in a streaming-capable step must use `BodyMode::Stream`.
+# IRR may also resume the same downstream stream after response-dependent
+# transitions; the agentic-loop example demonstrates that multi-round form.
+#
+# The typed response mode selected by `openai_responses_proxy` arms the
+# step-local `openai_stream_events` filter. It receives each SSE chunk before it
+# is sent to the client and preserves parser state through stream completion.
+#
+# Example:
+#
+#   curl -N http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Say hello","stream":true}'
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-terminal-stream]
+
+filter_chains:
+  - name: responses-terminal-stream
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+
+      - filter: openai_responses_validate
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_responses_proxy
+                terminal_streaming: true
+
+              - filter: openai_stream_events
+
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+
+              - filter: router
+                routes:
+                  - path: "/v1/responses"
+                    cluster: "inference-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true

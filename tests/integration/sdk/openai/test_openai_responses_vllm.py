@@ -45,6 +45,9 @@ PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
+IRR_STREAMING_CONFIG_PATH = (
+    "examples/configs/openai/responses/irr-terminal-streaming.yaml"
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -128,6 +131,19 @@ def _read_log_tail(log_path: str, max_lines: int = 50) -> str:
     if not lines:
         return "(no output captured)"
     return "".join(lines[-max_lines:])
+
+
+def _write_irr_streaming_config(praxis_port: int) -> str:
+    with open(IRR_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
 
 
 def _wait_for_proxy(port: int, proc: subprocess.Popen, log_path: str, timeout: float = 30.0) -> None:
@@ -348,10 +364,59 @@ def praxis_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
+def irr_streaming_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy with terminal Responses streaming through IRR."""
+    port = _free_port()
+    config_path = _write_irr_streaming_config(port)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("irr-terminal-streaming")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== IRR streaming Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
 def openai_client(praxis_proxy):
     """Return an OpenAI client pointed at the local Praxis proxy."""
     return OpenAI(
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def irr_streaming_client(irr_streaming_proxy):
+    """Return an OpenAI client using the terminal-streaming IRR proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{irr_streaming_proxy}/v1",
         api_key="test",
         max_retries=0,
         timeout=300,
@@ -570,8 +635,9 @@ class TestOpenAIResponsesVLLM:
         args = json.loads(fc.arguments)
         assert "city" in args, f"function arguments should contain city: {args}"
 
-    def test_streaming(self, openai_client):
-        stream = openai_client.responses.create(
+    def test_streaming_through_irr(self, irr_streaming_client):
+        """Stream a Responses request through a terminal IRR step."""
+        stream = irr_streaming_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: STREAM-OK /no_think",
             store=False,
@@ -590,10 +656,10 @@ class TestOpenAIResponsesVLLM:
             if event.type == "response.completed":
                 final_status = event.response.status
 
-        assert event_types[0] == "response.created"
-        assert event_types[-1] == "response.completed"
-        assert final_status == "completed"
-        assert "STREAM-OK" in "".join(text_parts)
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_status == "completed", final_status
+        assert "STREAM-OK" in "".join(text_parts), text_parts
 
 
 # ---------------------------------------------------------------------------

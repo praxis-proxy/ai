@@ -288,7 +288,10 @@ provider:
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert!(
+        matches!(action, praxis_filter::FilterAction::Continue),
+        "guardrails request-header phase should continue"
+    );
 }
 
 #[tokio::test]

@@ -7,7 +7,14 @@
 //! These tests verify that IRR, request-supplied MCP resolution,
 //! MCP dispatch, and the agentic inference loop function together.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    io::{Read as _, Write as _},
+    net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, build_pipeline, example_config_path, free_port, http_send,
@@ -395,6 +402,222 @@ fn round_trip_captures_tool_and_model_requests() {
     );
 }
 
+#[test]
+fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_stream_1",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_stream_1",
+                    "call_id": "call_stream_1",
+                    "name": "weather__get_weather",
+                    "arguments": "",
+                    "status": "in_progress"
+                },
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.function_call_arguments.delta",
+            serde_json::json!({
+                "response_id": "resp_stream_1",
+                "item_id": "fc_stream_1",
+                "output_index": 0,
+                "delta": r#"{"location":"SF"}"#,
+                "sequence_number": 2
+            }),
+        ),
+        sse_event(
+            "response.function_call_arguments.done",
+            serde_json::json!({
+                "response_id": "resp_stream_1",
+                "item_id": "fc_stream_1",
+                "output_index": 0,
+                "arguments": r#"{"location":"SF"}"#,
+                "sequence_number": 3
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_stream_1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "function_call",
+                        "id": "fc_stream_1",
+                        "call_id": "call_stream_1",
+                        "name": "weather__get_weather",
+                        "arguments": r#"{"location":"SF"}"#,
+                        "status": "completed"
+                    }],
+                    "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
+                },
+                "sequence_number": 4
+            }),
+        ),
+    ];
+    let second_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_stream_2", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_stream_2",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_stream_2", "role": "assistant", "status": "in_progress", "content": []},
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.output_text.delta",
+            serde_json::json!({
+                "response_id": "resp_stream_2",
+                "item_id": "msg_stream_2",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "The weather in SF is sunny.",
+                "sequence_number": 2
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_stream_2",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_stream_2",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "The weather in SF is sunny."}]
+                    }],
+                    "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}
+                },
+                "sequence_number": 3
+            }),
+        ),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                    "additionalProperties": false
+                })),
+        ],
+        ..McpMockConfig::default()
+    });
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model_port);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "stream": true,
+        "store": false,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed agentic request should return 200 (model requests: {}, MCP list: {}, MCP calls: {}): {raw}",
+        model_requests
+            .lock()
+            .expect("model request lock should not be poisoned")
+            .len(),
+        mcp.method_count("tools/list"),
+        mcp.method_count("tools/call"),
+    );
+    assert_eq!(
+        body.matches("event: response.created").count(),
+        1,
+        "one logical stream must expose one response.created event: {body}"
+    );
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "intermediate completion must be suppressed: {body}"
+    );
+    assert!(
+        body.contains("response.function_call_arguments.delta"),
+        "tool-call argument deltas should reach the client: {body}"
+    );
+    assert!(
+        body.contains("The weather in SF is sunny."),
+        "the resumed inference text should reach the same stream: {body}"
+    );
+    assert!(
+        !body.contains("resp_stream_2"),
+        "resumed turns must retain the first logical response ID: {body}"
+    );
+    assert!(
+        body.contains(r#""output_index":2"#),
+        "resumed model output should follow function and MCP output items: {body}"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "MCP tool should execute exactly once"
+    );
+
+    model_thread.join().expect("streaming model thread should finish");
+    let second_request: serde_json::Value = {
+        let requests = model_requests
+            .lock()
+            .expect("model request lock should not be poisoned");
+        assert_eq!(requests.len(), 2, "IRR should make two streamed model requests");
+        serde_json::from_str(&requests[1]).expect("second request should be JSON")
+    };
+    let input = second_request["input"]
+        .as_array()
+        .expect("second request input should be an array");
+    assert!(
+        input.iter().any(|item| item["type"] == "function_call"),
+        "second inference should receive the streamed function call"
+    );
+    assert!(
+        input.iter().any(|item| item["type"] == "function_call_output"),
+        "second inference should receive the MCP result"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Round-Trip: Web Search via IRR
 // -----------------------------------------------------------------------------
@@ -429,7 +652,7 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
     ])
     .start_with_shutdown();
 
-    let search_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let search_port = search_listener.local_addr().unwrap().port();
     spawn_search_mock(search_listener);
 
@@ -540,7 +763,7 @@ fn web_search_provider_failure_continues_loop_with_failed_result() {
     ])
     .start_with_shutdown();
 
-    let search_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let search_port = search_listener.local_addr().unwrap().port();
     spawn_failing_search_mock(search_listener);
 
@@ -613,7 +836,143 @@ fn web_search_provider_failure_continues_loop_with_failed_result() {
     );
 }
 
-fn spawn_search_mock(listener: std::net::TcpListener) {
+#[test]
+fn streaming_web_search_round_trip_resumes_one_logical_response() {
+    let search_call = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_stream_1",
+        "status": "completed",
+        "action": {"type": "search", "query": "Rust 2025 edition"}
+    });
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_ws_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_ws_stream_1",
+                "output_index": 0,
+                "item": search_call,
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_ws_stream_1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [search_call],
+                    "usage": {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}
+                },
+                "sequence_number": 2
+            }),
+        ),
+    ];
+    let final_message = serde_json::json!({
+        "type": "message",
+        "id": "msg_ws_stream_2",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Rust search completed."}]
+    });
+    let second_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_ws_stream_2", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_text.delta",
+            serde_json::json!({
+                "response_id": "resp_ws_stream_2",
+                "item_id": "msg_ws_stream_2",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "Rust search completed.",
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_ws_stream_2",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [final_message],
+                    "usage": {"input_tokens": 15, "output_tokens": 4, "total_tokens": 19}
+                },
+                "sequence_number": 2
+            }),
+        ),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    spawn_search_mock(search_listener);
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model_port, search_port);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust 2025 edition features",
+        "stream": true,
+        "store": false,
+        "tools": [{"type": "web_search_preview"}]
+    });
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+
+    assert_eq!(parse_status(&raw), 200, "streamed web search should return 200: {raw}");
+    assert_eq!(
+        body.matches("event: response.created").count(),
+        1,
+        "web search should preserve one logical response lifecycle: {body}"
+    );
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "the web-search inference terminal should be suppressed: {body}"
+    );
+    assert!(
+        body.contains("Rust search completed."),
+        "the post-search inference should resume in the same stream: {body}"
+    );
+    assert!(
+        !body.contains("resp_ws_stream_2"),
+        "the resumed inference must retain the first response ID: {body}"
+    );
+
+    model_thread.join().expect("streaming model thread should finish");
+    let requests = model_requests
+        .lock()
+        .expect("model request lock should not be poisoned");
+    assert_eq!(requests.len(), 2, "web search should trigger a second model stream");
+    let second_request: serde_json::Value =
+        serde_json::from_str(&requests[1]).expect("second model request should be JSON");
+    drop(requests);
+    assert!(
+        second_request["input"]
+            .as_array()
+            .is_some_and(|input| input.iter().any(|item| item["type"] == "web_search_call")),
+        "the second inference should receive the completed web-search result"
+    );
+}
+
+fn spawn_search_mock(listener: TcpListener) {
     use std::io::{Read as _, Write as _};
     let body = serde_json::json!({
         "web": {
@@ -625,7 +984,7 @@ fn spawn_search_mock(listener: std::net::TcpListener) {
         }
     })
     .to_string();
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0_u8; 4096];
         let _n = stream.read(&mut buf).unwrap();
@@ -638,10 +997,10 @@ fn spawn_search_mock(listener: std::net::TcpListener) {
 }
 
 /// Serve a single 5xx so the search client maps the callout to a failed outcome.
-fn spawn_failing_search_mock(listener: std::net::TcpListener) {
+fn spawn_failing_search_mock(listener: TcpListener) {
     use std::io::{Read as _, Write as _};
     let body = r#"{"error":"service unavailable"}"#;
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0_u8; 4096];
         let _n = stream.read(&mut buf).unwrap();
@@ -651,6 +1010,85 @@ fn spawn_failing_search_mock(listener: std::net::TcpListener) {
         );
         stream.write_all(response.as_bytes()).unwrap();
     });
+}
+
+/// Encode a typed Responses event as one SSE frame.
+fn sse_event(event_type: &str, mut payload: serde_json::Value) -> String {
+    payload
+        .as_object_mut()
+        .expect("SSE payload should be an object")
+        .insert("type".to_owned(), serde_json::Value::String(event_type.to_owned()));
+    format!("event: {event_type}\ndata: {payload}\n\n")
+}
+
+/// Handle returned by the synthetic streaming model backend.
+type StreamingModel = (u16, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>);
+
+/// Start a two-turn model backend that emits each SSE event as a chunk.
+fn start_streaming_model(responses: Vec<Vec<String>>) -> StreamingModel {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("streaming model should bind");
+    let port = listener
+        .local_addr()
+        .expect("streaming model should have an address")
+        .port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let handle = thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().expect("streaming model should accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("streaming model should set read timeout");
+            let request = read_json_request(&mut stream);
+            captured
+                .lock()
+                .expect("model request lock should not be poisoned")
+                .push(request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .expect("streaming model should write response headers");
+            for event in response {
+                write!(stream, "{:x}\r\n{event}\r\n", event.len()).expect("streaming model should write event chunk");
+                stream.flush().expect("streaming model should flush event chunk");
+            }
+            stream
+                .write_all(b"0\r\n\r\n")
+                .expect("streaming model should finish chunked response");
+        }
+    });
+    (port, requests, handle)
+}
+
+/// Read one content-length JSON request and return its body.
+fn read_json_request(stream: &mut TcpStream) -> String {
+    let mut raw = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = stream.read(&mut buffer).expect("streaming model should read request");
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buffer[..read]);
+        let text = String::from_utf8_lossy(&raw);
+        let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if body.len() >= content_length {
+            return body.get(..content_length).unwrap_or_default().to_owned();
+        }
+    }
+    String::new()
 }
 
 fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) -> praxis_core::config::Config {

@@ -13,6 +13,7 @@ All fields are optional; omitted values fall back to [`SseParserConfig`] default
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `logical_stream` | bool | no | Treat successive IRR inference streams as one logical Responses stream. Per-iteration lifecycle events are normalized and only the final terminal event is exposed downstream. |
 | `max_buffer_bytes` | integer | no | Maximum bytes buffered for incomplete SSE lines/data across chunk boundaries. Default: 10 MiB. |
 | `max_events` | integer | no | Maximum number of SSE events before the parser errors. Default: 100,000. |
 | `timeout_secs` | integer | no | Maximum seconds from first chunk to stream completion. Default: 300 (5 minutes). |
@@ -23,6 +24,7 @@ All fields are optional; omitted values fall back to [`SseParserConfig`] default
 ```yaml
 filter: openai_stream_events
 # All fields optional:
+# logical_stream: false
 # max_buffer_bytes: 10485760
 # max_events: 100000
 # timeout_secs: 300

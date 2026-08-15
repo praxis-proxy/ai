@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn parse_url_ipv6_loopback() {
         let parsed = parse_url_components("http://[::1]:9090/metrics").unwrap();
-        assert!(!parsed.tls);
+        assert!(!parsed.tls, "HTTP URL should not enable TLS");
         assert_eq!(parsed.host, "::1");
         assert_eq!(parsed.port, 9090);
         assert_eq!(parsed.authority, "[::1]:9090");
@@ -346,12 +346,18 @@ mod tests {
 
     #[test]
     fn parse_url_missing_host_returns_error() {
-        assert!(parse_url_components("/relative/path").is_err());
+        assert!(
+            parse_url_components("/relative/path").is_err(),
+            "relative URL should be rejected"
+        );
     }
 
     #[test]
     fn parse_url_invalid_returns_error() {
-        assert!(parse_url_components("://bad").is_err());
+        assert!(
+            parse_url_components("://bad").is_err(),
+            "malformed URL should be rejected"
+        );
     }
 
     #[test]
@@ -387,7 +393,10 @@ mod tests {
             std::future::pending::<Result<(), SubRequestError>>(),
         )
         .await;
-        assert!(matches!(result, Err(SubRequestError::DeadlineExceeded)));
+        assert!(
+            matches!(result, Err(SubRequestError::DeadlineExceeded)),
+            "deadline should bound the pending operation"
+        );
     }
 
     #[tokio::test]
