@@ -76,7 +76,9 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`credential_inject`](credential_inject.md) | Replaces caller credentials with the upstream credential selected by `intelligent_route` or `provider_route`. |
 | [`intelligent_route`](intelligent_route.md) | Selects an upstream cluster from a site/capability descriptor by matching either an inference model name or MCP tool name. |
+| [`provider_route`](provider_route.md) | Exact provider-local mapping from an authenticated intelligent routing selection to a private backend cluster. |
 
 ### Time To First Token
 

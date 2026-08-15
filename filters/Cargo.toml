@@ -44,6 +44,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 metrics-util = { workspace = true }

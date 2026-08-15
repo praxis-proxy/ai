@@ -7,8 +7,8 @@ use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
-    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
+    PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -101,6 +101,28 @@ fn register_routing_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "intelligent_route" => IntelligentRouteFilter::from_config
     );
+    register_routing_security_filter(registry, "provider_route", ProviderRouteFilter::from_config);
+    register_routing_security_filter(registry, "credential_inject", CredentialInjectFilter::from_config);
+}
+
+/// Register a routing HTTP filter as security-critical.
+#[expect(
+    clippy::type_complexity,
+    reason = "single-use registration helper; a type alias adds indirection"
+)]
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_routing_security_filter(
+    registry: &mut FilterRegistry,
+    name: &'static str,
+    factory: fn(&serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError>,
+) {
+    registry
+        .register_with_class(
+            name,
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(factory)),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: '{name}'"));
 }
 
 /// Register Anthropic-specific filters.
@@ -333,31 +355,22 @@ mod tests {
     fn build_ai_registry_includes_ai_and_builtin_filters() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
-        assert!(names.contains(&"ai_guardrails"), "expected ai_guardrails in registry");
-        assert!(
-            names.contains(&"openai_responses_validate"),
-            "expected openai_responses_validate in registry"
-        );
-        assert!(
-            names.contains(&"responses_to_chat_completions"),
-            "expected responses_to_chat_completions in registry"
-        );
-        assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
-        assert!(
-            names.contains(&"intelligent_route"),
-            "expected intelligent_route in registry"
-        );
-        assert!(
-            names.contains(&"anthropic_validate"),
-            "expected anthropic filter in registry"
-        );
-        assert!(
-            names.contains(&"anthropic_web_search"),
-            "expected anthropic_web_search in registry"
-        );
-        assert!(
-            names.contains(&"request_id"),
-            "expected core builtin request_id in registry"
-        );
+        let expected = [
+            "ai_guardrails",
+            "openai_responses_validate",
+            "responses_to_chat_completions",
+            "a2a",
+            "intelligent_route",
+            "provider_route",
+            "credential_inject",
+            "anthropic_validate",
+            "anthropic_web_search",
+            "request_id",
+        ];
+        for name in expected {
+            assert!(names.contains(&name), "expected {name} in registry");
+        }
+        assert!(registry.is_security_filter("provider_route"));
+        assert!(registry.is_security_filter("credential_inject"));
     }
 }
