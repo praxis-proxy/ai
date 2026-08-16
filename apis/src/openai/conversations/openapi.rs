@@ -5,7 +5,7 @@
 
 use utoipa::openapi::OpenApi;
 
-use super::routes::operation_specs;
+use super::{item_schema::openapi_components, routes::operation_specs};
 use crate::openai::operation;
 
 /// Generate the local Conversations implementation `OpenAPI` document as
@@ -13,10 +13,11 @@ use crate::openai::operation;
 ///
 /// # Errors
 ///
-/// Returns an error if the generated `OpenAPI` document cannot be serialized
-/// as JSON.
-pub fn implementation_openapi_json() -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&implementation_openapi())
+/// Returns an error if generated schemas cannot be assembled or serialized.
+pub fn implementation_openapi_json() -> Result<String, String> {
+    let document = implementation_openapi_value()?;
+    serde_json::to_string_pretty(&document)
+        .map_err(|error| format!("failed to serialize Conversations OpenAPI: {error}"))
 }
 
 /// Build the local Conversations implementation document from the operation
@@ -28,6 +29,18 @@ fn implementation_openapi() -> OpenApi {
         "Conversations",
         operation_specs().iter().map(|spec| &spec.definition),
     )
+}
+
+/// Insert generated item schemas into the registry-derived document.
+fn implementation_openapi_value() -> Result<serde_json::Value, String> {
+    let mut document = serde_json::to_value(implementation_openapi())
+        .map_err(|error| format!("failed to serialize Conversations OpenAPI: {error}"))?;
+    let schemas = document
+        .pointer_mut("/components/schemas")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "generated Conversations OpenAPI has no components.schemas object".to_owned())?;
+    schemas.extend(openapi_components()?);
+    Ok(document)
 }
 
 #[cfg(test)]
@@ -68,7 +81,7 @@ mod tests {
 
     #[test]
     fn every_generated_component_reference_resolves() {
-        let document = serde_json::to_value(implementation_openapi()).unwrap();
+        let document = implementation_openapi_value().unwrap();
         let mut references = Vec::new();
         collect_component_references(&document, &mut references);
         assert!(!references.is_empty());
@@ -84,15 +97,19 @@ mod tests {
 
     #[test]
     fn generated_components_preserve_runtime_contract_constraints() {
-        let document = serde_json::to_value(implementation_openapi()).unwrap();
+        let document = implementation_openapi_value().unwrap();
 
         assert_eq!(
             document.pointer("/components/schemas/CreateConversationItemsRequest/properties/items/type"),
             Some(&Value::String("array".to_owned()))
         );
         assert_eq!(
-            document.pointer("/components/schemas/ConversationItem/type"),
-            Some(&Value::String("object".to_owned()))
+            document.pointer("/components/schemas/InputItem/discriminator/propertyName"),
+            Some(&Value::String("type".to_owned()))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/ConversationItem/discriminator/propertyName"),
+            Some(&Value::String("type".to_owned()))
         );
         assert_eq!(
             document.pointer("/components/schemas/ConversationResource/properties/created_at/format"),
@@ -154,15 +171,11 @@ mod tests {
         let document = serde_json::to_value(implementation_openapi()).unwrap();
 
         assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/0/type"),
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/type"),
             Some(&Value::String("array".to_owned()))
         );
         assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/1/type"),
-            Some(&Value::String("null".to_owned()))
-        );
-        assert_eq!(
-            document.pointer("/components/schemas/CreateConversationRequest/properties/items/anyOf/0/maxItems"),
+            document.pointer("/components/schemas/CreateConversationRequest/properties/items/maxItems"),
             Some(&Value::Number(serde_json::Number::from(20_u64))),
             "items array should preserve the 20-item bound"
         );

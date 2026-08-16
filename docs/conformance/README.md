@@ -132,6 +132,18 @@ This command also runs the focused runtime contract tests recorded in the
 report. A failing or missing declared test makes the command fail after the
 JSON result has been written.
 
+Conversation input and output item unions are derived from the same pinned
+document into the runtime artifact:
+
+```console
+cargo xtask openai-conversation-item-contracts
+cargo xtask openai-conversation-item-contracts --check
+```
+
+Normal conformance generation performs the check before comparing schemas, so
+the runtime validator and generated implementation document cannot silently
+drift from the pinned item union.
+
 ## Reference Refresh
 
 Normal conformance runs do not fetch upstream. They read the complete vendored

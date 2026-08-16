@@ -17,9 +17,10 @@ use tracing::debug;
 use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
-        CreateConversationRequest, DeletedConversationResource, IncludeField, IncludeFields, ItemOrder,
+        CreateConversationRequest, DeletedConversationResource, IncludeField, IncludeFields, InputItem, ItemOrder,
         MAX_ITEMS_PER_REQUEST, Metadata, UpdateConversationRequest,
     },
+    item_schema::validate_output_item,
     validate::{MetadataError, validate_metadata},
 };
 use crate::{
@@ -91,11 +92,10 @@ pub(super) async fn handle_create_conversation(
     let raw_id = ctx.id_generator.generate(ctx.time_source);
     let conversation_id = format!("conv_{raw_id}");
     let created_at = current_timestamp(ctx);
-    let items = input.items.unwrap_or_default();
-    if let Err(msg) = validate_item_count(items.len()) {
+    if let Err(msg) = validate_item_count(input.items.len()) {
         return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
-    let item_values = items.into_iter().map(ConversationItem::into_value);
+    let item_values = input.items.into_iter().map(InputItem::into_value);
     let item_records = match build_item_records(ctx, tenant_id, &conversation_id, created_at, 1, item_values) {
         Ok(records) => records,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
@@ -281,7 +281,7 @@ pub(super) async fn handle_create_items(
     if let Err(msg) = validate_item_count(items.len()) {
         return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
-    let item_values = items.into_iter().map(ConversationItem::into_value);
+    let item_values = items.into_iter().map(InputItem::into_value);
     let start_position = match store.max_item_position(tenant_id, conversation_id).await {
         Ok(pos) => pos.saturating_add(1),
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
@@ -556,7 +556,11 @@ pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result
     };
     map.insert("id".to_owned(), Value::String(item_id.clone()));
     normalize_message_item(&mut map)?;
-    Ok((item_id, Value::Object(map)))
+    map.entry("status".to_owned())
+        .or_insert_with(|| Value::String("completed".to_owned()));
+    let item = Value::Object(map);
+    validate_output_item(&item)?;
+    Ok((item_id, item))
 }
 
 /// Normalize easy SDK message inputs into conversation message response objects.
@@ -591,6 +595,7 @@ fn normalize_message_content(role: &str, content: Value) -> Result<Value, String
                     "type": "output_text",
                     "text": text,
                     "annotations": [],
+                    "logprobs": [],
                 })
             } else {
                 serde_json::json!({
