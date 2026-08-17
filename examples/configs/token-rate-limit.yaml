@@ -1,0 +1,69 @@
+# Token Rate Limiting
+#
+# Reserves an estimated token cost at admission time and reconciles
+# that reservation against actual provider-reported usage once the
+# response completes. Rejects with 429 when the bucket can't cover
+# the estimate.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-rate-limit.yaml
+#   curl -i http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# This is the uncontested MVP core of the token rate limiting proposal
+# (docs/proposals/00121_token-rate-limiting.md, tracked by epic ai#121,
+# PR ai#658):
+#   - M1: a single global bucket (flat "default" rule)
+#   - M2: reservation-based admission, reconciled against actual usage
+#   - M6: 429 responses with token-denominated rate limit headers
+#
+# Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
+# for the full rationale): per-header/composite bucket keys (M5),
+# configurable estimation strategies (M3, `estimate_tokens` below is a
+# fixed placeholder), token-type-aware accounting (M4), and
+# observability/metering (M7/M8/S3).
+#
+# token_rate_limit is declared *before* token_count: response hooks
+# run in reverse declared order, so token_count's on_response_body
+# (which writes token.total to filter_metadata) runs before
+# token_rate_limit's on_response_body reads it back to reconcile the
+# reservation. This mirrors the token_usage_headers/token_count
+# ordering in examples/configs/token-counting.yaml.
+#
+# The X-RateLimit-*-Tokens response headers always reflect the
+# reservation-time snapshot, never this response's own reconciliation
+# — headers are committed before the body (and thus actual usage) is
+# known. Reconciliation still affects every *subsequent* request's
+# admission decision.
+#
+# Supported token_count provider values:
+#   openai | anthropic | google | bedrock | azure
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: token_rate_limit
+        rate: 1000            # tokens replenished per second
+        burst: 100000         # max bucket capacity, in tokens
+        estimate_tokens: 500  # fixed cost reserved per request at admission
+
+      - filter: token_count
+        provider: openai   # openai | anthropic | google | bedrock | azure
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
