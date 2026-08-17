@@ -40,6 +40,7 @@ pub(crate) mod responses_to_chat_completions;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;
+pub(crate) mod usage;
 
 pub use doc_extract::DocExtractFilter;
 pub use file_resolve::FileResolveFilter;
