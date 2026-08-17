@@ -9,7 +9,9 @@
 //! `/v1/responses/{id}/input_items`, `/v1/responses/{id}/cancel`,
 //! `/v1/responses/input_tokens`, `/v1/responses/compact`) are
 //! classified by method and path without inspecting the body.
-//! `POST /v1/responses` (create) is classified by body content. A
+//! `POST /v1/responses` (create) is classified from body content, with
+//! the endpoint treated as authoritative: a body carrying no format
+//! discriminator is a Responses request rather than unknown JSON. A
 //! `GET /v1/responses` `WebSocket` upgrade is classified from the method,
 //! path, and upgrade headers without inferring body-derived facts.
 //! Promotes classification facts to configurable headers, durable
@@ -27,17 +29,21 @@ pub(crate) mod config_validation;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
+/// Executes hosted file-search calls against an OGX vector store API.
+pub(crate) mod file_search_callout;
 pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
 pub(crate) mod openai_mcp_tool_resolve;
 pub(crate) mod openai_responses_proxy;
 pub(crate) mod openai_tool_parse;
+pub(crate) mod responses_to_chat_completions;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;
 
 pub use doc_extract::DocExtractFilter;
 pub use file_resolve::FileResolveFilter;
+pub use file_search_callout::FileSearchCalloutFilter;
 pub use mcp_dispatch::McpDispatchFilter;
 pub use model_rewrite::ModelRewriteFilter;
 pub use openai_mcp_tool_resolve::McpToolResolveFilter;
@@ -58,29 +64,77 @@ pub use store::ResponseStoreFilter;
 )]
 mod tests;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::{payload_processing::OnInvalidBehavior, value_safety::is_safe_promoted_value},
-    parse_filter_config,
+    builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
 };
 use tracing::{debug, trace};
 
 use self::config::{ResponsesFormatConfig, build_config};
-use crate::classifier::{
-    AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_path,
-    is_responses_websocket_handshake,
+use crate::{
+    classifier::{
+        AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_create,
+        is_responses_path, is_responses_websocket_handshake,
+    },
+    promotion::is_promotable_value,
 };
+
+/// Count compact JSON bytes without retaining the serialized representation.
+///
+/// Returns `Ok(None)` as soon as serialization would exceed `max_bytes`.
+pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<Option<usize>, serde_json::Error> {
+    let mut counter = BoundedJsonCounter {
+        bytes: 0,
+        exceeded: false,
+        max_bytes,
+    };
+    let result = serde_json::to_writer(&mut counter, value);
+    if counter.exceeded {
+        return Ok(None);
+    }
+    result?;
+    Ok(Some(counter.bytes))
+}
+
+/// JSON writer that counts bytes and stops at a fixed ceiling.
+struct BoundedJsonCounter {
+    /// Bytes accepted so far.
+    bytes: usize,
+    /// Whether a write crossed the configured ceiling.
+    exceeded: bool,
+    /// Maximum accepted bytes.
+    max_bytes: usize,
+}
+
+impl io::Write for BoundedJsonCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(next_bytes) = self.bytes.checked_add(buf.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte count overflow"));
+        };
+        if next_bytes > self.max_bytes {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON byte limit exceeded"));
+        }
+        self.bytes = next_bytes;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Maximum length of a body-derived value promoted to headers or filter results.
-const MAX_PROMOTED_VALUE_LEN: usize = 256;
 
 /// Default store name used when registering the response store in the
 /// per-request registry.
@@ -101,6 +155,17 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 ///
 /// Classification formats: `openai_responses`, `openai_chat_completions`,
 /// `unknown_json`, `invalid_json`, `non_json`.
+///
+/// `POST /v1/responses` (create) is authoritative: a valid create body may
+/// omit every discriminator the body heuristics key on (`input`, `prompt`
+/// object, `previous_response_id`, `conversation`) — for example
+/// `{"model":"gpt-5"}` — and would otherwise classify as `unknown_json`. On
+/// this endpoint such a body is classified as `openai_responses` instead,
+/// while body-derived facts (model, stream, store, …) are preserved. Bodies
+/// carrying positive signals for another format (`openai_chat_completions`,
+/// `anthropic_messages`) and genuine parse failures (`invalid_json`,
+/// `non_json`) are left untouched, so `on_invalid: reject` still rejects
+/// real errors.
 ///
 /// A `GET /v1/responses` request with valid HTTP `WebSocket` upgrade headers
 /// is classified as `openai_responses` without inspecting a body. This
@@ -221,19 +286,31 @@ impl HttpFilter for ResponsesFormatFilter {
 
 /// Classify a request from a recognized path/handshake or its body.
 fn classify_request(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> (ClassifiedRequest, bool) {
-    let websocket_handshake =
-        is_responses_websocket_handshake(&ctx.request.method, ctx.request.uri.path(), &ctx.request.headers);
-    if websocket_handshake || is_responses_path(&ctx.request.method, ctx.request.uri.path()) {
+    let method = &ctx.request.method;
+    let path = ctx.request.uri.path();
+
+    let websocket_handshake = is_responses_websocket_handshake(method, path, &ctx.request.headers);
+    if websocket_handshake || is_responses_path(method, path) {
         debug!(
-            method = %ctx.request.method,
-            path = ctx.request.uri.path(),
+            method = %method,
+            path = path,
             websocket_handshake,
             "classified request by method and path"
         );
-        (empty_result(AiRequestFormat::Responses), websocket_handshake)
-    } else {
-        (classify_request_body(bytes), false)
+        return (empty_result(AiRequestFormat::Responses), websocket_handshake);
     }
+
+    let mut classified = classify_request_body(bytes);
+
+    // POST /v1/responses (create) is authoritative: a valid create body may
+    // omit the discriminator fields that body heuristics rely on (e.g.
+    // `{"model":"gpt-5"}`) and classify as UnknownJson, but on this endpoint
+    // it is a Responses request.
+    if classified.format == AiRequestFormat::UnknownJson && is_responses_create(method, path) {
+        classified.format = AiRequestFormat::Responses;
+    }
+
+    (classified, false)
 }
 
 /// Check whether the format requires rejection.
@@ -295,7 +372,7 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
 /// Write optional string and boolean-option metadata fields.
 fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     if let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
+        && is_promotable_value(model)
     {
         ctx.set_metadata("openai_responses_format.model", model.clone());
     }
@@ -354,8 +431,7 @@ fn promote_headers(
 
     if let Some(header) = &config.headers.model
         && let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
-        && model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(model)
     {
         ctx.extra_request_headers
             .push((Cow::Owned(header.clone()), model.clone()));
@@ -402,8 +478,7 @@ fn promote_optional_results(
     classified: &ClassifiedRequest,
 ) -> Result<(), FilterError> {
     if let Some(model) = &classified.model
-        && is_safe_promoted_value(model)
-        && model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(model)
     {
         results.set("model", model.clone())?;
     }

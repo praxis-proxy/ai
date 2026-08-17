@@ -224,7 +224,7 @@ impl ModuleItems {
     fn clone_for_filter(&self) -> Self {
         Self {
             module_docs: Vec::new(),
-            configs: Vec::new(),
+            configs: self.configs.clone(),
             struct_docs: Vec::new(),
             structs: self.structs.clone(),
             enums: self.enums.clone(),
@@ -330,7 +330,20 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
     items.configs.clear();
     items.module_docs.clear();
     items.struct_docs.clear();
+    parse_local_shared_config(root, &mut items);
     items
+}
+
+/// Parse local configuration types shared by filters in separate API categories.
+fn parse_local_shared_config(root: &Path, items: &mut ModuleItems) {
+    let path = root.join("apis/src/web_search/config.rs");
+    let Ok(source) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(file) = syn::parse_file(&source) else {
+        return;
+    };
+    parse_file_items(&file, items);
 }
 
 /// Resolve praxis crate source directories from the cargo registry via
@@ -491,10 +504,11 @@ fn extract_filters(category_dir: &Path, shared_items: &ModuleItems) -> Vec<Filte
 }
 
 /// Parse non-anchor `.rs` files directly in the category root for shared
-/// enum/struct types. Only struct field info and enums survive
-/// `clone_for_filter`, so module docs and config structs from these
-/// files do not leak into individual filter docs.
+/// enum/struct types. Category-local module docs and config structs
+/// do not leak into individual filter docs, while global shared
+/// config structs remain available for cross-category filters.
 fn parse_category_shared_types(category_dir: &Path, anchors: &[FilterAnchor], out: &mut ModuleItems) {
+    let shared_configs = out.configs.clone();
     let Ok(entries) = fs::read_dir(category_dir) else {
         return;
     };
@@ -517,7 +531,7 @@ fn parse_category_shared_types(category_dir: &Path, anchors: &[FilterAnchor], ou
         };
         parse_file_items(&file, out);
     }
-    out.configs.clear();
+    out.configs = shared_configs;
     out.module_docs.clear();
     out.struct_docs.clear();
 }
@@ -959,13 +973,14 @@ fn parse_config_fields(s: &syn::ItemStruct) -> Option<Vec<RawField>> {
     let syn::Fields::Named(fields) = &s.fields else {
         return None;
     };
+    let rename_all = detect_rename_all(&s.attrs);
 
     Some(
         fields
             .named
             .iter()
             .map(|f| RawField {
-                name: serde_field_name(f),
+                name: serde_field_name(f, rename_all),
                 doc: extract_doc_comment(&f.attrs),
                 has_default: has_serde_default(&f.attrs),
                 deserialize_with: serde_deserialize_with(&f.attrs),
@@ -1007,12 +1022,17 @@ fn has_serde_default(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// Return the YAML field name for a struct field.
-fn serde_field_name(field: &syn::Field) -> String {
+fn serde_field_name(field: &syn::Field, rename_all: Option<&str>) -> String {
     field
         .attrs
         .iter()
         .find_map(serde_rename)
-        .or_else(|| field.ident.as_ref().map(ToString::to_string))
+        .or_else(|| {
+            field
+                .ident
+                .as_ref()
+                .map(|ident| apply_rename(&ident.to_string(), rename_all))
+        })
         .unwrap_or_default()
 }
 
@@ -1149,7 +1169,7 @@ fn parse_variant_fields(variant: &syn::Variant) -> Vec<RawField> {
         .named
         .iter()
         .map(|f| RawField {
-            name: serde_field_name(f),
+            name: serde_field_name(f, None),
             doc: extract_doc_comment(&f.attrs),
             has_default: has_serde_default(&f.attrs),
             deserialize_with: serde_deserialize_with(&f.attrs),
@@ -1259,17 +1279,22 @@ fn to_snake_case(s: &str) -> String {
     out
 }
 
-/// Convert `PascalCase` to `camelCase`.
+/// Convert a Rust identifier to `camelCase`.
 fn to_camel_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => {
-            let mut out = first.to_lowercase().collect::<String>();
-            out.push_str(chars.as_str());
-            out
-        },
+    let snake = to_snake_case(s);
+    let mut out = String::with_capacity(snake.len());
+    let mut uppercase_next = false;
+    for ch in snake.chars() {
+        if ch == '_' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            out.extend(ch.to_uppercase());
+            uppercase_next = false;
+        } else {
+            out.push(ch);
+        }
     }
+    out
 }
 
 // -----------------------------------------------------------------------------
@@ -1382,7 +1407,7 @@ fn render_type_path(tp: &syn::TypePath, enums: &BTreeMap<String, EnumInfo>) -> S
 
     match ident.as_str() {
         "Vec" => render_vec_type(last, enums),
-        "Option" => render_inner_or(last, enums, "any"),
+        "Option" | "Zeroizing" => render_inner_or(last, enums, "any"),
         "Arc" => render_arc_type(last, enums),
         "BTreeMap" | "HashMap" => render_map_type(last, enums),
         "String" => "string".to_owned(),
@@ -1929,6 +1954,12 @@ mod tests {
     }
 
     #[test]
+    fn to_camel_case_handles_rust_field_names() {
+        assert_eq!(to_camel_case("secret_ref"), "secretRef");
+        assert_eq!(to_camel_case("SecretRef"), "secretRef");
+    }
+
+    #[test]
     fn capitalize_basic() {
         assert_eq!(capitalize("traffic"), "Traffic", "basic word");
         assert_eq!(capitalize(""), "", "empty string");
@@ -2216,6 +2247,38 @@ mod tests {
     }
 
     #[test]
+    fn nested_config_fields_honor_struct_rename_all() {
+        let source = r#"
+            #[derive(Debug, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct OuterConfig {
+                credentials: Vec<CredentialConfig>,
+            }
+
+            #[derive(Debug, Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct CredentialConfig {
+                /// Secret reference.
+                secret_ref: String,
+            }
+        "#;
+        let file: syn::File = syn::parse_str(source).unwrap();
+        let mut items = ModuleItems::new();
+        parse_file_items(&file, &mut items);
+
+        let filter = build_filter(&items, "test", Some("OuterConfig"));
+        let names: Vec<&str> = filter.fields.iter().map(|field| field.name.as_str()).collect();
+        assert!(
+            names.contains(&"credentials[].secretRef"),
+            "nested fields must use their struct's serde rename_all rule"
+        );
+        assert!(
+            !names.contains(&"credentials[].secret_ref"),
+            "Rust field names must not leak into generated YAML documentation"
+        );
+    }
+
+    #[test]
     fn flattened_fields_render_at_parent_path() {
         let source = "
             #[derive(Debug, Deserialize)]
@@ -2481,6 +2544,37 @@ mod tests {
     }
 
     #[test]
+    fn web_search_filters_render_shared_provider_config_fields() {
+        let root = workspace_root();
+        let shared_items = parse_shared_config_items(&root);
+        let filters = discover_all_filters(&root, &shared_items);
+
+        for filter_name in ["anthropic_web_search", "openai_web_search"] {
+            let filter = filters
+                .iter()
+                .find(|entry| entry.filter.name == filter_name)
+                .expect("web-search filter should be discovered");
+            let api_key = filter
+                .filter
+                .fields
+                .iter()
+                .find(|field| field.name == "api_key")
+                .expect("web-search filter should document api_key");
+            assert_eq!(
+                api_key.required,
+                RequiredKind::Yes,
+                "{filter_name} should document api_key as required"
+            );
+            for expected in ["provider", "provider_failure_mode", "status_on_error", "base_url"] {
+                assert!(
+                    filter.filter.fields.iter().any(|field| field.name == expected),
+                    "{filter_name} should document {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn numeric_types_render_language_neutral() {
         let enums = BTreeMap::new();
         for (rust_ty, expected) in [
@@ -2500,6 +2594,12 @@ mod tests {
             let ty: syn::Type = syn::parse_str(rust_ty).unwrap();
             assert_eq!(render_type(&ty, &enums), expected, "{rust_ty}");
         }
+    }
+
+    #[test]
+    fn zeroizing_wrapper_renders_its_yaml_value_type() {
+        let ty: syn::Type = syn::parse_str("Option<Zeroizing<String>>").unwrap();
+        assert_eq!(render_type(&ty, &BTreeMap::new()), "string");
     }
 
     /// Build a sample [`FilterEntry`] for rendering tests.

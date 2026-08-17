@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#     "httpx>=0.27",
 #     "openai>=2.0",
 #     "pytest>=8.0",
 # ]
@@ -41,6 +42,7 @@ VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 
@@ -84,6 +86,23 @@ def _ogx_endpoint() -> str:
     return f"{host}:{port}"
 
 
+def _patch_store_backend(config: str, db_path: str) -> str:
+    if DATABASE_URL.startswith("postgres"):
+        config = config.replace(
+            'database_url: "sqlite://responses.db?mode=rwc"',
+            f'database_url: "{DATABASE_URL}"\n'
+            "        allow_private_database_url: true\n"
+            "        ssl_mode: disable",
+        )
+        config = config.replace("backend: sqlite", "backend: postgres")
+    else:
+        config = config.replace(
+            "sqlite://responses.db?mode=rwc",
+            f"sqlite://{db_path}?mode=rwc",
+        )
+    return config
+
+
 def _write_config(praxis_port: int, db_path: str) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
@@ -91,10 +110,7 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
-    config = config.replace(
-        "sqlite://responses.db?mode=rwc",
-        f"sqlite://{db_path}?mode=rwc",
-    )
+    config = _patch_store_backend(config, db_path)
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
@@ -226,12 +242,9 @@ def _write_agentic_config(
     config = config.replace(
         '- "127.0.0.1:3001"',
         f'- "{vllm}"\n'
-        "                    read_timeout_ms: 120000",
+        "                    read_timeout_ms: 300000",
     )
-    config = config.replace(
-        "sqlite://responses.db?mode=rwc",
-        f"sqlite://{db_path}?mode=rwc",
-    )
+    config = _patch_store_backend(config, db_path)
     config = config.replace(
         "- filter: openai_mcp_tool_resolve\n",
         "- filter: openai_mcp_tool_resolve\n"
@@ -239,16 +252,16 @@ def _write_agentic_config(
     )
     config = config.replace(
         "- filter: openai_mcp_dispatch\n"
-        "              - filter: agentic_loop",
+        "              - filter: openai_agentic_loop",
         "- filter: openai_mcp_dispatch\n"
         "                allow_loopback: true\n"
-        "              - filter: agentic_loop",
+        "              - filter: openai_agentic_loop",
     )
     config = config.replace(
         "max_iterations: 11\n",
         "max_iterations: 11\n"
-        "        timeout_ms: 120000\n"
-        "        step_timeout_ms: 120000\n",
+        "        timeout_ms: 300000\n"
+        "        step_timeout_ms: 300000\n",
     )
     config = config.replace(
         "- filter: openai_web_search\n"
@@ -317,7 +330,7 @@ def openai_client(praxis_proxy):
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         api_key="test",
         max_retries=0,
-        timeout=180,
+        timeout=300,
     )
 
 
@@ -633,7 +646,7 @@ def agentic_client(agentic_proxy):
         base_url=f"http://127.0.0.1:{proxy_port}/v1",
         api_key="test",
         max_retries=0,
-        timeout=180,
+        timeout=300,
     )
 
 
@@ -700,11 +713,11 @@ class TestAgenticLoopVLLM:
             f"rounds; got: {output_types}"
         )
 
-    def test_client_function_exits_agentic_loop(self, agentic_client):
+    def test_client_function_exits_openai_agentic_loop(self, agentic_client):
         """Client-side function tools exit the agentic loop without
         auto-execution, even when the IRR is active.
 
-        This proves the IRR + agentic_loop + mcp_dispatch correctly
+        This proves the IRR + openai_agentic_loop + mcp_dispatch correctly
         distinguish MCP tools (auto-loop) from client functions
         (return to caller).
         """
@@ -741,6 +754,260 @@ class TestAgenticLoopVLLM:
             f"got output types: {[i.type for i in response.output]}"
         )
         assert function_calls[0].name == "get_weather"
+
+
+# ---------------------------------------------------------------------------
+# File search: dedicated proxy config, fixtures, and tests
+# ---------------------------------------------------------------------------
+
+FILE_SEARCH_CONFIG_TEMPLATE = """\
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:{praxis_port}"
+    filter_chains: [file-search-pipeline]
+
+filter_chains:
+  - name: file-search-pipeline
+    filters:
+      - filter: openai_responses_format
+      - filter: openai_responses_validate
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 8
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_response_bytes: 67108864
+        max_state_bytes: 136314880
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_tool_parse
+              - filter: openai_file_search_callout
+                vector_store_url: http://{ogx_endpoint}
+                allow_private_url: true
+                timeout_ms: 30000
+                max_response_bytes: 10485760
+                max_total_response_bytes: 67108864
+                max_state_bytes: 136314880
+                callout_failure_mode: closed
+                forward_headers:
+                  - authorization
+              - filter: openai_responses_proxy
+                name: inference
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference"
+                    endpoints:
+                      - "{vllm_endpoint}"
+            on_result:
+              - filter: openai_file_search_callout
+                key: pending
+                value: "true"
+                next: inference
+              - default: true
+                done: true
+"""
+
+
+def _write_file_search_config(praxis_port: int) -> str:
+    config = FILE_SEARCH_CONFIG_TEMPLATE.format(
+        praxis_port=praxis_port,
+        ogx_endpoint=_ogx_endpoint(),
+        vllm_endpoint=_vllm_endpoint(),
+    )
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+@pytest.fixture(scope="session")
+def vector_store():
+    """Create a vector store with a test document in OGX."""
+    import httpx
+
+    marker = "PRAXIS-FILE-SEARCH-8472"
+    embedding_model = os.environ.get(
+        "OGX_EMBEDDING_MODEL",
+        "sentence-transformers/nomic-ai/nomic-embed-text-v1.5",
+    )
+    embedding_dimension = int(
+        os.environ.get("OGX_EMBEDDING_DIMENSION", "768")
+    )
+
+    client = httpx.Client(base_url=OGX_BASE_URL, timeout=300)
+    store_id = ""
+    file_id = ""
+
+    try:
+        store = client.post(
+            "/v1/vector_stores",
+            json={
+                "name": f"praxis-file-search-{os.getpid()}",
+                "embedding_model": embedding_model,
+                "embedding_dimension": embedding_dimension,
+                "provider_id": "faiss",
+            },
+        ).json()
+        store_id = store["id"]
+
+        file_content = (
+            f"Praxis file-search integration report.\n"
+            f"The secret marker is {marker}.\n"
+            f"Revenue grew 37 percent year over year.\n"
+        )
+        uploaded = client.post(
+            "/v1/files",
+            files={"file": ("test-marker.txt", file_content.encode(), "text/plain")},
+            data={"purpose": "assistants"},
+        ).json()
+        file_id = uploaded["id"]
+
+        client.post(
+            f"/v1/vector_stores/{store_id}/files",
+            json={
+                "file_id": file_id,
+                "attributes": {"department": "finance"},
+            },
+        )
+
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            status = client.get(
+                f"/v1/vector_stores/{store_id}/files/{file_id}"
+            ).json()
+            if status.get("status") == "completed":
+                break
+            if status.get("status") in ("failed", "cancelled"):
+                raise RuntimeError(
+                    f"OGX indexing failed: {status.get('last_error')}"
+                )
+            time.sleep(0.5)
+        else:
+            raise TimeoutError("OGX indexing timed out after 300s")
+
+        yield store_id, marker
+
+    finally:
+        if store_id:
+            try:
+                client.delete(f"/v1/vector_stores/{store_id}")
+            except Exception:
+                pass
+        if file_id:
+            try:
+                client.delete(f"/v1/files/{file_id}")
+            except Exception:
+                pass
+        client.close()
+
+
+@pytest.fixture(scope="session")
+def file_search_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy with the file-search-callout pipeline."""
+    port = _free_port()
+    config_path = _write_file_search_config(port)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("file-search")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== File search proxy logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def file_search_client(file_search_proxy):
+    """Return an OpenAI client pointed at the file-search Praxis proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{file_search_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+class TestFileSearchVLLM:
+    """File search integration tests: vLLM -> Praxis -> OGX -> vLLM."""
+
+    def test_file_search_with_vllm_translation(
+        self, file_search_client, vector_store
+    ):
+        """vLLM emits function_call(name=file_search) which the proxy
+        translates to file_search_call, executes the OGX search callout,
+        and returns results to the client.
+        """
+        store_id, _marker = vector_store
+        response = file_search_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "Use the file_search tool to find information about "
+                "the Praxis marker. Repeat the marker exactly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "file_search",
+                    "vector_store_ids": [store_id],
+                }
+            ],
+            include=["file_search_call.results"],
+            store=False,
+            max_output_tokens=512,
+        )
+
+        assert response.status in ("completed", "incomplete"), (
+            f"response should complete; got status={response.status}"
+        )
+
+        output_types = [item.type for item in response.output]
+        assert output_types, "response should have at least one output item"
+
+        file_search_items = [
+            item
+            for item in response.output
+            if item.type == "file_search_call"
+        ]
+        assert file_search_items, (
+            "translated function_call(name=file_search) should appear as "
+            f"file_search_call; got output types: {output_types}"
+        )
+        for item in file_search_items:
+            assert item.status in ("completed", "incomplete"), (
+                f"file_search_call status should be terminal; "
+                f"got: {item.status}"
+            )
 
 
 if __name__ == "__main__":

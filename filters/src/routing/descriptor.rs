@@ -16,6 +16,8 @@ use praxis_filter::FilterError;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
+use super::metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN};
+
 /// Maximum number of route candidates.
 const MAX_CANDIDATES: usize = 1024;
 
@@ -105,7 +107,7 @@ impl CapabilityKind {
         }
     }
 
-    /// Parse a kind string from a Grid routing overlay document.
+    /// Parse a kind string from a routing overlay document.
     ///
     /// # Errors
     ///
@@ -141,6 +143,10 @@ impl CapabilityKind {
 pub(crate) struct CandidateConfig {
     /// Cluster name to select when this candidate is chosen.
     pub cluster: String,
+
+    /// Optional final-hop credential reference.
+    #[serde(default)]
+    pub credential: Option<CandidateCredential>,
 
     /// Whether this candidate is fresh (default: `true`).
     #[serde(default = "default_fresh")]
@@ -180,6 +186,9 @@ pub(crate) struct RouteCandidate {
 
     /// Cluster name to select.
     pub cluster: Arc<str>,
+
+    /// Optional final-hop credential reference.
+    pub credential: Option<CandidateCredential>,
 
     /// Whether this candidate is fresh. Preserved from overlay/static config;
     /// the configuration producer owns freshness ordering.
@@ -248,7 +257,10 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 /// - the candidate list is empty or exceeds [`MAX_CANDIDATES`]
 /// - any name/site/cluster field is blank or oversized
 /// - duplicate (kind, name, site, cluster) tuples exist
-#[expect(clippy::too_many_lines, reason = "single validation pass over all candidate fields")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single validation loop, splitting hurts readability"
+)]
 pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
     if raw.is_empty() {
         return Err("routing: candidates list must not be empty".into());
@@ -264,6 +276,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
         validate_name(&format!("candidates[{i}].name"), &c.name)?;
         validate_name(&format!("candidates[{i}].site"), &c.site)?;
         validate_name(&format!("candidates[{i}].cluster"), &c.cluster)?;
+        validate_credential(i, c.credential.as_ref())?;
 
         if !seen.insert((c.kind, c.name.clone(), c.site.clone(), c.cluster.clone())) {
             return Err(format!(
@@ -280,6 +293,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
         candidates.push(RouteCandidate {
             admission_state: AdmissionState::default(),
             cluster: Arc::from(c.cluster.as_str()),
+            credential: c.credential,
             fresh: c.fresh,
             kind: c.kind,
             name: Arc::from(c.name.as_str()),
@@ -291,6 +305,28 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
     }
 
     Ok(candidates)
+}
+
+/// Validate credential reference fields on a candidate entry.
+fn validate_credential(index: usize, credential: Option<&CandidateCredential>) -> Result<(), FilterError> {
+    let Some(credential) = credential else {
+        return Ok(());
+    };
+    if credential.strategy != STRATEGY_BEARER_TOKEN {
+        return Err(format!("routing: candidates[{index}].credential.strategy is unsupported").into());
+    }
+    validate_name(
+        &format!("candidates[{index}].credential.secretRef.name"),
+        &credential.secret_ref.name,
+    )?;
+    validate_name(
+        &format!("candidates[{index}].credential.secretRef.namespace"),
+        &credential.secret_ref.namespace,
+    )?;
+    validate_name(
+        &format!("candidates[{index}].credential.secretRef.key"),
+        &credential.secret_ref.key,
+    )
 }
 
 /// Validate the promoted model header name.
@@ -570,6 +606,7 @@ mod tests {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();
         CandidateConfig {
             cluster: cluster.to_owned(),
+            credential: None,
             fresh: true,
             kind,
             name: name.to_owned(),

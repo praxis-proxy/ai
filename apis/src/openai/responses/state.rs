@@ -6,11 +6,14 @@
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
 //! across filter phases. It holds the heavy data needed by the
 //! validate → rehydrate → `openai_tool_parse` → `openai_responses_proxy` →
-//! `stream_events` → `agentic_loop` pipeline.
+//! `stream_events` → `openai_agentic_loop` pipeline.
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
 use std::collections::HashMap;
+
+/// Maximum citation file mappings retained during one response execution.
+pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 
 /// Request-scoped state shared across Responses API filters.
 ///
@@ -23,11 +26,10 @@ use std::collections::HashMap;
 /// without affecting external callers.
 ///
 /// [`RequestExtensions`]: praxis_filter::RequestExtensions
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "fields used incrementally as more filters are ported")
-)]
 pub(crate) struct ResponsesState {
+    /// Maps file IDs to filenames for citation annotation extraction.
+    pub citation_files: HashMap<String, String>,
+
     /// Truncation strategy for managing context window limits.
     ///
     /// Preserves the full object from the request so filters can
@@ -39,6 +41,12 @@ pub(crate) struct ResponsesState {
     /// Can be a string ID or an object with `id`. Controls which
     /// stored conversation this request belongs to.
     pub conversation: Option<serde_json::Value>,
+
+    /// Public output retained across local file-search inference rounds.
+    ///
+    /// This is request-local continuation state. Private search context stays
+    /// in [`Self::messages`] and is never exposed through Conversations.
+    pub file_search_output_items: Vec<serde_json::Value>,
 
     /// Additional fields to include in the response.
     ///
@@ -61,7 +69,7 @@ pub(crate) struct ResponsesState {
     pub input: Vec<serde_json::Value>,
 
     /// Current agentic loop iteration (0-indexed). Incremented by
-    /// `agentic_loop` at the start of each new inference round.
+    /// `openai_agentic_loop` at the start of each new inference round.
     pub iteration: u32,
 
     /// Maximum number of built-in tool invocations.
@@ -82,7 +90,7 @@ pub(crate) struct ResponsesState {
     ///
     /// Initialized from the current request's input. When
     /// `previous_response_id` is set, `rehydrate` prepends stored
-    /// history. `agentic_loop` appends tool results during agentic
+    /// history. `openai_agentic_loop` appends tool results during agentic
     /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
@@ -114,12 +122,15 @@ pub(crate) struct ResponsesState {
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
+    /// Whether provider-visible request fields require outbound serialization.
+    pub request_body_rebuild: RequestBodyRebuild,
+
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
 
     /// Tool calls from the current inference response only.
     ///
-    /// Cleared by `agentic_loop` at the start of each iteration
+    /// Cleared by `openai_agentic_loop` at the start of each iteration
     /// before `stream_events` writes new ones. Without explicit
     /// clearing, stale tool calls from a previous iteration cause
     /// duplicate dispatch.
@@ -127,14 +138,14 @@ pub(crate) struct ResponsesState {
 
     /// Web search calls from the current inference response only.
     ///
-    /// Cleared by `agentic_loop` at the start of each iteration.
+    /// Cleared by `openai_agentic_loop` at the start of each iteration.
     /// Stored separately from `tool_calls` because `web_search_call`
     /// items have a different shape (`action.query` instead of
     /// `name`/`arguments`) and must not trigger the
     /// one-function-call-per-round limit.
     pub web_search_calls: Vec<serde_json::Value>,
 
-    /// Tool choice setting. Reset to `"auto"` by `agentic_loop`
+    /// Tool choice setting. Reset to `"auto"` by `openai_agentic_loop`
     /// after the first iteration; the original value from the
     /// request only applies to the first inference call.
     pub tool_choice: serde_json::Value,
@@ -151,16 +162,29 @@ pub(crate) struct ResponsesState {
     ///
     /// Each round's model output items and MCP execution results are
     /// appended here so the final response contains the complete
-    /// trace. `agentic_loop` writes model items, `mcp_dispatch`
+    /// trace. `openai_agentic_loop` writes model items, `mcp_dispatch`
     /// writes `mcp_call` and `mcp_approval_request` items.
     pub accumulated_output: Vec<serde_json::Value>,
+}
+
+/// Whether the proxy can preserve the original request bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RequestBodyRebuild {
+    /// No provider-visible state has changed.
+    #[default]
+    PreserveOriginal,
+
+    /// Provider-visible state must be serialized before inference.
+    Required,
 }
 
 impl Default for ResponsesState {
     fn default() -> Self {
         Self {
+            citation_files: HashMap::new(),
             context_management: None,
             conversation: None,
+            file_search_output_items: Vec::new(),
             include: Vec::new(),
             history_rehydrated: false,
             input: Vec::new(),
@@ -174,6 +198,7 @@ impl Default for ResponsesState {
             previous_tools: Vec::new(),
             previous_usage: None,
             request_body: serde_json::Value::Null,
+            request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             tool_calls: Vec::new(),
             web_search_calls: Vec::new(),
@@ -196,7 +221,6 @@ impl ResponsesState {
             .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
 
         let tools = extract_array_field(&body, "tools");
-
         Self {
             context_management: body.get("context_management").cloned(),
             conversation: body.get("conversation").cloned(),
@@ -215,8 +239,12 @@ impl ResponsesState {
         }
     }
 
+    /// Require the proxy to serialize provider-visible request state.
+    pub(crate) fn mark_request_body_for_rebuild(&mut self) {
+        self.request_body_rebuild = RequestBodyRebuild::Required;
+    }
+
     /// Borrow the public output owned by [`Self::response_object`].
-    #[cfg(test)]
     pub(crate) fn output_items(&self) -> &[serde_json::Value] {
         self.response_object
             .get("output")
@@ -244,16 +272,22 @@ impl ResponsesState {
         };
         items
     }
+
+    /// Return whether provider-visible request state requires serialization.
+    pub(crate) fn request_body_requires_rebuild(&self) -> bool {
+        self.request_body_rebuild == RequestBodyRebuild::Required
+    }
 }
 
 /// Normalize the `input` field into a message array.
 ///
-/// The Responses API `input` can be a string (single user message)
-/// or an array of message objects. Normalizes both forms to a
-/// `Vec<Value>`.
+/// The Responses API `input` can be a string (single user message),
+/// a single item object, or an array of items. Normalizes all three
+/// forms to a `Vec<Value>`.
 fn normalize_input(body: &serde_json::Value) -> Vec<serde_json::Value> {
     match body.get("input") {
         Some(serde_json::Value::Array(arr)) => arr.clone(),
+        Some(input @ serde_json::Value::Object(_)) => vec![input.clone()],
         Some(serde_json::Value::String(s)) => {
             vec![serde_json::json!({
                 "type": "message",
@@ -357,6 +391,23 @@ mod tests {
         });
         let state = ResponsesState::from_request_body(body);
         assert_eq!(state.input.len(), 2, "array input should preserve all items");
+    }
+
+    #[test]
+    fn from_request_body_wraps_object_input_as_single_item() {
+        let input = json!({
+            "type": "message",
+            "role": "developer",
+            "content": "Be terse."
+        });
+        let state = ResponsesState::from_request_body(json!({
+            "model": "gpt-4o",
+            "input": input
+        }));
+
+        assert_eq!(state.input, vec![input]);
+        assert_eq!(state.messages, state.input);
+        assert_eq!(state.persisted_messages, state.input);
     }
 
     #[test]

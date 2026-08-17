@@ -253,8 +253,8 @@ fn input_items_from_array_input() {
     assert!(page.has_more, "should have more items");
     assert_eq!(
         page.next_cursor.as_deref(),
-        Some("2"),
-        "cursor should be the next offset"
+        Some("msg_resp_1_input_1"),
+        "cursor should use the synthetic ID assigned to the last item on the page"
     );
 
     let page2 = list_input_items(
@@ -385,7 +385,11 @@ fn input_items_limit_zero_clamps_to_one() {
 
     assert_eq!(page1.data.len(), 1, "limit 0 should clamp to one item");
     assert!(page1.has_more, "first page should indicate remaining items");
-    assert_eq!(page1.next_cursor.as_deref(), Some("1"), "cursor should advance by one");
+    assert_eq!(
+        page1.next_cursor.as_deref(),
+        Some("msg_resp_1_input_1"),
+        "cursor should use the synthetic ID assigned to the item on the page"
+    );
 
     let page2 = list_input_items(
         &record,
@@ -2010,7 +2014,9 @@ fn pg_unique_suffix() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tid = std::thread::current().id();
-    format!("{id}_{tid:?}").replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
+    format!("{id}_{tid:?}")
+        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
+        .to_lowercase()
 }
 
 #[test]

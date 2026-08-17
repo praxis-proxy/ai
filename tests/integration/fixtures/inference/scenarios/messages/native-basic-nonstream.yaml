@@ -1,0 +1,33 @@
+version: 1
+id: messages/native-basic-nonstream
+description: Minimal non-streaming Anthropic Messages request passed through to a native backend.
+protocol: anthropic_messages
+example_config: anthropic/messages-protocol.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - messages.native.request
+  - messages.native.response.text
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 8
+          stream: false
+          messages:
+            - role: user
+              content: Reply with exactly `4` and nothing else.
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

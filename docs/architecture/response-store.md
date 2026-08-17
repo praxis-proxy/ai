@@ -37,7 +37,13 @@ the persistence decision as new information arrives:
   store enabled, non-streaming).
 - Handles `GET /v1/responses/{id}` retrieval and
   `GET /v1/responses/{id}/input_items` pagination
-  directly from the store.
+  directly from the store. Query parameters on
+  `GET /v1/responses/{id}` are validated before
+  retrieval: `stream=false` and empty queries are
+  accepted, while `stream=true`, `include`,
+  `starting_after`, `include_obfuscation`, and
+  unknown parameters are rejected with a 400
+  response.
 - Handles `DELETE /v1/responses/{id}` locally.
 - Lazily initializes the store backend.
 - Rejects with a 500 response on store init failure

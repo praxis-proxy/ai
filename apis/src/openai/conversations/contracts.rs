@@ -11,8 +11,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use utoipa::{
-    ToSchema,
-    openapi::schema::{Object, ObjectBuilder, Type},
+    PartialSchema, ToSchema,
+    openapi::schema::{AnyOfBuilder, ArrayBuilder, Object, ObjectBuilder, Schema, Type},
 };
 
 /// Maximum number of items accepted by create operations.
@@ -106,24 +106,23 @@ impl IncludeFields {
 }
 
 /// Request body accepted by `POST /conversations`.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub(super) struct CreateConversationRequest {
     /// Optional metadata map. Missing and null both produce empty metadata.
+    #[schema(schema_with = nullable_metadata_schema)]
     pub(super) metadata: Option<Metadata>,
 
-    /// Optional initial items to add to the conversation.
-    #[serde(default)]
-    #[schema(max_items = 20)]
-    pub(super) items: Vec<ConversationItem>,
+    /// Optional nullable initial items to add to the conversation.
+    #[schema(schema_with = nullable_initial_items_schema)]
+    pub(super) items: Option<Vec<ConversationItem>>,
 }
 
 /// Request body accepted by `POST /conversations/{conversation_id}`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub(super) struct UpdateConversationRequest {
-    /// Optional metadata replacement. Null clears existing metadata.
-    #[serde(default)]
-    #[schema(value_type = Option<Metadata>)]
-    pub(super) metadata: MetadataUpdate,
+    /// Required metadata replacement.
+    #[serde(deserialize_with = "deserialize_metadata_object")]
+    pub(super) metadata: Metadata,
 }
 
 /// Request body accepted by `POST /conversations/{conversation_id}/items`.
@@ -161,28 +160,49 @@ impl Metadata {
     }
 }
 
-/// Metadata update semantics for the update operation.
-#[derive(Debug, Default)]
-pub(super) enum MetadataUpdate {
-    /// The metadata field was absent; preserve the stored value.
-    #[default]
-    Missing,
-    /// The metadata field was null; clear the stored value.
-    Clear,
-    /// Replace the stored metadata with this value.
-    Replace(Metadata),
+/// Preserve both nullable layers emitted for create metadata upstream.
+fn nullable_metadata_schema() -> Schema {
+    let metadata = AnyOfBuilder::new()
+        .item(Schema::Object(
+            ObjectBuilder::new()
+                .schema_type(Type::Object)
+                .additional_properties(Some(ObjectBuilder::new().schema_type(Type::String)))
+                .build(),
+        ))
+        .item(Schema::Object(ObjectBuilder::new().schema_type(Type::Null).build()))
+        .build();
+    Schema::AnyOf(
+        AnyOfBuilder::new()
+            .item(Schema::AnyOf(metadata))
+            .item(Schema::Object(ObjectBuilder::new().schema_type(Type::Null).build()))
+            .build(),
+    )
 }
 
-impl<'de> Deserialize<'de> for MetadataUpdate {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Option::<Metadata>::deserialize(deserializer).map(|metadata| match metadata {
-            Some(metadata) => Self::Replace(metadata),
-            None => Self::Clear,
-        })
+/// Generate the official nullable, bounded initial-items composition.
+fn nullable_initial_items_schema() -> Schema {
+    Schema::AnyOf(
+        AnyOfBuilder::new()
+            .item(
+                ArrayBuilder::new()
+                    .items(<ConversationItem as PartialSchema>::schema())
+                    .max_items(Some(MAX_ITEMS_PER_REQUEST)),
+            )
+            .item(Schema::Object(ObjectBuilder::new().schema_type(Type::Null).build()))
+            .build(),
+    )
+}
+
+/// Deserialize update metadata only from a JSON object.
+fn deserialize_metadata_object<'de, D>(deserializer: D) -> Result<Metadata, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if !value.is_object() {
+        return Err(serde::de::Error::custom("metadata must be an object"));
     }
+    Ok(Metadata(value))
 }
 
 /// Polymorphic conversation item stored and returned as an opaque JSON object.
@@ -365,23 +385,26 @@ mod tests {
     #[test]
     fn create_request_distinguishes_missing_and_null_items() {
         let missing: CreateConversationRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(missing.items.is_empty());
+        assert!(missing.items.is_none(), "missing items should use the default");
 
-        let null = serde_json::from_value::<CreateConversationRequest>(json!({"items": null}));
-        assert!(null.is_err(), "explicit null items must remain invalid");
+        let null: CreateConversationRequest = serde_json::from_value(json!({"items": null})).unwrap();
+        assert!(null.items.is_none(), "null items should use the default");
     }
 
     #[test]
-    fn update_request_preserves_metadata_field_state() {
-        let missing: UpdateConversationRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(matches!(missing.metadata, MetadataUpdate::Missing));
+    fn update_request_requires_non_null_metadata() {
+        let missing = serde_json::from_value::<UpdateConversationRequest>(json!({}));
+        assert!(missing.is_err(), "metadata must be present on update");
 
-        let null: UpdateConversationRequest = serde_json::from_value(json!({"metadata": null})).unwrap();
-        assert!(matches!(null.metadata, MetadataUpdate::Clear));
+        let null = serde_json::from_value::<UpdateConversationRequest>(json!({"metadata": null}));
+        assert!(null.is_err(), "metadata must be an object on update");
+
+        let array = serde_json::from_value::<UpdateConversationRequest>(json!({"metadata": ["a", "b"]}));
+        assert!(array.is_err(), "metadata must reject arrays");
 
         let replacement: UpdateConversationRequest =
             serde_json::from_value(json!({"metadata": {"project": "praxis"}})).unwrap();
-        assert!(matches!(replacement.metadata, MetadataUpdate::Replace(_)));
+        assert_eq!(replacement.metadata.as_value(), &json!({"project": "praxis"}));
     }
 
     #[test]

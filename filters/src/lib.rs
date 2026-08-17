@@ -11,6 +11,8 @@
 pub mod agentic;
 pub mod guardrails;
 pub mod inference;
+#[cfg(feature = "opentelemetry")]
+mod opentelemetry;
 pub mod prompt_enrich;
 mod register;
 pub mod routing;
@@ -22,7 +24,7 @@ pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
-pub use routing::IntelligentRouteFilter;
+pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;
 pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
 
@@ -80,6 +82,7 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            metrics_route: None,
             peer_identity: None,
             request: req,
             request_body_bytes: 0,

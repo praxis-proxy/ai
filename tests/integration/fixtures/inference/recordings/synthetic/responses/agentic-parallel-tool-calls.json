@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "scenario_id": "responses/agentic-parallel-tool-calls",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-agentic-model",
+    "source_id": "controlled-agentic-parallel-tool-calls"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_1": "msg_recorded_0002",
+      "resp_1": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Reply with exactly `4` and nothing else.",
+              "model": "synthetic-agentic-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "id": "resp_recorded_0001",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "status": "completed",
+              "usage": {
+                "input_tokens": 12,
+                "output_tokens": 1,
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "content": "Reply with exactly `4` and nothing else.",
+                  "role": "user",
+                  "type": "message"
+                }
+              ],
+              "model": "synthetic-agentic-model",
+              "parallel_tool_calls": false,
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "id": "resp_recorded_0001",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "status": "completed",
+              "usage": {
+                "input_tokens": 12,
+                "output_tokens": 1,
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

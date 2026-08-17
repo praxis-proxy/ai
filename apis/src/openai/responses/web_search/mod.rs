@@ -12,16 +12,13 @@
 //!
 //! # Pipeline dependencies
 //!
-//! - **`agentic_loop`** must run before this filter in the response phase (after in YAML order) to extract
+//! - **`openai_agentic_loop`** must run before this filter in the response phase (after in YAML order) to extract
 //!   `web_search_call` items from the model response into [`ResponsesState::web_search_calls`].
 //! - The IRR transition must match `openai_web_search.action = "loop"` and target the same inference step.
 //!
 //! [`ResponsesState::web_search_calls`]: super::state::ResponsesState
 //! [`filter_results`]: HttpFilterContext::filter_results
-//! [`SearchClient`]: provider::SearchClient
-
-pub(crate) mod config;
-pub(crate) mod provider;
+//! [`SearchClient`]: crate::web_search::SearchClient
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -37,8 +34,6 @@ pub(crate) mod provider;
 )]
 mod tests;
 
-use std::fmt::Write as _;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -47,12 +42,14 @@ use praxis_filter::{
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use self::{
-    config::{SearchContextSize, WebSearchFilterConfig, build_config},
-    provider::{SearchClient, SearchOutcome, SearchResult},
-};
 use super::state::ResponsesState;
-use crate::openai::responses::error::responses_error_rejection;
+use crate::{
+    openai::responses::error::responses_error_rejection,
+    web_search::{
+        SearchClient, SearchContextSize, SearchOutcome, SearchResult, WebSearchFilterConfig, build_config,
+        format_search_results,
+    },
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -66,6 +63,9 @@ const ACTION_LOOP: &str = "loop";
 
 /// Action value signalling no web search dispatch needed.
 const ACTION_DONE: &str = "done";
+
+/// Include value that gates `action.sources` in the output item.
+const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 
 // -----------------------------------------------------------------------------
 // WebSearchFilter
@@ -93,7 +93,7 @@ const ACTION_DONE: &str = "done";
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// default_context_size: medium
 /// timeout_ms: 10000
-/// failure_mode: closed
+/// provider_failure_mode: closed
 /// status_on_error: 502
 /// max_body_bytes: 67108864
 /// ```
@@ -153,8 +153,8 @@ impl WebSearchFilter {
         subrequest_client: crate::subrequest::SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: WebSearchFilterConfig = parse_filter_config("openai_web_search", config)?;
-        let validated = build_config(&cfg)?;
-        let search_client = SearchClient::from_config(&validated, subrequest_client)?;
+        let validated = build_config("openai_web_search", &cfg)?;
+        let search_client = SearchClient::from_config("openai_web_search", &validated, subrequest_client)?;
         Ok(Box::new(Self {
             search_client,
             default_context_size: validated.default_context_size,
@@ -283,7 +283,12 @@ impl HttpFilter for WebSearchFilter {
 
 /// Append search results to [`ResponsesState`].
 fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str, query: &str, results: &[SearchResult]) {
-    let output_item = build_output_item(call_id, status, query, results);
+    let include_sources = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES));
+
+    let output_item = build_output_item(call_id, status, query, results, include_sources);
     let tool_result = build_tool_result_message(call_id, results);
 
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
@@ -337,33 +342,42 @@ pub(crate) fn emit_status(ctx: &mut HttpFilterContext<'_>, call_id: &str, status
 }
 
 /// Build a `web_search_call` output item for the response.
-pub(crate) fn build_output_item(call_id: &str, status: &str, query: &str, results: &[SearchResult]) -> Value {
-    let mut item = serde_json::json!({
-        "type": "web_search_call",
-        "id": call_id,
-        "status": status,
-        "action": {
-            "type": "search",
-            "query": query,
-        },
+///
+/// `action.sources` is only included when `include_sources` is true,
+/// matching the `web_search_call.action.sources` include gate.
+pub(crate) fn build_output_item(
+    call_id: &str,
+    status: &str,
+    query: &str,
+    results: &[SearchResult],
+    include_sources: bool,
+) -> Value {
+    let mut action = serde_json::json!({
+        "type": "search",
+        "query": query,
     });
 
-    if !results.is_empty() {
+    if include_sources {
         let sources: Vec<Value> = results
             .iter()
             .map(|r| {
                 serde_json::json!({
-                    "title": r.title,
+                    "type": "url",
                     "url": r.url,
                 })
             })
             .collect();
-        if let Some(obj) = item.as_object_mut() {
+        if let Some(obj) = action.as_object_mut() {
             obj.insert("sources".to_owned(), Value::Array(sources));
         }
     }
 
-    item
+    serde_json::json!({
+        "type": "web_search_call",
+        "id": call_id,
+        "status": status,
+        "action": action,
+    })
 }
 
 /// Build a tool result message to append to conversation history.
@@ -380,18 +394,6 @@ pub(crate) fn build_tool_result_message(call_id: &str, results: &[SearchResult])
         "status": "completed",
         "output": content,
     })
-}
-
-/// Format search results as readable text for the model.
-pub(crate) fn format_search_results(results: &[SearchResult]) -> String {
-    let mut out = String::with_capacity(results.len() * 200);
-    for (i, r) in results.iter().enumerate() {
-        if i > 0 {
-            out.push_str("\n\n");
-        }
-        let _infallible = write!(out, "[{}] {}\n{}\n{}", i + 1, r.title, r.url, r.snippet);
-    }
-    out
 }
 
 /// Write the loop control action to filter results.

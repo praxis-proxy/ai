@@ -7,6 +7,7 @@
 //! session and replays those turns through an example configuration.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Component, PathBuf},
     str::FromStr,
@@ -14,6 +15,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
+
+use crate::inference_fixture::{RecordedBody, RecordedExchange, RecordedRequest, RecordedResponse};
 
 /// Stored-session protocol represented by a replay fixture.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -924,10 +927,41 @@ impl ReplayTurn {
     pub fn response_body(&self) -> String {
         serde_json::to_string(&self.response).unwrap_or_else(|e| panic!("serialize replay response: {e}"))
     }
+
+    /// Convert this legacy replay turn into the shared client exchange schema.
+    ///
+    /// This is lossy because replay fixtures do not retain an HTTP method or
+    /// response status; the adapter uses `POST` and status `200`. It preserves
+    /// the stored path, unlike [`crate::Recording::to_recorded_exchange`].
+    ///
+    /// The adapter borrows the replay turn, so its request, response, and path
+    /// are cloned only because the returned shared exchange owns them.
+    #[must_use]
+    pub fn to_client_exchange(&self) -> RecordedExchange {
+        RecordedExchange {
+            request: RecordedRequest {
+                method: "POST".to_owned(),
+                path: self.path.clone(),
+                headers: BTreeMap::new(),
+                body: RecordedBody::Json {
+                    value: self.request.clone(),
+                },
+            },
+            response: RecordedResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: RecordedBody::Json {
+                    value: self.response.clone(),
+                },
+            },
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     const CODEX_JSONL: &str = r#"{"timestamp":"2026-07-07T00:00:00Z","type":"session_meta","payload":{"id":"session_import_codex"}}
@@ -995,6 +1029,57 @@ mod tests {
 
         serde_json::from_str::<Value>(&turn.request_body()).expect("request body should be JSON");
         serde_json::from_str::<Value>(&turn.response_body()).expect("response body should be JSON");
+    }
+
+    #[test]
+    fn replay_turn_adapter_preserves_body_direction_and_lossy_http_defaults() {
+        // Catches swapping request and response bodies or dropping the stored replay route.
+        let turn = ReplayTurn {
+            name: "legacy-turn".to_owned(),
+            path: "/v1/responses?include=usage".to_owned(),
+            request: json!({"request_model": "request-only-model"}),
+            response: json!({"response_id": "response-only-id", "content": "answer"}),
+            source_records: None,
+        };
+
+        let exchange = turn.to_client_exchange();
+
+        assert_eq!(exchange.request.method, "POST");
+        assert_eq!(exchange.request.path, "/v1/responses?include=usage");
+        assert!(exchange.request.headers.is_empty());
+        assert_eq!(
+            exchange.request.body,
+            RecordedBody::Json {
+                value: json!({"request_model": "request-only-model"})
+            }
+        );
+        assert_eq!(exchange.response.status, 200);
+        assert!(exchange.response.headers.is_empty());
+        assert_eq!(
+            exchange.response.body,
+            RecordedBody::Json {
+                value: json!({"response_id": "response-only-id", "content": "answer"})
+            }
+        );
+    }
+
+    #[test]
+    fn replay_turn_json_shape_omits_and_defaults_optional_source_records() {
+        // Catches changing the existing replay-turn on-disk shape while adding its adapter.
+        let literal = json!({
+            "name": "legacy-turn",
+            "path": "/v1/responses",
+            "request": {"request_marker": "request"},
+            "response": {"response_marker": "response"}
+        });
+
+        let turn: ReplayTurn = serde_json::from_value(literal.clone()).expect("legacy replay turn should deserialize");
+
+        assert_eq!(turn.source_records, None);
+        assert_eq!(
+            serde_json::to_value(&turn).expect("legacy replay turn should serialize"),
+            literal
+        );
     }
 
     #[test]

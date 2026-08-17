@@ -1,6 +1,6 @@
 # Agentic Loop Controller
 #
-# Demonstrates the agentic_loop filter with iterative_request_router
+# Demonstrates the openai_agentic_loop filter with iterative_request_router
 # for step-based model-tool-model looping in the Responses API.
 #
 # The iterative_request_router (IRR) repeatedly runs one inference step.
@@ -26,12 +26,12 @@
 #
 # IRR inference filter chain:
 #   Request phase (forward):
-#     openai_web_search → openai_mcp_dispatch → agentic_loop
+#     openai_web_search → openai_mcp_dispatch → openai_agentic_loop
 #       → openai_responses_proxy → router → load_balancer
 #   Response phase (reverse):
-#     load_balancer → router → openai_responses_proxy → agentic_loop
+#     load_balancer → router → openai_responses_proxy → openai_agentic_loop
 #       → openai_mcp_dispatch → openai_web_search
-#   agentic_loop extracts completed function calls and web_search_call
+#   openai_agentic_loop extracts completed function calls and web_search_call
 #   items. Dispatch filters then identify their respective calls, write
 #   the IRR transition, and execute them at the start of the next
 #   iteration before inference.
@@ -116,7 +116,7 @@ filter_chains:
               # calls, and second-to-last on the model response to
               # classify MCP tool calls.
               - filter: openai_mcp_dispatch
-              - filter: agentic_loop
+              - filter: openai_agentic_loop
                 max_infer_iters: 10
               - filter: openai_responses_proxy
               - filter: router

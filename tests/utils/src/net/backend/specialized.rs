@@ -7,10 +7,60 @@ use std::{
     io::{Read as _, Write as _},
     net::TcpStream,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
+
+/// Start a backend that returns different responses on each call.
+///
+/// Each entry in `responses` is `(status, body)`. After all entries
+/// are exhausted, the backend returns 500 with `exhausted`.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind.
+pub fn start_stateful_backend(responses: Vec<(u16, String)>) -> StatefulBackendGuard {
+    let state = Arc::new(Mutex::new(responses));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured_requests = Arc::clone(&requests);
+
+    let guard = spawn_tcp_server_with_shutdown(move |mut stream| {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let headers = read_until_headers_complete(&mut stream);
+        captured_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(headers);
+
+        let response = next_stateful_response(&state);
+        let _sent = stream.write_all(response.as_bytes());
+    });
+
+    StatefulBackendGuard { guard, requests }
+}
+
+/// Pop and encode the next response for a stateful test backend.
+fn next_stateful_response(responses: &Mutex<Vec<(u16, String)>>) -> String {
+    let mut queue = responses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (status, body) = if queue.is_empty() {
+        (500_u16, "exhausted".to_owned())
+    } else {
+        queue.remove(0)
+    };
+    let reason = super::simple::reason_phrase(status);
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Server: praxis-stateful-backend\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+}
 
 /// Spawn a raw TCP server that calls `handler` in a new
 /// thread for each accepted connection. Returns the port.
@@ -35,6 +85,29 @@ pub struct BackendGuard {
 
     /// Shared flag signalling the listener loop to exit.
     shutdown: Arc<AtomicBool>,
+}
+
+/// Stateful backend guard with captured request headers.
+pub struct StatefulBackendGuard {
+    /// Inner backend guard that shuts down the listener on drop.
+    guard: BackendGuard,
+    /// Raw request headers, in arrival order.
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl StatefulBackendGuard {
+    /// The allocated port number.
+    pub fn port(&self) -> u16 {
+        self.guard.port()
+    }
+
+    /// Return the captured requests in arrival order.
+    pub fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl BackendGuard {

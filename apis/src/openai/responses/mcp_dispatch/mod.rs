@@ -6,8 +6,8 @@
 //! Operates in two phases within an
 //! `iterative_request_router` inference step:
 //!
-//! 1. **Response path** (`on_response_body`): after `agentic_loop` extracts model-produced function calls, identifies
-//!    calls backed by [`ResponsesState::mcp_tool_map`], checks approval policies, and writes
+//! 1. **Response path** (`on_response_body`): after `openai_agentic_loop` extracts model-produced function calls,
+//!    identifies calls backed by [`ResponsesState::mcp_tool_map`], checks approval policies, and writes
 //!    `openai_mcp_dispatch.action = "loop"` to filter results.
 //! 2. **Request-body path** (`on_request_body`, next IRR iteration): executes pending MCP calls via
 //!    [`mcp_client::call_tool`] and appends results to `messages`, `persisted_messages`, and `output_items` before
@@ -19,8 +19,8 @@
 //! - **`openai_stream_events`** (or equivalent accumulator) must populate [`ResponsesState::tool_calls`] from the
 //!   upstream response. Currently only `function_call` events are accumulated; native `mcp_call` events require either
 //!   `mcp_tool_resolve` rewriting MCP tools into function tools or the accumulator adding `mcp_call` support.
-//! - **`agentic_loop`** must run after this filter in request order, so response order is `agentic_loop` then
-//!   `openai_mcp_dispatch`.
+//! - **`openai_agentic_loop`** must run after this filter in request order, so response order is `openai_agentic_loop`
+//!   then `openai_mcp_dispatch`.
 //! - The IRR transition must match `openai_mcp_dispatch.action = "loop"` and target the same inference step.
 //!
 //! Ordinary client-side function calls do not match the MCP tool map,
@@ -345,9 +345,34 @@ fn extract_call_id(tc: &serde_json::Value) -> String {
         .to_owned()
 }
 
+/// Normalize raw tool call arguments.
+///
+/// Function calls carry arguments either as a JSON string
+/// (e.g., `"{\"city\":\"Paris\"}"`) or directly as a JSON value.
+/// Returns `(parsed_value, canonical_string)` or an error for
+/// malformed JSON strings.
+fn normalize_arguments(raw: &serde_json::Value) -> Result<(serde_json::Value, String), String> {
+    match raw {
+        serde_json::Value::String(s) => {
+            let parsed = serde_json::from_str(s).map_err(|e| format!("malformed tool arguments: {e}"))?;
+            Ok((parsed, s.clone()))
+        },
+        other => Ok((other.clone(), other.to_string())),
+    }
+}
+
 /// Extract serialised arguments from a tool call value.
+///
+/// Uses the same string-vs-non-string convention as
+/// [`normalize_arguments`] but only produces the canonical string,
+/// avoiding the deep clone that full normalization performs on
+/// non-string values.
 fn extract_arguments(tc: &serde_json::Value) -> String {
-    tc.get("arguments").map(ToString::to_string).unwrap_or_default()
+    match tc.get("arguments") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
 }
 
 /// Check a single tool call for approval requirement.
@@ -531,24 +556,16 @@ fn parse_call_arguments(
         .get("arguments")
         .cloned()
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    let arguments = match &raw {
-        serde_json::Value::String(s) => match serde_json::from_str(s) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                warn!(tool_name, error = %e, "malformed JSON in tool call arguments");
-                return Err(Box::new(build_error_result(
-                    call_id,
-                    server_label,
-                    tool_name,
-                    s,
-                    &format!("malformed tool arguments: {e}"),
-                )));
-            },
-        },
-        other => other.clone(),
-    };
-    let arguments_string = arguments.to_string();
-    Ok((arguments, arguments_string))
+    normalize_arguments(&raw).map_err(|e| {
+        warn!(tool_name, error = %e, "malformed JSON in tool call arguments");
+        Box::new(build_error_result(
+            call_id,
+            server_label,
+            tool_name,
+            raw.as_str().unwrap_or_default(),
+            &e,
+        ))
+    })
 }
 
 /// Build result from a completed (successful or failed) MCP call.

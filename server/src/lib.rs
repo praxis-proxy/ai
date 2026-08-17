@@ -70,11 +70,22 @@ pub fn build_full_registry(
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::too_many_lines,
+    clippy::unwrap_used,
+    reason = "tests"
+)]
 mod tests {
     use praxis_core::config::Config;
 
     use super::*;
+
+    fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
+    }
 
     #[test]
     fn default_config_parses_successfully() {
@@ -104,5 +115,59 @@ mod tests {
             !config.listeners.is_empty(),
             "loaded config should define at least one listener"
         );
+    }
+
+    #[test]
+    fn routing_filters_are_registered_exactly_once() {
+        let registry = build_full_registry(&test_subrequest_client());
+        let names = registry.available_filters();
+        for expected in ["intelligent_route", "provider_route", "credential_inject"] {
+            assert_eq!(
+                names.iter().filter(|name| **name == expected).count(),
+                1,
+                "{expected} must be registered exactly once"
+            );
+        }
+        assert!(!registry.is_security_filter("intelligent_route"));
+        assert!(registry.is_security_filter("provider_route"));
+        assert!(registry.is_security_filter("credential_inject"));
+    }
+
+    #[test]
+    fn provider_pipeline_filters_construct_from_registry() {
+        let registry = build_full_registry(&test_subrequest_client());
+        let peer_config = serde_yaml::from_str(
+            "trusted_peers:\n\
+             \x20 - cert_digest: 0000000000000000000000000000000000000000000000000000000000000000\n\
+             \x20   organization: ai-grid\n",
+        )
+        .expect("peer config");
+        let provider_route_config = serde_yaml::from_str(
+            "provider_id: site-a\n\
+             routes:\n\
+             \x20 - candidate_id: candidate-a\n\
+             \x20   cluster: backend\n\
+             \x20   model: model-a\n\
+             \x20   paths: [/v1/chat/completions]\n",
+        )
+        .expect("provider route config");
+        let credential_config = serde_yaml::from_str(
+            "credentials:\n\
+             \x20 - name: provider-token\n\
+             \x20   namespace: grid-system\n\
+             \x20   key: token\n\
+             \x20   value: test-only-token\n",
+        )
+        .expect("credential config");
+
+        for (name, config) in [
+            ("peer_identity_trust", &peer_config),
+            ("provider_route", &provider_route_config),
+            ("credential_inject", &credential_config),
+        ] {
+            registry
+                .create(name, config)
+                .unwrap_or_else(|error| panic!("{name} must construct from the full registry: {error}"));
+        }
     }
 }

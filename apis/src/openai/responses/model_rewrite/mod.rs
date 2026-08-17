@@ -42,21 +42,13 @@ use std::{borrow::Cow, collections::HashMap};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::value_safety::is_safe_promoted_value, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
 use self::config::{ModelRewriteConfig, OnInvalidBehavior, validate_config};
 use super::error::responses_error_rejection;
-use crate::{classifier::is_responses_create, json_body::replace_json_body};
-
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Maximum length of a body-derived value promoted to headers or filter results.
-const MAX_PROMOTED_VALUE_LEN: usize = 256;
+use crate::{classifier::is_responses_create, json_body::replace_json_body, promotion::is_promotable_value};
 
 // -----------------------------------------------------------------------------
 // ModelRewriteFilter
@@ -398,15 +390,11 @@ fn promote_facts(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult, header
 /// control characters are not written to metadata.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult) {
     if let Some(orig) = &result.original_model
-        && is_safe_promoted_value(orig)
-        && orig.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(orig)
     {
         ctx.set_metadata("openai_responses_model_rewrite.original_model", orig.clone());
     }
-    if !result.effective_model.is_empty()
-        && is_safe_promoted_value(&result.effective_model)
-        && result.effective_model.len() <= MAX_PROMOTED_VALUE_LEN
-    {
+    if !result.effective_model.is_empty() && is_promotable_value(&result.effective_model) {
         ctx.set_metadata(
             "openai_responses_model_rewrite.effective_model",
             result.effective_model.clone(),
@@ -424,8 +412,7 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult) {
 fn promote_headers(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult, headers: &config::ModelRewriteHeaders) {
     if let Some(header) = &headers.effective_model
         && !result.effective_model.is_empty()
-        && is_safe_promoted_value(&result.effective_model)
-        && result.effective_model.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(&result.effective_model)
     {
         ctx.extra_request_headers
             .push((Cow::Owned(header.clone()), result.effective_model.clone()));
@@ -433,8 +420,7 @@ fn promote_headers(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult, head
 
     if let Some(header) = &headers.original_model
         && let Some(orig) = &result.original_model
-        && is_safe_promoted_value(orig)
-        && orig.len() <= MAX_PROMOTED_VALUE_LEN
+        && is_promotable_value(orig)
     {
         ctx.extra_request_headers
             .push((Cow::Owned(header.clone()), orig.clone()));
@@ -445,10 +431,7 @@ fn promote_headers(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult, head
 fn set_filter_results_from_result(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult) {
     let results = ctx.filter_results.entry("openai_responses_model_rewrite").or_default();
 
-    if !result.effective_model.is_empty()
-        && is_safe_promoted_value(&result.effective_model)
-        && result.effective_model.len() <= MAX_PROMOTED_VALUE_LEN
-    {
+    if !result.effective_model.is_empty() && is_promotable_value(&result.effective_model) {
         set_filter_result(results, "effective_model", result.effective_model.clone());
     }
     if result.rewritten {

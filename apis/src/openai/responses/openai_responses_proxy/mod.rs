@@ -248,10 +248,8 @@ impl serde::Serialize for OutboundBody<'_> {
                     map.serialize_entry(name, backend_messages.as_ref())?;
                     wrote_input = true;
                 },
-                "previous_response_id" | "conversation" => {},
-                "tool_choice" => {
-                    map.serialize_entry(name, &self.state.tool_choice)?;
-                },
+                "previous_response_id" if self.state.history_rehydrated => {},
+                "conversation" => {},
                 _ => map.serialize_entry(name, value)?,
             }
         }
@@ -305,6 +303,7 @@ fn compaction_to_assistant_message(m: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+
 /// Count the exact bytes the proxy will serialize for an outbound body.
 pub(super) fn serialized_outbound_body_len(state: &ResponsesState) -> Result<usize, serde_json::Error> {
     let mut counter = ByteCounter::default();
@@ -332,7 +331,8 @@ impl std::io::Write for ByteCounter {
 
 /// Return whether state requires parsing and rebuilding the outbound body.
 fn request_needs_rebuild(state: &ResponsesState) -> bool {
-    state.messages != state.input
+    state.request_body_requires_rebuild()
+        || state.messages != state.input
         || (state.history_rehydrated
             && (state.previous_response_id.is_some()
                 || state.conversation.is_some()

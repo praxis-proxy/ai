@@ -1,0 +1,299 @@
+{
+  "version": 1,
+  "scenario_id": "responses/native-tool-call",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "live",
+    "provider": "vllm",
+    "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+    "source_id": null
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-tool-bc78401e75caba56": "chatcmpl-recorded-0002",
+      "resp_a6fc7130b48fb2dc": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is the weather in Boston? Use the get_weather function.",
+              "max_output_tokens": 64,
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "store": false,
+              "stream": false,
+              "tool_choice": {
+                "name": "get_weather",
+                "type": "function"
+              },
+              "tools": [
+                {
+                  "description": "Get the current weather for a city.",
+                  "name": "get_weather",
+                  "parameters": {
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "city"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "created_at": "1970-01-01T00:00:00Z",
+              "ec_transfer_params": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input_messages": null,
+              "instructions": null,
+              "kv_transfer_params": null,
+              "max_output_tokens": 64,
+              "max_tool_calls": null,
+              "metadata": null,
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "object": "response",
+              "output": [
+                {
+                  "arguments": "{\"city\":\"Boston\"}",
+                  "call_id": "chatcmpl-recorded-0002",
+                  "caller": null,
+                  "id": "fc_9cb13267fa3319d4",
+                  "name": "get_weather",
+                  "namespace": null,
+                  "status": "completed",
+                  "type": "function_call"
+                }
+              ],
+              "output_messages": null,
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt": null,
+              "reasoning": null,
+              "service_tier": "auto",
+              "status": "completed",
+              "temperature": 1.0,
+              "text": null,
+              "tool_choice": {
+                "name": "get_weather",
+                "type": "function"
+              },
+              "tools": [
+                {
+                  "allowed_callers": null,
+                  "defer_loading": null,
+                  "description": "Get the current weather for a city.",
+                  "name": "get_weather",
+                  "output_schema": null,
+                  "parameters": {
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "city"
+                    ],
+                    "type": "object"
+                  },
+                  "strict": null,
+                  "type": "function"
+                }
+              ],
+              "top_logprobs": null,
+              "top_p": 0.95,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 323,
+                "input_tokens_details": {
+                  "cached_tokens": 0,
+                  "cached_tokens_per_turn": [],
+                  "input_tokens_per_turn": []
+                },
+                "output_tokens": 22,
+                "output_tokens_details": {
+                  "output_tokens_per_turn": [],
+                  "reasoning_tokens": 0,
+                  "tool_output_tokens": 0,
+                  "tool_output_tokens_per_turn": []
+                },
+                "total_tokens": 345
+              },
+              "user": null
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is the weather in Boston? Use the get_weather function.",
+              "max_output_tokens": 64,
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "store": false,
+              "stream": false,
+              "tool_choice": {
+                "name": "get_weather",
+                "type": "function"
+              },
+              "tools": [
+                {
+                  "description": "Get the current weather for a city.",
+                  "name": "get_weather",
+                  "parameters": {
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "city"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "created_at": "1970-01-01T00:00:00Z",
+              "ec_transfer_params": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input_messages": null,
+              "instructions": null,
+              "kv_transfer_params": null,
+              "max_output_tokens": 64,
+              "max_tool_calls": null,
+              "metadata": null,
+              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "object": "response",
+              "output": [
+                {
+                  "arguments": "{\"city\":\"Boston\"}",
+                  "call_id": "chatcmpl-recorded-0002",
+                  "caller": null,
+                  "id": "fc_9cb13267fa3319d4",
+                  "name": "get_weather",
+                  "namespace": null,
+                  "status": "completed",
+                  "type": "function_call"
+                }
+              ],
+              "output_messages": null,
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt": null,
+              "reasoning": null,
+              "service_tier": "auto",
+              "status": "completed",
+              "temperature": 1.0,
+              "text": null,
+              "tool_choice": {
+                "name": "get_weather",
+                "type": "function"
+              },
+              "tools": [
+                {
+                  "allowed_callers": null,
+                  "defer_loading": null,
+                  "description": "Get the current weather for a city.",
+                  "name": "get_weather",
+                  "output_schema": null,
+                  "parameters": {
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "city"
+                    ],
+                    "type": "object"
+                  },
+                  "strict": null,
+                  "type": "function"
+                }
+              ],
+              "top_logprobs": null,
+              "top_p": 0.95,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 323,
+                "input_tokens_details": {
+                  "cached_tokens": 0,
+                  "cached_tokens_per_turn": [],
+                  "input_tokens_per_turn": []
+                },
+                "output_tokens": 22,
+                "output_tokens_details": {
+                  "output_tokens_per_turn": [],
+                  "reasoning_tokens": 0,
+                  "tool_output_tokens": 0,
+                  "tool_output_tokens_per_turn": []
+                },
+                "total_tokens": 345
+              },
+              "user": null
+            }
+          }
+        }
+      }
+    }
+  ]
+}

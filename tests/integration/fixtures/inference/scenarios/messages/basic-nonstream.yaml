@@ -1,0 +1,33 @@
+version: 1
+id: messages/basic-nonstream
+description: Minimal Anthropic Messages request translated to Chat Completions.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.request.minimal
+  - messages.response.text
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          messages:
+            - role: user
+              content: What is 2+2? Reply with just the number.
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

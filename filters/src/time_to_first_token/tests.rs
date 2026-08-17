@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use http::header::HeaderValue;
+use praxis_ai_apis::promotion::MAX_PROMOTED_VALUE_LEN;
 use praxis_filter::{HttpFilter as _, Response};
 
 use super::*;

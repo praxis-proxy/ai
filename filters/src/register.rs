@@ -7,14 +7,15 @@ use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
-    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
+    PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
 ///
 /// When `subrequest_client` is provided, filters that make HTTP
-/// callouts (`openai_file_resolve`, `openai_web_search`) capture the
+/// callouts (`openai_file_resolve`, `openai_web_search`,
+/// `anthropic_web_search`) capture the
 /// shared client instead of creating isolated per-filter connectors.
 ///
 /// Does not call [`FilterRegistry::with_builtins`].
@@ -30,7 +31,7 @@ use crate::{
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     register_agentic_filters(registry);
     register_general_ai_filters(registry);
-    register_anthropic_filters(registry);
+    register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
     register_routing_filters(registry);
 }
@@ -100,10 +101,32 @@ fn register_routing_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "intelligent_route" => IntelligentRouteFilter::from_config
     );
+    register_routing_security_filter(registry, "provider_route", ProviderRouteFilter::from_config);
+    register_routing_security_filter(registry, "credential_inject", CredentialInjectFilter::from_config);
+}
+
+/// Register a routing HTTP filter as security-critical.
+#[expect(
+    clippy::type_complexity,
+    reason = "single-use registration helper; a type alias adds indirection"
+)]
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_routing_security_filter(
+    registry: &mut FilterRegistry,
+    name: &'static str,
+    factory: fn(&serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError>,
+) {
+    registry
+        .register_with_class(
+            name,
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(factory)),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: '{name}'"));
 }
 
 /// Register Anthropic-specific filters.
-fn register_anthropic_filters(registry: &mut FilterRegistry) {
+fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
         @register registry,
         http "anthropic_messages_format" => praxis_ai_apis::anthropic::AnthropicMessagesFormatFilter::from_config
@@ -124,6 +147,7 @@ fn register_anthropic_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "anthropic_validate" => praxis_ai_apis::anthropic::AnthropicValidateFilter::from_config
     );
+    register_anthropic_web_search(registry, subrequest_client);
 }
 
 /// Register OpenAI Responses API request-path filters.
@@ -159,6 +183,7 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
         http "openai_responses_rehydrate" => praxis_ai_apis::openai::RehydrateFilter::from_config
     );
     register_compact(registry, subrequest_client);
+    register_file_search_callout(registry, subrequest_client);
     register_openai_response_filters(registry, subrequest_client);
 }
 
@@ -175,6 +200,10 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     praxis_filter::register_filters!(
         @register registry,
         http "openai_responses_proxy" => praxis_ai_apis::openai::ResponsesProxyFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "responses_to_chat_completions" => praxis_ai_apis::openai::ResponsesToChatCompletionsFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -196,13 +225,35 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config
+        http "openai_agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config
     );
 }
 
 // -----------------------------------------------------------------------------
 // Sub-request-aware registration
 // -----------------------------------------------------------------------------
+
+/// Register `anthropic_web_search` with the shared client when
+/// available, otherwise fall back to an isolated per-filter connector.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_anthropic_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "anthropic_web_search",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'anthropic_web_search'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "anthropic_web_search" => praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_config
+        );
+    }
+}
 
 /// Register `openai_file_resolve` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
@@ -248,6 +299,28 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
     }
 }
 
+/// Register `openai_file_search_callout` with the shared client when
+/// available, otherwise fall back to an isolated per-filter connector.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "openai_file_search_callout",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    praxis_ai_apis::openai::FileSearchCalloutFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_search_callout'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "openai_file_search_callout" => praxis_ai_apis::openai::FileSearchCalloutFilter::from_config
+        );
+    }
+}
+
 /// Register `openai_web_search` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
@@ -282,23 +355,22 @@ mod tests {
     fn build_ai_registry_includes_ai_and_builtin_filters() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
-        assert!(names.contains(&"ai_guardrails"), "expected ai_guardrails in registry");
-        assert!(
-            names.contains(&"openai_responses_validate"),
-            "expected openai_responses_validate in registry"
-        );
-        assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
-        assert!(
-            names.contains(&"intelligent_route"),
-            "expected intelligent_route in registry"
-        );
-        assert!(
-            names.contains(&"anthropic_validate"),
-            "expected anthropic filter in registry"
-        );
-        assert!(
-            names.contains(&"request_id"),
-            "expected core builtin request_id in registry"
-        );
+        let expected = [
+            "ai_guardrails",
+            "openai_responses_validate",
+            "responses_to_chat_completions",
+            "a2a",
+            "intelligent_route",
+            "provider_route",
+            "credential_inject",
+            "anthropic_validate",
+            "anthropic_web_search",
+            "request_id",
+        ];
+        for name in expected {
+            assert!(names.contains(&name), "expected {name} in registry");
+        }
+        assert!(registry.is_security_filter("provider_route"));
+        assert!(registry.is_security_filter("credential_inject"));
     }
 }
