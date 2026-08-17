@@ -7,15 +7,16 @@ use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
 use crate::{
-    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
-    PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IntelligentRouteFilter, McpFilter,
+    ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter,
+    TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
 ///
 /// When `subrequest_client` is provided, filters that make HTTP
 /// callouts (`openai_file_resolve`, `openai_web_search`,
-/// `anthropic_web_search`) capture the
+/// `anthropic_web_search`, `external_metering`) capture the
 /// shared client instead of creating isolated per-filter connectors.
 ///
 /// Does not call [`FilterRegistry::with_builtins`].
@@ -31,6 +32,7 @@ use crate::{
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     register_agentic_filters(registry);
     register_general_ai_filters(registry);
+    register_external_metering(registry, subrequest_client);
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
     register_routing_filters(registry);
@@ -93,6 +95,28 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "time_to_first_token" => TimeToFirstTokenFilter::from_config
     );
+}
+
+/// Register the external metering filter, capturing the shared
+/// sub-request client when one is available.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_external_metering(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "external_metering",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    ExternalMeteringFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'external_metering'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "external_metering" => ExternalMeteringFilter::from_config
+        );
+    }
 }
 
 /// Register intelligent routing filters.

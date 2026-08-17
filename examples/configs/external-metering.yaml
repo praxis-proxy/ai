@@ -1,0 +1,63 @@
+# External Metering
+#
+# Pre-request balance check and post-response token usage reporting
+# against an external metering service. Identity headers are captured
+# from configurable tenant headers (default prefix: x-tenant-) and
+# stripped before forwarding upstream.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/external-metering.yaml
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "x-tenant-username: alice" \
+#     -H "x-tenant-group: engineering" \
+#     -H "x-tenant-subscription: sub-42" \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# Pipeline ordering matters: external_metering is declared before
+# token_count so that response hooks (which run in reverse order)
+# execute token_count first, writing token.input / token.output /
+# token.total to filter_metadata, then external_metering reads them
+# and sends a CloudEvent to the metering service.
+#
+# Balance check endpoint:
+#   GET {metering_url}/api/v1/customers/{username}/entitlements/{feature_key}/value?model={model}
+#
+# Usage report endpoint:
+#   POST {metering_url}/api/v1/events  (CloudEvents 1.0 JSON)
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: external_metering
+        metering_url: "http://127.0.0.1:9090"
+        timeout_seconds: 5
+        feature_key: "inference-tokens"
+        source: "ai-gateway"
+        fail_open: true
+        identity_header_prefix: "x-tenant-"
+        # Optional fallbacks for deployments where an upstream authentication
+        # layer does not inject identity headers. Without default_username,
+        # requests carrying no identity header are not metered at all.
+        # default_username: "anonymous"
+        # default_model: "unknown"
+
+      - filter: token_count
+        provider: openai
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
