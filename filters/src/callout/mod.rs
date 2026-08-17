@@ -16,7 +16,7 @@ mod extract;
 #[cfg(test)]
 mod tests;
 
-use std::{borrow::Cow, time::Duration};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -228,12 +228,12 @@ impl HttpCalloutFilter {
             }
         }
 
+        // Inject with set (overwrite) semantics: a header taken from the
+        // trusted callout response replaces any client-supplied header of
+        // the same name rather than being appended alongside it.
         for name in &self.inject_headers {
-            if let Some(value) = response.headers.get(name)
-                && let Ok(value_str) = value.to_str()
-            {
-                ctx.extra_request_headers
-                    .push((Cow::Owned(name.to_string()), value_str.to_owned()));
+            if let Some(value) = response.headers.get(name) {
+                ctx.request_headers_to_set.push((name.clone(), value.clone()));
             }
         }
 
