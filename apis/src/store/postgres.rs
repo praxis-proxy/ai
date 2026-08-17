@@ -756,8 +756,8 @@ impl ConversationItemStore for PostgresResponseStore {
 
             sqlx::query(AssertSqlSafe(insert_sql.as_str()))
                 .bind(&item.item_id)
-                .bind(&item.tenant_id)
-                .bind(&item.conversation_id)
+                .bind(tenant_id)
+                .bind(conversation_id)
                 .bind(&item_data)
                 .bind(item.created_at)
                 .bind(position)

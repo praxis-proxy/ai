@@ -742,8 +742,8 @@ async fn sqlite_create_items_and_sync(
 
         sqlx::query(AssertSqlSafe(insert_sql.as_str()))
             .bind(&item.item_id)
-            .bind(&item.tenant_id)
-            .bind(&item.conversation_id)
+            .bind(tenant_id)
+            .bind(conversation_id)
             .bind(&item_data)
             .bind(item.created_at)
             .bind(position)
