@@ -50,10 +50,17 @@ struct TokenUsage {
     total: u64,
 
     /// Input tokens served from the provider's prompt cache.
-    cache_read: u64,
+    ///
+    /// `None` when the provider did not report the count at all, which is
+    /// distinct from a reported zero: an absent count means the response
+    /// carried no cache information, a zero means the cache was not hit.
+    cache_read: Option<u64>,
 
     /// Input tokens written to the provider's prompt cache.
-    cache_write: u64,
+    ///
+    /// `None` when the provider did not report the count at all, as for
+    /// providers whose API has no cache-write concept.
+    cache_write: Option<u64>,
 }
 
 impl TokenUsage {
@@ -72,7 +79,10 @@ impl TokenUsage {
 
     /// Attaches prompt cache counts, which break down [`Self::input_tokens`]
     /// rather than adding to it.
-    fn with_cache(mut self, cache_read: u64, cache_write: u64) -> Self {
+    ///
+    /// Pass `None` for a count the provider did not report, so that it stays
+    /// distinguishable from a count the provider reported as zero.
+    fn with_cache(mut self, cache_read: Option<u64>, cache_write: Option<u64>) -> Self {
         self.cache_read = cache_read;
         self.cache_write = cache_write;
         self
@@ -93,13 +103,15 @@ impl TokenUsage {
         self.total
     }
 
-    /// Returns input tokens served from the provider's prompt cache.
-    fn cache_read_tokens(self) -> u64 {
+    /// Returns input tokens served from the provider's prompt cache, or `None`
+    /// when the provider did not report the count.
+    fn cache_read_tokens(self) -> Option<u64> {
         self.cache_read
     }
 
-    /// Returns input tokens written to the provider's prompt cache.
-    fn cache_write_tokens(self) -> u64 {
+    /// Returns input tokens written to the provider's prompt cache, or `None`
+    /// when the provider did not report the count.
+    fn cache_write_tokens(self) -> Option<u64> {
         self.cache_write
     }
 }
@@ -136,7 +148,15 @@ fn set_token_usage(ctx: &mut HttpFilterContext<'_>, input: u64, output: u64, tot
 ///
 /// Recorded separately from [`set_token_usage`] because cached tokens are a
 /// subset of the input count, not an addition to it.
-fn set_cache_token_usage(ctx: &mut HttpFilterContext<'_>, cache_read: u64, cache_write: u64) {
-    ctx.set_metadata(META_TOKEN_CACHE_READ, cache_read.to_string());
-    ctx.set_metadata(META_TOKEN_CACHE_WRITE, cache_write.to_string());
+///
+/// Each count is written only when the provider reported it, so a consumer can
+/// tell "no cache information in this response" from "cache reported zero".
+fn set_cache_token_usage(ctx: &mut HttpFilterContext<'_>, cache_read: Option<u64>, cache_write: Option<u64>) {
+    if let Some(cache_read) = cache_read {
+        ctx.set_metadata(META_TOKEN_CACHE_READ, cache_read.to_string());
+    }
+
+    if let Some(cache_write) = cache_write {
+        ctx.set_metadata(META_TOKEN_CACHE_WRITE, cache_write.to_string());
+    }
 }

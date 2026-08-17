@@ -857,7 +857,10 @@ async fn json_openai_records_cached_tokens() {
     let (cache_read, cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
 
     assert_eq!(cache_read.as_deref(), Some("900"), "OpenAI cached prompt tokens");
-    assert_eq!(cache_write.as_deref(), Some("0"), "OpenAI reports no cache writes");
+    assert_eq!(
+        cache_write, None,
+        "OpenAI has no cache write field, so no cache write metadata is written"
+    );
 }
 
 #[tokio::test]
@@ -868,17 +871,39 @@ async fn json_google_records_cached_content_tokens() {
     let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Google, "application/json", json).await;
 
     assert_eq!(cache_read.as_deref(), Some("1100"), "Google cached content tokens");
-    assert_eq!(cache_write.as_deref(), Some("0"), "Google reports no cache writes");
+    assert_eq!(
+        cache_write, None,
+        "Google has no cache write field, so no cache write metadata is written"
+    );
 }
 
 #[tokio::test]
-async fn json_without_cache_records_zero() {
+async fn json_without_cache_records_no_metadata() {
     let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"total_tokens":57}}"#;
 
     let (cache_read, cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
 
-    assert_eq!(cache_read.as_deref(), Some("0"), "no cache activity reported as zero");
-    assert_eq!(cache_write.as_deref(), Some("0"), "no cache activity reported as zero");
+    assert_eq!(
+        cache_read, None,
+        "a response with no cache information writes no cache read metadata"
+    );
+    assert_eq!(
+        cache_write, None,
+        "a response with no cache information writes no cache write metadata"
+    );
+}
+
+#[tokio::test]
+async fn json_with_zero_cached_tokens_records_zero() {
+    let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+
+    let (cache_read, _cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(
+        cache_read.as_deref(),
+        Some("0"),
+        "a reported cache miss is recorded as zero, distinct from absent"
+    );
 }
 
 #[tokio::test]
@@ -896,7 +921,7 @@ async fn sse_anthropic_records_cache_breakdown() {
 }
 
 #[tokio::test]
-async fn sse_anthropic_without_cache_records_zero() {
+async fn sse_anthropic_without_cache_records_no_metadata() {
     let events = concat!(
         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25}}}\n\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
@@ -905,11 +930,13 @@ async fn sse_anthropic_without_cache_records_zero() {
     let (cache_read, cache_write) =
         run_cache_extraction(ProviderKind::Anthropic, "text/event-stream", events.as_bytes()).await;
 
-    assert_eq!(cache_read.as_deref(), Some("0"), "absent cache fields reported as zero");
     assert_eq!(
-        cache_write.as_deref(),
-        Some("0"),
-        "absent cache fields reported as zero"
+        cache_read, None,
+        "a stream with no cache fields writes no cache read metadata"
+    );
+    assert_eq!(
+        cache_write, None,
+        "a stream with no cache fields writes no cache write metadata"
     );
 }
 
@@ -929,7 +956,10 @@ async fn sse_openai_final_usage_records_cached_tokens() {
         Some("900"),
         "cached tokens from final usage event"
     );
-    assert_eq!(cache_write.as_deref(), Some("0"), "OpenAI reports no cache writes");
+    assert_eq!(
+        cache_write, None,
+        "OpenAI has no cache write field, so no cache write metadata is written"
+    );
 }
 
 #[tokio::test]

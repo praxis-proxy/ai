@@ -10,8 +10,9 @@ use super::TokenUsage;
 /// Cache write counts are not reported by every provider.
 ///
 /// `OpenAI` and Google expose how much of the prompt was *read* from their cache
-/// but not how much was written to it, so those parsers report no cache writes.
-const NO_CACHE_WRITE: u64 = 0;
+/// but not how much was written to it, so those parsers leave the cache write
+/// count absent rather than claiming a zero the provider never reported.
+const NO_CACHE_WRITE: Option<u64> = None;
 
 // -----------------------------------------------------------------------------
 // OpenAI / Azure
@@ -54,10 +55,7 @@ struct OpenAiPromptTokensDetails {
 pub(super) fn parse_openai(body: &[u8]) -> Option<TokenUsage> {
     let response: OpenAiResponse = serde_json::from_slice(body).ok()?;
     let usage = response.usage?;
-    let cache_read = usage
-        .prompt_tokens_details
-        .and_then(|details| details.cached_tokens)
-        .unwrap_or(0);
+    let cache_read = usage.prompt_tokens_details.and_then(|details| details.cached_tokens);
     Some(
         TokenUsage::new(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
             .with_cache(cache_read, NO_CACHE_WRITE),
@@ -99,12 +97,12 @@ struct AnthropicUsage {
 pub(super) fn parse_anthropic(body: &[u8]) -> Option<TokenUsage> {
     let response: AnthropicResponse = serde_json::from_slice(body).ok()?;
     let usage = response.usage?;
-    let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
-    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = usage.cache_creation_input_tokens;
+    let cache_read = usage.cache_read_input_tokens;
     let actual_input = usage
         .input_tokens
-        .saturating_add(cache_write)
-        .saturating_add(cache_read);
+        .saturating_add(cache_write.unwrap_or(0))
+        .saturating_add(cache_read.unwrap_or(0));
     Some(TokenUsage::new(actual_input, usage.output_tokens, None).with_cache(cache_read, cache_write))
 }
 
@@ -144,7 +142,7 @@ struct GoogleUsageMetadata {
 pub(super) fn parse_google(body: &[u8]) -> Option<TokenUsage> {
     let response: GoogleResponse = serde_json::from_slice(body).ok()?;
     let usage = response.usage_metadata?;
-    let cache_read = usage.cached_content_token_count.unwrap_or(0);
+    let cache_read = usage.cached_content_token_count;
     Some(
         TokenUsage::new(
             usage.prompt_token_count,
@@ -492,9 +490,29 @@ mod tests {
         let usage = parse_openai(json).unwrap();
 
         assert_eq!(usage.input_tokens(), 1000, "cached tokens are already in prompt_tokens");
-        assert_eq!(usage.total_tokens(), 1050);
-        assert_eq!(usage.cache_read_tokens(), 900);
-        assert_eq!(usage.cache_write_tokens(), 0, "OpenAI does not report cache writes");
+        assert_eq!(usage.total_tokens(), 1050, "total should be prompt + completion");
+        assert_eq!(usage.cache_read_tokens(), Some(900), "cached_tokens is the cache read");
+        assert_eq!(
+            usage.cache_write_tokens(),
+            None,
+            "OpenAI has no cache write field, so the count is absent rather than zero"
+        );
+    }
+
+    #[test]
+    fn openai_cached_tokens_zero_is_reported_not_absent() {
+        let json = br#"{"usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 0}
+        }}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(
+            usage.cache_read_tokens(),
+            Some(0),
+            "an explicit zero is a reported cache miss, distinct from an absent count"
+        );
     }
 
     #[test]
@@ -502,8 +520,12 @@ mod tests {
         let json = br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20}}"#;
         let usage = parse_openai(json).unwrap();
 
-        assert_eq!(usage.cache_read_tokens(), 0);
-        assert_eq!(usage.cache_write_tokens(), 0);
+        assert_eq!(
+            usage.cache_read_tokens(),
+            None,
+            "no prompt_tokens_details means no cache information"
+        );
+        assert_eq!(usage.cache_write_tokens(), None, "OpenAI never reports cache writes");
     }
 
     #[test]
@@ -511,7 +533,11 @@ mod tests {
         let json = br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20, "prompt_tokens_details": null}}"#;
         let usage = parse_openai(json).unwrap();
 
-        assert_eq!(usage.cache_read_tokens(), 0);
+        assert_eq!(
+            usage.cache_read_tokens(),
+            None,
+            "null prompt_tokens_details means no cache information"
+        );
     }
 
     #[test]
@@ -525,8 +551,16 @@ mod tests {
         let usage = parse_anthropic(json).unwrap();
 
         assert_eq!(usage.input_tokens(), 3250, "input is the sum of all input fields");
-        assert_eq!(usage.cache_read_tokens(), 3000);
-        assert_eq!(usage.cache_write_tokens(), 200);
+        assert_eq!(
+            usage.cache_read_tokens(),
+            Some(3000),
+            "cache_read_input_tokens is the cache read"
+        );
+        assert_eq!(
+            usage.cache_write_tokens(),
+            Some(200),
+            "cache_creation_input_tokens is the cache write"
+        );
     }
 
     #[test]
@@ -534,8 +568,16 @@ mod tests {
         let json = br#"{"usage": {"input_tokens": 20, "output_tokens": 30}}"#;
         let usage = parse_anthropic(json).unwrap();
 
-        assert_eq!(usage.cache_read_tokens(), 0);
-        assert_eq!(usage.cache_write_tokens(), 0);
+        assert_eq!(
+            usage.cache_read_tokens(),
+            None,
+            "an omitted cache read field means no cache information"
+        );
+        assert_eq!(
+            usage.cache_write_tokens(),
+            None,
+            "an omitted cache write field means no cache information"
+        );
     }
 
     #[test]
@@ -552,8 +594,16 @@ mod tests {
             1200,
             "cached tokens are already in promptTokenCount"
         );
-        assert_eq!(usage.cache_read_tokens(), 1100);
-        assert_eq!(usage.cache_write_tokens(), 0, "Google does not report cache writes");
+        assert_eq!(
+            usage.cache_read_tokens(),
+            Some(1100),
+            "cachedContentTokenCount is the cache read"
+        );
+        assert_eq!(
+            usage.cache_write_tokens(),
+            None,
+            "Google has no cache write field, so the count is absent rather than zero"
+        );
     }
 
     #[test]
@@ -561,7 +611,11 @@ mod tests {
         let json = br#"{"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20}}"#;
         let usage = parse_google(json).unwrap();
 
-        assert_eq!(usage.cache_read_tokens(), 0);
+        assert_eq!(
+            usage.cache_read_tokens(),
+            None,
+            "an omitted cachedContentTokenCount means no cache information"
+        );
     }
 
     #[test]
@@ -569,8 +623,16 @@ mod tests {
         let json = br#"{"usage": {"inputTokens": 10, "outputTokens": 20}}"#;
         let usage = parse_bedrock(json).unwrap();
 
-        assert_eq!(usage.cache_read_tokens(), 0);
-        assert_eq!(usage.cache_write_tokens(), 0);
+        assert_eq!(
+            usage.cache_read_tokens(),
+            None,
+            "the Converse cache shape is not parsed, so no cache read is claimed"
+        );
+        assert_eq!(
+            usage.cache_write_tokens(),
+            None,
+            "the Converse cache shape is not parsed, so no cache write is claimed"
+        );
     }
 
     #[test]
@@ -583,7 +645,15 @@ mod tests {
         }}"#;
         let usage = parse_bedrock(json).unwrap();
 
-        assert_eq!(usage.cache_read_tokens(), 200);
-        assert_eq!(usage.cache_write_tokens(), 100);
+        assert_eq!(
+            usage.cache_read_tokens(),
+            Some(200),
+            "the Anthropic fallback carries the cache read through"
+        );
+        assert_eq!(
+            usage.cache_write_tokens(),
+            Some(100),
+            "the Anthropic fallback carries the cache write through"
+        );
     }
 }

@@ -73,16 +73,16 @@ pub(super) fn parse_anthropic_event(data: &[u8]) -> StreamingTokens {
         && let Some(message) = start.message
         && let Some(usage) = message.usage
     {
-        let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
-        let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+        let cache_write = usage.cache_creation_input_tokens;
+        let cache_read = usage.cache_read_input_tokens;
         let actual_input = usage
             .input_tokens
-            .saturating_add(cache_write)
-            .saturating_add(cache_read);
+            .saturating_add(cache_write.unwrap_or(0))
+            .saturating_add(cache_read.unwrap_or(0));
         return StreamingTokens {
             input: Some(actual_input),
-            cache_read: Some(cache_read),
-            cache_write: Some(cache_write),
+            cache_read,
+            cache_write,
             ..StreamingTokens::default()
         };
     }
@@ -240,8 +240,24 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_message_start_without_cache_reports_zero() {
+    fn anthropic_message_start_without_cache_reports_absent_counts() {
         let event = br#"{"type":"message_start","message":{"usage":{"input_tokens":25}}}"#;
+
+        assert_eq!(
+            parse_anthropic_event(event),
+            StreamingTokens {
+                input: Some(25),
+                output: None,
+                cache_read: None,
+                cache_write: None,
+            },
+            "omitted cache fields stay absent instead of accumulating a zero"
+        );
+    }
+
+    #[test]
+    fn anthropic_message_start_with_zero_cache_reports_zero() {
+        let event = br#"{"type":"message_start","message":{"usage":{"input_tokens":25,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
 
         assert_eq!(
             parse_anthropic_event(event),
@@ -250,7 +266,8 @@ mod tests {
                 output: None,
                 cache_read: Some(0),
                 cache_write: Some(0),
-            }
+            },
+            "an explicit zero is a reported cache miss, distinct from an absent count"
         );
     }
 

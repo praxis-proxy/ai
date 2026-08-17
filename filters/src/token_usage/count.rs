@@ -341,8 +341,8 @@ fn handle_json_body(
                 input = usage.input_tokens(),
                 output = usage.output_tokens(),
                 total = usage.total_tokens(),
-                cache_read = usage.cache_read_tokens(),
-                cache_write = usage.cache_write_tokens(),
+                cache_read = ?usage.cache_read_tokens(),
+                cache_write = ?usage.cache_write_tokens(),
                 "extracted token usage from JSON response"
             );
         }
@@ -415,15 +415,24 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
         .insert(META_INPUT.to_owned(), usage.input_tokens().to_string());
     ctx.filter_metadata
         .insert(META_OUTPUT.to_owned(), usage.output_tokens().to_string());
-    ctx.filter_metadata
-        .insert(META_CACHE_READ.to_owned(), usage.cache_read_tokens().to_string());
-    ctx.filter_metadata
-        .insert(META_CACHE_WRITE.to_owned(), usage.cache_write_tokens().to_string());
+
+    // Only accumulate counts the event actually reported, so an unreported
+    // count stays absent instead of being pinned to zero at finalization.
+    if let Some(cache_read) = usage.cache_read_tokens() {
+        ctx.filter_metadata
+            .insert(META_CACHE_READ.to_owned(), cache_read.to_string());
+    }
+
+    if let Some(cache_write) = usage.cache_write_tokens() {
+        ctx.filter_metadata
+            .insert(META_CACHE_WRITE.to_owned(), cache_write.to_string());
+    }
+
     trace!(
         input = usage.input_tokens(),
         output = usage.output_tokens(),
-        cache_read = usage.cache_read_tokens(),
-        cache_write = usage.cache_write_tokens(),
+        cache_read = ?usage.cache_read_tokens(),
+        cache_write = ?usage.cache_write_tokens(),
         "complete token usage found in SSE event"
     );
     true
@@ -459,6 +468,11 @@ fn merge_accumulated_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: u6
     ctx.filter_metadata.insert(key.to_owned(), new_value.to_string());
 }
 
+/// Reads an accumulated count, returning `None` when no event reported it.
+fn read_accumulated(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
+    ctx.filter_metadata.get(key).and_then(|value| value.parse().ok())
+}
+
 /// Write accumulated streaming counts to the well-known metadata keys.
 fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>) {
     let has_accumulated = ctx.filter_metadata.contains_key(META_INPUT) || ctx.filter_metadata.contains_key(META_OUTPUT);
@@ -466,32 +480,19 @@ fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>) {
         return;
     }
 
-    let input: u64 = ctx
-        .filter_metadata
-        .get(META_INPUT)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let output: u64 = ctx
-        .filter_metadata
-        .get(META_OUTPUT)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let cache_read: u64 = ctx
-        .filter_metadata
-        .get(META_CACHE_READ)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let cache_write: u64 = ctx
-        .filter_metadata
-        .get(META_CACHE_WRITE)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let input = read_accumulated(ctx, META_INPUT).unwrap_or(0);
+    let output = read_accumulated(ctx, META_OUTPUT).unwrap_or(0);
+    let cache_read = read_accumulated(ctx, META_CACHE_READ);
+    let cache_write = read_accumulated(ctx, META_CACHE_WRITE);
 
     set_token_usage(ctx, input, output, None);
     set_cache_token_usage(ctx, cache_read, cache_write);
     debug!(
         input,
-        output, cache_read, cache_write, "finalized streaming token counts"
+        output,
+        ?cache_read,
+        ?cache_write,
+        "finalized streaming token counts"
     );
 }
 
