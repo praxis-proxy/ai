@@ -62,7 +62,7 @@ const DISALLOWED_FORWARD_HEADERS: &[http::HeaderName] = &[
 // HttpCalloutFilter
 // -----------------------------------------------------------------------------
 
-/// HTTP callout filter.
+/// Calls an external HTTP service during request processing and feeds its response into branch-chain evaluation.
 ///
 /// Makes an outbound HTTP request during request processing,
 /// optionally forwarding the request body and downstream headers.
@@ -545,7 +545,10 @@ fn build_subrequest_client(cfg: &HttpCalloutConfig) -> SubRequestClient {
 #[async_trait]
 impl HttpFilter for HttpCalloutFilter {
     fn name(&self) -> &'static str {
-        FILTER_NAME
+        // Literal required: `cargo xtask generate-filter-docs` discovers
+        // filter anchors by the string literal returned from `name()`.
+        // Kept in sync with `FILTER_NAME` by `name_matches_filter_name`.
+        "http_callout"
     }
 
     fn request_body_access(&self) -> BodyAccess {

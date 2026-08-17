@@ -259,6 +259,24 @@ mod filter_tests {
     }
 
     #[test]
+    fn name_matches_filter_name() {
+        // `name()` must return the "http_callout" string literal so the
+        // filter-docs generator can discover it; guard against drift from
+        // the internal FILTER_NAME const.
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            "#,
+        )
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        assert_eq!(filter.name(), crate::callout::FILTER_NAME);
+        assert_eq!(filter.name(), "http_callout");
+    }
+
+    #[test]
     fn needs_request_context_is_true() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
