@@ -211,16 +211,12 @@ impl HttpCalloutFilter {
 
     /// Process a successful callout response: extract results and
     /// inject headers.
-    fn handle_success(
-        &self,
-        response: &SubResponse,
-        ctx: &mut HttpFilterContext<'_>,
-    ) -> Result<FilterAction, FilterError> {
+    fn handle_success(&self, response: &SubResponse, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         if !self.extractions.is_empty() {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&response.body) {
                 let results = ctx.filter_results.entry(self.name()).or_default();
                 for extraction in &self.extractions {
-                    extraction.evaluate(&json, results)?;
+                    extraction.evaluate(&json, results);
                 }
                 debug!(results = ?results, "extracted callout results");
             } else {
@@ -237,7 +233,7 @@ impl HttpCalloutFilter {
             }
         }
 
-        Ok(FilterAction::Continue)
+        FilterAction::Continue
     }
 
     /// Build a rejection response.
@@ -289,14 +285,10 @@ impl HttpCalloutFilter {
     }
 
     /// Process a completed callout response by status.
-    fn handle_response(
-        &self,
-        response: &SubResponse,
-        ctx: &mut HttpFilterContext<'_>,
-    ) -> Result<FilterAction, FilterError> {
+    fn handle_response(&self, response: &SubResponse, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         if !(200..300).contains(&response.status) {
             info!(url = %self.url, status = response.status, "callout rejected request");
-            return Ok(Self::build_rejection(response.status));
+            return Self::build_rejection(response.status);
         }
 
         info!(url = %self.url, status = response.status, "callout succeeded");
@@ -349,10 +341,11 @@ impl HttpCalloutFilter {
 
         let (request, fw) = self.build_request(ctx, callout_body, depth);
 
-        match self.perform_callout(&request, &fw).await {
+        let action = match self.perform_callout(&request, &fw).await {
             Some(response) => self.handle_response(&response, ctx),
-            None => Ok(self.failure_action()),
-        }
+            None => self.failure_action(),
+        };
+        Ok(action)
     }
 }
 

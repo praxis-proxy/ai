@@ -27,12 +27,24 @@ pub(crate) struct CompiledExtraction {
 impl CompiledExtraction {
     /// Parse and compile a `JSONPath` expression at config time.
     ///
+    /// Also validates `result_key` up front by probing the result-set
+    /// key rules, so invalid keys (empty, over-long, or containing
+    /// characters other than ASCII alphanumerics, `_`, or `-`) fail at
+    /// startup instead of silently on every request.
+    ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the expression is invalid.
+    /// Returns [`FilterError`] if the expression is invalid or the
+    /// result key is rejected by [`FilterResultSet`].
     pub(crate) fn compile(json_path: &str, result_key: String) -> Result<Self, FilterError> {
         let path = JsonPath::parse(json_path)
             .map_err(|e| -> FilterError { format!("http_callout: invalid JSONPath '{json_path}': {e}").into() })?;
+
+        // Probe the key against the result-set rules with an empty value.
+        FilterResultSet::new()
+            .set(result_key.clone(), "")
+            .map_err(|e| -> FilterError { format!("http_callout: invalid result_key '{result_key}': {e}").into() })?;
+
         Ok(Self { path, result_key })
     }
 
@@ -46,27 +58,34 @@ impl CompiledExtraction {
     /// - `array` / `object` → compact JSON
     /// - `null` or no match → skip (no entry written)
     ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the result set rejects the
-    /// key or value.
-    pub(crate) fn evaluate(&self, json: &Value, results: &mut FilterResultSet) -> Result<(), FilterError> {
+    /// The key is validated at config time (see [`Self::compile`]), so
+    /// the only remaining failure mode is a coerced *value* rejected by
+    /// the result-set limits (e.g. an oversized array/object coercion).
+    /// Such a value is logged and skipped rather than failing the
+    /// request, so a hostile or oversized third-party response is
+    /// handled per the filter's `on_failure` policy instead of the `?`
+    /// path.
+    pub(crate) fn evaluate(&self, json: &Value, results: &mut FilterResultSet) {
         let node_list = self.path.query(json);
         let nodes: Vec<&Value> = node_list.all();
 
         let Some(first) = nodes.first() else {
             debug!(key = %self.result_key, "JSONPath matched no nodes; skipping");
-            return Ok(());
+            return;
         };
 
-        let coerced = coerce_value(first);
-        let Some(value) = coerced else {
+        let Some(value) = coerce_value(first) else {
             debug!(key = %self.result_key, "JSONPath matched null; skipping");
-            return Ok(());
+            return;
         };
 
-        results.set(self.result_key.clone(), value)?;
-        Ok(())
+        if let Err(error) = results.set(self.result_key.clone(), value) {
+            warn!(
+                key = %self.result_key,
+                %error,
+                "extracted value rejected by result set limits; skipping"
+            );
+        }
     }
 }
 
@@ -256,11 +275,31 @@ mod tests {
     }
 
     #[test]
+    fn compile_rejects_invalid_result_key() {
+        // A dotted key is rejected by the result-set key rules
+        // (ASCII alphanumeric, '_', or '-' only) at config time.
+        let err = CompiledExtraction::compile("$.flagged", "lakera.flagged".into()).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid result_key"),
+            "should report invalid result key: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_empty_result_key() {
+        let err = CompiledExtraction::compile("$.flagged", String::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid result_key"),
+            "should report invalid result key: {err}"
+        );
+    }
+
+    #[test]
     fn evaluate_bool_true() {
         let ext = CompiledExtraction::compile("$.flagged", "flagged".into()).unwrap();
         let json = json!({"flagged": true});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("flagged"), Some("true"));
     }
 
@@ -269,7 +308,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.flagged", "flagged".into()).unwrap();
         let json = json!({"flagged": false});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("flagged"), Some("false"));
     }
 
@@ -278,7 +317,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.score", "score".into()).unwrap();
         let json = json!({"score": 0.95});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("score"), Some("0.95"));
     }
 
@@ -287,7 +326,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.label", "label".into()).unwrap();
         let json = json!({"label": "safe"});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("label"), Some("safe"));
     }
 
@@ -296,7 +335,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.tags", "tags".into()).unwrap();
         let json = json!({"tags": ["a", "b"]});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("tags"), Some(r#"["a","b"]"#));
     }
 
@@ -305,7 +344,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.meta", "meta".into()).unwrap();
         let json = json!({"meta": {"k": "v"}});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert_eq!(rs.get("meta"), Some(r#"{"k":"v"}"#));
     }
 
@@ -314,7 +353,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.missing", "missing".into()).unwrap();
         let json = json!({"missing": null});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert!(rs.get("missing").is_none(), "null should be skipped");
     }
 
@@ -323,7 +362,7 @@ mod tests {
         let ext = CompiledExtraction::compile("$.nonexistent", "key".into()).unwrap();
         let json = json!({"other": 1});
         let mut rs = FilterResultSet::new();
-        ext.evaluate(&json, &mut rs).unwrap();
+        ext.evaluate(&json, &mut rs);
         assert!(rs.get("key").is_none(), "no-match should be skipped");
     }
 
