@@ -10,10 +10,19 @@
 # fields like "model" that Lakera rejects. The full
 # downstream body reaches the upstream untouched.
 #
-# Requires the LLAMA_GUARD_OPENROUTER_API_KEY environment variable.
+# Requires the LAKERA_API_KEY environment variable.
 #
 # Usage:
-#   LLAMA_GUARD_OPENROUTER_API_KEY=... cargo run -p praxis-ai-proxy -- -c examples/configs/llama-guard.yaml
+#   LAKERA_API_KEY=... cargo run -p praxis-ai-proxy -- -c examples/configs/lakera-guard.yaml
+#
+# Note: non-JSON request bodies cannot be shaped by target.body and are
+# forwarded to Lakera as-is; with on_failure: closed a non-2xx response
+# then rejects the request. Use conditions to scope the callout if that
+# matters for your traffic.
+#
+# A LlamaGuard variant of this example is planned once richer on_result
+# matching lands (praxis-proxy/praxis#964); LlamaGuard verdicts such as
+# "unsafe\nS02" need contains-style matching rather than exact equality.
 
 listeners:
   - name: web
@@ -25,23 +34,22 @@ filter_chains:
     filters:
       - filter: http_callout
         target:
-          url: "https://openrouter.ai/api/v1/chat/completions"
+          url: "https://api.lakera.ai/v2/guard"
           timeout: "2s"
           headers:
             - name: "Authorization"
-              value: "Bearer ${LLAMA_GUARD_OPENROUTER_API_KEY}"
+              value: "Bearer ${LAKERA_API_KEY}"
             - name: "Content-Type"
               value: "application/json"
           body:
-            model: "$.model"
             messages: "$.messages"
         request:
           phase: request_body
           max_body_bytes: 1048576
         response:
           extract:
-            - json_path: "$.choices[0].message.content"
-              result_key: "llama_guard_output"
+            - json_path: "$.flagged"
+              result_key: "flagged"
         on_failure: closed
         status_on_error: 403
         circuit_breaker:
@@ -51,11 +59,11 @@ filter_chains:
           - when:
               methods: [POST]
         branch_chains:
-          - name: block_unsafe
+          - name: block_flagged
             on_result:
               filter: http_callout
-              key: llama_guard_output
-              result: "unsafe"
+              key: flagged
+              result: "true"
             rejoin: terminal
             chains:
               - name: reject_flagged
