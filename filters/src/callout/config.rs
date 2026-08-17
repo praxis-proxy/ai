@@ -28,8 +28,15 @@ pub(crate) struct HttpCalloutConfig {
     #[serde(default)]
     pub response: ResponseConfig,
 
-    /// Behavior on callout failure.
-    #[serde(default, alias = "failure_mode")]
+    /// Behavior when the callout itself fails (DNS, connect, timeout,
+    /// I/O): `open` continues the request, `closed` rejects it.
+    ///
+    /// Note: this is distinct from the pipeline entry's own
+    /// `failure_mode` key, which governs how the pipeline reacts when a
+    /// filter returns an error. Core strips `failure_mode` as a
+    /// structural key before this config is parsed, so it cannot be
+    /// used as an alias here.
+    #[serde(default)]
     pub on_failure: FailureModeConfig,
 
     /// HTTP status code returned when rejecting on failure.
