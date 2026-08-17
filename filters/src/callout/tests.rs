@@ -1019,4 +1019,170 @@ mod filter_tests {
             .is_some_and(|rs| rs.get("field").is_some());
         assert!(!has_field, "null field should not be written to results");
     }
+
+    // -------------------------------------------------------------------------
+    // Forward Headers — absence
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn forward_header_absent_from_request_not_sent() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              forward_headers:
+                - "x-custom"
+            request:
+              phase: request_headers
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        // Downstream request omits the configured forward header.
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        // A forward header that is absent downstream must not appear on the callout.
+        let requests = mock_server.received_requests().await.expect("recorded requests");
+        let callout = requests.first().expect("callout should have fired");
+        assert!(
+            callout.headers.get("x-custom").is_none(),
+            "absent forward header should not be sent to the callout"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Body Shaping — non-JSON fallback
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn body_shaping_non_json_forwards_raw() {
+        let mock_server = MockServer::start().await;
+
+        // Shaping is configured, but the downstream body is not JSON, so the
+        // raw body must be forwarded verbatim rather than dropped.
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .and(wiremock::matchers::body_string("this is not json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"flagged": false})))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              body:
+                messages: "$.messages"
+            request:
+              phase: request_body
+            response:
+              extract:
+                - json_path: "$.flagged"
+                  result_key: "flagged"
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let mut body = Some(bytes::Bytes::from("this is not json"));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "non-JSON body with shaping should forward raw and succeed"
+        );
+
+        let results = ctx.filter_results.get("http_callout").expect("should have results");
+        assert_eq!(results.get("flagged"), Some("false"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Nested Config — deny_unknown_fields
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn config_rejects_unknown_target_field() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+              bogus: true
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("unknown field"),
+            "should reject unknown target field: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_response_field() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            response:
+              bogus: true
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("unknown field"),
+            "should reject unknown response field: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_circuit_breaker_field() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            circuit_breaker:
+              failure_threshold: 3
+              recovery_timeout: "30s"
+              bogus: true
+            "#,
+        )
+        .unwrap();
+
+        let err = HttpCalloutFilter::from_config(&yaml).err().expect("expected error");
+        assert!(
+            err.to_string().contains("bogus") || err.to_string().contains("unknown field"),
+            "should reject unknown circuit_breaker field: {err}"
+        );
+    }
 }

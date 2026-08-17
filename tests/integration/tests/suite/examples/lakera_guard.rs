@@ -69,6 +69,32 @@ fn lakera_guard_passes_clean() {
     );
 }
 
+#[test]
+fn lakera_guard_get_bypasses_callout() {
+    // The example scopes the callout to `methods: [POST]`, so a GET must
+    // reach the upstream without a callout — even when Lakera would flag it.
+    let (mock_lakera_port, _lakera_guard) = start_mock_lakera(true);
+    let backend_guard = start_backend_with_shutdown("upstream ok");
+    let proxy_port = free_port();
+
+    let config = load_lakera_config(proxy_port, mock_lakera_port, backend_guard.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/models HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\r\n",
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "GET should bypass the POST-scoped callout and reach upstream"
+    );
+    assert!(raw.contains("upstream ok"), "GET should receive the upstream body");
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
