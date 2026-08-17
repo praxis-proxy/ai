@@ -444,7 +444,10 @@ mod filter_tests {
         let mut ctx = make_filter_context(&req);
 
         let action = filter.on_request(&mut ctx).await.unwrap();
-        assert!(matches!(action, FilterAction::Continue), "fail-open should continue on transport failure");
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "fail-open should continue on transport failure"
+        );
     }
 
     // -------------------------------------------------------------------------

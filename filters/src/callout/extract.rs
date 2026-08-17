@@ -147,51 +147,77 @@ fn coerce_value(value: &Value) -> Option<String> {
     }
 }
 
-pub(crate) fn sanitize_string(raw: &str) -> Option<String> {
+/// Maximum byte length for a sanitized value before truncation.
+const MAX_SANITIZED_LEN: usize = 255;
 
-    // 1. Skip leading control characters and whitespace (e.g., leading \n\n)
+/// Sanitize an extracted string value before it enters the result set.
+///
+/// Extracted values come from an untrusted third-party callout response
+/// and feed [`FilterResultSet`] entries, branch matching, and logs, so
+/// this is a defense-in-depth pass against control-character/log
+/// injection. It:
+///
+/// - strips leading control characters and whitespace (e.g. a leading `"\n\n"`),
+/// - keeps characters up to the first embedded control character and drops everything after it (multi-line verdicts
+///   such as `"unsafe\nS02"` collapse to their first line, `"unsafe"`),
+/// - drops `/` and `\` from the retained text,
+/// - truncates the result to [`MAX_SANITIZED_LEN`] bytes at a UTF-8 character boundary, and
+/// - returns `None` if nothing usable remains.
+pub(crate) fn sanitize_string(raw: &str) -> Option<String> {
+    // Skip leading control characters and whitespace (e.g. leading "\n\n").
     let trimmed = raw.trim_start_matches(|c: char| c < '\x20' || c == '\x7F' || c.is_whitespace());
 
-    let mut sanitized = String::new();
-    let mut rest_of_str = "";
+    let (sanitized, rest) = split_at_first_control(trimmed);
 
-    // 2. Collect chars until the first control character (e.g., \n)
-    for (idx, c) in trimmed.char_indices() {
-        if c < '\x20' || c == '\x7F' {
-            rest_of_str = &trimmed[idx..];
-            break; // Stop at trailing control character, but collect them to show code
-        }
-        if c != '/' && c != '\\' {
-            sanitized.push(c);
-        }
-    }
-
-    // 3. Log a warning if there were lines/content after the first \n
-    let remaining_content = rest_of_str.trim();
-    if !remaining_content.is_empty() {
+    // Anything after the first embedded control character is dropped;
+    // note it so a truncated multi-line value is not silently lost.
+    let remaining = rest.trim();
+    if !remaining.is_empty() {
         warn!(
-            flagged_category = %remaining_content,
-            verdict = %sanitized,
-            "Callout flagged request with category detail"
+            dropped = %remaining,
+            kept = %sanitized,
+            "extracted value contained control characters; truncated to first line"
         );
     }
 
-    let result = if sanitized.is_empty() {
-        None
-    } else if sanitized.len() <= 255 {
-        Some(sanitized)
-    } else {
-        // Find the last valid UTF-8 boundary within 255 bytes
-        let mut len = 255;
-        while len > 0 && !sanitized.is_char_boundary(len) {
-            len -= 1;
+    if sanitized.is_empty() {
+        return None;
+    }
+    truncate_at_char_boundary(&sanitized, MAX_SANITIZED_LEN)
+}
+
+/// Split `input` at its first control character.
+///
+/// Returns `(kept, rest)` where `kept` is the text before the first
+/// control character with `/` and `\` removed, and `rest` is the
+/// remaining slice starting at that control character (empty if none).
+fn split_at_first_control(input: &str) -> (String, &str) {
+    let mut kept = String::with_capacity(input.len());
+    for (idx, c) in input.char_indices() {
+        if c < '\x20' || c == '\x7F' {
+            // `char_indices` yields a valid boundary; `get` avoids the
+            // deny-by-default `indexing_slicing` lint regardless.
+            return (kept, input.get(idx..).unwrap_or(""));
         }
-        sanitized
-            .get(..len)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-    };
-    result
+        if c != '/' && c != '\\' {
+            kept.push(c);
+        }
+    }
+    (kept, "")
+}
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 boundary.
+///
+/// Returns `None` if the truncated result would be empty.
+fn truncate_at_char_boundary(s: &str, max: usize) -> Option<String> {
+    if s.len() <= max {
+        return Some(s.to_owned());
+    }
+    let mut len = max;
+    while len > 0 && !s.is_char_boundary(len) {
+        len -= 1;
+    }
+    s.get(..len).filter(|t| !t.is_empty()).map(ToOwned::to_owned)
 }
 
 // -----------------------------------------------------------------------------
@@ -309,14 +335,14 @@ mod tests {
         // Leading newlines stripped, trailing category stripped -> "unsafe"
         let input = "\n\nunsafe\nS02";
         let result = sanitize_string(input);
-        assert_eq!(result, Some("unsafe".to_string()));
+        assert_eq!(result, Some("unsafe".to_owned()));
     }
 
     #[test]
     fn test_sanitize_string_safe() {
         let input = "safe";
         let result = sanitize_string(input);
-        assert_eq!(result, Some("safe".to_string()));
+        assert_eq!(result, Some("safe".to_owned()));
     }
 
     #[test]
