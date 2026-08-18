@@ -33,6 +33,8 @@ fn as_rejection(action: praxis_filter::FilterAction) -> praxis_filter::Rejection
         | praxis_filter::FilterAction::Release
         | praxis_filter::FilterAction::BodyDone
         | praxis_filter::FilterAction::TerminalResponse(_) => None,
+        #[cfg(feature = "praxis-main")]
+        praxis_filter::FilterAction::StreamingTerminalResponse(_) => None,
     }
     .unwrap()
 }
