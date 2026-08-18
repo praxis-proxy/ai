@@ -260,6 +260,30 @@ mod filter_tests {
     }
 
     #[test]
+    fn config_rejects_userinfo_in_url() {
+        // Embedded credentials could leak into logs or be forwarded to the
+        // callout target; both `user:pass@host` and bare `user@host` must
+        // be rejected at config time.
+        for bad in ["http://user:pass@example.com/api", "http://user@example.com/api"] {
+            let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+                r#"
+                target:
+                  url: "{bad}"
+                "#,
+            ))
+            .unwrap();
+
+            let err = HttpCalloutFilter::from_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("URL with userinfo should be rejected: {bad}"));
+            assert!(
+                err.to_string().contains("userinfo"),
+                "error should mention userinfo for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn config_warns_on_private_ip_url() {
         // Private/loopback URLs should succeed (warning only).
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
