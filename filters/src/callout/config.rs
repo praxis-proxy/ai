@@ -60,6 +60,19 @@ pub(crate) struct TargetConfig {
     /// Absolute HTTP(S) URL to call.
     pub url: String,
 
+    /// Allow the target to resolve to a private, loopback, or
+    /// link-local address.
+    ///
+    /// Defaults to `true`, which preserves the permissive behavior of
+    /// pointing a callout at a loopback/sidecar guard service (only a
+    /// warning is emitted). Set to `false` to harden against SSRF and
+    /// DNS-rebinding: the callout is then rejected at request time if the
+    /// resolved peer address is private/loopback/link-local — including a
+    /// hostname that resolves to such an address (e.g. cloud metadata at
+    /// `169.254.169.254`).
+    #[serde(default = "default_allow_private_addresses")]
+    pub allow_private_addresses: bool,
+
     /// Request timeout (e.g. `"2s"`, `"500ms"`).
     #[serde(default = "default_timeout", deserialize_with = "deserialize_duration")]
     pub timeout: Duration,
@@ -216,6 +229,11 @@ fn default_max_body_bytes() -> usize {
     1_048_576 // 1 MiB
 }
 
+/// Default: allow private/loopback targets (permissive, warning only).
+fn default_allow_private_addresses() -> bool {
+    true
+}
+
 // -----------------------------------------------------------------------------
 // Duration Parsing
 // -----------------------------------------------------------------------------
@@ -261,6 +279,12 @@ fn is_private_or_loopback(addr: &IpAddr) -> bool {
         IpAddr::V6(v6) => v6.is_loopback(),
     }
 }
+
+// The request-time SSRF / DNS-rebinding block defers to the shared
+// classifier `praxis_core::connectivity::is_private_ip` (used directly in
+// `resolve_peer`) rather than defining another private-address predicate
+// here. See praxis-proxy/ai#771 for the effort to unify the several
+// hand-rolled classifiers that still exist across this codebase.
 
 /// Validate the URL scheme is `http` or `https`.
 fn validate_scheme(parsed: &http::Uri, url: &str) -> Result<(), FilterError> {

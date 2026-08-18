@@ -26,6 +26,7 @@ use http::HeaderMap;
 use pingora_core::upstreams::peer::HttpPeer;
 use praxis_core::{
     circuit::CircuitBreakerConfig as CoreCircuitBreakerConfig,
+    connectivity::is_private_ip,
     subrequest::{
         DEPTH_HEADER, FrameworkHeaders, SubRequest, SubRequestClient, SubRequestConnector, SubRequestConnectorOptions,
         SubResponse,
@@ -71,6 +72,11 @@ const DISALLOWED_FORWARD_HEADERS: &[http::HeaderName] = &[
 ///
 /// [`FilterResultSet`]: praxis_filter::FilterResultSet
 pub struct HttpCalloutFilter {
+    /// Allow the target to resolve to a private/loopback/link-local
+    /// address. When `false`, such a resolved peer is rejected at
+    /// request time (SSRF / DNS-rebinding protection).
+    allow_private_addresses: bool,
+
     /// Pre-compiled body shaper for reshaping the callout body.
     body_shaper: BodyShaper,
 
@@ -141,6 +147,7 @@ impl HttpCalloutFilter {
         let client = build_subrequest_client(&cfg);
 
         Ok(Box::new(Self {
+            allow_private_addresses: cfg.target.allow_private_addresses,
             body_shaper,
             client,
             extractions,
@@ -263,12 +270,30 @@ impl HttpCalloutFilter {
     }
 
     /// Resolve DNS for the target and construct an [`HttpPeer`].
+    ///
+    /// When `allow_private_addresses` is `false`, the resolved peer address
+    /// is validated *after* resolution against the shared classifier
+    /// [`praxis_core::connectivity::is_private_ip`], so a hostname that
+    /// resolves to a private/loopback/link-local address (or rebinds to one
+    /// after config time) is rejected rather than connected to. Deferring to
+    /// core's predicate keeps this check consistent with the rest of the
+    /// proxy instead of adding another hand-rolled range list (see
+    /// praxis-proxy/ai#771).
     async fn resolve_peer(&self) -> Result<HttpPeer, String> {
         let addr = tokio::net::lookup_host((self.target.host.as_str(), self.target.port))
             .await
             .map_err(|e| format!("DNS resolution failed for {}: {e}", self.target.host))?
             .next()
             .ok_or_else(|| format!("no addresses resolved for {}", self.target.host))?;
+
+        if !self.allow_private_addresses && is_private_ip(&addr.ip()) {
+            return Err(format!(
+                "{} resolved to a blocked private/loopback address {} \
+                 (allow_private_addresses is false)",
+                self.target.host,
+                addr.ip()
+            ));
+        }
 
         Ok(HttpPeer::new(
             addr.to_string(),

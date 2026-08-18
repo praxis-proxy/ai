@@ -710,6 +710,93 @@ mod filter_tests {
     }
 
     // -------------------------------------------------------------------------
+    // SSRF / DNS-rebinding (allow_private_addresses)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn private_target_blocked_when_addresses_disallowed() {
+        // A live server on loopback that would answer 200 if reached. With
+        // allow_private_addresses: false, resolve_peer must reject the
+        // loopback peer *before* any request, so the callout fails and
+        // on_failure: closed surfaces as Reject(status_on_error).
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              allow_private_addresses: false
+            request:
+              phase: request_headers
+            on_failure: closed
+            status_on_error: 502
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 502),
+            "a resolved private/loopback peer must be blocked when disallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_target_allowed_by_default() {
+        // The default (allow_private_addresses omitted -> true) preserves the
+        // permissive loopback-guard use case: a callout to a loopback server
+        // succeeds and continues the request.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+            on_failure: closed
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a loopback target must be reachable under the permissive default"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Timeout
     // -------------------------------------------------------------------------
 

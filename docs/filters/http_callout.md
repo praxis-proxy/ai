@@ -15,6 +15,7 @@ Makes an outbound HTTP request during request processing, optionally forwarding 
 |-------|------|---------|-------------|
 | `target` | TargetConfig | yes | Callout target configuration. |
 | `target.url` | string | yes | Absolute HTTP(S) URL to call. |
+| `target.allow_private_addresses` | bool | no | Allow the target to resolve to a private, loopback, or link-local address. Defaults to `true`, which preserves the permissive behavior of pointing a callout at a loopback/sidecar guard service (only a warning is emitted). Set to `false` to harden against SSRF and DNS-rebinding: the callout is then rejected at request time if the resolved peer address is private/loopback/link-local — including a hostname that resolves to such an address (e.g. cloud metadata at `169.254.169.254`). |
 | `target.timeout` | Duration | no | Request timeout (e.g. `"2s"`, `"500ms"`). |
 | `target.headers` | HeaderEntry[] | no | Static headers to send with every callout. |
 | `target.headers[].name` | string | yes | Header name. |

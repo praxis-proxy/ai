@@ -35,6 +35,12 @@ filter_chains:
       - filter: http_callout
         target:
           url: "https://api.lakera.ai/v2/guard"
+          # This callout targets a public API. Reject it at request time
+          # if the host ever resolves to a private/loopback/link-local
+          # address (SSRF / DNS-rebinding hardening). Leave unset (default
+          # true) only when deliberately pointing at a loopback/sidecar
+          # guard service.
+          allow_private_addresses: false
           timeout: "2s"
           headers:
             - name: "Authorization"
