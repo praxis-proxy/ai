@@ -8,13 +8,12 @@
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/token-rate-limit-per-app.yaml
-#   curl -i http://localhost:8080/v1/chat/completions -H 'x-app-id: odin' -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#   curl -i http://localhost:8080/v1/chat/completions -H 'x-app-id: app-a' -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
 #
-# Example scenario: an AI Platform Admin creates a shared token_rate_limit
-# rule and three teams (odin, thor, loki) each send traffic tagged with
-# their own x-app-id header. Each team draws down only its own budget --
-# odin exhausting its budget and getting 429s has no effect on thor's or
-# loki's remaining tokens.
+# Multiple apps can share this one rule, each tagging its own traffic
+# with a distinct x-app-id header value. Each app draws down only its
+# own budget -- one app exhausting its budget and getting 429s has no
+# effect on any other app's remaining tokens.
 #
 # See token-rate-limit.yaml for the full rationale on reservation-based
 # admission (M2), reconciliation, and what's still deliberately out of

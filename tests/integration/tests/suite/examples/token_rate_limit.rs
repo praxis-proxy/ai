@@ -234,13 +234,13 @@ fn token_rate_limit_per_app_config(
     praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
 }
 
-/// Customer scenario: an AI Platform Admin creates one `token_rate_limit`
-/// rule keyed by `x-app-id` and hands out the same per-app budget to
-/// three teams -- odin, thor, and loki. Each team's traffic should draw
-/// down only its own budget: one team hitting its limit and getting
-/// blocked must have zero effect on the others' remaining tokens.
+/// Demonstrates one `token_rate_limit` rule keyed by `x-app-id` handing
+/// out the same per-app budget to multiple apps. Each app's traffic
+/// should draw down only its own budget: one app hitting its limit and
+/// getting blocked must have zero effect on the others' remaining
+/// tokens.
 #[test]
-fn bucket_key_header_isolates_per_app_budgets_across_odin_thor_loki() {
+fn bucket_key_header_isolates_per_app_budgets_across_multiple_apps() {
     let backend = Backend::fixed(PLAIN_TEXT_BODY)
         .header("content-type", "text/plain")
         .start_with_shutdown();
@@ -248,11 +248,11 @@ fn bucket_key_header_isolates_per_app_budgets_across_odin_thor_loki() {
     // burst=40, estimate=40: each app gets exactly one admitted request
     // before its own bucket is exhausted. start_proxy's readiness probe
     // (GET /, no x-app-id header) draws from the separate global fallback
-    // bucket, so it doesn't touch any of odin/thor/loki's budgets.
+    // bucket, so it doesn't touch any per-app budgets.
     let config = token_rate_limit_per_app_config(proxy_port, backend.port(), 40, 40);
     let proxy = start_proxy(&config);
 
-    for app in ["odin", "thor", "loki"] {
+    for app in ["app-a", "app-b", "app-c"] {
         let admitted = http_send(
             proxy.addr(),
             &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", app)]),
