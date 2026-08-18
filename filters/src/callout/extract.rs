@@ -202,27 +202,25 @@ pub(crate) fn sanitize_string(raw: &str) -> Option<String> {
     if sanitized.is_empty() {
         return None;
     }
-    truncate_at_char_boundary(&sanitized, MAX_SANITIZED_LEN)
+    truncate_at_char_boundary(sanitized, MAX_SANITIZED_LEN)
 }
 
 /// Split `input` at its first control character.
 ///
 /// Returns `(kept, rest)` where `kept` is the text before the first
-/// control character with `/` and `\` removed, and `rest` is the
-/// remaining slice starting at that control character (empty if none).
-fn split_at_first_control(input: &str) -> (String, &str) {
-    let mut kept = String::with_capacity(input.len());
+/// control character and `rest` is the remaining slice starting at that
+/// control character (empty if none). Non-control characters — including
+/// `/` and `\` — are preserved verbatim so legitimate extracted values
+/// (e.g. `"unsafe/S02"`) reach `on_result` matching intact.
+fn split_at_first_control(input: &str) -> (&str, &str) {
     for (idx, c) in input.char_indices() {
         if c < '\x20' || c == '\x7F' {
-            // `char_indices` yields a valid boundary; `get` avoids the
+            // `char_indices` yields valid boundaries; `get` avoids the
             // deny-by-default `indexing_slicing` lint regardless.
-            return (kept, input.get(idx..).unwrap_or(""));
-        }
-        if c != '/' && c != '\\' {
-            kept.push(c);
+            return (input.get(..idx).unwrap_or(""), input.get(idx..).unwrap_or(""));
         }
     }
-    (kept, "")
+    (input, "")
 }
 
 /// Truncate `s` to at most `max` bytes on a UTF-8 boundary.
@@ -389,6 +387,23 @@ mod tests {
         let input = "\n\n\r\t";
         let result = sanitize_string(input);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_sanitize_string_preserves_slashes() {
+        // `/` and `\` are legitimate value characters (e.g. a policy code
+        // like "unsafe/S02"); they must survive sanitization so on_result
+        // matching sees the value the provider actually returned.
+        assert_eq!(sanitize_string("unsafe/S02"), Some("unsafe/S02".to_owned()));
+        assert_eq!(sanitize_string("safe/clean"), Some("safe/clean".to_owned()));
+        assert_eq!(sanitize_string(r"a\b/c"), Some(r"a\b/c".to_owned()));
+    }
+
+    #[test]
+    fn test_sanitize_string_truncates_at_control_char_not_slash() {
+        // A control character still truncates; a slash before it is kept,
+        // and content after the control character is dropped.
+        assert_eq!(sanitize_string("keep/me\ndrop/this"), Some("keep/me".to_owned()));
     }
 
     // -------------------------------------------------------------------------
