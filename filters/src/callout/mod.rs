@@ -128,6 +128,7 @@ impl HttpCalloutFilter {
 
         validate_callout_url(&cfg.target.url)?;
         validate_max_body_bytes(cfg.request.max_body_bytes)?;
+        validate_status_on_error(cfg.status_on_error)?;
 
         let body_shaper = BodyShaper::compile(&cfg.target.body)?;
         let headers = parse_static_headers(&cfg)?;
@@ -371,6 +372,24 @@ fn request_depth(ctx: &HttpFilterContext<'_>) -> u32 {
 fn validate_max_body_bytes(n: usize) -> Result<(), FilterError> {
     if n > MAX_BODY_BYTES {
         return Err(format!("http_callout: max_body_bytes ({n}) exceeds limit ({MAX_BODY_BYTES})").into());
+    }
+    Ok(())
+}
+
+/// Reject a `status_on_error` value outside the valid HTTP status range.
+///
+/// `None` (unset) is accepted; the filter then defaults to `403`. A
+/// configured value must be a legal HTTP status code (100–599) so the
+/// rejection path never emits a nonsensical status like `0` or `65535`.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if a configured status is outside 100–599.
+fn validate_status_on_error(status: Option<u16>) -> Result<(), FilterError> {
+    if let Some(code) = status
+        && !(100..=599).contains(&code)
+    {
+        return Err(format!("http_callout: status_on_error ({code}) must be a valid HTTP status code (100-599)").into());
     }
     Ok(())
 }

@@ -221,6 +221,45 @@ mod filter_tests {
     }
 
     #[test]
+    fn config_rejects_status_on_error_out_of_range() {
+        for bad in ["0", "99", "600", "65535"] {
+            let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+                r#"
+                target:
+                  url: "http://example.com/api"
+                status_on_error: {bad}
+                "#,
+            ))
+            .unwrap();
+
+            let err = HttpCalloutFilter::from_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("status_on_error={bad} should be rejected"));
+            assert!(
+                err.to_string().contains("status_on_error"),
+                "should mention status_on_error for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_accepts_valid_status_on_error() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+            status_on_error: 503
+            "#,
+        )
+        .unwrap();
+
+        assert!(
+            HttpCalloutFilter::from_config(&yaml).is_ok(),
+            "a valid HTTP status should be accepted"
+        );
+    }
+
+    #[test]
     fn config_warns_on_private_ip_url() {
         // Private/loopback URLs should succeed (warning only).
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
