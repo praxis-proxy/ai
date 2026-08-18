@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn per_header_state_resolves_key_from_header() {
         let state = TokenRateLimitState::per_header("x-app-id".to_owned(), 10.0);
-        let headers = headers_with("x-app-id", "odin");
-        assert_eq!(state.resolve_key(&headers).as_deref(), Some("odin"));
+        let headers = headers_with("x-app-id", "app-a");
+        assert_eq!(state.resolve_key(&headers).as_deref(), Some("app-a"));
     }
 
     #[test]
@@ -232,21 +232,21 @@ mod tests {
     fn with_bucket_creates_independent_buckets_per_key() {
         let state = TokenRateLimitState::per_header("x-app-id".to_owned(), 10.0);
 
-        // odin exhausts its own bucket...
-        state.with_bucket(Some("odin"), 0.0, 10.0, 0, |b| b.try_reserve(10.0, 0.0, 10.0, 0));
+        // app-a exhausts its own bucket...
+        state.with_bucket(Some("app-a"), 0.0, 10.0, 0, |b| b.try_reserve(10.0, 0.0, 10.0, 0));
         assert!(
             state
-                .with_bucket(Some("odin"), 0.0, 10.0, 0, |b| b.try_reserve(1.0, 0.0, 10.0, 0))
+                .with_bucket(Some("app-a"), 0.0, 10.0, 0, |b| b.try_reserve(1.0, 0.0, 10.0, 0))
                 .is_none(),
-            "odin should be exhausted"
+            "app-a should be exhausted"
         );
 
-        // ...but thor's independent bucket is untouched.
+        // ...but app-b's independent bucket is untouched.
         assert!(
             state
-                .with_bucket(Some("thor"), 0.0, 10.0, 0, |b| b.try_reserve(10.0, 0.0, 10.0, 0))
+                .with_bucket(Some("app-b"), 0.0, 10.0, 0, |b| b.try_reserve(10.0, 0.0, 10.0, 0))
                 .is_some(),
-            "thor's bucket must be independent of odin's"
+            "app-b's bucket must be independent of app-a's"
         );
     }
 

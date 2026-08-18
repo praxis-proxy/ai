@@ -318,29 +318,29 @@ async fn bucket_key_header_isolates_budgets_across_apps() {
         serde_yaml::from_str("rate: 0.0001\nburst: 100\nestimate_tokens: 100\nbucket_key_header: x-app-id").unwrap();
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
-    // odin exhausts its own 100-token budget entirely...
-    let odin_req = make_request_with_header("x-app-id", "odin");
-    let mut odin_ctx = crate::test_utils::make_filter_context(&odin_req);
-    let odin_first = filter.on_request(&mut odin_ctx).await.unwrap();
+    // app-a exhausts its own 100-token budget entirely...
+    let app_a_req = make_request_with_header("x-app-id", "app-a");
+    let mut app_a_ctx = crate::test_utils::make_filter_context(&app_a_req);
+    let app_a_first = filter.on_request(&mut app_a_ctx).await.unwrap();
     assert!(
-        matches!(odin_first, FilterAction::Continue),
-        "odin's first request should be admitted"
+        matches!(app_a_first, FilterAction::Continue),
+        "app-a's first request should be admitted"
     );
 
-    let mut odin_second_ctx = crate::test_utils::make_filter_context(&odin_req);
-    let odin_second = filter.on_request(&mut odin_second_ctx).await.unwrap();
+    let mut app_a_second_ctx = crate::test_utils::make_filter_context(&app_a_req);
+    let app_a_second = filter.on_request(&mut app_a_second_ctx).await.unwrap();
     assert!(
-        matches!(odin_second, FilterAction::Reject(_)),
-        "odin should now be blocked, budget exhausted"
+        matches!(app_a_second, FilterAction::Reject(_)),
+        "app-a should now be blocked, budget exhausted"
     );
 
-    // ...but thor's independent 100-token budget is completely untouched.
-    let thor_req = make_request_with_header("x-app-id", "thor");
-    let mut thor_ctx = crate::test_utils::make_filter_context(&thor_req);
-    let thor_first = filter.on_request(&mut thor_ctx).await.unwrap();
+    // ...but app-b's independent 100-token budget is completely untouched.
+    let app_b_req = make_request_with_header("x-app-id", "app-b");
+    let mut app_b_ctx = crate::test_utils::make_filter_context(&app_b_req);
+    let app_b_first = filter.on_request(&mut app_b_ctx).await.unwrap();
     assert!(
-        matches!(thor_first, FilterAction::Continue),
-        "thor's budget must be independent of odin's exhausted one"
+        matches!(app_b_first, FilterAction::Continue),
+        "app-b's budget must be independent of app-a's exhausted one"
     );
 }
 
@@ -373,28 +373,28 @@ async fn bucket_key_header_reconciles_against_the_same_per_key_bucket() {
         serde_yaml::from_str("rate: 0.0001\nburst: 100\nestimate_tokens: 50\nbucket_key_header: x-app-id").unwrap();
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
-    let loki_req = make_request_with_header("x-app-id", "loki");
-    let mut ctx = crate::test_utils::make_filter_context(&loki_req);
-    drop(filter.on_request(&mut ctx).await.unwrap()); // reserves 50 from loki's bucket, 50 left
+    let app_c_req = make_request_with_header("x-app-id", "app-c");
+    let mut ctx = crate::test_utils::make_filter_context(&app_c_req);
+    drop(filter.on_request(&mut ctx).await.unwrap()); // reserves 50 from app-c's bucket, 50 left
     ctx.set_metadata(META_TOKEN_TOTAL, "30"); // actual usage only 30
 
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    // Reconciliation must have released 20 back into loki's *own* bucket
+    // Reconciliation must have released 20 back into app-c's *own* bucket
     // (50 remaining + 20 released = 70), not some other app's or the
     // global fallback bucket.
-    let mut next_ctx = crate::test_utils::make_filter_context(&loki_req);
+    let mut next_ctx = crate::test_utils::make_filter_context(&app_c_req);
     let next = filter.on_request(&mut next_ctx).await.unwrap();
     assert!(
         matches!(next, FilterAction::Continue),
-        "loki's own bucket should reflect the released tokens (70 available >= 50 requested)"
+        "app-c's own bucket should reflect the released tokens (70 available >= 50 requested)"
     );
 
-    let mut after_ctx = crate::test_utils::make_filter_context(&loki_req);
+    let mut after_ctx = crate::test_utils::make_filter_context(&app_c_req);
     let after = filter.on_request(&mut after_ctx).await.unwrap();
     assert!(
         matches!(after, FilterAction::Reject(_)),
-        "only 20 left in loki's bucket after the prior admission, should reject another 50-token request"
+        "only 20 left in app-c's bucket after the prior admission, should reject another 50-token request"
     );
 }
