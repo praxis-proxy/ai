@@ -232,6 +232,21 @@ fn register_admin_endpoints(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
 ) {
     if let Some(admin_addr) = &config.admin.address {
+        #[cfg(feature = "praxis-main")]
+        {
+            praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
+                server.server_mut(),
+                admin_addr,
+                praxis_protocol::http::pingora::health::AdminEndpointOptions {
+                    health_registry: Some(health_registry),
+                    kv_registry: Some(kv_stores.clone()),
+                    pipelines: None,
+                    verbose: config.admin.verbose,
+                },
+            );
+        }
+
+        #[cfg(not(feature = "praxis-main"))]
         praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
             server.server_mut(),
             admin_addr,
