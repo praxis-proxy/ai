@@ -404,6 +404,50 @@ mod filter_tests {
         assert_eq!(results.get("score"), Some("0.95"));
     }
 
+    #[tokio::test]
+    async fn non_2xx_callout_response_forwards_status_to_downstream() {
+        // A *completed* callout that answers with a non-2xx status is
+        // distinct from a transport failure: the filter forwards the
+        // callout's own status to the downstream client, it does not apply
+        // `status_on_error` (that path is only for DNS/connect/I/O errors).
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+            on_failure: open
+            status_on_error: 403
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 500),
+            "a completed non-2xx callout should forward its own status (500), \
+             not status_on_error and not fail-open Continue"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Non-JSON Response
     // -------------------------------------------------------------------------
