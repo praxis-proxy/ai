@@ -298,6 +298,29 @@ mod filter_tests {
         assert!(filter.is_ok(), "private/loopback URL should succeed with a warning");
     }
 
+    #[test]
+    fn config_accepts_disallowed_forward_header_with_warning() {
+        // A hop-by-hop/sensitive forward_header (e.g. connection) is a
+        // config no-op, not an error: the filter builds successfully and
+        // warns at config time. (Request-time skipping is covered by
+        // disallowed_forward_header_not_sent.)
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+            target:
+              url: "http://example.com/api"
+              forward_headers:
+                - "connection"
+                - "x-allowed"
+            "#,
+        )
+        .unwrap();
+
+        assert!(
+            HttpCalloutFilter::from_config(&yaml).is_ok(),
+            "a disallowed forward_header should warn, not fail config"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Target Parsing
     // -------------------------------------------------------------------------
@@ -1214,6 +1237,62 @@ mod filter_tests {
         assert!(
             callout.headers.get("x-custom").is_none(),
             "absent forward header should not be sent to the callout"
+        );
+    }
+
+    #[tokio::test]
+    async fn disallowed_forward_header_not_sent() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        // `proxy-authorization` is hop-by-hop/sensitive (disallowed); `x-ok`
+        // is an ordinary header that should forward normally.
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              forward_headers:
+                - "proxy-authorization"
+                - "x-ok"
+            request:
+              phase: request_headers
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        // The client supplies BOTH headers downstream.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("proxy-authorization", "Bearer secret".parse().unwrap());
+        headers.insert("x-ok", "fine".parse().unwrap());
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers,
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        let requests = mock_server.received_requests().await.expect("recorded requests");
+        let callout = requests.first().expect("callout should have fired");
+        assert!(
+            callout.headers.get("proxy-authorization").is_none(),
+            "a disallowed forward header must not reach the callout even when the client sends it"
+        );
+        assert_eq!(
+            callout.headers.get("x-ok").map(http::HeaderValue::as_bytes),
+            Some(&b"fine"[..]),
+            "an allowed forward header should still be forwarded"
         );
     }
 

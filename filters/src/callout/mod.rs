@@ -133,6 +133,7 @@ impl HttpCalloutFilter {
         let body_shaper = BodyShaper::compile(&cfg.target.body)?;
         let headers = parse_static_headers(&cfg)?;
         let forward_headers = parse_header_names(&cfg.target.forward_headers, "forward_header")?;
+        warn_on_disallowed_forward_headers(&forward_headers);
         let extractions = compile_extractions(&cfg)?;
         let inject_headers = parse_header_names(&cfg.response.inject_headers, "inject_header")?;
 
@@ -426,6 +427,24 @@ fn parse_header_names(names: &[String], context: &str) -> Result<Vec<http::Heade
                 .map_err(|e| -> FilterError { format!("http_callout: invalid {context} '{h}': {e}").into() })
         })
         .collect()
+}
+
+/// Warn about configured forward headers that will never be forwarded.
+///
+/// Hop-by-hop and sensitive headers in [`DISALLOWED_FORWARD_HEADERS`] are
+/// silently skipped at request time. Surfacing them at config time tells
+/// the operator their entry is a no-op instead of leaving them to wonder
+/// why the header never reaches the callout target.
+fn warn_on_disallowed_forward_headers(forward_headers: &[http::HeaderName]) {
+    for name in forward_headers {
+        if DISALLOWED_FORWARD_HEADERS.contains(name) {
+            warn!(
+                header = %name,
+                "http_callout: forward_header '{name}' is a hop-by-hop or sensitive header \
+                 and will not be forwarded to the callout target"
+            );
+        }
+    }
 }
 
 /// Compile `JSONPath` extraction rules from config.
