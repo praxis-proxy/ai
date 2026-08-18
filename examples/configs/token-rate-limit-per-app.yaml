@@ -1,0 +1,56 @@
+# Token Rate Limiting -- Per-App Budgets
+#
+# Extends token-rate-limit.yaml with ai#129's bucket_key_header: each
+# unique value of the configured request header (here, x-app-id) gets
+# its own independent token bucket, so a platform admin can hand out
+# per-app budgets from a single filter instance. Requests missing the
+# header share one fallback bucket.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-rate-limit-per-app.yaml
+#   curl -i http://localhost:8080/v1/chat/completions -H 'x-app-id: odin' -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# Example scenario: an AI Platform Admin creates a shared token_rate_limit
+# rule and three teams (odin, thor, loki) each send traffic tagged with
+# their own x-app-id header. Each team draws down only its own budget --
+# odin exhausting its budget and getting 429s has no effect on thor's or
+# loki's remaining tokens.
+#
+# See token-rate-limit.yaml for the full rationale on reservation-based
+# admission (M2), reconciliation, and what's still deliberately out of
+# scope (composite/CEL keys, configurable estimation, token-type-aware
+# accounting, observability/metering).
+#
+# Supported token_count provider values:
+#   openai | anthropic | google | bedrock | azure
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: token_rate_limit
+        rate: 1000                    # tokens replenished per second, per app
+        burst: 100000                 # max bucket capacity per app, in tokens
+        estimate_tokens: 500          # fixed cost reserved per request at admission
+        bucket_key_header: x-app-id   # one independent bucket per app
+
+      - filter: token_count
+        provider: openai   # openai | anthropic | google | bedrock | azure
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"

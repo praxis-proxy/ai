@@ -8,6 +8,16 @@ use praxis_filter::FilterAction;
 use super::TokenRateLimitFilter;
 use crate::token_usage::META_TOKEN_TOTAL;
 
+/// Build a request carrying a single extra header, for `bucket_key_header` tests.
+fn make_request_with_header(name: &str, value: &str) -> praxis_filter::Request {
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+        http::HeaderValue::from_str(value).unwrap(),
+    );
+    req
+}
+
 // -----------------------------------------------------------------------------
 // Config Validation
 // -----------------------------------------------------------------------------
@@ -53,8 +63,25 @@ fn from_config_rejects_unknown_field() {
         serde_yaml::from_str("rate: 10\nburst: 100\nestimate_tokens: 5\nbucket_key: header").unwrap();
     assert!(
         TokenRateLimitFilter::from_config(&yaml).is_err(),
-        "M5 bucket keys are deliberately not supported yet, config should reject the unknown field"
+        "composite/CEL bucket keys are still deliberately unsupported, config should reject the unknown field"
     );
+}
+
+#[test]
+fn from_config_accepts_bucket_key_header() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("rate: 10\nburst: 100\nestimate_tokens: 5\nbucket_key_header: x-app-id").unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "token_rate_limit");
+}
+
+#[test]
+fn from_config_defaults_bucket_key_header_to_none_when_absent() {
+    // Existing configs without bucket_key_header must keep working unchanged
+    // (single global bucket) -- covered by from_config_parses_valid_config,
+    // asserted again here to pin the default explicitly as this field is added.
+    let yaml: serde_yaml::Value = serde_yaml::from_str("rate: 10\nburst: 100\nestimate_tokens: 5").unwrap();
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
 }
 
 // -----------------------------------------------------------------------------
@@ -278,5 +305,96 @@ async fn does_not_reconcile_before_end_of_stream() {
     assert!(
         matches!(third, FilterAction::Reject(_)),
         "bucket should be fully drained now (no premature release happened pre-end_of_stream)"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Per-app bucket keys (ai#129 bucket_key_header)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bucket_key_header_isolates_budgets_across_apps() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("rate: 0.0001\nburst: 100\nestimate_tokens: 100\nbucket_key_header: x-app-id").unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    // odin exhausts its own 100-token budget entirely...
+    let odin_req = make_request_with_header("x-app-id", "odin");
+    let mut odin_ctx = crate::test_utils::make_filter_context(&odin_req);
+    let odin_first = filter.on_request(&mut odin_ctx).await.unwrap();
+    assert!(
+        matches!(odin_first, FilterAction::Continue),
+        "odin's first request should be admitted"
+    );
+
+    let mut odin_second_ctx = crate::test_utils::make_filter_context(&odin_req);
+    let odin_second = filter.on_request(&mut odin_second_ctx).await.unwrap();
+    assert!(
+        matches!(odin_second, FilterAction::Reject(_)),
+        "odin should now be blocked, budget exhausted"
+    );
+
+    // ...but thor's independent 100-token budget is completely untouched.
+    let thor_req = make_request_with_header("x-app-id", "thor");
+    let mut thor_ctx = crate::test_utils::make_filter_context(&thor_req);
+    let thor_first = filter.on_request(&mut thor_ctx).await.unwrap();
+    assert!(
+        matches!(thor_first, FilterAction::Continue),
+        "thor's budget must be independent of odin's exhausted one"
+    );
+}
+
+#[tokio::test]
+async fn bucket_key_header_falls_back_to_shared_bucket_when_header_absent() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("rate: 0.0001\nburst: 50\nestimate_tokens: 50\nbucket_key_header: x-app-id").unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    // No x-app-id header on either request: both should share one fallback bucket.
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let first = filter.on_request(&mut first_ctx).await.unwrap();
+    assert!(
+        matches!(first, FilterAction::Continue),
+        "first keyless request should be admitted"
+    );
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let second = filter.on_request(&mut second_ctx).await.unwrap();
+    assert!(
+        matches!(second, FilterAction::Reject(_)),
+        "second keyless request should share (and exhaust) the same fallback bucket"
+    );
+}
+
+#[tokio::test]
+async fn bucket_key_header_reconciles_against_the_same_per_key_bucket() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("rate: 0.0001\nburst: 100\nestimate_tokens: 50\nbucket_key_header: x-app-id").unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let loki_req = make_request_with_header("x-app-id", "loki");
+    let mut ctx = crate::test_utils::make_filter_context(&loki_req);
+    drop(filter.on_request(&mut ctx).await.unwrap()); // reserves 50 from loki's bucket, 50 left
+    ctx.set_metadata(META_TOKEN_TOTAL, "30"); // actual usage only 30
+
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    // Reconciliation must have released 20 back into loki's *own* bucket
+    // (50 remaining + 20 released = 70), not some other app's or the
+    // global fallback bucket.
+    let mut next_ctx = crate::test_utils::make_filter_context(&loki_req);
+    let next = filter.on_request(&mut next_ctx).await.unwrap();
+    assert!(
+        matches!(next, FilterAction::Continue),
+        "loki's own bucket should reflect the released tokens (70 available >= 50 requested)"
+    );
+
+    let mut after_ctx = crate::test_utils::make_filter_context(&loki_req);
+    let after = filter.on_request(&mut after_ctx).await.unwrap();
+    assert!(
+        matches!(after, FilterAction::Reject(_)),
+        "only 20 left in loki's bucket after the prior admission, should reject another 50-token request"
     );
 }

@@ -5,15 +5,16 @@
 //!
 //! Implements the uncontested MVP core of `ai#658`'s token rate limiting
 //! proposal (`docs/proposals/00121_token-rate-limiting.md`, tracked by
-//! epic `ai#121`): a single global token bucket, reservation-based
-//! admission reconciled against actual provider-reported usage, and
-//! standard 429 responses with token-denominated rate limit headers.
+//! epic `ai#121`): a token bucket (global, or one per header value per
+//! `ai#129`), reservation-based admission reconciled against actual
+//! provider-reported usage, and standard 429 responses with
+//! token-denominated rate limit headers.
 //!
 //! Deliberately deferred, pending open design threads on `ai#658`:
 //!
-//! - **Bucket keys (M5)**: per-header/per-model/composite keys are still marked `TBD` in the proposal itself, and
-//!   overlap with `ai#123`/`ai#129`/`praxis#189`+`praxis#232`. This filter only supports one global bucket for now, the
-//!   same simplification `rate_limit`'s own `Global` mode makes.
+//! - **Fuller bucket keys (rest of M5)**: `ai#129`'s single-header-value keying (one budget applied uniformly per key,
+//!   fallback to global) is implemented; composite/multi-dimension keys, per-model keys (`ai#123`), and CEL-expression
+//!   keys (overlapping `praxis#189`/`#232`) are not.
 //! - **Configurable estimation (M3)**: `estimate_tokens` is a fixed constant per rule for now, not derived from request
 //!   metadata (e.g. `max_tokens`).
 //! - **Token-type-aware accounting (M4)**: reconciles against `token.total` only; per-type (input/output/cached)
@@ -33,6 +34,7 @@ mod tests;
 
 mod bucket;
 mod config;
+mod state;
 
 use std::time::Instant;
 
@@ -42,7 +44,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
 
-use self::{bucket::TokenBucket, config::TokenRateLimitConfig};
+use self::{config::TokenRateLimitConfig, state::TokenRateLimitState};
 use crate::token_usage::META_TOKEN_TOTAL;
 
 // -----------------------------------------------------------------------------
@@ -52,6 +54,13 @@ use crate::token_usage::META_TOKEN_TOTAL;
 /// Metadata key stashing this request's reserved token estimate, read
 /// back during response-phase reconciliation.
 const META_RESERVED: &str = "token_rate_limit.reserved";
+
+/// Metadata key stashing the resolved per-key bucket key (`ai#129`
+/// `bucket_key_header` mode), read back in `on_response`/reconciliation so
+/// they operate on the same bucket `on_request` reserved from. Absent when
+/// keying isn't configured, or the configured header was missing on this
+/// request (both cases fall back to the shared/global bucket).
+const META_BUCKET_KEY: &str = "token_rate_limit.bucket_key";
 
 /// Rate limit header: configured token budget.
 ///
@@ -86,13 +95,14 @@ const HEADER_RATELIMIT_RESET: &str = "X-RateLimit-Reset-Tokens";
 ///
 /// ```yaml
 /// filter: token_rate_limit
-/// rate: 1000            # tokens replenished per second
-/// burst: 100000         # max bucket capacity, in tokens
-/// estimate_tokens: 500  # fixed cost reserved per request at admission
+/// rate: 1000                    # tokens replenished per second
+/// burst: 100000                 # max bucket capacity, in tokens
+/// estimate_tokens: 500          # fixed cost reserved per request at admission
+/// bucket_key_header: x-app-id   # optional (ai#129): one bucket per header value, else one global bucket
 /// ```
 pub struct TokenRateLimitFilter {
-    /// Single global bucket (per-key buckets are M5, not yet built).
-    bucket: TokenBucket,
+    /// Bucket state: global, or one bucket per `bucket_key_header` value.
+    state: TokenRateLimitState,
 
     /// Tokens replenished per second.
     rate: f64,
@@ -138,8 +148,13 @@ impl TokenRateLimitFilter {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "burst fits u64")]
         let burst_string = (cfg.burst as u64).to_string();
 
+        let state = match cfg.bucket_key_header {
+            Some(header_name) => TokenRateLimitState::per_header(header_name, cfg.burst),
+            None => TokenRateLimitState::global(cfg.burst),
+        };
+
         Ok(Box::new(Self {
-            bucket: TokenBucket::new(cfg.burst),
+            state,
             rate: cfg.rate,
             burst: cfg.burst,
             estimate_tokens: cfg.estimate_tokens,
@@ -193,6 +208,11 @@ impl TokenRateLimitFilter {
     /// Overshoot beyond what the bucket can absorb floors at zero (see
     /// [`bucket::TokenBucket::reconcile`]); this is a known open
     /// question, not solved here.
+    ///
+    /// Reconciles against the same bucket `on_request` reserved from,
+    /// identified by [`META_BUCKET_KEY`] (absent means the global/fallback
+    /// bucket, whether because keying isn't configured or the header was
+    /// missing on this request).
     fn reconcile(&self, ctx: &HttpFilterContext<'_>) {
         let Some(reserved) = ctx.get_metadata(META_RESERVED).and_then(|v| v.parse::<f64>().ok()) else {
             return;
@@ -202,10 +222,14 @@ impl TokenRateLimitFilter {
             return;
         };
 
+        let key = ctx.get_metadata(META_BUCKET_KEY);
         let now = self.now_nanos();
         let delta = reserved - actual;
-        let remaining = self.bucket.reconcile(delta, self.rate, self.burst, now);
+        let remaining = self.state.with_bucket(key, self.rate, self.burst, now, |b| {
+            b.reconcile(delta, self.rate, self.burst, now)
+        });
         tracing::debug!(
+            key = key.unwrap_or("<global>"),
             reserved,
             actual,
             remaining,
@@ -231,19 +255,26 @@ impl HttpFilter for TokenRateLimitFilter {
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let now = self.now_nanos();
 
-        if self
-            .bucket
-            .try_reserve(self.estimate_tokens, self.rate, self.burst, now)
-            .is_some()
-        {
+        let key = self.state.resolve_key(&ctx.request.headers);
+        let acquired = self.state.with_bucket(key.as_deref(), self.rate, self.burst, now, |b| {
+            b.try_reserve(self.estimate_tokens, self.rate, self.burst, now)
+        });
+
+        if acquired.is_some() {
             ctx.set_metadata(META_RESERVED, self.estimate_tokens.to_string());
+            if let Some(key) = key {
+                ctx.set_metadata(META_BUCKET_KEY, key);
+            }
             Ok(FilterAction::Continue)
         } else {
             tracing::info!(
                 estimate = self.estimate_tokens,
+                key = key.as_deref().unwrap_or("<global>"),
                 "token_rate_limit: rejecting request (429)"
             );
-            let remaining = self.bucket.current_tokens(self.rate, self.burst, now);
+            let remaining = self.state.with_bucket(key.as_deref(), self.rate, self.burst, now, |b| {
+                b.current_tokens(self.rate, self.burst, now)
+            });
             let (headers, retry_secs) = self.rate_limit_headers(remaining, ctx.time_source);
 
             let mut rejection = Rejection::status(429).with_header("Retry-After", format!("{retry_secs}"));
@@ -259,7 +290,10 @@ impl HttpFilter for TokenRateLimitFilter {
         // before the body streams, before actual usage is known, so
         // they can't reflect this response's own reconciliation yet.
         let now = self.now_nanos();
-        let remaining = self.bucket.current_tokens(self.rate, self.burst, now);
+        let key = self.state.resolve_key(&ctx.request.headers);
+        let remaining = self.state.with_bucket(key.as_deref(), self.rate, self.burst, now, |b| {
+            b.current_tokens(self.rate, self.burst, now)
+        });
         let (headers, _retry_secs) = self.rate_limit_headers(remaining, ctx.time_source);
 
         if let Some(ref mut resp) = ctx.response_header {

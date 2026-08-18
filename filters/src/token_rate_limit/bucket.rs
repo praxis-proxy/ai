@@ -109,6 +109,19 @@ impl TokenBucket {
         Self::refill(&mut state, rate, burst, now_nanos);
         state.tokens
     }
+
+    /// Read the last refill timestamp in nanoseconds, without refilling.
+    ///
+    /// Used by per-key eviction to identify idle (long since fully
+    /// refilled) buckets worth reclaiming, mirroring `praxis`'s own
+    /// `token_bucket::TokenBucket::last_refill_nanos`.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "poisoned mutex is unrecoverable; matches praxis's std::process::abort style"
+    )]
+    pub(super) fn last_refill_nanos(&self) -> u64 {
+        self.state.lock().unwrap().last_refill_nanos
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -212,5 +225,33 @@ mod tests {
         assert!((bucket.current_tokens(0.0, 50.0, 0) - 30.0).abs() < 1e-9);
         // Reading twice must not change the balance.
         assert!((bucket.current_tokens(0.0, 50.0, 0) - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn last_refill_nanos_starts_at_zero_and_tracks_last_access() {
+        let bucket = TokenBucket::new(10.0);
+        assert_eq!(
+            bucket.last_refill_nanos(),
+            0,
+            "no access yet, still at construction epoch"
+        );
+
+        bucket.try_reserve(1.0, 10.0, 10.0, 500);
+        assert_eq!(
+            bucket.last_refill_nanos(),
+            500,
+            "should track the timestamp of the last refill"
+        );
+    }
+
+    #[test]
+    fn last_refill_nanos_does_not_itself_trigger_a_refill() {
+        let bucket = TokenBucket::new(10.0);
+        bucket.try_reserve(10.0, 10.0, 10.0, 0);
+        // Reading the timestamp alone (no rate/burst/now passed) must not
+        // advance state -- a subsequent real access at time 0 should still
+        // see the fully-drained bucket.
+        assert_eq!(bucket.last_refill_nanos(), 0);
+        assert!(bucket.try_reserve(1.0, 10.0, 10.0, 0).is_none());
     }
 }

@@ -8,7 +8,8 @@
 //! `ai#658`): reservation-based admission, 429 rejection with
 //! token-denominated headers, and reconciliation against actual
 //! provider-reported usage (`token_count`'s `token.total`) once the
-//! response completes.
+//! response completes. Also covers `ai#129`'s `bucket_key_header`
+//! per-app budgets (`token-rate-limit-per-app.yaml`).
 
 use std::collections::HashMap;
 
@@ -16,6 +17,26 @@ use praxis_test_utils::{
     Backend, example_config_path, free_port, http_send, json_post, load_example_config, parse_body, parse_header,
     parse_status, patch_yaml, start_proxy,
 };
+
+/// Build a `POST` request carrying extra headers beyond the standard
+/// JSON content-type/length, for `bucket_key_header` scenarios that
+/// need to tag requests with an app identity.
+fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> String {
+    let mut extra = String::new();
+    for (name, value) in headers {
+        extra.push_str(&format!("{name}: {value}\r\n"));
+    }
+    format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         {extra}\
+         Connection: close\r\n\r\n\
+         {body}",
+        body.len()
+    )
+}
 
 // -----------------------------------------------------------------------------
 // Mock response bodies
@@ -189,4 +210,99 @@ fn example_config_token_rate_limit() {
     let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
     assert_eq!(parse_status(&raw), 200, "example config smoke test should return 200");
     assert_eq!(parse_body(&raw), PLAIN_TEXT_BODY, "body should pass through unchanged");
+}
+
+// -----------------------------------------------------------------------------
+// Per-app budgets (ai#129 bucket_key_header) -- token-rate-limit-per-app.yaml
+// -----------------------------------------------------------------------------
+
+/// Build a YAML config for the per-app budget pipeline using the example
+/// file, substituting `burst`/`estimate_tokens` so tests can exercise
+/// small, deterministic per-app budgets.
+fn token_rate_limit_per_app_config(
+    proxy_port: u16,
+    backend_port: u16,
+    burst: u64,
+    estimate_tokens: u64,
+) -> praxis_core::config::Config {
+    let path = example_config_path("token-rate-limit-per-app.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml
+        .replace("burst: 100000", &format!("burst: {burst}"))
+        .replace("estimate_tokens: 500", &format!("estimate_tokens: {estimate_tokens}"));
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
+    praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
+}
+
+/// Customer scenario: an AI Platform Admin creates one `token_rate_limit`
+/// rule keyed by `x-app-id` and hands out the same per-app budget to
+/// three teams -- odin, thor, and loki. Each team's traffic should draw
+/// down only its own budget: one team hitting its limit and getting
+/// blocked must have zero effect on the others' remaining tokens.
+#[test]
+fn bucket_key_header_isolates_per_app_budgets_across_odin_thor_loki() {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    // burst=40, estimate=40: each app gets exactly one admitted request
+    // before its own bucket is exhausted. start_proxy's readiness probe
+    // (GET /, no x-app-id header) draws from the separate global fallback
+    // bucket, so it doesn't touch any of odin/thor/loki's budgets.
+    let config = token_rate_limit_per_app_config(proxy_port, backend.port(), 40, 40);
+    let proxy = start_proxy(&config);
+
+    for app in ["odin", "thor", "loki"] {
+        let admitted = http_send(
+            proxy.addr(),
+            &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", app)]),
+        );
+        assert_eq!(
+            parse_status(&admitted),
+            200,
+            "{app}'s first request should be admitted from its own untouched budget"
+        );
+        assert_eq!(
+            parse_header(&admitted, "x-ratelimit-limit-tokens"),
+            Some("40".to_owned()),
+            "{app}'s limit header should reflect the configured per-app burst"
+        );
+
+        let blocked = http_send(
+            proxy.addr(),
+            &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", app)]),
+        );
+        assert_eq!(
+            parse_status(&blocked),
+            429,
+            "{app}'s second request should be blocked, its own 40-token budget is exhausted"
+        );
+        assert!(
+            parse_header(&blocked, "retry-after").is_some(),
+            "{app}'s 429 should carry a Retry-After header"
+        );
+    }
+}
+
+/// Requests without the configured `x-app-id` header must not be silently
+/// admitted (a bypass of the per-app budgeting) -- they share one
+/// fallback bucket, sized the same as every per-app bucket.
+#[test]
+fn bucket_key_header_falls_back_to_shared_bucket_when_header_absent() {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = token_rate_limit_per_app_config(proxy_port, backend.port(), 40, 40);
+    let proxy = start_proxy(&config);
+
+    // start_proxy's own readiness probe already consumed the fallback
+    // bucket's only 40 tokens, so a keyless request here should already
+    // be blocked.
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&raw),
+        429,
+        "keyless request should share (and find exhausted) the fallback bucket the readiness probe already drained"
+    );
 }
