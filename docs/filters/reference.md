@@ -54,6 +54,12 @@ see the [Praxis core filter reference][core-ref].
 | [`a2a`](a2a.md) | Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method, family, task ID, streaming detection, and version to request headers, filter results, and durable metadata for routing. |
 | [`mcp`](mcp.md) | Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata. |
 
+### Authentication
+
+| Filter | Description |
+|--------|-------------|
+| [`jwt_auth`](jwt_auth.md) | Validates JWT bearer tokens against a JWKS endpoint and injects verified claims as request headers. |
+
 ### Guardrails
 
 | Filter | Description |

@@ -11,6 +11,7 @@
 pub mod agentic;
 pub mod guardrails;
 pub mod inference;
+pub mod jwt_auth;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
 pub mod prompt_enrich;
@@ -22,6 +23,7 @@ mod token_usage;
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
+pub use jwt_auth::JwtAuthFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};

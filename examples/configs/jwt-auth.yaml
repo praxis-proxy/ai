@@ -1,0 +1,44 @@
+# JWT Authentication
+#
+# Validates bearer JWT tokens against a JWKS endpoint and
+# injects verified claims as request headers. Works with any
+# OIDC-compliant identity provider (Keycloak, Okta, Azure AD).
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/jwt-auth.yaml
+#
+# Get a token from your IdP, then:
+#   curl http://localhost:8080/v1/messages \
+#     -H "x-api-key: <JWT>" \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"test","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+#
+# The filter validates the JWT signature against the JWKS
+# endpoint, extracts configured claims into request headers,
+# and strips the token header before forwarding upstream.
+
+listeners:
+  - name: gateway
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - authenticated
+
+filter_chains:
+  - name: authenticated
+    filters:
+      - filter: jwt_auth
+        jwks_url: "http://127.0.0.1:8280/realms/ai-gateway/protocol/openid-connect/certs"
+        issuer: "http://127.0.0.1:8280/realms/ai-gateway"
+        token_header: "x-api-key"
+        claim_headers:
+          preferred_username: "x-tenant-username"
+          groups: "x-tenant-group"
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
