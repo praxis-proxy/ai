@@ -265,7 +265,8 @@ fn is_authenticated_url(url: &str) -> bool {
     match reqwest::Url::parse(url) {
         Ok(u) => {
             u.scheme() == "https"
-                || (u.scheme() == "http" && matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
+                // url::host_str() returns IPv6 hosts bracketed, so match "[::1]".
+                || (u.scheme() == "http" && matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
         },
         // Unparseable URL: treat as unauthenticated so we warn.
         Err(_) => false,
