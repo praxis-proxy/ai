@@ -299,6 +299,47 @@ mod filter_tests {
     }
 
     // -------------------------------------------------------------------------
+    // Target Parsing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn target_parse_https_enables_tls_sni_and_default_port() {
+        // An https URL without an explicit port must enable TLS, set the
+        // SNI to the host, default the port to 443, and omit the port from
+        // the Host authority (since 443 is the default for the scheme).
+        let target = crate::callout::CalloutTarget::parse("https://example.com/api").unwrap();
+
+        assert!(target.tls, "https should enable TLS");
+        assert_eq!(target.port, 443, "https should default to port 443");
+        assert_eq!(target.sni, "example.com", "SNI should be the host");
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.authority, "example.com", "default port omitted from authority");
+        assert_eq!(target.request_uri, "/api");
+    }
+
+    #[test]
+    fn target_parse_https_explicit_nondefault_port_in_authority() {
+        // A non-default https port must appear in the Host authority.
+        let target = crate::callout::CalloutTarget::parse("https://example.com:8443/api").unwrap();
+
+        assert!(target.tls);
+        assert_eq!(target.port, 8443);
+        assert_eq!(target.sni, "example.com", "SNI is the host, not host:port");
+        assert_eq!(target.authority, "example.com:8443", "non-default port kept in authority");
+    }
+
+    #[test]
+    fn target_parse_http_disables_tls_and_leaves_sni_empty() {
+        // An http URL defaults to port 80, disables TLS, and has no SNI.
+        let target = crate::callout::CalloutTarget::parse("http://example.com/api").unwrap();
+
+        assert!(!target.tls, "http should disable TLS");
+        assert_eq!(target.port, 80, "http should default to port 80");
+        assert!(target.sni.is_empty(), "no SNI without TLS");
+        assert_eq!(target.authority, "example.com", "default port omitted from authority");
+    }
+
+    // -------------------------------------------------------------------------
     // Phase Handling
     // -------------------------------------------------------------------------
 
