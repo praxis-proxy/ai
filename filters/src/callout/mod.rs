@@ -395,7 +395,9 @@ fn validate_status_on_error(status: Option<u16>) -> Result<(), FilterError> {
     if let Some(code) = status
         && !(100..=599).contains(&code)
     {
-        return Err(format!("http_callout: status_on_error ({code}) must be a valid HTTP status code (100-599)").into());
+        return Err(
+            format!("http_callout: status_on_error ({code}) must be a valid HTTP status code (100-599)").into(),
+        );
     }
     Ok(())
 }

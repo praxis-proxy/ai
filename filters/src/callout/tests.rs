@@ -348,7 +348,10 @@ mod filter_tests {
         assert!(target.tls);
         assert_eq!(target.port, 8443);
         assert_eq!(target.sni, "example.com", "SNI is the host, not host:port");
-        assert_eq!(target.authority, "example.com:8443", "non-default port kept in authority");
+        assert_eq!(
+            target.authority, "example.com:8443",
+            "non-default port kept in authority"
+        );
     }
 
     #[test]
