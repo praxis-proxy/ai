@@ -332,8 +332,7 @@ impl CompactFilter {
         let record = fetch_response(&*store, &tenant_id, &req).await?;
         let messages = extract_stored_messages(record)?;
         let summary = self.summarize_messages(&req, &messages).await?;
-        let response_object =
-            build_and_persist_compaction(self, ctx, &*store, &tenant_id, &req, &summary).await?;
+        let response_object = build_and_persist_compaction(self, ctx, &*store, &tenant_id, &req, &summary).await?;
         let body_bytes = serde_json::to_vec(&response_object).unwrap_or_default();
         Ok(FilterAction::Reject(
             praxis_filter::Rejection::status(200)
