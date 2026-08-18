@@ -382,6 +382,11 @@ fn validate_max_body_bytes(n: usize) -> Result<(), FilterError> {
 /// configured value must be a legal HTTP status code (100–599) so the
 /// rejection path never emits a nonsensical status like `0` or `65535`.
 ///
+/// The `100..=599` range check is the established convention across the
+/// codebase (`openai_responses_compact`, `web_search`, core builtins),
+/// currently duplicated per filter. See the follow-up to promote a shared
+/// `validate_status_on_error` helper into `praxis-ai-apis`.
+///
 /// # Errors
 ///
 /// Returns [`FilterError`] if a configured status is outside 100–599.
