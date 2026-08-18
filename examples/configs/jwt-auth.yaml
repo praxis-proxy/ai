@@ -1,8 +1,8 @@
 # JWT Authentication
 #
-# Validates bearer JWT tokens against a JWKS endpoint and
-# injects verified claims as request headers. Works with any
-# OIDC-compliant identity provider (Keycloak, Okta, Azure AD).
+# Validates bearer JWT tokens against a JWKS endpoint and writes
+# verified claims to filter_metadata for downstream filters. Works
+# with any OIDC-compliant identity provider (Keycloak, Okta, Azure AD).
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/jwt-auth.yaml
@@ -14,8 +14,14 @@
 #     -d '{"model":"test","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 #
 # The filter validates the JWT signature against the JWKS
-# endpoint, extracts configured claims into request headers,
-# and strips the token header before forwarding upstream.
+# endpoint, writes configured claims to filter_metadata, and
+# strips the token header before forwarding upstream.
+#
+# The JWKS URL is the filter's root of trust: use https:// in
+# production. This example uses a loopback http:// URL, which is
+# accepted without a warning. For an in-cluster IdP with a
+# self-signed cert, set insecure_skip_tls_verify: true (logs a
+# warning) rather than falling back to plain http.
 
 listeners:
   - name: gateway
@@ -30,7 +36,7 @@ filter_chains:
         jwks_url: "http://127.0.0.1:8280/realms/ai-gateway/protocol/openid-connect/certs"
         issuer: "http://127.0.0.1:8280/realms/ai-gateway"
         token_header: "x-api-key"
-        claim_headers:
+        claim_metadata:
           preferred_username: "x-tenant-username"
           groups: "x-tenant-group"
       - filter: router

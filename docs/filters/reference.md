@@ -58,7 +58,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`jwt_auth`](jwt_auth.md) | Validates JWT bearer tokens against a JWKS endpoint and injects verified claims as request headers. |
+| [`jwt_auth`](jwt_auth.md) | Validates JWT bearer tokens against a JWKS endpoint and writes verified claims to `filter_metadata`. |
 
 ### Guardrails
 

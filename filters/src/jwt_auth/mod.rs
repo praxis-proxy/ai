@@ -2,15 +2,24 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! JWT authentication filter: validates bearer tokens against a
-//! JWKS endpoint and injects verified claims as request headers.
+//! JWKS endpoint and writes verified claims to `filter_metadata`.
 //!
 //! The filter downloads public keys from the `IdP`'s JWKS endpoint
-//! at startup (and refreshes on unknown `kid`), validates the JWT
-//! signature locally (no per-request callout), and extracts
-//! configured claims into request headers for downstream filters.
+//! lazily on the first request (and refreshes on unknown `kid` or
+//! TTL expiry), validates the JWT signature locally (no per-request
+//! callout), and writes configured claims to `filter_metadata` for
+//! downstream filters. Claims are deliberately not injected as
+//! upstream request headers — see [`JwtAuthFilter`] for why.
 //!
 //! Works with any OIDC-compliant identity provider (Keycloak,
 //! Okta, Azure AD, etc.) that publishes a JWKS endpoint.
+//!
+//! # Temporary bridge
+//!
+//! This filter is a self-contained bridge for JWT/OIDC-fronted
+//! deployments. JWT validation is expected to move into the core
+//! CPEX policy engine; this filter should be retired once that
+//! lands (tracked in #708). No other filter should depend on it.
 
 mod config;
 mod jwks;
@@ -48,25 +57,37 @@ const BEARER_PREFIX: &str = "bearer ";
 // JwtAuthFilter
 // -----------------------------------------------------------------------------
 
-/// Validates JWT bearer tokens against a JWKS endpoint and injects
-/// verified claims as request headers.
+/// Validates JWT bearer tokens against a JWKS endpoint and writes
+/// verified claims to `filter_metadata`.
 ///
 /// # How it works
 ///
-/// 1. Extracts the bearer token from the `Authorization` header
+/// 1. Extracts the bearer token from the configured header
 /// 2. Decodes the JWT header to find the `kid` (key ID)
 /// 3. Looks up the public key in the JWKS cache (refreshes if unknown)
-/// 4. Validates the signature, expiry, issuer, and audience
-/// 5. Extracts configured claims and injects them as request headers
-/// 6. Rejects with 401 if any step fails
+/// 4. Validates the signature, expiry, `nbf`, issuer, and audience
+/// 5. Writes configured claims to `filter_metadata`
+/// 6. Strips the token header so it never reaches the upstream
+/// 7. Rejects with 401 if any step fails
+///
+/// Tokens without a `kid` header are rejected — the JWKS lookup is
+/// keyed by `kid`, so single-key `IdP`s that omit it are not supported.
+///
+/// # Claims go to metadata, not headers
+///
+/// Verified claims are written to `filter_metadata`, not to upstream
+/// request headers. Header injection would happen after
+/// `request_headers_to_remove` is applied, so `identity_header_guard`
+/// could not strip them and they would leak to the upstream provider.
+/// `filter_metadata` is the trusted channel downstream filters read.
 ///
 /// # YAML configuration
 ///
 /// ```yaml
 /// filter: jwt_auth
-/// jwks_url: "http://keycloak:8080/realms/ai-gateway/protocol/openid-connect/certs"
-/// issuer: "http://keycloak:8080/realms/ai-gateway"
-/// claim_headers:
+/// jwks_url: "https://keycloak.example.com/realms/ai-gateway/protocol/openid-connect/certs"
+/// issuer: "https://keycloak.example.com/realms/ai-gateway"
+/// claim_metadata:
 ///   preferred_username: "x-tenant-username"
 ///   groups: "x-tenant-group"
 /// ```
@@ -80,8 +101,8 @@ pub struct JwtAuthFilter {
     /// Expected audience (`aud` claim).
     audience: Option<String>,
 
-    /// Maps claim names to header names for injection.
-    claim_headers: Vec<(String, String)>,
+    /// Maps claim names to `filter_metadata` keys.
+    claim_metadata: Vec<(String, String)>,
 
     /// Header to read the bearer token from.
     token_header: String,
@@ -92,22 +113,25 @@ impl JwtAuthFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if config parsing fails, validation
-    /// fails, or the initial JWKS fetch fails.
+    /// Returns [`FilterError`] if config parsing or validation fails.
+    /// JWKS keys are fetched lazily on the first request, so a
+    /// misconfigured or unreachable endpoint surfaces as 401s at
+    /// request time, not a construction error.
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let config: JwtAuthConfig = parse_filter_config("jwt_auth", value)?;
         validate_config(&config).map_err(|e| -> FilterError { e.into() })?;
 
         let jwks_url = config.jwks_url.clone();
-        let claim_headers: Vec<(String, String)> = config.claim_headers.into_iter().collect();
+        let claim_metadata: Vec<(String, String)> = config.claim_metadata.into_iter().collect();
 
-        let jwks = JwksCache::new(jwks_url).map_err(|e| -> FilterError { e.into() })?;
+        let jwks =
+            JwksCache::new(jwks_url, config.insecure_skip_tls_verify).map_err(|e| -> FilterError { e.into() })?;
 
         Ok(Box::new(Self {
             jwks,
             issuer: config.issuer,
             audience: config.audience,
-            claim_headers,
+            claim_metadata,
             token_header: config.token_header.to_lowercase(),
         }))
     }
@@ -132,6 +156,45 @@ impl JwtAuthFilter {
         } else {
             None
         }
+    }
+
+    /// Verify a token's signature and claims, returning its claims.
+    ///
+    /// The accepted algorithms come from the JWKS entry, never from
+    /// the token header, so an attacker cannot downgrade to `none`
+    /// or force HS256 with the public key as an HMAC secret.
+    ///
+    /// Kept separate from `on_request` so the sizable `Validation`
+    /// and `TokenData` values stay off the request handler's stack
+    /// frame.
+    fn verify_claims(
+        &self,
+        token: &str,
+        decoding_key: &jsonwebtoken::DecodingKey,
+        algorithms: Vec<jsonwebtoken::Algorithm>,
+    ) -> Result<serde_json::Value, jsonwebtoken::errors::Error> {
+        let Some(first_alg) = algorithms.first().copied() else {
+            return Err(jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into());
+        };
+        let mut validation = Validation::new(first_alg);
+        validation.algorithms = algorithms;
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        // Disable the default audience requirement — only enforce
+        // when explicitly configured.
+        validation.set_audience::<&str>(&[]);
+        validation.validate_aud = false;
+
+        if let Some(iss) = &self.issuer {
+            validation.set_issuer(&[iss]);
+        }
+        if let Some(aud) = &self.audience {
+            validation.set_audience(&[aud]);
+            validation.validate_aud = true;
+        }
+
+        let token_data: TokenData<serde_json::Value> = decode(token, decoding_key, &validation)?;
+        Ok(token_data.claims)
     }
 }
 
@@ -167,45 +230,28 @@ impl HttpFilter for JwtAuthFilter {
         };
 
         // 3. Look up the public key
-        let Some((decoding_key, algorithm)) = self.jwks.get_key(kid).await else {
+        let Some((decoding_key, algorithms)) = self.jwks.get_key(kid).await else {
             debug!(kid, "unknown signing key");
             return Ok(reject_unauthorized("invalid token"));
         };
 
-        // 4. Build validation rules
-        let mut validation = Validation::new(algorithm);
-        validation.validate_exp = true;
-        validation.validate_nbf = true;
-        // Disable default audience requirement — only enforce
-        // when explicitly configured.
-        validation.set_audience::<&str>(&[]);
-        validation.validate_aud = false;
-
-        if let Some(iss) = &self.issuer {
-            validation.set_issuer(&[iss]);
-        }
-
-        if let Some(aud) = &self.audience {
-            validation.set_audience(&[aud]);
-            validation.validate_aud = true;
-        }
-
-        // 5. Validate the token
-        let token_data: TokenData<serde_json::Value> = match decode(token, &decoding_key, &validation) {
-            Ok(data) => data,
+        // 4. Verify signature, expiry, nbf, issuer, and audience. Extracted to a helper so the large `Validation` and
+        //    `TokenData` values live in their own stack frame.
+        let claims = match self.verify_claims(token, &decoding_key, algorithms) {
+            Ok(claims) => claims,
             Err(e) => {
                 debug!("JWT validation failed: {e}");
                 return Ok(reject_unauthorized("invalid token"));
             },
         };
 
-        // 6. Strip the token header so the JWT doesn't leak to the upstream provider. credential_injection will add the
+        // 5. Strip the token header so the JWT doesn't leak to the upstream provider. credential_injection will add the
         //    real provider key later.
         if let Ok(name) = http::HeaderName::from_bytes(self.token_header.as_bytes()) {
             ctx.request_headers_to_remove.push(name);
         }
 
-        // 7. Extract claims to filter_metadata only.
+        // 6. Extract claims to filter_metadata only.
         //
         //    Identity is NOT injected into extra_request_headers
         //    because those are added to the upstream request after
@@ -215,10 +261,9 @@ impl HttpFilter for JwtAuthFilter {
         //
         //    Downstream filters (external_metering) read identity
         //    from filter_metadata, which is the trusted channel.
-        let claims = &token_data.claims;
-        for (claim_name, header_name) in &self.claim_headers {
+        for (claim_name, metadata_key) in &self.claim_metadata {
             if let Some(value) = claims.get(claim_name) {
-                let header_value = match value {
+                let metadata_value = match value {
                     serde_json::Value::String(s) => s.clone(),
                     serde_json::Value::Array(arr) => {
                         let parts: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
@@ -227,7 +272,7 @@ impl HttpFilter for JwtAuthFilter {
                     other => other.to_string(),
                 };
 
-                ctx.set_metadata(header_name.clone(), header_value);
+                ctx.set_metadata(metadata_key.clone(), metadata_value);
             }
         }
 
