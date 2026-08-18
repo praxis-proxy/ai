@@ -571,7 +571,12 @@ fn build_subrequest_client(cfg: &HttpCalloutConfig) -> SubRequestClient {
         circuit_breaker,
     });
 
-    SubRequestClient::new(connector)
+    // Cap buffered response bytes at the configured `max_body_bytes`.
+    // `execute` uses `min(per_call_limit, client_ceiling)`, so leaving the
+    // client at its 64 MiB default would silently clamp any configured
+    // `max_body_bytes` above 64 MiB. Setting the ceiling here keeps the
+    // effective response limit equal to the operator's configured value.
+    SubRequestClient::with_max_response_bytes(connector, cfg.request.max_body_bytes)
 }
 
 // -----------------------------------------------------------------------------

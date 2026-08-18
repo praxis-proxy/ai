@@ -660,6 +660,52 @@ mod filter_tests {
         );
     }
 
+    #[tokio::test]
+    async fn oversized_response_body_treated_as_failure() {
+        // The client's response-byte ceiling is set to the configured
+        // max_body_bytes, so a response larger than that must fail the
+        // callout (not silently truncate). With on_failure: closed that
+        // surfaces as Reject(status_on_error).
+        let mock_server = MockServer::start().await;
+
+        // Configured cap is 1024 bytes; return well over that.
+        let big_body = "x".repeat(4096);
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(big_body))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+            request:
+              phase: request_headers
+              max_body_bytes: 1024
+            on_failure: closed
+            status_on_error: 502
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 502),
+            "a response body over max_body_bytes should fail the callout"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Timeout
     // -------------------------------------------------------------------------
