@@ -3,15 +3,18 @@
 
 //! Intelligent routing filters.
 //!
-//! Provides the `intelligent_route` filter for static AI Grid inference model
-//! and MCP tool routing.  This filter belongs in the AI proxy because
-//! it encodes AI-specific semantics — candidate freshness, local-site
-//! preference, and MCP tool-call routing — that are not generic Praxis
-//! proxy mechanics.
+//! Provides the edge `intelligent_route` filter and the provider-side
+//! `provider_route` and `credential_inject` filters. These belong in
+//! the AI proxy because they encode AI-specific routing contracts, not
+//! generic Praxis proxy mechanics.
 
+mod credential_inject;
 pub(crate) mod descriptor;
 mod intelligent_route;
 pub(crate) mod metadata;
 pub(crate) mod overlay;
+mod provider_route;
 
+pub use credential_inject::CredentialInjectFilter;
 pub use intelligent_route::IntelligentRouteFilter;
+pub use provider_route::ProviderRouteFilter;

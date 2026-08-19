@@ -15,8 +15,8 @@
 //! client-supplied model name from hijacking MCP routing.
 //!
 //! Candidate selection is deterministic: the first matching candidate in
-//! the configured or configuration-producer-rendered order wins after admission filtering.
-//! The filter does not recompute geography, load, or scoring.
+//! the configured or overlay-rendered order wins after admission filtering.
+//! The filter does not recompute source geography, load, or scoring.
 //!
 //! No request-time metrics or control-plane lookups are performed.
 
@@ -39,7 +39,7 @@ use super::{
     metadata::{
         OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
         ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_TIER, ROUTE_SITE,
-        ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER,
+        ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
     overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, RouteSnapshot},
 };
@@ -78,7 +78,7 @@ const MAX_TTL_SECS: u64 = 86_400;
 ///     cluster: local-inference
 /// ```
 ///
-/// **Overlay mode** — candidates are loaded from a routing overlay envelope:
+/// **Overlay mode** — candidates are loaded from an overlay envelope:
 ///
 /// ```yaml
 /// filter: intelligent_route
@@ -106,7 +106,7 @@ struct IntelligentRouteConfig {
 
     /// Clusters that terminate the authenticated provider-hop protocol.
     ///
-    /// A selected candidate emits the fixed `x-ai-routing-*` context only when
+    /// A selected candidate emits the fixed routing context only when
     /// its cluster is present in this allowlist. Each named cluster must use an
     /// mTLS-authenticated Praxis provider gateway. Direct API/backend clusters
     /// remain absent.
@@ -275,12 +275,12 @@ enum AffinityOutcome<'a> {
 /// This filter is registered by the AI proxy (not Praxis core) because it
 /// encodes AI-specific routing semantics: ordered candidate consumption,
 /// admission-state filtering, session affinity, and MCP tool-call routing.
-/// Praxis core provides the generic filter runtime; this filter adds the
-/// intelligent routing candidate model on top.
+/// Praxis core provides the generic filter runtime; this filter adds the intelligent routing
+/// candidate model on top.
 ///
 /// **Modes:**
 /// - **Static:** candidates are declared inline in the YAML config.
-/// - **Overlay:** candidates are loaded from a routing overlay file (`routing-overlay.json` envelope or legacy
+/// - **Overlay:** candidates are loaded from an overlay file (`routing-overlay.json` envelope or legacy
 ///   `routing-config.json`) and hot-reloaded via [`ArcSwap`] when the file changes.
 ///
 /// **Behavior:**
@@ -291,8 +291,8 @@ enum AffinityOutcome<'a> {
 /// - If no matching candidate is found, the filter rejects with 404.
 ///
 /// **Selection:** the first matching candidate in the configured or
-/// configuration-producer-rendered order wins after admission filtering.  Praxis AI does not
-/// recompute geography, load, or score.  `admission_state=none` is never
+/// overlay-rendered order wins after admission filtering.  Praxis AI does not
+/// recompute source geography, load, or score.  `admission_state=none` is never
 /// eligible.  `admission_state=existing_only` is only eligible through an
 /// already-bound session affinity entry.
 ///
@@ -435,10 +435,10 @@ impl IntelligentRouteFilter {
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
 
         if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
-            return Err("routing: cannot set both overlay_file and candidates".into());
+            return Err("intelligent_route: cannot set both overlay_file and candidates".into());
         }
         if cfg.overlay_file.is_none() && cfg.expected_overlay_scope.is_some() {
-            return Err("routing: expected_overlay_scope requires envelope overlay_file mode".into());
+            return Err("intelligent_route: expected_overlay_scope requires envelope overlay_file mode".into());
         }
 
         let (snapshot, reload_handle) = if let Some(path) = cfg.overlay_file {
@@ -446,11 +446,11 @@ impl IntelligentRouteFilter {
             build_overlay_snapshot(path, &reload, cfg.expected_overlay_scope)?
         } else if let Some(candidates_raw) = cfg.candidates {
             if cfg.reload.is_some() {
-                return Err("routing: reload block is not valid with static candidates".into());
+                return Err("intelligent_route: reload block is not valid with static candidates".into());
             }
             build_static_snapshot(candidates_raw, cfg.local_site)?
         } else {
-            return Err("routing: either overlay_file or candidates must be set".into());
+            return Err("intelligent_route: either overlay_file or candidates must be set".into());
         };
 
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
@@ -520,8 +520,12 @@ fn build_overlay_snapshot(
     reload: &ReloadConfig,
     expected_scope: Option<ExpectedOverlayScope>,
 ) -> SnapshotResult {
-    let content = overlay::read_overlay_bounded(&path)
-        .map_err(|e| FilterError::from(format!("routing: failed to read overlay file {}: {e}", path.display())))?;
+    let content = overlay::read_overlay_bounded(&path).map_err(|e| {
+        FilterError::from(format!(
+            "intelligent_route: failed to read overlay file {}: {e}",
+            path.display()
+        ))
+    })?;
     let snap = RouteSnapshot::from_overlay_with_scope(&content, expected_scope.as_ref())?;
     tracing::info!(
         path = %path.display(),
@@ -548,8 +552,8 @@ fn build_overlay_snapshot(
 
 /// Build a static snapshot from inline candidates.
 fn build_static_snapshot(candidates_raw: Vec<CandidateConfig>, local_site: Option<String>) -> SnapshotResult {
-    let local_site_str =
-        local_site.ok_or_else(|| FilterError::from("routing: local_site is required when candidates is set"))?;
+    let local_site_str = local_site
+        .ok_or_else(|| FilterError::from("intelligent_route: local_site is required when candidates is set"))?;
     descriptor::validate_local_site(&local_site_str)?;
     let candidates = descriptor::validate_candidates(candidates_raw)?;
     let snap = RouteSnapshot::from_static(candidates, Arc::from(local_site_str.as_str()));
@@ -571,7 +575,7 @@ fn build_session_affinity(config: Option<SessionAffinityConfig>) -> Result<Optio
         .filter(|h| !h.trim().is_empty())
         .map(str::parse::<HeaderName>)
         .transpose()
-        .map_err(|e| -> FilterError { format!("routing: invalid session_affinity.header: {e}").into() })?;
+        .map_err(|e| -> FilterError { format!("intelligent_route: invalid session_affinity.header: {e}").into() })?;
     let cookie = cfg.cookie.as_deref().filter(|c| !c.trim().is_empty()).map(Arc::from);
     Ok(Some(SessionAffinity {
         bindings: DashMap::new(),
@@ -587,7 +591,7 @@ fn validate_provider_hop_clusters(clusters: Vec<String>) -> Result<BTreeSet<Stri
     for cluster in clusters {
         descriptor::validate_cluster_name("provider_hop_clusters", &cluster)?;
         if !validated.insert(cluster) {
-            return Err("routing: duplicate provider_hop_clusters entry".into());
+            return Err("intelligent_route: duplicate provider_hop_clusters entry".into());
         }
     }
     Ok(validated)
@@ -598,10 +602,10 @@ fn validate_session_affinity_config(cfg: &SessionAffinityConfig) -> Result<(), F
     let has_header = cfg.header.as_deref().is_some_and(|h| !h.trim().is_empty());
     let has_cookie = cfg.cookie.as_deref().is_some_and(|c| !c.trim().is_empty());
     if !has_header && !has_cookie {
-        return Err("routing: session_affinity requires at least one of header or cookie".into());
+        return Err("intelligent_route: session_affinity requires at least one of header or cookie".into());
     }
     if cfg.ttl_secs == 0 || cfg.ttl_secs > MAX_TTL_SECS {
-        return Err(format!("routing: session_affinity.ttl_secs must be 1-{MAX_TTL_SECS}").into());
+        return Err(format!("intelligent_route: session_affinity.ttl_secs must be 1-{MAX_TTL_SECS}").into());
     }
     Ok(())
 }
@@ -623,7 +627,7 @@ impl HttpFilter for IntelligentRouteFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // Client-supplied Grid protocol context is never allowed to survive an
+        // Client-supplied routing protocol context is never allowed to survive an
         // edge routing decision.
         ctx.request_headers_to_remove
             .push(HeaderName::from_static(SELECTED_CANDIDATE_HEADER));
@@ -906,8 +910,8 @@ fn evict_expired(affinity: &SessionAffinity) {
 /// Always excludes [`Excluded`] candidates.  When `is_new_session`
 /// is `true`, also excludes [`ExistingOnly`] candidates.
 ///
-/// Praxis AI intentionally preserves the configured or configuration-producer-rendered
-/// candidate order. The configuration producer owns geography, load-aware ordering, and rank.
+/// Praxis AI intentionally preserves the configured or overlay-rendered
+/// candidate order. The source owns geography, load-aware ordering, and rank.
 ///
 /// [`Excluded`]: AdmissionState::Excluded
 /// [`ExistingOnly`]: AdmissionState::ExistingOnly
@@ -956,6 +960,7 @@ fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>,
     if let Some(tier) = &candidate.selection_tier {
         ctx.set_metadata(ROUTE_SELECTION_TIER, &**tier);
     }
+    set_credential_metadata(ctx, candidate.credential.as_ref());
 }
 
 /// Emit the minimal AI-owned edge-to-provider context.
@@ -1427,7 +1432,7 @@ mod tests {
         assert_eq!(
             ctx.cluster.as_deref(),
             Some("stale-remote"),
-            "freshness must not reorder candidates; the producer owns overlay ordering"
+            "freshness must not reorder candidates; the source owns overlay ordering"
         );
     }
 
@@ -1445,7 +1450,7 @@ mod tests {
         assert_eq!(
             ctx.cluster.as_deref(),
             Some("stale-local"),
-            "intelligent_route must preserve Grid/config order after admission filtering"
+            "intelligent_route must preserve overlay/config order after admission filtering"
         );
     }
 
@@ -1793,7 +1798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_first_preserved_when_producer_orders_it_first() {
+    async fn stale_first_preserved_when_source_orders_it_first() {
         let f = make_filter_with_fresh(&[
             ("inference_model", "llama", "site-a", "stale-local", false),
             ("inference_model", "llama", "site-b", "fresh-remote", true),
@@ -1806,7 +1811,7 @@ mod tests {
         assert_eq!(
             ctx.cluster.as_deref(),
             Some("stale-local"),
-            "intelligent_route must preserve input order; Grid is responsible for freshness ordering"
+            "intelligent_route must preserve input order; the source is responsible for freshness ordering"
         );
     }
 
@@ -2683,6 +2688,7 @@ mod tests {
             descriptor::validate_candidates(vec![
                 CandidateConfig {
                     cluster: cluster1.to_owned(),
+                    credential: None,
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
@@ -2690,6 +2696,7 @@ mod tests {
                 },
                 CandidateConfig {
                     cluster: cluster2.to_owned(),
+                    credential: None,
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
@@ -2705,6 +2712,7 @@ mod tests {
         RouteSnapshot::from_static(
             descriptor::validate_candidates(vec![CandidateConfig {
                 cluster: cluster.to_owned(),
+                credential: None,
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: "llama".to_owned(),
@@ -2751,6 +2759,7 @@ mod tests {
             route_candidates.push(RouteCandidate {
                 admission_state: AdmissionState::from_overlay_str(admission_str).unwrap(),
                 cluster: Arc::from(*cluster),
+                credential: None,
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: Arc::from("llama"),

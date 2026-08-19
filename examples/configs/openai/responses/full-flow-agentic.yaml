@@ -1,0 +1,179 @@
+# Responses API Full Flow — File Search Callout (Non-Streaming)
+#
+# Extends the full-flow pipeline with an iterative_request_router (IRR)
+# around the inference step, enabling server-side file search execution.
+# The IRR sends the request to the model, executes any returned
+# file_search_call through the vector store, and feeds the search
+# context back for a second model inference before returning the
+# final Responses API object.
+#
+# Because IRR fully buffers responses, this config does NOT support
+# streaming or WebSocket. For streaming without the agentic loop,
+# see full-flow.yaml. For MCP-driven agentic tool loops, see
+# agentic-loop.yaml (these two loop types cannot share an IRR step
+# because agentic_loop and file_search_callout use incompatible
+# response-body accumulation strategies).
+#
+# Pre-IRR filters run once on the client request to set up shared
+# state (ResponsesState) which persists across all IRR iterations
+# via extension swapping.
+#
+# Pre-IRR pipeline (runs once):
+#   1. openai_conversations — CRUD for the Conversations API
+#   2. openai_responses_format — classifies body, promotes metadata
+#   3. openai_responses_validate — validates parameters, generates IDs
+#   4. openai_tool_parse — parses tools array, promotes summary facts
+#   5. openai_response_store — persists responses, registers store backend
+#   6. openai_stream_events — accumulates SSE events (no-op here since
+#      IRR buffers the response; retained for pipeline consistency)
+#   7. openai_responses_rehydrate — loads previous_response_id / conversation
+#   8. openai_file_resolve — resolves file_id references via Files API
+#   9. openai_doc_extract — converts input_file to input_text for backends
+#      that do not natively support input_file
+#  10. openai_mcp_tool_resolve — resolves MCP tool entries via tools/list
+#
+# IRR inference filter chain (all routing lives inside the IRR step
+# because the IRR must be the terminal filter in the chain):
+#   Request phase (forward):
+#     openai_file_search_callout → openai_responses_proxy
+#       → headers → router → load_balancer
+#   Response phase (reverse):
+#     load_balancer → router → headers → openai_responses_proxy
+#       → openai_file_search_callout
+#
+# Only Responses API traffic (/v1/responses) is routed by this
+# config. Non-Responses paths (/v1/prompts, /v1/embeddings, etc.)
+# receive a route-miss error. For a full gateway that also routes
+# non-Responses traffic, see full-flow.yaml (without IRR).
+#
+# Transition rules (evaluated after each step's response-body):
+#   openai_file_search_callout.pending = "true" → next: inference
+#   default                                     → done (exit to client)
+#
+# Model responses that combine file_search_call with a client-executed
+# function_call are rejected until cross-request continuation state
+# exists.
+#
+# Security: StreamBuffer body callouts run before this listener's
+# header-phase filters. Deploy this example behind an outer
+# authentication and authorization boundary before enabling the
+# required allow_pre_security_callout acknowledgement below.
+#
+# Example requests:
+#
+#   # Simple — validated and routed through the IRR (single pass)
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
+#
+#   # Multi-turn with previous_response_id
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_abc"}'
+#
+#   # File search — model issues file_search_call, executed via vector store
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What does the README say about deployment?",
+#       "tools": [{"type": "file_search", "vector_store_ids": ["vs_abc"]}]
+#     }'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [full-flow-agentic-pipeline]
+
+filter_chains:
+  - name: full-flow-agentic-pipeline
+    filters:
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
+
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+
+      - filter: openai_responses_validate
+
+      - filter: openai_tool_parse
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_stream_events
+
+      - filter: openai_responses_rehydrate
+
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:9999"
+        allow_private_files_api_url: true
+        allow_pre_security_callout: true
+        forward_headers:
+          - authorization
+          - x-tenant-id
+        on_missing: reject
+        timeout_ms: 10000
+
+      - filter: openai_doc_extract
+        allow_pre_security_callout: true
+        on_unsupported: continue
+
+      - filter: openai_mcp_tool_resolve
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 8
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_response_bytes: 67108864
+        max_state_bytes: 136314880
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_file_search_callout
+                vector_store_url: http://127.0.0.1:3002
+                allow_private_url: true
+                timeout_ms: 5000
+                max_response_bytes: 10485760
+                max_total_response_bytes: 67108864
+                max_state_bytes: 136314880
+                callout_failure_mode: closed
+                forward_headers:
+                  - authorization
+              - filter: openai_responses_proxy
+                name: inference
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+              - filter: router
+                routes:
+                  - path: "/v1/responses"
+                    cluster: "inference-backend"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_file_search_callout
+                key: pending
+                value: "true"
+                next: inference
+              - default: true
+                done: true

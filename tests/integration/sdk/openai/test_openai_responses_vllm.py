@@ -42,6 +42,7 @@ VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 
@@ -85,6 +86,23 @@ def _ogx_endpoint() -> str:
     return f"{host}:{port}"
 
 
+def _patch_store_backend(config: str, db_path: str) -> str:
+    if DATABASE_URL.startswith("postgres"):
+        config = config.replace(
+            'database_url: "sqlite://responses.db?mode=rwc"',
+            f'database_url: "{DATABASE_URL}"\n'
+            "        allow_private_database_url: true\n"
+            "        ssl_mode: disable",
+        )
+        config = config.replace("backend: sqlite", "backend: postgres")
+    else:
+        config = config.replace(
+            "sqlite://responses.db?mode=rwc",
+            f"sqlite://{db_path}?mode=rwc",
+        )
+    return config
+
+
 def _write_config(praxis_port: int, db_path: str) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
@@ -92,10 +110,7 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
-    config = config.replace(
-        "sqlite://responses.db?mode=rwc",
-        f"sqlite://{db_path}?mode=rwc",
-    )
+    config = _patch_store_backend(config, db_path)
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
@@ -229,10 +244,7 @@ def _write_agentic_config(
         f'- "{vllm}"\n'
         "                    read_timeout_ms: 300000",
     )
-    config = config.replace(
-        "sqlite://responses.db?mode=rwc",
-        f"sqlite://{db_path}?mode=rwc",
-    )
+    config = _patch_store_backend(config, db_path)
     config = config.replace(
         "- filter: openai_mcp_tool_resolve\n",
         "- filter: openai_mcp_tool_resolve\n"
@@ -240,10 +252,10 @@ def _write_agentic_config(
     )
     config = config.replace(
         "- filter: openai_mcp_dispatch\n"
-        "              - filter: agentic_loop",
+        "              - filter: openai_agentic_loop",
         "- filter: openai_mcp_dispatch\n"
         "                allow_loopback: true\n"
-        "              - filter: agentic_loop",
+        "              - filter: openai_agentic_loop",
     )
     config = config.replace(
         "max_iterations: 11\n",
@@ -701,11 +713,11 @@ class TestAgenticLoopVLLM:
             f"rounds; got: {output_types}"
         )
 
-    def test_client_function_exits_agentic_loop(self, agentic_client):
+    def test_client_function_exits_openai_agentic_loop(self, agentic_client):
         """Client-side function tools exit the agentic loop without
         auto-execution, even when the IRR is active.
 
-        This proves the IRR + agentic_loop + mcp_dispatch correctly
+        This proves the IRR + openai_agentic_loop + mcp_dispatch correctly
         distinguish MCP tools (auto-loop) from client functions
         (return to caller).
         """

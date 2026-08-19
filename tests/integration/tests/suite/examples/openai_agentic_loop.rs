@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the agentic_loop filter with
+//! Integration tests for the openai_agentic_loop filter with
 //! `iterative_request_router`.
 //!
 //! These tests verify that IRR, request-supplied MCP resolution,
@@ -282,15 +282,15 @@ fn round_trip_captures_tool_and_model_requests() {
     );
 
     // -------------------------------------------------------------------------
-    // Assert agentic_loop bookkeeping in second request
+    // Assert openai_agentic_loop bookkeeping in second request
     // -------------------------------------------------------------------------
     assert_eq!(
         model_body["parallel_tool_calls"], false,
-        "agentic_loop must force parallel_tool_calls=false on re-entry"
+        "openai_agentic_loop must force parallel_tool_calls=false on re-entry"
     );
     assert_eq!(
         model_body["tool_choice"], "auto",
-        "agentic_loop must reset tool_choice to auto on re-entry"
+        "openai_agentic_loop must reset tool_choice to auto on re-entry"
     );
 }
 

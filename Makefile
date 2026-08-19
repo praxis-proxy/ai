@@ -14,6 +14,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-schema test-integration test-inference-fixtures \
+	test-postgres-unit test-postgres-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
@@ -81,6 +82,12 @@ test-inference-fixtures:
 	cargo test -p praxis-test-utils $(_NOCAPTURE)
 	cargo test -p xtask inference_fixtures $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --test suite inference_fixtures $(_NOCAPTURE)
+
+test-postgres-unit:
+	cargo test -p praxis-ai-apis store::tests::pg_ -- --ignored $(_NOCAPTURE)
+
+test-postgres-integration:
+	cargo test -p praxis-tests-integration --test suite openai_response_store_postgres -- --ignored $(_NOCAPTURE)
 
 openai-conformance:
 	cargo xtask openai-conformance $(OPENAI_CONFORMANCE_ARGS)
@@ -190,6 +197,8 @@ help:
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo "  test-inference-fixtures  inference fixture and replay tests"
+	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
+	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
 	@echo ""

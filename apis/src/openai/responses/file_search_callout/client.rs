@@ -390,8 +390,12 @@ impl FileSearchClient {
     /// each callout of the fan-out, so correlation is established
     /// once rather than per vector store.
     pub(crate) fn callout_headers(&self, ctx: &praxis_filter::HttpFilterContext<'_>) -> HeaderMap {
+        // On IRR continuation iterations the synthetic request lacks client
+        // credentials, so the allowlist is applied to the original request's
+        // headers rather than the synthetic ones.
+        let request_headers = super::callout_request_headers(ctx);
         self.api_client
-            .callout_headers(&ctx.request.headers, &Correlation::from_filter_context(ctx))
+            .callout_headers(&request_headers, &Correlation::from_filter_context(ctx))
     }
 
     /// Search multiple vector stores with bounded concurrency and aggregation.

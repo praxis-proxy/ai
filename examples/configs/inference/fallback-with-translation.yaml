@@ -1,0 +1,149 @@
+# Inference Fallback with Protocol Translation
+#
+# Demonstrates provider failover with Responses-to-Chat Completions
+# protocol translation using the iterative_request_router. When the
+# primary backend returns a retryable status, the request automatically
+# retries against a fallback provider. Both backends receive translated
+# Chat Completions requests with isolated credentials.
+#
+# Step boundary: the IRR resets per-step metadata for credential
+# isolation but preserves extensions across steps. This means:
+#
+#   - ResponsesState (extension, set by openai_responses_validate)
+#     survives step transitions.
+#   - openai_responses_format.format (metadata) does not.
+#
+# Because responses_to_chat_completions reads both metadata and
+# extensions, each step must re-run openai_responses_format and
+# openai_responses_validate to repopulate its metadata. Without
+# them the translation filter returns 500: "request pipeline state
+# is unavailable".
+#
+# Filter ordering within each step:
+#
+#   1. openai_responses_format         classify, set metadata
+#   2. openai_responses_model_rewrite  rewrite model (optional)
+#   3. openai_responses_validate       parse body, set metadata + extension
+#   4. responses_to_chat_completions   translate body using both
+#   5. path_rewrite                    /v1/responses -> /v1/chat/completions
+#   6. router                          select cluster
+#   7. credential_injection            inject per-cluster credentials
+#   8. load_balancer                   select endpoint
+#
+# Key ordering constraints:
+#   - 1 before 2: model rewrite reads openai_responses_format.stream
+#   - 2 before 3: validate parses after rewrite, so ResponsesState
+#     carries the effective model
+#   - 3 before 4: translation reads responses.response_id metadata
+#     and ResponsesState extension, both set by validate
+#   - 6 before 7: credential injection matches on ctx.cluster,
+#     which the router sets
+#
+# Pre-IRR filters:
+#   openai_responses_format rejects non-Responses requests early.
+#   openai_responses_validate rejects malformed bodies before the
+#   IRR allocates sub-request resources.
+#
+# Adapting for real providers:
+#   - Add openai_responses_model_rewrite between format and validate
+#     in the fallback step to map model names across providers.
+#   - Use env_var instead of value in credential_injection to read
+#     API keys from the environment at startup.
+#   - Add a headers filter (request_set Host) before load_balancer
+#     for external HTTPS upstreams.
+#   - Add tls: { sni: "hostname" } to the cluster for HTTPS.
+#   - Adjust the path_rewrite replacement per provider (e.g.
+#     /api/v1/chat/completions for OpenRouter).
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/inference/fallback-with-translation.yaml
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [inference-failover]
+
+filter_chains:
+  - name: inference-failover
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: iterative_request_router
+        initial_step: primary
+        steps:
+          - name: primary
+            filters:
+              - filter: openai_responses_format
+              - filter: openai_responses_validate
+              - filter: responses_to_chat_completions
+                max_body_bytes: 67108864
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: primary-backend
+              - filter: credential_injection
+                clusters:
+                  - name: primary-backend
+                    header: Authorization
+                    value: "primary-key"
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+              - filter: load_balancer
+                clusters:
+                  - name: primary-backend
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - status: [429, 502, 503, 504]
+                next: fallback
+              - default: true
+                done: true
+
+          - name: fallback
+            filters:
+              - filter: openai_responses_format
+              - filter: openai_responses_validate
+              - filter: responses_to_chat_completions
+                max_body_bytes: 67108864
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: fallback-backend
+              - filter: credential_injection
+                clusters:
+                  - name: fallback-backend
+                    header: Authorization
+                    value: "fallback-key"
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+              - filter: load_balancer
+                clusters:
+                  - name: fallback-backend
+                    endpoints:
+                      - "127.0.0.1:3002"
+            on_result:
+              - default: true
+                done: true

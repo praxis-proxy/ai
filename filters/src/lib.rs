@@ -25,7 +25,7 @@ pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
-pub use routing::IntelligentRouteFilter;
+pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;
 pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
 pub use trace_context::TraceContextFilter;
@@ -95,6 +95,8 @@ pub(crate) mod test_utils {
             response_header: None,
             response_headers_modified: false,
             subrequest_client: None,
+            #[cfg(feature = "praxis-main")]
+            subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
             rewritten_path: None,
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,

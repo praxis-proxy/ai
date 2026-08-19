@@ -1726,7 +1726,9 @@ fn pg_unique_suffix() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tid = std::thread::current().id();
-    format!("{id}_{tid:?}").replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
+    format!("{id}_{tid:?}")
+        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
+        .to_lowercase()
 }
 
 #[test]
