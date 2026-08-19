@@ -38,10 +38,10 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
-        rate: 1000                    # tokens replenished per second, per app
-        burst: 100000                 # max bucket capacity per app, in tokens
+        window: 1h                    # sliding window duration, per app
+        capacity: 100000              # max tokens admitted within `window`, per app
         estimate_tokens: 500          # fixed cost reserved per request at admission
-        bucket_key_header: x-app-id   # one independent bucket per app
+        bucket_key_header: x-app-id   # one independent budget per app
 
       - filter: token_count
         provider: openai   # openai | anthropic | google | bedrock | azure

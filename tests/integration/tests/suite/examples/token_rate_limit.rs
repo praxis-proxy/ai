@@ -55,18 +55,18 @@ const PLAIN_TEXT_BODY: &str = "ok";
 // -----------------------------------------------------------------------------
 
 /// Build a YAML config for the token rate limiting pipeline using the
-/// example file, substituting `burst`/`estimate_tokens` with the given
+/// example file, substituting `capacity`/`estimate_tokens` with the given
 /// values so tests can exercise small, deterministic budgets.
 fn token_rate_limit_config(
     proxy_port: u16,
     backend_port: u16,
-    burst: u64,
+    capacity: u64,
     estimate_tokens: u64,
 ) -> praxis_core::config::Config {
     let path = example_config_path("token-rate-limit.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let yaml = yaml
-        .replace("burst: 100000", &format!("burst: {burst}"))
+        .replace("capacity: 100000", &format!("capacity: {capacity}"))
         .replace("estimate_tokens: 500", &format!("estimate_tokens: {estimate_tokens}"));
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
     praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
@@ -77,7 +77,7 @@ fn token_rate_limit_config(
 // -----------------------------------------------------------------------------
 
 #[test]
-fn admits_request_within_budget_and_injects_token_headers() {
+fn admits_request_within_budget() {
     let backend = Backend::fixed(PLAIN_TEXT_BODY)
         .header("content-type", "text/plain")
         .start_with_shutdown();
@@ -88,19 +88,6 @@ fn admits_request_within_budget_and_injects_token_headers() {
     let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
     assert_eq!(parse_status(&raw), 200, "request within budget should be admitted");
     assert_eq!(parse_body(&raw), PLAIN_TEXT_BODY, "body should pass through unchanged");
-    assert_eq!(
-        parse_header(&raw, "x-ratelimit-limit-tokens"),
-        Some("100000".to_owned()),
-        "limit header should reflect configured burst"
-    );
-    assert!(
-        parse_header(&raw, "x-ratelimit-remaining-tokens").is_some(),
-        "remaining-tokens header should be present"
-    );
-    assert!(
-        parse_header(&raw, "x-ratelimit-reset-tokens").is_some(),
-        "reset header should be present"
-    );
 }
 
 #[test]
@@ -109,11 +96,11 @@ fn rejects_with_429_and_retry_after_when_estimate_budget_exhausted() {
         .header("content-type", "text/plain")
         .start_with_shutdown();
     let proxy_port = free_port();
-    // burst=90, estimate=40. start_proxy's readiness probe (a real GET /
-    // through the filter chain) consumes one reservation before the test
-    // body runs, and this backend returns no usage info so it's never
-    // reconciled: probe -40 -> 50 left, first request -40 -> 10 left
-    // (200), second request needs 40 more and must be rejected.
+    // capacity=90, estimate=40. start_proxy's readiness probe (a real GET
+    // / through the filter chain) consumes one reservation before the
+    // test body runs, and this backend returns no usage info so it's
+    // never reconciled: probe -40 -> 50 left, first request -40 -> 10
+    // left (200), second request needs 40 more and must be rejected.
     let config = token_rate_limit_config(proxy_port, backend.port(), 90, 40);
     let proxy = start_proxy(&config);
 
@@ -150,13 +137,13 @@ fn reconciliation_frees_budget_for_next_request_after_low_actual_usage() {
         .header("content-type", "application/json")
         .start_with_shutdown();
     let proxy_port = free_port();
-    // burst=60, estimate=40. Every admitted request (including
+    // capacity=60, estimate=40. Every admitted request (including
     // start_proxy's own readiness-probe GET / through the filter
     // chain) reserves 40 and then, since this backend's actual usage
     // (10) is far below the estimate, gets 30 released back on
-    // reconciliation — so the bucket settles into a steady drain of
+    // reconciliation — so the window settles into a steady drain of
     // only 10 net tokens per request instead of monotonically losing
-    // the full 40. Starting from a full bucket of 60:
+    // the full 40. Starting from an empty window (0/60 used):
     //   probe:   reserve 40 (60->20), reconcile +30 -> 50
     //   first:   reserve 40 (50->10), reconcile +30 -> 40   [200]
     //   second:  reserve 40 (40->0),  reconcile +30 -> 30   [200]
@@ -217,18 +204,18 @@ fn example_config_token_rate_limit() {
 // -----------------------------------------------------------------------------
 
 /// Build a YAML config for the per-app budget pipeline using the example
-/// file, substituting `burst`/`estimate_tokens` so tests can exercise
+/// file, substituting `capacity`/`estimate_tokens` so tests can exercise
 /// small, deterministic per-app budgets.
 fn token_rate_limit_per_app_config(
     proxy_port: u16,
     backend_port: u16,
-    burst: u64,
+    capacity: u64,
     estimate_tokens: u64,
 ) -> praxis_core::config::Config {
     let path = example_config_path("token-rate-limit-per-app.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let yaml = yaml
-        .replace("burst: 100000", &format!("burst: {burst}"))
+        .replace("capacity: 100000", &format!("capacity: {capacity}"))
         .replace("estimate_tokens: 500", &format!("estimate_tokens: {estimate_tokens}"));
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
     praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
@@ -245,10 +232,11 @@ fn bucket_key_header_isolates_per_app_budgets_across_multiple_apps() {
         .header("content-type", "text/plain")
         .start_with_shutdown();
     let proxy_port = free_port();
-    // burst=40, estimate=40: each app gets exactly one admitted request
-    // before its own bucket is exhausted. start_proxy's readiness probe
-    // (GET /, no x-app-id header) draws from the separate global fallback
-    // bucket, so it doesn't touch any per-app budgets.
+    // capacity=40, estimate=40: each app gets exactly one admitted
+    // request before its own budget is exhausted. start_proxy's
+    // readiness probe (GET /, no x-app-id header) draws from the
+    // separate global fallback budget, so it doesn't touch any per-app
+    // budgets.
     let config = token_rate_limit_per_app_config(proxy_port, backend.port(), 40, 40);
     let proxy = start_proxy(&config);
 
@@ -261,11 +249,6 @@ fn bucket_key_header_isolates_per_app_budgets_across_multiple_apps() {
             parse_status(&admitted),
             200,
             "{app}'s first request should be admitted from its own untouched budget"
-        );
-        assert_eq!(
-            parse_header(&admitted, "x-ratelimit-limit-tokens"),
-            Some("40".to_owned()),
-            "{app}'s limit header should reflect the configured per-app burst"
         );
 
         let blocked = http_send(
@@ -280,6 +263,12 @@ fn bucket_key_header_isolates_per_app_budgets_across_multiple_apps() {
         assert!(
             parse_header(&blocked, "retry-after").is_some(),
             "{app}'s 429 should carry a Retry-After header"
+        );
+        assert_eq!(
+            parse_header(&blocked, "x-ratelimit-limit-tokens"),
+            Some("40".to_owned()),
+            "{app}'s 429 limit header should reflect the configured per-app capacity, proving the block was \
+             this app's own budget rather than some shared/misattributed one"
         );
     }
 }

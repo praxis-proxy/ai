@@ -3389,7 +3389,6 @@ fn scan_json_balance_is_a_no_op_once_invalid() {
     assert!(!state.is_complete(), "an invalid scan must never report complete");
 }
 
-
 #[test]
 fn scan_json_balance_persists_across_chunk_calls() {
     let full = br#"{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t","status":{"state":"TASK_STATE_WORKING"}}}}"#;

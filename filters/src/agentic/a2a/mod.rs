@@ -978,7 +978,6 @@ fn clear_sse_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.cluster");
 }
 
-
 /// Build a `JsonRpcConfig` for the shared parser with A2A-appropriate defaults.
 fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
     use praxis_filter::builtins::http::payload_processing::json_rpc::config::{BatchPolicy, JsonRpcHeaders};
