@@ -69,7 +69,7 @@ wiremock = "0.6.5"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-praxis-core = { version = "0.5.2", package = "praxis-proxy-core" }
+praxis-core = { version = "0.5.2", package = "praxis-proxy-core", features = ["otel"] }
 praxis-filter = { version = "0.5.2", package = "praxis-proxy-filter" }
 praxis-protocol = { version = "0.5.2", package = "praxis-proxy-protocol" }
 praxis-tls = { version = "0.5.2", package = "praxis-proxy-tls" }
