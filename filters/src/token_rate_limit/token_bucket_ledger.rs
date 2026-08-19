@@ -64,8 +64,8 @@ impl TokenBucketConfig {
         if self.capacity == 0 {
             return Err("capacity must be positive".into());
         }
-        if self.refill_rate <= 0.0 {
-            return Err("refill_rate must be positive".into());
+        if !self.refill_rate.is_finite() || self.refill_rate <= 0.0 {
+            return Err("refill_rate must be a positive, finite number".into());
         }
         if self.reservation_timeout_ms == 0 {
             return Err("reservation timeout must be positive".into());
@@ -648,5 +648,28 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn non_finite_refill_rate_is_rejected() {
+        // FedRAMP-guidance (input validation, SI-10): `refill_rate <= 0.0`
+        // is always false for NaN and +/-Infinity, so a naive positivity
+        // check silently admits them. NaN would poison every refill
+        // calculation; Infinity would refill the bucket to capacity in any
+        // nonzero time delta, defeating the rate limit entirely.
+        for bad_rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                TokenBucketLedger::new(TokenBucketConfig {
+                    capacity: 1,
+                    refill_rate: bad_rate,
+                    reservation_timeout_ms: 1,
+                    max_keys: 1,
+                    max_key_length: 1,
+                    max_active_reservations: 1,
+                })
+                .is_err(),
+                "refill_rate {bad_rate} must be rejected as non-finite/non-positive"
+            );
+        }
     }
 }

@@ -1000,9 +1000,12 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
 
 #[tokio::test]
 async fn valkey_failure_fails_closed() {
-    // Unreachable backend (no server on this port): a rate limiter that
-    // silently admits everything when its backend is down defeats the
-    // point of rate limiting it at all.
+    // FedRAMP-guidance (fail-secure on component failure, denial-of-service
+    // protection): an unreachable backend (no server on this port) must
+    // reject, not admit -- a rate limiter that silently lets every request
+    // through when its state store is unavailable defeats the point of
+    // rate limiting it at all, right when a backend outage makes runaway
+    // spend/load most likely.
     let yaml = single_rule_yaml(
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 10\nbackend:\n  kind: valkey\n  \
          url: redis://127.0.0.1:1\n",

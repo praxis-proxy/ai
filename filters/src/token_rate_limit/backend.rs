@@ -1014,16 +1014,16 @@ impl ValkeyTokenBucketBackend {
     ///
     /// Returns [`BackendError::Unavailable`] if `config.url` isn't a
     /// well-formed Valkey/Redis connection URL, or if `capacity`/
-    /// `refill_rate` aren't positive.
+    /// `refill_rate` aren't positive and finite.
     pub(super) fn new(config: ValkeyTokenBucketConfig) -> Result<Self, BackendError> {
         if config.capacity == 0 {
             return Err(BackendError::Unavailable(
                 "token_bucket capacity must be positive".into(),
             ));
         }
-        if config.refill_rate <= 0.0 {
+        if !config.refill_rate.is_finite() || config.refill_rate <= 0.0 {
             return Err(BackendError::Unavailable(
-                "token_bucket refill_rate must be positive".into(),
+                "token_bucket refill_rate must be a positive, finite number".into(),
             ));
         }
         let valkey = ValkeyEval::new(config.url)?;
@@ -1400,6 +1400,36 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn valkey_token_bucket_backend_rejects_non_finite_refill_rate() {
+        // FedRAMP-guidance (input validation, SI-10): NaN/Infinity both
+        // satisfy `refill_rate > 0.0`'s negation check being false (a
+        // naive `<= 0.0` guard never trips), yet either would corrupt the
+        // shared Lua-side refill math or refill to capacity instantly --
+        // for a Valkey-backed rule that's a state-poisoning/DoS bug
+        // shared across every gateway replica, not just one instance.
+        let base = || ValkeyTokenBucketConfig {
+            url: "redis://127.0.0.1:1".into(),
+            namespace: "ns".into(),
+            rule: "default".into(),
+            capacity: 10,
+            refill_rate: 1.0,
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 8,
+        };
+        for bad_rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
+                    refill_rate: bad_rate,
+                    ..base()
+                })
+                .is_err(),
+                "refill_rate {bad_rate} must be rejected as non-finite/non-positive"
+            );
+        }
     }
 
     #[test]
