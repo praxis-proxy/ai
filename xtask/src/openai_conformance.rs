@@ -21,6 +21,8 @@ mod oasdiff;
 mod print;
 /// Complete reference verification and semantic area projection.
 mod reference;
+/// Responses registry drift check against the pinned specification.
+mod responses_registry;
 /// Semantic YAML tree used for full-spec projection.
 mod semantic_yaml;
 /// `OpenAPI` spec loading and operation extraction.
@@ -110,6 +112,17 @@ pub(crate) struct Args {
 // -----------------------------------------------------------------------------
 // Entry Point
 // -----------------------------------------------------------------------------
+
+/// Run the Responses registry drift check and report the outcome.
+pub(crate) fn run_responses_registry_check() {
+    match responses_registry::check() {
+        Ok(summary) => println!("{summary}"),
+        Err(failures) => {
+            eprintln!("{failures}");
+            std::process::exit(1);
+        },
+    }
+}
 
 /// Run OpenAI API conformance coverage calculation.
 #[expect(clippy::too_many_lines, reason = "CLI orchestration and threshold handling")]
