@@ -8,7 +8,27 @@ use praxis_filter::{FilterAction, HttpFilter};
 use super::TokenRateLimitFilter;
 use crate::token_usage::META_TOKEN_TOTAL;
 
-/// Build a request carrying a single extra header, for `bucket_key_header` tests.
+/// Wrap one rule body (already-valid YAML lines, unindented) into a
+/// full one-rule `rules:` config, named `"default"`. Most scenarios
+/// pre-date per-rule algorithm choice and only care about one rule's
+/// behavior in isolation -- multi-rule dispatch itself is covered
+/// separately below.
+fn single_rule(body: &str) -> String {
+    let indented = body
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("rules:\n  - name: default\n{indented}\n")
+}
+
+/// [`single_rule`], parsed straight into a [`serde_yaml::Value`].
+fn single_rule_yaml(body: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(&single_rule(body)).unwrap()
+}
+
+/// Build a request carrying a single extra header, for `bucket_key_header`/
+/// `match` tests.
 fn make_request_with_header(name: &str, value: &str) -> praxis_filter::Request {
     let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     req.headers.insert(
@@ -24,44 +44,71 @@ fn make_request_with_header(name: &str, value: &str) -> praxis_filter::Request {
 
 #[test]
 fn from_config_parses_valid_config() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100000\nestimate_tokens: 500").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100000\nestimate_tokens: 500");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     assert_eq!(filter.name(), "token_rate_limit");
 }
 
 #[test]
+fn from_config_rejects_an_empty_rules_list() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("rules: []\n").unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("at least one rule"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_duplicate_rule_names() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: dup\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   estimate_tokens: 10\n\
+         \x20 - name: dup\n\
+         \x20   algorithm: token_bucket\n\
+         \x20   capacity: 100\n\
+         \x20   refill_rate: 1\n\
+         \x20   estimate_tokens: 10\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("duplicate rule name"), "got: {err}");
+}
+
+#[test]
 fn from_config_rejects_zero_capacity() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 0\nestimate_tokens: 10").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 0\nestimate_tokens: 10");
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("capacity must be"), "got: {err}");
 }
 
 #[test]
 fn from_config_rejects_zero_estimate() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 0").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 0");
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("estimate_tokens"), "got: {err}");
 }
 
 #[test]
 fn from_config_rejects_estimate_exceeding_capacity() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 500").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 500");
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("must not exceed capacity"), "got: {err}");
 }
 
 #[test]
 fn from_config_rejects_invalid_window() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: not-a-duration\ncapacity: 100\nestimate_tokens: 5").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: not-a-duration\ncapacity: 100\nestimate_tokens: 5");
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("invalid duration"), "got: {err}");
 }
 
 #[test]
 fn from_config_rejects_unknown_field() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 5\nbucket_key: header").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nbucket_key: header",
+    );
     assert!(
         TokenRateLimitFilter::from_config(&yaml).is_err(),
         "composite/CEL bucket keys are still deliberately unsupported, config should reject the unknown field"
@@ -69,9 +116,17 @@ fn from_config_rejects_unknown_field() {
 }
 
 #[test]
+fn from_config_rejects_the_old_flat_pre_rules_shape() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100000\nestimate_tokens: 500").unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("rules"), "got: {err}");
+}
+
+#[test]
 fn from_config_accepts_bucket_key_header() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 5\nbucket_key_header: x-app-id").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nbucket_key_header: x-app-id",
+    );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     assert_eq!(filter.name(), "token_rate_limit");
 }
@@ -81,7 +136,7 @@ fn from_config_defaults_bucket_key_header_to_none_when_absent() {
     // Existing configs without bucket_key_header must keep working unchanged
     // (single shared budget) -- covered by from_config_parses_valid_config,
     // asserted again here to pin the default explicitly as this field is added.
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 5").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5");
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
 }
 
@@ -94,14 +149,15 @@ fn from_config_defaults_to_memory_backend_when_backend_block_absent() {
     // No `backend:` block at all must keep working exactly like before this
     // field was added -- a config written for the in-process-only MVP
     // should never start silently expecting shared state it never asked for.
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 5").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5");
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
 }
 
 #[test]
 fn from_config_accepts_explicit_memory_backend() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 5\nbackend:\n  kind: memory").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nbackend:\n  kind: memory",
+    );
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
 }
 
@@ -110,18 +166,19 @@ fn from_config_rejects_valkey_backend_without_url() {
     // A distributed deployment that forgets `backend.url` must fail loudly
     // at startup, not silently fall back to per-instance state -- silent
     // fallback would defeat the whole point of asking for a shared backend.
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 5\nbackend:\n  kind: valkey").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nbackend:\n  kind: valkey",
+    );
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("backend.url is required"), "got: {err}");
 }
 
 #[test]
 fn from_config_accepts_valkey_backend_with_url() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "window: 1h\ncapacity: 100\nestimate_tokens: 5\nbackend:\n  kind: valkey\n  url: redis://127.0.0.1:6399",
-    )
-    .unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nbackend:\n  kind: valkey\n  url: \
+         redis://127.0.0.1:6399",
+    );
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
 }
 
@@ -204,7 +261,7 @@ fn expand_backend_url_with_rejects_an_invalid_variable_name() {
 
 #[tokio::test]
 async fn admits_request_within_budget() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 1000\nestimate_tokens: 200").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimate_tokens: 200");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -220,7 +277,7 @@ async fn admits_request_within_budget() {
 
 #[tokio::test]
 async fn rejects_with_429_when_budget_exhausted() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 60").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 60");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -256,7 +313,7 @@ async fn rejects_with_429_when_budget_exhausted() {
 
 #[tokio::test]
 async fn rejection_does_not_consume_budget() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 10\nestimate_tokens: 10").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nestimate_tokens: 10");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -281,13 +338,43 @@ async fn rejection_does_not_consume_budget() {
     }
 }
 
+#[tokio::test]
+async fn a_request_matching_no_rule_is_not_rate_limited() {
+    // Business behavior: a rule scoped to one app must not silently
+    // become a global rate limiter for traffic it was never configured
+    // to cover -- operators who want a catch-all budget add a trailing
+    // rule with no `match`.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: alpha-only\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1\n\
+         \x20   estimate_tokens: 1\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let unmatched_req = make_request_with_header("x-app-id", "beta");
+    for _ in 0..5 {
+        let mut ctx = crate::test_utils::make_filter_context(&unmatched_req);
+        assert!(
+            matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+            "traffic matching no configured rule must pass through, even repeatedly"
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Reconciliation (on_response_body)
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
 async fn reconcile_releases_unused_tokens_on_overestimate() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 50").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 50");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -319,7 +406,7 @@ async fn reconcile_releases_unused_tokens_on_overestimate() {
 
 #[tokio::test]
 async fn reconcile_draws_more_tokens_on_underestimate_and_can_starve_next_request() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 50").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 50");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -342,7 +429,7 @@ async fn reconcile_draws_more_tokens_on_underestimate_and_can_starve_next_reques
 
 #[tokio::test]
 async fn reconcile_charges_the_estimate_without_token_total_metadata() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 50").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 50");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -374,7 +461,7 @@ async fn reconcile_charges_the_estimate_without_token_total_metadata() {
 
 #[tokio::test]
 async fn does_not_reconcile_before_end_of_stream() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 50").unwrap();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 50");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -411,8 +498,9 @@ async fn does_not_reconcile_before_end_of_stream() {
 
 #[tokio::test]
 async fn bucket_key_header_isolates_budgets_across_apps() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 100\nbucket_key_header: x-app-id").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 100\nbucket_key_header: x-app-id",
+    );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     // app-a exhausts its own 100-token budget entirely...
@@ -443,8 +531,9 @@ async fn bucket_key_header_isolates_budgets_across_apps() {
 
 #[tokio::test]
 async fn bucket_key_header_falls_back_to_shared_bucket_when_header_absent() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 50\nestimate_tokens: 50\nbucket_key_header: x-app-id").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 50\nestimate_tokens: 50\nbucket_key_header: x-app-id",
+    );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     // No x-app-id header on either request: both should share one fallback budget.
@@ -466,8 +555,9 @@ async fn bucket_key_header_falls_back_to_shared_bucket_when_header_absent() {
 
 #[tokio::test]
 async fn bucket_key_header_reconciles_against_the_same_per_key_bucket() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 50\nbucket_key_header: x-app-id").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 50\nbucket_key_header: x-app-id",
+    );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let app_c_req = make_request_with_header("x-app-id", "app-c");
@@ -505,8 +595,9 @@ async fn bucket_key_header_with_empty_or_oversized_value_falls_back_to_the_share
     // be able to mint its own budget, which would let a client exhaust
     // the bucket_key_header cardinality bound cheaply. Both fall back to
     // the one shared budget instead.
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 50\nestimate_tokens: 50\nbucket_key_header: x-app-id").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 50\nestimate_tokens: 50\nbucket_key_header: x-app-id",
+    );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let empty_value_req = make_request_with_header("x-app-id", "");
@@ -543,8 +634,9 @@ async fn lost_request_is_charged_at_its_estimate_and_cannot_bypass_the_budget() 
     // how long such a reservation is trusted before being conservatively
     // charged at its estimate, matching the "lost request handling"
     // question `ai#658`'s own design doc leaves open.
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 300ms\ncapacity: 50\nestimate_tokens: 50\nreservation_timeout: 50ms").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 300ms\ncapacity: 50\nestimate_tokens: 50\nreservation_timeout: 50ms",
+    );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -579,18 +671,182 @@ async fn lost_request_is_charged_at_its_estimate_and_cannot_bypass_the_budget() 
 
 #[test]
 fn from_config_accepts_custom_reservation_timeout() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 5\nreservation_timeout: 10s").unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nreservation_timeout: 10s",
+    );
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
 }
 
 #[test]
 fn from_config_rejects_invalid_reservation_timeout() {
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str("window: 1h\ncapacity: 100\nestimate_tokens: 5\nreservation_timeout: not-a-duration")
-            .unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nreservation_timeout: \
+         not-a-duration",
+    );
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("invalid duration"), "got: {err}");
+}
+
+// -----------------------------------------------------------------------------
+// Per-rule algorithm choice (ai#789/praxis#551): mixed sliding_window and
+// token_bucket rules, disambiguated by a header match -- the customer
+// scenario this feature exists for (each app/team picks its own
+// algorithm and budget).
+// -----------------------------------------------------------------------------
+
+/// Two rules, one per algorithm, matched by `x-app-id`: `alpha` gets a
+/// tiny sliding-window budget, `beta` gets a tiny token-bucket budget.
+fn two_algorithm_rules_yaml() -> serde_yaml::Value {
+    serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: team-alpha\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   estimate_tokens: 100\n\
+         \x20 - name: team-beta\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: beta\n\
+         \x20   algorithm: token_bucket\n\
+         \x20   capacity: 100\n\
+         \x20   refill_rate: 1\n\
+         \x20   estimate_tokens: 100\n",
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn dispatches_to_the_first_matching_rule_by_algorithm_and_enforces_its_own_budget() {
+    let filter = TokenRateLimitFilter::from_config(&two_algorithm_rules_yaml()).unwrap();
+
+    let alpha_req = make_request_with_header("x-app-id", "alpha");
+    let mut ctx = crate::test_utils::make_filter_context(&alpha_req);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "alpha's sliding-window rule should admit its first 100-token request"
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&alpha_req);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(_)),
+        "alpha's sliding-window budget is now exhausted"
+    );
+
+    // beta's independent token-bucket rule/budget is completely untouched
+    // by alpha's exhaustion, proving the two rules (and algorithms) are
+    // fully isolated from one another.
+    let beta_req = make_request_with_header("x-app-id", "beta");
+    let mut ctx = crate::test_utils::make_filter_context(&beta_req);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "beta's token-bucket rule must be unaffected by alpha's exhausted sliding-window rule"
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&beta_req);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(_)),
+        "beta's token-bucket budget is now exhausted too"
+    );
+}
+
+/// Two-rule config for [`reconciliation_settles_against_the_same_rule_that_admitted_the_request`]:
+/// alpha (sliding window, capacity 5) and beta (token bucket, capacity
+/// 100, `estimate_tokens` 40 -- smaller than capacity so a correct vs.
+/// wrong/no-op credit-back is observably distinguishable).
+fn team_alpha_sliding_and_team_beta_bucket_config() -> serde_yaml::Value {
+    serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: team-alpha\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5\n\
+         \x20   estimate_tokens: 5\n\
+         \x20 - name: team-beta\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: beta\n\
+         \x20   algorithm: token_bucket\n\
+         \x20   capacity: 100\n\
+         \x20   refill_rate: 0.0001\n\
+         \x20   estimate_tokens: 40\n",
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn reconciliation_settles_against_the_same_rule_that_admitted_the_request() {
+    // Regression guard for the rule-index bookkeeping: reconciling a
+    // token-bucket-admitted request must credit back into *that same*
+    // rule's own bucket, not silently no-op or corrupt a different rule's
+    // (e.g. the sliding-window one's) state.
+    let filter = TokenRateLimitFilter::from_config(&team_alpha_sliding_and_team_beta_bucket_config()).unwrap();
+
+    let beta_req = make_request_with_header("x-app-id", "beta");
+    // 100 - 40 - 40 = 20 remaining, then denied on a third 40-token ask.
+    let mut first_ctx = crate::test_utils::make_filter_context(&beta_req);
+    assert!(matches!(
+        filter.on_request(&mut first_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        request_action(&*filter, &beta_req).await,
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        request_action(&*filter, &beta_req).await,
+        FilterAction::Reject(_)
+    ));
+
+    // Reconcile the *first* reservation down to actual usage of 10
+    // (refunding 30): if this credited the wrong rule, or no-op'd, beta's
+    // bucket would still be stuck at 20 and stay denied below.
+    first_ctx.set_metadata(META_TOKEN_TOTAL, "10");
+    let mut body = None;
+    drop(filter.on_response_body(&mut first_ctx, &mut body, true).unwrap());
+
+    // 20 + 30 refund = 50 available, enough for one more 40-token request.
+    assert!(
+        matches!(request_action(&*filter, &beta_req).await, FilterAction::Continue),
+        "the refund from reconciling beta's own reservation must land in beta's own bucket"
+    );
+
+    // alpha's untouched sliding-window rule must still have its full
+    // capacity -- proving the refund didn't leak into the wrong rule.
+    let alpha_req = make_request_with_header("x-app-id", "alpha");
+    assert!(
+        matches!(request_action(&*filter, &alpha_req).await, FilterAction::Continue),
+        "alpha's rule must be completely unaffected by beta's reconciliation"
+    );
+}
+
+#[test]
+fn from_config_accepts_a_token_bucket_rule() {
+    let yaml = single_rule_yaml("algorithm: token_bucket\ncapacity: 100\nrefill_rate: 10\nestimate_tokens: 5");
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[tokio::test]
+async fn token_bucket_rule_admits_within_capacity_and_denies_over_it() {
+    let yaml = single_rule_yaml("algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nestimate_tokens: 100");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(_)
+    ));
 }
 
 // -----------------------------------------------------------------------------
@@ -602,10 +858,39 @@ fn from_config_rejects_invalid_reservation_timeout() {
 //   TOKEN_RATE_LIMIT_VALKEY_URL=redis://127.0.0.1:6400 cargo test -p praxis-ai-filters token_rate_limit
 // -----------------------------------------------------------------------------
 
+/// [`single_rule`], with a trailing `backend: {kind: valkey}` block
+/// appended -- shared by the cross-instance/worker-reconciliation
+/// scenarios below, which only vary the algorithm-specific rule body.
+fn single_rule_valkey_yaml(algorithm_body: &str, url: &str, namespace: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(&single_rule(&format!(
+        "{algorithm_body}\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: {namespace}\n"
+    )))
+    .unwrap()
+}
+
 /// `filter.on_request` against a fresh context for one test request.
 async fn request_action(filter: &dyn HttpFilter, req: &praxis_filter::Request) -> FilterAction {
     let mut ctx = crate::test_utils::make_filter_context(req);
     filter.on_request(&mut ctx).await.unwrap()
+}
+
+/// Assert `req` is admitted by `filter`, with a business-behavior message
+/// explaining why (for the many cross-instance/cross-algorithm Valkey
+/// scenarios below).
+async fn assert_admitted(filter: &dyn HttpFilter, req: &praxis_filter::Request, why: &str) {
+    assert!(
+        matches!(request_action(filter, req).await, FilterAction::Continue),
+        "{why}"
+    );
+}
+
+/// Assert `req` is denied (429) by `filter`, with a business-behavior
+/// message explaining why.
+async fn assert_denied(filter: &dyn HttpFilter, req: &praxis_filter::Request, why: &str) {
+    assert!(
+        matches!(request_action(filter, req).await, FilterAction::Reject(_)),
+        "{why}"
+    );
 }
 
 /// Poll `filter.on_request` for `req` up to `attempts` times, sleeping
@@ -629,10 +914,11 @@ async fn valkey_budget_exhausted_on_one_instance_is_denied_on_another() {
         return;
     };
     let namespace = format!("praxis-test-cross-instance-{}", std::process::id());
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "window: 1h\ncapacity: 100\nestimate_tokens: 100\nbucket_key_header: x-app-id\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: {namespace}\n"
-    ))
-    .unwrap();
+    let yaml = single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 100\nbucket_key_header: x-app-id",
+        &url,
+        &namespace,
+    );
 
     // Two independent filter instances, exactly as two gateway replicas
     // would each build their own filter from the same config.
@@ -640,24 +926,17 @@ async fn valkey_budget_exhausted_on_one_instance_is_denied_on_another() {
     let instance_two = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let app_a_req = make_request_with_header("x-app-id", "app-a");
-    assert!(
-        matches!(
-            request_action(instance_one.as_ref(), &app_a_req).await,
-            FilterAction::Continue
-        ),
-        "app-a's first request should be admitted on instance one"
-    );
+    assert_admitted(instance_one.as_ref(), &app_a_req, "admitted on instance one").await;
 
     // The *second* gateway instance must see app-a's budget as already
     // exhausted -- this is the property that makes Valkey worth the
     // added complexity over in-process state (final scenario).
-    assert!(
-        matches!(
-            request_action(instance_two.as_ref(), &app_a_req).await,
-            FilterAction::Reject(_)
-        ),
-        "app-a's exhausted budget must be visible on instance two via shared Valkey state"
-    );
+    assert_denied(
+        instance_two.as_ref(),
+        &app_a_req,
+        "exhausted budget visible via shared Valkey state",
+    )
+    .await;
 
     // app-b, sharing neither app-a's identity nor its budget, must be
     // unaffected by app-a's exhaustion -- isolation holds across the
@@ -665,13 +944,12 @@ async fn valkey_budget_exhausted_on_one_instance_is_denied_on_another() {
     // two specifically: the same instance (and shared Valkey namespace)
     // that just correctly denied app-a.
     let app_b_req = make_request_with_header("x-app-id", "app-b");
-    assert!(
-        matches!(
-            request_action(instance_two.as_ref(), &app_b_req).await,
-            FilterAction::Continue
-        ),
-        "app-b must be unaffected by app-a's exhausted budget, even sharing the same Valkey namespace"
-    );
+    assert_admitted(
+        instance_two.as_ref(),
+        &app_b_req,
+        "app-b unaffected by app-a's exhausted budget",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -681,18 +959,17 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
         return;
     };
     let namespace = format!("praxis-test-valkey-worker-{}", std::process::id());
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "window: 1h\ncapacity: 100\nestimate_tokens: 50\nbucket_key_header: x-app-id\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: {namespace}\n"
-    ))
-    .unwrap();
+    let yaml = single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 50\nbucket_key_header: x-app-id",
+        &url,
+        &namespace,
+    );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let app_a_req = make_request_with_header("x-app-id", "app-a");
     let mut ctx = crate::test_utils::make_filter_context(&app_a_req);
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
     ctx.set_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
     // Reconciliation for a Valkey backend is enqueued onto a background
@@ -700,19 +977,18 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
     // up on a network round-trip that has no bearing on this request's
     // own admission) -- so the freed budget becomes visible asynchronously.
     let mut body = None;
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
-        FilterAction::Continue
-    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
 
     // 10 (settled) + 85 should just fit under capacity=100 only once the
     // worker has actually released the 40 unused reserved tokens (50
     // estimate - 10 actual); before that, 50 (still-active reservation)
     // + 85 would exceed capacity and be denied.
-    let yaml_probe: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "window: 1h\ncapacity: 100\nestimate_tokens: 85\nbucket_key_header: x-app-id\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: {namespace}\n"
-    ))
-    .unwrap();
+    let yaml_probe = single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 85\nbucket_key_header: x-app-id",
+        &url,
+        &namespace,
+    );
     let probe_filter = TokenRateLimitFilter::from_config(&yaml_probe).unwrap();
 
     let settled = poll_until_admitted(probe_filter.as_ref(), &app_a_req, 40).await;
@@ -727,10 +1003,10 @@ async fn valkey_failure_fails_closed() {
     // Unreachable backend (no server on this port): a rate limiter that
     // silently admits everything when its backend is down defeats the
     // point of rate limiting it at all.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "window: 1h\ncapacity: 100\nestimate_tokens: 10\nbackend:\n  kind: valkey\n  url: redis://127.0.0.1:1\n",
-    )
-    .unwrap();
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 10\nbackend:\n  kind: valkey\n  \
+         url: redis://127.0.0.1:1\n",
+    );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -741,4 +1017,109 @@ async fn valkey_failure_fails_closed() {
         },
         other => panic!("unreachable Valkey backend must not admit the request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn valkey_token_bucket_budget_exhausted_on_one_instance_is_denied_on_another() {
+    // The token-bucket analog of `valkey_budget_exhausted_on_one_instance_is_denied_on_another`:
+    // proves the *second* algorithm also gets the distributed-state
+    // property that's the whole point of the Valkey backend, not just
+    // the sliding-window one.
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-tb-cross-instance-{}", std::process::id());
+    let yaml = single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.001\nestimate_tokens: 100\nbucket_key_header: x-app-id",
+        &url,
+        &namespace,
+    );
+
+    let instance_one = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let instance_two = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let app_a_req = make_request_with_header("x-app-id", "app-a");
+    assert_admitted(instance_one.as_ref(), &app_a_req, "admitted on instance one").await;
+    assert_denied(
+        instance_two.as_ref(),
+        &app_a_req,
+        "exhausted bucket visible via shared Valkey state",
+    )
+    .await;
+
+    let app_b_req = make_request_with_header("x-app-id", "app-b");
+    assert_admitted(
+        instance_two.as_ref(),
+        &app_b_req,
+        "app-b unaffected by app-a's exhaustion",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_token_bucket_failure_fails_closed() {
+    // The token-bucket analog of `valkey_failure_fails_closed`: an
+    // unreachable Valkey backend must not silently admit token-bucket
+    // requests either -- fail-closed has to hold for both algorithms,
+    // not just the sliding-window one it was first proven on.
+    let yaml = single_rule_yaml(
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nestimate_tokens: 10\nbackend:\n  kind: valkey\n  \
+         url: redis://127.0.0.1:1\n",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    match filter.on_request(&mut ctx).await.unwrap() {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 503, "unreachable backend should fail closed with 503");
+        },
+        other => panic!("unreachable Valkey backend must not admit the token-bucket request, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
+    // Token-bucket analog of `valkey_worker_reconciles_usage_off_the_response_path`:
+    // reconciliation is enqueued onto the background worker, not awaited
+    // inline, and its credit becomes visible once the worker runs.
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-tb-worker-{}", std::process::id());
+    let yaml = single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nestimate_tokens: 50\nbucket_key_header: x-app-id",
+        &url,
+        &namespace,
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let app_a_req = make_request_with_header("x-app-id", "app-a");
+    let mut ctx = crate::test_utils::make_filter_context(&app_a_req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    ctx.set_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
+
+    let mut body = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    // 10 (settled) + 85 should just fit under capacity=100 only once the
+    // worker has actually credited back the 40 unused reserved tokens
+    // (50 estimate - 10 actual); before that, 50 (still-reserved) + 85
+    // would exceed capacity and be denied.
+    let yaml_probe = single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nestimate_tokens: 85\nbucket_key_header: x-app-id",
+        &url,
+        &namespace,
+    );
+    let probe_filter = TokenRateLimitFilter::from_config(&yaml_probe).unwrap();
+
+    let settled = poll_until_admitted(probe_filter.as_ref(), &app_a_req, 40).await;
+    assert!(
+        settled,
+        "worker-based reconciliation should eventually credit into the shared bucket"
+    );
 }

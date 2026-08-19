@@ -10,6 +10,13 @@
 //! provider-reported usage (`token_count`'s `token.total`) once the
 //! response completes. Also covers `ai#129`'s `bucket_key_header`
 //! per-app budgets (`token-rate-limit-per-app.yaml`).
+//!
+//! `mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas`
+//! additionally covers `ai#789`/`praxis#551`'s per-rule algorithm choice
+//! (`rules:`/`match:`/`algorithm:`) end-to-end through the real
+//! [`praxis_filter::HttpFilter`] pipeline, gated on a live Valkey/Redis
+//! instance the same way `filters/src/token_rate_limit/tests.rs`'s
+//! unit-level Valkey tests are.
 
 use std::collections::HashMap;
 
@@ -271,6 +278,162 @@ fn bucket_key_header_isolates_per_app_budgets_across_multiple_apps() {
              this app's own budget rather than some shared/misattributed one"
         );
     }
+}
+
+// -----------------------------------------------------------------------------
+// Mixed algorithms, per rule (ai#789/praxis#551) -- Valkey-backed, driven
+// through the real gateway pipeline across two independent proxy
+// instances (simulated replicas), gated on a live Valkey/Redis instance
+// via TOKEN_RATE_LIMIT_VALKEY_URL (see filters/src/token_rate_limit/
+// tests.rs for local setup instructions).
+// -----------------------------------------------------------------------------
+
+/// Two `token_rate_limit` rules sharing one Valkey namespace: `team-alpha`
+/// (matched on `x-app-id: alpha`) enforces a sliding-window budget,
+/// `team-beta` (matched on `x-app-id: beta`) enforces a token-bucket
+/// budget. A request matching neither rule (no `x-app-id` header) is a
+/// catch-all-free config here, so it passes through unrated -- this
+/// config is deliberately about proving per-algorithm isolation, not
+/// fallback-bucket behavior (already covered above).
+fn mixed_algorithm_rules_config(proxy_port: u16, backend_port: u16, valkey_url: &str, namespace: &str) -> String {
+    let yaml = format!(
+        "listeners:\n\
+         \x20 - name: default\n\
+         \x20   address: \"0.0.0.0:8080\"\n\
+         \x20   filter_chains:\n\
+         \x20     - main\n\
+         filter_chains:\n\
+         \x20 - name: main\n\
+         \x20   filters:\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path_prefix: \"/\"\n\
+         \x20           cluster: backend\n\
+         \x20     - filter: token_rate_limit\n\
+         \x20       rules:\n\
+         \x20         - name: team-alpha\n\
+         \x20           match:\n\
+         \x20             headers:\n\
+         \x20               x-app-id: alpha\n\
+         \x20           algorithm: sliding_window\n\
+         \x20           window: 1h\n\
+         \x20           capacity: 100\n\
+         \x20           estimate_tokens: 100\n\
+         \x20           backend:\n\
+         \x20             kind: valkey\n\
+         \x20             url: {valkey_url}\n\
+         \x20             namespace: {namespace}\n\
+         \x20         - name: team-beta\n\
+         \x20           match:\n\
+         \x20             headers:\n\
+         \x20               x-app-id: beta\n\
+         \x20           algorithm: token_bucket\n\
+         \x20           capacity: 100\n\
+         \x20           refill_rate: 0.001\n\
+         \x20           estimate_tokens: 100\n\
+         \x20           backend:\n\
+         \x20             kind: valkey\n\
+         \x20             url: {valkey_url}\n\
+         \x20             namespace: {namespace}\n\
+         \x20     - filter: access_log\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         \x20         - name: backend\n\
+         \x20           endpoints:\n\
+         \x20             - \"127.0.0.1:3000\"\n"
+    );
+    patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]))
+}
+
+/// Proves both algorithms get the distributed-state property that's the
+/// whole point of the Valkey backend -- not just in isolation (already
+/// covered at the unit-test tier in `filters/src/token_rate_limit/
+/// tests.rs`), but through the real gateway pipeline, with two
+/// independent proxy processes standing in for two gateway
+/// replicas/instances sharing one Valkey namespace behind a load
+/// balancer.
+#[test]
+fn mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas() {
+    let Ok(valkey_url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        eprintln!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-it-mixed-algorithms-{}", std::process::id());
+
+    let backend_one = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let backend_two = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+
+    // Two independent proxy processes, each built from the same rules
+    // config and pointed at the same Valkey namespace -- exactly as two
+    // gateway replicas behind a load balancer would be.
+    let proxy_one_port = free_port();
+    let config_one = praxis_core::config::Config::from_yaml(&mixed_algorithm_rules_config(
+        proxy_one_port,
+        backend_one.port(),
+        &valkey_url,
+        &namespace,
+    ))
+    .expect("config should parse");
+    let proxy_one = start_proxy(&config_one);
+
+    let proxy_two_port = free_port();
+    let config_two = praxis_core::config::Config::from_yaml(&mixed_algorithm_rules_config(
+        proxy_two_port,
+        backend_two.port(),
+        &valkey_url,
+        &namespace,
+    ))
+    .expect("config should parse");
+    let proxy_two = start_proxy(&config_two);
+
+    // team-alpha's sliding-window rule: admitted on replica one,
+    // capacity-exhausted (100/100) on replica two via the shared Valkey
+    // budget.
+    let alpha_first = http_send(
+        proxy_one.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "alpha")]),
+    );
+    assert_eq!(
+        parse_status(&alpha_first),
+        200,
+        "team-alpha's first request should be admitted on replica one"
+    );
+    let alpha_second = http_send(
+        proxy_two.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "alpha")]),
+    );
+    assert_eq!(
+        parse_status(&alpha_second),
+        429,
+        "team-alpha's exhausted sliding-window budget must be visible on replica two via shared Valkey state"
+    );
+
+    // team-beta's token-bucket rule: admitted on replica one,
+    // capacity-exhausted on replica two -- proving the *second*
+    // algorithm gets the same cross-replica property, and that it
+    // doesn't share state with (or get blocked by) team-alpha's budget.
+    let beta_first = http_send(
+        proxy_one.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "beta")]),
+    );
+    assert_eq!(
+        parse_status(&beta_first),
+        200,
+        "team-beta's first request should be admitted on replica one, unaffected by team-alpha's exhaustion"
+    );
+    let beta_second = http_send(
+        proxy_two.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "beta")]),
+    );
+    assert_eq!(
+        parse_status(&beta_second),
+        429,
+        "team-beta's exhausted token-bucket budget must be visible on replica two via shared Valkey state"
+    );
 }
 
 /// Requests without the configured `x-app-id` header must not be silently

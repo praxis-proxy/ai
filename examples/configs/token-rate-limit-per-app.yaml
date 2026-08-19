@@ -16,9 +16,9 @@
 # effect on any other app's remaining tokens.
 #
 # See token-rate-limit.yaml for the full rationale on reservation-based
-# admission (M2), reconciliation, and what's still deliberately out of
-# scope (composite/CEL keys, configurable estimation, token-type-aware
-# accounting, observability/metering).
+# admission (M2), reconciliation, the `rules:` schema, and what's still
+# deliberately out of scope (composite/CEL keys, configurable
+# estimation, token-type-aware accounting, observability/metering).
 #
 # Supported token_count provider values:
 #   openai | anthropic | google | bedrock | azure
@@ -38,10 +38,13 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
-        window: 1h                    # sliding window duration, per app
-        capacity: 100000              # max tokens admitted within `window`, per app
-        estimate_tokens: 500          # fixed cost reserved per request at admission
-        bucket_key_header: x-app-id   # one independent budget per app
+        rules:
+          - name: default
+            algorithm: sliding_window
+            window: 1h                    # sliding window duration, per app
+            capacity: 100000              # max tokens admitted within `window`, per app
+            estimate_tokens: 500          # fixed cost reserved per request at admission
+            bucket_key_header: x-app-id   # one independent budget per app
 
       - filter: token_count
         provider: openai   # openai | anthropic | google | bedrock | azure

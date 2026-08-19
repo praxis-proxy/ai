@@ -3,27 +3,56 @@
 
 # `token_rate_limit`
 
-Token-denominated rate limiter: reserves an estimated cost at admission, reconciles against actual usage after the response completes.
+Token-denominated rate limiter: reserves an estimated cost at admission, reconciles against actual usage after the response completes. Evaluates an ordered list of rules, each with its own optional match condition, algorithm choice, and budget.
 
 ## Configuration Notes
 
-This covers the uncontested MVP core of `ai#658`'s proposal (a single global bucket, reservation-based admission (M2) against a fixed per-request estimate, and standard 429/headers (M6)) plus one narrow, undisputed slice of M5: keying buckets by a single request header, exactly as specified in `ai#129` (`bucket_key_header`, one bucket per unique header value, fall back to the global bucket when absent). Composite/CEL-expression keys and per-model keys from `ai#123`/`#658`'s fuller M5 are still out of scope here.
+Mirrors the `rules:`/`match:` shape from `ai#658`'s evolved design doc (`docs/proposals/00121_token-rate-limiting.md`), scoped to this MVP's static header-value matchers and per-rule algorithm choice. CEL matchers, soft-limit tiers, weighted per-type accounting, and configurable estimation strategies are still out of scope (see the module doc comment) -- upstream itself defers the first two; the latter two are deferred to a separate follow-up by design, not by upstream mandate.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `rate` | number | yes | Tokens replenished per second. |
-| `burst` | number | yes | Maximum bucket capacity, in tokens. |
-| `estimate_tokens` | number | yes | Fixed token cost reserved at admission time, before actual usage is known. MVP placeholder for M3 (configurable estimation strategies). Real deployments will want this derived from request metadata (e.g. `max_tokens`) rather than a single fixed constant — that's out of scope for this walking skeleton. |
-| `bucket_key_header` | string | no | Header whose value keys an independent bucket, per `ai#129`. When set, each unique header value gets its own bucket sized by `rate`/`burst`/`estimate_tokens`; requests missing the header fall back to a single shared global bucket. When unset (the default), every request shares one global bucket, same as today. |
+| `rules` | RuleConfig[] | yes | Evaluated in order; the first rule whose `match` is satisfied (or which has no `match` at all) applies to a given request. A request satisfying no rule's `match` is not rate limited by this filter instance -- add a trailing rule with no `match` to enforce a catch-all budget instead. |
+| `rules[].name` | string | yes | Human-readable rule identifier, folded into Valkey key namespacing so distinct rules sharing one backend never collide. |
+| `rules[].r#match` | MatchConfig | no | Static header-value match condition. Every listed header must be present on the request with an exact value match (ANDed) for this rule to apply. Omit entirely for a catch-all rule. |
+| `rules[].r#match.headers` | object<string, string> | yes | Every header must be present on the request with this exact value for the rule to match (ANDed across all entries). |
+| `rules[].algorithm` | `sliding_window` \| `token_bucket` | yes | Which admission algorithm this rule enforces, and that algorithm's own parameters. |
+| `rules[].window` | string | `sliding_window` only | Sliding window duration (e.g. `"1h"`, `"60s"`). |
+| `rules[].capacity` | integer | yes | Maximum tokens admitted within `window` (`sliding_window`) or held at once (`token_bucket`). |
+| `rules[].refill_rate` | number | `token_bucket` only | Tokens refilled per second, up to `capacity`. |
+| `rules[].estimate_tokens` | integer | yes | Fixed token cost reserved at admission time, before actual usage is known. MVP placeholder for M3 (configurable estimation strategies). Real deployments will want this derived from request metadata (e.g. `max_tokens`) rather than a single fixed constant -- that's out of scope for this walking skeleton. |
+| `rules[].bucket_key_header` | string | no | Header whose value keys an independent budget within this rule, per `ai#129`. When set, each unique header value gets its own budget; requests missing the header fall back to one shared budget. When unset (the default), every request matching this rule shares one budget. |
+| `rules[].reservation_timeout` | string | no | How long an admitted-but-never-reconciled reservation (lost request: timeout, connection reset, upstream crash) is held before being conservatively charged at its estimate. Answers `ai#658`'s own still-open "lost request handling" question for this MVP. Defaults to [`DEFAULT_RESERVATION_TIMEOUT`] when unset. |
+| `rules[].backend` | BackendConfig | no | Where this rule's admission state lives: in-process (default, one budget per gateway instance) or a shared Valkey backend (one budget shared across every gateway instance/replica). |
+| `rules[].backend.kind` | `memory` \| `valkey` | no | Which backend implementation to use. |
+| `rules[].backend.url` | string | no | Backend connection URL. Supports one `${ENV_VAR}` reference, so credentials/hostnames don't need to be committed to config. Required when `kind: valkey`, ignored otherwise. |
+| `rules[].backend.namespace` | string | no | Key namespace prefix, so multiple filter rules or deployments can share one Valkey instance without colliding. Ignored for `kind: memory`. Defaults to `"praxis:token_rate_limit"` when unset. |
 
 ## Example
 
 ```yaml
 filter: token_rate_limit
-rate: 1000                    # tokens replenished per second
-burst: 100000                 # max bucket capacity, in tokens
-estimate_tokens: 500          # fixed cost reserved per request at admission
-bucket_key_header: x-app-id   # optional (ai#129): one bucket per header value, else one global bucket
+rules:
+  - name: team-alpha                 # human-readable, unique per filter instance
+    match:                           # optional: omit for a catch-all rule
+      headers:
+        x-app-id: alpha
+    algorithm: sliding_window        # sliding_window | token_bucket
+    window: 1h                       # sliding_window only: window duration
+    capacity: 100000                 # max tokens admitted (sliding_window) or held (token_bucket)
+    estimate_tokens: 500             # fixed cost reserved per request at admission
+    bucket_key_header: x-team-id     # optional (ai#129): one budget per header value within this rule
+    backend:                         # optional: defaults to in-process state
+      kind: valkey                    # memory (default) | valkey
+      url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
+      namespace: praxis:token_rate_limit
+  - name: team-beta
+    match:
+      headers:
+        x-app-id: beta
+    algorithm: token_bucket
+    capacity: 50000
+    refill_rate: 50                  # token_bucket only: tokens refilled per second
+    estimate_tokens: 200
 ```

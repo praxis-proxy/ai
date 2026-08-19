@@ -12,20 +12,24 @@
 # This is the uncontested MVP core of the token rate limiting proposal
 # (docs/proposals/00121_token-rate-limiting.md, tracked by epic ai#121,
 # PR ai#658):
-#   - M1: a single sliding-window budget (flat "default" rule)
+#   - M1: a single sliding-window budget (one catch-all rule)
 #   - M2: reservation-based admission, reconciled against actual usage
 #   - M6: 429 responses with token-denominated rate limit headers
 #
-# `window`/`capacity` match ai#658's own field names: "Windows are
-# sliding: a `window: 1h` budget tracks usage in the most recent 60
-# minutes from the current instant." State defaults to in-process; set
-# `backend: {kind: valkey, url: ..., namespace: ...}` to share one
-# budget across every gateway instance/replica.
+# `rules:` (per `ai#789`/`praxis#551`) lets each rule pick its own
+# admission algorithm and match condition; a rule with no `match:` is a
+# catch-all applying to every request that reaches it. This example
+# uses one such catch-all rule. `window`/`capacity` match ai#658's own
+# field names: "Windows are sliding: a `window: 1h` budget tracks usage
+# in the most recent 60 minutes from the current instant." State
+# defaults to in-process; set `backend: {kind: valkey, url: ...,
+# namespace: ...}` to share one budget across every gateway
+# instance/replica.
 #
 # Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
-# for the full rationale): per-header/composite bucket keys (M5),
-# configurable estimation strategies (M3, `estimate_tokens` below is a
-# fixed placeholder), token-type-aware accounting (M4), and
+# for the full rationale): CEL/composite bucket keys, configurable
+# estimation strategies (M3, `estimate_tokens` below is a fixed
+# placeholder), token-type-aware accounting (M4), and
 # observability/metering (M7/M8/S3).
 #
 # token_rate_limit is declared *before* token_count: response hooks
@@ -59,9 +63,12 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
-        window: 1h             # sliding window duration
-        capacity: 100000       # max tokens admitted within `window`
-        estimate_tokens: 500   # fixed cost reserved per request at admission
+        rules:
+          - name: default
+            algorithm: sliding_window
+            window: 1h             # sliding window duration
+            capacity: 100000       # max tokens admitted within `window`
+            estimate_tokens: 500   # fixed cost reserved per request at admission
 
       - filter: token_count
         provider: openai   # openai | anthropic | google | bedrock | azure
