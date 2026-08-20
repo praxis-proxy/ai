@@ -284,12 +284,8 @@ impl CompiledRule {
     }
 
     /// Resolve which budget key a request should use within this rule,
-    /// given its configured key header (if any).
-    ///
-    /// Returns [`FALLBACK_KEY`] when keying isn't configured at all, or
-    /// when it is configured but this particular request's header is
-    /// absent, not valid UTF-8, empty, or exceeds [`MAX_KEY_LENGTH`] --
-    /// all of these route to one shared budget.
+    /// given its configured key header (if any). See [`FALLBACK_KEY`]
+    /// for when that sentinel applies instead.
     fn resolve_key(&self, headers: &http::HeaderMap) -> String {
         self.bucket_key_header
             .as_ref()

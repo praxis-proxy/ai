@@ -1403,12 +1403,8 @@ mod tests {
 
     #[test]
     fn valkey_token_bucket_backend_rejects_non_finite_refill_rate() {
-        // NaN/Infinity both satisfy `refill_rate > 0.0`'s negation check
-        // being false (a naive `<= 0.0` guard never trips), yet either
-        // would corrupt the shared Lua-side refill math or refill to
-        // capacity instantly -- for a Valkey-backed rule that's a
-        // state-poisoning bug shared across every gateway replica, not
-        // just one instance.
+        // Proves the shared validator (see non_finite_refill_rate_is_rejected)
+        // is actually wired into this backend's constructor too.
         let base = || ValkeyTokenBucketConfig {
             url: "redis://127.0.0.1:1".into(),
             namespace: "ns".into(),
@@ -1433,12 +1429,8 @@ mod tests {
 
     #[test]
     fn valkey_token_bucket_backend_rejects_capacity_exceeding_f64_safe_integer() {
-        // Every `as f64` cast on `capacity` in the shared refill math
-        // assumes it stays within f64's 2^53 mantissa; a larger value
-        // would silently lose precision instead of erroring. This must
-        // reject identically on the Valkey backend as it already does
-        // on the in-memory one, so a config isn't accepted on one
-        // backend and rejected on the other.
+        // See MAX_F64_SAFE_INTEGER's doc comment for why this bound exists;
+        // proven here for the Valkey backend's own constructor.
         let base = || ValkeyTokenBucketConfig {
             url: "redis://127.0.0.1:1".into(),
             namespace: "ns".into(),
@@ -1461,13 +1453,9 @@ mod tests {
 
     #[test]
     fn valkey_token_bucket_backend_rejects_a_refill_rate_ratio_exceeding_the_pexpire_ttl_bound() {
-        // TOKEN_BUCKET_RESERVE_SCRIPT folds capacity/refill_rate into a
-        // millisecond PEXPIRE TTL; an extreme ratio here would make that
-        // PEXPIRE call fail after tokens have already been decremented
-        // by an earlier redis.call() in the same script, permanently
-        // draining the bucket on every reserve attempt instead of just
-        // denying one request. Must reject identically to the in-memory
-        // backend's equivalent bound.
+        // See MAX_CAPACITY_REFILL_RATE_RATIO_SECS's doc comment for why
+        // this bound exists; proven here for the Valkey backend's own
+        // constructor.
         let base = || ValkeyTokenBucketConfig {
             url: "redis://127.0.0.1:1".into(),
             namespace: "ns".into(),

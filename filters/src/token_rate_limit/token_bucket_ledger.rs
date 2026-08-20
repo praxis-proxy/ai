@@ -43,27 +43,21 @@ use dashmap::DashMap;
 /// fill an empty bucket from scratch.
 ///
 /// [`super::backend::TOKEN_BUCKET_RESERVE_SCRIPT`]'s Valkey/Lua path
-/// folds this same ratio into a millisecond TTL passed to `PEXPIRE`.
-/// Lua 5.1 formats numbers via `%.14g`, which switches to scientific
-/// notation (e.g. `"1e+14"`) once a value's magnitude reaches ~1e14;
-/// `PEXPIRE`'s strict-integer argument parser then rejects the command
-/// outright. Because Redis doesn't roll back a script's earlier
-/// `redis.call()`s when a later one errors, that failure lands *after*
-/// tokens have already been decremented, permanently draining the
-/// bucket on every reserve attempt instead of just denying one request.
-/// Rejecting the ratio here, in the algorithm-agnostic config shared by
-/// both backends, keeps `memory`/`valkey` behavior for the same rule
-/// consistent (a config that's rejected on one backend is rejected on
-/// both) and stays ~1e5x below the threshold with wide margin for
-/// `reservation_timeout_ms` on top.
+/// folds this ratio into a millisecond `PEXPIRE` TTL. Lua 5.1's `%.14g`
+/// number formatting switches to scientific notation past ~1e14, which
+/// `PEXPIRE`'s strict-integer parser rejects -- and since Redis doesn't
+/// roll back a script's earlier `redis.call()`s on a later error, that
+/// failure would permanently drain the bucket instead of just denying
+/// one request. Enforced here, shared by both backends, so a config
+/// rejected on one is rejected on both. 1e9 stays ~1e5x below the
+/// threshold, with margin for `reservation_timeout_ms` on top.
 pub(super) const MAX_CAPACITY_REFILL_RATE_RATIO_SECS: f64 = 1e9;
 
 /// Upper bound on `capacity`/`estimate_tokens`, matching f64's 2^53
 /// mantissa: every `as f64` cast site in this module (refill math,
-/// deficit/overage arithmetic) is annotated `#[expect(cast_precision_loss)]`
-/// on the stated assumption that these values stay far below this
-/// threshold. Nothing previously enforced that assumption; a `capacity`
-/// above it would silently lose precision instead of erroring.
+/// deficit/overage arithmetic) assumes its input stays below this via
+/// `#[expect(cast_precision_loss)]`. A `capacity` above it would
+/// silently lose precision instead of erroring.
 pub(super) const MAX_F64_SAFE_INTEGER: u64 = 1 << 53;
 
 /// Bounds and parameters for a [`TokenBucketLedger`].
@@ -703,11 +697,7 @@ mod tests {
 
     #[test]
     fn non_finite_refill_rate_is_rejected() {
-        // `refill_rate <= 0.0` is always false for NaN and +/-Infinity,
-        // so a naive positivity check silently admits them. NaN would
-        // poison every refill calculation; Infinity would refill the
-        // bucket to capacity in any nonzero time delta, defeating the
-        // rate limit entirely.
+        // `refill_rate <= 0.0` alone is always false for NaN/+-Infinity.
         for bad_rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(
                 TokenBucketLedger::new(TokenBucketConfig {
