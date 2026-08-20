@@ -1158,6 +1158,8 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::token_rate_limit::ledger::LedgerConfig;
 
@@ -1550,5 +1552,74 @@ mod tests {
                 "token_bucket key {bucket_key} collided with a sliding_window key"
             );
         }
+    }
+
+    #[test]
+    fn worker_enqueue_fails_once_its_receiver_is_gone() {
+        let worker = ReconcileWorker::detached();
+        let request = ReconcileRequest {
+            key: "a".into(),
+            reservation_id: 1,
+            actual: Some(1),
+            estimate: 1,
+            now_ms: 0,
+        };
+        assert!(worker.enqueue(request).is_err());
+    }
+
+    /// A backend whose `reconcile` always fails, to drive
+    /// [`run_reconcile_worker`]'s bounded-retry-then-abandon path.
+    struct AlwaysFailsReconcile {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TokenRateLimitStateBackend for AlwaysFailsReconcile {
+        async fn reserve(&self, _request: ReserveRequest) -> Result<BackendReserve, BackendError> {
+            panic!("not exercised by this test")
+        }
+
+        async fn reconcile(&self, _request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(BackendError::Unavailable("simulated failure".into()))
+        }
+
+        fn enqueue_reconcile(&self, _request: ReconcileRequest) -> Result<(), BackendError> {
+            panic!("not exercised by this test")
+        }
+
+        fn limit(&self) -> u64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_worker_retries_then_abandons_a_persistently_failing_reconcile() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(run_reconcile_worker(
+            AlwaysFailsReconcile {
+                attempts: Arc::clone(&attempts),
+            },
+            rx,
+        ));
+        tx.send(ReconcileRequest {
+            key: "a".into(),
+            reservation_id: 1,
+            actual: Some(1),
+            estimate: 1,
+            now_ms: 0,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        // 1 initial attempt + 2 retries (25ms, 50ms backoff) before abandoning.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "must retry exactly twice, then abandon"
+        );
     }
 }

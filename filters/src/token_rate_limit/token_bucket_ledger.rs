@@ -713,4 +713,67 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn zero_reservation_timeout_is_rejected() {
+        assert!(
+            TokenBucketLedger::new(TokenBucketConfig {
+                capacity: 1,
+                refill_rate: 1.0,
+                reservation_timeout_ms: 0,
+                max_keys: 1,
+                max_key_length: 1,
+                max_active_reservations: 1,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn zero_ledger_bounds_are_rejected() {
+        for (max_keys, max_key_length, max_active_reservations) in [(0, 1, 1), (1, 0, 1), (1, 1, 0)] {
+            assert!(
+                TokenBucketLedger::new(TokenBucketConfig {
+                    capacity: 1,
+                    refill_rate: 1.0,
+                    reservation_timeout_ms: 1,
+                    max_keys,
+                    max_key_length,
+                    max_active_reservations,
+                })
+                .is_err(),
+                "bounds ({max_keys}, {max_key_length}, {max_active_reservations}) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn key_capacity_denies_new_keys_beyond_the_configured_limit() {
+        let l = TokenBucketLedger::new(TokenBucketConfig {
+            capacity: 100,
+            refill_rate: 1.0,
+            reservation_timeout_ms: 100,
+            max_keys: 1,
+            max_key_length: 256,
+            max_active_reservations: 32,
+        })
+        .unwrap();
+        assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
+        assert!(matches!(l.reserve("b", 1, 0), Decision::Denied { .. }));
+    }
+
+    #[test]
+    fn reservation_capacity_denies_beyond_the_configured_limit() {
+        let l = TokenBucketLedger::new(TokenBucketConfig {
+            capacity: 1_000,
+            refill_rate: 1.0,
+            reservation_timeout_ms: 100,
+            max_keys: 32,
+            max_key_length: 256,
+            max_active_reservations: 1,
+        })
+        .unwrap();
+        assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
+        assert!(matches!(l.reserve("b", 1, 0), Decision::Denied { .. }));
+    }
 }

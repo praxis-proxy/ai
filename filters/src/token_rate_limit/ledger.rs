@@ -637,4 +637,131 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn duplicate_budget_windows_are_rejected() {
+        assert!(
+            Ledger::new(LedgerConfig {
+                budgets: vec![
+                    Budget {
+                        window_ms: 1_000,
+                        capacity: 10
+                    },
+                    Budget {
+                        window_ms: 1_000,
+                        capacity: 20
+                    },
+                ],
+                reservation_timeout_ms: 1,
+                max_keys: 1,
+                max_key_length: 1,
+                max_active_reservations: 1
+            })
+            .is_err(),
+            "two budgets sharing the same window are ambiguous"
+        );
+    }
+
+    #[test]
+    fn zero_reservation_timeout_is_rejected() {
+        assert!(
+            Ledger::new(LedgerConfig {
+                budgets: vec![Budget {
+                    window_ms: 1_000,
+                    capacity: 10
+                }],
+                reservation_timeout_ms: 0,
+                max_keys: 1,
+                max_key_length: 1,
+                max_active_reservations: 1
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn zero_ledger_bounds_are_rejected() {
+        for (max_keys, max_key_length, max_active_reservations) in [(0, 1, 1), (1, 0, 1), (1, 1, 0)] {
+            assert!(
+                Ledger::new(LedgerConfig {
+                    budgets: vec![Budget {
+                        window_ms: 1_000,
+                        capacity: 10
+                    }],
+                    reservation_timeout_ms: 1,
+                    max_keys,
+                    max_key_length,
+                    max_active_reservations
+                })
+                .is_err(),
+                "bounds ({max_keys}, {max_key_length}, {max_active_reservations}) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn key_capacity_denies_new_keys_beyond_the_configured_limit() {
+        let l = Ledger::new(LedgerConfig {
+            budgets: vec![Budget {
+                window_ms: 1_000,
+                capacity: 100,
+            }],
+            reservation_timeout_ms: 100,
+            max_keys: 1,
+            max_key_length: 256,
+            max_active_reservations: 32,
+        })
+        .unwrap();
+        assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
+        assert!(matches!(
+            l.reserve("b", 1, 0),
+            Decision::Denied {
+                reason: DenialReason::KeyCapacity,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn expired_active_reservation_is_reaped_on_next_reserve_for_the_same_key() {
+        let l = ledger(&[(100, 10)]);
+        let r = match l.reserve("a", 10, 0) {
+            Decision::Admitted(r) => r,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert_eq!(l.active_count(), 1);
+        // Never reconciled, and now well past both the window and the
+        // reservation timeout -- the next reserve for "a" must reap the
+        // stale reservation before evaluating capacity, not deny it as
+        // still active.
+        assert!(matches!(l.reserve("a", 10, 200), Decision::Admitted(_)));
+        assert_eq!(l.active_count(), 1, "old reservation reaped, new one admitted");
+        assert_eq!(
+            l.reconcile(r.id, Some(1), 200),
+            Settlement::Noop,
+            "the reaped id was actually dropped, not just shadowed"
+        );
+    }
+
+    #[test]
+    fn expired_sibling_reservation_is_reaped_during_reconcile() {
+        let l = ledger(&[(1_000, 10)]);
+        let stale = match l.reserve("a", 1, 0) {
+            Decision::Admitted(r) => r,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        let fresh = match l.reserve("a", 1, 50) {
+            Decision::Admitted(r) => r,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert_eq!(l.active_count(), 2);
+        // Reconciling `fresh` at t=150 (>= reservation_timeout_ms=100 past
+        // `stale`'s creation) must also reap `stale` as a side effect.
+        assert!(matches!(
+            l.reconcile(fresh.id, Some(1), 150),
+            Settlement::Applied { .. }
+        ));
+        assert_eq!(l.active_count(), 0, "the stale sibling must be reaped too");
+        assert_eq!(l.reconcile(stale.id, Some(1), 150), Settlement::Noop);
+    }
 }

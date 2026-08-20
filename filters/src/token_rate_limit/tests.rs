@@ -669,6 +669,60 @@ async fn lost_request_is_charged_at_its_estimate_and_cannot_bypass_the_budget() 
 }
 
 #[test]
+fn from_config_rejects_an_invalid_match_header_name() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nmatch:\n  headers:\n    \"x \
+         app\": bad\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("invalid match header"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_an_invalid_bucket_key_header_name() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nbucket_key_header: \"x app\"\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("invalid bucket_key_header"), "got: {err}");
+}
+
+#[test]
+fn from_config_accepts_minute_suffix_durations() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 5m\ncapacity: 100\nestimate_tokens: 5");
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_a_zero_duration_window() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 0s\ncapacity: 100\nestimate_tokens: 5");
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("must be positive"), "got: {err}");
+}
+
+#[test]
+fn debug_format_lists_configured_rule_names() {
+    // `from_config` returns `Box<dyn HttpFilter>`, which has no `Debug`
+    // impl -- build the concrete type directly to exercise its own
+    // `Debug` impl instead.
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5");
+    let cfg: super::config::TokenRateLimitConfig =
+        praxis_filter::parse_filter_config("token_rate_limit", &yaml).unwrap();
+    let rules = cfg
+        .rules
+        .into_iter()
+        .map(super::compile_rule)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let filter = TokenRateLimitFilter {
+        rules,
+        epoch: std::time::Instant::now(),
+    };
+    let debug = format!("{filter:?}");
+    assert!(debug.contains("default"), "got: {debug}");
+}
+
+#[test]
 fn from_config_accepts_custom_reservation_timeout() {
     let yaml = single_rule_yaml(
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 5\nreservation_timeout: 10s",
