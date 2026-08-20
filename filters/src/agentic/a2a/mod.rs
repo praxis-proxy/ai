@@ -176,6 +176,9 @@ impl HttpFilter for A2aFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         let parsed = match praxis_filter::builtins::http::payload_processing::body_parsing::parse_json_rpc_body(
+            #[cfg(feature = "praxis-main")]
+            body.as_ref(),
+            #[cfg(not(feature = "praxis-main"))]
             body,
             end_of_stream,
             &self.json_rpc_config,

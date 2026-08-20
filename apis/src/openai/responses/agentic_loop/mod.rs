@@ -120,7 +120,7 @@ use serde_json::{Value, json};
 use tracing::{debug, trace};
 
 use self::config::{AgenticLoopConfig, build_config};
-use super::{error::responses_error_rejection, state::ResponsesState, stream_events::accumulator::merge_usage};
+use super::{error::responses_error_rejection, state::ResponsesState, usage::merge_usage};
 
 // -----------------------------------------------------------------------------
 // Constants
