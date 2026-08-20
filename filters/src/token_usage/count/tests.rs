@@ -538,8 +538,32 @@ async fn sse_final_event_without_trailing_blank_line() {
 // SSE: Scratch Overflow
 // -----------------------------------------------------------------------------
 
+/// Regression test for #674: an oversized event must not disable
+/// extraction for the rest of the stream. The scanner recovers at the
+/// next event boundary, so a terminal usage event arriving afterward is
+/// still captured.
 #[tokio::test]
-async fn sse_overflow_finalizes_partial_counts() {
+async fn sse_oversized_event_recovers_and_captures_terminal_usage() {
+    let mut events = b"data: ".to_vec();
+    events.extend(std::iter::repeat_n(b'x', DEFAULT_MAX_SCRATCH_BYTES + 1));
+    events.extend_from_slice(b"\n\n");
+    events.extend_from_slice(
+        b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\n",
+    );
+
+    let (input, output, total) = run_sse_extraction(ProviderKind::OpenAi, &events).await;
+
+    assert_eq!(
+        input.as_deref(),
+        Some("10"),
+        "terminal usage should be captured after the oversized event is discarded"
+    );
+    assert_eq!(output.as_deref(), Some("20"));
+    assert_eq!(total.as_deref(), Some("30"));
+}
+
+#[tokio::test]
+async fn sse_overflow_does_not_finalize_mid_stream() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -558,10 +582,44 @@ async fn sse_overflow_finalizes_partial_counts() {
     let mut body2 = Some(Bytes::from(overflow_chunk));
     drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
 
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "overflow mid-stream should not finalize early; already-accumulated counts wait for end_of_stream"
+    );
+
+    let mut body3 = Some(Bytes::from_static(b"\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut body3, true).unwrap());
+
     assert_eq!(ctx.get_metadata("token.input"), Some("10"));
     assert_eq!(ctx.get_metadata("token.output"), Some("20"));
     assert_eq!(ctx.get_metadata("token.total"), Some("30"));
     assert_no_working_metadata(&ctx);
+}
+
+#[tokio::test]
+async fn sse_overflow_with_no_usage_sets_overflow_status() {
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let overflow_chunk = vec![b'x'; DEFAULT_MAX_SCRATCH_BYTES + 1];
+    let mut body = Some(Bytes::from(overflow_chunk));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "no usage was ever captured, so no counts should be written"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "billing consumers must not mistake this for zero usage"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -591,8 +649,10 @@ fn on_response_body_noop_without_mode() {
 // Buffer Overflow
 // -----------------------------------------------------------------------------
 
+/// Regression test for #674: overflow must not be indistinguishable
+/// from a genuine zero-usage response.
 #[tokio::test]
-async fn json_overflow_sets_nothing() {
+async fn json_overflow_sets_explicit_status_not_zero() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -608,14 +668,55 @@ async fn json_overflow_sets_nothing() {
 
     assert!(
         ctx.get_metadata("token.input").is_none(),
-        "overflow should not set tokens"
+        "overflow should not set counts"
     );
-    let working_keys: Vec<_> = ctx
-        .filter_metadata
-        .keys()
-        .filter(|k| k.starts_with(META_PREFIX))
-        .collect();
-    assert!(working_keys.is_empty(), "overflow should clear all working metadata");
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "billing consumers must not mistake missing counts for zero usage"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+/// A valid response with usage near the end but larger than the
+/// configured limit exhibits the same overflow signal, not silence.
+#[tokio::test]
+async fn json_valid_usage_beyond_configured_limit_sets_overflow_status() {
+    let mut filter = make_filter(ProviderKind::OpenAi);
+    filter.max_body_bytes = 64;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let padding = "x".repeat(200);
+    let json = format!(
+        r#"{{"id":"resp-1","padding":"{padding}","usage":{{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}}}"#
+    );
+    let mut body = Some(Bytes::from(json.into_bytes()));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(ctx.get_metadata("token.input").is_none());
+    assert_eq!(ctx.get_metadata("token.status"), Some("overflow"));
+}
+
+#[test]
+fn max_body_bytes_configurable_via_yaml() {
+    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_body_bytes: 4096").unwrap();
+    let filter = TokenCountFilter::from_config(&config).unwrap();
+
+    assert_eq!(filter.name(), "token_count");
+}
+
+#[test]
+fn max_scratch_bytes_configurable_via_yaml() {
+    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_scratch_bytes: 512").unwrap();
+    let filter = TokenCountFilter::from_config(&config).unwrap();
+
+    assert_eq!(filter.name(), "token_count");
 }
 
 // -----------------------------------------------------------------------------
@@ -842,7 +943,11 @@ fn on_response_body_noop_for_bedrock_invoke_model() {
 use std::fmt::Write as _;
 
 fn make_filter(provider: ProviderKind) -> TokenCountFilter {
-    TokenCountFilter { provider }
+    TokenCountFilter {
+        provider,
+        max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        max_scratch_bytes: DEFAULT_MAX_SCRATCH_BYTES,
+    }
 }
 
 fn make_response_with_content_type(ct: &str) -> Response {

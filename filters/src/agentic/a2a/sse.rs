@@ -40,6 +40,29 @@ pub(crate) struct SseScanState {
 
     /// Total scratch bytes consumed (`line_buf` + `data_buf`).
     pub scratch_bytes: usize,
+
+    /// Progress discarding an event that exceeded `max_scratch_bytes`,
+    /// if any. See [`SkipPhase`].
+    pub skip: SkipPhase,
+}
+
+/// Progress discarding an oversized event's bytes without buffering them.
+///
+/// An event exceeding `max_scratch_bytes` is dropped rather than
+/// retained: its bytes are discarded as they arrive, and scanning
+/// resumes normally once a blank line (the SSE event boundary) is
+/// found — tracked here without ever buffering the discarded content.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipPhase {
+    /// Not discarding; bytes are buffered normally.
+    #[default]
+    NotSkipping,
+    /// Discarding; the line since the last newline has been empty so
+    /// far. A newline seen now means a blank line — the boundary.
+    LineEmptySoFar,
+    /// Discarding; the line since the last newline has had at least
+    /// one byte. A newline seen now just ends that (non-blank) line.
+    LineHasContent,
 }
 
 // -----------------------------------------------------------------------------
@@ -47,30 +70,34 @@ pub(crate) struct SseScanState {
 // -----------------------------------------------------------------------------
 
 /// Outcome of [`scan_sse_chunk`].
-///
-/// Always returns completed payloads, even when the scratch limit is
-/// exceeded partway through a chunk. The caller should process the
-/// payloads first, then check `overflowed` to decide whether to
-/// continue or disable capture.
 pub(crate) struct SseScanResult {
     /// Completed `data:` payloads dispatched during this chunk.
     pub payloads: Vec<Vec<u8>>,
 
-    /// Whether the scratch limit was exceeded. When `true`, the
-    /// caller should store routes from `payloads`, then clear
-    /// capture state and stop scanning further chunks.
-    pub overflowed: bool,
+    /// Number of events discarded during this chunk for exceeding
+    /// `max_scratch_bytes`. Informational only — scanning already
+    /// recovered at the next event boundary, so the caller does not
+    /// need to take any corrective action.
+    pub dropped_events: usize,
 }
 
 // -----------------------------------------------------------------------------
 // Scanning
 // -----------------------------------------------------------------------------
 
-/// Process one SSE chunk, returning completed `data:` payloads and
-/// an overflow flag.
+/// Process one SSE chunk, returning completed `data:` payloads and the
+/// number of oversized events discarded.
+///
+/// An event that would exceed `max_scratch_bytes` is dropped rather than
+/// buffered: its bytes are discarded without ever being retained, and
+/// scanning resumes normally at the next blank-line event boundary. This
+/// bounds memory use per event without losing later events on the same
+/// stream — in particular, a terminal usage/summary event arriving after
+/// an oversized one is still captured.
 #[expect(clippy::too_many_lines, reason = "linear byte-processing loop")]
 pub(crate) fn scan_sse_chunk(state: &mut SseScanState, chunk: &[u8], max_scratch_bytes: usize) -> SseScanResult {
     let mut payloads = Vec::new();
+    let mut dropped_events = 0_usize;
     let mut i = 0;
 
     // If previous chunk ended with CR and this starts with LF, consume it
@@ -81,39 +108,67 @@ pub(crate) fn scan_sse_chunk(state: &mut SseScanState, chunk: &[u8], max_scratch
     state.prev_cr = false;
 
     while let Some(&b) = chunk.get(i) {
-        if b == b'\n' || b == b'\r' {
-            process_line(&state.line_buf, &mut state.data_buf, &mut state.has_data, &mut payloads);
-            state.line_buf.clear();
+        let is_newline = b == b'\n' || b == b'\r';
 
-            // CRLF within the same chunk: skip the LF.
-            if b == b'\r' {
-                if let Some(&next) = chunk.get(i + 1) {
-                    if next == b'\n' {
-                        i += 1;
-                    }
+        match state.skip {
+            SkipPhase::NotSkipping => {
+                if is_newline {
+                    process_line(&state.line_buf, &mut state.data_buf, &mut state.has_data, &mut payloads);
+                    state.line_buf.clear();
                 } else {
-                    state.prev_cr = true;
+                    state.line_buf.push(b);
                 }
-            }
-        } else {
-            state.line_buf.push(b);
+            },
+            SkipPhase::LineEmptySoFar => {
+                state.skip = if is_newline {
+                    SkipPhase::NotSkipping // blank line: event boundary found
+                } else {
+                    SkipPhase::LineHasContent
+                };
+            },
+            SkipPhase::LineHasContent => {
+                if is_newline {
+                    state.skip = SkipPhase::LineEmptySoFar;
+                }
+            },
         }
 
-        state.scratch_bytes = state.line_buf.len() + state.data_buf.len();
-        if state.scratch_bytes > max_scratch_bytes {
-            return SseScanResult {
-                payloads,
-                overflowed: true,
-            };
+        // CRLF within the same chunk: skip the LF. Applies regardless of
+        // skip state, since it tracks raw byte position, not buffering.
+        if b == b'\r' {
+            if let Some(&next) = chunk.get(i + 1) {
+                if next == b'\n' {
+                    i += 1;
+                }
+            } else {
+                state.prev_cr = true;
+            }
+        }
+
+        if state.skip == SkipPhase::NotSkipping {
+            state.scratch_bytes = state.line_buf.len() + state.data_buf.len();
+            if state.scratch_bytes > max_scratch_bytes {
+                state.line_buf.clear();
+                state.data_buf.clear();
+                state.has_data = false;
+                state.scratch_bytes = 0;
+                // The line since the last newline already has content
+                // unless byte `b` itself was the newline starting it.
+                state.skip = if is_newline {
+                    SkipPhase::LineEmptySoFar
+                } else {
+                    SkipPhase::LineHasContent
+                };
+                dropped_events += 1;
+            }
         }
 
         i += 1;
     }
 
-    state.scratch_bytes = state.line_buf.len() + state.data_buf.len();
     SseScanResult {
         payloads,
-        overflowed: false,
+        dropped_events,
     }
 }
 
@@ -429,14 +484,18 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn scratch_overflow_sets_overflowed_flag() {
+    fn scratch_overflow_recovers_at_next_event_boundary() {
         let mut state = SseScanState::default();
-        let chunk = b"data: a]very long line that exceeds the limit\n";
+        let chunk = b"data: this-line-is-too-long-to-fit\n\ndata: ok\n\n";
 
         let result = scan_sse_chunk(&mut state, chunk, 10);
 
-        assert!(result.overflowed, "exceeding scratch limit should set overflowed");
-        assert!(result.payloads.is_empty(), "no completed events before overflow");
+        assert_eq!(
+            result.dropped_events, 1,
+            "oversized event should be dropped, not abort scanning"
+        );
+        assert_eq!(result.payloads.len(), 1, "scanning should resume for the next event");
+        assert_eq!(result.payloads[0], b"ok");
     }
 
     #[test]
@@ -447,13 +506,27 @@ mod tests {
 
         let result = scan_sse_chunk(&mut state, chunk, 15);
 
-        assert!(result.overflowed, "should overflow on the second event");
+        assert_eq!(result.dropped_events, 1, "should drop the second, oversized event");
         assert_eq!(
             result.payloads.len(),
             1,
             "first completed event should still be returned"
         );
         assert_eq!(result.payloads[0], b"ok");
+    }
+
+    #[test]
+    fn scratch_overflow_recovers_across_chunk_boundary() {
+        let mut state = SseScanState::default();
+
+        let r1 = scan_sse_chunk(&mut state, b"data: aaaaaaaaaaaaaaaa", 10);
+        assert_eq!(r1.dropped_events, 1, "overflow should be detected mid-line");
+        assert!(r1.payloads.is_empty());
+
+        let r2 = scan_sse_chunk(&mut state, b"aaaaaaaa\n\ndata: ok\n\n", 10);
+        assert_eq!(r2.dropped_events, 0, "no further drops once the boundary is found");
+        assert_eq!(r2.payloads.len(), 1, "next event should be captured normally");
+        assert_eq!(r2.payloads[0], b"ok");
     }
 
     #[test]
