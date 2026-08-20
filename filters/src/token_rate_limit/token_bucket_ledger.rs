@@ -39,6 +39,33 @@ use std::{
 
 use dashmap::DashMap;
 
+/// Upper bound, in seconds, on `capacity / refill_rate` -- the time to
+/// fill an empty bucket from scratch.
+///
+/// [`super::backend::TOKEN_BUCKET_RESERVE_SCRIPT`]'s Valkey/Lua path
+/// folds this same ratio into a millisecond TTL passed to `PEXPIRE`.
+/// Lua 5.1 formats numbers via `%.14g`, which switches to scientific
+/// notation (e.g. `"1e+14"`) once a value's magnitude reaches ~1e14;
+/// `PEXPIRE`'s strict-integer argument parser then rejects the command
+/// outright. Because Redis doesn't roll back a script's earlier
+/// `redis.call()`s when a later one errors, that failure lands *after*
+/// tokens have already been decremented, permanently draining the
+/// bucket on every reserve attempt instead of just denying one request.
+/// Rejecting the ratio here, in the algorithm-agnostic config shared by
+/// both backends, keeps `memory`/`valkey` behavior for the same rule
+/// consistent (a config that's rejected on one backend is rejected on
+/// both) and stays ~1e5x below the threshold with wide margin for
+/// `reservation_timeout_ms` on top.
+pub(super) const MAX_CAPACITY_REFILL_RATE_RATIO_SECS: f64 = 1e9;
+
+/// Upper bound on `capacity`/`estimate_tokens`, matching f64's 2^53
+/// mantissa: every `as f64` cast site in this module (refill math,
+/// deficit/overage arithmetic) is annotated `#[expect(cast_precision_loss)]`
+/// on the stated assumption that these values stay far below this
+/// threshold. Nothing previously enforced that assumption; a `capacity`
+/// above it would silently lose precision instead of erroring.
+pub(super) const MAX_F64_SAFE_INTEGER: u64 = 1 << 53;
+
 /// Bounds and parameters for a [`TokenBucketLedger`].
 #[derive(Clone, Debug)]
 pub(super) struct TokenBucketConfig {
@@ -58,15 +85,39 @@ pub(super) struct TokenBucketConfig {
     pub(super) max_active_reservations: usize,
 }
 
+/// Validate `capacity`/`refill_rate` bounds shared by both the in-memory
+/// and Valkey token-bucket backends, so a config that's rejected on one
+/// is rejected identically on the other (see [`MAX_F64_SAFE_INTEGER`]
+/// and [`MAX_CAPACITY_REFILL_RATE_RATIO_SECS`] for why each bound
+/// exists).
+pub(super) fn validate_capacity_and_refill_rate(capacity: u64, refill_rate: f64) -> Result<(), String> {
+    if capacity == 0 {
+        return Err("capacity must be positive".into());
+    }
+    if capacity > MAX_F64_SAFE_INTEGER {
+        return Err(format!("capacity must not exceed {MAX_F64_SAFE_INTEGER} (2^53)"));
+    }
+    if !refill_rate.is_finite() || refill_rate <= 0.0 {
+        return Err("refill_rate must be a positive, finite number".into());
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "capacity is already checked above to not exceed f64's 2^53 mantissa"
+    )]
+    let capacity_f64 = capacity as f64;
+    if capacity_f64 / refill_rate > MAX_CAPACITY_REFILL_RATE_RATIO_SECS {
+        return Err(format!(
+            "capacity / refill_rate must not exceed {MAX_CAPACITY_REFILL_RATE_RATIO_SECS} seconds (time to fill \
+             an empty bucket)"
+        ));
+    }
+    Ok(())
+}
+
 impl TokenBucketConfig {
     /// Validate configuration before constructing a ledger.
     pub(super) fn validate(&self) -> Result<(), String> {
-        if self.capacity == 0 {
-            return Err("capacity must be positive".into());
-        }
-        if !self.refill_rate.is_finite() || self.refill_rate <= 0.0 {
-            return Err("refill_rate must be a positive, finite number".into());
-        }
+        validate_capacity_and_refill_rate(self.capacity, self.refill_rate)?;
         if self.reservation_timeout_ms == 0 {
             return Err("reservation timeout must be positive".into());
         }
@@ -559,12 +610,12 @@ mod tests {
 
     #[test]
     fn abandoned_reservation_stays_charged_after_timeout() {
-        // FedRAMP-guidance (denial-of-service protection): a lost
-        // request (never reconciled) must not free its reserved tokens
-        // back into the bucket just because it timed out -- the tokens
-        // were already spent at reserve time under the immediate-
-        // decrement design, so "abandoned" must mean "stays charged",
-        // matching the sliding-window ledger's equivalent guarantee.
+        // A lost request (never reconciled) must not free its reserved
+        // tokens back into the bucket just because it timed out -- the
+        // tokens were already spent at reserve time under the
+        // immediate-decrement design, so "abandoned" must mean "stays
+        // charged", matching the sliding-window ledger's equivalent
+        // guarantee.
         let l = ledger(10, 1.0);
         assert!(matches!(l.reserve("a", 10, 0), Decision::Admitted(_)));
         assert_eq!(l.active_count(), 1);
@@ -652,11 +703,11 @@ mod tests {
 
     #[test]
     fn non_finite_refill_rate_is_rejected() {
-        // FedRAMP-guidance (input validation, SI-10): `refill_rate <= 0.0`
-        // is always false for NaN and +/-Infinity, so a naive positivity
-        // check silently admits them. NaN would poison every refill
-        // calculation; Infinity would refill the bucket to capacity in any
-        // nonzero time delta, defeating the rate limit entirely.
+        // `refill_rate <= 0.0` is always false for NaN and +/-Infinity,
+        // so a naive positivity check silently admits them. NaN would
+        // poison every refill calculation; Infinity would refill the
+        // bucket to capacity in any nonzero time delta, defeating the
+        // rate limit entirely.
         for bad_rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(
                 TokenBucketLedger::new(TokenBucketConfig {

@@ -534,8 +534,12 @@ impl ValkeyEval {
     }
 
     /// Run one `EVAL script KEYS... ARGV...` command against a fresh
-    /// connection, bounded by [`VALKEY_TIMEOUT`] (fail closed rather than
-    /// hang if Valkey is reachable but wedged).
+    /// connection. Opening that connection (via [`Self::connection`]) and
+    /// running the command each get their own independent
+    /// [`VALKEY_TIMEOUT`] window (fail closed rather than hang if Valkey
+    /// is reachable but wedged), so this call's worst-case latency is up
+    /// to 2x [`VALKEY_TIMEOUT`], not [`VALKEY_TIMEOUT`] itself -- relevant
+    /// since `reserve`/`reconcile` sit synchronously on the request path.
     async fn eval<const N: usize>(
         &self,
         script: &str,
@@ -844,7 +848,7 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
 /// (ms), `[4]` max keys, `[5]` max active reservations, `[6]` estimate.
 /// Returns `[1, id, estimate]` on admission or `[0, retry_after_ms]` on
 /// denial.
-const TOKEN_BUCKET_RESERVE_SCRIPT: &str = "
+pub(super) const TOKEN_BUCKET_RESERVE_SCRIPT: &str = "
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 local capacity = tonumber(ARGV[1])
@@ -1013,19 +1017,14 @@ impl ValkeyTokenBucketBackend {
     /// # Errors
     ///
     /// Returns [`BackendError::Unavailable`] if `config.url` isn't a
-    /// well-formed Valkey/Redis connection URL, or if `capacity`/
-    /// `refill_rate` aren't positive and finite.
+    /// well-formed Valkey/Redis connection URL, if `capacity`/
+    /// `refill_rate` aren't positive and finite, or if `capacity` or
+    /// `capacity / refill_rate` exceeds the bounds documented on
+    /// [`token_bucket_ledger::MAX_F64_SAFE_INTEGER`]/
+    /// [`token_bucket_ledger::MAX_CAPACITY_REFILL_RATE_RATIO_SECS`].
     pub(super) fn new(config: ValkeyTokenBucketConfig) -> Result<Self, BackendError> {
-        if config.capacity == 0 {
-            return Err(BackendError::Unavailable(
-                "token_bucket capacity must be positive".into(),
-            ));
-        }
-        if !config.refill_rate.is_finite() || config.refill_rate <= 0.0 {
-            return Err(BackendError::Unavailable(
-                "token_bucket refill_rate must be a positive, finite number".into(),
-            ));
-        }
+        token_bucket_ledger::validate_capacity_and_refill_rate(config.capacity, config.refill_rate)
+            .map_err(BackendError::Unavailable)?;
         let valkey = ValkeyEval::new(config.url)?;
         Ok(Self {
             valkey,
@@ -1273,12 +1272,12 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // InMemoryTokenBucketBackend (trait-contract level -- exhaustive
     // business-scenario coverage for refill/refund/overage/DoS bounds
     // lives in `token_bucket_ledger::tests`; these confirm the backend
     // wrapper faithfully exposes that ledger through the shared trait).
-    // -------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     fn bucket_backend(capacity: u64, refill_rate: f64) -> InMemoryTokenBucketBackend {
         let ledger = TokenBucketLedger::new(token_bucket_ledger::TokenBucketConfig {
@@ -1375,10 +1374,10 @@ mod tests {
         assert_eq!(report.active_keys, 1);
     }
 
-    // -------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // ValkeyTokenBucketBackend construction-time validation and the
     // same no-I/O trait-contract checks as the sliding-window backend.
-    // -------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     #[test]
     fn valkey_token_bucket_backend_rejects_zero_capacity_or_refill_rate() {
@@ -1404,12 +1403,12 @@ mod tests {
 
     #[test]
     fn valkey_token_bucket_backend_rejects_non_finite_refill_rate() {
-        // FedRAMP-guidance (input validation, SI-10): NaN/Infinity both
-        // satisfy `refill_rate > 0.0`'s negation check being false (a
-        // naive `<= 0.0` guard never trips), yet either would corrupt the
-        // shared Lua-side refill math or refill to capacity instantly --
-        // for a Valkey-backed rule that's a state-poisoning/DoS bug
-        // shared across every gateway replica, not just one instance.
+        // NaN/Infinity both satisfy `refill_rate > 0.0`'s negation check
+        // being false (a naive `<= 0.0` guard never trips), yet either
+        // would corrupt the shared Lua-side refill math or refill to
+        // capacity instantly -- for a Valkey-backed rule that's a
+        // state-poisoning bug shared across every gateway replica, not
+        // just one instance.
         let base = || ValkeyTokenBucketConfig {
             url: "redis://127.0.0.1:1".into(),
             namespace: "ns".into(),
@@ -1430,6 +1429,64 @@ mod tests {
                 "refill_rate {bad_rate} must be rejected as non-finite/non-positive"
             );
         }
+    }
+
+    #[test]
+    fn valkey_token_bucket_backend_rejects_capacity_exceeding_f64_safe_integer() {
+        // Every `as f64` cast on `capacity` in the shared refill math
+        // assumes it stays within f64's 2^53 mantissa; a larger value
+        // would silently lose precision instead of erroring. This must
+        // reject identically on the Valkey backend as it already does
+        // on the in-memory one, so a config isn't accepted on one
+        // backend and rejected on the other.
+        let base = || ValkeyTokenBucketConfig {
+            url: "redis://127.0.0.1:1".into(),
+            namespace: "ns".into(),
+            rule: "default".into(),
+            capacity: 10,
+            refill_rate: 1.0,
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 8,
+        };
+        assert!(
+            ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
+                capacity: token_bucket_ledger::MAX_F64_SAFE_INTEGER + 1,
+                ..base()
+            })
+            .is_err(),
+            "capacity above 2^53 must be rejected before precision is silently lost"
+        );
+    }
+
+    #[test]
+    fn valkey_token_bucket_backend_rejects_a_refill_rate_ratio_exceeding_the_pexpire_ttl_bound() {
+        // TOKEN_BUCKET_RESERVE_SCRIPT folds capacity/refill_rate into a
+        // millisecond PEXPIRE TTL; an extreme ratio here would make that
+        // PEXPIRE call fail after tokens have already been decremented
+        // by an earlier redis.call() in the same script, permanently
+        // draining the bucket on every reserve attempt instead of just
+        // denying one request. Must reject identically to the in-memory
+        // backend's equivalent bound.
+        let base = || ValkeyTokenBucketConfig {
+            url: "redis://127.0.0.1:1".into(),
+            namespace: "ns".into(),
+            rule: "default".into(),
+            capacity: 10,
+            refill_rate: 1.0,
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 8,
+        };
+        assert!(
+            ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
+                capacity: 10,
+                refill_rate: 10.0 / (token_bucket_ledger::MAX_CAPACITY_REFILL_RATE_RATIO_SECS * 2.0),
+                ..base()
+            })
+            .is_err(),
+            "a capacity/refill_rate ratio beyond the PEXPIRE TTL bound must be rejected"
+        );
     }
 
     #[test]

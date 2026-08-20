@@ -113,9 +113,9 @@ const META_BUCKET_KEY: &str = "token_rate_limit.bucket_key";
 const META_RULE_INDEX: &str = "token_rate_limit.rule_index";
 
 /// Sentinel key for requests with no `bucket_key_header` configured, or
-/// where the configured header was absent/not valid UTF-8 on this
-/// request -- both cases share one budget, sized the same as every
-/// per-key budget.
+/// where the configured header was absent, not valid UTF-8, empty, or
+/// longer than [`MAX_KEY_LENGTH`] on this request -- all of these cases
+/// share one budget, sized the same as every per-key budget.
 const FALLBACK_KEY: &str = "__fallback__";
 
 /// Bound on distinct `bucket_key_header` values retained at once, per rule.
@@ -288,7 +288,8 @@ impl CompiledRule {
     ///
     /// Returns [`FALLBACK_KEY`] when keying isn't configured at all, or
     /// when it is configured but this particular request's header is
-    /// absent/not valid UTF-8 -- both cases route to one shared budget.
+    /// absent, not valid UTF-8, empty, or exceeds [`MAX_KEY_LENGTH`] --
+    /// all of these route to one shared budget.
     fn resolve_key(&self, headers: &http::HeaderMap) -> String {
         self.bucket_key_header
             .as_ref()

@@ -590,11 +590,10 @@ async fn bucket_key_header_with_empty_or_oversized_value_falls_back_to_the_share
     // Guards two things at once: (1) correctness -- a present-but-empty
     // header value must not be treated as its own distinct key, letting
     // a client bypass per-app isolation with a technically-present but
-    // meaningless value; (2) availability (FedRAMP-guidance: denial of
-    // service protection) -- an oversized/garbage header value must not
-    // be able to mint its own budget, which would let a client exhaust
-    // the bucket_key_header cardinality bound cheaply. Both fall back to
-    // the one shared budget instead.
+    // meaningless value; (2) availability -- an oversized/garbage header
+    // value must not be able to mint its own budget, which would let a
+    // client exhaust the bucket_key_header cardinality bound cheaply.
+    // Both fall back to the one shared budget instead.
     let yaml = single_rule_yaml(
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 50\nestimate_tokens: 50\nbucket_key_header: x-app-id",
     );
@@ -625,13 +624,13 @@ async fn bucket_key_header_with_empty_or_oversized_value_falls_back_to_the_share
 
 #[tokio::test]
 async fn lost_request_is_charged_at_its_estimate_and_cannot_bypass_the_budget() {
-    // FedRAMP-guidance (denial-of-service protection): a client that
-    // aborts a request before the response completes (connection reset,
-    // client timeout, upstream crash) must not be able to dodge the
-    // budget entirely by ensuring on_response_body/reconciliation never
-    // runs -- that would make token rate limiting trivially bypassable
-    // by just not waiting for the response. reservation_timeout bounds
-    // how long such a reservation is trusted before being conservatively
+    // A client that aborts a request before the response completes
+    // (connection reset, client timeout, upstream crash) must not be
+    // able to dodge the budget entirely by ensuring on_response_body/
+    // reconciliation never runs -- that would make token rate limiting
+    // trivially bypassable by just not waiting for the response.
+    // reservation_timeout bounds how long such a reservation is trusted
+    // before being conservatively
     // charged at its estimate, matching the "lost request handling"
     // question `ai#658`'s own design doc leaves open.
     let yaml = single_rule_yaml(
@@ -830,6 +829,41 @@ fn from_config_accepts_a_token_bucket_rule() {
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
 }
 
+/// Regression test for the actual reported vulnerability: `.nan`/`.inf`
+/// parse cleanly from YAML via `serde_yaml` into an `f64` field with no
+/// deserialization error, so this must be caught by `from_config`'s
+/// validation, not just by unit tests that construct the Rust config
+/// struct directly (which bypass the YAML layer entirely and can't catch
+/// a future regression in the YAML-to-ledger wiring).
+#[test]
+fn from_config_rejects_non_finite_refill_rate_from_yaml() {
+    for literal in [".nan", ".inf", "-.inf"] {
+        let yaml = single_rule_yaml(&format!(
+            "algorithm: token_bucket\ncapacity: 100\nrefill_rate: {literal}\nestimate_tokens: 5"
+        ));
+        let err = TokenRateLimitFilter::from_config(&yaml)
+            .err()
+            .unwrap_or_else(|| panic!("refill_rate: {literal} must be rejected"));
+        assert!(
+            err.to_string().contains("refill_rate"),
+            "got: {err} for refill_rate: {literal}"
+        );
+    }
+}
+
+#[test]
+fn from_config_rejects_a_refill_rate_that_would_overflow_the_valkey_reserve_scripts_pexpire_ttl() {
+    // capacity / refill_rate = 1e11 seconds -- a config typo away from
+    // plausible (e.g. an extra zero on refill_rate against a large
+    // capacity meant for a generous burst rule), not a contrived extreme.
+    // See MAX_CAPACITY_REFILL_RATE_RATIO_SECS's doc comment for why an
+    // unbounded ratio here is a real, silently budget-draining bug on the
+    // Valkey backend, not just a cosmetic validation gap.
+    let yaml = single_rule_yaml("algorithm: token_bucket\ncapacity: 1000000000\nrefill_rate: 0.01\nestimate_tokens: 5");
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("capacity / refill_rate"), "got: {err}");
+}
+
 #[tokio::test]
 async fn token_bucket_rule_admits_within_capacity_and_denies_over_it() {
     let yaml = single_rule_yaml("algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nestimate_tokens: 100");
@@ -1000,11 +1034,10 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
 
 #[tokio::test]
 async fn valkey_failure_fails_closed() {
-    // FedRAMP-guidance (fail-secure on component failure, denial-of-service
-    // protection): an unreachable backend (no server on this port) must
-    // reject, not admit -- a rate limiter that silently lets every request
-    // through when its state store is unavailable defeats the point of
-    // rate limiting it at all, right when a backend outage makes runaway
+    // An unreachable backend (no server on this port) must reject, not
+    // admit -- a rate limiter that silently lets every request through
+    // when its state store is unavailable defeats the point of rate
+    // limiting it at all, right when a backend outage makes runaway
     // spend/load most likely.
     let yaml = single_rule_yaml(
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimate_tokens: 10\nbackend:\n  kind: valkey\n  \

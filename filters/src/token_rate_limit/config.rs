@@ -52,6 +52,14 @@ pub(super) struct TokenRateLimitConfig {
 pub(super) struct RuleConfig {
     /// Human-readable rule identifier, folded into Valkey key
     /// namespacing so distinct rules sharing one backend never collide.
+    ///
+    /// Renaming a live `valkey`-backed rule is therefore not a
+    /// no-op for operators: it changes the Valkey key hash, so the old
+    /// name's tracked budget is orphaned (left to expire on its own TTL)
+    /// and the new name starts with a fresh budget. There's no
+    /// migration/rename path today -- routine config hygiene (e.g.
+    /// renaming `"gold"` to `"gold-tier"`) silently resets that rule's
+    /// state.
     pub name: String,
 
     /// Static header-value match condition. Every listed header must be
@@ -85,8 +93,15 @@ pub(super) struct RuleConfig {
     pub bucket_key_header: Option<String>,
 
     /// How long an admitted-but-never-reconciled reservation (lost
-    /// request: timeout, connection reset, upstream crash) is held
-    /// before being conservatively charged at its estimate.
+    /// request: timeout, connection reset, upstream crash) is tracked as
+    /// active before that already-reserved-at-admission charge against
+    /// its estimate becomes irreversibly locked in (sliding-window:
+    /// folded into the settled total so it survives the window's normal
+    /// aging-out; token-bucket: the tokens were already decremented at
+    /// reserve time regardless, this only bounds how long the
+    /// reservation is tracked as pending). This does **not** defer when
+    /// the charge first applies -- it applies immediately at admission,
+    /// same as any other reservation.
     ///
     /// Answers `ai#658`'s own still-open "lost request handling"
     /// question for this MVP. Defaults to [`DEFAULT_RESERVATION_TIMEOUT`]

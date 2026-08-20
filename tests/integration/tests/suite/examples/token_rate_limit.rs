@@ -206,6 +206,48 @@ fn example_config_token_rate_limit() {
     assert_eq!(parse_body(&raw), PLAIN_TEXT_BODY, "body should pass through unchanged");
 }
 
+/// Smoke-tests the real `token-rate-limit-mixed-algorithms.yaml` example
+/// file itself (ai#789/praxis#551), distinct from
+/// `mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas`
+/// below, which builds its own hand-rolled YAML with a Valkey backend
+/// clause to prove cross-replica isolation. This confirms the example
+/// file that ships in the repo actually wires up both the `team-alpha`
+/// (sliding_window) and `team-beta` (token_bucket) rules correctly.
+#[test]
+fn example_config_token_rate_limit_mixed_algorithms() {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "token-rate-limit-mixed-algorithms.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let alpha = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "alpha")]),
+    );
+    assert_eq!(
+        parse_status(&alpha),
+        200,
+        "team-alpha's sliding_window rule should admit a request within its budget"
+    );
+
+    let beta = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "beta")]),
+    );
+    assert_eq!(
+        parse_status(&beta),
+        200,
+        "team-beta's token_bucket rule should admit a request within its budget"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Per-app budgets (ai#129 bucket_key_header) -- token-rate-limit-per-app.yaml
 // -----------------------------------------------------------------------------
