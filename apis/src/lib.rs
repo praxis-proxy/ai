@@ -96,7 +96,6 @@ pub(crate) mod test_utils {
             response_header: None,
             response_headers_modified: false,
             subrequest_client: None,
-            #[cfg(feature = "praxis-main")]
             subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
             rewritten_path: None,
             selected_endpoint_index: None,
