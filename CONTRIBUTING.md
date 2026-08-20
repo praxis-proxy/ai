@@ -302,11 +302,11 @@ Before submitting or merging PRs, ensure that you have:
 ## Issue Assignment
 
 If you are interested in working on an issue, comment on
-it to express your interest. A maintainer will assign it
+it to express your interest. A reviewer will assign it
 to you. **Do not open a pull request for an issue you are
 not assigned to.** Unassigned PRs will be closed.
 
-This avoids duplicate effort and gives maintainers
+This avoids duplicate effort and gives reviewers
 visibility into who is working on what.
 
 ## PR Review Process
@@ -315,7 +315,7 @@ The `praxis-bot` GitHub App runs automated code review
 on every pull request. Its comments are treated with the
 same weight as human reviewer comments — **every finding
 must be addressed** before the PR can be merged. This
-ensures maintainers can quickly verify that all feedback
+ensures reviewers can quickly verify that all feedback
 has been handled and keeps the review process moving
 smoothly.
 
