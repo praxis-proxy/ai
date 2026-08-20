@@ -206,6 +206,24 @@ fn parses_fixed_configuration() {
 }
 
 #[test]
+fn valkey_configuration_requires_a_url() {
+    let mut value = config();
+    value["backend"] = serde_yaml::from_str("kind: valkey\n").unwrap();
+
+    let error = TokenRateLimitFilter::from_config_inner(&value).unwrap_err();
+    assert!(error.to_string().contains("backend.url is required for Valkey"));
+}
+
+#[test]
+fn valkey_configuration_rejects_an_invalid_url() {
+    let mut value = config();
+    value["backend"] = serde_yaml::from_str("kind: valkey\nurl: not-a-valkey-url\n").unwrap();
+
+    let error = TokenRateLimitFilter::from_config_inner(&value).unwrap_err();
+    assert!(error.to_string().contains("shared quota backend unavailable"));
+}
+
+#[test]
 fn declares_response_body_access_for_reconciliation() {
     let filter = TokenRateLimitFilter::from_config_inner(&config()).unwrap();
     assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);

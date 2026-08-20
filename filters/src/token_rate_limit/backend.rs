@@ -470,3 +470,38 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
         self.limit
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{super::ledger::Budget, *};
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "the test supplies a valid local Redis URL")]
+    fn key_parts_are_scoped_and_hash_quota_keys() {
+        let backend = ValkeyTokenRateLimitBackend::new(ValkeyBackendConfig {
+            url: "redis://127.0.0.1:6379".into(),
+            namespace: "praxis-test".into(),
+            rule: "default".into(),
+            budgets: vec![
+                Budget {
+                    window_ms: 60_000,
+                    capacity: 100,
+                },
+                Budget {
+                    window_ms: 3_600_000,
+                    capacity: 1_000,
+                },
+            ],
+            reservation_timeout_ms: 120_000,
+            max_keys: 100,
+            max_active_reservations: 100,
+        })
+        .unwrap();
+        let parts = backend.key_parts("alice/model-a");
+
+        assert_eq!(parts.len(), 9);
+        assert_eq!(backend.limit(), 100);
+        assert!(parts.iter().all(|part| part.starts_with("praxis-test:")));
+        assert!(parts.iter().all(|part| !part.contains("alice/model-a")));
+    }
+}
