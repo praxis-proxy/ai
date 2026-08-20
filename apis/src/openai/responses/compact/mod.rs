@@ -575,7 +575,7 @@ fn extract_stored_messages(record: ResponseRecord) -> Result<Vec<Value>, FilterA
 }
 
 /// Build and persist the compaction result for an explicit compact request.
-#[expect(clippy::too_many_arguments, reason = "all parameters are needed")]
+#[expect(clippy::too_many_arguments, clippy::too_many_lines, reason = "all parameters are needed")]
 async fn build_and_persist_compaction(
     filter: &CompactFilter,
     ctx: &HttpFilterContext<'_>,
@@ -594,7 +594,10 @@ async fn build_and_persist_compaction(
         "id": resp_id,
         "object": "response",
         "status": "completed",
+        "model": model,
+        "created_at": created_at,
         "previous_response_id": req.response_id,
+        "output": compacted_messages,
     });
 
     let record = ResponseRecord {
@@ -823,6 +826,8 @@ fn persist_compaction_response(
             "id": response_id,
             "object": "response",
             "status": "completed",
+            "model": model,
+            "created_at": created_at,
         }),
         input: persisted.clone(),
         messages: persisted,
