@@ -18,6 +18,10 @@ const DEFAULT_SOURCE: &str = "ai-gateway";
 /// Default header prefix for tenant identity headers.
 const DEFAULT_IDENTITY_HEADER_PREFIX: &str = "x-tenant-";
 
+/// Default metadata namespace the `identity_header_guard` filter writes
+/// captured identity headers under.
+const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
+
 /// Deserialized YAML config for the `external_metering` filter.
 ///
 /// ```yaml
@@ -28,6 +32,7 @@ const DEFAULT_IDENTITY_HEADER_PREFIX: &str = "x-tenant-";
 /// source: "ai-gateway"
 /// fail_open: true
 /// identity_header_prefix: "x-tenant-"
+/// identity_metadata_namespace: "identity"
 /// default_username: "anonymous"
 /// default_model: "unknown"
 /// ```
@@ -60,6 +65,12 @@ pub(super) struct ExternalMeteringConfig {
     #[serde(default = "default_identity_header_prefix")]
     pub identity_header_prefix: String,
 
+    /// Metadata namespace the `identity_header_guard` filter writes captured
+    /// identity headers under. Must match that filter's
+    /// `metadata_namespace` setting when both run in one pipeline.
+    #[serde(default = "default_identity_metadata_namespace")]
+    pub identity_metadata_namespace: String,
+
     /// Fallback username when no identity header is present.
     /// If set, requests without `{prefix}username` are still metered
     /// under this name. If unset, metering is skipped entirely.
@@ -83,6 +94,19 @@ pub(super) fn validate_config(cfg: &ExternalMeteringConfig) -> Result<(), Filter
 
     if cfg.identity_header_prefix.is_empty() {
         return Err("external_metering: identity_header_prefix must not be empty".into());
+    }
+
+    // A prefix with characters that cannot appear in an HTTP header name
+    // (e.g. a space) would silently match nothing, leaving tenant identity
+    // headers unstripped while the filter reports healthy.
+    if http::header::HeaderName::from_bytes(cfg.identity_header_prefix.as_bytes()).is_err() {
+        return Err(
+            "external_metering: identity_header_prefix must contain only valid HTTP header name characters".into(),
+        );
+    }
+
+    if cfg.identity_metadata_namespace.is_empty() {
+        return Err("external_metering: identity_metadata_namespace must not be empty".into());
     }
 
     Ok(())
@@ -111,4 +135,9 @@ fn default_true() -> bool {
 /// Serde default for `identity_header_prefix`.
 fn default_identity_header_prefix() -> String {
     DEFAULT_IDENTITY_HEADER_PREFIX.to_owned()
+}
+
+/// Serde default for `identity_metadata_namespace`.
+fn default_identity_metadata_namespace() -> String {
+    DEFAULT_IDENTITY_METADATA_NAMESPACE.to_owned()
 }

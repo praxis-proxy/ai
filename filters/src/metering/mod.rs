@@ -32,6 +32,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::HeaderName;
+use metrics::counter;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use praxis_ai_apis::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
 use praxis_core::subrequest::SubRequestConnector;
@@ -77,6 +78,10 @@ const META_TOKEN_CACHE_READ: &str = "token.cache_read";
 /// `token_count`). A breakdown of [`META_TOKEN_INPUT`], not an addition to it.
 const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
 
+/// Counter incremented whenever a usage or error event fails to reach the
+/// metering service (transport failure or non-2xx acknowledgement).
+const METRIC_REPORT_FAILURES: &str = "praxis_ai_metering_report_failures_total";
+
 /// Upper bound on metering service response bodies.
 ///
 /// Balance and event-acknowledgement responses are small JSON documents;
@@ -121,6 +126,14 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// Integrates with an external metering service for pre-request balance
 /// checks and post-response token usage reporting.
 ///
+/// Tenant identity is resolved from the highest-trust source available:
+/// verified `{prefix}*` metadata written by an authentication filter,
+/// then the `identity_header_guard` filter's namespaced
+/// `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request
+/// headers. A higher tier always wins, so forged client headers can
+/// never override verified claims, and identity headers plus client
+/// credentials are always stripped before the request is forwarded.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -131,6 +144,7 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// source: "ai-gateway"
 /// fail_open: true
 /// identity_header_prefix: "x-tenant-"
+/// identity_metadata_namespace: "identity"
 /// default_username: "anonymous"
 /// default_model: "unknown"
 /// ```
@@ -150,7 +164,12 @@ pub struct ExternalMeteringFilter {
     feature_key: String,
 
     /// Prefix of the tenant identity headers to capture and strip.
+    /// Lowercased once at construction.
     identity_header_prefix: String,
+
+    /// Metadata namespace the `identity_header_guard` filter writes
+    /// captured headers under (tier 2 of identity resolution).
+    identity_metadata_namespace: String,
 
     /// Base URL of the external metering service.
     metering_url: String,
@@ -207,7 +226,8 @@ impl ExternalMeteringFilter {
             default_username: cfg.default_username,
             fail_open: cfg.fail_open,
             feature_key: cfg.feature_key,
-            identity_header_prefix: cfg.identity_header_prefix,
+            identity_header_prefix: cfg.identity_header_prefix.to_ascii_lowercase(),
+            identity_metadata_namespace: cfg.identity_metadata_namespace,
             metering_url: cfg.metering_url,
             source: cfg.source,
             subrequest_client,
@@ -216,6 +236,12 @@ impl ExternalMeteringFilter {
     }
 
     /// Ask the metering service whether the tenant may spend more tokens.
+    ///
+    /// The metering service expresses denial only through a `2xx` response
+    /// whose body carries `hasAccess: false`. Any non-`2xx` status means the
+    /// service itself is misbehaving (bad route, internal error), so it is
+    /// handled by the availability policy (`fail_open`) rather than treated
+    /// as a denial.
     async fn check_balance(&self, state: &MeteringState) -> FilterAction {
         let url = build_balance_url(&self.metering_url, &state.username, &self.feature_key, &state.model);
         let request = SubRequest {
@@ -237,11 +263,11 @@ impl ExternalMeteringFilter {
         match result {
             Ok(resp) if is_success(resp.status) => parse_balance_result(&resp.body, self.fail_open),
             Ok(resp) => {
-                debug!(status = resp.status, "balance check rejected");
+                warn!(status = resp.status, "balance check returned a non-2xx status");
                 self.on_metering_unavailable()
             },
             Err(error) => {
-                debug!(%error, "balance check unreachable");
+                warn!(%error, "balance check unreachable");
                 self.on_metering_unavailable()
             },
         }
@@ -294,7 +320,7 @@ impl HttpFilter for ExternalMeteringFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let mut state = capture_identity(ctx, &self.identity_header_prefix);
+        let mut state = capture_identity(ctx, &self.identity_header_prefix, &self.identity_metadata_namespace);
 
         if state.username.is_empty() {
             let Some(fallback) = self.default_username.as_ref() else {
@@ -488,7 +514,10 @@ struct BalanceResponse {
 
 /// Capture tenant identity from the configured headers and mark those headers,
 /// along with client credentials, for removal before the request is forwarded.
-fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str) -> MeteringState {
+///
+/// `prefix` must already be lowercase; [`ExternalMeteringFilter::build`]
+/// lowercases it once at construction.
+fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_namespace: &str) -> MeteringState {
     let user_agent = ctx
         .request
         .headers
@@ -497,7 +526,7 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str) -> MeteringSt
         .unwrap_or_default()
         .to_owned();
 
-    let mut identity = read_identity_headers(ctx, prefix);
+    let mut identity = read_identity_headers(ctx, prefix, identity_namespace);
     strip_client_credentials(ctx);
 
     if identity.group.is_empty() {
@@ -537,30 +566,37 @@ struct Identity {
 /// Three tiers, most trusted first:
 ///
 /// 1. Unnamespaced `{prefix}*` metadata keys, written by an authentication filter from verified credentials (e.g. JWT
-///    claims). When any of these are present, every lower tier is ignored entirely so a client cannot spoof
-///    `subscription` or `model` via forged headers alongside valid credentials.
-/// 2. Namespaced `identity.{prefix}*` metadata keys, written by the `identity_header_guard` filter from captured
+///    claims or a validated API key). When any of these are present, every lower tier is ignored entirely so a client
+///    cannot spoof the remaining fields via forged headers alongside valid credentials.
+/// 2. Namespaced `{namespace}.{prefix}*` metadata keys, written by the `identity_header_guard` filter from captured
 ///    request headers.
 /// 3. Raw `{prefix}*` request headers, set by a trusted upstream auth layer when neither metadata tier is populated.
 ///
 /// Identity headers are always marked for removal so tenant identity
 /// never leaks to the upstream provider, regardless of which tier
 /// supplied the identity.
-fn read_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix: &str) -> Identity {
-    let prefix_lower = prefix.to_ascii_lowercase();
-
+fn read_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_namespace: &str) -> Identity {
     let mut identity = Identity::default();
-    read_metadata_identity(ctx, &prefix_lower, "", &mut identity);
-    let has_verified_identity = !identity.username.is_empty();
+    read_metadata_identity(ctx, prefix, "", &mut identity);
+
+    // Any verified field blocks the lower tiers entirely: an auth filter
+    // may map only some claims (e.g. group without username), and a
+    // partially verified identity must not be extended by forgeable
+    // sources.
+    let has_verified_identity = !(identity.username.is_empty()
+        && identity.group.is_empty()
+        && identity.subscription.is_empty()
+        && identity.model.is_empty());
 
     if !has_verified_identity {
-        read_metadata_identity(ctx, &prefix_lower, "identity.", &mut identity);
+        read_metadata_identity(ctx, prefix, &format!("{identity_namespace}."), &mut identity);
     }
 
-    if !has_verified_identity && identity.username.is_empty() {
-        read_header_identity(ctx, &prefix_lower, &mut identity);
+    let has_metadata_identity = has_verified_identity || !identity.username.is_empty();
+    if has_metadata_identity {
+        strip_identity_headers(ctx, prefix);
     } else {
-        strip_identity_headers(ctx, &prefix_lower);
+        read_header_identity(ctx, prefix, &mut identity);
     }
 
     identity
@@ -588,10 +624,12 @@ fn read_metadata_identity(ctx: &HttpFilterContext<'_>, prefix_lower: &str, names
 
 /// Read identity from raw `{prefix}*` request headers, marking each one
 /// for removal.
+///
+/// [`HeaderName::as_str`] already returns the lowercased name, so the
+/// pre-lowercased prefix compares directly without per-header allocation.
 fn read_header_identity(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str, identity: &mut Identity) {
     for (key, value) in &ctx.request.headers {
-        let key_lower = key.as_str().to_ascii_lowercase();
-        let Some(suffix) = key_lower.strip_prefix(prefix_lower) else {
+        let Some(suffix) = key.as_str().strip_prefix(prefix_lower) else {
             continue;
         };
         let val = value.to_str().unwrap_or_default();
@@ -612,7 +650,7 @@ fn read_header_identity(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str, ide
 /// unused identity headers still never reach the upstream provider.
 fn strip_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str) {
     for (key, _) in &ctx.request.headers {
-        if key.as_str().to_ascii_lowercase().starts_with(prefix_lower) {
+        if key.as_str().starts_with(prefix_lower) {
             ctx.request_headers_to_remove.push(key.clone());
         }
     }
@@ -626,10 +664,7 @@ fn strip_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str) {
 fn strip_client_credentials(ctx: &mut HttpFilterContext<'_>) {
     ctx.request_headers_to_remove.push(http::header::AUTHORIZATION);
     ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
-
-    if let Ok(name) = "x-api-key".parse::<HeaderName>() {
-        ctx.request_headers_to_remove.push(name);
-    }
+    ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
 }
 
 // -----------------------------------------------------------------------------
@@ -726,17 +761,22 @@ fn spawn_usage_report(client: SubRequestClient, metering_url: &str, timeout: Dur
     });
 }
 
-/// Log the outcome of a usage report delivery.
+/// Log the outcome of a usage report delivery and count failures.
+///
+/// Emits [`METRIC_REPORT_FAILURES`] so dropped billing events are visible
+/// on a dashboard rather than only in debug logs.
 fn report_delivery(result: Result<SubResponse, SubRequestError>) {
     match result {
         Ok(resp) if is_success(resp.status) => {
             trace!(status = resp.status, "metering usage report sent");
         },
         Ok(resp) => {
-            debug!(status = resp.status, "metering usage report rejected");
+            counter!(METRIC_REPORT_FAILURES).increment(1);
+            warn!(status = resp.status, "metering usage report rejected");
         },
         Err(error) => {
-            debug!(%error, "metering usage report failed");
+            counter!(METRIC_REPORT_FAILURES).increment(1);
+            warn!(%error, "metering usage report failed");
         },
     }
 }
@@ -819,25 +859,104 @@ fn build_envelope(ctx: &EventContext<'_>, event_type: &str) -> serde_json::Value
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Extract the `model` field from a JSON body fragment without full parsing.
+/// Extract the top-level `model` field from a JSON body fragment.
 ///
-/// Request bodies arrive in chunks and can be megabytes long, so this scans for
-/// the field instead of buffering and deserializing the whole document. Returns
-/// `None` when the chunk does not contain a complete `"model": "..."` pair.
+/// Request bodies arrive in chunks and can be megabytes long, so this scans
+/// with a string- and depth-aware state machine instead of buffering and
+/// deserializing the whole document. Only a `"model"` key belonging to the
+/// top-level object is matched, so `"model"` occurrences nested inside
+/// `messages` content can never misattribute the request. Returns `None`
+/// when the chunk does not contain the complete top-level `"model": "..."`
+/// pair.
 fn extract_model_from_bytes(bytes: &[u8]) -> Option<String> {
-    const KEY: &str = "\"model\"";
-
     let text = std::str::from_utf8(bytes).ok()?;
-    let key_pos = text.find(KEY)?;
-    let after_key = text.get(key_pos.checked_add(KEY.len())?..)?;
-    let value = after_key
-        .trim_start()
-        .strip_prefix(':')?
-        .trim_start()
-        .strip_prefix('"')?;
-    let end = value.find('"')?;
+    let mut scanner = TopLevelKeyScanner::new(text);
 
-    Some(value.get(..end)?.to_owned())
+    while let Some(key) = scanner.next_top_level_key() {
+        if key == "model" {
+            return scanner.string_value().map(str::to_owned);
+        }
+    }
+
+    None
+}
+
+/// Incremental scanner over the top-level keys of a JSON object fragment.
+///
+/// Tracks nesting depth and string boundaries (including escapes) so keys
+/// inside nested objects, arrays, or string values are never surfaced.
+struct TopLevelKeyScanner<'a> {
+    /// Remaining unscanned input.
+    rest: &'a str,
+
+    /// Current object/array nesting depth; the document object is depth 1.
+    depth: u32,
+}
+
+impl<'a> TopLevelKeyScanner<'a> {
+    /// Start scanning at the beginning of a JSON document fragment.
+    fn new(text: &'a str) -> Self {
+        Self { rest: text, depth: 0 }
+    }
+
+    /// Advance to the next key of the top-level object and return it.
+    fn next_top_level_key(&mut self) -> Option<&'a str> {
+        loop {
+            let mut chars = self.rest.char_indices();
+            let (pos, ch) = chars.next()?;
+            match ch {
+                '{' | '[' => {
+                    self.depth = self.depth.checked_add(1)?;
+                    self.rest = self.rest.get(pos + 1..)?;
+                },
+                '}' | ']' => {
+                    self.depth = self.depth.checked_sub(1)?;
+                    self.rest = self.rest.get(pos + 1..)?;
+                },
+                '"' => {
+                    let start = pos + 1;
+                    let end = find_string_end(self.rest, start)?;
+                    let content = self.rest.get(start..end)?;
+                    let after = self.rest.get(end + 1..)?;
+                    let is_key = after.trim_start().starts_with(':');
+                    self.rest = after;
+                    if self.depth == 1 && is_key {
+                        return Some(content);
+                    }
+                },
+                _ => {
+                    self.rest = self.rest.get(pos + ch.len_utf8()..)?;
+                },
+            }
+        }
+    }
+
+    /// Read the string value following the key just returned.
+    ///
+    /// Returns `None` when the value is not a string (e.g. `null`) or the
+    /// fragment is cut off before the closing quote.
+    fn string_value(&self) -> Option<&'a str> {
+        let after_colon = self.rest.trim_start().strip_prefix(':')?;
+        let value = after_colon.trim_start().strip_prefix('"')?;
+        let end = find_string_end(value, 0)?;
+        value.get(..end)
+    }
+}
+
+/// Find the byte offset of the unescaped closing quote for the string
+/// starting at `from` (which must point just past the opening quote).
+fn find_string_end(text: &str, from: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, ch) in text.get(from..)?.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(from + offset);
+        }
+    }
+    None
 }
 
 /// Read a numeric `filter_metadata` value, defaulting to zero.

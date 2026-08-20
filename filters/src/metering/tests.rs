@@ -111,6 +111,32 @@ timeout_seconds: 0
 }
 
 #[test]
+fn config_prefix_with_invalid_header_chars_fails() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+identity_header_prefix: "x tenant "
+"#,
+    )
+    .unwrap();
+    let result = ExternalMeteringFilter::from_config(&yaml);
+    assert!(result.is_err(), "prefix with spaces must be rejected");
+}
+
+#[test]
+fn config_empty_namespace_fails() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+identity_metadata_namespace: ""
+"#,
+    )
+    .unwrap();
+    let result = ExternalMeteringFilter::from_config(&yaml);
+    assert!(result.is_err(), "empty namespace must be rejected");
+}
+
+#[test]
 fn config_unknown_field_fails() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -241,7 +267,7 @@ fn captures_tenant_headers_with_default_prefix() {
     req.headers.insert("x-tenant-model", "gpt-4".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     assert_eq!(state.username, "alice");
     assert_eq!(state.group, "engineering");
@@ -256,7 +282,7 @@ fn strips_identity_and_auth_headers() {
     req.headers.insert("authorization", "Bearer sk-test".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let _state = capture_identity(&mut ctx, "x-tenant-");
+    let _state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
     assert!(removed.contains(&"x-tenant-username"));
@@ -270,7 +296,7 @@ fn custom_prefix_captures_correctly() {
     req.headers.insert("x-myco-username", "bob".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-myco-");
+    let state = capture_identity(&mut ctx, "x-myco-", "identity");
 
     assert_eq!(state.username, "bob");
 }
@@ -279,7 +305,7 @@ fn custom_prefix_captures_correctly() {
 fn missing_username_returns_empty() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     assert!(state.username.is_empty());
 }
@@ -304,7 +330,7 @@ fn verified_identity_ignores_forged_headers_and_guard_metadata() {
     ctx.filter_metadata
         .insert("identity.x-tenant-model".to_owned(), "model-forged".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     assert_eq!(state.username, "alice");
     assert_eq!(state.group, "engineering");
@@ -333,12 +359,70 @@ fn guard_metadata_supplies_identity_without_verified_claims() {
     ctx.filter_metadata
         .insert("identity.x-tenant-model".to_owned(), "claude-3".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     assert_eq!(state.username, "bob");
     assert_eq!(state.group, "ml");
     assert_eq!(state.subscription, "sub-7");
     assert_eq!(state.model, "claude-3");
+}
+
+#[test]
+fn partial_verified_identity_blocks_lower_tiers() {
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("x-tenant-username", "header-mallory".parse().unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    // An auth filter that maps only the group claim, no username.
+    ctx.filter_metadata
+        .insert("x-tenant-group".to_owned(), "engineering".to_owned());
+    // Guard-captured copy of a forged subscription.
+    ctx.filter_metadata
+        .insert("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned());
+
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+
+    assert_eq!(state.group, "engineering", "verified group must survive");
+    assert!(
+        state.subscription.is_empty(),
+        "guard metadata must not extend a partially verified identity: {}",
+        state.subscription
+    );
+    assert!(
+        state.username.is_empty(),
+        "raw header must not extend a partially verified identity: {}",
+        state.username
+    );
+}
+
+#[test]
+fn custom_namespace_supplies_guard_identity() {
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("tenant-meta.x-tenant-username".to_owned(), "bob".to_owned());
+
+    let state = capture_identity(&mut ctx, "x-tenant-", "tenant-meta");
+
+    assert_eq!(state.username, "bob", "configured namespace must resolve tier 2");
+}
+
+#[test]
+fn multi_value_identity_header_is_fully_stripped() {
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers.insert("x-tenant-username", "alice".parse().unwrap());
+    req.headers.append("x-tenant-username", "mallory".parse().unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+
+    assert_eq!(state.username, "alice", "first value wins during capture");
+    let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
+    assert!(
+        removed.contains(&"x-tenant-username"),
+        "the duplicated header name must be marked for removal (removing a name drops every value): {removed:?}"
+    );
 }
 
 #[test]
@@ -352,7 +436,7 @@ fn guard_identity_blocks_raw_header_fallback() {
     ctx.filter_metadata
         .insert("identity.x-tenant-username".to_owned(), "bob".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     assert_eq!(state.username, "bob");
     assert!(
@@ -374,7 +458,7 @@ fn group_falls_back_to_subscription() {
     req.headers.insert("x-tenant-subscription", "sub-99".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     assert_eq!(state.group, "sub-99");
 }
@@ -387,7 +471,7 @@ fn strips_accept_encoding_to_keep_response_readable() {
         .insert("accept-encoding", "gzip, deflate, br".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let _state = capture_identity(&mut ctx, "x-tenant-");
+    let _state = capture_identity(&mut ctx, "x-tenant-", "identity");
 
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
     assert!(removed.contains(&"accept-encoding"));
@@ -413,6 +497,37 @@ fn extracts_model_with_whitespace_around_colon() {
 fn extracts_model_when_not_first_field() {
     let body = br#"{"stream":true,"max_tokens":100,"model":"gpt-4o-mini"}"#;
     assert_eq!(extract_model_from_bytes(body).as_deref(), Some("gpt-4o-mini"));
+}
+
+#[test]
+fn extract_model_ignores_nested_decoy() {
+    // A "model" key inside a message object must not win over the real
+    // top-level field, regardless of field order.
+    let body = br#"{"messages":[{"role":"user","content":"hi","model":"decoy"}],"model":"gpt-4"}"#;
+    assert_eq!(
+        extract_model_from_bytes(body).as_deref(),
+        Some("gpt-4"),
+        "nested decoy must not shadow the top-level model"
+    );
+}
+
+#[test]
+fn extract_model_ignores_decoy_inside_string_value() {
+    let body = br#"{"prompt":"please say \"model\": \"decoy\" back","model":"gpt-4o"}"#;
+    assert_eq!(
+        extract_model_from_bytes(body).as_deref(),
+        Some("gpt-4o"),
+        "a quoted decoy inside a string value must be skipped"
+    );
+}
+
+#[test]
+fn extract_model_returns_none_when_only_nested() {
+    let body = br#"{"messages":[{"model":"decoy","content":"hi"}]}"#;
+    assert!(
+        extract_model_from_bytes(body).is_none(),
+        "a nested-only model key must not be attributed"
+    );
 }
 
 #[test]

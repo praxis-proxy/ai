@@ -47,6 +47,9 @@ filter_chains:
         source: "ai-gateway"
         fail_open: true
         identity_header_prefix: "x-tenant-"
+        # Namespace the identity_header_guard filter writes captured headers
+        # under; must match that filter's metadata_namespace when both run.
+        # identity_metadata_namespace: "identity"
         # Optional fallbacks for deployments where an upstream authentication
         # layer does not inject identity headers. Without default_username,
         # requests carrying no identity header are not metered at all.
