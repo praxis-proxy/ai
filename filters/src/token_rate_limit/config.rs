@@ -16,8 +16,8 @@ use serde::Deserialize;
 /// algorithm choice (`sliding_window` or `token_bucket`) and that rule's
 /// own budget.
 ///
-/// Mirrors the `rules:`/`match:` shape from `ai#658`'s evolved design doc
-/// (`docs/proposals/00121_token-rate-limiting.md`), scoped to this MVP's
+/// Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting`
+/// proposal in `praxis-proxy/enhancements`, scoped to this MVP's
 /// static header-value matchers and per-rule algorithm choice. CEL
 /// matchers, soft-limit tiers, weighted per-type accounting, and
 /// configurable estimation strategies are still out of scope (see the
@@ -103,7 +103,7 @@ pub(super) struct RuleConfig {
     /// the charge first applies -- it applies immediately at admission,
     /// same as any other reservation.
     ///
-    /// Answers `ai#658`'s own still-open "lost request handling"
+    /// Answers the proposal's still-open "lost request handling"
     /// question for this MVP. Defaults to [`DEFAULT_RESERVATION_TIMEOUT`]
     /// when unset.
     #[serde(default)]

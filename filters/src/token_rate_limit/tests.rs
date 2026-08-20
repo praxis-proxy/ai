@@ -618,8 +618,8 @@ async fn bucket_key_header_with_empty_or_oversized_value_falls_back_to_the_share
 }
 
 // -----------------------------------------------------------------------------
-// Lost-request handling (ai#658's still-open question, answered here via
-// reservation_timeout)
+// Lost-request handling (the proposal's still-open question, answered here
+// via reservation_timeout)
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -632,7 +632,7 @@ async fn lost_request_is_charged_at_its_estimate_and_cannot_bypass_the_budget() 
     // reservation_timeout bounds how long such a reservation is trusted
     // before being conservatively
     // charged at its estimate, matching the "lost request handling"
-    // question `ai#658`'s own design doc leaves open.
+    // question the proposal's own design doc leaves open.
     let yaml = single_rule_yaml(
         "algorithm: sliding_window\nwindow: 300ms\ncapacity: 50\nestimate_tokens: 50\nreservation_timeout: 50ms",
     );

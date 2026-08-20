@@ -7,7 +7,7 @@
 //! on nerdalert's `poc/distributed-token-rate-limit-demo` spike branch
 //! (<https://github.com/nerdalert/ai/tree/poc/distributed-token-rate-limit-demo>).
 //! Replaces this filter's token-bucket state with a true sliding window per
-//! `ai#658`'s design doc ("Windows are sliding: a `window: 1h` budget
+//! the proposal's design doc ("Windows are sliding: a `window: 1h` budget
 //! tracks usage in the most recent 60 minutes from the current instant"),
 //! and answers that same proposal's still-open "lost request handling"
 //! question via `reservation_timeout_ms` + conservative charge-at-estimate

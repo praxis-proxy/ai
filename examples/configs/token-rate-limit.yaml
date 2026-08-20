@@ -10,8 +10,8 @@
 #   curl -i http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
 #
 # This is the uncontested MVP core of the token rate limiting proposal
-# (docs/proposals/00121_token-rate-limiting.md, tracked by epic ai#121,
-# PR ai#658):
+# (00121_token-rate-limiting.md in praxis-proxy/enhancements, tracked by
+# epic ai#121):
 #   - M1: a single sliding-window budget (one catch-all rule)
 #   - M2: reservation-based admission, reconciled against actual usage
 #   - M6: 429 responses with token-denominated rate limit headers
@@ -19,9 +19,9 @@
 # `rules:` (per `ai#789`/`praxis#551`) lets each rule pick its own
 # admission algorithm and match condition; a rule with no `match:` is a
 # catch-all applying to every request that reaches it. This example
-# uses one such catch-all rule. `window`/`capacity` match ai#658's own
-# field names: "Windows are sliding: a `window: 1h` budget tracks usage
-# in the most recent 60 minutes from the current instant." State
+# uses one such catch-all rule. `window`/`capacity` match the proposal's
+# own field names: "Windows are sliding: a `window: 1h` budget tracks
+# usage in the most recent 60 minutes from the current instant." State
 # defaults to in-process; set `backend: {kind: valkey, url: ...,
 # namespace: ...}` to share one budget across every gateway
 # instance/replica.

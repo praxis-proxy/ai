@@ -3,10 +3,10 @@
 
 //! Token-denominated rate limiting filter.
 //!
-//! Implements the uncontested MVP core of `ai#658`'s token rate limiting
-//! proposal (`docs/proposals/00121_token-rate-limiting.md`, tracked by
-//! epic `ai#121`): an ordered list of `rules`, each an optional static
-//! header-value match condition (`ai#658`'s "static matchers (MVP)")
+//! Implements the uncontested MVP core of the token rate limiting
+//! proposal (`00121_token-rate-limiting.md` in `praxis-proxy/enhancements`,
+//! tracked by epic `ai#121`): an ordered list of `rules`, each an optional
+//! static header-value match condition ("static matchers (MVP)")
 //! bound to an independently-chosen admission algorithm and its own
 //! token budget, reservation-based admission reconciled against actual
 //! provider-reported usage, and standard 429 responses with
@@ -32,20 +32,22 @@
 //! `ai#789`/`praxis#551` ("this looks like a per-rule choice, similar to
 //! `shadow`/enforcement-action knobs elsewhere").
 //!
-//! Deliberately deferred, pending open design threads on `ai#658`:
+//! Deliberately deferred, pending the proposal's own open design questions:
 //!
 //! - **CEL-expression matchers**: only static, exact header-value equality matching is implemented (overlapping
 //!   `praxis#189`/`#232`).
-//! - **Composite/multi-dimension keys, per-model keys (`ai#123`)**: `ai#129`'s single-header-value keying (one budget
-//!   applied uniformly per key, fallback to global) is implemented per rule; richer composite keys are not.
+//! - **Composite/multi-dimension keys, per-model keys**: flagged as TBD under the proposal's own M5 goal (see
+//!   `ai#123`/`ai#232`); `ai#129`'s single-header-value keying (one budget applied uniformly per key, fallback to
+//!   global) is implemented per rule, and intentionally does not resolve identity to a key itself -- it keys off
+//!   whatever header value an upstream component has already put there.
 //! - **Configurable estimation (M3)**: `estimate_tokens` is a fixed constant per rule, not derived from request
 //!   metadata (e.g. `max_tokens`).
 //! - **Token-type-aware accounting (M4)**: reconciles against `token.total` only; per-type (input/output/cached)
 //!   weighting is not modeled yet.
-//! - **Multiple budgets per rule, soft-limit tiers**: `ai#658`'s proposal allows several `token_budgets` (e.g. hourly +
-//!   daily) and graduated tiers per rule; this MVP admits exactly one budget per rule with a hard deny at capacity.
+//! - **Multiple budgets per rule, soft-limit tiers**: the proposal allows several `token_budgets` (e.g. hourly + daily)
+//!   and graduated tiers per rule; this MVP admits exactly one budget per rule with a hard deny at capacity.
 //! - **Observability (M7/M8) and metering (S3)**: out of scope here -- both are recommended to split into their own
-//!   proposals on the `ai#658` review thread.
+//!   follow-on proposals.
 //!
 //! `X-RateLimit-*` headers are emitted on 429 rejection only, matching
 //! the validated pattern on the source spike branch: computing
@@ -135,7 +137,7 @@ const MAX_ACTIVE_RESERVATIONS: usize = 200_000;
 /// Uses the `-Tokens` suffix per `ai#124`'s spec, distinct from the
 /// existing `rate_limit` filter's unsuffixed `X-RateLimit-Limit`, to
 /// avoid a header collision when both filters run in the same
-/// pipeline (flagged on the `ai#658` review thread).
+/// pipeline.
 const HEADER_RATELIMIT_LIMIT_TOKENS: &str = "X-RateLimit-Limit-Tokens";
 
 /// Rate limit header: remaining tokens (always `0` -- only sent on 429).

@@ -4,8 +4,8 @@
 //! Integration tests for the `token_rate_limit` filter's example config.
 //!
 //! Covers the uncontested MVP core of the token rate limiting proposal
-//! (`docs/proposals/00121_token-rate-limiting.md`, epic `ai#121`, PR
-//! `ai#658`): reservation-based admission, 429 rejection with
+//! (`00121_token-rate-limiting.md` in `praxis-proxy/enhancements`, epic
+//! `ai#121`): reservation-based admission, 429 rejection with
 //! token-denominated headers, and reconciliation against actual
 //! provider-reported usage (`token_count`'s `token.total`) once the
 //! response completes. Also covers `ai#129`'s `bucket_key_header`
