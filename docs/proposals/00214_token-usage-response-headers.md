@@ -144,7 +144,7 @@ Response Headers (injected into downstream response)
 
 #### Implementation Approach
 
-1. **String-based metadata transport** — per maintainer
+1. **String-based metadata transport** — per reviewer
    guidance in [#462], token data uses `filter_metadata`
    rather than typed fields on `HttpFilterContext`. This
    keeps the core struct free of AI-specific concerns.

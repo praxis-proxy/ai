@@ -28,22 +28,22 @@ Build consensus with community members.
 
 ### 2. Sign-off
 
-A maintainer reviews the discussion and marks it as
+A reviewer reviews the discussion and marks it as
 approved. This confirms the project is open to the
 proposed direction.
 
-> **Note**: It's fair to directly ping maintainers asking
+> **Note**: It's fair to directly ping reviewers asking
 > for review and approval consideration when things get stuck.
 
 ### 3. Issue
 
-Once the discussion is approved by a maintainer and resolved,
+Once the discussion is approved by a reviewer and resolved,
 create an `EPIC` issue from the discussion. Include first a link
 to the originating discussion, followed by a high-level summary.
 This is where all implementation work will be organized (as
 sub-tasks).
 
-> **Note**: Maintainers will assign epic and sub-task owners.
+> **Note**: Reviewers will assign epic and sub-task owners.
 
 ### 4. Proposal PR
 
@@ -80,7 +80,7 @@ CI will close PRs that:
 Iterate on the proposal in subsequent PRs. Add the
 **How?** section: either a list of implementing PRs
 or a full requirements and design writeup. Refine
-until a maintainer marks the proposal as accepted.
+until a reviewer marks the proposal as accepted.
 
 ### 6. Experimental
 
@@ -96,7 +96,7 @@ nothing about them is guaranteed.
 
 ### 7. Release
 
-After a soak period determined by maintainers a maintainer
+After a soak period determined by reviewers a reviewer
 may promote the feature from experimental to released. The
 proposal status is updated to `released`.
 
@@ -104,7 +104,7 @@ proposal status is updated to `released`.
 
 Every proposal must list its stakeholders in the
 frontmatter. Stakeholders are people with a vested
-interest in the outcome of a proposal: maintainers,
+interest in the outcome of a proposal: reviewers,
 domain experts, downstream consumers, or anyone whose
 work is directly affected by the change. Stakeholders
 are expected to review and provide feedback throughout
@@ -119,7 +119,7 @@ An author may also be a stakeholder.
 
 Every proposal must list graduation criteria in the
 frontmatter. These are the conditions that must be
-satisfied before a maintainer will advance the
+satisfied before a reviewer will advance the
 proposal's status (e.g. `proposed` to `accepted`,
 `experimental` to `released`).
 

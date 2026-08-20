@@ -104,7 +104,7 @@ solves this once for all features.
   request-scoped state and retrieve it in later
   lifecycle phases so that I do not re-parse data or
   use side channels.
-- As a framework maintainer, I want one generic
+- As a framework reviewer, I want one generic
   extension mechanism so that new features do not
   require adding fields to `HttpFilterContext`.
 - As a Praxis developer, I want extensions to survive
