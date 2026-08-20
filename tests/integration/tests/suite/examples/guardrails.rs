@@ -27,7 +27,7 @@ fn nemo_guardrails_config_parses_correctly() {
 #[test]
 fn nemo_guardrails_forwards_to_backend() {
     let backend = start_backend_with_shutdown("ok");
-    let nemo = nemo_mock(r#"{"status":"passed","rails_status":{"self check input":{"status":"success"}}}"#);
+    let nemo = nemo_mock(r#"{"status":"success","rails_status":{"self check input":{"status":"success"}}}"#);
     let proxy_port = free_port();
     let config = load_example_config(
         "nemo-guardrails.yaml",
@@ -73,13 +73,13 @@ fn nemo_guardrails_block_rejects_with_403() {
     );
 }
 
-/// `NeMo` returns `"modified"` (redact placeholder) → request is forwarded
-/// to the upstream unchanged and the upstream response is returned.
+/// `NeMo` returns `"error"` with `guardrails_data` → proxy fails closed
+/// with a 500 and does not forward to the upstream.
 #[test]
-fn nemo_guardrails_redact_placeholder_continues() {
+fn nemo_guardrails_error_status_does_not_forward() {
     let backend = start_backend_with_shutdown("ok");
     let nemo = nemo_mock(
-        r#"{"status":"modified","content":"my ssn is [REDACTED]","rails_status":{"pii masking":{"status":"blocked"}}}"#,
+        r#"{"status":"error","rails_status":{},"guardrails_data":{"error":"Config load failed.","details":"bad path"}}"#,
     );
     let proxy_port = free_port();
     let config = load_example_config(
@@ -89,17 +89,16 @@ fn nemo_guardrails_redact_placeholder_continues() {
     );
     let proxy = start_proxy(&config);
 
-    let (status, body) = http_post(
+    let (status, _body) = http_post(
         proxy.addr(),
         "/v1/guardrail/checks",
-        r#"{"model":"test","messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#,
+        r#"{"model":"test","messages":[{"role":"user","content":"hello"}]}"#,
     );
 
     assert_eq!(
-        status, 200,
-        "NeMo 'modified' should continue (body replacement deferred to #579)"
+        status, 500,
+        "NeMo 'error' status should fail closed with a 500, not forward to upstream"
     );
-    assert_eq!(body, "ok", "upstream response should reach the client");
 }
 
 /// `NeMo` is unreachable → provider error propagates and the proxy does not

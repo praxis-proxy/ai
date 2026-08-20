@@ -280,7 +280,7 @@ async fn on_request_body_passes_through() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "passed"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "success"})))
         .mount(&mock_server)
         .await;
 
@@ -295,7 +295,7 @@ async fn on_request_body_passes_through() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(action, praxis_filter::FilterAction::Continue),
-        "nemo provider should pass through when status is 'passed'"
+        "nemo provider should pass through when status is 'success'"
     );
     assert_eq!(
         ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
@@ -342,15 +342,18 @@ async fn on_request_body_blocked_writes_filter_results() {
 }
 
 #[tokio::test]
-async fn on_request_body_modified_writes_filter_results() {
+async fn on_request_body_error_status_fails_closed() {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": "modified",
-            "content": "my ssn is [REDACTED]",
-            "rails_status": {"pii masking": {"status": "blocked"}}
+            "status": "error",
+            "rails_status": {},
+            "guardrails_data": {
+                "error": "Could not load guardrails configuration.",
+                "details": "Invalid config path."
+            }
         })))
         .mount(&mock_server)
         .await;
@@ -360,18 +363,13 @@ async fn on_request_body_modified_writes_filter_results() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(
-        br#"{"messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#,
+        br#"{"messages":[{"role":"user","content":"hello"}]}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await;
     assert!(
-        matches!(action, praxis_filter::FilterAction::Continue),
-        "modified verdict should forward unchanged (redact placeholder deferred to #579)"
-    );
-    assert_eq!(
-        ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
-        Some("redacted"),
-        "modified verdict should record a 'redacted' status in filter_results"
+        result.is_err(),
+        "NeMo error status should fail closed rather than pass through"
     );
 }
 
@@ -504,7 +502,7 @@ async fn on_request_body_empty_messages_array_still_evaluated() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "passed"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "success"})))
         .mount(&mock_server)
         .await;
 
