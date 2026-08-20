@@ -20,17 +20,17 @@ license = "MIT"
 repository = "https://github.com/praxis-proxy/ai"
 
 [workspace.dependencies]
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 base64 = "0.23.1"
 bytes = "1.12.1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 dashmap = "6.2.1"
-futures = "0.3.33"
-h2 = "0.4.15"
+futures = "0.3.34"
+h2 = "0.4.18"
 http = "1.5.0"
-http-body-util = "0.1.4"
+http-body-util = "0.1.5"
 hyper = { version = "1.11.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal", "user"] }
@@ -38,10 +38,10 @@ percent-encoding = "2.3.2"
 notify = "8.2.0"
 quote = "1.0.47"
 rand = "0.10.2"
-rcgen = "0.14.8"
+rcgen = "0.14.9"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
-rmcp = { version = "3.1.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 rustls = "0.23.43"
 schemars = "1.2.2"
 rustls-pemfile = "2.2.0"
@@ -51,10 +51,10 @@ serde_json_canonicalizer = "0.3.2"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 syn = { version = "3.0.3", features = ["full", "extra-traits", "visit"] }
-serde_yaml = { package = "yaml_serde", version = "0.10.4" }
+serde_yaml = { package = "yaml_serde", version = "0.10.7" }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres"] }
 tempfile = "3.27.0"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tiktoken-rs = "0.12.0"
 tikv-jemallocator = "0.7.0"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
@@ -69,11 +69,11 @@ wiremock = "0.6.5"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-praxis-core = { version = "0.5.2", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.5.2", package = "praxis-proxy-filter" }
-praxis-protocol = { version = "0.5.2", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.5.2", package = "praxis-proxy-tls" }
-praxis = { version = "0.5.2", package = "praxis-proxy" }
+praxis-core = { version = "0.5.3", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.5.3", package = "praxis-proxy-filter" }
+praxis-protocol = { version = "0.5.3", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.5.3", package = "praxis-proxy-tls" }
+praxis = { version = "0.5.3", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
 
 # Praxis AI workspace dependencies
