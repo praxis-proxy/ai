@@ -13,11 +13,9 @@ use serde_json::Value;
 /// Saturating recursive sum for numeric token-usage fields.
 ///
 /// Recursively merges `current` into `accumulated`:
-/// - Objects: fields are merged recursively; newly introduced keys
-///   are preserved.
+/// - Objects: fields are merged recursively; newly introduced keys are preserved.
 /// - Unsigned integers: saturating-add.
-/// - All other types (including signed/float numbers and type
-///   mismatches): `accumulated` is replaced with `current`.
+/// - All other types (including signed/float numbers and type mismatches): `accumulated` is replaced with `current`.
 pub(crate) fn merge_usage(accumulated: &mut Value, current: &Value) {
     match (accumulated, current) {
         (Value::Object(accumulated), Value::Object(current)) => {
@@ -94,7 +92,10 @@ mod tests {
     fn replaces_non_unsigned_number() {
         let mut acc = json!({"field": -1});
         merge_usage(&mut acc, &json!({"field": 5}));
-        assert_eq!(acc["field"], 5, "signed/float numbers should replace rather than saturating-add");
+        assert_eq!(
+            acc["field"], 5,
+            "signed/float numbers should replace rather than saturating-add"
+        );
     }
 
     #[test]

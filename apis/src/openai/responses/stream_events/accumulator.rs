@@ -14,7 +14,10 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::StreamEventsState;
-use crate::openai::{responses::{state::ResponsesState, usage::merge_usage}, sse::responses::ResponsesEvent};
+use crate::openai::{
+    responses::{state::ResponsesState, usage::merge_usage},
+    sse::responses::ResponsesEvent,
+};
 
 /// Process a single SSE event, updating `ResponsesState` in
 /// extensions and per-filter accumulation state.
