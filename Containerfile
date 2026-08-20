@@ -49,9 +49,15 @@ RUN mkdir -p apis/src filters/src server/src \
     && echo '//! stub' > server/src/lib.rs \
     && printf '//! stub\nfn main() {}\n' > server/src/main.rs
 
+ARG ENABLE_OPENTELEMETRY=false
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy
+    if [ "$ENABLE_OPENTELEMETRY" = "true" ]; then \
+      cargo build --release -p praxis-ai-proxy --features opentelemetry; \
+    else \
+      cargo build --release -p praxis-ai-proxy; \
+    fi
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -74,7 +80,11 @@ RUN find apis/src filters/src server/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy \
+    if [ "$ENABLE_OPENTELEMETRY" = "true" ]; then \
+      cargo build --release -p praxis-ai-proxy --features opentelemetry; \
+    else \
+      cargo build --release -p praxis-ai-proxy; \
+    fi \
     && cp target/release/praxis-ai /usr/local/bin/praxis-ai
 
 # ------------------------------------------------------------------------------

@@ -385,9 +385,7 @@ mod tests {
         test_utils,
     };
 
-    // -------------------------------------------------------------------------
-    // Header Stripping
-    // -------------------------------------------------------------------------
+    // ---- Header stripping ----
 
     #[tokio::test]
     async fn strips_routing_protocol_headers() {
@@ -561,9 +559,7 @@ mod tests {
         assert!(ctx.request_headers_to_set.is_empty());
     }
 
-    // -------------------------------------------------------------------------
-    // Exact Candidate Matching
-    // -------------------------------------------------------------------------
+    // ---- Exact candidate matching ----
 
     #[tokio::test]
     async fn known_candidate_selects_cluster() {
@@ -611,9 +607,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // Missing Required Headers
-    // -------------------------------------------------------------------------
+    // ---- Missing required headers ----
 
     #[tokio::test]
     async fn missing_candidate_header_denied_403() {
@@ -669,9 +663,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // Oversized Or Empty Values Fail Closed
-    // -------------------------------------------------------------------------
+    // ---- Oversized/empty values fail closed ----
 
     #[tokio::test]
     async fn empty_candidate_id_denied() {
@@ -698,9 +690,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // Metadata Output
-    // -------------------------------------------------------------------------
+    // ---- Metadata output ----
 
     #[tokio::test]
     async fn sets_provider_route_metadata() {
@@ -715,9 +705,7 @@ mod tests {
         assert!(ctx.get_metadata(PROVIDER_ROUTE_REQUEST_ID).is_some());
     }
 
-    // -------------------------------------------------------------------------
-    // Provider Attribution
-    // -------------------------------------------------------------------------
+    // ---- Provider attribution ----
 
     #[tokio::test]
     async fn sets_provider_attribution_request_header() {
@@ -774,9 +762,7 @@ mod tests {
         assert!(resp.headers.get(PROVIDER_ATTRIBUTION_RESPONSE_HEADER).is_none());
     }
 
-    // -------------------------------------------------------------------------
-    // Credential Metadata
-    // -------------------------------------------------------------------------
+    // ---- Credential metadata ----
 
     #[tokio::test]
     async fn no_credential_clears_metadata() {
@@ -840,9 +826,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // Config Validation
-    // -------------------------------------------------------------------------
+    // ---- Config validation ----
 
     #[test]
     fn empty_routes_rejected() {

@@ -22,7 +22,7 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
-opentelemetry = ["praxis-ai-filters/opentelemetry"]
+opentelemetry = ["praxis-ai-filters/opentelemetry", "praxis-core/otel"]
 praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
 
 [lints]
@@ -39,7 +39,7 @@ praxis-protocol = { workspace = true }
 praxis-tls = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time", "fs"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "fs"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 
