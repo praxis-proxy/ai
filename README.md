@@ -41,6 +41,31 @@ transforms, and routes traffic through one policy-driven gateway.
 
 ![Praxis AI architecture](assets/praxis-ai-architecture.svg)
 
+### Why is this separate from praxis-proxy/praxis?
+
+The [praxis-proxy/praxis] repository is considered the "core" framework
+and standard server build for Praxis.
+
+The separation of repositories for clear contiguous themes in the Praxis
+organization is a **very explicit** choice at the core of Praxis architectural
+philosophy. We practice a very diligent separation of concerns. This
+particular separation provides:
+
+* This Cleanly separates different technical domains and competencies for
+  our contributors.
+* The `praxis-proxy/praxis` core repo no need for dependency on `ai`: we
+  explicitly support standard use cases without AI.
+* Reduces the tendency for overreach from one subsystem to another, which
+  encourages cleaner APIs and library surfaces.
+* AI capabilities generally move and change **much faster** than the standard
+  networking proxy technology in core, as that ecosystem is very mature.
+
+See our [conventions] for more details on our development practices and
+philosophies.
+
+[praxis-proxy/praxis]:https://github.com/praxis-proxy/praxis
+[conventions]:https://github.com/praxis-proxy/conventions
+
 ## Quick start
 
 Build and start the gateway with its built-in configuration:
