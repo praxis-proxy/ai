@@ -5,6 +5,10 @@
 
 Integrates with an external metering service for pre-request balance checks and post-response token usage reporting.
 
+## Configuration Notes
+
+Tenant identity is resolved from the highest-trust source available: verified `{prefix}*` metadata written by an authentication filter, then the `identity_header_guard` filter's namespaced `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request headers. A higher tier always wins, so forged client headers can never override verified claims, and identity headers plus client credentials are always stripped before the request is forwarded.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -15,6 +19,7 @@ Integrates with an external metering service for pre-request balance checks and 
 | `source` | string | no | `CloudEvents` `source` field value. |
 | `fail_open` | bool | no | When `true` (default), requests proceed if the metering service is unavailable. When `false`, requests are rejected with 503. |
 | `identity_header_prefix` | string | no | Prefix for tenant identity headers to capture and strip. Expected headers: `{prefix}username`, `{prefix}group`, `{prefix}subscription`, `{prefix}model`. |
+| `identity_metadata_namespace` | string | no | Metadata namespace the `identity_header_guard` filter writes captured identity headers under. Must match that filter's `metadata_namespace` setting when both run in one pipeline. |
 | `default_username` | string | no | Fallback username when no identity header is present. If set, requests without `{prefix}username` are still metered under this name. If unset, metering is skipped entirely. |
 | `default_model` | string | no | Fallback model name when no identity model header is present. |
 
@@ -28,6 +33,7 @@ feature_key: "inference-tokens"
 source: "ai-gateway"
 fail_open: true
 identity_header_prefix: "x-tenant-"
+identity_metadata_namespace: "identity"
 default_username: "anonymous"
 default_model: "unknown"
 ```
