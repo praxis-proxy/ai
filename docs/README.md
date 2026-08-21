@@ -28,7 +28,7 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [Adding filters](developing/adding-filters.md)
 - [Type design](developing/type-design.md)
 - [Project management](developing/project-management.md)
-- [Proposal process](proposals.md)
+- [Proposal process](https://github.com/praxis-proxy/enhancements)
 
 ## Operations and releases
 

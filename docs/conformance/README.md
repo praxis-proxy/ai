@@ -203,7 +203,7 @@ Strict conformance records a failed step while known failures remain.
 
 On pull requests, the gate compares normalized failure fingerprints with the
 base branch's checked-in report. Existing failures and fixes need no label.
-New missing operations or drift details fail the workflow unless a maintainer
+New missing operations or drift details fail the workflow unless a reviewer
 applies `conformance-failure-acknowledged`. Adding or removing that label
 reruns the workflow.
 

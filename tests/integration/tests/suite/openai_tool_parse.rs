@@ -394,7 +394,7 @@ filter_chains:
               filter: openai_tool_parse
               key: has_tools
               result: "true"
-            rejoin: terminal
+            rejoin: shared_load_balancer
             chains:
               - name: tools_chain
                 filters:
@@ -402,20 +402,19 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "tools"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "tools"
-                        endpoints:
-                          - "127.0.0.1:{tools_port}"
       - filter: router
         routes:
           - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+          - name: "tools"
+            endpoints:
+              - "127.0.0.1:{tools_port}"
 "#
     )
 }
@@ -438,7 +437,7 @@ filter_chains:
               filter: openai_tool_parse
               key: tool_choice
               result: "required"
-            rejoin: terminal
+            rejoin: shared_load_balancer
             chains:
               - name: required_chain
                 filters:
@@ -446,20 +445,19 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "required"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "required"
-                        endpoints:
-                          - "127.0.0.1:{required_port}"
       - filter: router
         routes:
           - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+          - name: "required"
+            endpoints:
+              - "127.0.0.1:{required_port}"
 "#
     )
 }
@@ -512,7 +510,7 @@ filter_chains:
               filter: openai_tool_parse
               key: has_web_search
               result: "true"
-            rejoin: terminal
+            rejoin: shared_load_balancer
             chains:
               - name: web_chain
                 filters:
@@ -520,20 +518,19 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "web"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "web"
-                        endpoints:
-                          - "127.0.0.1:{web_port}"
       - filter: router
         routes:
           - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+          - name: "web"
+            endpoints:
+              - "127.0.0.1:{web_port}"
 "#
     )
 }
@@ -556,7 +553,7 @@ filter_chains:
               filter: openai_tool_parse
               key: has_web_search
               result: "true"
-            rejoin: terminal
+            rejoin: shared_load_balancer
             chains:
               - name: web_chain
                 filters:
@@ -564,20 +561,19 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "web"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "web"
-                        endpoints:
-                          - "127.0.0.1:{web_port}"
       - filter: router
         routes:
           - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+          - name: "web"
+            endpoints:
+              - "127.0.0.1:{web_port}"
 "#
     )
 }

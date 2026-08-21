@@ -13,7 +13,7 @@ owns locally, then preserve the request and response bodies as much as possible
 when passing them through.
 
 This test plan extends the broader Messages API filter proposal in
-[00484_anthropic-messages-api-filters.md](proposals/00484_anthropic-messages-api-filters.md)
+[00484_anthropic-messages-api-filters.md](https://github.com/praxis-proxy/enhancements/blob/main/proposals/00484_anthropic-messages-api-filters.md)
 with concrete fixture and test coverage.
 
 ## Sources

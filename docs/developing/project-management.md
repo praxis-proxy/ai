@@ -8,7 +8,7 @@ and tracking work.
 
 Every issue goes through triage before it becomes
 accepted work. New issues are automatically labeled
-`triage/needs-triage` when opened. Maintainers review
+`triage/needs-triage` when opened. Reviewers review
 incoming issues regularly (typically daily) to assess
 scope, validity, and priority.
 
@@ -21,7 +21,7 @@ reverts it to `triage/needs-triage`.
 
 | Label | Meaning |
 | --- | --- |
-| `triage/needs-triage` | Awaiting maintainer review |
+| `triage/needs-triage` | Awaiting reviewer review |
 | `triage/accepted` | Assigned to a milestone; accepted for work |
 
 ## Bot-Generated Issues
@@ -29,24 +29,24 @@ reverts it to `triage/needs-triage`.
 A weekly bot opens issues on the repository to surface
 potential improvements, bugs, or maintenance tasks. These
 issues are labeled `NEED HUMAN REVIEW` and **must not be
-worked on until a maintainer has reviewed them**.
+worked on until a reviewer has reviewed them**.
 
 ### Rules
 
 - **Do not self-assign** a bot-generated issue before it
   has been reviewed.
 - **Do not submit a PR** for a bot-generated issue before
-  it has been validated by a maintainer.
+  it has been validated by a reviewer.
 
 ### Review Process
 
-A maintainer reviews the issue and applies one of the
+A reviewer reviews the issue and applies one of the
 following labels:
 
 | Label | Meaning |
 | --- | --- |
-| `NEED HUMAN REVIEW` | Awaiting maintainer review (applied automatically by the bot) |
-| `HUMAN REVIEWED` | A maintainer has validated the issue |
+| `NEED HUMAN REVIEW` | Awaiting reviewer review (applied automatically by the bot) |
+| `HUMAN REVIEWED` | A reviewer has validated the issue |
 
 To **approve** an issue, replace the `NEED HUMAN REVIEW`
 label with `HUMAN REVIEWED`. The label history records
