@@ -1,0 +1,151 @@
+name: vLLM GPU Container
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "vllm/Containerfile"
+      - ".github/workflows/vllm-gpu-container.yaml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "vllm/Containerfile"
+      - ".github/workflows/vllm-gpu-container.yaml"
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      inference_model:
+        description: "Inference model (HuggingFace ID) — default is Qwen/Qwen3-0.6B"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/praxis-proxy/vllm-gpu
+  INFERENCE_MODEL: ${{ inputs.inference_model || 'Qwen/Qwen3-0.6B' }}
+
+jobs:
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant path changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
+                                         "${{ github.event.merge_group.head_sha }}" -- \
+            'vllm/Containerfile' \
+            '.github/workflows/vllm-gpu-container.yaml')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-test:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: TODO-GPU-RUNNER-LABEL
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set image tag
+        run: echo "IMAGE_TAG=${INFERENCE_MODEL#*/}" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          docker system prune -af
+
+      - name: Build image
+        env:
+          DOCKER_BUILDKIT: "1"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          BUILD_ARGS=(
+            --build-arg "INFERENCE_MODEL=${INFERENCE_MODEL}"
+            --tag "${IMAGE_NAME}:${IMAGE_TAG}"
+            --file vllm/Containerfile
+          )
+          if [ -n "${HF_TOKEN}" ]; then
+            BUILD_ARGS+=(--secret "id=hf_token,env=HF_TOKEN")
+          fi
+          docker build "${BUILD_ARGS[@]}" .
+
+      - name: Start vLLM
+        run: |
+          docker run -d --name vllm-inference \
+            --gpus all \
+            -p 8000:8000 \
+            "${IMAGE_NAME}:${IMAGE_TAG}" \
+            --model "/opt/vllm/models/${INFERENCE_MODEL}" \
+            --max-model-len 4096 \
+            --served-model-name "${INFERENCE_MODEL#*/}" \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+
+      - name: Wait for vLLM readiness
+        run: |
+          echo "Waiting for vLLM health endpoint..."
+          timeout 300 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; do
+            sleep 5
+          done'
+          echo "vLLM is ready"
+
+      - name: Smoke test inference
+        run: |
+          response=$(curl -sf http://127.0.0.1:8000/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "'"${INFERENCE_MODEL#*/}"'",
+              "messages": [{"role": "user", "content": "Say hello in one word."}],
+              "max_tokens": 16
+            }')
+          echo "$response" | jq .
+          echo "$response" | jq -e '.choices[0].message.content' > /dev/null
+
+      - name: vLLM logs
+        if: failure()
+        run: docker logs vllm-inference
+
+      - name: Stop vLLM
+        if: always()
+        run: docker rm -f vllm-inference || true
+
+      - name: Log in to GHCR
+        if: contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name)
+        run: |
+          docker push "${IMAGE_NAME}:${IMAGE_TAG}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
+            docker push "${IMAGE_NAME}:latest"
+          fi
