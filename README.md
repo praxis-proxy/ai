@@ -128,7 +128,7 @@ filters and protocol support. Before opening a pull request, please read the
 [development setup](docs/developing/getting-started.md).
 
 For larger changes, open a [feature request] and follow the
-[proposal process](docs/proposals.md) so we can shape the idea together.
+[proposal process](https://github.com/praxis-proxy/enhancements) so we can shape the idea together.
 
 [Open an issue][issues] · [Request a feature][feature request] ·
 [Open a pull request][pull requests]
