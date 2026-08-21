@@ -68,12 +68,12 @@ utoipa = "5.5.0"
 wiremock = "0.6.5"
 zeroize = "1.9.0"
 
-# Praxis core dependencies (PR #988 revision for resumable IRR streaming)
-praxis-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2", package = "praxis-proxy-core" }
-praxis-filter = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2", package = "praxis-proxy-filter" }
-praxis-protocol = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2", package = "praxis-proxy-protocol" }
-praxis-tls = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2", package = "praxis-proxy-tls" }
-praxis = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a198962dfddc149f3010ab42ba69130230c91fe2", package = "praxis-proxy" }
+# Praxis core dependencies
+praxis-core = { version = "0.5.3", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.5.3", package = "praxis-proxy-filter" }
+praxis-protocol = { version = "0.5.3", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.5.3", package = "praxis-proxy-tls" }
+praxis = { version = "0.5.3", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
 
 # Praxis AI workspace dependencies
