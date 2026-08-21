@@ -482,9 +482,13 @@ fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_default();
     if !summary.is_empty() {
+        let prefix = obj
+            .get("summary_prefix")
+            .and_then(Value::as_str)
+            .unwrap_or(crate::openai::responses::compact::DEFAULT_SUMMARY_PREFIX);
         messages.push(json!({
             "role": "assistant",
-            "content": format!("[Previous conversation summary]\n\n{summary}")
+            "content": format!("{prefix}{summary}")
         }));
     }
 }

@@ -297,9 +297,13 @@ fn compaction_to_assistant_message(m: &serde_json::Value) -> serde_json::Value {
         .and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_default();
+    let prefix = m
+        .get("summary_prefix")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(super::compact::DEFAULT_SUMMARY_PREFIX);
     serde_json::json!({
         "role": "assistant",
-        "content": format!("[Previous conversation summary]\n\n{summary}")
+        "content": format!("{prefix}{summary}")
     })
 }
 

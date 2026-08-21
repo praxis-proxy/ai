@@ -18,6 +18,7 @@ Compaction only applies to multi-turn requests where `openai_responses_rehydrate
 | `inference_url` | string | yes | URL of the inference backend for summarization calls. E.g., `"http://localhost:11434/v1/chat/completions"` |
 | `default_model` | string | no | Default model for summarization when not overridden in the request's `context_management`. |
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
+| `summary_prefix` | string | no | Prefix prepended to the summary when translating compaction items to backend messages. Defaults to `"[Previous conversation summary]\n\n"`. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `callout_failure_mode` | `closed` \| `open` | no | Failure mode for the inference callout. |
 | `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
@@ -39,6 +40,7 @@ filter: openai_responses_compact
 inference_url: "http://localhost:11434/v1/chat/completions"
 default_model: gpt-4o-mini
 tiktoken_encoding: cl100k_base
+summary_prefix: "[Previous conversation summary]\n\n"
 timeout_ms: 30000
 callout_failure_mode: closed
 status_on_error: 502

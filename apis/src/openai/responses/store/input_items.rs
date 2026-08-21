@@ -144,10 +144,16 @@ fn normalize_input_items(record: &ResponseRecord) -> Vec<serde_json::Value> {
     let items = match &record.input {
         serde_json::Value::Null => vec![],
         serde_json::Value::String(text) => vec![scalar_input_item(&record.id, text)],
-        serde_json::Value::Array(arr) => arr.clone(),
+        serde_json::Value::Array(arr) => arr.iter().filter(|item| !is_compaction_item(item)).cloned().collect(),
         other => vec![other.clone()],
     };
     ensure_stable_ids(&record.id, items)
+}
+
+/// Returns `true` for internal compaction items that should be hidden
+/// from the public `input_items` API.
+fn is_compaction_item(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
 }
 
 /// Assign a stable synthetic ID (`msg_{response_id}_input_{index}`) to
