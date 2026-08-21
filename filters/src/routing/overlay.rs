@@ -521,6 +521,7 @@ impl RouteSnapshot {
             .overlay
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
+        warn_if_selection_policy_has_no_groups(selection_mode, &group_index);
 
         Ok(Self {
             candidates,
@@ -547,6 +548,7 @@ impl RouteSnapshot {
         let selection_mode = doc
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
+        warn_if_selection_policy_has_no_groups(selection_mode, &group_index);
 
         Ok(Self {
             candidates,
@@ -576,6 +578,16 @@ impl RouteSnapshot {
             schema_version: None,
             semantic_revision: None,
         }
+    }
+}
+
+/// Warn when a non-deterministic policy has no grouped candidates to select.
+fn warn_if_selection_policy_has_no_groups(selection_mode: PickerPolicy, group_index: &GroupIndex) {
+    if selection_mode != PickerPolicy::Deterministic && group_index.is_empty() {
+        tracing::warn!(
+            selection_mode = ?selection_mode,
+            "routing: selection policy is set but no candidates have selection_group; policy will not take effect"
+        );
     }
 }
 
@@ -1009,11 +1021,23 @@ fn handle_overlay_reload(
         return;
     };
 
-    if is_unchanged(&content, snapshot, expected_scope) {
+    let current = snapshot.load();
+    let content_hash: [u8; 32] = Sha256::digest(&content).into();
+    if content_hash == current.content_hash {
+        tracing::debug!("intelligent_route: overlay snapshot is unchanged");
         return;
     }
 
-    apply_overlay(path, &content, snapshot, expected_scope);
+    match RouteSnapshot::from_overlay_with_scope(&content, expected_scope) {
+        Ok(new_snap) => {
+            if is_semantically_unchanged(&current, &new_snap) {
+                tracing::debug!("intelligent_route: overlay snapshot is semantically unchanged");
+                return;
+            }
+            apply_overlay(new_snap, snapshot);
+        },
+        Err(e) => log_overlay_reload_error(path, snapshot, &e),
+    }
 }
 
 /// Read the overlay file with a bounded read.
@@ -1057,78 +1081,51 @@ pub(crate) fn read_overlay_bounded(path: &Path) -> Result<Vec<u8>, std::io::Erro
     Ok(buf)
 }
 
-/// Avoid replacing request-time state for a timestamp-only rewrite.
-///
-/// The candidate snapshot is fully parsed and scope-validated before its
-/// semantic revision is trusted. This preserves round-robin counters without
-/// allowing malformed content to bypass normal reload validation.
-fn is_unchanged(
-    content: &[u8],
-    snapshot: &ArcSwap<RouteSnapshot>,
-    expected_scope: Option<&ExpectedOverlayScope>,
-) -> bool {
-    let new_hash: [u8; 32] = Sha256::digest(content).into();
-    let current = snapshot.load();
-    let unchanged = new_hash == current.content_hash
-        || (current.semantic_revision.is_some()
-            && RouteSnapshot::from_overlay_with_scope(content, expected_scope)
-                .ok()
-                .and_then(|candidate| candidate.semantic_revision)
-                == current.semantic_revision);
-    if unchanged {
-        tracing::debug!("intelligent_route: overlay snapshot is semantically unchanged");
-    }
-    unchanged
+/// Return whether a validated candidate preserves the current semantic revision.
+fn is_semantically_unchanged(current: &RouteSnapshot, candidate: &RouteSnapshot) -> bool {
+    current.semantic_revision.is_some() && candidate.semantic_revision == current.semantic_revision
 }
 
 /// Parse the overlay and swap the snapshot on success.
-#[expect(clippy::too_many_lines, reason = "error and success paths with structured logging")]
-fn apply_overlay(
-    path: &Path,
-    content: &[u8],
-    snapshot: &ArcSwap<RouteSnapshot>,
-    expected_scope: Option<&ExpectedOverlayScope>,
-) {
-    match RouteSnapshot::from_overlay_with_scope(content, expected_scope) {
-        Ok(new_snap) => {
-            let previous_serving_revision = snapshot
-                .load()
-                .semantic_revision
-                .as_deref()
-                .unwrap_or("none")
-                .to_owned();
-            let accepted_revision = new_snap.semantic_revision.as_deref().unwrap_or("none").to_owned();
-            let schema_version = new_snap.schema_version.as_deref().unwrap_or("none").to_owned();
-            let candidate_count = new_snap.candidates.len();
-            let local_site = Arc::clone(&new_snap.local_site);
-            let contract_format = new_snap.contract_format;
-            snapshot.store(Arc::new(new_snap));
-            tracing::info!(
-                candidate_count,
-                local_site = &*local_site,
-                contract_format = ?contract_format,
-                schema_version = %schema_version,
-                accepted_revision = %accepted_revision,
-                serving_revision = %accepted_revision,
-                previous_serving_revision = %previous_serving_revision,
-                "intelligent_route: overlay reloaded"
-            );
-        },
-        Err(e) => {
-            let serving_rev = snapshot
-                .load()
-                .semantic_revision
-                .as_deref()
-                .unwrap_or("none")
-                .to_owned();
-            tracing::error!(
-                path = %path.display(),
-                error = %e,
-                retained_serving_revision = %serving_rev,
-                "intelligent_route: overlay reload failed, retaining previous snapshot"
-            );
-        },
-    }
+fn apply_overlay(new_snap: RouteSnapshot, snapshot: &ArcSwap<RouteSnapshot>) {
+    let previous_serving_revision = snapshot
+        .load()
+        .semantic_revision
+        .as_deref()
+        .unwrap_or("none")
+        .to_owned();
+    let accepted_revision = new_snap.semantic_revision.as_deref().unwrap_or("none").to_owned();
+    let schema_version = new_snap.schema_version.as_deref().unwrap_or("none").to_owned();
+    let candidate_count = new_snap.candidates.len();
+    let local_site = Arc::clone(&new_snap.local_site);
+    let contract_format = new_snap.contract_format;
+    snapshot.store(Arc::new(new_snap));
+    tracing::info!(
+        candidate_count,
+        local_site = &*local_site,
+        contract_format = ?contract_format,
+        schema_version = %schema_version,
+        accepted_revision = %accepted_revision,
+        serving_revision = %accepted_revision,
+        previous_serving_revision = %previous_serving_revision,
+        "intelligent_route: overlay reloaded"
+    );
+}
+
+/// Log a rejected overlay while retaining the last-known-good snapshot.
+fn log_overlay_reload_error(path: &Path, snapshot: &ArcSwap<RouteSnapshot>, error: &FilterError) {
+    let serving_rev = snapshot
+        .load()
+        .semantic_revision
+        .as_deref()
+        .unwrap_or("none")
+        .to_owned();
+    tracing::error!(
+        path = %path.display(),
+        error = %error,
+        retained_serving_revision = %serving_rev,
+        "intelligent_route: overlay reload failed, retaining previous snapshot"
+    );
 }
 
 /// Set up a [`RecommendedWatcher`] that sends to the given channel
@@ -2308,7 +2305,8 @@ mod tests {
             include_bytes!("../../../tests/fixtures/overlay-contract/v1/timestamp-change-same-revision.json");
         let snapshot = ArcSwap::from_pointee(RouteSnapshot::from_overlay(valid).unwrap());
 
-        assert!(is_unchanged(timestamp_only, &snapshot, None));
+        let timestamp_snapshot = RouteSnapshot::from_overlay(timestamp_only).unwrap();
+        assert!(is_semantically_unchanged(&snapshot.load(), &timestamp_snapshot));
     }
 
     fn select_round_robin_cluster(snapshot: &RouteSnapshot) -> String {
