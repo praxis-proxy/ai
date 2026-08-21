@@ -336,10 +336,11 @@ impl HttpCalloutFilter {
             },
         };
 
-        match self
-            .client
-            .execute(&peer, request, self.max_body_bytes, self.timeout, Some(fw))
-            .await
+        match Box::pin(
+            self.client
+                .execute(&peer, request, self.max_body_bytes, self.timeout, Some(fw)),
+        )
+        .await
         {
             Ok(response) => Some(response),
             Err(e) => {
@@ -368,7 +369,7 @@ impl HttpCalloutFilter {
 
         let (request, fw) = self.build_request(ctx, callout_body, depth);
 
-        let action = match self.perform_callout(&request, &fw).await {
+        let action = match Box::pin(self.perform_callout(&request, &fw)).await {
             Some(response) => self.handle_response(&response, ctx),
             None => self.failure_action(),
         };
@@ -644,7 +645,7 @@ impl HttpFilter for HttpCalloutFilter {
             return Ok(FilterAction::Continue);
         }
 
-        self.execute_callout(ctx, None).await
+        Box::pin(self.execute_callout(ctx, None)).await
     }
 
     async fn on_request_body(
@@ -658,6 +659,6 @@ impl HttpFilter for HttpCalloutFilter {
         }
 
         let body_bytes = body.as_ref().map(|b| b.to_vec());
-        self.execute_callout(ctx, body_bytes).await
+        Box::pin(self.execute_callout(ctx, body_bytes)).await
     }
 }
