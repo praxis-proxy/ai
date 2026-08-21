@@ -12,7 +12,7 @@ use std::{
 
 use praxis_test_utils::{
     free_port, http_get, http_send, json_post, load_example_config, parse_body, parse_status,
-    start_backend_with_shutdown, start_capturing_backend, start_proxy,
+    start_backend_with_shutdown, start_capturing_backend, start_proxy, start_stateful_backend,
 };
 
 const FILE_METADATA: &str = r#"{"id":"test-file-123","object":"file","bytes":13,"created_at":1750000000,"filename":"test.txt","purpose":"user_data"}"#;
@@ -21,6 +21,9 @@ const IMAGE_METADATA: &str =
 const OVERSIZED_METADATA: &str = r#"{"id":"huge-file","object":"file","bytes":999999999,"created_at":1750000000,"filename":"huge.bin","purpose":"user_data"}"#;
 const FILE_CONTENT: &str = "Hello, world!";
 const IMAGE_CONTENT: &[u8] = b"\x89PNG";
+const MISSING_FILE_ERROR: &str = r#"{"error":{"message":"No such File object: nonexistent-file","type":"invalid_request_error","code":"file_not_found"}}"#;
+const FILES_API_RATE_LIMIT: &str =
+    r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#;
 
 #[test]
 fn example_config_resolves_input_file_to_openai_shape() {
@@ -176,6 +179,15 @@ fn example_config_rejects_missing_file_with_on_missing_reject() {
         "file_resolve_error",
         "error type should be file_resolve_error"
     );
+    let raw_body = parse_body(&raw);
+    assert!(
+        !raw_body.contains("No such File object"),
+        "OGX metadata error body must not leak into the outer rejection"
+    );
+    assert!(
+        !raw_body.contains("invalid_request_error"),
+        "OGX error type must not leak into the outer rejection"
+    );
 }
 
 #[test]
@@ -311,6 +323,32 @@ fn example_config_routes_files_api_paths_to_files_backend() {
 }
 
 #[test]
+fn example_config_preserves_direct_files_api_rate_limit() {
+    let files_guard = start_stateful_backend(vec![(429, FILES_API_RATE_LIMIT.to_owned())]);
+    let inference_guard = start_backend_with_shutdown("inference-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "openai/responses/file-resolve.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:9999", files_guard.port()),
+            ("127.0.0.1:3001", inference_guard.port()),
+            ("127.0.0.1:3002", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_get(proxy.addr(), "/v1/files/file-123", None);
+    assert_eq!(status, 429, "direct Files API errors should keep the upstream status");
+    assert_eq!(
+        body, FILES_API_RATE_LIMIT,
+        "direct Files API errors should keep the upstream body"
+    );
+}
+
+#[test]
 fn example_config_forwards_headers_to_files_api() {
     let files_api_port = start_files_api_stub_auth_required();
     let inference_guard = start_capturing_backend("{}");
@@ -435,7 +473,7 @@ fn handle_files_api_request_auth(mut stream: std::net::TcpStream) {
         } else if path.contains("test-file-123") {
             (200, "application/json", FILE_METADATA.as_bytes().to_vec())
         } else {
-            (404, "application/json", br#"{"error":"not found"}"#.to_vec())
+            (404, "application/json", MISSING_FILE_ERROR.as_bytes().to_vec())
         };
 
     let header = format!(
@@ -481,7 +519,7 @@ fn handle_files_api_request(mut stream: std::net::TcpStream) {
         } else if path.contains("huge-file") {
             (200, "application/json", OVERSIZED_METADATA.as_bytes().to_vec())
         } else {
-            (404, "application/json", br#"{"error":"not found"}"#.to_vec())
+            (404, "application/json", MISSING_FILE_ERROR.as_bytes().to_vec())
         };
 
     let header = format!(
