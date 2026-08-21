@@ -60,19 +60,15 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "inference"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "inference"
-                        endpoints:
-                          - "127.0.0.1:3001"
-            rejoin: terminal
+            rejoin: shared_load_balancer
 
       # Default: all other requests (with or without tools)
       - filter: router
         routes:
           - path_prefix: "/"
             cluster: "inference"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "inference"
             endpoints:

@@ -175,18 +175,8 @@ impl HttpFilter for A2aFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        // praxis-core `main` changed `parse_json_rpc_body`'s body parameter from
-        // `&Option<Bytes>` (released 0.5.2) to `Option<&Bytes>`. Gate the argument
-        // so this compiles against both the released dependency and core `main`.
-        // TODO: remove this gate once we pin to a praxis-core release that ships
-        // the `Option<&Bytes>` signature, keeping only the `body.as_ref()` arm.
-        #[cfg(not(feature = "praxis-main"))]
-        let rpc_body = &*body;
-        #[cfg(feature = "praxis-main")]
-        let rpc_body = body.as_ref();
-
         let parsed = match praxis_filter::builtins::http::payload_processing::body_parsing::parse_json_rpc_body(
-            rpc_body,
+            body.as_ref(),
             end_of_stream,
             &self.json_rpc_config,
             self.config.on_invalid,
