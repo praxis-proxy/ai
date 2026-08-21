@@ -23,7 +23,14 @@ const META_TOKEN_INPUT: &str = "token.input";
 const META_TOKEN_OUTPUT: &str = "token.output";
 
 /// Metadata key for the total token count.
-const META_TOKEN_TOTAL: &str = "token.total";
+///
+/// `pub(crate)` so sibling filters (e.g. `token_rate_limit`) that need to
+/// read post-response usage can reference this constant directly instead
+/// of duplicating the string literal — see the duplication risk this
+/// avoids: [`ai#351`](https://github.com/praxis-proxy/ai/issues/351)
+/// (cached-token double-counting caused by a second, independent parsing
+/// path drifting from this one).
+pub(crate) const META_TOKEN_TOTAL: &str = "token.total";
 
 /// Unified token usage extracted from an AI provider response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

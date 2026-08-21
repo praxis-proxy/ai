@@ -44,6 +44,7 @@ mod session_replay;
 mod time_to_first_token;
 mod token_count;
 mod token_counting;
+mod token_rate_limit;
 mod token_usage_headers;
 mod vector_stores_routing;
 mod vllm_agentic_api;
