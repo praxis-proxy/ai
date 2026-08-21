@@ -1,0 +1,38 @@
+# Identity Header Guard
+#
+# Captures identity headers matching a prefix into filter
+# metadata and strips them before forwarding upstream.
+# Prevents identity leakage to LLM providers.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/identity-header-guard.yaml
+#   curl http://localhost:8080/v1/chat/completions \
+#     -H "x-tenant-username: yossi" \
+#     -H "x-tenant-group: ai-eng" \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# The upstream backend receives the request WITHOUT the
+# x-tenant-* headers. Identity is available in filter_metadata
+# for downstream filters (metering, audit).
+
+listeners:
+  - name: gateway
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - guarded
+
+filter_chains:
+  - name: guarded
+    filters:
+      - filter: identity_header_guard
+        prefix: "x-tenant-"
+        metadata_namespace: "identity"
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
