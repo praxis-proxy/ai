@@ -49,12 +49,7 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "inference-backend"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "inference-backend"
-                        endpoints:
-                          - "127.0.0.1:3001"
-            rejoin: terminal
+            rejoin: shared_load_balancer
 
       # Stateless: no branch matched — proxy directly to backend
       # with zero additional filter processing.
@@ -62,7 +57,8 @@ filter_chains:
         routes:
           - path_prefix: "/"
             cluster: "inference-backend"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "inference-backend"
             endpoints:

@@ -165,7 +165,7 @@ filter_chains:
               filter: openai_responses_format
               key: mode
               result: stateful
-            rejoin: terminal
+            rejoin: shared_load_balancer
             chains:
               - name: stateful_chain
                 filters:
@@ -173,20 +173,19 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "stateful"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "stateful"
-                        endpoints:
-                          - "127.0.0.1:{stateful_port}"
       - filter: router
         routes:
           - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+          - name: "stateful"
+            endpoints:
+              - "127.0.0.1:{stateful_port}"
 "#
     )
 }
