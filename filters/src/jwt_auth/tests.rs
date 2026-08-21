@@ -575,3 +575,61 @@ claim_metadata:
         "token with matching audience should pass"
     );
 }
+
+/// A transient JWKS failure must back off briefly, not block auth for the
+/// full success cooldown. The mock fails once then serves keys; a token
+/// that 401s on the first (failed) fetch must validate after the ~1s
+/// failure backoff — which would be impossible under a flat 30s cooldown.
+#[tokio::test]
+async fn transient_jwks_failure_recovers_after_short_backoff() {
+    let kid = "test-kid-backoff";
+
+    let server = MockServer::start().await;
+    // First fetch fails...
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // ...subsequent fetches succeed.
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({ "sub": "user-1", "exp": chrono::Utc::now().timestamp() + 3600 });
+    let token = mint_token(kid, &claims);
+
+    let send = || async {
+        let mut req = make_request(Method::POST, "/v1/messages");
+        req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+        let mut ctx = make_filter_context(&req);
+        filter.on_request(&mut ctx).await.unwrap()
+    };
+
+    // First request: JWKS fetch fails (503) -> rejected.
+    assert!(
+        matches!(send().await, FilterAction::Reject(_)),
+        "first request should fail while JWKS is unavailable"
+    );
+
+    // After the ~1s failure backoff, the retry succeeds and the token
+    // validates. Under a flat 30s cooldown this would still be rejected.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(
+        matches!(send().await, FilterAction::Continue),
+        "request after the short failure backoff should recover and pass"
+    );
+}

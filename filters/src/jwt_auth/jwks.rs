@@ -22,8 +22,15 @@ use tracing::{debug, warn};
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Minimum interval between JWKS refresh attempts.
+/// Cooldown after a *successful* refresh, and the ceiling for the
+/// failure backoff. Bounds unknown-`kid` refetch abuse when the `IdP`
+/// is healthy.
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// First backoff after a *failed* refresh. Subsequent consecutive
+/// failures double it, capped at [`REFRESH_COOLDOWN`], so a transient
+/// `IdP` blip recovers in ~1s instead of blocking auth for a full 30s.
+const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 
 /// Default TTL for cached keys.
 const DEFAULT_TTL: Duration = Duration::from_secs(300); // 5 minutes
@@ -60,6 +67,14 @@ struct CachedKeys {
     /// When the cache was last refreshed. `None` means never
     /// refreshed — forces immediate fetch on first request.
     last_refresh: Option<Instant>,
+
+    /// Cooldown that must elapse since `last_refresh` before another
+    /// refresh is attempted. `REFRESH_COOLDOWN` after a success; a
+    /// short exponential backoff after a failure.
+    retry_after: Duration,
+
+    /// Consecutive failed refreshes, used to grow `retry_after`.
+    consecutive_failures: u32,
 }
 
 impl JwksCache {
@@ -97,6 +112,8 @@ impl JwksCache {
             keys: Arc::new(RwLock::new(CachedKeys {
                 by_kid: HashMap::new(),
                 last_refresh: None,
+                retry_after: REFRESH_COOLDOWN,
+                consecutive_failures: 0,
             })),
             refresh_lock: Mutex::new(()),
             client,
@@ -107,6 +124,12 @@ impl JwksCache {
     /// Look up a decoding key by `kid`. Refreshes when:
     /// - the `kid` is unknown and the cooldown has elapsed, or
     /// - the cache TTL has expired.
+    ///
+    /// A failed refresh backs off exponentially (starting at
+    /// [`FAILURE_BACKOFF_INITIAL`], capped at [`REFRESH_COOLDOWN`]), so a
+    /// transient `IdP` blip is retried within ~1s rather than blocking
+    /// auth for the full success cooldown, while a sustained outage is
+    /// not hammered.
     ///
     /// If a refresh fails (e.g. the `IdP` is unreachable), the last
     /// good cache is served past its TTL rather than failing closed —
@@ -123,12 +146,14 @@ impl JwksCache {
             }
         }
 
-        // Cooldown gate (lock-free): if we attempted a refresh very
-        // recently, serve whatever is cached instead of refetching.
-        // This bounds unknown-kid abuse to one fetch per cooldown.
+        // Cooldown gate (lock-free): if we attempted a refresh within
+        // the current cooldown, serve whatever is cached instead of
+        // refetching. The cooldown is REFRESH_COOLDOWN after a success
+        // (bounds unknown-kid abuse) or a short backoff after a failure
+        // (fast recovery from a transient IdP blip).
         {
             let keys = self.keys.read().await;
-            if keys.last_refresh.is_some_and(|t| t.elapsed() < REFRESH_COOLDOWN) {
+            if keys.last_refresh.is_some_and(|t| t.elapsed() < keys.retry_after) {
                 return keys.by_kid.get(kid).cloned();
             }
         }
@@ -139,21 +164,32 @@ impl JwksCache {
         let _guard = self.refresh_lock.lock().await;
         {
             let keys = self.keys.read().await;
-            if keys.last_refresh.is_some_and(|t| t.elapsed() < REFRESH_COOLDOWN) {
+            if keys.last_refresh.is_some_and(|t| t.elapsed() < keys.retry_after) {
                 return keys.by_kid.get(kid).cloned();
             }
         }
 
         debug!(kid, "refreshing JWKS");
-        if let Err(e) = self.refresh().await {
-            warn!("JWKS refresh failed: {e}");
-            // Serve stale cache on failure (stale-if-error).
-            let keys = self.keys.read().await;
-            return keys.by_kid.get(kid).cloned();
+        match self.refresh().await {
+            Ok(()) => {
+                // Success resets the backoff to the full cooldown.
+                let mut keys = self.keys.write().await;
+                keys.consecutive_failures = 0;
+                keys.retry_after = REFRESH_COOLDOWN;
+                keys.by_kid.get(kid).cloned()
+            },
+            Err(e) => {
+                warn!("JWKS refresh failed: {e}");
+                // Grow the backoff (capped) so a transient failure is
+                // retried quickly but a sustained outage isn't hammered.
+                let mut keys = self.keys.write().await;
+                keys.consecutive_failures = keys.consecutive_failures.saturating_add(1);
+                let shift = (keys.consecutive_failures - 1).min(5);
+                keys.retry_after = FAILURE_BACKOFF_INITIAL.saturating_mul(1 << shift).min(REFRESH_COOLDOWN);
+                // Serve stale cache on failure (stale-if-error).
+                keys.by_kid.get(kid).cloned()
+            },
         }
-
-        let keys = self.keys.read().await;
-        keys.by_kid.get(kid).cloned()
     }
 
     /// Fetch JWKS from the endpoint and update the cache.
