@@ -11,6 +11,7 @@
 pub(crate) mod api_client;
 pub(crate) mod conversations;
 pub(crate) mod include;
+pub(crate) mod error_response_formatter;
 mod operation;
 pub(crate) mod responses;
 pub(crate) mod sse;
