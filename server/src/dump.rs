@@ -369,7 +369,7 @@ filter_chains:
         clusters:
           - name: backend
             endpoints:
-              - "127.0.0.1:9090"
+              - "198.51.100.1:9090"
 "#;
 
     /// Assert a resolved filter's chain, indices, and type name.
@@ -509,7 +509,7 @@ filter_chains:
         clusters:
           - name: backend
             endpoints:
-              - "127.0.0.1:9090"
+              - "198.51.100.1:9090"
 "#;
 
     #[test]
