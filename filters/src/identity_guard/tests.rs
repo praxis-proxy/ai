@@ -234,7 +234,7 @@ async fn non_utf8_header_stripped_but_not_captured() {
 }
 
 #[tokio::test]
-async fn duplicate_headers_last_value_wins() {
+async fn duplicate_headers_first_value_wins() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(r#"prefix: "x-tenant-""#).unwrap();
     let filter = IdentityHeaderGuardFilter::from_config(&yaml).unwrap();
 
