@@ -120,7 +120,8 @@ pub(crate) struct RequestConfig {
     #[serde(default)]
     pub phase: Phase,
 
-    /// Maximum request body bytes to buffer and forward.
+    /// Maximum body bytes to buffer. Caps both the forwarded request
+    /// body and the accepted callout response body.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
 }

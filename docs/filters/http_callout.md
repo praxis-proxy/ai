@@ -24,7 +24,7 @@ Makes an outbound HTTP request during request processing, optionally forwarding 
 | `target.body` | object<string, string> | no | Reshape the downstream request body for the callout. Each key becomes a field in the callout JSON body; each value is a `JSONPath` expression evaluated against the downstream body. When set, only the listed fields are sent — the downstream body goes to upstream untouched. When absent, the downstream body is forwarded verbatim. |
 | `request` | RequestConfig | no | Request phase and body forwarding options. |
 | `request.phase` | `request_headers` \| `request_body` | no | Phase at which the callout executes. |
-| `request.max_body_bytes` | integer | no | Maximum request body bytes to buffer and forward. |
+| `request.max_body_bytes` | integer | no | Maximum body bytes to buffer. Caps both the forwarded request body and the accepted callout response body. |
 | `response` | ResponseConfig | no | Response extraction and header injection. |
 | `response.extract` | ExtractionConfig[] | no | `JSONPath` extractions to write into [`FilterResultSet`]. |
 | `response.extract[].json_path` | string | yes | `JSONPath` expression to evaluate against the response body. |
