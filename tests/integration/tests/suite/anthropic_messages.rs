@@ -436,6 +436,9 @@ filter_chains:
           - name: mock
             endpoints:
               - "127.0.0.1:{backend_port}"
+
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }

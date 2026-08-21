@@ -415,6 +415,8 @@ filter_chains:
           - name: "tools"
             endpoints:
               - "127.0.0.1:{tools_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -458,6 +460,8 @@ filter_chains:
           - name: "required"
             endpoints:
               - "127.0.0.1:{required_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -483,6 +487,8 @@ filter_chains:
           - name: "backend"
             endpoints:
               - "127.0.0.1:{backend_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -531,6 +537,8 @@ filter_chains:
           - name: "web"
             endpoints:
               - "127.0.0.1:{web_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -574,6 +582,8 @@ filter_chains:
           - name: "web"
             endpoints:
               - "127.0.0.1:{web_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }

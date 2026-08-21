@@ -87,3 +87,6 @@ filter_chains:
           - name: "agent-b"
             endpoints:
               - "127.0.0.1:9002"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
