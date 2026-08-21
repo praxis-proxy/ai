@@ -51,6 +51,10 @@ enum Command {
     /// Validate inference fixture coverage.
     CheckInference(inference_fixtures::CheckArgs),
 
+    /// Check the runtime Responses operation registry against
+    /// the pinned OpenAI specification.
+    CheckResponsesRegistry,
+
     /// Start a quick HTTP test server returning a static
     /// response to every request.
     Echo(echo::Args),
@@ -118,6 +122,7 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::CheckInference(args) => inference_fixtures::run_check(&args),
+        Command::CheckResponsesRegistry => openai_conformance::run_responses_registry_check(),
         Command::Echo(args) => echo::run(args),
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),

@@ -114,6 +114,7 @@ lint:
 	cargo xtask sync-inference-readme
 	cargo xtask sync-responses-readme
 	cargo xtask check-inference
+	cargo xtask check-responses-registry
 
 fmt:
 	cargo +nightly fmt --all
