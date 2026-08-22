@@ -376,6 +376,8 @@ filter_chains:
         clusters:
           - name: backend
             endpoints: ["10.0.0.1:80"]
+insecure_options:
+  allow_private_endpoints: true
 "#,
         )
         .unwrap();
@@ -414,6 +416,8 @@ filter_chains:
         clusters:
           - name: backend
             endpoints: ["10.0.0.1:80"]
+insecure_options:
+  allow_private_endpoints: true
 "#,
         )
         .unwrap();
@@ -669,6 +673,8 @@ filter_chains:
         clusters:
           - name: other
             endpoints: ["10.0.0.1:80"]
+insecure_options:
+  allow_private_endpoints: true
 "#,
         )
         .unwrap();
@@ -710,6 +716,8 @@ filter_chains:
         clusters:
           - name: backend
             endpoints: ["10.0.0.1:80"]
+insecure_options:
+  allow_private_endpoints: true
 "#,
         )
         .unwrap();
@@ -735,6 +743,7 @@ filter_chains:
             r#"
 insecure_options:
   allow_open_security_filters: true
+  allow_private_endpoints: true
 listeners:
   - name: web
     address: "127.0.0.1:8080"
@@ -855,6 +864,8 @@ filter_chains:
         clusters:
           - name: backend
             endpoints: ["10.0.0.1:80"]
+insecure_options:
+  allow_private_endpoints: true
 "#,
         )
         .unwrap()

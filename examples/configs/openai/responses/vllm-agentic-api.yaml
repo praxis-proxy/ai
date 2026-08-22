@@ -31,3 +31,6 @@ filter_chains:
           - name: "vllm-agentic-api"
             endpoints:
               - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

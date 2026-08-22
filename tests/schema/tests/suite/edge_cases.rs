@@ -103,6 +103,8 @@ filter_chains:
             load_balancer_strategy:
               consistent_hash:
                 header: "X-User-Id"
+insecure_options:
+  allow_private_endpoints: true
 "#;
     let config = Config::from_yaml(yaml).unwrap();
     assert_eq!(
@@ -241,6 +243,8 @@ filter_chains:
         clusters:
           - name: backend
             endpoints: ["127.0.0.1:3000"]
+insecure_options:
+  allow_private_endpoints: true
 "#;
     let config = Config::from_yaml(yaml).unwrap();
     let filters = &config.filter_chains[0].filters;
@@ -284,6 +288,8 @@ filter_chains:
         clusters:
           - name: backend
             endpoints: ["127.0.0.1:3000"]
+insecure_options:
+  allow_private_endpoints: true
 "#;
     let err = Config::from_yaml(yaml).unwrap_err();
     assert!(err.to_string().contains("exactly one"), "got: {err}");

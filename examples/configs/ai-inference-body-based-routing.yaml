@@ -63,3 +63,6 @@ filter_chains:
           - name: default
             endpoints:
               - "10.0.3.1:8080"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

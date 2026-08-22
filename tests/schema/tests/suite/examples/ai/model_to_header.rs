@@ -89,6 +89,8 @@ filter_chains:
           - name: fallback
             endpoints:
               - "127.0.0.1:{port_default}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }

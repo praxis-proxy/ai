@@ -546,6 +546,9 @@ filter_chains:
           - name: "default-backend"
             endpoints:
               - "127.0.0.1:{}"
+
+insecure_options:
+  allow_private_endpoints: true
 "#,
         inference_guard.port(),
         default_guard.port()
@@ -628,6 +631,9 @@ filter_chains:
           - name: "inference-backend"
             endpoints:
               - "127.0.0.1:{}"
+
+insecure_options:
+  allow_private_endpoints: true
 "#,
         inference_guard.port()
     );
@@ -762,6 +768,9 @@ filter_chains:
           - name: "default-backend"
             endpoints:
               - "127.0.0.1:{}"
+
+insecure_options:
+  allow_private_endpoints: true
 "#,
         inference_guard.port(),
         default_guard.port()
