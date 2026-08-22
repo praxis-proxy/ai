@@ -93,15 +93,6 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 cargo_metadata = "0.23.1"
 
-# Temporary stacked validation pin until the authenticated-principal core
-# change is available in an upstream Praxis release.
-[patch.crates-io]
-praxis-proxy = { git = "https://github.com/nerdalert/praxis.git", rev = "c2fe2484b64095d06954b80a300e6eaabecc2d1e" }
-praxis-proxy-core = { git = "https://github.com/nerdalert/praxis.git", rev = "c2fe2484b64095d06954b80a300e6eaabecc2d1e" }
-praxis-proxy-filter = { git = "https://github.com/nerdalert/praxis.git", rev = "c2fe2484b64095d06954b80a300e6eaabecc2d1e" }
-praxis-proxy-protocol = { git = "https://github.com/nerdalert/praxis.git", rev = "c2fe2484b64095d06954b80a300e6eaabecc2d1e" }
-praxis-proxy-tls = { git = "https://github.com/nerdalert/praxis.git", rev = "c2fe2484b64095d06954b80a300e6eaabecc2d1e" }
-
 [profile.release]
 codegen-units = 1
 lto = true
