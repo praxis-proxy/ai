@@ -29,6 +29,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 dashmap = "6.2.1"
 futures = "0.3.34"
 h2 = "0.4.18"
+redis = { version = "1.5.0", default-features = false, features = ["connection-manager", "script", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.0", features = ["http1", "server"] }
@@ -284,4 +285,3 @@ bare_urls = "deny"
 invalid_html_tags = "deny"
 missing_crate_level_docs = "deny"
 private_doc_tests = "allow"
-

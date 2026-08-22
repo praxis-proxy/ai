@@ -442,9 +442,7 @@ mod tests {
 
     use super::*;
 
-    // -------------------------------------------------------------------------
-    // Config Validation
-    // -------------------------------------------------------------------------
+    // ---- Config validation ----
 
     #[test]
     fn empty_credentials_rejected() {
@@ -519,9 +517,7 @@ mod tests {
         assert_eq!(default_strategy(), STRATEGY_BEARER_TOKEN);
     }
 
-    // -------------------------------------------------------------------------
-    // No-Op When No Credential Is Selected
-    // -------------------------------------------------------------------------
+    // ---- No-op when no selected credential ----
 
     #[tokio::test]
     async fn no_selected_credential_is_noop() {
@@ -540,9 +536,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // Bearer Token Injection
-    // -------------------------------------------------------------------------
+    // ---- Bearer token injection ----
 
     #[tokio::test]
     async fn bearer_token_with_configured_value_injects_authorization() {
@@ -585,9 +579,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // File Source
-    // -------------------------------------------------------------------------
+    // ---- File source ----
 
     #[tokio::test]
     async fn file_source_reads_token_and_injects_authorization() {
@@ -695,9 +687,7 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Fail Closed
-    // -------------------------------------------------------------------------
+    // ---- Fail closed ----
 
     #[tokio::test]
     async fn missing_configured_token_fails_closed_503() {
@@ -736,9 +726,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // Security: Token Not In Metadata
-    // -------------------------------------------------------------------------
+    // ---- Security: token not in metadata ----
 
     #[tokio::test]
     async fn token_not_in_filter_metadata_after_injection() {
@@ -758,9 +746,7 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Multi-Credential Selection
-    // -------------------------------------------------------------------------
+    // ---- Multi-credential selection ----
 
     #[tokio::test]
     async fn multiple_credentials_selects_matching_entry_only() {

@@ -55,12 +55,42 @@ pub fn resolve_pipelines(
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
 
         validate_provider_boundary(listener, &entries, &chains)?;
+        validate_token_rate_limit_order(listener, &entries)?;
         validate_pipeline(&pipeline, &entries, &listener.name, &config.insecure_options)?;
 
         pipelines.insert(listener.name.clone(), Arc::new(pipeline));
     }
 
     Ok(ListenerPipelines::new(pipelines))
+}
+
+/// Keep quota admission ahead of routing and token usage extraction.
+fn validate_token_rate_limit_order(
+    listener: &Listener,
+    entries: &[FilterEntry],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(limiter_index) = entries.iter().position(|entry| entry.filter_type == "token_rate_limit") else {
+        return Ok(());
+    };
+    if entries
+        .iter()
+        .position(|entry| entry.filter_type == "intelligent_route")
+        .is_some_and(|route_index| route_index < limiter_index)
+    {
+        return Err(format!(
+            "listener '{}': token_rate_limit must precede intelligent_route",
+            listener.name
+        )
+        .into());
+    }
+    if entries
+        .iter()
+        .position(|entry| entry.filter_type == "token_count")
+        .is_some_and(|token_count_index| token_count_index < limiter_index)
+    {
+        return Err(format!("listener '{}': token_count must follow token_rate_limit", listener.name).into());
+    }
+    Ok(())
 }
 
 /// Apply body limits, health registry, KV stores, and insecure options to a
