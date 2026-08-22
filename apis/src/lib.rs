@@ -95,6 +95,7 @@ pub(crate) mod test_utils {
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
             response_headers_modified: false,
+            subrequest_response_mode: Default::default(),
             subrequest_client: None,
             subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
             #[cfg(feature = "praxis-main")]
