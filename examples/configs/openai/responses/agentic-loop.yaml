@@ -47,9 +47,11 @@
 #                    at least max_infer_iters + 1 (initial inference plus
 #                    the allowed MCP-backed inference continuations).
 #
-# Streaming limitation:
-#   IRR does not support incremental streaming. All responses within
-#   the loop are fully buffered.
+# Streaming:
+#   With stream=true, each inference round is streamed through the same
+#   downstream Responses SSE lifecycle. Intermediate response lifecycle
+#   events are normalized by openai_stream_events while MCP and web-search
+#   transitions resume inference after each upstream stream completes.
 #
 # Example requests:
 #
@@ -103,9 +105,16 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 11
+        max_stream_response_bytes: 67108864
         steps:
           - name: inference
             filters:
+              # Parses every inference SSE stream, preserves one logical
+              # response identity across rounds, and withholds per-round
+              # terminal events until the IRR transition is known.
+              - filter: openai_stream_events
+                logical_stream: true
+
               # Runs first on request re-entry to execute pending web
               # searches, and last on the model response to detect
               # web_search_call items.
@@ -119,6 +128,7 @@ filter_chains:
               - filter: openai_agentic_loop
                 max_infer_iters: 10
               - filter: openai_responses_proxy
+                terminal_streaming: true
               - filter: router
                 routes:
                   - path_prefix: "/"

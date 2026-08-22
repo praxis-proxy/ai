@@ -167,9 +167,7 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
-        }
+        BodyMode::Stream
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -224,7 +222,7 @@ impl HttpFilter for McpDispatchFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
-            return Ok(FilterAction::Release);
+            return Ok(FilterAction::Continue);
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {

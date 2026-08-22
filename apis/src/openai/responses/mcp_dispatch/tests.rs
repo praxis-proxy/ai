@@ -195,11 +195,8 @@ fn filter_response_body_mode() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("max_body_bytes: 1024").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
     assert!(
-        matches!(
-            filter.response_body_mode(),
-            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
-        ),
-        "should return StreamBuffer with configured max_bytes"
+        matches!(filter.response_body_mode(), praxis_filter::BodyMode::Stream),
+        "agentic responses must remain stream-compatible"
     );
 }
 
@@ -928,13 +925,16 @@ fn assert_dispatch_action(ctx: &praxis_filter::HttpFilterContext<'_>, expected: 
 }
 
 #[test]
-fn on_response_body_not_end_of_stream_returns_release() {
+fn on_response_body_not_end_of_stream_continues_to_stream_parser() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     let mut body = Some(Bytes::from("data"));
     let result = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-    assert!(matches!(result, FilterAction::Release));
+    assert!(
+        matches!(result, FilterAction::Continue),
+        "stream chunks must reach the downstream openai_stream_events filter"
+    );
 }
 
 #[test]
