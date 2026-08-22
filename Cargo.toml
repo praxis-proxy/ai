@@ -49,6 +49,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json_canonicalizer = "0.3.2"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde_json_path = "0.7.2"
 sha2 = "0.11.0"
 syn = { version = "3.0.3", features = ["full", "extra-traits", "visit"] }
 serde_yaml = { package = "yaml_serde", version = "0.10.7" }
