@@ -5,7 +5,9 @@ members = [
     "server/build_support",
     "filters",
     "apis",
+    "integrations/llmd/ext-proc",
     "xtask",
+    "tests/environment",
     "tests/integration",
     "tests/schema",
     "tests/utils",
@@ -66,6 +68,16 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 utoipa = "5.5.0"
 wiremock = "0.6.5"
+prost = "0.14.4"
+prost-build = "0.14.4"
+prost-types = "0.14.4"
+prost-wkt-types = { version = "0.7.1", features = ["vendored-protox"] }
+protox = "0.9.1"
+sync_wrapper = "1.0.2"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = { version = "0.14.6", features = ["transport"] }
+tokio-stream = "0.1.18"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
@@ -75,6 +87,9 @@ praxis-protocol = { version = "0.5.3", package = "praxis-proxy-protocol" }
 praxis-tls = { version = "0.5.3", package = "praxis-proxy-tls" }
 praxis = { version = "0.5.3", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
+
+# AI-owned llm-d ext_proc compatibility layer
+praxis-ai-llmd-ext-proc = { version = "0.2.0", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
 praxis-ai-proxy = { version = "0.2.0", path = "server" }

@@ -8,6 +8,12 @@ readme = "../../README.md"
 publish = false
 
 [features]
+llmd-ext-proc = [
+    "praxis-ai-proxy/llmd-ext-proc",
+    "dep:praxis-ai-llmd-ext-proc",
+    "dep:tokio-stream",
+    "dep:tonic",
+]
 praxis-main = ["praxis-ai-proxy/praxis-main"]
 
 [lints]
@@ -19,6 +25,7 @@ base64 = { workspace = true }
 praxis = { workspace = true }
 praxis-ai-apis = { workspace = true }
 praxis-ai-proxy = { workspace = true }
+praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-protocol = { workspace = true }
@@ -41,6 +48,8 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 pingora-core = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "sync"] }
+tokio-stream = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 tracing = { workspace = true }
 url = { workspace = true }
 futures = { workspace = true }
