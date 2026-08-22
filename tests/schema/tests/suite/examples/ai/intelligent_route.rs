@@ -315,6 +315,8 @@ filter_chains:
           - name: llama-remote
             endpoints:
               - "127.0.0.1:{remote_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#,
         overlay = overlay_path.display()
     )
@@ -358,6 +360,8 @@ filter_chains:
           - name: llama-remote
             endpoints:
               - "127.0.0.1:{remote_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -397,6 +401,8 @@ filter_chains:
           - name: tools-site-b
             endpoints:
               - "127.0.0.1:{remote_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -488,6 +494,8 @@ filter_chains:
           - name: tools-site-b
             endpoints:
               - "127.0.0.1:{remote_tool_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }

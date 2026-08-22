@@ -885,6 +885,8 @@ filter_chains:
           - name: calendar-mcp
             endpoints:
               - "127.0.0.1:{backend_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#,
     )
 }
@@ -930,6 +932,8 @@ filter_chains:
           - name: calendar-mcp
             endpoints:
               - "127.0.0.1:{calendar_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#,
     )
 }
@@ -961,6 +965,8 @@ filter_chains:
           - name: weather-mcp
             endpoints:
               - "127.0.0.1:{backend_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#,
     )
 }
@@ -992,6 +998,8 @@ filter_chains:
           - name: weather-mcp
             endpoints:
               - "127.0.0.1:{backend_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#,
     )
 }
