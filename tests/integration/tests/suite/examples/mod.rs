@@ -12,6 +12,7 @@ mod anthropic_messages;
 mod anthropic_messages_web_search;
 mod compact;
 mod credential_injection;
+mod external_metering;
 mod file_search_callout;
 mod full_flow;
 mod full_flow_agentic;
