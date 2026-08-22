@@ -311,14 +311,25 @@ async fn resolve_and_rewrite(
     body: &mut Option<Bytes>,
     parsed: &mut serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
+    // Establish the request's shared trace context before the first
+    // callout. This filter's callouts can run in the pre-read phase,
+    // ahead of header-phase filters, so this is often the hop that
+    // initializes it rather than the one that inherits it.
+    drop(crate::correlation::TraceContext::get_or_init(ctx));
+
+    // One header set for every callout this filter makes: current
+    // input and rehydrated history resolve under a single delegation
+    // span, not one span per resolution phase.
+    let callout_headers = filter.client.callout_headers(ctx);
+
     let mut budget = filter.client.resolution_budget();
-    let count = match resolve_current_input(filter, ctx, parsed, &mut budget).await {
+    let count = match resolve_current_input(filter, parsed, &callout_headers, &mut budget).await {
         Ok(count) => count,
         Err(e) => return Ok(reject_resolve_error(&e)),
     };
     if count == 0 {
         trace!("no file_id references found");
-        if let Err(e) = update_state(filter, ctx, None, &mut budget).await {
+        if let Err(e) = update_state(filter, ctx, None, &callout_headers, &mut budget).await {
             return Ok(reject_resolve_error(&e));
         }
         if let Some(rejection) = reject_oversized_state_body(ctx, filter.config.max_body_bytes)? {
@@ -331,7 +342,7 @@ async fn resolve_and_rewrite(
     if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
         return Ok(rejection);
     }
-    if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
+    if let Err(e) = update_state(filter, ctx, Some(parsed), &callout_headers, &mut budget).await {
         return Ok(reject_resolve_error(&e));
     }
     if let Some(rejection) = reject_oversized_state_body(ctx, filter.config.max_body_bytes)? {
@@ -359,15 +370,15 @@ fn reject_oversized_state_body(
 /// Resolve references in the request body's current input.
 async fn resolve_current_input(
     filter: &FileResolveFilter,
-    ctx: &HttpFilterContext<'_>,
     parsed: &mut serde_json::Value,
+    callout_headers: &http::HeaderMap,
     budget: &mut ResolutionBudget,
 ) -> Result<usize, ResolveError> {
     Box::pin(resolve_input_with_budget(
         parsed,
         &filter.client,
         filter.config.on_missing,
-        &ctx.request.headers,
+        callout_headers,
         filter.url_resolver.as_ref(),
         budget,
     ))
@@ -379,6 +390,7 @@ async fn update_state(
     filter: &FileResolveFilter,
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: Option<&serde_json::Value>,
+    callout_headers: &http::HeaderMap,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     match resolved_body {
@@ -389,6 +401,7 @@ async fn update_state(
                 &filter.client,
                 filter.config.on_missing,
                 filter.url_resolver.as_ref(),
+                callout_headers,
                 budget,
             ))
             .await
@@ -399,6 +412,7 @@ async fn update_state(
                 &filter.client,
                 filter.config.on_missing,
                 filter.url_resolver.as_ref(),
+                callout_headers,
                 budget,
             ))
             .await
@@ -437,6 +451,7 @@ async fn sync_state_with_budget(
     client: &FilesApiClient,
     on_missing: OnMissing,
     url_resolver: Option<&FileUrlResolver>,
+    callout_headers: &http::HeaderMap,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -453,7 +468,7 @@ async fn sync_state_with_budget(
     let resolver = HistoryResolver {
         client,
         on_missing,
-        request_headers: &ctx.request.headers,
+        request_headers: callout_headers,
         url_resolver,
     };
 
@@ -477,16 +492,28 @@ async fn sync_state(
     on_missing: OnMissing,
 ) -> Result<(), ResolveError> {
     let mut budget = client.resolution_budget();
-    sync_state_with_budget(ctx, resolved_body, client, on_missing, None, &mut budget).await
+    let callout_headers = client.callout_headers(ctx);
+    sync_state_with_budget(
+        ctx,
+        resolved_body,
+        client,
+        on_missing,
+        None,
+        &callout_headers,
+        &mut budget,
+    )
+    .await
 }
 
 /// Resolve file references in rehydrated history when the
 /// current input did not require a body rewrite.
+#[expect(clippy::too_many_arguments, reason = "threading resolver through state sync")]
 async fn resolve_state_history(
     ctx: &mut HttpFilterContext<'_>,
     client: &FilesApiClient,
     on_missing: OnMissing,
     url_resolver: Option<&FileUrlResolver>,
+    callout_headers: &http::HeaderMap,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -497,7 +524,7 @@ async fn resolve_state_history(
     let resolver = HistoryResolver {
         client,
         on_missing,
-        request_headers: &ctx.request.headers,
+        request_headers: callout_headers,
         url_resolver,
     };
 

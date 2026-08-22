@@ -1338,6 +1338,52 @@ async fn searches_multiple_stores_concurrently() {
     );
 }
 
+/// Callouts must be built from the configured allowlist plus
+/// correlation, never from the raw downstream header map.
+///
+/// The vector-store search is a delegated call across a security
+/// boundary: passing the downstream headers through would leak every
+/// client header the operator did not opt into — credentials
+/// included — and would carry no correlation.
+#[tokio::test]
+async fn search_callouts_apply_the_forward_allowlist_and_carry_correlation() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "forward_headers:\n  - authorization\n");
+    let mut ctx = make_context_with_headers(
+        Some(one_pending_state(&["vs-a"])),
+        &[
+            ("authorization", "Bearer allowlisted"),
+            ("cookie", "session=not-allowlisted"),
+        ],
+    );
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let sent = requests[0].to_ascii_lowercase();
+
+    assert!(
+        sent.contains("authorization: bearer allowlisted"),
+        "allowlisted header should reach the vector store: {sent}"
+    );
+    assert!(
+        !sent.contains("cookie"),
+        "headers outside the allowlist must not reach the vector store: {sent}"
+    );
+    assert!(
+        sent.contains("x-request-id:"),
+        "delegated call must carry correlation: {sent}"
+    );
+    assert!(
+        sent.contains("traceparent:"),
+        "delegated call must carry trace context: {sent}"
+    );
+}
+
 #[tokio::test]
 async fn aggregate_results_are_score_sorted_and_limited_to_top_k() {
     let server = MockServer::routes([
@@ -1834,10 +1880,21 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
 }
 
 fn make_context(state: Option<ResponsesState>) -> HttpFilterContext<'static> {
-    let request = Box::leak(Box::new(crate::test_utils::make_request(
-        http::Method::POST,
-        "/v1/responses",
-    )));
+    make_context_with_headers(state, &[])
+}
+
+fn make_context_with_headers(
+    state: Option<ResponsesState>,
+    downstream_headers: &[(&str, &str)],
+) -> HttpFilterContext<'static> {
+    let mut built = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    for (name, value) in downstream_headers {
+        built.headers.insert(
+            http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            http::HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    let request = Box::leak(Box::new(built));
     let mut ctx = crate::test_utils::make_filter_context(request);
     ctx.set_metadata("openai_responses_format.stream", "false");
     if let Some(state) = state {

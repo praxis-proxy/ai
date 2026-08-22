@@ -82,7 +82,9 @@ pub(crate) struct FileResolveConfig {
 
     /// Headers to forward from the original request to the
     /// Files API for authentication and tenant isolation. No
-    /// downstream headers are forwarded by default.
+    /// downstream headers are forwarded by default. The
+    /// correlation headers `x-request-id` and `traceparent` are
+    /// always sent and do not need to be listed here.
     #[serde(default)]
     pub forward_headers: Vec<String>,
 

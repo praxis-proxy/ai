@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod classifier;
+pub mod correlation;
 pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;

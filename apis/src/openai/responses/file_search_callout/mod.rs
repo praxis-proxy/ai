@@ -228,7 +228,7 @@ impl FileSearchCalloutFilter {
         clippy::too_many_lines,
         reason = "separates global, per-call, and transport planning failures"
     )]
-    async fn execute_plan(&self, plan: &SearchPlan, request_headers: &HeaderMap) -> SearchBatch {
+    async fn execute_plan(&self, plan: &SearchPlan, callout_headers: &HeaderMap) -> SearchBatch {
         if let Some(message) = plan.planning_error {
             return SearchBatch::with_failures(
                 plan.calls.len(),
@@ -257,7 +257,7 @@ impl FileSearchCalloutFilter {
         let mut batch = if specs.is_empty() {
             SearchBatch::new(plan.calls.len())
         } else {
-            self.client.search(&specs, plan.calls.len(), request_headers).await
+            self.client.search(&specs, plan.calls.len(), callout_headers).await
         };
         batch.failures.extend(planning_failures);
         batch
@@ -283,33 +283,61 @@ impl FileSearchCalloutFilter {
         )))
     }
 
+    /// Build the header set for this request's callouts, establishing
+    /// the shared trace context first.
+    ///
+    /// Delegated callouts can run in the `StreamBuffer` pre-read
+    /// phase, ahead of header-phase filters, so this filter is often
+    /// the hop that initializes the request's trace context rather
+    /// than the one that inherits it.
+    ///
+    /// One header set covers the whole fan-out: the callouts of one
+    /// request share a delegation span, and the operator's
+    /// `forward_headers` allowlist is applied once here rather than
+    /// the raw downstream headers reaching the vector store.
+    fn prepare_callout_headers(&self, ctx: &mut HttpFilterContext<'_>) -> HeaderMap {
+        drop(crate::correlation::TraceContext::get_or_init(ctx));
+        self.client.callout_headers(ctx)
+    }
+
     /// Execute pending calls before the next inference body is serialized.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "linear sequence: plan → callout → apply → size check"
-    )]
     async fn execute_pending(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if let Some(rejection) = unsupported_streaming_rejection(ctx) {
             return Ok(rejection);
         }
+        // Checked before planning, so trace context is established
+        // only for requests that actually call out, and before the
+        // plan borrows `ctx` immutably.
+        if !ctx.extensions.get::<ResponsesState>().is_some_and(has_pending_calls) {
+            return Ok(FilterAction::Continue);
+        }
+        let callout_headers = self.prepare_callout_headers(ctx);
+
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
         let plan = build_search_plan(state);
-        if !plan.has_pending_calls {
-            return Ok(FilterAction::Continue);
-        }
-        let hdrs = callout_request_headers(ctx);
-        let batch = self.execute_plan(&plan, &hdrs).await;
+        let batch = self.execute_plan(&plan, &callout_headers).await;
         if let Some(rejection) = self.failure_rejection(&batch) {
             return Ok(rejection);
         }
+        self.commit_batch(ctx, &plan, &batch)
+    }
+
+    /// Commit a completed batch into request state and advance the
+    /// iteration counter.
+    fn commit_batch(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        plan: &SearchPlan,
+        batch: &SearchBatch,
+    ) -> Result<FilterAction, FilterError> {
         let framework_bytes = retained_iteration_bytes(ctx);
         let state = ctx
             .extensions
             .get_mut::<ResponsesState>()
             .ok_or_else(|| -> FilterError { "openai_file_search_callout: ResponsesState disappeared".into() })?;
-        if let Err(rejection) = Self::apply_batch(state, &plan, &batch) {
+        if let Err(rejection) = Self::apply_batch(state, plan, batch) {
             return Ok(rejection);
         }
         if !continuation_state_fits(framework_bytes, state, self.max_state_bytes, 0) {
@@ -873,9 +901,6 @@ struct SearchPlan {
     /// Metadata filters shared by every search spec.
     filters: Option<Value>,
 
-    /// Whether the response contained any pending call before local caps.
-    has_pending_calls: bool,
-
     /// Maximum number of aggregate results per call.
     max_num_results: Option<u64>,
 
@@ -1049,10 +1074,18 @@ struct FileSearchToolDef {
     vector_store_count: usize,
 }
 
+/// Return whether the state holds any file-search call awaiting a
+/// callout.
+///
+/// Shared with the filter boundary, which needs the answer before
+/// planning borrows the state, so the two cannot drift apart.
+fn has_pending_calls(state: &ResponsesState) -> bool {
+    state.output_items().iter().any(is_pending_file_search_call)
+}
+
 /// Build an owned plan for every pending call before applying the fan-out cap.
 fn build_search_plan(state: &ResponsesState) -> SearchPlan {
     let tool = extract_file_search_tool_def(&state.tools);
-    let has_pending_calls = state.output_items().iter().any(is_pending_file_search_call);
     let call_budget = remaining_file_search_call_budget(state);
     let mut calls = pending_calls(state, tool.vector_store_count, call_budget);
     let spec_coordinates = schedule_searches(&mut calls, tool.vector_store_ids.len());
@@ -1060,7 +1093,6 @@ fn build_search_plan(state: &ResponsesState) -> SearchPlan {
     SearchPlan {
         calls,
         filters: tool.filters,
-        has_pending_calls,
         max_num_results: tool.max_num_results,
         planning_error: tool.planning_error,
         ranking_options: tool.ranking_options,
