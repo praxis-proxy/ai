@@ -10,6 +10,7 @@ pub use test_utils::load_example_config;
 mod agentic_routing;
 mod anthropic_messages;
 mod anthropic_messages_web_search;
+mod aws_sigv4;
 mod compact;
 mod credential_injection;
 mod file_search_callout;
