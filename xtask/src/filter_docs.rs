@@ -1789,6 +1789,7 @@ fn format_title(category_name: &str) -> String {
             "openai" => "OpenAI".to_owned(),
             "mcp" => "MCP".to_owned(),
             "a2a" => "A2A".to_owned(),
+            "aws" => "AWS".to_owned(),
             other => capitalize(other),
         })
         .collect::<Vec<_>>()
@@ -2405,6 +2406,7 @@ mod tests {
             "basic category"
         );
         assert_eq!(format_title("openai"), "OpenAI", "special case");
+        assert_eq!(format_title("aws"), "AWS", "special case");
         assert_eq!(format_title("token_usage"), "Token Usage", "multi-word");
     }
 
