@@ -5,5 +5,4 @@
 
 mod sigv4;
 
-// `Sigv4SignFilter` is added to this re-export in Task 3, once the
-// `HttpFilter` implementation exists.
+pub use sigv4::Sigv4SignFilter;

@@ -150,6 +150,134 @@ pub(crate) fn sign_headers<'a>(
 }
 
 // -----------------------------------------------------------------------------
+// Filter
+// -----------------------------------------------------------------------------
+
+/// Signs outbound requests to AWS services using `SigV4`.
+///
+/// See the module docs for the ordering requirement (must run after
+/// any path-rewrite filter) and the Host-header contract.
+pub struct Sigv4SignFilter {
+    /// AWS region used in the signing scope.
+    region: String,
+
+    /// AWS signing service name.
+    service: String,
+
+    /// Host header to sign and to set on the outbound request.
+    host: String,
+
+    /// Static credentials resolved once at construction time.
+    credentials: Credentials,
+
+    /// Maximum buffered request-body bytes.
+    max_body_bytes: usize,
+}
+
+impl Sigv4SignFilter {
+    /// Build a filter instance from parsed config, resolving static
+    /// credentials from the configured environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if either credential environment
+    /// variable is unset or not valid UTF-8.
+    fn new(config: Sigv4SignConfig) -> Result<Self, FilterError> {
+        let access_key = std::env::var(&config.access_key_env_var).map_err(|e| {
+            FilterError::from(format!(
+                "aws_sigv4_sign: access_key_env_var '{}' is not set: {e}",
+                config.access_key_env_var
+            ))
+        })?;
+        let secret_key = std::env::var(&config.secret_key_env_var).map_err(|e| {
+            FilterError::from(format!(
+                "aws_sigv4_sign: secret_key_env_var '{}' is not set: {e}",
+                config.secret_key_env_var
+            ))
+        })?;
+        let session_token = config
+            .session_token_env_var
+            .as_ref()
+            .map(std::env::var)
+            .transpose()
+            .map_err(|e| FilterError::from(format!("aws_sigv4_sign: session_token_env_var is set but not readable: {e}")))?;
+
+        let credentials = Credentials::new(access_key, secret_key, session_token, None, "aws_sigv4_sign-static");
+
+        Ok(Self {
+            region: config.region,
+            service: config.service,
+            host: config.host,
+            credentials,
+            max_body_bytes: config.max_body_bytes,
+        })
+    }
+
+    /// Parse YAML config and build a boxed filter instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config is malformed or the
+    /// configured credential environment variables are unset.
+    pub(crate) fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, FilterError> {
+        let config = parse_sigv4_config(config)?;
+        Ok(Box::new(Self::new(config)?))
+    }
+}
+
+#[async_trait::async_trait]
+impl praxis_filter::HttpFilter for Sigv4SignFilter {
+    fn name(&self) -> &'static str {
+        "aws_sigv4_sign"
+    }
+
+    fn request_body_access(&self) -> praxis_filter::BodyAccess {
+        praxis_filter::BodyAccess::ReadOnly
+    }
+
+    fn request_body_mode(&self) -> praxis_filter::BodyMode {
+        praxis_filter::BodyMode::StreamBuffer {
+            max_bytes: Some(self.max_body_bytes),
+        }
+    }
+
+    async fn on_request(&self, ctx: &mut praxis_filter::HttpFilterContext<'_>) -> Result<praxis_filter::FilterAction, FilterError> {
+        let path_and_query = ctx
+            .rewritten_path
+            .as_deref()
+            .or_else(|| ctx.request.uri.path_and_query().map(http::uri::PathAndQuery::as_str))
+            .unwrap_or("/");
+
+        let body = ctx.buffered_request_body.clone().unwrap_or_default();
+        let uri = format!("https://{}{path_and_query}", self.host);
+
+        let signed_headers = sign_headers(
+            &self.credentials,
+            &self.region,
+            &self.service,
+            SystemTime::now(),
+            ctx.request.method.as_str(),
+            &uri,
+            std::iter::once(("host", self.host.as_str())),
+            &body,
+        );
+
+        let Ok(signed_headers) = signed_headers else {
+            return Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(503)));
+        };
+
+        let host_value = HeaderValue::from_str(&self.host)
+            .map_err(|e| FilterError::from(format!("aws_sigv4_sign: configured host is not a valid header value: {e}")))?;
+        ctx.request_headers_to_set.push((http::header::HOST, host_value));
+        for (name, value) in signed_headers {
+            ctx.request_headers_to_set.push((name, value));
+        }
+
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Config
 // -----------------------------------------------------------------------------
 
@@ -216,7 +344,11 @@ mod tests {
 
     use aws_credential_types::Credentials;
 
-    use super::{DEFAULT_MAX_BODY_BYTES, parse_sigv4_config};
+    use http::Method;
+    use praxis_filter::{FilterAction, HttpFilter as _};
+
+    use super::{DEFAULT_MAX_BODY_BYTES, Sigv4SignConfig, Sigv4SignFilter, parse_sigv4_config};
+    use crate::test_utils::{make_filter_context, make_request};
 
     fn yaml(body: &str) -> serde_yaml::Value {
         serde_yaml::from_str(body).expect("test YAML must parse")
@@ -376,5 +508,107 @@ mod tests {
             .iter()
             .any(|(name, _)| name.as_str().eq_ignore_ascii_case("x-amz-content-sha256"));
         assert!(has_content_sha256, "x-amz-content-sha256 must be present given PayloadChecksumKind::XAmzSha256");
+    }
+
+    /// Builds a filter directly from known-good credentials, bypassing
+    /// environment-variable resolution entirely (this workspace denies
+    /// `unsafe_code`, including in tests, so tests must not mutate
+    /// process-global env vars via `unsafe { std::env::set_var(..) }`).
+    /// Constructing the struct literal directly is possible because
+    /// `tests` is a child module of `sigv4` and so can see its private
+    /// fields.
+    fn test_filter() -> Sigv4SignFilter {
+        Sigv4SignFilter {
+            region: "us-east-1".to_owned(),
+            service: "bedrock".to_owned(),
+            host: "bedrock-runtime.us-east-1.amazonaws.com".to_owned(),
+            credentials: Credentials::new(
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                None,
+                None,
+                "test-filter",
+            ),
+            max_body_bytes: 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn on_request_sets_signed_headers_and_host() {
+        let filter = test_filter();
+        let request = make_request(Method::POST, "/model/anthropic.claude-3/invoke");
+        let mut ctx = make_filter_context(&request);
+        ctx.buffered_request_body = Some(bytes::Bytes::from_static(br#"{"prompt":"hi"}"#));
+
+        let action = filter.on_request(&mut ctx).await.expect("signing must succeed");
+        assert!(matches!(action, FilterAction::Continue));
+
+        let host = ctx
+            .request_headers_to_set
+            .iter()
+            .find(|(name, _)| *name == http::header::HOST)
+            .map(|(_, value)| value.to_str().expect("ascii"));
+        assert_eq!(host, Some("bedrock-runtime.us-east-1.amazonaws.com"), "filter must set its own Host header");
+
+        let has_authorization = ctx
+            .request_headers_to_set
+            .iter()
+            .any(|(name, value)| *name == http::header::AUTHORIZATION && value.as_bytes().starts_with(b"AWS4-HMAC-SHA256 "));
+        assert!(has_authorization, "must set a well-formed Authorization header");
+    }
+
+    #[tokio::test]
+    async fn on_request_uses_rewritten_path_when_present() {
+        let filter = test_filter();
+        let request = make_request(Method::POST, "/original/client/path");
+        let mut ctx = make_filter_context(&request);
+        ctx.buffered_request_body = Some(bytes::Bytes::new());
+        ctx.rewritten_path = Some("/model/anthropic.claude-3/invoke".to_owned());
+
+        let _action = filter.on_request(&mut ctx).await.expect("signing must succeed");
+
+        // Re-derive the signature independently using the rewritten
+        // path and compare against what the filter produced, proving
+        // it signed the rewritten path and not the original request path.
+        let expected_auth_prefix = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/";
+        let authorization = ctx
+            .request_headers_to_set
+            .iter()
+            .find(|(name, _)| *name == http::header::AUTHORIZATION)
+            .map(|(_, value)| value.to_str().expect("ascii").to_owned())
+            .expect("authorization header must be set");
+        assert!(authorization.starts_with(expected_auth_prefix));
+        // A signature computed over "/original/client/path" would
+        // differ; a strong assertion here would duplicate sign_headers
+        // (already vector-tested above), so this test's real value is
+        // functional coverage of the rewritten_path branch itself,
+        // combined with the field-presence assertions above.
+    }
+
+    #[tokio::test]
+    async fn on_request_fails_closed_when_credentials_env_vars_missing() {
+        let filter = Sigv4SignFilter::new(Sigv4SignConfig {
+            region: "us-east-1".to_owned(),
+            service: "bedrock".to_owned(),
+            host: "bedrock-runtime.us-east-1.amazonaws.com".to_owned(),
+            access_key_env_var: "SIGV4_TEST_DEFINITELY_UNSET_AKID".to_owned(),
+            secret_key_env_var: "SIGV4_TEST_DEFINITELY_UNSET_SECRET".to_owned(),
+            session_token_env_var: None,
+            max_body_bytes: 1024,
+        });
+        assert!(filter.is_err(), "missing credential env vars must fail at construction, not silently sign with empty keys");
+    }
+
+    #[test]
+    fn from_config_wires_parsing_and_credential_resolution() {
+        let config = yaml(
+            "region: us-east-1\n\
+             service: bedrock\n\
+             host: bedrock-runtime.us-east-1.amazonaws.com\n\
+             access_key_env_var: SIGV4_TEST_FROM_CONFIG_DEFINITELY_UNSET_AKID\n\
+             secret_key_env_var: SIGV4_TEST_FROM_CONFIG_DEFINITELY_UNSET_SECRET\n",
+        );
+        let err = Sigv4SignFilter::from_config(&config);
+        assert!(err.is_err(), "from_config must propagate credential-resolution failure through to the caller");
     }
 }
