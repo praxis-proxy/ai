@@ -9,6 +9,7 @@
 //! inference routing, prompt enrichment, and token usage handling.
 
 pub mod agentic;
+pub mod aws;
 pub mod guardrails;
 pub mod inference;
 #[cfg(feature = "opentelemetry")]
