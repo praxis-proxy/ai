@@ -20,7 +20,7 @@
 //!
 //! # Ordering requirement
 //!
-//! This filter reads [`HttpFilterContext::rewritten_path`] and sets
+//! This filter reads [`praxis_filter::HttpFilterContext::rewritten_path`] and sets
 //! its own `Host` header. It must be placed **after** any
 //! `path_rewrite`/`url_rewrite` filter in the same chain, and it owns
 //! the `Host` header for the request — do not pair it with another
@@ -28,7 +28,7 @@
 //!
 //! By the time this filter runs, `ctx.request` is still the
 //! **client's original** request; the actual upstream path is
-//! [`HttpFilterContext::rewritten_path`] when set (applied to the wire
+//! [`praxis_filter::HttpFilterContext::rewritten_path`] when set (applied to the wire
 //! later, in the protocol layer's `upstream_request_filter`), and
 //! there is no framework-computed "final upstream Host" at all. This
 //! filter sets `Host` itself; the operator must point the cluster's
@@ -88,7 +88,7 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 ///
 /// Pure function: takes the already-resolved `credentials` and every
 /// piece of the request that participates in signing, and returns the
-/// headers to set. Does not read [`HttpFilterContext`] directly so it
+/// headers to set. Does not read [`praxis_filter::HttpFilterContext`] directly so it
 /// can be tested independently of the framework (see the AWS-vector
 /// test below) and independently of async credential resolution.
 ///
@@ -98,7 +98,14 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 ///
 /// Returns [`FilterError`] if the signing library rejects the inputs
 /// (e.g. an invalid header name/value, or a malformed URI).
-#[expect(clippy::too_many_arguments, reason = "each argument is a distinct, independently-testable piece of the signature")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct, independently-testable piece of the signature"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "31 lines; one over limit due to the settings/params/sign/collect sequence"
+)]
 pub(crate) fn sign_headers<'a>(
     credentials: &Credentials,
     region: &str,
@@ -109,8 +116,10 @@ pub(crate) fn sign_headers<'a>(
     headers: impl Iterator<Item = (&'a str, &'a str)>,
     body: &'a [u8],
 ) -> Result<Vec<(HeaderName, HeaderValue)>, FilterError> {
-    use aws_sigv4::http_request::{sign, PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings};
-    use aws_sigv4::sign::v4;
+    use aws_sigv4::{
+        http_request::{PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign},
+        sign::v4,
+    };
 
     let identity = credentials.clone().into();
 
@@ -200,7 +209,11 @@ impl Sigv4SignFilter {
             .as_ref()
             .map(std::env::var)
             .transpose()
-            .map_err(|e| FilterError::from(format!("aws_sigv4_sign: session_token_env_var is set but not readable: {e}")))?;
+            .map_err(|e| {
+                FilterError::from(format!(
+                    "aws_sigv4_sign: session_token_env_var is set but not readable: {e}"
+                ))
+            })?;
 
         let credentials = Credentials::new(access_key, secret_key, session_token, None, "aws_sigv4_sign-static");
 
@@ -241,7 +254,14 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
         }
     }
 
-    async fn on_request(&self, ctx: &mut praxis_filter::HttpFilterContext<'_>) -> Result<praxis_filter::FilterAction, FilterError> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "31 lines; one over limit due to the host/uri/sign/header-set sequence"
+    )]
+    async fn on_request(
+        &self,
+        ctx: &mut praxis_filter::HttpFilterContext<'_>,
+    ) -> Result<praxis_filter::FilterAction, FilterError> {
         let path_and_query = ctx
             .rewritten_path
             .as_deref()
@@ -263,11 +283,16 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
         );
 
         let Ok(signed_headers) = signed_headers else {
-            return Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(503)));
+            return Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(
+                503,
+            )));
         };
 
-        let host_value = HeaderValue::from_str(&self.host)
-            .map_err(|e| FilterError::from(format!("aws_sigv4_sign: configured host is not a valid header value: {e}")))?;
+        let host_value = HeaderValue::from_str(&self.host).map_err(|e| {
+            FilterError::from(format!(
+                "aws_sigv4_sign: configured host is not a valid header value: {e}"
+            ))
+        })?;
         ctx.request_headers_to_set.push((http::header::HOST, host_value));
         for (name, value) in signed_headers {
             ctx.request_headers_to_set.push((name, value));
@@ -338,12 +363,17 @@ pub(crate) fn parse_sigv4_config(config: &serde_yaml::Value) -> Result<Sigv4Sign
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, reason = "tests")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "tests"
+)]
 mod tests {
     use std::time::SystemTime;
 
     use aws_credential_types::Credentials;
-
     use http::Method;
     use praxis_filter::{FilterAction, HttpFilter as _};
 
@@ -370,8 +400,14 @@ mod tests {
         assert_eq!(config.host, "bedrock-runtime.us-east-1.amazonaws.com");
         assert_eq!(config.access_key_env_var, "AWS_ACCESS_KEY_ID");
         assert_eq!(config.secret_key_env_var, "AWS_SECRET_ACCESS_KEY");
-        assert!(config.session_token_env_var.is_none(), "session token should default to None");
-        assert_eq!(config.max_body_bytes, DEFAULT_MAX_BODY_BYTES, "should apply default max_body_bytes");
+        assert!(
+            config.session_token_env_var.is_none(),
+            "session token should default to None"
+        );
+        assert_eq!(
+            config.max_body_bytes, DEFAULT_MAX_BODY_BYTES,
+            "should apply default max_body_bytes"
+        );
     }
 
     #[test]
@@ -416,7 +452,10 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "doc-comment explaining a documentation discrepancy dominates the line count")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "doc-comment explaining a documentation discrepancy dominates the line count"
+    )]
     fn sign_headers_matches_aws_published_get_object_example() {
         // Worked example from AWS's own docs (fetched 2026-08-22):
         // https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html#example-signature-calculations
@@ -477,6 +516,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "33 lines; three over limit due to two header-presence assertions"
+    )]
     fn sign_headers_includes_security_token_for_temporary_credentials() {
         let credentials = Credentials::new(
             "ASIAEXAMPLE",
@@ -502,12 +545,18 @@ mod tests {
         let has_security_token = headers
             .iter()
             .any(|(name, _)| name.as_str().eq_ignore_ascii_case("x-amz-security-token"));
-        assert!(has_security_token, "temporary credentials must produce a signed x-amz-security-token header");
+        assert!(
+            has_security_token,
+            "temporary credentials must produce a signed x-amz-security-token header"
+        );
 
         let has_content_sha256 = headers
             .iter()
             .any(|(name, _)| name.as_str().eq_ignore_ascii_case("x-amz-content-sha256"));
-        assert!(has_content_sha256, "x-amz-content-sha256 must be present given PayloadChecksumKind::XAmzSha256");
+        assert!(
+            has_content_sha256,
+            "x-amz-content-sha256 must be present given PayloadChecksumKind::XAmzSha256"
+        );
     }
 
     /// Builds a filter directly from known-good credentials, bypassing
@@ -548,12 +597,15 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == http::header::HOST)
             .map(|(_, value)| value.to_str().expect("ascii"));
-        assert_eq!(host, Some("bedrock-runtime.us-east-1.amazonaws.com"), "filter must set its own Host header");
+        assert_eq!(
+            host,
+            Some("bedrock-runtime.us-east-1.amazonaws.com"),
+            "filter must set its own Host header"
+        );
 
-        let has_authorization = ctx
-            .request_headers_to_set
-            .iter()
-            .any(|(name, value)| *name == http::header::AUTHORIZATION && value.as_bytes().starts_with(b"AWS4-HMAC-SHA256 "));
+        let has_authorization = ctx.request_headers_to_set.iter().any(|(name, value)| {
+            *name == http::header::AUTHORIZATION && value.as_bytes().starts_with(b"AWS4-HMAC-SHA256 ")
+        });
         assert!(has_authorization, "must set a well-formed Authorization header");
     }
 
@@ -596,7 +648,10 @@ mod tests {
             session_token_env_var: None,
             max_body_bytes: 1024,
         });
-        assert!(filter.is_err(), "missing credential env vars must fail at construction, not silently sign with empty keys");
+        assert!(
+            filter.is_err(),
+            "missing credential env vars must fail at construction, not silently sign with empty keys"
+        );
     }
 
     #[test]
@@ -609,6 +664,9 @@ mod tests {
              secret_key_env_var: SIGV4_TEST_FROM_CONFIG_DEFINITELY_UNSET_SECRET\n",
         );
         let err = Sigv4SignFilter::from_config(&config);
-        assert!(err.is_err(), "from_config must propagate credential-resolution failure through to the caller");
+        assert!(
+            err.is_err(),
+            "from_config must propagate credential-resolution failure through to the caller"
+        );
     }
 }
