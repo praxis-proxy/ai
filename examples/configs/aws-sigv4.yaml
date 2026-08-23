@@ -43,3 +43,6 @@ filter_chains:
         host: bedrock-runtime.us-east-1.amazonaws.com
         access_key_env_var: AWS_ACCESS_KEY_ID
         secret_key_env_var: AWS_SECRET_ACCESS_KEY
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend
