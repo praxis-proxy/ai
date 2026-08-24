@@ -176,17 +176,22 @@ const MAX_SANITIZED_LEN: usize = 255;
 /// this is a defense-in-depth pass against control-character/log
 /// injection. It:
 ///
-/// - strips leading control characters and whitespace (e.g. a leading `"\n\n"`),
+/// - trims leading and trailing control characters and whitespace (e.g. a leading `"\n\n"` or a trailing `" "`),
 /// - keeps characters up to the first embedded control character and drops everything after it (multi-line verdicts
 ///   such as `"unsafe\nS02"` collapse to their first line, `"unsafe"`),
-/// - drops `/` and `\` from the retained text,
+/// - preserves all other printable characters verbatim, including `/` and `\`, so provider values such as
+///   `"unsafe/S02"` reach `on_result` matching intact,
 /// - truncates the result to [`MAX_SANITIZED_LEN`] bytes at a UTF-8 character boundary, and
 /// - returns `None` if nothing usable remains.
+///
+/// Trimming both ends matters because these values feed `on_result`
+/// exact-equality matching: a provider that returns `"safe "` must still
+/// match a config that says `safe`.
 pub(crate) fn sanitize_string(raw: &str) -> Option<String> {
     // Skip leading control characters and whitespace (e.g. leading "\n\n").
     let trimmed = raw.trim_start_matches(|c: char| c < '\x20' || c == '\x7F' || c.is_whitespace());
 
-    let (sanitized, rest) = split_at_first_control(trimmed);
+    let (kept, rest) = split_at_first_control(trimmed);
 
     // Anything after the first embedded control character is dropped;
     // note it so a truncated multi-line value is not silently lost.
@@ -194,10 +199,14 @@ pub(crate) fn sanitize_string(raw: &str) -> Option<String> {
     if !remaining.is_empty() {
         warn!(
             dropped = %remaining,
-            kept = %sanitized,
+            kept = %kept,
             "extracted value contained control characters; truncated to first line"
         );
     }
+
+    // Trailing whitespace would defeat `on_result` exact-equality matching,
+    // so drop it as well. Leading whitespace is already gone above.
+    let sanitized = kept.trim_end();
 
     if sanitized.is_empty() {
         return None;
@@ -404,6 +413,141 @@ mod tests {
         // A control character still truncates; a slash before it is kept,
         // and content after the control character is dropped.
         assert_eq!(sanitize_string("keep/me\ndrop/this"), Some("keep/me".to_owned()));
+    }
+
+    #[test]
+    fn test_sanitize_string_trims_trailing_whitespace() {
+        // These values feed `on_result` exact-equality matching, so a
+        // provider that pads its verdict must still match a bare config value.
+        assert_eq!(sanitize_string("safe  "), Some("safe".to_owned()));
+        assert_eq!(sanitize_string("  safe  "), Some("safe".to_owned()));
+        assert_eq!(sanitize_string("\tsafe\t"), Some("safe".to_owned()));
+        assert_eq!(
+            sanitize_string("unsafe/S02 "),
+            Some("unsafe/S02".to_owned()),
+            "trailing trim must not disturb interior slashes"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_string_inner_whitespace_preserved() {
+        // Only the ends are trimmed; a multi-word verdict keeps its spacing.
+        assert_eq!(
+            sanitize_string("  needs review  "),
+            Some("needs review".to_owned()),
+            "interior spaces are part of the value"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_string_whitespace_before_control_char() {
+        // The value is trimmed after the control-character split, so padding
+        // that sits just before a newline is removed too.
+        assert_eq!(sanitize_string("safe  \nS02"), Some("safe".to_owned()));
+    }
+
+    #[test]
+    fn test_sanitize_string_only_whitespace_is_none() {
+        assert_eq!(sanitize_string("   "), None, "whitespace-only yields no value");
+        assert_eq!(sanitize_string(" \t \n "), None, "mixed blank input yields no value");
+    }
+
+    #[test]
+    fn test_sanitize_string_truncates_over_max_len() {
+        let long = "a".repeat(MAX_SANITIZED_LEN + 50);
+        let result = sanitize_string(&long).expect("a long ASCII value should survive truncation");
+        assert_eq!(
+            result.len(),
+            MAX_SANITIZED_LEN,
+            "value must be truncated to the byte ceiling"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_string_at_exactly_max_len_is_unchanged() {
+        let exact = "a".repeat(MAX_SANITIZED_LEN);
+        assert_eq!(
+            sanitize_string(&exact),
+            Some(exact.clone()),
+            "a value exactly at the ceiling must not be truncated"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_string_truncation_respects_char_boundary() {
+        // "é" is two bytes, so a run of them straddles the 255-byte ceiling.
+        // Truncation must back off to a character boundary rather than
+        // slicing a multi-byte character in half.
+        let multibyte = "é".repeat(200);
+        let result = sanitize_string(&multibyte).expect("multi-byte value should survive truncation");
+
+        assert!(
+            result.len() <= MAX_SANITIZED_LEN,
+            "truncated value must respect the byte ceiling, got {} bytes",
+            result.len()
+        );
+        assert!(
+            multibyte.starts_with(&result),
+            "truncated value must be a prefix of the input"
+        );
+        assert_eq!(
+            result.chars().count(),
+            MAX_SANITIZED_LEN / 2,
+            "each 'é' is two bytes, so the odd trailing byte must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_string_truncation_preserves_utf8() {
+        // Guards the boundary walk generally: the result must still be valid
+        // UTF-8 for any multi-byte width, including 4-byte emoji.
+        for filler in ["é", "→", "🙂"] {
+            let input = filler.repeat(MAX_SANITIZED_LEN);
+            let result = sanitize_string(&input).expect("multi-byte value should survive truncation");
+            assert!(
+                result.len() <= MAX_SANITIZED_LEN,
+                "{filler}: truncated to {} bytes, over the ceiling",
+                result.len()
+            );
+            assert!(
+                input.starts_with(&result),
+                "{filler}: truncated value must be a prefix of the input"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Coercion
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn coerce_value_null_is_none() {
+        assert_eq!(coerce_value(&Value::Null), None, "null has no string form");
+    }
+
+    #[test]
+    fn coerce_value_scalars() {
+        assert_eq!(coerce_value(&json!(true)), Some("true".to_owned()));
+        assert_eq!(coerce_value(&json!(false)), Some("false".to_owned()));
+        assert_eq!(coerce_value(&json!(42)), Some("42".to_owned()));
+        assert_eq!(coerce_value(&json!(1.5)), Some("1.5".to_owned()));
+    }
+
+    #[test]
+    fn coerce_value_string_is_sanitized() {
+        // Strings route through `sanitize_string`, so the same trimming and
+        // control-character rules apply.
+        assert_eq!(coerce_value(&json!("  unsafe/S02  ")), Some("unsafe/S02".to_owned()));
+        assert_eq!(coerce_value(&json!("unsafe\nS02")), Some("unsafe".to_owned()));
+        assert_eq!(coerce_value(&json!("   ")), None, "blank string yields no value");
+    }
+
+    #[test]
+    fn coerce_value_composites_are_serialized_then_sanitized() {
+        // Arrays and objects are rendered as compact JSON, which contains no
+        // control characters, so the text survives intact.
+        assert_eq!(coerce_value(&json!(["a", "b"])), Some(r#"["a","b"]"#.to_owned()));
+        assert_eq!(coerce_value(&json!({"k": "v"})), Some(r#"{"k":"v"}"#.to_owned()));
     }
 
     // -------------------------------------------------------------------------
