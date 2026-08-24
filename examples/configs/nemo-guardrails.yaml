@@ -5,7 +5,7 @@
 #
 #   passed   → request forwarded to the upstream unchanged
 #   blocked  → 403 returned to the client (triggered rail names in body)
-#   modified → forwarded unchanged (body replacement deferred to #579)
+#   modified → 403 returned to the client (triggered rail names in body)
 #
 # Start a local NeMo Guardrails instance before running this config
 #
