@@ -80,6 +80,12 @@ use serde::Deserialize;
 /// Default cap on buffered request-body bytes used for payload hashing.
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// Upper bound on the configurable body buffer. Signing requires
+/// buffering the whole body to hash it, so an unbounded value would let
+/// a single request pin an arbitrary amount of memory; 64 MiB is well
+/// above any realistic inference payload.
+const MAX_ALLOWED_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 // -----------------------------------------------------------------------------
 // Signing
 // -----------------------------------------------------------------------------
@@ -176,6 +182,11 @@ pub struct Sigv4SignFilter {
     /// Host header to sign and to set on the outbound request.
     host: String,
 
+    /// Pre-validated `Host` header value, checked once at construction
+    /// time so a malformed configured host is rejected at startup rather
+    /// than on every request.
+    host_header: HeaderValue,
+
     /// Static credentials resolved once at construction time.
     credentials: Credentials,
 
@@ -189,38 +200,32 @@ impl Sigv4SignFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if either credential environment
-    /// variable is unset or not valid UTF-8.
+    /// Returns [`FilterError`] if either credential environment variable
+    /// is unset or not valid UTF-8, if `max_body_bytes` is outside the
+    /// accepted range, or if the configured host is not a valid `Host`
+    /// header value.
     fn new(config: Sigv4SignConfig) -> Result<Self, FilterError> {
-        let access_key = std::env::var(&config.access_key_env_var).map_err(|e| {
-            FilterError::from(format!(
-                "aws_sigv4_sign: access_key_env_var '{}' is not set: {e}",
-                config.access_key_env_var
-            ))
-        })?;
-        let secret_key = std::env::var(&config.secret_key_env_var).map_err(|e| {
-            FilterError::from(format!(
-                "aws_sigv4_sign: secret_key_env_var '{}' is not set: {e}",
-                config.secret_key_env_var
-            ))
-        })?;
-        let session_token = config
-            .session_token_env_var
-            .as_ref()
-            .map(std::env::var)
-            .transpose()
-            .map_err(|e| {
-                FilterError::from(format!(
-                    "aws_sigv4_sign: session_token_env_var is set but not readable: {e}"
-                ))
-            })?;
+        if config.max_body_bytes == 0 || config.max_body_bytes > MAX_ALLOWED_BODY_BYTES {
+            return Err(FilterError::from(format!(
+                "aws_sigv4_sign: max_body_bytes must be between 1 and {MAX_ALLOWED_BODY_BYTES}, got {}",
+                config.max_body_bytes
+            )));
+        }
 
-        let credentials = Credentials::new(access_key, secret_key, session_token, None, "aws_sigv4_sign-static");
+        let host_header = HeaderValue::from_str(&config.host).map_err(|e| {
+            FilterError::from(format!(
+                "aws_sigv4_sign: host '{}' is not a valid header value: {e}",
+                config.host
+            ))
+        })?;
+
+        let credentials = resolve_static_credentials(&config)?;
 
         Ok(Self {
             region: config.region,
             service: config.service,
             host: config.host,
+            host_header,
             credentials,
             max_body_bytes: config.max_body_bytes,
         })
@@ -236,6 +241,47 @@ impl Sigv4SignFilter {
         let config = parse_sigv4_config(config)?;
         Ok(Box::new(Self::new(config)?))
     }
+}
+
+/// Resolve static AWS credentials from the configured environment
+/// variables.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if either required credential environment
+/// variable is unset or not valid UTF-8, or if the optional session
+/// token variable is set but unreadable.
+fn resolve_static_credentials(config: &Sigv4SignConfig) -> Result<Credentials, FilterError> {
+    let access_key = std::env::var(&config.access_key_env_var).map_err(|e| {
+        FilterError::from(format!(
+            "aws_sigv4_sign: access_key_env_var '{}' is not set: {e}",
+            config.access_key_env_var
+        ))
+    })?;
+    let secret_key = std::env::var(&config.secret_key_env_var).map_err(|e| {
+        FilterError::from(format!(
+            "aws_sigv4_sign: secret_key_env_var '{}' is not set: {e}",
+            config.secret_key_env_var
+        ))
+    })?;
+    let session_token = config
+        .session_token_env_var
+        .as_ref()
+        .map(std::env::var)
+        .transpose()
+        .map_err(|e| {
+            FilterError::from(format!(
+                "aws_sigv4_sign: session_token_env_var is set but not readable: {e}"
+            ))
+        })?;
+
+    Ok(Credentials::new(
+        access_key,
+        secret_key,
+        session_token,
+        None,
+        "aws_sigv4_sign-static",
+    ))
 }
 
 #[async_trait::async_trait]
@@ -256,7 +302,7 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "31 lines; one over limit due to the host/uri/sign/header-set sequence"
+        reason = "the linear path/uri/sign/fail-closed/header-set sequence exceeds the 30-line limit"
     )]
     async fn on_request(
         &self,
@@ -282,18 +328,25 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
             &body,
         );
 
-        let Ok(signed_headers) = signed_headers else {
-            return Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(
-                503,
-            )));
+        let signed_headers = match signed_headers {
+            Ok(headers) => headers,
+            Err(e) => {
+                // Fail closed: never forward an unsigned request. The
+                // error carries only signing-input diagnostics (invalid
+                // URI/header/params), never key material, so it is safe
+                // to surface — without it an operator sees a bare 503
+                // and cannot tell misconfiguration from an outage.
+                tracing::warn!(error = %e, "aws_sigv4_sign: request signing failed; rejecting with 503");
+                return Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(
+                    503,
+                )));
+            },
         };
 
-        let host_value = HeaderValue::from_str(&self.host).map_err(|e| {
-            FilterError::from(format!(
-                "aws_sigv4_sign: configured host is not a valid header value: {e}"
-            ))
-        })?;
-        ctx.request_headers_to_set.push((http::header::HOST, host_value));
+        // `host_header` was validated once at construction; this clone is
+        // the minimal ownership handoff into the headers-to-set list.
+        ctx.request_headers_to_set
+            .push((http::header::HOST, self.host_header.clone()));
         for (name, value) in signed_headers {
             ctx.request_headers_to_set.push((name, value));
         }
@@ -571,6 +624,7 @@ mod tests {
             region: "us-east-1".to_owned(),
             service: "bedrock".to_owned(),
             host: "bedrock-runtime.us-east-1.amazonaws.com".to_owned(),
+            host_header: http::HeaderValue::from_static("bedrock-runtime.us-east-1.amazonaws.com"),
             credentials: Credentials::new(
                 "AKIAIOSFODNN7EXAMPLE",
                 "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
@@ -652,6 +706,58 @@ mod tests {
             filter.is_err(),
             "missing credential env vars must fail at construction, not silently sign with empty keys"
         );
+    }
+
+    #[tokio::test]
+    async fn on_request_rejects_with_503_when_signing_fails() {
+        let filter = test_filter();
+        let request = make_request(Method::POST, "/model/anthropic.claude-3/invoke");
+        let mut ctx = make_filter_context(&request);
+        ctx.buffered_request_body = Some(bytes::Bytes::new());
+        // A control character in the rewritten path makes the composed
+        // URI unparseable, so `sign_headers` -> `SignableRequest::new`
+        // fails at request time. This exercises the runtime fail-closed
+        // branch, distinct from the construction-time credential check.
+        ctx.rewritten_path = Some("/model/\u{7f}/invoke".to_owned());
+
+        let action = filter
+            .on_request(&mut ctx)
+            .await
+            .expect("filter must reject, not error out");
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "a runtime signing failure must fail closed with 503"
+        );
+        assert!(
+            ctx.request_headers_to_set.is_empty(),
+            "no headers must be set when signing fails (no partially-signed request)"
+        );
+    }
+
+    #[test]
+    fn new_rejects_out_of_range_max_body_bytes() {
+        let cfg = |max_body_bytes| Sigv4SignConfig {
+            region: "us-east-1".to_owned(),
+            service: "bedrock".to_owned(),
+            host: "bedrock-runtime.us-east-1.amazonaws.com".to_owned(),
+            access_key_env_var: "SIGV4_TEST_UNSET_AKID".to_owned(),
+            secret_key_env_var: "SIGV4_TEST_UNSET_SECRET".to_owned(),
+            session_token_env_var: None,
+            max_body_bytes,
+        };
+
+        // Validation runs before credential resolution, so these fail on
+        // the bound even with the credential env vars unset.
+        // (`Sigv4SignFilter` is not `Debug`, so match instead of `expect_err`.)
+        for bad in [0, super::MAX_ALLOWED_BODY_BYTES + 1] {
+            match Sigv4SignFilter::new(cfg(bad)) {
+                Ok(_) => panic!("out-of-range max_body_bytes ({bad}) must be rejected"),
+                Err(err) => assert!(
+                    format!("{err}").contains("max_body_bytes"),
+                    "error must name the offending field, got: {err}"
+                ),
+            }
+        }
     }
 
     #[test]
