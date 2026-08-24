@@ -1,0 +1,27 @@
+[package]
+name = "praxis-tests-environment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "llm-d environment integration tests for Praxis AI"
+
+[features]
+default = []
+llmd-ext-proc = ["praxis-ai-proxy/llmd-ext-proc", "praxis-test-utils/llmd-ext-proc"]
+
+[lints]
+workspace = true
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
+harness = true
+required-features = ["llmd-ext-proc"]
+
+[dev-dependencies]
+praxis-ai-proxy = { workspace = true }
+praxis-core = { workspace = true }
+praxis-test-utils = { workspace = true }
+serde_json = { workspace = true }
