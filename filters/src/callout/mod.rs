@@ -7,6 +7,11 @@
 //! request processing, extracts results from the response via `JSONPath`,
 //! and feeds them into [`FilterResultSet`] for branch-chain evaluation.
 //!
+//! **Experimental.** Requires the `http-callout-filter` cargo feature, which
+//! is off by default and activates the `experimental` marker feature. The
+//! filter is a work in progress and its configuration surface may change
+//! between releases.
+//!
 //! [`HttpFilter`]: praxis_filter::HttpFilter
 //! [`FilterResultSet`]: praxis_filter::FilterResultSet
 
@@ -64,6 +69,11 @@ const DISALLOWED_FORWARD_HEADERS: &[http::HeaderName] = &[
 // -----------------------------------------------------------------------------
 
 /// Calls an external HTTP service during request processing and feeds its response into branch-chain evaluation.
+///
+/// Experimental: requires the `http-callout-filter` cargo feature,
+/// which is off by default and activates the `experimental` marker.
+/// This filter is a work in progress and its configuration surface
+/// may change between releases.
 ///
 /// Makes an outbound HTTP request during request processing,
 /// optionally forwarding the request body and downstream headers.

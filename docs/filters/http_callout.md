@@ -7,6 +7,8 @@ Calls an external HTTP service during request processing and feeds its response 
 
 ## Configuration Notes
 
+Experimental: requires the `http-callout-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter is a work in progress and its configuration surface may change between releases.
+
 Makes an outbound HTTP request during request processing, optionally forwarding the request body and downstream headers. Extracts values from the callout response via `JSONPath` and writes them to [`FilterResultSet`] for branch-chain evaluation.
 
 ## Configuration

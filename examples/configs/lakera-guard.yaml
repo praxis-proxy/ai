@@ -12,8 +12,12 @@
 #
 # Requires the LAKERA_API_KEY environment variable.
 #
+# The http_callout filter is experimental and is not compiled into the
+# default build. Enable it with --features http-callout-filter.
+#
 # Usage:
-#   LAKERA_API_KEY=... cargo run -p praxis-ai-proxy -- -c examples/configs/lakera-guard.yaml
+#   LAKERA_API_KEY=... cargo run -p praxis-ai-proxy \
+#     --features http-callout-filter -- -c examples/configs/lakera-guard.yaml
 #
 # Note: non-JSON request bodies cannot be shaped by target.body and are
 # forwarded to Lakera as-is; with on_failure: closed a non-2xx response

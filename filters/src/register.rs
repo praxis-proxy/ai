@@ -6,10 +6,11 @@
 use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
+#[cfg(feature = "http-callout-filter")]
+use crate::HttpCalloutFilter;
 use crate::{
-    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, HttpCalloutFilter, IntelligentRouteFilter, McpFilter,
-    ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter,
-    TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
+    PromptEnrichFilter, ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -74,6 +75,7 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "ai_guardrails" => AiGuardrailsFilter::from_config
     );
+    #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
         http "http_callout" => HttpCalloutFilter::from_config
@@ -362,7 +364,6 @@ mod tests {
         let names = registry.available_filters();
         let expected = [
             "ai_guardrails",
-            "http_callout",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",
@@ -376,6 +377,19 @@ mod tests {
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");
         }
+
+        // Experimental filters register only when their feature is enabled.
+        #[cfg(feature = "http-callout-filter")]
+        assert!(
+            names.contains(&"http_callout"),
+            "http_callout must register when its feature is enabled"
+        );
+        #[cfg(not(feature = "http-callout-filter"))]
+        assert!(
+            !names.contains(&"http_callout"),
+            "http_callout must not register when its feature is disabled"
+        );
+
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
     }

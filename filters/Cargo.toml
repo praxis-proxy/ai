@@ -15,6 +15,12 @@ name = "praxis_ai_filters"
 [features]
 default = ["apis"]
 apis = ["praxis-ai-apis/default"]
+# Experimental: the generic http_callout filter. Work in progress; the config
+# surface may change. Activates the `experimental` marker.
+http-callout-filter = ["experimental"]
+# Marker feature activated transitively by any experimental feature, mirroring
+# praxis core's server crate. Lets consumers gate on "anything experimental".
+experimental = []
 opentelemetry = []
 praxis-main = []
 
