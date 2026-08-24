@@ -6,7 +6,7 @@
 
 FROM vllm/vllm-openai:v0.26.0
 
-RUN pip install "huggingface-hub[cli]"
+RUN pip install --no-cache-dir "huggingface-hub[cli]==1.*"
 
 ARG INFERENCE_MODEL=""
 
