@@ -6,6 +6,8 @@
 use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
+#[cfg(feature = "http-callout-filter")]
+use crate::HttpCalloutFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
     PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
@@ -79,6 +81,11 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "ai_guardrails" => AiGuardrailsFilter::from_config
+    );
+    #[cfg(feature = "http-callout-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "http_callout" => HttpCalloutFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -378,6 +385,19 @@ mod tests {
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");
         }
+
+        // Experimental filters register only when their feature is enabled.
+        #[cfg(feature = "http-callout-filter")]
+        assert!(
+            names.contains(&"http_callout"),
+            "http_callout must register when its feature is enabled"
+        );
+        #[cfg(not(feature = "http-callout-filter"))]
+        assert!(
+            !names.contains(&"http_callout"),
+            "http_callout must not register when its feature is disabled"
+        );
+
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
         assert!(registry.is_security_filter("aws_sigv4_sign"));

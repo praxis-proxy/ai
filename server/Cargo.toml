@@ -22,7 +22,13 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
+default = []
+# Experimental: the generic http_callout filter (see praxis-ai-filters).
+http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
+# Marker feature activated transitively by any experimental feature.
+experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]
+llmd-ext-proc = ["dep:praxis-ai-llmd-ext-proc"]
 praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
 
 [lints]
@@ -33,6 +39,7 @@ clap = { workspace = true }
 notify = { workspace = true }
 praxis-ai-filters = { workspace = true }
 praxis-ai-apis = { workspace = true }
+praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-protocol = { workspace = true }

@@ -1,0 +1,99 @@
+# Lakera Guard Content Safety
+#
+# Screens every request body through Lakera Guard for
+# content moderation before forwarding to the upstream.
+# Flagged requests are rejected with 403; clean requests
+# continue to the backend.
+#
+# The target.body option uses JSONPath to send only the
+# "messages" array to Lakera, stripping provider-specific
+# fields like "model" that Lakera rejects. The full
+# downstream body reaches the upstream untouched.
+#
+# Requires the LAKERA_API_KEY environment variable.
+#
+# The http_callout filter is experimental and is not compiled into the
+# default build. Enable it with --features http-callout-filter.
+#
+# Usage:
+#   LAKERA_API_KEY=... cargo run -p praxis-ai-proxy \
+#     --features http-callout-filter -- -c examples/configs/lakera-guard.yaml
+#
+# Note: non-JSON request bodies cannot be shaped by target.body and are
+# forwarded to Lakera as-is; with on_failure: closed a non-2xx response
+# then rejects the request. Use conditions to scope the callout if that
+# matters for your traffic.
+#
+# A LlamaGuard variant of this example is planned once richer on_result
+# matching lands (praxis-proxy/praxis#964); LlamaGuard verdicts such as
+# "unsafe\nS02" need contains-style matching rather than exact equality.
+
+listeners:
+  - name: web
+    address: "0.0.0.0:8080"
+    filter_chains: [safety-check, routing]
+
+filter_chains:
+  - name: safety-check
+    filters:
+      - filter: http_callout
+        target:
+          url: "https://api.lakera.ai/v2/guard"
+          # This callout targets a public API. Reject it at request time
+          # if the host ever resolves to a private/loopback/link-local
+          # address (SSRF / DNS-rebinding hardening). Leave unset (default
+          # true) only when deliberately pointing at a loopback/sidecar
+          # guard service.
+          allow_private_addresses: false
+          timeout: "2s"
+          headers:
+            - name: "Authorization"
+              value: "Bearer ${LAKERA_API_KEY}"
+            - name: "Content-Type"
+              value: "application/json"
+          body:
+            messages: "$.messages"
+        request:
+          phase: request_body
+          max_body_bytes: 1048576
+        response:
+          extract:
+            - json_path: "$.flagged"
+              result_key: "flagged"
+        on_failure: closed
+        status_on_error: 403
+        circuit_breaker:
+          failure_threshold: 5
+          recovery_timeout: "30s"
+        conditions:
+          - when:
+              methods: [POST]
+        branch_chains:
+          - name: block_flagged
+            on_result:
+              filter: http_callout
+              key: flagged
+              result: "true"
+            rejoin: terminal
+            chains:
+              - name: reject_flagged
+                filters:
+                  - filter: static_response
+                    status: 403
+                    body: "request blocked by content safety"
+
+  - name: routing
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

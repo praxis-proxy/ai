@@ -15,6 +15,12 @@ name = "praxis_ai_filters"
 [features]
 default = ["apis"]
 apis = ["praxis-ai-apis/default"]
+# Experimental: the generic http_callout filter. Work in progress; the config
+# surface may change. Activates the `experimental` marker.
+http-callout-filter = ["experimental"]
+# Marker feature activated transitively by any experimental feature, mirroring
+# praxis core's server crate. Lets consumers gate on "anything experimental".
+experimental = []
 opentelemetry = []
 praxis-main = []
 
@@ -34,6 +40,7 @@ futures = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 notify = { workspace = true }
+pingora-core.workspace = true
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
@@ -41,6 +48,7 @@ reqwest.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
+serde_json_path = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }

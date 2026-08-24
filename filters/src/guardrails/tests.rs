@@ -38,6 +38,25 @@ fn as_rejection(action: praxis_filter::FilterAction) -> praxis_filter::Rejection
     .unwrap()
 }
 
+/// Build a `NeMo` guardrail filter backed by a mock that returns a
+/// `"modified"` (PII redact) verdict. Returns the filter and the
+/// mock server (whose lifetime must be held for the duration of
+/// the test).
+async fn nemo_pii_redact_filter() -> (Box<dyn praxis_filter::HttpFilter>, wiremock::MockServer) {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "modified",
+            "content": "my ssn is [REDACTED]",
+            "rails_status": {"pii masking": {"status": "blocked"}}
+        })))
+        .mount(&mock_server)
+        .await;
+    let filter = nemo_filter(&format!("{}/v1/guardrail/checks", mock_server.uri()));
+    (filter, mock_server)
+}
+
 // =============================================================================
 // General config
 // =============================================================================
@@ -341,36 +360,45 @@ async fn on_request_body_blocked_writes_filter_results() {
 }
 
 #[tokio::test]
-async fn on_request_body_modified_writes_filter_results() {
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
-    let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": "modified",
-            "content": "my ssn is [REDACTED]",
-            "rails_status": {"pii masking": {"status": "blocked"}}
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
-    let filter = nemo_filter(&endpoint);
+async fn on_request_body_modified_rejects_with_403() {
+    let (filter, _server) = nemo_pii_redact_filter().await;
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(
         br#"{"messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#,
     ));
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = as_rejection(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert_eq!(rejection.status, 403, "redact verdict must reject with HTTP 403");
+    let body_text = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
     assert!(
-        matches!(action, praxis_filter::FilterAction::Continue),
-        "modified verdict should forward unchanged (redact placeholder deferred to #579)"
+        body_text.contains("pii masking"),
+        "rejection body should include the blocked rail name, got: {body_text}"
     );
     assert_eq!(
         ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
         Some("redacted"),
-        "modified verdict should record a 'redacted' status in filter_results"
+        "redact verdict should record 'redacted' status in filter_results even when rejecting"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_modified_never_forwards_original_secret() {
+    let (filter, _server) = nemo_pii_redact_filter().await;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let original_body = br#"{"messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#;
+    let mut body = Some(bytes::Bytes::from_static(original_body));
+
+    let rejection = as_rejection(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert!(
+        !String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default()).contains("123-45-6789"),
+        "the original secret must not appear in the rejection body"
+    );
+    assert_eq!(
+        ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
+        Some("redacted"),
+        "status must be 'redacted', not 'passed', so downstream branch logic is not misled"
     );
 }
 

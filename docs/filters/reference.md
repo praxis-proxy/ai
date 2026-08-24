@@ -60,6 +60,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`aws_sigv4_sign`](aws_sigv4_sign.md) | Signs outbound requests to AWS services using `SigV4`. |
 
+### Callout
+
+| Filter | Description |
+|--------|-------------|
+| [`http_callout`](http_callout.md) | Calls an external HTTP service during request processing and feeds its response into branch-chain evaluation. |
+
 ### Guardrails
 
 | Filter | Description |
