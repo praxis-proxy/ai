@@ -1,0 +1,635 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Praxis Contributors
+
+//! Unit tests for the JWT authentication filter.
+
+use http::{HeaderValue, Method};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use praxis_filter::FilterAction;
+use serde_json::json;
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+use crate::test_utils::{make_filter_context, make_request};
+
+// -----------------------------------------------------------------------------
+// Test Key Material (pre-generated throwaway keypairs, test-only, not secrets)
+// -----------------------------------------------------------------------------
+
+/// The key the JWKS endpoint publishes and legitimate tokens are signed with.
+const TEST_RSA_PRIVATE_PEM: &str = include_str!("test_fixtures/rsa_private.pem");
+
+/// A second, unrelated key used only to forge tokens whose signature
+/// does NOT match the published JWKS key.
+const ATTACKER_RSA_PRIVATE_PEM: &str = include_str!("test_fixtures/rsa_private_attacker.pem");
+
+fn test_encoding_key() -> EncodingKey {
+    EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes()).unwrap()
+}
+
+fn attacker_encoding_key() -> EncodingKey {
+    EncodingKey::from_rsa_pem(ATTACKER_RSA_PRIVATE_PEM.as_bytes()).unwrap()
+}
+
+/// Build a JWKS JSON response from the legitimate test key.
+fn build_jwks_response(kid: &str) -> serde_json::Value {
+    let key = test_encoding_key();
+    let mut jwk = jsonwebtoken::jwk::Jwk::from_encoding_key(&key, Algorithm::RS256).unwrap();
+    jwk.common.key_id = Some(kid.to_owned());
+    jwk.common.key_algorithm = Some(jsonwebtoken::jwk::KeyAlgorithm::RS256);
+    json!({ "keys": [jwk] })
+}
+
+/// Mint a JWT signed with the legitimate test key.
+fn mint_token(kid: &str, claims: &serde_json::Value) -> String {
+    mint_token_with(kid, claims, &test_encoding_key())
+}
+
+/// Mint a JWT with the given claims, signed with an explicit key.
+fn mint_token_with(kid: &str, claims: &serde_json::Value, key: &EncodingKey) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(kid.to_owned());
+    encode(&header, claims, key).unwrap()
+}
+
+// -----------------------------------------------------------------------------
+// Config Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn config_rejects_empty_jwks_url() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+jwks_url: ""
+claim_metadata:
+  preferred_username: "x-tenant-username"
+"#,
+    )
+    .unwrap();
+    match super::JwtAuthFilter::from_config(&yaml) {
+        Err(err) => assert!(
+            err.to_string().contains("jwks_url must not be empty"),
+            "should reject empty jwks_url: {err}"
+        ),
+        Ok(_) => panic!("empty jwks_url should be rejected"),
+    }
+}
+
+#[test]
+fn config_rejects_empty_claim_metadata() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+jwks_url: "http://keycloak:8080/certs"
+claim_metadata: {}
+"#,
+    )
+    .unwrap();
+    match super::JwtAuthFilter::from_config(&yaml) {
+        Err(err) => assert!(
+            err.to_string().contains("claim_metadata must have at least one"),
+            "should reject empty claim_metadata: {err}"
+        ),
+        Ok(_) => panic!("empty claim_metadata should be rejected"),
+    }
+}
+
+#[test]
+fn config_rejects_unknown_fields() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+jwks_url: "http://keycloak:8080/certs"
+claim_metadata:
+  sub: "x-user"
+bogus_field: true
+"#,
+    )
+    .unwrap();
+    assert!(
+        super::JwtAuthFilter::from_config(&yaml).is_err(),
+        "unknown fields should be rejected"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Token Validation Tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn valid_token_passes_and_writes_metadata() {
+    let kid = "test-kid-1";
+
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  preferred_username: "x-tenant-username"
+  groups: "x-tenant-group"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "sub": "user-123",
+        "preferred_username": "yossi",
+        "groups": ["ai-eng"],
+        "iss": "test",
+        "exp": chrono::Utc::now().timestamp() + 3600
+    });
+    let token = mint_token(kid, &claims);
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "valid token should continue");
+    assert_eq!(
+        ctx.filter_metadata.get("x-tenant-username"),
+        Some(&"yossi".to_owned()),
+        "username should be in metadata"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("x-tenant-group"),
+        Some(&"ai-eng".to_owned()),
+        "groups should be joined and in metadata"
+    );
+}
+
+#[tokio::test]
+async fn valid_token_queues_token_header_for_removal() {
+    let kid = "test-kid-strip";
+
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "sub": "user-123",
+        "iss": "test",
+        "exp": chrono::Utc::now().timestamp() + 3600
+    });
+    let token = mint_token(kid, &claims);
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "valid token should continue");
+    assert!(
+        ctx.request_headers_to_remove.iter().any(|h| h.as_str() == "x-api-key"),
+        "token header should be queued for removal so the JWT does not leak upstream"
+    );
+}
+
+#[tokio::test]
+async fn expired_token_rejected() {
+    let kid = "test-kid-2";
+
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "sub": "user-123",
+        "exp": chrono::Utc::now().timestamp() - 3600
+    });
+    let token = mint_token(kid, &claims);
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "expired token should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn wrong_issuer_rejected() {
+    let kid = "test-kid-3";
+
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+issuer: "https://expected-issuer.com"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "sub": "user-123",
+        "iss": "https://wrong-issuer.com",
+        "exp": chrono::Utc::now().timestamp() + 3600
+    });
+    let token = mint_token(kid, &claims);
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "wrong issuer should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn unknown_kid_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response("published-kid")))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "sub": "user-123",
+        "exp": chrono::Utc::now().timestamp() + 3600
+    });
+    let token = mint_token("unknown-kid", &claims);
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "unknown kid should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn missing_token_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response("kid")))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let req = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "missing token should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn garbage_token_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response("kid")))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers
+        .insert("x-api-key", HeaderValue::from_static("not.a.jwt.at.all"));
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "garbage token should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn bearer_prefix_extraction() {
+    let kid = "test-kid-bearer";
+
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "authorization"
+claim_metadata:
+  preferred_username: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "preferred_username": "yossi",
+        "exp": chrono::Utc::now().timestamp() + 3600
+    });
+    let token = mint_token(kid, &claims);
+    let bearer = format!("Bearer {token}");
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers
+        .insert("authorization", HeaderValue::from_str(&bearer).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "Bearer prefix should be stripped correctly"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("x-tenant-username"),
+        Some(&"yossi".to_owned()),
+        "username should be extracted from Bearer token"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Security Tests — the properties an auth filter exists to enforce
+// -----------------------------------------------------------------------------
+
+/// The core security property: a structurally valid token that claims
+/// the published `kid` but is signed with a DIFFERENT key must be
+/// rejected. Without signature verification this would pass.
+#[tokio::test]
+async fn forged_signature_rejected() {
+    let kid = "test-kid-forge";
+
+    let server = MockServer::start().await;
+    // JWKS publishes the legitimate key.
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "sub": "attacker",
+        "exp": chrono::Utc::now().timestamp() + 3600
+    });
+    // Signed with the attacker key, but claims the published kid.
+    let token = mint_token_with(kid, &claims, &attacker_encoding_key());
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "token signed with a non-published key must be rejected"
+    );
+    assert!(
+        ctx.filter_metadata.get("x-tenant-username").is_none(),
+        "no identity should be written for a forged token"
+    );
+}
+
+/// A token whose `aud` does not match the configured audience must be
+/// rejected when `audience` is set.
+#[tokio::test]
+async fn audience_mismatch_rejected() {
+    let kid = "test-kid-aud";
+
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+audience: "praxis-gateway"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "sub": "user-123",
+        "aud": "some-other-service",
+        "exp": chrono::Utc::now().timestamp() + 3600
+    });
+    let token = mint_token(kid, &claims);
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "token with mismatched audience should be rejected"
+    );
+}
+
+/// A token whose `aud` matches the configured audience passes.
+#[tokio::test]
+async fn audience_match_passes() {
+    let kid = "test-kid-aud-ok";
+
+    let server = MockServer::start().await;
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+audience: "praxis-gateway"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({
+        "sub": "user-123",
+        "aud": "praxis-gateway",
+        "exp": chrono::Utc::now().timestamp() + 3600
+    });
+    let token = mint_token(kid, &claims);
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "token with matching audience should pass"
+    );
+}
+
+/// A transient JWKS failure must back off briefly, not block auth for the
+/// full success cooldown. The mock fails once then serves keys; a token
+/// that 401s on the first (failed) fetch must validate after the ~1s
+/// failure backoff — which would be impossible under a flat 30s cooldown.
+#[tokio::test]
+async fn transient_jwks_failure_recovers_after_short_backoff() {
+    let kid = "test-kid-backoff";
+
+    let server = MockServer::start().await;
+    // First fetch fails...
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // ...subsequent fetches succeed.
+    Mock::given(path("/certs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(build_jwks_response(kid)))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+jwks_url: "{}/certs"
+token_header: "x-api-key"
+claim_metadata:
+  sub: "x-tenant-username"
+"#,
+        server.uri()
+    ))
+    .unwrap();
+    let filter = super::JwtAuthFilter::from_config(&yaml).unwrap();
+
+    let claims = json!({ "sub": "user-1", "exp": chrono::Utc::now().timestamp() + 3600 });
+    let token = mint_token(kid, &claims);
+
+    let send = || async {
+        let mut req = make_request(Method::POST, "/v1/messages");
+        req.headers.insert("x-api-key", HeaderValue::from_str(&token).unwrap());
+        let mut ctx = make_filter_context(&req);
+        filter.on_request(&mut ctx).await.unwrap()
+    };
+
+    // First request: JWKS fetch fails (503) -> rejected.
+    assert!(
+        matches!(send().await, FilterAction::Reject(_)),
+        "first request should fail while JWKS is unavailable"
+    );
+
+    // After the ~1s failure backoff, the retry succeeds and the token
+    // validates. Under a flat 30s cooldown this would still be rejected.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(
+        matches!(send().await, FilterAction::Continue),
+        "request after the short failure backoff should recover and pass"
+    );
+}

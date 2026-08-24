@@ -30,6 +30,7 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+jsonwebtoken = { workspace = true }
 metrics = { workspace = true }
 notify = { workspace = true }
 praxis-ai-apis = { workspace = true }
