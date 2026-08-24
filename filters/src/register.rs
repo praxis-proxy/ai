@@ -397,7 +397,11 @@ mod tests {
             !names.contains(&"http_callout"),
             "http_callout must not register when its feature is disabled"
         );
+    }
 
+    #[test]
+    fn build_ai_registry_marks_security_filters() {
+        let registry = build_ai_registry();
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
         assert!(registry.is_security_filter("aws_sigv4_sign"));
