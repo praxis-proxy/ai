@@ -243,7 +243,12 @@ class TestAnthropicMessagesLLMKatan:
         assert len(response.content[0].text) > 0
 
     def test_streaming_basic(self, anthropic_client):
-        event_types = set()
+        # Capture events in arrival order so we assert the SSE lifecycle
+        # *sequence* (message_start -> content_block_delta -> message_stop),
+        # not merely that each type shows up at some point. A set() would let a
+        # stream that emits these out of order pass, which is exactly what this
+        # test is meant to catch.
+        event_types = []
 
         with anthropic_client.messages.stream(
             model=LLM_KATAN_MODEL,
@@ -251,16 +256,27 @@ class TestAnthropicMessagesLLMKatan:
             messages=[{"role": "user", "content": "Stream test"}],
         ) as stream:
             for event in stream:
-                event_types.add(event.type)
+                event_types.append(event.type)
 
-        assert "message_start" in event_types, (
-            f"should see message_start; saw: {event_types}"
+        assert event_types, "stream produced no events"
+
+        # The lifecycle must open with message_start and close with message_stop.
+        assert event_types[0] == "message_start", (
+            f"stream must open with message_start; saw: {event_types}"
         )
+        assert event_types[-1] == "message_stop", (
+            f"stream must close with message_stop; saw: {event_types}"
+        )
+
+        # At least one content_block_delta must arrive strictly between the
+        # opening message_start and the closing message_stop.
         assert "content_block_delta" in event_types, (
             f"should see content_block_delta; saw: {event_types}"
         )
-        assert "message_stop" in event_types, (
-            f"should see message_stop; saw: {event_types}"
+        first_delta = event_types.index("content_block_delta")
+        assert 0 < first_delta < len(event_types) - 1, (
+            "content_block_delta must arrive after message_start and before "
+            f"message_stop; saw: {event_types}"
         )
 
     def test_streaming_collects_full_text(self, anthropic_client):
