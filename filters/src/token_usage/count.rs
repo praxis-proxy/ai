@@ -30,7 +30,8 @@ use std::fmt::Write as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
 };
 use serde::Deserialize;
 use tracing::{debug, trace};
@@ -38,7 +39,7 @@ use tracing::{debug, trace};
 use super::{
     TokenUsage,
     providers::{parse_anthropic, parse_bedrock, parse_google, parse_openai},
-    set_token_usage, streaming,
+    set_token_status_overflow, set_token_usage, streaming,
 };
 use crate::agentic::a2a::sse;
 
@@ -85,6 +86,14 @@ const META_SSE_PREV_CR: &str = "token_count.sse_prev_cr";
 /// Metadata key for SSE scanner scratch byte count.
 const META_SSE_SCRATCH: &str = "token_count.sse_scratch_bytes";
 
+/// Metadata key for the SSE scanner's oversized-event skip phase.
+const META_SSE_SKIP: &str = "token_count.sse_skip";
+
+/// Metadata key recording that the most recent SSE stream action was
+/// discarding an oversized event. Used by [`finalize_streaming_counts`]
+/// to mark overflow when the terminal usage event itself was dropped.
+const META_SSE_DROPPED_TAIL: &str = "token_count.sse_dropped_tail";
+
 /// Bedrock `InvokeModel` response header carrying the input token count.
 const HEADER_BEDROCK_INPUT: &str = "x-amzn-bedrock-input-token-count";
 
@@ -101,6 +110,28 @@ const HEADER_BEDROCK_OUTPUT: &str = "x-amzn-bedrock-output-token-count";
 struct TokenCountConfig {
     /// AI provider whose response format to parse.
     provider: ProviderKind,
+
+    /// Maximum bytes to buffer for a non-streaming JSON response before
+    /// giving up on locating its usage field. Must be greater than 0 and
+    /// at most 64 MiB.
+    #[serde(default = "default_max_body_bytes")]
+    max_body_bytes: usize,
+
+    /// Maximum scratch bytes (buffered line + in-progress event data) for
+    /// the SSE scanner before an event is discarded as oversized. Must be
+    /// greater than 0 and at most 64 MiB.
+    #[serde(default = "default_max_scratch_bytes")]
+    max_scratch_bytes: usize,
+}
+
+/// Default for [`TokenCountConfig::max_body_bytes`].
+fn default_max_body_bytes() -> usize {
+    DEFAULT_MAX_BODY_BYTES
+}
+
+/// Default for [`TokenCountConfig::max_scratch_bytes`].
+fn default_max_scratch_bytes() -> usize {
+    DEFAULT_MAX_SCRATCH_BYTES
 }
 
 /// Provider and transport shape selected by the `token_count` configuration.
@@ -160,12 +191,20 @@ impl ProviderKind {
 /// ```yaml
 /// filter: token_count
 /// provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure
+/// max_body_bytes: 1048576    # optional, JSON capture limit
+/// max_scratch_bytes: 65536   # optional, SSE per-event capture limit
 /// ```
 ///
 /// [`filter_metadata`]: HttpFilterContext::filter_metadata
 pub struct TokenCountFilter {
     /// Which provider's response format to parse.
     provider: ProviderKind,
+
+    /// Maximum bytes to buffer for a non-streaming JSON response.
+    max_body_bytes: usize,
+
+    /// Maximum scratch bytes per SSE event before it is discarded.
+    max_scratch_bytes: usize,
 }
 
 impl TokenCountFilter {
@@ -176,9 +215,27 @@ impl TokenCountFilter {
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: TokenCountConfig = parse_filter_config("token_count", config)?;
+        validate_max_body_bytes("token_count", cfg.max_body_bytes)?;
+        validate_max_scratch_bytes(cfg.max_scratch_bytes)?;
 
-        Ok(Box::new(Self { provider: cfg.provider }))
+        Ok(Box::new(Self {
+            provider: cfg.provider,
+            max_body_bytes: cfg.max_body_bytes,
+            max_scratch_bytes: cfg.max_scratch_bytes,
+        }))
     }
+}
+
+/// Reject a `max_scratch_bytes` that is zero or above the shared 64 MiB
+/// capture ceiling used by other payload-processing filters.
+fn validate_max_scratch_bytes(value: usize) -> Result<(), FilterError> {
+    if value == 0 {
+        return Err("token_count: 'max_scratch_bytes' must be greater than 0".into());
+    }
+    if value > MAX_JSON_BODY_BYTES {
+        return Err(format!("token_count: max_scratch_bytes ({value}) exceeds maximum ({MAX_JSON_BODY_BYTES})").into());
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -255,8 +312,8 @@ impl HttpFilter for TokenCountFilter {
         let mode = ctx.get_metadata(META_MODE).map(str::to_owned);
 
         match mode.as_deref() {
-            Some("sse") => handle_sse_body(ctx, body, end_of_stream, self.provider),
-            Some("json") => handle_json_body(ctx, body, end_of_stream, self.provider),
+            Some("sse") => handle_sse_body(ctx, body, end_of_stream, self.provider, self.max_scratch_bytes),
+            Some("json") => handle_json_body(ctx, body, end_of_stream, self.provider, self.max_body_bytes),
             _ => {},
         }
 
@@ -303,15 +360,24 @@ fn extract_bedrock_headers(ctx: &mut HttpFilterContext<'_>) {
 // -----------------------------------------------------------------------------
 
 /// Accumulate JSON body chunks and extract token usage on completion.
+///
+/// A response larger than `max_body_bytes` cannot be parsed for usage
+/// (it may appear anywhere, including near the end), so extraction is
+/// abandoned. Rather than leaving no signal at all, an explicit overflow
+/// status is recorded so consumers do not mistake this for a genuine
+/// zero-usage response.
 fn handle_json_body(
     ctx: &mut HttpFilterContext<'_>,
     body: &Option<Bytes>,
     end_of_stream: bool,
     provider: ProviderKind,
+    max_body_bytes: usize,
 ) {
     if let Some(chunk) = body.as_ref()
-        && !accumulate_response_hex(ctx, chunk, DEFAULT_MAX_BODY_BYTES)
+        && !accumulate_response_hex(ctx, chunk, max_body_bytes)
     {
+        set_token_status_overflow(ctx);
+        debug!("JSON response exceeded token_count capture limit, usage is unavailable");
         clear_all_metadata(ctx);
         return;
     }
@@ -345,24 +411,31 @@ fn handle_json_body(
 // -----------------------------------------------------------------------------
 
 /// Process SSE body chunks and extract token usage incrementally.
-fn handle_sse_body(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>, end_of_stream: bool, provider: ProviderKind) {
+///
+/// An oversized event is discarded by the scanner without aborting the
+/// stream, so a terminal usage event arriving after it is still captured.
+/// Final counts are only ever written at `end_of_stream`.
+fn handle_sse_body(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    end_of_stream: bool,
+    provider: ProviderKind,
+    max_scratch_bytes: usize,
+) {
     if let Some(chunk) = body.as_ref() {
         let mut state = load_sse_scan_state(ctx);
 
-        let result = sse::scan_sse_chunk(&mut state, chunk, DEFAULT_MAX_SCRATCH_BYTES);
+        let result = sse::scan_sse_chunk(&mut state, chunk, max_scratch_bytes);
 
         for payload in &result.payloads {
             process_sse_payload(ctx, payload, provider);
         }
 
-        if result.overflowed {
+        if result.dropped_events > 0 {
             debug!(
-                scratch_bytes = state.scratch_bytes,
-                "SSE scratch exceeds limit, finalizing token counts"
+                dropped_events = result.dropped_events,
+                "SSE event exceeded scratch limit, discarding and resuming at next event boundary"
             );
-            finalize_streaming_counts(ctx);
-            clear_all_metadata(ctx);
-            return;
         }
 
         save_sse_scan_state(ctx, &state);
@@ -376,7 +449,7 @@ fn handle_sse_body(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>, end_of
             process_sse_payload(ctx, payload, provider);
         }
 
-        finalize_streaming_counts(ctx);
+        finalize_streaming_counts(ctx, state.tail == sse::ScanTail::Dropped);
         clear_all_metadata(ctx);
     }
 }
@@ -437,8 +510,24 @@ fn merge_accumulated_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: u6
 }
 
 /// Write accumulated streaming counts to the well-known metadata keys.
-fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>) {
+///
+/// If the stream ended after discarding an oversized event — including
+/// the case where Anthropic/Bedrock partial counts were already stored
+/// and the terminal usage event itself overflowed — an explicit overflow
+/// status is recorded so this is distinguishable from a complete capture.
+/// Recovered usage that arrived *after* an oversized event is treated as
+/// authoritative and does not set overflow.
+fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>, dropped_tail: bool) {
     let has_accumulated = ctx.filter_metadata.contains_key(META_INPUT) || ctx.filter_metadata.contains_key(META_OUTPUT);
+
+    if dropped_tail {
+        set_token_status_overflow(ctx);
+        debug!(
+            has_accumulated,
+            "stream ended after an oversized SSE event; marking status overflow"
+        );
+    }
+
     if !has_accumulated {
         return;
     }
@@ -486,12 +575,17 @@ fn load_sse_scan_state(ctx: &HttpFilterContext<'_>) -> sse::SseScanState {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
+    let skip = sse::SkipPhase::from_metadata_str(ctx.filter_metadata.get(META_SSE_SKIP).map(String::as_str));
+    let tail = sse::ScanTail::from_metadata_str(ctx.filter_metadata.get(META_SSE_DROPPED_TAIL).map(String::as_str));
+
     sse::SseScanState {
         line_buf,
         data_buf,
         has_data,
         prev_cr,
         scratch_bytes,
+        skip,
+        tail,
     }
 }
 
@@ -510,6 +604,11 @@ fn save_sse_scan_state(ctx: &mut HttpFilterContext<'_>, state: &sse::SseScanStat
     );
     ctx.filter_metadata
         .insert(META_SSE_SCRATCH.to_owned(), state.scratch_bytes.to_string());
+
+    ctx.filter_metadata
+        .insert(META_SSE_SKIP.to_owned(), state.skip.as_str().to_owned());
+    ctx.filter_metadata
+        .insert(META_SSE_DROPPED_TAIL.to_owned(), state.tail.as_str().to_owned());
 }
 
 // -----------------------------------------------------------------------------

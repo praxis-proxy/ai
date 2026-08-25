@@ -25,6 +25,16 @@ const META_TOKEN_OUTPUT: &str = "token.output";
 /// Metadata key for the total token count.
 const META_TOKEN_TOTAL: &str = "token.total";
 
+/// Metadata key signaling that usage could not be captured because the
+/// response exceeded the configured capture limit. Absent on success,
+/// including when the provider genuinely reported no usage — consumers
+/// must not treat "no counts" the same as "counts unavailable."
+const META_TOKEN_STATUS: &str = "token.status";
+
+/// Value of [`META_TOKEN_STATUS`] when capture was abandoned due to
+/// exceeding the configured size limit.
+const TOKEN_STATUS_OVERFLOW: &str = "overflow";
+
 /// Unified token usage extracted from an AI provider response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TokenUsage {
@@ -71,4 +81,10 @@ fn set_token_usage(ctx: &mut HttpFilterContext<'_>, input: u64, output: u64, tot
     ctx.set_metadata(META_TOKEN_INPUT, input.to_string());
     ctx.set_metadata(META_TOKEN_OUTPUT, output.to_string());
     ctx.set_metadata(META_TOKEN_TOTAL, total.to_string());
+}
+
+/// Marks token usage as unavailable due to exceeding the capture limit,
+/// distinguishable from a genuine zero-usage response.
+fn set_token_status_overflow(ctx: &mut HttpFilterContext<'_>) {
+    ctx.set_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW.to_owned());
 }

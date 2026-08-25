@@ -1,0 +1,48 @@
+# AWS SigV4 Request Signing
+#
+# Signs outbound requests to an AWS service (Bedrock, in this
+# example) using Signature Version 4. Credentials are static,
+# sourced from environment variables — see the module docs on
+# Sigv4SignFilter for the planned OIDC/default-credential-chain
+# follow-up.
+#
+# IMPORTANT: the "host" this filter signs and sets must match the
+# cluster's actual endpoint/TLS SNI below — Praxis does not
+# reconcile these for you (see the filter's module docs for why).
+#
+# In this example, the backend cluster points at a local test
+# double (127.0.0.1:3000); in production, point it at the real
+# AWS Bedrock endpoint, e.g. bedrock-runtime.us-east-1.amazonaws.com:443
+# with TLS enabled and tls.sni set to the same host.
+#
+# Required environment variables:
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - bedrock
+
+filter_chains:
+  - name: bedrock
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/model/"
+            cluster: bedrock
+      - filter: load_balancer
+        clusters:
+          - name: bedrock
+            endpoints:
+              - "127.0.0.1:3000"
+      - filter: aws_sigv4_sign
+        region: us-east-1
+        service: bedrock
+        host: bedrock-runtime.us-east-1.amazonaws.com
+        access_key_env_var: AWS_ACCESS_KEY_ID
+        secret_key_env_var: AWS_SECRET_ACCESS_KEY
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

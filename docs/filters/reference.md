@@ -54,6 +54,12 @@ see the [Praxis core filter reference][core-ref].
 | [`a2a`](a2a.md) | Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method, family, task ID, streaming detection, and version to request headers, filter results, and durable metadata for routing. |
 | [`mcp`](mcp.md) | Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata. |
 
+### AWS
+
+| Filter | Description |
+|--------|-------------|
+| [`aws_sigv4_sign`](aws_sigv4_sign.md) | Signs outbound requests to AWS services using `SigV4`. |
+
 ### Callout
 
 | Filter | Description |
@@ -97,4 +103,4 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`token_count`](token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`]. |
-| [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. |
+| [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. Also injects `Praxis-Token-Status` when usage capture failed (e.g. overflow), so an unavailable count is never silently indistinguishable from a genuine zero. |
