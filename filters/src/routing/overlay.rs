@@ -252,7 +252,7 @@ impl PickerPolicy {
 
 /// Wire wrapper kept extensible independently from routing and scoring policy.
 #[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SelectionPolicy {
     /// Selection mode applied locally by `intelligent_route`.
     pub(crate) mode: PickerPolicy,
@@ -1255,6 +1255,26 @@ mod tests {
         let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
         assert_eq!(snapshot.selection_mode, PickerPolicy::RoundRobin);
         assert_eq!(snapshot.candidates[0].selection_group, Some(0));
+    }
+
+    #[test]
+    fn selection_policy_ignores_unknown_forward_compatible_fields() {
+        let json = r#"{
+            "local_site": "site-a",
+            "selection_policy": {
+                "mode": "roundRobin",
+                "futureField": "ignored"
+            },
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "llama-3",
+                "site": "site-a",
+                "cluster": "local-inference",
+                "selection_group": 0
+            }]
+        }"#;
+        let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        assert_eq!(snapshot.selection_mode, PickerPolicy::RoundRobin);
     }
 
     #[test]
