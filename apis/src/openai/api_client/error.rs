@@ -5,8 +5,8 @@
 
 /// Errors from OpenAI-compatible API client HTTP operations.
 ///
-/// Covers transport failures, bounded-read overflows, JSON decode
-/// errors, and URL construction problems. Consumers map these to
+/// Covers transport failures, bounded-read overflows, and URL
+/// construction problems. Consumers map these to
 /// domain-specific error types (e.g. `ResolveError` for the file
 /// resolver).
 #[derive(Debug)]

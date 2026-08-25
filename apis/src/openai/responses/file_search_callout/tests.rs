@@ -1179,6 +1179,11 @@ async fn open_and_closed_failure_modes_are_distinct() {
             closed.on_request(&mut closed_ctx).await.unwrap(),
             FilterAction::Reject(_)
         ));
+        assert_eq!(
+            closed_ctx.extensions.get::<ResponsesState>().unwrap().output_items()[0]["status"],
+            "searching",
+            "status {status}"
+        );
 
         let open_server = MockServer::start_with(move |_path| MockResponse {
             body: body.clone(),
@@ -1194,6 +1199,10 @@ async fn open_and_closed_failure_modes_are_distinct() {
         let state = open_ctx.extensions.get::<ResponsesState>().unwrap();
         assert_eq!(state.output_items()[0]["status"], "incomplete", "status {status}");
         assert!(state.output_items()[0].get("results").is_none());
+        assert!(
+            state.messages.iter().any(|item| item["type"] == "function_call_output"),
+            "status {status}"
+        );
     }
 }
 
