@@ -2706,6 +2706,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "wiremock",
  "yaml_serde",
  "zeroize",

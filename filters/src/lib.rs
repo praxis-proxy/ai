@@ -10,6 +10,7 @@
 
 pub mod agentic;
 pub mod aws;
+pub mod azure;
 #[cfg(feature = "http-callout-filter")]
 pub mod callout;
 pub mod guardrails;
@@ -24,6 +25,7 @@ mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use aws::Sigv4SignFilter;
+pub use azure::AzureAdFilter;
 #[cfg(feature = "http-callout-filter")]
 pub use callout::HttpCalloutFilter;
 pub use guardrails::AiGuardrailsFilter;

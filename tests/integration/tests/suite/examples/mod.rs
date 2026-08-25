@@ -11,6 +11,7 @@ mod agentic_routing;
 mod anthropic_messages;
 mod anthropic_messages_web_search;
 mod aws_sigv4;
+mod azure_ad;
 mod compact;
 mod credential_injection;
 mod file_search_callout;

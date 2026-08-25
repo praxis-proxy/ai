@@ -9,9 +9,9 @@ use praxis_filter::FilterRegistry;
 #[cfg(feature = "http-callout-filter")]
 use crate::HttpCalloutFilter;
 use crate::{
-    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
-    PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
-    TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, AzureAdFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter,
+    ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter,
+    TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -34,6 +34,7 @@ use crate::{
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     register_agentic_filters(registry);
     register_aws_filters(registry);
+    register_azure_filters(registry);
     register_general_ai_filters(registry);
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
@@ -74,6 +75,11 @@ fn register_agentic_filters(registry: &mut FilterRegistry) {
 /// Register AWS-specific filters.
 fn register_aws_filters(registry: &mut FilterRegistry) {
     register_routing_security_filter(registry, "aws_sigv4_sign", Sigv4SignFilter::from_config);
+}
+
+/// Register Azure-specific filters.
+fn register_azure_filters(registry: &mut FilterRegistry) {
+    register_routing_security_filter(registry, "azure_ad", AzureAdFilter::from_config);
 }
 
 /// Register general-purpose AI filters.
@@ -381,6 +387,7 @@ mod tests {
             "anthropic_web_search",
             "request_id",
             "aws_sigv4_sign",
+            "azure_ad",
         ];
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");
@@ -405,5 +412,6 @@ mod tests {
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
         assert!(registry.is_security_filter("aws_sigv4_sign"));
+        assert!(registry.is_security_filter("azure_ad"));
     }
 }
