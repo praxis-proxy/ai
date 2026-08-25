@@ -39,7 +39,9 @@
 //! rejected with `503` rather than forwarded unauthenticated. Token
 //! acquisition happens asynchronously in the background so that building
 //! or hot-reloading a pipeline never blocks on a network round-trip to
-//! Entra ID.
+//! Entra ID. Repeated acquisition failures back off exponentially (up to
+//! 15 minutes) so an unreachable endpoint does not become a tight retry
+//! loop.
 //!
 //! # YAML config
 //!
@@ -75,8 +77,15 @@ use tracing::warn;
 /// flight.
 const EXPIRY_SKEW: Duration = Duration::from_secs(30);
 
-/// How long to wait before retrying after a failed token acquisition.
+/// Base delay before retrying after a failed token acquisition. Grows
+/// exponentially with consecutive failures, capped at
+/// [`MAX_RETRY_BACKOFF`].
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Upper bound on the exponential retry backoff, so a persistently
+/// unreachable token endpoint settles into an infrequent poll rather than
+/// a tight loop.
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(900);
 
 /// Lower bound on the scheduled refresh delay, so a pathologically small
 /// `expires_in` from the token endpoint cannot spin the refresher.
@@ -191,6 +200,23 @@ fn refresh_delay(ttl: Duration, ratio: f64) -> Duration {
     ttl.mul_f64(ratio).max(MIN_REFRESH_DELAY)
 }
 
+/// Safety margin to subtract from a token's TTL before caching its
+/// expiry. Normally [`EXPIRY_SKEW`], but never more than half the TTL, so
+/// a short-lived token stays usable for part of its life instead of being
+/// cached already-expired (which would fail every request closed).
+fn effective_skew(ttl: Duration) -> Duration {
+    EXPIRY_SKEW.min(ttl / 2)
+}
+
+/// Exponential backoff after `failures` consecutive fetch failures:
+/// `RETRY_BACKOFF * 2^(failures - 1)`, capped at [`MAX_RETRY_BACKOFF`].
+fn retry_backoff(failures: u32) -> Duration {
+    // Bound the shift so it can never exceed u32 width; the result is
+    // capped anyway, so a large shift just saturates to the ceiling.
+    let shift = failures.saturating_sub(1).min(20);
+    RETRY_BACKOFF.saturating_mul(1_u32 << shift).min(MAX_RETRY_BACKOFF)
+}
+
 // -----------------------------------------------------------------------------
 // Background refresher
 // -----------------------------------------------------------------------------
@@ -285,10 +311,12 @@ fn spawn_refresher(params: RefresherParams) -> RefreshHandle {
     RefreshHandle { shutdown, thread }
 }
 
-/// Acquire a token once, publish it to the shared cache, and return the
-/// delay until the next refresh. On failure the cache is left untouched
-/// (so a still-valid token keeps serving) and the retry backoff is used.
-async fn refresh_once(client: &reqwest::Client, params: &RefresherParams) -> Duration {
+/// Acquire a token once and publish it to the shared cache.
+///
+/// Returns `Some(delay)` — the delay until the next scheduled refresh —
+/// on success, or `None` on failure. On failure the cache is left
+/// untouched, so a still-valid token keeps serving.
+async fn refresh_once(client: &reqwest::Client, params: &RefresherParams) -> Option<Duration> {
     match fetch_token(
         client,
         &params.token_url,
@@ -299,16 +327,22 @@ async fn refresh_once(client: &reqwest::Client, params: &RefresherParams) -> Dur
     .await
     {
         Ok((authorization, ttl)) => {
-            let expires_at = Instant::now() + ttl.saturating_sub(EXPIRY_SKEW);
+            if ttl <= EXPIRY_SKEW {
+                warn!(
+                    ttl_secs = ttl.as_secs(),
+                    "azure_ad: token TTL is unusually short; validity margin reduced"
+                );
+            }
+            let expires_at = Instant::now() + ttl.saturating_sub(effective_skew(ttl));
             params.shared.store(Arc::new(Some(CachedToken {
                 authorization,
                 expires_at,
             })));
-            refresh_delay(ttl, params.refresh_ratio)
+            Some(refresh_delay(ttl, params.refresh_ratio))
         },
         Err(error) => {
             warn!(%error, "azure_ad: token refresh failed; will retry");
-            RETRY_BACKOFF
+            None
         },
     }
 }
@@ -324,8 +358,15 @@ async fn refresh_loop(params: RefresherParams, shutdown: CancellationToken) {
         },
     };
 
+    let mut failures: u32 = 0;
     loop {
-        let delay = refresh_once(&client, &params).await;
+        let delay = if let Some(delay) = refresh_once(&client, &params).await {
+            failures = 0;
+            delay
+        } else {
+            failures = failures.saturating_add(1);
+            retry_backoff(failures)
+        };
         tokio::select! {
             () = tokio::time::sleep(delay) => {},
             () = shutdown.cancelled() => break,
@@ -356,15 +397,12 @@ impl AzureAdFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if `refresh_ratio` is out of range or the
-    /// configured secret environment variable is unset or not UTF-8.
+    /// Returns [`FilterError`] if `refresh_ratio` is out of range,
+    /// `authority_host` or `tenant_id` contain URL-structural characters,
+    /// or the configured secret environment variable is unset or not
+    /// UTF-8.
     fn new(config: AzureAdConfig) -> Result<Self, FilterError> {
-        if !(config.refresh_ratio > 0.0 && config.refresh_ratio < 1.0) {
-            return Err(FilterError::from(format!(
-                "azure_ad: refresh_ratio must be between 0 and 1 (exclusive), got {}",
-                config.refresh_ratio
-            )));
-        }
+        validate_config(&config)?;
 
         let client_secret = std::env::var(&config.client_secret_env_var).map_err(|e| {
             FilterError::from(format!(
@@ -475,6 +513,43 @@ pub(crate) struct AzureAdConfig {
     pub(crate) refresh_ratio: f64,
 }
 
+/// Validate the config fields [`AzureAdFilter::new`] relies on before it
+/// reads the secret and spawns the refresher.
+fn validate_config(config: &AzureAdConfig) -> Result<(), FilterError> {
+    if !(config.refresh_ratio > 0.0 && config.refresh_ratio < 1.0) {
+        return Err(FilterError::from(format!(
+            "azure_ad: refresh_ratio must be between 0 and 1 (exclusive), got {}",
+            config.refresh_ratio
+        )));
+    }
+    validate_url_component("authority_host", &config.authority_host)?;
+    validate_url_component("tenant_id", &config.tenant_id)?;
+    Ok(())
+}
+
+/// Reject a config value that could break out of its URL component and
+/// redirect the token request — which carries the client secret in its
+/// body — to an unintended endpoint.
+///
+/// `authority_host` is interpolated as the URL authority and `tenant_id`
+/// as a path segment; either could otherwise inject a scheme, an `@`
+/// userinfo host override, or extra path/query/fragment. This does not
+/// attempt full hostname validation — it only forbids the characters that
+/// change URL structure, which keeps GUID and domain-style tenants valid.
+fn validate_url_component(field: &str, value: &str) -> Result<(), FilterError> {
+    if value.is_empty() {
+        return Err(FilterError::from(format!("azure_ad: {field} must not be empty")));
+    }
+    let forbidden = |c: char| matches!(c, '/' | '\\' | '?' | '#' | '@') || c.is_whitespace() || c.is_control();
+    if value.contains(forbidden) {
+        return Err(FilterError::from(format!(
+            "azure_ad: {field} '{value}' is invalid: it must be a bare value with no scheme, \
+             path, query, '@', or whitespace"
+        )));
+    }
+    Ok(())
+}
+
 /// Default value for [`AzureAdConfig::authority_host`].
 fn default_authority_host() -> String {
     "login.microsoftonline.com".to_owned()
@@ -515,8 +590,9 @@ mod tests {
     use praxis_filter::{FilterAction, HttpFilter as _};
 
     use super::{
-        AzureAdFilter, CachedToken, EXPIRY_SKEW, MIN_REFRESH_DELAY, RefreshHandle, fetch_token, parse_azure_ad_config,
-        refresh_delay,
+        AzureAdFilter, CachedToken, EXPIRY_SKEW, MAX_RETRY_BACKOFF, MIN_REFRESH_DELAY, RETRY_BACKOFF, RefreshHandle,
+        RefresherParams, effective_skew, fetch_token, parse_azure_ad_config, refresh_delay, refresh_once,
+        retry_backoff, validate_url_component,
     };
     use crate::test_utils::{make_filter_context, make_request};
 
@@ -621,6 +697,55 @@ mod tests {
         assert!(err.is_err(), "missing secret env var must fail construction");
     }
 
+    // -- URL-component validation ---------------------------------------------
+
+    #[test]
+    fn validate_url_component_accepts_guid_and_domain_tenants() {
+        validate_url_component("tenant_id", "00000000-0000-0000-0000-000000000000")
+            .expect("GUID tenant must be accepted");
+        validate_url_component("tenant_id", "contoso.onmicrosoft.com").expect("domain tenant must be accepted");
+        validate_url_component("authority_host", "login.microsoftonline.com").expect("bare host must be accepted");
+        validate_url_component("authority_host", "login.microsoftonline.us:443").expect("host:port must be accepted");
+    }
+
+    #[test]
+    fn validate_url_component_rejects_structural_characters() {
+        // Each of these could redirect the secret-bearing token POST.
+        for bad in [
+            "login.microsoftonline.com@evil.com", // '@' userinfo host override
+            "https://evil.com",                   // scheme injection
+            "host/extra",                         // path injection
+            "host?q=1",                           // query injection
+            "host#frag",                          // fragment injection
+            "host with space",
+            "",
+        ] {
+            assert!(
+                validate_url_component("authority_host", bad).is_err(),
+                "value {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn new_rejects_authority_host_with_userinfo_override() {
+        let cfg = super::AzureAdConfig {
+            tenant_id: "tid".to_owned(),
+            client_id: "cid".to_owned(),
+            scope: "s".to_owned(),
+            client_secret_env_var: "AZURE_TEST_UNSET_SECRET".to_owned(),
+            authority_host: "login.microsoftonline.com@evil.com".to_owned(),
+            refresh_ratio: 0.75,
+        };
+        match AzureAdFilter::new(cfg) {
+            Ok(_) => panic!("malicious authority_host must be rejected"),
+            Err(err) => assert!(
+                format!("{err}").contains("authority_host"),
+                "error must name the offending field, got: {err}"
+            ),
+        }
+    }
+
     // -- Pure helpers ---------------------------------------------------------
 
     #[test]
@@ -634,6 +759,26 @@ mod tests {
         // 1s * 0.75 = 750ms, below the floor.
         let delay = refresh_delay(std::time::Duration::from_secs(1), 0.75);
         assert_eq!(delay, MIN_REFRESH_DELAY);
+    }
+
+    #[test]
+    fn effective_skew_is_capped_at_half_ttl() {
+        use std::time::Duration;
+        // Long tokens get the full skew.
+        assert_eq!(effective_skew(Duration::from_secs(3600)), EXPIRY_SKEW);
+        // Short tokens get at most half their TTL, so they are never
+        // cached already-expired.
+        assert_eq!(effective_skew(Duration::from_secs(40)), Duration::from_secs(20));
+        assert_eq!(effective_skew(Duration::from_secs(10)), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn retry_backoff_grows_then_caps() {
+        assert_eq!(retry_backoff(0), RETRY_BACKOFF, "no failures yet -> base delay");
+        assert_eq!(retry_backoff(1), RETRY_BACKOFF, "first failure -> base delay");
+        assert_eq!(retry_backoff(2), RETRY_BACKOFF * 2);
+        assert_eq!(retry_backoff(3), RETRY_BACKOFF * 4);
+        assert_eq!(retry_backoff(1000), MAX_RETRY_BACKOFF, "large failure count -> capped");
     }
 
     #[test]
@@ -754,6 +899,61 @@ mod tests {
         assert!(authorization.is_sensitive(), "bearer header must be marked sensitive");
         assert_eq!(ttl, std::time::Duration::from_secs(3600));
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_once_caches_usable_token_for_short_ttl() {
+        // A TTL below the full EXPIRY_SKEW must still yield a token that
+        // is valid right now — regression for the skew-saturates-to-zero
+        // bug that would cache an already-expired token and 503 forever.
+        let (url, server) = mock_token_endpoint(r#"{"access_token":"short","expires_in":40}"#);
+        let shared = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let params = RefresherParams {
+            token_url: url,
+            client_id: "cid".to_owned(),
+            client_secret: "secret".to_owned(),
+            scope: "scope".to_owned(),
+            refresh_ratio: 0.75,
+            shared: std::sync::Arc::clone(&shared),
+        };
+        let client = reqwest::Client::new();
+
+        let delay = refresh_once(&client, &params)
+            .await
+            .expect("short-ttl fetch must succeed");
+        assert!(delay >= MIN_REFRESH_DELAY, "refresh delay must respect the floor");
+
+        let cached = shared.load_full();
+        match &*cached {
+            Some(token) => assert!(
+                token.is_valid(std::time::Instant::now()),
+                "a 40s token must be usable now, not cached already-expired"
+            ),
+            None => panic!("a successful fetch must cache a token"),
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_once_returns_none_on_failure() {
+        // Closed port -> fetch fails -> no token cached, None returned so
+        // the loop applies backoff.
+        let shared = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None));
+        let params = RefresherParams {
+            token_url: "http://127.0.0.1:1/token".to_owned(),
+            client_id: "cid".to_owned(),
+            client_secret: "secret".to_owned(),
+            scope: "scope".to_owned(),
+            refresh_ratio: 0.75,
+            shared: std::sync::Arc::clone(&shared),
+        };
+        let client = reqwest::Client::new();
+
+        assert!(
+            refresh_once(&client, &params).await.is_none(),
+            "a failed fetch must return None"
+        );
+        assert!(shared.load_full().is_none(), "a failed fetch must not cache a token");
     }
 
     #[tokio::test]
