@@ -373,6 +373,19 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_api_non_streaming_without_total() {
+        let json = br#"{"id":"resp_123","object":"response","usage":{"input_tokens":10,"output_tokens":20}}"#;
+        let usage = parse_openai(json).unwrap();
+        assert_eq!(usage.input_tokens(), 10);
+        assert_eq!(usage.output_tokens(), 20);
+        assert_eq!(
+            usage.total_tokens(),
+            30,
+            "non-streaming Responses API should compute total when absent"
+        );
+    }
+
+    #[test]
     fn openai_responses_api_null_response_returns_none() {
         let json = br#"{"type":"response.output_item.added","response":null}"#;
         assert!(parse_openai(json).is_none(), "null response should return None");
