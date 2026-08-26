@@ -391,30 +391,37 @@ fn handle_json_body(
     }
 
     if end_of_stream {
-        let bytes = ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex));
-
-        if let Some(data) = bytes
-            && let Some(usage) = provider.extract_token_usage(&data)
-        {
-            set_token_usage(
-                ctx,
-                usage.input_tokens(),
-                usage.output_tokens(),
-                Some(usage.total_tokens()),
-            );
-            set_cache_token_usage(ctx, usage.cache_read_tokens(), usage.cache_write_tokens());
-            debug!(
-                input = usage.input_tokens(),
-                output = usage.output_tokens(),
-                total = usage.total_tokens(),
-                cache_read = ?usage.cache_read_tokens(),
-                cache_write = ?usage.cache_write_tokens(),
-                "extracted token usage from JSON response"
-            );
+        if let Some(data) = ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex)) {
+            record_json_usage(ctx, provider, &data);
         }
 
         clear_all_metadata(ctx);
     }
+}
+
+/// Parses buffered JSON usage and records the normalized counts and prompt
+/// cache breakdown. Called once at end-of-stream with the fully buffered body;
+/// a body carrying no recognizable usage records nothing.
+fn record_json_usage(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, data: &[u8]) {
+    let Some(usage) = provider.extract_token_usage(data) else {
+        return;
+    };
+
+    set_token_usage(
+        ctx,
+        usage.input_tokens(),
+        usage.output_tokens(),
+        Some(usage.total_tokens()),
+    );
+    set_cache_token_usage(ctx, usage.cache_read_tokens(), usage.cache_write_tokens());
+    debug!(
+        input = usage.input_tokens(),
+        output = usage.output_tokens(),
+        total = usage.total_tokens(),
+        cache_read = ?usage.cache_read_tokens(),
+        cache_write = ?usage.cache_write_tokens(),
+        "extracted token usage from JSON response"
+    );
 }
 
 // -----------------------------------------------------------------------------
