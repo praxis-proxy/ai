@@ -21,7 +21,10 @@ use super::{
     list_input_items,
 };
 use crate::{
-    openai::{include::IncludeFields, responses::state::ResponsesState},
+    openai::{
+        include::{IncludeField, IncludeFields},
+        responses::state::ResponsesState,
+    },
     store::{ResponseRecord, ResponseStore as _, ResponseStoreRegistry, SqliteResponseStore},
 };
 
@@ -4742,6 +4745,194 @@ async fn get_input_items_tenant_isolation() {
     assert_eq!(
         rejection.status, 404,
         "input_items should return 404 when response belongs to different tenant"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// GET /v1/responses/{id}/input_items include projection
+// -----------------------------------------------------------------------------
+
+/// Stored input covering a top-level include-gated field (reasoning
+/// `encrypted_content`) and a nested one (message `input_image.image_url`).
+fn include_fixture_input() -> serde_json::Value {
+    json!([
+        {
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "stored-secret"
+        },
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "auto"},
+                {"type": "input_text", "text": "keep me"}
+            ]
+        }
+    ])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_omits_include_gated_fields_when_not_requested() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_include_default", "default", include_fixture_input()).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_include_default/input_items?order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "input_items without include should return 200");
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "both stored items should be listed");
+    assert!(
+        data[0].get("encrypted_content").is_none(),
+        "unrequested encrypted reasoning must be omitted"
+    );
+    assert!(
+        data[1]["content"][0].get("image_url").is_none(),
+        "unrequested input-image URLs must be omitted"
+    );
+    assert_eq!(
+        data[1]["content"][1]["text"], "keep me",
+        "content not gated by include must survive projection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_include_reveals_requested_field_for_both_sdk_encodings() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_include_reveal", "default", include_fixture_input()).await;
+
+    for query in [
+        "include=reasoning.encrypted_content&order=asc",
+        "include%5B%5D=reasoning.encrypted_content&order=asc",
+    ] {
+        let path = format!("/v1/responses/resp_include_reveal/input_items?{query}");
+        let req = crate::test_utils::make_request(http::Method::GET, &path);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        let rejection = expect_reject(action);
+        assert_eq!(rejection.status, 200, "include should be accepted for {query}");
+
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(
+            data[0]["encrypted_content"], "stored-secret",
+            "{query} should reveal the requested stored field"
+        );
+        assert!(
+            data[1]["content"][0].get("image_url").is_none(),
+            "{query} must not reveal include-gated fields it did not request"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_include_applies_to_paginated_window() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_include_page", "default", include_fixture_input()).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_include_page/input_items?include=reasoning.encrypted_content&limit=1&order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "include should combine with pagination params");
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(
+        data.len(),
+        1,
+        "limit should still bound the page when include is present"
+    );
+    assert_eq!(body["has_more"], true, "a second page should remain available");
+    assert_eq!(
+        body["last_id"], "reasoning_1",
+        "projection must not strip the item ID used as the pagination cursor"
+    );
+    assert_eq!(
+        data[0]["encrypted_content"], "stored-secret",
+        "requested field should be present on the paginated item"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_rejects_malformed_include_values() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_include_bad", "default", include_fixture_input()).await;
+
+    for (query, expected) in [
+        ("include=future.secret_field", "unsupported include value"),
+        ("include%5B%5D=future.secret_field", "unsupported include value"),
+        ("include", "requires a value"),
+    ] {
+        let path = format!("/v1/responses/resp_include_bad/input_items?{query}");
+        let req = crate::test_utils::make_request(http::Method::GET, &path);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        let rejection = expect_reject(action);
+        assert_eq!(rejection.status, 400, "{query} should be rejected as invalid input");
+
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(expected),
+            "{query} should explain the problem, got '{message}'"
+        );
+    }
+}
+
+#[test]
+fn list_input_items_projects_each_page_item_with_requested_includes() {
+    let record = make_record_with_input(include_fixture_input());
+    let mut includes = IncludeFields::default();
+    includes.insert(IncludeField::ReasoningEncryptedContent);
+    let params = ListParams {
+        cursor: None,
+        limit: 1,
+        order: Order::Ascending,
+    };
+
+    let page = list_input_items(&record, &params, includes).unwrap();
+    assert_eq!(page.data.len(), 1, "limit should bound the projected page");
+    assert!(page.has_more, "a second item should remain");
+    assert_eq!(
+        page.data[0]["encrypted_content"], "stored-secret",
+        "requested include should preserve the encrypted reasoning content"
+    );
+
+    let next_params = ListParams {
+        cursor: page.next_cursor.clone(),
+        limit: 1,
+        order: Order::Ascending,
+    };
+    let next_page = list_input_items(&record, &next_params, includes).unwrap();
+    assert!(
+        next_page.data[0]["content"][0].get("image_url").is_none(),
+        "include values that were not requested must stay projected out on later pages"
+    );
+    assert_eq!(
+        next_page.data[0]["content"][1]["text"], "keep me",
+        "non-gated content must survive projection"
+    );
+    assert_eq!(
+        record.input[1]["content"][0]["image_url"], "https://example.com/image.png",
+        "projection must not mutate the stored record"
     );
 }
 
