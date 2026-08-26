@@ -58,3 +58,6 @@ filter_chains:
           - name: "default-mcp"
             endpoints:
               - "127.0.0.1:9003"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

@@ -5,9 +5,12 @@
 //! checks, mock backends, HTTP clients, and TLS utilities.
 
 pub mod backend;
+#[cfg(feature = "llmd-ext-proc")]
+pub mod ext_proc_mock;
 pub mod http_client;
 pub mod port;
 pub mod postgres;
+pub mod simulator;
 pub mod tls;
 pub mod wait;
 
@@ -18,12 +21,15 @@ pub use backend::{
     start_echo_backend, start_header_echo_backend, start_scripted_websocket_backend,
     start_scripted_websocket_backend_turns, start_stateful_backend, start_uri_echo_backend,
 };
+#[cfg(feature = "llmd-ext-proc")]
+pub use ext_proc_mock::{MockProcessorGuard, start_mock_routing_processor};
 pub use http_client::{
     http_get, http_get_retry, http_get_v6, http_post, http_send, json_post, parse_body, parse_header, parse_header_all,
     parse_status,
 };
 pub use port::{PortGuard, bind_unique_port, free_port, free_port_guard, free_port_v6, ipv6_available};
 pub use postgres::{PostgresGuard, start_postgres};
+pub use simulator::{SimulatorGuard, start_simulator, start_simulator_with_model};
 pub use tls::{
     ClientCert, TestCertificates, https_get, https_send, start_mtls_backend, start_tcp_echo_backend,
     start_tcp_tagged_backend, start_tls_backend, tls_connection_rejected, tls_send_recv, wait_for_https, wait_for_tls,

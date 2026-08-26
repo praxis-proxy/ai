@@ -2342,9 +2342,14 @@ mod tests {
 
     #[test]
     fn replay_config_rejects_a_nonloopback_admin_bind() {
+        // The example config already carries a top-level `insecure_options:`
+        // (allow_private_endpoints for its loopback backend), so merge
+        // `allow_public_admin` under that block rather than emitting a second
+        // top-level `insecure_options:` key.
         let source = format!(
-            "{}\nadmin:\n  address: \"192.0.2.10:19090\"\ninsecure_options:\n  allow_public_admin: true\n",
+            "{}\nadmin:\n  address: \"192.0.2.10:19090\"\n",
             replay_config_source("openai/responses/responses-proxy.yaml")
+                .replace("insecure_options:\n", "insecure_options:\n  allow_public_admin: true\n")
         );
 
         let error = build_replay_config(&source, 19_001, "127.0.0.1:3001", 19_002)
@@ -2535,9 +2540,16 @@ mod tests {
 
     #[test]
     fn replay_config_rejects_background_cluster_health_checks() {
-        let mut source = replay_config_source("openai/responses/responses-proxy.yaml");
+        // The example config already carries a top-level `insecure_options:`
+        // (allow_private_endpoints for its loopback backend), so merge
+        // `allow_private_health_checks` under that block rather than emitting a
+        // second top-level `insecure_options:` key.
+        let mut source = replay_config_source("openai/responses/responses-proxy.yaml").replace(
+            "insecure_options:\n",
+            "insecure_options:\n  allow_private_health_checks: true\n",
+        );
         source.push_str(
-            "\nclusters:\n  - name: probe\n    endpoints: [\"127.0.0.1:3001\"]\n    health_check:\n      type: http\ninsecure_options:\n  allow_private_health_checks: true\n",
+            "\nclusters:\n  - name: probe\n    endpoints: [\"127.0.0.1:3001\"]\n    health_check:\n      type: http\n",
         );
 
         let error = build_replay_config(&source, 19_001, "127.0.0.1:3001", 19_002)

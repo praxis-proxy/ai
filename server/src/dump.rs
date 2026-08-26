@@ -370,6 +370,8 @@ filter_chains:
           - name: backend
             endpoints:
               - "127.0.0.1:9090"
+insecure_options:
+  allow_private_endpoints: true
 "#;
 
     /// Assert a resolved filter's chain, indices, and type name.
@@ -510,6 +512,8 @@ filter_chains:
           - name: backend
             endpoints:
               - "127.0.0.1:9090"
+insecure_options:
+  allow_private_endpoints: true
 "#;
 
     #[test]

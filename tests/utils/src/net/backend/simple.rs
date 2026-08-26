@@ -673,6 +673,9 @@ fn start_server(mut config: Config) -> u16 {
     }
 
     std::thread::spawn(move || {
+        #[cfg(feature = "praxis-main")]
+        praxis::run_server(config, None, None);
+        #[cfg(not(feature = "praxis-main"))]
         praxis::run_server(config, None);
     });
 

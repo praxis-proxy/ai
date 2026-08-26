@@ -73,10 +73,10 @@ fn nemo_guardrails_block_rejects_with_403() {
     );
 }
 
-/// `NeMo` returns `"modified"` (redact placeholder) → request is forwarded
-/// to the upstream unchanged and the upstream response is returned.
+/// `NeMo` returns `"modified"` (redact verdict) → proxy rejects with 403.
+/// The original sensitive body must never be forwarded to the upstream.
 #[test]
-fn nemo_guardrails_redact_placeholder_continues() {
+fn nemo_guardrails_redact_rejects_with_403() {
     let backend = start_backend_with_shutdown("ok");
     let nemo = nemo_mock(
         r#"{"status":"modified","content":"my ssn is [REDACTED]","rails_status":{"pii masking":{"status":"blocked"}}}"#,
@@ -95,11 +95,11 @@ fn nemo_guardrails_redact_placeholder_continues() {
         r#"{"model":"test","messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#,
     );
 
-    assert_eq!(
-        status, 200,
-        "NeMo 'modified' should continue (body replacement deferred to #579)"
+    assert_eq!(status, 403, "NeMo 'modified' must reject with 403");
+    assert!(
+        body.contains("pii masking"),
+        "triggered rail name should appear in rejection body; got: {body}"
     );
-    assert_eq!(body, "ok", "upstream response should reach the client");
 }
 
 /// `NeMo` is unreachable → provider error propagates and the proxy does not

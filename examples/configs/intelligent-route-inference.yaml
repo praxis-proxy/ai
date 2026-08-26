@@ -62,3 +62,6 @@ filter_chains:
 admin:
   address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

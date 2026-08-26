@@ -31,7 +31,7 @@ pub use agentic::{
     McpToolFixture, start_a2a_mock_server, start_a2a_mock_server_with_config, start_mcp_mock_server,
     start_mcp_mock_server_with_config,
 };
-pub use example_config::{example_config_path, load_example_config, patch_yaml};
+pub use example_config::{allow_loopback_endpoints, example_config_path, load_example_config, patch_yaml};
 pub use net::*;
 pub use proxy::{
     ProxyGuard, ProxyShutdownError, ReloadableProxyGuard, build_pipeline, custom_filter_yaml, registry_with,

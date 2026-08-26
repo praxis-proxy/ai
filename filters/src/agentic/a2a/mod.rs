@@ -310,7 +310,7 @@ impl HttpFilter for A2aFilter {
 /// Task routes take precedence over context routes. For task-routable methods,
 /// only the task ID is consulted. For context-routable methods, the context ID
 /// is consulted. Because the method sets are disjoint in the current A2A spec,
-/// both lookups cannot apply in practice — but the ordering guarantees task
+/// both lookups cannot apply in practice - but the ordering guarantees task
 /// wins if both IDs are ever simultaneously present.
 #[expect(clippy::too_many_lines, reason = "sequential lookup-classify-trace pipeline")]
 fn lookup_task_route(
@@ -541,7 +541,7 @@ fn commit_tentative_capture(
 /// Store task and context routes extracted from a response body.
 ///
 /// Task routes use `terminal_ttl_seconds` when the task is done; context routes
-/// always use `ttl_seconds` because a completed task does not end the context —
+/// always use `ttl_seconds` because a completed task does not end the context -
 /// later messages or `ListTasks` calls in the same context still need routing.
 #[expect(clippy::too_many_lines, reason = "sequential extract-store-log pipeline")]
 fn store_task_route(
@@ -647,7 +647,7 @@ fn accumulate_response_hex(ctx: &mut HttpFilterContext<'_>, chunk: &[u8], max_by
 ///
 /// A2A JSON-RPC responses are always a top-level `{...}` object, so
 /// tracking a stack of expected closing brackets while skipping bytes
-/// inside string literals is sufficient to detect completion — a full
+/// inside string literals is sufficient to detect completion - a full
 /// incremental JSON parser is unnecessary. Structural JSON bytes (`{`,
 /// `}`, `[`, `]`, `"`, `\`) are always single-byte ASCII, so scanning raw
 /// bytes is safe even when a chunk boundary splits a multibyte UTF-8
@@ -658,7 +658,7 @@ fn accumulate_response_hex(ctx: &mut HttpFilterContext<'_>, chunk: &[u8], max_by
 /// trailing bytes after a complete object, or a trailing comma). The
 /// real `serde_json` parse in [`try_capture_from_buffer`] remains the
 /// source of truth, and that function abandons capture immediately on a
-/// failed parse — see its doc comment for why that is always safe to do
+/// failed parse - see its doc comment for why that is always safe to do
 /// unconditionally, without waiting for `end_of_stream`.
 #[derive(Debug, Default, Clone)]
 #[expect(clippy::struct_excessive_bools, reason = "independent per-byte scan flags")]
@@ -699,7 +699,7 @@ impl JsonBalanceState {
 
 /// Update `state` with the bytes in `chunk`. A no-op once `state` is
 /// already complete or invalid, so total work across all chunks is
-/// O(n) in bytes rather than the O(n²) of re-scanning the whole buffer
+/// O(n) in bytes rather than the O(n^2) of re-scanning the whole buffer
 /// every call.
 #[expect(
     clippy::too_many_lines,
@@ -829,7 +829,7 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 /// Runs inside the synchronous `on_response_body` hook, so it cannot
-/// await or write to external stores — state persists via `filter_metadata`
+/// await or write to external stores - state persists via `filter_metadata`
 /// hex encoding between calls.
 fn process_sse_response_chunk(
     ctx: &mut HttpFilterContext<'_>,
@@ -845,16 +845,15 @@ fn process_sse_response_chunk(
         try_extract_task_from_sse_payload(payload, ctx, store, config);
     }
 
-    if result.overflowed {
+    if result.dropped_events > 0 {
         debug!(
-            scratch_bytes = state.scratch_bytes,
+            dropped_events = result.dropped_events,
             max_bytes = config.max_response_body_bytes,
-            "SSE scratch exceeds capture limit, disabling streaming capture"
+            "SSE event exceeded capture limit, discarding and resuming at next event boundary"
         );
-        clear_sse_capture_metadata(ctx);
-    } else {
-        save_sse_scan_state(ctx, &state);
     }
+
+    save_sse_scan_state(ctx, &state);
 }
 
 /// Drains any incomplete SSE event buffered in `filter_metadata` at
@@ -874,7 +873,7 @@ fn flush_pending_sse_payloads(
     }
 }
 
-/// Invalid UTF-8 or unparseable JSON silently skips — the proxy must
+/// Invalid UTF-8 or unparseable JSON silently skips - the proxy must
 /// never fail on arbitrary SSE payloads.
 fn try_extract_task_from_sse_payload(
     data: &[u8],
@@ -896,6 +895,7 @@ fn try_extract_task_from_sse_payload(
 /// Reconstructs scanner state from hex-encoded `filter_metadata` keys.
 /// Metadata bypasses the 256-byte dynamic-value helper because the
 /// scanner buffers raw SSE line/data bytes that can exceed that limit.
+#[expect(clippy::too_many_lines, reason = "sequential per-field metadata reads")]
 fn load_sse_scan_state(ctx: &HttpFilterContext<'_>) -> sse::SseScanState {
     let line_buf = ctx
         .filter_metadata
@@ -925,12 +925,21 @@ fn load_sse_scan_state(ctx: &HttpFilterContext<'_>) -> sse::SseScanState {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
+    let skip = sse::SkipPhase::from_metadata_str(ctx.filter_metadata.get("a2a.response.sse_skip").map(String::as_str));
+    let tail = sse::ScanTail::from_metadata_str(
+        ctx.filter_metadata
+            .get("a2a.response.sse_dropped_tail")
+            .map(String::as_str),
+    );
+
     sse::SseScanState {
         line_buf,
         data_buf,
         has_data,
         prev_cr,
         scratch_bytes,
+        skip,
+        tail,
     }
 }
 
@@ -950,6 +959,13 @@ fn save_sse_scan_state(ctx: &mut HttpFilterContext<'_>, state: &sse::SseScanStat
     ctx.filter_metadata.insert(
         "a2a.response.sse_scratch_bytes".to_owned(),
         state.scratch_bytes.to_string(),
+    );
+
+    ctx.filter_metadata
+        .insert("a2a.response.sse_skip".to_owned(), state.skip.as_str().to_owned());
+    ctx.filter_metadata.insert(
+        "a2a.response.sse_dropped_tail".to_owned(),
+        state.tail.as_str().to_owned(),
     );
 }
 
@@ -975,9 +991,9 @@ fn clear_sse_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.sse_has_data");
     ctx.filter_metadata.remove("a2a.response.sse_prev_cr");
     ctx.filter_metadata.remove("a2a.response.sse_scratch_bytes");
+    ctx.filter_metadata.remove("a2a.response.sse_skip");
     ctx.filter_metadata.remove("a2a.response.cluster");
 }
-
 
 /// Build a `JsonRpcConfig` for the shared parser with A2A-appropriate defaults.
 fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {
