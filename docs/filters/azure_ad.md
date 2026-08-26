@@ -7,6 +7,8 @@ Injects an Azure AD (Entra ID) bearer token into outbound requests.
 
 ## Configuration Notes
 
+Experimental: requires the `azure-ad-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter is a work in progress and its configuration surface may change between releases.
+
 See the module docs for scope (client-secret only), the routing-vs-authentication separation, and the fail-closed behavior.
 
 ## Example

@@ -6,12 +6,14 @@
 use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
+#[cfg(feature = "azure-ad-filter")]
+use crate::AzureAdFilter;
 #[cfg(feature = "http-callout-filter")]
 use crate::HttpCalloutFilter;
 use crate::{
-    A2aFilter, AiGuardrailsFilter, AzureAdFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter,
-    ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter,
-    TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
+    PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
+    TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -34,6 +36,7 @@ use crate::{
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     register_agentic_filters(registry);
     register_aws_filters(registry);
+    #[cfg(feature = "azure-ad-filter")]
     register_azure_filters(registry);
     register_general_ai_filters(registry);
     register_anthropic_filters(registry, subrequest_client);
@@ -78,6 +81,7 @@ fn register_aws_filters(registry: &mut FilterRegistry) {
 }
 
 /// Register Azure-specific filters.
+#[cfg(feature = "azure-ad-filter")]
 fn register_azure_filters(registry: &mut FilterRegistry) {
     register_routing_security_filter(registry, "azure_ad", AzureAdFilter::from_config);
 }
@@ -387,13 +391,18 @@ mod tests {
             "anthropic_web_search",
             "request_id",
             "aws_sigv4_sign",
-            "azure_ad",
         ];
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");
         }
+    }
 
-        // Experimental filters register only when their feature is enabled.
+    /// Experimental filters register only when their cargo feature is enabled.
+    #[test]
+    fn build_ai_registry_gates_experimental_filters() {
+        let registry = build_ai_registry();
+        let names = registry.available_filters();
+
         #[cfg(feature = "http-callout-filter")]
         assert!(
             names.contains(&"http_callout"),
@@ -404,6 +413,16 @@ mod tests {
             !names.contains(&"http_callout"),
             "http_callout must not register when its feature is disabled"
         );
+        #[cfg(feature = "azure-ad-filter")]
+        assert!(
+            names.contains(&"azure_ad"),
+            "azure_ad must register when its feature is enabled"
+        );
+        #[cfg(not(feature = "azure-ad-filter"))]
+        assert!(
+            !names.contains(&"azure_ad"),
+            "azure_ad must not register when its feature is disabled"
+        );
     }
 
     #[test]
@@ -412,6 +431,7 @@ mod tests {
         assert!(registry.is_security_filter("provider_route"));
         assert!(registry.is_security_filter("credential_inject"));
         assert!(registry.is_security_filter("aws_sigv4_sign"));
+        #[cfg(feature = "azure-ad-filter")]
         assert!(registry.is_security_filter("azure_ad"));
     }
 }

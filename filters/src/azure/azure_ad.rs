@@ -4,6 +4,10 @@
 //! [`AzureAdFilter`] — injects Azure AD (Entra ID) bearer tokens into
 //! outbound requests to Azure OpenAI and other Azure AI services.
 //!
+//! **Experimental.** Requires the `azure-ad-filter` cargo feature, which
+//! is off by default and activates the `experimental` marker. The
+//! configuration surface may change between releases.
+//!
 //! # Overview
 //!
 //! Enterprise Azure deployments prohibit static API keys and require an
@@ -379,6 +383,11 @@ async fn refresh_loop(params: RefresherParams, shutdown: CancellationToken) {
 // -----------------------------------------------------------------------------
 
 /// Injects an Azure AD (Entra ID) bearer token into outbound requests.
+///
+/// Experimental: requires the `azure-ad-filter` cargo feature, which is
+/// off by default and activates the `experimental` marker. This filter
+/// is a work in progress and its configuration surface may change
+/// between releases.
 ///
 /// See the module docs for scope (client-secret only), the
 /// routing-vs-authentication separation, and the fail-closed behavior.

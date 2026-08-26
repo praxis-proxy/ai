@@ -12,6 +12,9 @@ cpex-policy-engine = []
 # Experimental: gates the lakera-guard example test, which needs the
 # http_callout filter registered in the in-process proxy registry.
 http-callout-filter = ["praxis-ai-proxy/http-callout-filter"]
+# Experimental: gates the azure_ad example test, which needs the azure_ad
+# filter registered in the in-process proxy registry.
+azure-ad-filter = ["praxis-ai-proxy/azure-ad-filter"]
 llmd-ext-proc = ["praxis-test-utils/llmd-ext-proc"]
 no-mac-cert-rotation-tests = [] # We use this to disable testing cert rotation on macOS
 praxis-main = ["praxis-test-utils/praxis-main"]
