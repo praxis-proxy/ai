@@ -60,13 +60,13 @@ mod tests {
 
     #[test]
     fn connection_refusal_produces_valid_openai_json() {
-        let ctx = ErrorResponseContext::new("upstream_connect_error", "Connection refused", 502);
+        let ctx = ErrorResponseContext::new("upstream_connect_refused", "Connection refused", 502);
         let response = OpenAiErrorFormatter.format(&ctx);
 
         let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(parsed["error"]["message"], "Connection refused");
         assert_eq!(parsed["error"]["type"], "server_error");
-        assert_eq!(parsed["error"]["code"], "upstream_connect_error");
+        assert_eq!(parsed["error"]["code"], "upstream_connect_refused");
         assert!(parsed["error"]["param"].is_null());
     }
 
