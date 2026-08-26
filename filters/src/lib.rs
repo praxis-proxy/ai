@@ -88,6 +88,8 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            #[cfg(feature = "praxis-main")]
+            session_stores: None,
             metrics_route: None,
             peer_identity: None,
             request: req,
@@ -112,6 +114,8 @@ pub(crate) mod test_utils {
             cluster_retry_state_released: false,
             #[cfg(feature = "praxis-main")]
             endpoint_reselector: None,
+            #[cfg(feature = "praxis-main")]
+            pinned_endpoint_address: None,
             rewritten_path: None,
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,
