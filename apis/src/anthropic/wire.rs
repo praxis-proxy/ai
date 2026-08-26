@@ -154,6 +154,21 @@ impl MessageDeltaUsage {
             server_tool_use: None,
         }
     }
+
+    /// Create terminal delta usage with input token details.
+    pub(crate) fn with_input(
+        output_tokens: u64,
+        input_tokens: Option<u64>,
+        cache_read_input_tokens: Option<u64>,
+    ) -> Self {
+        Self {
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens,
+            input_tokens,
+            output_tokens,
+            server_tool_use: None,
+        }
+    }
 }
 
 /// Anthropic error response envelope.

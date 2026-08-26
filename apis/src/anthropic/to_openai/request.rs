@@ -38,6 +38,16 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
 
     if let Some(stream) = obj.get("stream") {
         chat.insert("stream".to_owned(), stream.clone());
+
+        if stream.as_bool() == Some(true) {
+            let mut opts = obj
+                .get("stream_options")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            opts.insert("include_usage".to_owned(), Value::Bool(true));
+            chat.insert("stream_options".to_owned(), Value::Object(opts));
+        }
     }
 
     map_parameters(&mut chat, obj);
@@ -1271,5 +1281,43 @@ mod tests {
         assert_eq!(tools.len(), 2, "only untyped and custom client tools should remain");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
         assert_eq!(tools[1]["function"]["name"], "get_time");
+    }
+
+    #[test]
+    fn streaming_request_includes_usage_option() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["stream"], true, "stream should be true");
+        assert_eq!(
+            parsed["stream_options"]["include_usage"], true,
+            "stream_options.include_usage should be set"
+        );
+    }
+
+    #[test]
+    fn non_streaming_request_omits_stream_options() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "stream_options should not be present without stream:true"
+        );
+    }
+
+    #[test]
+    fn stream_false_omits_stream_options() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["stream"], false, "stream should be false");
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "stream_options should not be present when stream is false"
+        );
     }
 }
