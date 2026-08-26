@@ -9,8 +9,9 @@ use utoipa::PartialSchema;
 
 use super::contracts::{
     ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
-    CreateConversationRequest, DeletedConversationResource, IncludeField, ItemOrder, UpdateConversationRequest,
+    CreateConversationRequest, DeletedConversationResource, ItemOrder, UpdateConversationRequest,
 };
+use crate::openai::include::IncludeField;
 use crate::openai::operation::{
     MediaTypeSpec, OpenAiHandlingMode, OpenAiHttpMethod, OpenAiOperationSpec, OwnedOperationContract,
     ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec, schema_binding,

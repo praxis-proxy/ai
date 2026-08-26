@@ -67,11 +67,9 @@ use super::{
     list_input_items,
 };
 use crate::{
-    classifier::is_responses_create,
-    is_event_stream_content_type,
-    store::{
+    classifier::is_responses_create, is_event_stream_content_type, openai::include::{IncludeFields, parse_include}, store::{
         PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
-    },
+    }
 };
 
 /// Persists Responses API responses to the configured response store backend.
@@ -896,6 +894,14 @@ impl ResponseStoreFilter {
 
     /// Serve `GET /v1/responses/{id}/input_items`.
     async fn handle_get_input_items(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
+
+        let includes = match parse_include(ctx.request.uri.query()) {
+            Ok(includes) => includes,
+            Err(msg) => {
+                debug!(response_id = id, error = %msg, "invalid input_items query parameter");
+                return FilterAction::Reject(reject_invalid_input(&msg));
+            },
+        };
         let params = match parse_query_params(ctx.request.uri.query()) {
             Ok(p) => p,
             Err(msg) => {
@@ -908,7 +914,7 @@ impl ResponseStoreFilter {
             Ok(r) => r,
             Err(action) => return action,
         };
-        build_input_items_response(id, &record, &params)
+        build_input_items_response(id, &record, &params, includes)
     }
 }
 
@@ -917,8 +923,8 @@ impl ResponseStoreFilter {
 // -----------------------------------------------------------------------------
 
 /// Build a paginated input items response from a stored record.
-fn build_input_items_response(id: &str, record: &ResponseRecord, params: &ListParams) -> FilterAction {
-    match list_input_items(record, params) {
+fn build_input_items_response(id: &str, record: &ResponseRecord, params: &ListParams, includes: IncludeFields) -> FilterAction {
+    match list_input_items(record, params, includes) {
         Ok(page) => build_input_items_ok(id, &page),
         Err(StoreError::InvalidInput(msg)) => {
             debug!(response_id = id, error = %msg, "invalid input_items pagination parameter");
@@ -1008,9 +1014,7 @@ fn apply_query_param(params: &mut ListParams, key: &str, value: &str) -> Result<
         },
         "limit" => params.limit = parse_limit(value)?,
         "order" => params.order = parse_order(value)?,
-        "include" | "include[]" => {
-            return Err("The 'include' parameter is not supported by the local response store.".to_owned());
-        },
+        "include" | "include[]" => {},
         _ => return Err(format!("Unknown query parameter: '{key}'.")),
     }
     Ok(())
