@@ -219,8 +219,8 @@ mod tests {
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
         assert!(
-            matches!(action, FilterAction::Release),
-            "should release after extracting model"
+            matches!(action, FilterAction::BodyDone),
+            "should complete with BodyDone after extracting model"
         );
         assert_eq!(ctx.extra_request_headers.len(), 1, "should add exactly one header");
         let (name, value) = &ctx.extra_request_headers[0];
@@ -244,8 +244,8 @@ mod tests {
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
         assert!(
-            matches!(action, FilterAction::Release),
-            "should release after extracting model"
+            matches!(action, FilterAction::BodyDone),
+            "should complete with BodyDone after extracting model"
         );
         let (name, value) = &ctx.extra_request_headers[0];
         assert_eq!(name, "X-AI-Model", "header name should be X-AI-Model");

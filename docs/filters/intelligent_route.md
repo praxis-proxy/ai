@@ -9,11 +9,11 @@ Selects an upstream cluster from a site/capability descriptor by matching either
 
 This filter is registered by the AI proxy (not Praxis core) because it encodes AI-specific routing semantics: ordered candidate consumption, admission-state filtering, session affinity, and MCP tool-call routing. Praxis core provides the generic filter runtime; this filter adds the intelligent routing candidate model on top.
 
-**Modes:** - **Static:** candidates are declared inline in the YAML config. - **Overlay:** candidates are loaded from a routing overlay file (`routing-overlay.json` envelope or legacy `routing-config.json`) and hot-reloaded via [`ArcSwap`] when the file changes.
+**Modes:** - **Static:** candidates are declared inline in the YAML config. - **Overlay:** candidates are loaded from an overlay file (`routing-overlay.json` envelope or legacy `routing-config.json`) and hot-reloaded via [`ArcSwap`] when the file changes.
 
 **Behavior:** - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written. - If no routing source is present, the filter returns `Continue` without routing. - If the model header or MCP tool name is blank, oversized, or invalid, the filter rejects with 400. - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written. - If no matching candidate is found, the filter rejects with 404.
 
-**Selection:** the first matching candidate in the configured or configuration-producer-rendered order wins after admission filtering.  Praxis AI does not recompute geography, load, or score.  `admission_state=none` is never eligible.  `admission_state=existing_only` is only eligible through an already-bound session affinity entry.
+**Selection:** the first matching candidate in the configured or overlay-rendered order wins after admission filtering.  Praxis AI does not recompute source geography, load, or score.  `admission_state=none` is never eligible.  `admission_state=existing_only` is only eligible through an already-bound session affinity entry.
 
 **Metadata:** on successful selection, bounded in-process filter metadata is written under the `intelligent_route.` namespace (`kind`, `name`, `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and optionally `rank`, `selection_tier`).  When session affinity is enabled, `session.bound`, `session.reused`, and `session.failover` keys are also written. When the selected cluster is present in `provider_hop_clusters`, client-supplied `x-ai-routing-candidate`, `x-ai-routing-request-id`, and `x-ai-routing-revision` values are removed and replaced with the selected stable ID, a generated provider-hop request ID, and the serving overlay revision (envelope mode only). These AI-owned, non-reserved headers are sent only to an mTLS-authenticated provider gateway; the provider must run `peer_identity_trust` before consuming them. No credential reference or value is forwarded. No request-time database, control-plane, or metrics lookups are performed.
 
@@ -37,7 +37,7 @@ Supports two modes:
 
 **Static mode** — candidates and `local_site` are specified inline:
 
-**Overlay mode** — candidates are loaded from a routing overlay envelope:
+**Overlay mode** — candidates are loaded from an overlay envelope:
 
 ## Configuration
 
@@ -45,13 +45,19 @@ Supports two modes:
 |-------|------|---------|-------------|
 | `candidates` | CandidateConfig[] | no | Static list of route candidates (mutually exclusive with `overlay_file`). |
 | `candidates[].cluster` | string | yes | Cluster name to select when this candidate is chosen. |
+| `candidates[].credential` | CandidateCredential | no | Optional final-hop credential reference. |
+| `candidates[].credential.strategy` | string | yes | Injection strategy. |
+| `candidates[].credential.secretRef` | CredentialRef | yes | Secret locator, never secret bytes. |
+| `candidates[].credential.secretRef.key` | string | yes | Secret data key. |
+| `candidates[].credential.secretRef.name` | string | yes | Secret name. |
+| `candidates[].credential.secretRef.namespace` | string | yes | Secret namespace. |
 | `candidates[].fresh` | bool | no | Whether this candidate is fresh (default: `true`). |
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
-| `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed `x-ai-routing-*` context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
+| `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
 | `expected_overlay_scope` | ExpectedOverlayScope | no | Expected scope of the overlay envelope. When set, each specified field is validated against the envelope scope on load and every reload. Rejected on mismatch. Only relevant in overlay mode with envelope-format files. |
 | `expected_overlay_scope.network` | string | no | Expected network name. |
 | `expected_overlay_scope.gateway` | string | no | Expected gateway name. |

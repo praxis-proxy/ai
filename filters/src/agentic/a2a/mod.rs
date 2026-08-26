@@ -176,7 +176,7 @@ impl HttpFilter for A2aFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         let parsed = match praxis_filter::builtins::http::payload_processing::body_parsing::parse_json_rpc_body(
-            body,
+            body.as_ref(),
             end_of_stream,
             &self.json_rpc_config,
             self.config.on_invalid,
@@ -310,7 +310,7 @@ impl HttpFilter for A2aFilter {
 /// Task routes take precedence over context routes. For task-routable methods,
 /// only the task ID is consulted. For context-routable methods, the context ID
 /// is consulted. Because the method sets are disjoint in the current A2A spec,
-/// both lookups cannot apply in practice — but the ordering guarantees task
+/// both lookups cannot apply in practice - but the ordering guarantees task
 /// wins if both IDs are ever simultaneously present.
 #[expect(clippy::too_many_lines, reason = "sequential lookup-classify-trace pipeline")]
 fn lookup_task_route(
@@ -382,6 +382,33 @@ fn lookup_task_route(
     }
 }
 
+/// Advances or abandons a pending tentative route. Returns `true` if the
+/// caller should return early (tentative guard handled this chunk).
+fn handle_pending_tentative(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    end_of_stream: bool,
+    store: &LocalTaskRouteStore,
+    config: &config::TaskRoutingConfig,
+) -> bool {
+    if !ctx.filter_metadata.contains_key("a2a.response.tentative_json") {
+        return false;
+    }
+    let has_new_content = body
+        .as_ref()
+        .is_some_and(|b| b.iter().any(|&byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r')));
+    if has_new_content {
+        debug!("tentative route discarded: trailing non-whitespace after balanced JSON prefix");
+        clear_capture_metadata(ctx);
+    } else if end_of_stream {
+        debug!("tentative route confirmed at EOS: no trailing content");
+        commit_tentative_capture(ctx, store, config);
+        clear_capture_metadata(ctx);
+    }
+    // else: whitespace-only chunk, EOS not yet seen — keep waiting.
+    true
+}
+
 /// Drives non-streaming A2A task-route capture for one `on_response_body`
 /// call: accumulate the chunk, update the [`JsonBalanceState`] scanner,
 /// and either abandon capture (invalid buffer), attempt a parse (buffer
@@ -393,6 +420,10 @@ fn handle_non_streaming_capture(
     store: &LocalTaskRouteStore,
     config: &config::TaskRoutingConfig,
 ) {
+    if handle_pending_tentative(ctx, body, end_of_stream, store, config) {
+        return;
+    }
+
     if let Some(chunk) = body.as_ref()
         && !accumulate_response_hex(ctx, chunk, config.max_response_body_bytes)
     {
@@ -414,26 +445,25 @@ fn handle_non_streaming_capture(
         // remaining chunk up to max_response_body_bytes only to hit
         // this same dead end at end_of_stream.
         clear_capture_metadata(ctx);
+    } else if is_complete && !end_of_stream {
+        // Structurally complete but EOS not yet confirmed. Parse tentatively
+        // and hold: the route is committed only when EOS arrives with no
+        // further non-whitespace bytes. This prevents a valid JSON prefix
+        // followed by trailing garbage from poisoning task-route ownership.
+        parse_to_tentative(ctx);
     } else if is_complete || end_of_stream {
+        // EOS is confirmed (either directly or together with is_complete):
+        // the full response is in the buffer; commit immediately.
         try_capture_from_buffer(ctx, store, config);
     }
 }
 
-/// Pingora may not deliver a separate EOS callback after the final data
-/// chunk, so callers attempt this as soon as [`JsonBalanceState`] reports
-/// the buffer holds a balanced top-level JSON value, rather than waiting
-/// for `end_of_stream`. This avoids repeating a full hex-decode and
-/// `serde_json` parse of the whole accumulated buffer on every chunk.
-///
-/// [`JsonBalanceState`] is a heuristic gate, not a validator: a buffer
-/// can be balanced and type-matched yet still fail to parse (e.g.
-/// trailing bytes after a complete object, or a trailing comma). Bytes
-/// already accumulated up to a structurally-closed offset cannot become
-/// parseable by appending more bytes afterward — any further data can
-/// only add trailing content, which `serde_json` rejects just the same.
-/// So a failed parse here is unconditionally terminal: clear capture
-/// state immediately rather than holding the (still-growing) buffer and
-/// re-attempting the same doomed parse at `end_of_stream`.
+/// Called from the `is_complete || end_of_stream` branch of
+/// [`handle_non_streaming_capture`] -- either the fast path where both
+/// conditions are true simultaneously, or the fallback where EOS arrives
+/// with an incomplete buffer. Parses the full accumulated hex buffer and,
+/// on success, stores the extracted routes. A failed parse is
+/// unconditionally terminal and clears capture state.
 fn try_capture_from_buffer(
     ctx: &mut HttpFilterContext<'_>,
     store: &LocalTaskRouteStore,
@@ -453,10 +483,65 @@ fn try_capture_from_buffer(
     clear_capture_metadata(ctx);
 }
 
+/// Parse the accumulated buffer and, on success, store the result in filter
+/// metadata under `a2a.response.tentative_json` without committing to the
+/// route store. The route is committed only once
+/// [`handle_non_streaming_capture`] receives EOS with no further
+/// non-whitespace bytes, proving no trailing content follows.
+///
+/// A failed parse clears capture state immediately — a balanced-but-invalid
+/// buffer (e.g. trailing comma) cannot be salvaged by later bytes.
+fn parse_to_tentative(ctx: &mut HttpFilterContext<'_>) {
+    let parsed = ctx
+        .filter_metadata
+        .get("a2a.response.buffer_hex")
+        .and_then(|hex| decode_hex(hex))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+
+    match parsed {
+        Some(value) => {
+            if let Ok(json_str) = serde_json::to_string(&value) {
+                ctx.filter_metadata
+                    .insert("a2a.response.tentative_json".to_owned(), json_str);
+            } else {
+                // Serialization failure is effectively infallible for a Value
+                // that was just deserialized, but clear state defensively so
+                // the tentative guard cannot be bypassed on subsequent chunks.
+                clear_capture_metadata(ctx);
+            }
+        },
+        None => {
+            // Balanced but unparseable: unconditionally terminal.
+            clear_capture_metadata(ctx);
+        },
+    }
+}
+
+/// Commit a previously tentative capture to the route store.
+///
+/// Called only after [`handle_non_streaming_capture`] confirms EOS arrived
+/// with no non-whitespace bytes following the balanced JSON prefix.
+fn commit_tentative_capture(
+    ctx: &HttpFilterContext<'_>,
+    store: &LocalTaskRouteStore,
+    config: &config::TaskRoutingConfig,
+) {
+    let Some(json_str) = ctx.filter_metadata.get("a2a.response.tentative_json") else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return;
+    };
+    let Some(cluster) = ctx.filter_metadata.get("a2a.response.cluster") else {
+        return;
+    };
+    store_task_route(&value, cluster, store, config);
+}
+
 /// Store task and context routes extracted from a response body.
 ///
 /// Task routes use `terminal_ttl_seconds` when the task is done; context routes
-/// always use `ttl_seconds` because a completed task does not end the context —
+/// always use `ttl_seconds` because a completed task does not end the context -
 /// later messages or `ListTasks` calls in the same context still need routing.
 #[expect(clippy::too_many_lines, reason = "sequential extract-store-log pipeline")]
 fn store_task_route(
@@ -517,6 +602,7 @@ fn clear_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.json_in_string");
     ctx.filter_metadata.remove("a2a.response.json_escaped");
     ctx.filter_metadata.remove("a2a.response.json_invalid");
+    ctx.filter_metadata.remove("a2a.response.tentative_json");
 }
 
 /// Accumulate raw bytes as hex to avoid corruption when chunk boundaries
@@ -561,7 +647,7 @@ fn accumulate_response_hex(ctx: &mut HttpFilterContext<'_>, chunk: &[u8], max_by
 ///
 /// A2A JSON-RPC responses are always a top-level `{...}` object, so
 /// tracking a stack of expected closing brackets while skipping bytes
-/// inside string literals is sufficient to detect completion — a full
+/// inside string literals is sufficient to detect completion - a full
 /// incremental JSON parser is unnecessary. Structural JSON bytes (`{`,
 /// `}`, `[`, `]`, `"`, `\`) are always single-byte ASCII, so scanning raw
 /// bytes is safe even when a chunk boundary splits a multibyte UTF-8
@@ -572,7 +658,7 @@ fn accumulate_response_hex(ctx: &mut HttpFilterContext<'_>, chunk: &[u8], max_by
 /// trailing bytes after a complete object, or a trailing comma). The
 /// real `serde_json` parse in [`try_capture_from_buffer`] remains the
 /// source of truth, and that function abandons capture immediately on a
-/// failed parse — see its doc comment for why that is always safe to do
+/// failed parse - see its doc comment for why that is always safe to do
 /// unconditionally, without waiting for `end_of_stream`.
 #[derive(Debug, Default, Clone)]
 #[expect(clippy::struct_excessive_bools, reason = "independent per-byte scan flags")]
@@ -613,7 +699,7 @@ impl JsonBalanceState {
 
 /// Update `state` with the bytes in `chunk`. A no-op once `state` is
 /// already complete or invalid, so total work across all chunks is
-/// O(n) in bytes rather than the O(n²) of re-scanning the whole buffer
+/// O(n) in bytes rather than the O(n^2) of re-scanning the whole buffer
 /// every call.
 #[expect(
     clippy::too_many_lines,
@@ -743,7 +829,7 @@ fn hex_digit(b: u8) -> Option<u8> {
 }
 
 /// Runs inside the synchronous `on_response_body` hook, so it cannot
-/// await or write to external stores — state persists via `filter_metadata`
+/// await or write to external stores - state persists via `filter_metadata`
 /// hex encoding between calls.
 fn process_sse_response_chunk(
     ctx: &mut HttpFilterContext<'_>,
@@ -759,16 +845,15 @@ fn process_sse_response_chunk(
         try_extract_task_from_sse_payload(payload, ctx, store, config);
     }
 
-    if result.overflowed {
+    if result.dropped_events > 0 {
         debug!(
-            scratch_bytes = state.scratch_bytes,
+            dropped_events = result.dropped_events,
             max_bytes = config.max_response_body_bytes,
-            "SSE scratch exceeds capture limit, disabling streaming capture"
+            "SSE event exceeded capture limit, discarding and resuming at next event boundary"
         );
-        clear_sse_capture_metadata(ctx);
-    } else {
-        save_sse_scan_state(ctx, &state);
     }
+
+    save_sse_scan_state(ctx, &state);
 }
 
 /// Drains any incomplete SSE event buffered in `filter_metadata` at
@@ -788,7 +873,7 @@ fn flush_pending_sse_payloads(
     }
 }
 
-/// Invalid UTF-8 or unparseable JSON silently skips — the proxy must
+/// Invalid UTF-8 or unparseable JSON silently skips - the proxy must
 /// never fail on arbitrary SSE payloads.
 fn try_extract_task_from_sse_payload(
     data: &[u8],
@@ -810,6 +895,7 @@ fn try_extract_task_from_sse_payload(
 /// Reconstructs scanner state from hex-encoded `filter_metadata` keys.
 /// Metadata bypasses the 256-byte dynamic-value helper because the
 /// scanner buffers raw SSE line/data bytes that can exceed that limit.
+#[expect(clippy::too_many_lines, reason = "sequential per-field metadata reads")]
 fn load_sse_scan_state(ctx: &HttpFilterContext<'_>) -> sse::SseScanState {
     let line_buf = ctx
         .filter_metadata
@@ -839,12 +925,21 @@ fn load_sse_scan_state(ctx: &HttpFilterContext<'_>) -> sse::SseScanState {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
+    let skip = sse::SkipPhase::from_metadata_str(ctx.filter_metadata.get("a2a.response.sse_skip").map(String::as_str));
+    let tail = sse::ScanTail::from_metadata_str(
+        ctx.filter_metadata
+            .get("a2a.response.sse_dropped_tail")
+            .map(String::as_str),
+    );
+
     sse::SseScanState {
         line_buf,
         data_buf,
         has_data,
         prev_cr,
         scratch_bytes,
+        skip,
+        tail,
     }
 }
 
@@ -864,6 +959,13 @@ fn save_sse_scan_state(ctx: &mut HttpFilterContext<'_>, state: &sse::SseScanStat
     ctx.filter_metadata.insert(
         "a2a.response.sse_scratch_bytes".to_owned(),
         state.scratch_bytes.to_string(),
+    );
+
+    ctx.filter_metadata
+        .insert("a2a.response.sse_skip".to_owned(), state.skip.as_str().to_owned());
+    ctx.filter_metadata.insert(
+        "a2a.response.sse_dropped_tail".to_owned(),
+        state.tail.as_str().to_owned(),
     );
 }
 
@@ -889,9 +991,9 @@ fn clear_sse_capture_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove("a2a.response.sse_has_data");
     ctx.filter_metadata.remove("a2a.response.sse_prev_cr");
     ctx.filter_metadata.remove("a2a.response.sse_scratch_bytes");
+    ctx.filter_metadata.remove("a2a.response.sse_skip");
     ctx.filter_metadata.remove("a2a.response.cluster");
 }
-
 
 /// Build a `JsonRpcConfig` for the shared parser with A2A-appropriate defaults.
 fn build_json_rpc_config(max_body_bytes: usize) -> JsonRpcConfig {

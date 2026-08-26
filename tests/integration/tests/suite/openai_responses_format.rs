@@ -715,6 +715,8 @@ filter_chains:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -741,6 +743,8 @@ filter_chains:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -767,6 +771,8 @@ filter_chains:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -792,6 +798,8 @@ filter_chains:
           - name: "backend"
             endpoints:
               - "127.0.0.1:{backend_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -817,6 +825,8 @@ filter_chains:
           - name: "backend"
             endpoints:
               - "127.0.0.1:{backend_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -839,7 +849,7 @@ filter_chains:
               filter: openai_responses_format
               key: format
               result: openai_responses
-            rejoin: terminal
+            rejoin: shared_load_balancer
             chains:
               - name: responses_chain
                 filters:
@@ -847,20 +857,21 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "responses"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "responses"
-                        endpoints:
-                          - "127.0.0.1:{responses_port}"
       - filter: router
         routes:
           - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+          - name: "responses"
+            endpoints:
+              - "127.0.0.1:{responses_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -882,8 +893,8 @@ filter_chains:
             on_result:
               filter: openai_responses_format
               key: background
-              result: true
-            rejoin: terminal
+              result: "true"
+            rejoin: shared_load_balancer
             chains:
               - name: background_chain
                 filters:
@@ -891,20 +902,21 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "background"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "background"
-                        endpoints:
-                          - "127.0.0.1:{background_port}"
       - filter: router
         routes:
           - path_prefix: "/"
             cluster: "default"
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+          - name: "background"
+            endpoints:
+              - "127.0.0.1:{background_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -944,6 +956,8 @@ filter_chains:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -976,6 +990,8 @@ filter_chains:
           - name: "default"
             endpoints:
               - "127.0.0.1:{default_port}"
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }

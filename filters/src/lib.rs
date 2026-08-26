@@ -9,8 +9,15 @@
 //! inference routing, prompt enrichment, and token usage handling.
 
 pub mod agentic;
+pub mod aws;
+#[cfg(feature = "azure-ad-filter")]
+pub mod azure;
+#[cfg(feature = "http-callout-filter")]
+pub mod callout;
 pub mod guardrails;
 pub mod inference;
+#[cfg(feature = "opentelemetry")]
+mod opentelemetry;
 pub mod prompt_enrich;
 mod register;
 pub mod routing;
@@ -18,11 +25,16 @@ mod time_to_first_token;
 mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
+pub use aws::Sigv4SignFilter;
+#[cfg(feature = "azure-ad-filter")]
+pub use azure::AzureAdFilter;
+#[cfg(feature = "http-callout-filter")]
+pub use callout::HttpCalloutFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
-pub use routing::IntelligentRouteFilter;
+pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;
 pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
 
@@ -80,6 +92,8 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            #[cfg(feature = "praxis-main")]
+            session_stores: None,
             metrics_route: None,
             peer_identity: None,
             request: req,
@@ -91,6 +105,21 @@ pub(crate) mod test_utils {
             response_header: None,
             response_headers_modified: false,
             subrequest_client: None,
+            subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
+            #[cfg(feature = "praxis-main")]
+            attempted_endpoints: Vec::new(),
+            #[cfg(feature = "praxis-main")]
+            retry_policy: None,
+            #[cfg(feature = "praxis-main")]
+            route_retry_policy: None,
+            #[cfg(feature = "praxis-main")]
+            cluster_retry_state: None,
+            #[cfg(feature = "praxis-main")]
+            cluster_retry_state_released: false,
+            #[cfg(feature = "praxis-main")]
+            endpoint_reselector: None,
+            #[cfg(feature = "praxis-main")]
+            pinned_endpoint_address: None,
             rewritten_path: None,
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,

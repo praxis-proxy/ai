@@ -32,6 +32,8 @@ filter_chains:
             endpoints: ["10.0.0.1:8080"]
           - name: web
             endpoints: ["10.0.0.2:8080"]
+insecure_options:
+  allow_private_endpoints: true
 "#;
     let config = Config::from_yaml(yaml).unwrap();
     assert_eq!(config.filter_chains.len(), 1, "should have 1 filter chain");
@@ -61,6 +63,8 @@ filter_chains:
             endpoints: ["10.0.0.1:80"]
           - name: v2
             endpoints: ["10.0.0.2:80"]
+insecure_options:
+  allow_private_endpoints: true
 "#;
     let config = Config::from_yaml(yaml).unwrap();
     assert_eq!(config.filter_chains.len(), 1, "should have 1 filter chain");

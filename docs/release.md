@@ -49,7 +49,7 @@ that the tag matches `workspace.package.version`, runs the test suite,
 builds the multi-stage Alpine image, pushes it to
 `ghcr.io/praxis-proxy/ai`, and creates the GitHub Release.
 
-Maintainers can manually dispatch the **Publish** workflow when a container
+Reviewers can manually dispatch the **Publish** workflow when a container
 image is needed without creating a tagged GitHub Release.
 
 [ghcr]: https://ghcr.io/praxis-proxy/ai

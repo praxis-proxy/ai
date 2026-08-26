@@ -8,7 +8,14 @@ readme = "../../README.md"
 publish = false
 
 [features]
-cpex-policy-engine = ["praxis-filter/cpex-policy-engine"]
+cpex-policy-engine = []
+# Experimental: gates the lakera-guard example test, which needs the
+# http_callout filter registered in the in-process proxy registry.
+http-callout-filter = ["praxis-ai-proxy/http-callout-filter"]
+# Experimental: gates the azure_ad example test, which needs the azure_ad
+# filter registered in the in-process proxy registry.
+azure-ad-filter = ["praxis-ai-proxy/azure-ad-filter"]
+llmd-ext-proc = ["praxis-test-utils/llmd-ext-proc"]
 no-mac-cert-rotation-tests = [] # We use this to disable testing cert rotation on macOS
 praxis-main = ["praxis-test-utils/praxis-main"]
 
@@ -23,11 +30,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 nix = { workspace = true }
 praxis-core = { workspace = true }
+praxis-ai-proxy = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-test-utils = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "process"] }
 tokio-tungstenite = { workspace = true }
+rustls-pemfile = { workspace = true }

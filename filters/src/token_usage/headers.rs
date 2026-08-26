@@ -8,7 +8,7 @@ use http::header::{HeaderName, HeaderValue};
 use praxis_filter::{EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
 use tracing::trace;
 
-use super::{META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_TOTAL};
+use super::{META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_STATUS, META_TOKEN_TOTAL};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -23,13 +23,21 @@ const HEADER_TOKEN_OUTPUT: HeaderName = HeaderName::from_static("praxis-token-ou
 /// Response header carrying the total token count.
 const HEADER_TOKEN_TOTAL: HeaderName = HeaderName::from_static("praxis-token-total");
 
+/// Response header signaling that usage could not be captured (e.g.
+/// "overflow"), present instead of or alongside the count headers so
+/// consumers cannot mistake missing counts for zero usage.
+const HEADER_TOKEN_STATUS: HeaderName = HeaderName::from_static("praxis-token-status");
+
 // -----------------------------------------------------------------------------
 // TokenUsageHeadersFilter
 // -----------------------------------------------------------------------------
 
 /// Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and
 /// `Praxis-Token-Total` headers into downstream responses when
-/// token usage data is present in [`filter_metadata`].
+/// token usage data is present in [`filter_metadata`]. Also injects
+/// `Praxis-Token-Status` when usage capture failed (e.g. overflow),
+/// so an unavailable count is never silently indistinguishable from
+/// a genuine zero.
 ///
 /// Reads token counts written by upstream filters and exposes them
 /// as HTTP response headers for infrastructure-level consumption
@@ -92,25 +100,36 @@ impl HttpFilter for TokenUsageHeadersFilter {
 /// response headers. No-op when response headers are absent or
 /// no token data has been written by upstream filters.
 fn inject_usage_headers(ctx: &mut HttpFilterContext<'_>) {
-    let (Some(input), Some(output), Some(total)) = (
+    let status = ctx.get_metadata(META_TOKEN_STATUS).map(str::to_owned);
+    let counts = match (
         ctx.get_metadata(META_TOKEN_INPUT).map(str::to_owned),
         ctx.get_metadata(META_TOKEN_OUTPUT).map(str::to_owned),
         ctx.get_metadata(META_TOKEN_TOTAL).map(str::to_owned),
-    ) else {
+    ) {
+        (Some(input), Some(output), Some(total)) => Some((input, output, total)),
+        _ => None,
+    };
+
+    if status.is_none() && counts.is_none() {
         trace!("no token usage metadata found, skipping header injection");
         return;
-    };
+    }
 
     let Some(resp) = ctx.response_header.as_mut() else {
         return;
     };
 
     ctx.response_headers_modified = true;
-
     let headers = &mut resp.headers;
-    insert_token_header(headers, &HEADER_TOKEN_INPUT, &input);
-    insert_token_header(headers, &HEADER_TOKEN_OUTPUT, &output);
-    insert_token_header(headers, &HEADER_TOKEN_TOTAL, &total);
+
+    if let Some(status) = &status {
+        insert_token_header(headers, &HEADER_TOKEN_STATUS, status);
+    }
+    if let Some((input, output, total)) = &counts {
+        insert_token_header(headers, &HEADER_TOKEN_INPUT, input);
+        insert_token_header(headers, &HEADER_TOKEN_OUTPUT, output);
+        insert_token_header(headers, &HEADER_TOKEN_TOTAL, total);
+    }
 
     trace!("injected token usage response headers");
 }
@@ -281,6 +300,48 @@ mod tests {
             resp.headers.get("praxis-token-total").map(|v| v.to_str().unwrap()),
             Some("200")
         );
+    }
+
+    #[tokio::test]
+    async fn injects_status_header_on_overflow_without_counts() {
+        let filter = TokenUsageHeadersFilter;
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata(META_TOKEN_STATUS, "overflow".to_owned());
+
+        let mut resp = crate::test_utils::make_response();
+        ctx.response_header = Some(&mut resp);
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        ctx.response_header = None;
+
+        assert!(
+            ctx.response_headers_modified,
+            "status alone should still modify headers"
+        );
+        assert_eq!(resp.headers["praxis-token-status"], "overflow");
+        assert!(
+            resp.headers.get("praxis-token-input").is_none(),
+            "no counts available on overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn injects_counts_without_status_header_on_success() {
+        let filter = TokenUsageHeadersFilter;
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_token_metadata(&mut ctx, "10", "20", "30");
+
+        let mut resp = crate::test_utils::make_response();
+        ctx.response_header = Some(&mut resp);
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        ctx.response_header = None;
+
+        assert!(
+            resp.headers.get("praxis-token-status").is_none(),
+            "no status header on a normal, successful extraction"
+        );
+        assert_eq!(resp.headers["praxis-token-input"], "10");
     }
 
     #[test]

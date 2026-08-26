@@ -6,9 +6,14 @@
 use praxis_core::subrequest::SubRequestClient;
 use praxis_filter::FilterRegistry;
 
+#[cfg(feature = "azure-ad-filter")]
+use crate::AzureAdFilter;
+#[cfg(feature = "http-callout-filter")]
+use crate::HttpCalloutFilter;
 use crate::{
-    A2aFilter, AiGuardrailsFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
+    PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
+    TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -30,6 +35,9 @@ use crate::{
 /// ```
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     register_agentic_filters(registry);
+    register_aws_filters(registry);
+    #[cfg(feature = "azure-ad-filter")]
+    register_azure_filters(registry);
     register_general_ai_filters(registry);
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
@@ -67,11 +75,27 @@ fn register_agentic_filters(registry: &mut FilterRegistry) {
     );
 }
 
+/// Register AWS-specific filters.
+fn register_aws_filters(registry: &mut FilterRegistry) {
+    register_routing_security_filter(registry, "aws_sigv4_sign", Sigv4SignFilter::from_config);
+}
+
+/// Register Azure-specific filters.
+#[cfg(feature = "azure-ad-filter")]
+fn register_azure_filters(registry: &mut FilterRegistry) {
+    register_routing_security_filter(registry, "azure_ad", AzureAdFilter::from_config);
+}
+
 /// Register general-purpose AI filters.
 fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "ai_guardrails" => AiGuardrailsFilter::from_config
+    );
+    #[cfg(feature = "http-callout-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "http_callout" => HttpCalloutFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -101,6 +125,28 @@ fn register_routing_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "intelligent_route" => IntelligentRouteFilter::from_config
     );
+    register_routing_security_filter(registry, "provider_route", ProviderRouteFilter::from_config);
+    register_routing_security_filter(registry, "credential_inject", CredentialInjectFilter::from_config);
+}
+
+/// Register a routing HTTP filter as security-critical.
+#[expect(
+    clippy::type_complexity,
+    reason = "single-use registration helper; a type alias adds indirection"
+)]
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_routing_security_filter(
+    registry: &mut FilterRegistry,
+    name: &'static str,
+    factory: fn(&serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError>,
+) {
+    registry
+        .register_with_class(
+            name,
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(factory)),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: '{name}'"));
 }
 
 /// Register Anthropic-specific filters.
@@ -203,7 +249,7 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config
+        http "openai_agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config
     );
 }
 
@@ -333,31 +379,59 @@ mod tests {
     fn build_ai_registry_includes_ai_and_builtin_filters() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
-        assert!(names.contains(&"ai_guardrails"), "expected ai_guardrails in registry");
+        let expected = [
+            "ai_guardrails",
+            "openai_responses_validate",
+            "responses_to_chat_completions",
+            "a2a",
+            "intelligent_route",
+            "provider_route",
+            "credential_inject",
+            "anthropic_validate",
+            "anthropic_web_search",
+            "request_id",
+            "aws_sigv4_sign",
+        ];
+        for name in expected {
+            assert!(names.contains(&name), "expected {name} in registry");
+        }
+    }
+
+    /// Experimental filters register only when their cargo feature is enabled.
+    #[test]
+    fn build_ai_registry_gates_experimental_filters() {
+        let registry = build_ai_registry();
+        let names = registry.available_filters();
+
+        #[cfg(feature = "http-callout-filter")]
         assert!(
-            names.contains(&"openai_responses_validate"),
-            "expected openai_responses_validate in registry"
+            names.contains(&"http_callout"),
+            "http_callout must register when its feature is enabled"
         );
+        #[cfg(not(feature = "http-callout-filter"))]
         assert!(
-            names.contains(&"responses_to_chat_completions"),
-            "expected responses_to_chat_completions in registry"
+            !names.contains(&"http_callout"),
+            "http_callout must not register when its feature is disabled"
         );
-        assert!(names.contains(&"a2a"), "expected agentic filter a2a in registry");
+        #[cfg(feature = "azure-ad-filter")]
         assert!(
-            names.contains(&"intelligent_route"),
-            "expected intelligent_route in registry"
+            names.contains(&"azure_ad"),
+            "azure_ad must register when its feature is enabled"
         );
+        #[cfg(not(feature = "azure-ad-filter"))]
         assert!(
-            names.contains(&"anthropic_validate"),
-            "expected anthropic filter in registry"
+            !names.contains(&"azure_ad"),
+            "azure_ad must not register when its feature is disabled"
         );
-        assert!(
-            names.contains(&"anthropic_web_search"),
-            "expected anthropic_web_search in registry"
-        );
-        assert!(
-            names.contains(&"request_id"),
-            "expected core builtin request_id in registry"
-        );
+    }
+
+    #[test]
+    fn build_ai_registry_marks_security_filters() {
+        let registry = build_ai_registry();
+        assert!(registry.is_security_filter("provider_route"));
+        assert!(registry.is_security_filter("credential_inject"));
+        assert!(registry.is_security_filter("aws_sigv4_sign"));
+        #[cfg(feature = "azure-ad-filter")]
+        assert!(registry.is_security_filter("azure_ad"));
     }
 }

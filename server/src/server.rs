@@ -235,9 +235,14 @@ fn register_admin_endpoints(
         praxis_protocol::http::pingora::health::add_admin_endpoints_to_pingora_server(
             server.server_mut(),
             admin_addr,
-            Some(health_registry),
-            Some(kv_stores.clone()),
-            config.admin.verbose,
+            praxis_protocol::http::pingora::health::AdminEndpointOptions {
+                health_registry: Some(health_registry),
+                kv_registry: Some(kv_stores.clone()),
+                pipelines: None,
+                #[cfg(feature = "praxis-main")]
+                log_level: None,
+                verbose: config.admin.verbose,
+            },
         );
     }
 }

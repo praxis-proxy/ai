@@ -153,7 +153,7 @@ async fn execute_resolved_url(
         let peer = HttpPeer::new(*addr, parsed.tls, parsed.sni.clone());
         debug!(host = %parsed.host, %addr, "sub-request: trying resolved address");
 
-        match client.execute(&peer, &request, max_response_bytes, timeout, None).await {
+        match Box::pin(client.execute(&peer, &request, max_response_bytes, timeout, None)).await {
             Ok(response) => return Ok(response),
             Err(SubRequestError::Connect(error)) => {
                 debug!(host = %parsed.host, %addr, %error, "sub-request: connect failed, trying next address");
@@ -296,14 +296,14 @@ mod tests {
         let captured = capture_raw_request(good_listener);
 
         let parsed = parse_url_components(&format!("http://example.test:{}/test", good_addr.port())).unwrap();
-        let response = execute_resolved_url(
+        let response = Box::pin(execute_resolved_url(
             &test_client(),
             parsed,
             empty_request(),
             &[bad_addr, good_addr],
             1024,
             Duration::from_secs(5),
-        )
+        ))
         .await
         .unwrap();
 
@@ -319,14 +319,14 @@ mod tests {
         let authority = format!("my-virtual-host.example.com:{}", addr.port());
         let parsed = parse_url_components(&format!("http://{authority}/test")).unwrap();
 
-        execute_resolved_url(
+        Box::pin(execute_resolved_url(
             &test_client(),
             parsed,
             empty_request(),
             &[addr],
             1024,
             Duration::from_secs(5),
-        )
+        ))
         .await
         .unwrap();
 

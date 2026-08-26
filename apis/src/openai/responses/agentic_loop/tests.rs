@@ -19,21 +19,21 @@ use crate::test_utils::{make_filter_context, make_request};
 fn from_config_accepts_null() {
     let yaml = serde_yaml::Value::Null;
     let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "agentic_loop");
+    assert_eq!(filter.name(), "openai_agentic_loop");
 }
 
 #[test]
 fn from_config_accepts_empty_mapping() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "agentic_loop");
+    assert_eq!(filter.name(), "openai_agentic_loop");
 }
 
 #[test]
 fn from_config_accepts_custom_values() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 5").unwrap();
     let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "agentic_loop");
+    assert_eq!(filter.name(), "openai_agentic_loop");
 }
 
 #[test]
@@ -229,6 +229,33 @@ async fn forces_parallel_tool_calls_false() {
     assert_eq!(
         state.request_body["parallel_tool_calls"], false,
         "request_body should contain parallel_tool_calls=false for proxy serialization"
+    );
+    assert!(
+        state.request_body_requires_rebuild(),
+        "inserting parallel_tool_calls must require proxy serialization"
+    );
+}
+
+#[tokio::test]
+async fn preserves_unmodified_parallel_tool_calls_false() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let body = json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "parallel_tool_calls": false,
+        "tools": [{"type": "function"}]
+    });
+    ctx.extensions.insert(ResponsesState::from_request_body(body));
+
+    drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        !state.request_body_requires_rebuild(),
+        "an already-disabled request should retain byte-exact passthrough"
     );
 }
 
@@ -700,8 +727,8 @@ fn filter_results_schema_for_irr_consumers() {
 
     let results = ctx
         .filter_results
-        .get("agentic_loop")
-        .expect("IRR consumers require agentic_loop entry");
+        .get("openai_agentic_loop")
+        .expect("IRR consumers require openai_agentic_loop entry");
     let action = results.get("action").expect("IRR consumers require action key");
     assert!(
         action == "loop" || action == "done",
@@ -977,10 +1004,10 @@ fn example_config_agentic_loop_parses() {
         .expect("inference step should have filters");
     let al_config = step_filters
         .iter()
-        .find(|f| f["filter"].as_str() == Some("agentic_loop"))
-        .expect("inference step should have agentic_loop filter");
+        .find(|f| f["filter"].as_str() == Some("openai_agentic_loop"))
+        .expect("inference step should have openai_agentic_loop filter");
     let filter = super::AgenticLoopFilter::from_config(al_config).unwrap();
-    assert_eq!(filter.name(), "agentic_loop");
+    assert_eq!(filter.name(), "openai_agentic_loop");
 }
 
 // -----------------------------------------------------------------------------
@@ -1269,8 +1296,8 @@ fn make_state_with_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
 fn assert_action(ctx: &praxis_filter::HttpFilterContext<'_>, expected: &str) {
     let results = ctx
         .filter_results
-        .get("agentic_loop")
-        .expect("filter_results should contain agentic_loop entry");
+        .get("openai_agentic_loop")
+        .expect("filter_results should contain openai_agentic_loop entry");
     let action = results.get("action").expect("should have action key");
-    assert_eq!(action, expected, "agentic_loop action mismatch");
+    assert_eq!(action, expected, "openai_agentic_loop action mismatch");
 }
