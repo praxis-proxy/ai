@@ -144,23 +144,8 @@ pub(crate) struct MessageDeltaUsage {
 }
 
 impl MessageDeltaUsage {
-    /// Create terminal delta usage from the cumulative output token count.
-    pub(crate) fn new(output_tokens: u64) -> Self {
-        Self {
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-            input_tokens: None,
-            output_tokens,
-            server_tool_use: None,
-        }
-    }
-
-    /// Create terminal delta usage with input token details.
-    pub(crate) fn with_input(
-        output_tokens: u64,
-        input_tokens: Option<u64>,
-        cache_read_input_tokens: Option<u64>,
-    ) -> Self {
+    /// Create terminal delta usage with token counts.
+    pub(crate) fn new(output_tokens: u64, input_tokens: Option<u64>, cache_read_input_tokens: Option<u64>) -> Self {
         Self {
             cache_creation_input_tokens: None,
             cache_read_input_tokens,

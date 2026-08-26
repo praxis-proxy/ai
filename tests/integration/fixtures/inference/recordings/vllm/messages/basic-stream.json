@@ -167,7 +167,10 @@
                 }
               ],
               "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
-              "stream": true
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              }
             }
           }
         },

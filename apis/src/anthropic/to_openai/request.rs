@@ -36,19 +36,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
         chat.insert("max_completion_tokens".to_owned(), max_tokens.clone());
     }
 
-    if let Some(stream) = obj.get("stream") {
-        chat.insert("stream".to_owned(), stream.clone());
-
-        if stream.as_bool() == Some(true) {
-            let mut opts = obj
-                .get("stream_options")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            opts.insert("include_usage".to_owned(), Value::Bool(true));
-            chat.insert("stream_options".to_owned(), Value::Object(opts));
-        }
-    }
+    convert_stream(&mut chat, obj);
 
     map_parameters(&mut chat, obj);
     convert_tools(&mut chat, obj);
@@ -512,6 +500,24 @@ fn non_empty_lines(lines: &[String]) -> Option<String> {
 
 /// Map Anthropic parameters to Chat Completions-compatible equivalents.
 ///
+/// Copy `stream` and request streaming usage when enabled.
+fn convert_stream(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
+    let Some(stream) = obj.get("stream") else {
+        return;
+    };
+    chat.insert("stream".to_owned(), stream.clone());
+
+    if stream.as_bool() == Some(true) {
+        let mut opts = obj
+            .get("stream_options")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        opts.insert("include_usage".to_owned(), Value::Bool(true));
+        chat.insert("stream_options".to_owned(), Value::Object(opts));
+    }
+}
+
 /// `top_k` has no standard Chat Completions equivalent but is preserved
 /// as an extra body parameter for backends that support it
 /// (e.g. vLLM).

@@ -793,26 +793,7 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
         .get(FINISH_REASON_KEY)
         .map_or("end_turn", |v| map_stop_reason(v));
 
-    let output_tokens: u64 = ctx
-        .filter_metadata
-        .get(OUTPUT_TOKENS_KEY)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let prompt_tokens: Option<u64> = ctx
-        .filter_metadata
-        .get(INPUT_TOKENS_KEY)
-        .and_then(|v| v.parse().ok());
-
-    let cache_read: Option<u64> = ctx
-        .filter_metadata
-        .get(CACHE_READ_TOKENS_KEY)
-        .and_then(|v| v.parse().ok());
-
-    let input_tokens = prompt_tokens.map(|pt| match cache_read {
-        Some(cached) => pt.saturating_sub(cached),
-        None => pt,
-    });
+    let usage = collect_delta_usage(ctx);
 
     emit_event(
         output,
@@ -825,23 +806,37 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
                 "stop_reason": stop_reason,
                 "stop_sequence": null
             },
-            "usage": message_delta_usage(output_tokens, input_tokens, cache_read)
+            "usage": usage
         }),
     );
+}
+
+/// Collect token counts from metadata and build the terminal delta usage.
+fn collect_delta_usage(ctx: &HttpFilterContext<'_>) -> MessageDeltaUsage {
+    let output_tokens: u64 = ctx
+        .filter_metadata
+        .get(OUTPUT_TOKENS_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let prompt_tokens: Option<u64> = ctx.filter_metadata.get(INPUT_TOKENS_KEY).and_then(|v| v.parse().ok());
+
+    let cache_read: Option<u64> = ctx
+        .filter_metadata
+        .get(CACHE_READ_TOKENS_KEY)
+        .and_then(|v| v.parse().ok());
+
+    let input_tokens = prompt_tokens.map(|pt| match cache_read {
+        Some(cached) => pt.saturating_sub(cached),
+        None => pt,
+    });
+
+    MessageDeltaUsage::new(output_tokens, input_tokens, cache_read)
 }
 
 /// Build a schema-complete Anthropic `Message.usage` value.
 fn message_start_usage() -> MessageUsage {
     MessageUsage::new(0, 0, None)
-}
-
-/// Build a schema-complete Anthropic `message_delta.usage` value.
-fn message_delta_usage(
-    output_tokens: u64,
-    input_tokens: Option<u64>,
-    cache_read_input_tokens: Option<u64>,
-) -> MessageDeltaUsage {
-    MessageDeltaUsage::with_input(output_tokens, input_tokens, cache_read_input_tokens)
 }
 
 /// Map `OpenAI` finish reasons to Anthropic stop reasons.
@@ -1165,8 +1160,10 @@ mod tests {
 
         assert_u64_field(usage, "output_tokens", 5, "message_delta usage");
         assert_u64_field(
-            usage, "input_tokens", 20,
-            "input_tokens should exclude cached (100 - 80)"
+            usage,
+            "input_tokens",
+            20,
+            "input_tokens should exclude cached (100 - 80)",
         );
         assert_u64_field(usage, "cache_read_input_tokens", 80, "message_delta usage");
     }

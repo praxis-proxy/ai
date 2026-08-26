@@ -166,7 +166,10 @@
                 }
               ],
               "model": "gpt-4o",
-              "stream": true
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              }
             }
           }
         },
