@@ -3,7 +3,10 @@
 
 //! Input item pagination for the `OpenAI` Responses API.
 
-use crate::{openai::include::{project_item, IncludeFields}, store::{ResponseRecord, StoreError}};
+use crate::{
+    openai::include::{IncludeFields, project_item},
+    store::{ResponseRecord, StoreError},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -98,7 +101,15 @@ pub struct InputItemPage {
 ///
 /// Returns [`StoreError::InvalidInput`] if the cursor is malformed
 /// or overflows while calculating the page window.
-pub fn list_input_items(record: &ResponseRecord, params: &ListParams, includes: IncludeFields) -> Result<InputItemPage, StoreError> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "pagination logic benefits from single-function locality"
+)]
+pub fn list_input_items(
+    record: &ResponseRecord,
+    params: &ListParams,
+    includes: IncludeFields,
+) -> Result<InputItemPage, StoreError> {
     let mut items = normalize_input_items(record);
     if params.order == Order::Descending {
         items.reverse();

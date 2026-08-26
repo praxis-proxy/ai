@@ -4166,7 +4166,7 @@ fn list_input_items_assigns_synthetic_ids_to_id_less_array_items() {
     // Default order is descending, but synthetic IDs must stay tied to
     // each item's original stored position, not its display position.
     let params = ListParams::default();
-    let includes = IncludeFields::default();    
+    let includes = IncludeFields::default();
     let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(
         page.data[0]["id"], "msg_resp_test_input_1",
@@ -4332,7 +4332,7 @@ fn list_input_items_descending_cursor_operates_on_reversed_order() {
     let params = ListParams {
         cursor: Some("c".to_owned()),
         limit: 2,
-        order: Order::Descending,   
+        order: Order::Descending,
     };
     let includes = IncludeFields::default();
     let page = list_input_items(&record, &params, includes).unwrap();

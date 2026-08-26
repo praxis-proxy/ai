@@ -14,19 +14,21 @@ use serde::{
 use serde_json::{Map, Value};
 use tracing::debug;
 
-use crate::openai::include::{IncludeFields, parse_include, project_item, decode_query_component_strict};
 use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
-        CreateConversationRequest, DeletedConversationResource, ItemOrder,
-        MAX_ITEMS_PER_REQUEST, Metadata, UpdateConversationRequest,
+        CreateConversationRequest, DeletedConversationResource, ItemOrder, MAX_ITEMS_PER_REQUEST, Metadata,
+        UpdateConversationRequest,
     },
     validate::{MetadataError, validate_metadata},
 };
 use crate::{
-    openai::responses::{
-        DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
-        store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
+    openai::{
+        include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
+        responses::{
+            DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
+            store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
+        },
     },
     store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
 };

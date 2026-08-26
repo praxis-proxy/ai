@@ -12,7 +12,10 @@ use super::{
     SqliteResponseStore, SslMode, StoreError,
     trait_def::{ConversationItemStore, ResponseStore},
 };
-use crate::openai::{include::IncludeFields, responses::store::{ListParams, Order, list_input_items}};
+use crate::openai::{
+    include::IncludeFields,
+    responses::store::{ListParams, Order, list_input_items},
+};
 
 // -----------------------------------------------------------------------------
 // Schema Initialization
@@ -358,7 +361,8 @@ fn input_items_honors_sort_order() {
         IncludeFields::default(),
     )
     .expect("ascending list should succeed");
-    let descending = list_input_items(&record, &ListParams::default(), includes).expect("descending list should succeed");
+    let descending =
+        list_input_items(&record, &ListParams::default(), includes).expect("descending list should succeed");
 
     assert_eq!(
         ascending.data,
