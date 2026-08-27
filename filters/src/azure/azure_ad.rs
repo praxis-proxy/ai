@@ -56,7 +56,7 @@
 //! scope: https://cognitiveservices.azure.com/.default
 //! client_secret_env_var: AZURE_CLIENT_SECRET
 //! authority_host: login.microsoftonline.com   # optional, for sovereign clouds
-//! refresh_ratio: 0.75                          # optional, refresh at 75% of TTL
+//! refresh_ratio: 0.75                          # optional, refresh at 75% of the usable lifetime
 //! ```
 
 use std::{
@@ -201,10 +201,12 @@ async fn fetch_token(
     Ok((authorization, Duration::from_secs(token.expires_in)))
 }
 
-/// Compute how long to wait before the next refresh: `ttl * ratio`,
-/// floored at [`MIN_REFRESH_DELAY`].
-fn refresh_delay(ttl: Duration, ratio: f64) -> Duration {
-    ttl.mul_f64(ratio).max(MIN_REFRESH_DELAY)
+/// Compute how long to wait before the next refresh: `lifetime * ratio`,
+/// floored at [`MIN_REFRESH_DELAY`]. Callers pass the skew-adjusted
+/// usable lifetime, not the raw TTL, so the refresh always fires while
+/// the cached token is still valid.
+fn refresh_delay(lifetime: Duration, ratio: f64) -> Duration {
+    lifetime.mul_f64(ratio).max(MIN_REFRESH_DELAY)
 }
 
 /// Safety margin to subtract from a token's TTL before caching its
@@ -242,7 +244,8 @@ struct RefresherParams {
     /// `OAuth2` scope (e.g. `https://cognitiveservices.azure.com/.default`).
     scope: String,
 
-    /// Fraction of a token's TTL at which to refresh it.
+    /// Fraction of a token's usable lifetime (TTL minus the expiry
+    /// safety margin) at which to refresh it.
     refresh_ratio: f64,
 
     /// Shared cache the filter's hot path reads from.
@@ -551,8 +554,9 @@ pub(crate) struct AzureAdConfig {
     #[serde(default = "default_authority_host")]
     pub(crate) authority_host: String,
 
-    /// Fraction of a token's TTL at which to refresh it. Must be in the
-    /// open interval `(0, 1)`.
+    /// Fraction of a token's usable lifetime (TTL minus the expiry
+    /// safety margin) at which to refresh it. Must be in the open
+    /// interval `(0, 1)`.
     #[serde(default = "default_refresh_ratio")]
     pub(crate) refresh_ratio: f64,
 }
