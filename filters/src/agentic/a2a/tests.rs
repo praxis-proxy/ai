@@ -1518,6 +1518,40 @@ fn task_routing_rejects_zero_ttl() {
 }
 
 #[test]
+fn task_routing_rejects_ttl_above_ceiling() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        task_routing:
+          enabled: true
+          ttl_seconds: 18446744073709551615
+        "#,
+    )
+    .unwrap();
+    let err = A2aFilter::from_config(&yaml).err().expect("should fail");
+    assert!(
+        err.to_string().contains("ttl_seconds") && err.to_string().contains("exceeds maximum"),
+        "ttl_seconds=u64::MAX should be rejected: {err}"
+    );
+}
+
+#[test]
+fn task_routing_rejects_terminal_ttl_above_ceiling() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        task_routing:
+          enabled: true
+          terminal_ttl_seconds: 18446744073709551615
+        "#,
+    )
+    .unwrap();
+    let err = A2aFilter::from_config(&yaml).err().expect("should fail");
+    assert!(
+        err.to_string().contains("terminal_ttl_seconds") && err.to_string().contains("exceeds maximum"),
+        "terminal_ttl_seconds=u64::MAX should be rejected: {err}"
+    );
+}
+
+#[test]
 fn task_routing_rejects_zero_max_response_body_bytes() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"

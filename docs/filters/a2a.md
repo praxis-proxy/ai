@@ -30,8 +30,8 @@ When `task_routing.enabled` is true, the filter captures task and context owners
 | `task_routing.on_lookup_miss` | `continue` | no | Behavior when a task route lookup misses. |
 | `task_routing.route_cluster_header` | string | no | Internal header name injected on task or context route hit. |
 | `task_routing.store` | `local` | no | Storage backend for task routes. |
-| `task_routing.terminal_ttl_seconds` | integer | no | TTL in seconds for terminal task routes (0 = remove immediately). |
-| `task_routing.ttl_seconds` | integer | no | TTL in seconds for non-terminal task routes. |
+| `task_routing.terminal_ttl_seconds` | integer | no | TTL in seconds for terminal task routes (0 = remove immediately). Must be at most 2,592,000 (30 days). |
+| `task_routing.ttl_seconds` | integer | no | TTL in seconds for non-terminal task routes. Must be greater than 0 and at most 2,592,000 (30 days). |
 
 ## Examples
 
