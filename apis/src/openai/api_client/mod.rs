@@ -73,9 +73,7 @@ pub(crate) struct ApiClient {
 fn map_subrequest_error(err: SubRequestError) -> ApiClientError {
     match err {
         SubRequestError::ResponseTooLarge { limit, .. } => ApiClientError::ResponseTooLarge { limit },
-        other => ApiClientError::CalloutFailed {
-            detail: other.to_string(),
-        },
+        source => ApiClientError::Transport { source },
     }
 }
 
@@ -107,6 +105,11 @@ impl ApiClient {
         &self.api_base_url
     }
 
+    /// Return the configured maximum response size.
+    pub(crate) fn max_response_bytes(&self) -> usize {
+        self.max_response_bytes
+    }
+
     /// Return the configured per-request timeout.
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
@@ -125,46 +128,26 @@ impl ApiClient {
         resource_url(&self.api_base_url, path_prefix, resource_id, suffix)
     }
 
-    /// Send a GET request and parse the response body as JSON.
-    pub(crate) async fn get_json(
+    /// Send a GET request and return a bounded HTTP response.
+    pub(crate) async fn get(
         &self,
-        url: String,
+        url: &str,
         request_headers: &HeaderMap,
-    ) -> Result<serde_json::Value, ApiClientError> {
+        max_response_bytes: usize,
+    ) -> Result<SubResponse, ApiClientError> {
         let headers = self.build_header_map(request_headers);
-        let response = self.execute_url(&url, http::Method::GET, headers, Bytes::new()).await?;
-        serde_json::from_slice(&response.body).map_err(|e| ApiClientError::DecodeFailed {
-            detail: format!("JSON decode failed: {e}"),
-        })
+        self.execute_url(url, http::Method::GET, headers, Bytes::new(), max_response_bytes)
+            .await
     }
 
-    /// Send a POST request with a JSON body and parse the response
-    /// body as JSON.
-    pub(crate) async fn post_json(
-        &self,
-        url: String,
-        body: &serde_json::Value,
-        request_headers: &HeaderMap,
-    ) -> Result<serde_json::Value, ApiClientError> {
-        let serialized = serde_json::to_vec(body).map_err(|e| ApiClientError::DecodeFailed {
-            detail: format!("request body serialization failed: {e}"),
-        })?;
-
-        let response = self.post_json_bytes(url, serialized, request_headers).await?;
-
-        serde_json::from_slice(&response).map_err(|e| ApiClientError::DecodeFailed {
-            detail: format!("JSON decode failed: {e}"),
-        })
-    }
-
-    /// Send a pre-serialized JSON body and return the bounded raw
+    /// Send a pre-serialized JSON body and return the bounded HTTP
     /// response.
     pub(crate) async fn post_json_bytes(
         &self,
         url: String,
         body: Vec<u8>,
         request_headers: &HeaderMap,
-    ) -> Result<Bytes, ApiClientError> {
+    ) -> Result<SubResponse, ApiClientError> {
         let mut headers = self.build_header_map(request_headers);
         headers.remove(http::header::CONTENT_TYPE);
         headers.insert(
@@ -172,42 +155,29 @@ impl ApiClient {
             http::HeaderValue::from_static("application/json"),
         );
 
-        let response = self
-            .execute_url(&url, http::Method::POST, headers, Bytes::from(body))
-            .await?;
-        Ok(response.body)
+        self.execute_url(
+            &url,
+            http::Method::POST,
+            headers,
+            Bytes::from(body),
+            self.max_response_bytes,
+        )
+        .await
     }
 
     /// Send a GET request and return the response body with
     /// bounded reads.
     ///
-    /// The Pingora connector does not follow redirects (it
-    /// connects to a specific peer), matching the redirect-
-    /// rejection behavior of the previous `reqwest` path.
+    /// The Pingora connector does not follow redirects because it
+    /// connects to a specific peer. Redirect responses are returned
+    /// to the caller as bounded HTTP responses.
     pub(crate) async fn get_bytes(
         &self,
         url: &str,
         request_headers: &HeaderMap,
         max_bytes: usize,
     ) -> Result<Bytes, ApiClientError> {
-        let headers = self.build_header_map(request_headers);
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: http::Uri::default(),
-            headers,
-            body: Bytes::new(),
-        };
-
-        let response = subrequest::execute_url(&self.client, url, request, max_bytes, self.timeout)
-            .await
-            .map_err(map_subrequest_error)?;
-
-        if response.status < 200 || response.status >= 300 {
-            return Err(ApiClientError::CalloutFailed {
-                detail: format!("content download failed: {}", response.status),
-            });
-        }
-
+        let response = self.get(url, request_headers, max_bytes).await?;
         Ok(response.body)
     }
 
@@ -234,14 +204,19 @@ impl ApiClient {
         map
     }
 
-    /// Parse the URL, build a [`SubRequest`], execute via the
-    /// client, and check for non-2xx status.
+    /// Parse the URL, build a [`SubRequest`], and execute it with
+    /// the caller's response-size limit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the request's independently owned transport fields stay explicit"
+    )]
     async fn execute_url(
         &self,
         url: &str,
         method: http::Method,
         headers: HeaderMap,
         body: Bytes,
+        max_response_bytes: usize,
     ) -> Result<SubResponse, ApiClientError> {
         let request = SubRequest {
             method,
@@ -250,18 +225,29 @@ impl ApiClient {
             body,
         };
 
-        let response = subrequest::execute_url(&self.client, url, request, self.max_response_bytes, self.timeout)
+        let mut response = subrequest::execute_url(&self.client, url, request, max_response_bytes, self.timeout)
             .await
             .map_err(map_subrequest_error)?;
-
-        if response.status < 200 || response.status >= 300 {
-            return Err(ApiClientError::CalloutFailed {
-                detail: format!("callout rejected with status {}", response.status),
-            });
-        }
-
+        sanitize_response_headers(&mut response.headers);
         Ok(response)
     }
+}
+
+/// Retain the safe response metadata required by callout consumers.
+fn sanitize_response_headers(headers: &mut HeaderMap) {
+    let mut sanitized = HeaderMap::new();
+    for name in [
+        "content-type",
+        "retry-after",
+        "x-request-id",
+        "request-id",
+        "openai-request-id",
+    ] {
+        for value in headers.get_all(name) {
+            sanitized.append(http::HeaderName::from_static(name), value.clone());
+        }
+    }
+    *headers = sanitized;
 }
 
 #[cfg(test)]
@@ -390,7 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_bytes_does_not_follow_redirects() {
+    async fn get_bytes_preserves_redirect_without_following_it() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -405,19 +391,16 @@ mod tests {
         });
         let client = test_client(&format!("http://{address}"));
 
-        let err = client
+        let body = client
             .get_bytes(
                 &format!("http://{address}/v1/files/test/content"),
                 &HeaderMap::new(),
                 1024,
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(err, ApiClientError::CalloutFailed { .. }),
-            "redirect response should be rejected without contacting its target"
-        );
+        assert!(body.is_empty(), "redirect response should not contact its target");
     }
 
     #[tokio::test]
@@ -440,8 +423,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, ApiClientError::CalloutFailed { .. }),
-            "transport errors should be mapped to CalloutFailed"
+            matches!(err, ApiClientError::Transport { .. }),
+            "transport errors should remain typed"
         );
     }
 
@@ -500,7 +483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_json_parses_valid_json() {
+    async fn get_returns_valid_json_without_decoding() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -516,17 +499,18 @@ mod tests {
         });
         let client = test_client(&format!("http://{address}"));
 
-        let json = client
-            .get_json(format!("http://{address}/v1/files/file-abc"), &HeaderMap::new())
+        let response = client
+            .get(&format!("http://{address}/v1/files/file-abc"), &HeaderMap::new(), 1024)
             .await
             .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
 
         assert_eq!(json["id"].as_str().unwrap(), "file-abc");
         assert_eq!(json["content_type"].as_str().unwrap(), "text/plain");
     }
 
     #[tokio::test]
-    async fn get_json_returns_decode_error_on_invalid_json() {
+    async fn get_preserves_invalid_json_without_decoding() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -539,34 +523,30 @@ mod tests {
         });
         let client = test_client(&format!("http://{address}"));
 
-        let err = client
-            .get_json(format!("http://{address}/v1/files/file-abc"), &HeaderMap::new())
+        let response = client
+            .get(&format!("http://{address}/v1/files/file-abc"), &HeaderMap::new(), 1024)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(err, ApiClientError::DecodeFailed { .. }),
-            "invalid JSON should return a decode error"
-        );
+        assert_eq!(response.body, "not-json!!!");
     }
 
     #[tokio::test]
-    async fn post_json_sends_body_and_parses_response() {
+    async fn post_json_bytes_sends_body_and_preserves_response() {
         let (listener, address) = bind_test_server();
         let captured = capture_request(listener, r#"{"results":[]}"#);
         let client = test_client(&format!("http://{address}"));
 
-        let request_body = serde_json::json!({"query": "test"});
-        let json = client
-            .post_json(
+        let response = client
+            .post_json_bytes(
                 format!("http://{address}/v1/vector_stores/vs-123/search"),
-                &request_body,
+                br#"{"query":"test"}"#.to_vec(),
                 &HeaderMap::new(),
             )
             .await
             .unwrap();
 
-        assert!(json["results"].as_array().unwrap().is_empty());
+        assert_eq!(response.body, br#"{"results":[]}"#.as_slice());
 
         let request = captured.join().unwrap();
         let request_lower = request.to_lowercase();
@@ -580,25 +560,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_json_returns_decode_error_on_invalid_json() {
+    async fn post_json_bytes_preserves_invalid_json() {
         let (listener, address) = bind_test_server();
         let captured = capture_request(listener, "not-json!!!");
         let client = test_client(&format!("http://{address}"));
 
-        let err = client
-            .post_json(
+        let response = client
+            .post_json_bytes(
                 format!("http://{address}/v1/vector_stores/vs-123/search"),
-                &serde_json::json!({"query": "test"}),
+                br#"{"query":"test"}"#.to_vec(),
                 &HeaderMap::new(),
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
         captured.join().unwrap();
-        assert!(
-            matches!(err, ApiClientError::DecodeFailed { .. }),
-            "invalid JSON should return a decode error"
-        );
+        assert_eq!(response.body, "not-json!!!");
     }
 
     #[tokio::test]
@@ -618,7 +595,7 @@ mod tests {
         headers.insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
 
         client
-            .post_json(format!("http://{address}/v1/search"), &serde_json::json!({}), &headers)
+            .post_json_bytes(format!("http://{address}/v1/search"), b"{}".to_vec(), &headers)
             .await
             .unwrap();
 
@@ -633,35 +610,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_json_non_2xx_returns_callout_failed() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _read = stream.read(&mut request).unwrap();
-            let body = r#"{"error":"not found"}"#;
-            let response = format!(
-                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the status matrix keeps every response-preservation case visible"
+    )]
+    async fn get_preserves_valid_http_statuses_and_bounded_bodies() {
+        for (status, location) in [
+            (301_u16, Some("https://example.invalid/redirect")),
+            (302_u16, Some("https://example.invalid/redirect")),
+            (401_u16, None),
+            (403_u16, None),
+            (404_u16, None),
+            (429_u16, None),
+            (500_u16, None),
+            (503_u16, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = format!(r#"{{"error":{{"message":"status-{status}"}}}}"#);
+            let response_body = body.clone();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _read = stream.read(&mut request).unwrap();
+                let location = location.map_or_else(String::new, |value| format!("Location: {value}\r\n"));
+                let response = format!(
+                    "HTTP/1.1 {status} Status\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let client = test_client(&format!("http://{address}"));
+
+            let response = client
+                .get(&format!("http://{address}/v1/files/file-abc"), &HeaderMap::new(), 1024)
+                .await
+                .unwrap();
+
+            assert_eq!(response.status, status, "status {status} should be preserved");
+            assert_eq!(response.body, body, "status {status} body should be preserved");
+            assert!(
+                response.headers.get(http::header::LOCATION).is_none(),
+                "Location must not be exposed"
             );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        let client = test_client(&format!("http://{address}"));
-
-        let err = client
-            .get_json(format!("http://{address}/v1/files/missing"), &HeaderMap::new())
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(err, ApiClientError::CalloutFailed { .. }),
-            "non-2xx JSON response should map to CalloutFailed"
-        );
+        }
     }
 
     #[tokio::test]
-    async fn get_bytes_non_2xx_returns_callout_failed() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the header policy test lists the allowed and rejected boundary values"
+    )]
+    async fn get_exposes_only_safe_response_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -669,32 +669,86 @@ mod tests {
             let mut request = [0_u8; 4096];
             let _read = stream.read(&mut request).unwrap();
             stream
-                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 30\r\nX-Request-Id: req_123\r\nConnection: x-remove-me\r\nX-Remove-Me: should-not-pass\r\nX-Praxis-Private: should-not-pass\r\nSet-Cookie: session=secret\r\nCookie: session=secret\r\nAuthorization: Bearer secret\r\nX-Api-Key: secret\r\nX-Auth-Token: secret\r\nX-Unknown-Provider: should-not-pass\r\nContent-Length: 2\r\n\r\n{}",
+                )
                 .unwrap();
         });
         let client = test_client(&format!("http://{address}"));
 
-        let err = client
-            .get_bytes(
-                &format!("http://{address}/v1/files/test/content"),
-                &HeaderMap::new(),
-                1024,
-            )
+        let response = client
+            .get(&format!("http://{address}/v1/files/file-abc"), &HeaderMap::new(), 1024)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(err, ApiClientError::CalloutFailed { .. }),
-            "non-2xx byte download should map to CalloutFailed via callout client"
-        );
+        assert_eq!(response.headers[http::header::CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers[http::header::RETRY_AFTER], "30");
+        assert_eq!(response.headers["x-request-id"], "req_123");
+        for name in [
+            "connection",
+            "x-remove-me",
+            "x-praxis-private",
+            "set-cookie",
+            "cookie",
+            "authorization",
+            "x-api-key",
+            "x-auth-token",
+            "x-unknown-provider",
+        ] {
+            assert!(response.headers.get(name).is_none(), "{name} must not be exposed");
+        }
     }
 
     #[test]
-    fn display_callout_failed() {
-        let err = ApiClientError::CalloutFailed {
-            detail: "connection refused".to_owned(),
-        };
-        assert_eq!(err.to_string(), "API callout failed: connection refused");
+    #[expect(
+        clippy::too_many_lines,
+        reason = "each typed transport variant needs an independent source-redaction assertion"
+    )]
+    fn transport_errors_preserve_kind_without_rendering_source_details() {
+        let connect = map_subrequest_error(SubRequestError::Connect("attacker-controlled".to_owned()));
+        assert!(matches!(
+            connect,
+            ApiClientError::Transport {
+                source: SubRequestError::Connect(_)
+            }
+        ));
+        assert!(!connect.to_string().contains("attacker-controlled"));
+
+        let io = map_subrequest_error(SubRequestError::Io("attacker-controlled".to_owned()));
+        assert!(matches!(
+            io,
+            ApiClientError::Transport {
+                source: SubRequestError::Io(_)
+            }
+        ));
+        assert!(!io.to_string().contains("attacker-controlled"));
+
+        let admission = map_subrequest_error(SubRequestError::AdmissionTimeout { max_connections: 1 });
+        assert!(matches!(
+            admission,
+            ApiClientError::Transport {
+                source: SubRequestError::AdmissionTimeout { .. }
+            }
+        ));
+
+        let circuit = map_subrequest_error(SubRequestError::CircuitOpen {
+            peer: "attacker-controlled".to_owned(),
+        });
+        assert!(matches!(
+            circuit,
+            ApiClientError::Transport {
+                source: SubRequestError::CircuitOpen { .. }
+            }
+        ));
+        assert!(!circuit.to_string().contains("attacker-controlled"));
+
+        let deadline = map_subrequest_error(SubRequestError::DeadlineExceeded);
+        assert!(matches!(
+            deadline,
+            ApiClientError::Transport {
+                source: SubRequestError::DeadlineExceeded
+            }
+        ));
     }
 
     #[test]
@@ -710,14 +764,6 @@ mod tests {
     fn display_response_too_large() {
         let err = ApiClientError::ResponseTooLarge { limit: 1024 };
         assert_eq!(err.to_string(), "response exceeds size limit (1024 bytes)");
-    }
-
-    #[test]
-    fn display_decode_failed() {
-        let err = ApiClientError::DecodeFailed {
-            detail: "expected value at line 1".to_owned(),
-        };
-        assert_eq!(err.to_string(), "response decode failed: expected value at line 1");
     }
 
     #[tokio::test]
@@ -781,7 +827,12 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(&err, ApiClientError::CalloutFailed { .. }),
+            matches!(
+                &err,
+                ApiClientError::Transport {
+                    source: SubRequestError::DeadlineExceeded
+                }
+            ),
             "slow body should fail before completing: {err}"
         );
     }

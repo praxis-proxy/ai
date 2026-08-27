@@ -4,7 +4,7 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | Yes (Alpha) |
+| 0.2.x   | Yes (Alpha) |
 
 Praxis AI is pre-`1.0.0`. Only the latest patch release of the current
 minor line receives security updates. Older pre-release lines become

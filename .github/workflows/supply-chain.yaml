@@ -26,10 +26,13 @@ jobs:
 
   security-audit:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Supply chain audit
         uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
@@ -42,10 +45,13 @@ jobs:
 
   dependency-check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Supply chain audit
         uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0

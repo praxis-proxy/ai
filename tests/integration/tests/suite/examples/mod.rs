@@ -11,6 +11,8 @@ mod agentic_routing;
 mod anthropic_messages;
 mod anthropic_messages_web_search;
 mod aws_sigv4;
+#[cfg(feature = "azure-ad-filter")]
+mod azure_ad;
 mod compact;
 mod credential_injection;
 mod file_search_callout;

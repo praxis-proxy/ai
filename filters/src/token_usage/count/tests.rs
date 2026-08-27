@@ -1039,6 +1039,180 @@ fn on_response_body_noop_for_bedrock_invoke_model() {
 }
 
 // -----------------------------------------------------------------------------
+// Prompt Cache Breakdown
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn json_anthropic_records_cache_breakdown() {
+    let json = br#"{"usage":{"input_tokens":50,"output_tokens":100,"cache_creation_input_tokens":1000,"cache_read_input_tokens":5000}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Anthropic, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("5000"), "Anthropic cache read tokens");
+    assert_eq!(cache_write.as_deref(), Some("1000"), "Anthropic cache write tokens");
+}
+
+#[tokio::test]
+async fn json_openai_records_cached_tokens() {
+    let json =
+        br#"{"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":900}}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("900"), "OpenAI cached prompt tokens");
+    assert_eq!(
+        cache_write, None,
+        "OpenAI has no cache write field, so no cache write metadata is written"
+    );
+}
+
+#[tokio::test]
+async fn json_google_records_cached_content_tokens() {
+    let json =
+        br#"{"usageMetadata":{"promptTokenCount":1200,"candidatesTokenCount":40,"cachedContentTokenCount":1100}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Google, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("1100"), "Google cached content tokens");
+    assert_eq!(
+        cache_write, None,
+        "Google has no cache write field, so no cache write metadata is written"
+    );
+}
+
+#[tokio::test]
+async fn json_without_cache_records_no_metadata() {
+    let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"total_tokens":57}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(
+        cache_read, None,
+        "a response with no cache information writes no cache read metadata"
+    );
+    assert_eq!(
+        cache_write, None,
+        "a response with no cache information writes no cache write metadata"
+    );
+}
+
+#[tokio::test]
+async fn json_with_zero_cached_tokens_records_zero() {
+    let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+
+    let (cache_read, _cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(
+        cache_read.as_deref(),
+        Some("0"),
+        "a reported cache miss is recorded as zero, distinct from absent"
+    );
+}
+
+#[tokio::test]
+async fn sse_anthropic_records_cache_breakdown() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":500}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::Anthropic, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(cache_read.as_deref(), Some("500"), "cache read from message_start");
+    assert_eq!(cache_write.as_deref(), Some("100"), "cache write from message_start");
+}
+
+#[tokio::test]
+async fn sse_anthropic_without_cache_records_no_metadata() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::Anthropic, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        cache_read, None,
+        "a stream with no cache fields writes no cache read metadata"
+    );
+    assert_eq!(
+        cache_write, None,
+        "a stream with no cache fields writes no cache write metadata"
+    );
+}
+
+#[tokio::test]
+async fn sse_openai_final_usage_records_cached_tokens() {
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        "data: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":900}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::OpenAi, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        cache_read.as_deref(),
+        Some("900"),
+        "cached tokens from final usage event"
+    );
+    assert_eq!(
+        cache_write, None,
+        "OpenAI has no cache write field, so no cache write metadata is written"
+    );
+}
+
+#[tokio::test]
+async fn sse_google_final_usage_records_cached_tokens() {
+    let events = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        "data: {\"usageMetadata\":{\"promptTokenCount\":1200,\"candidatesTokenCount\":40,\"cachedContentTokenCount\":1100}}\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::Google, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        cache_read.as_deref(),
+        Some("1100"),
+        "cached content tokens from final usage event"
+    );
+    assert_eq!(
+        cache_write, None,
+        "Google has no cache write field, so no cache write metadata is written"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_invoke_model_headers_record_no_cache() {
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/claude/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    resp.headers
+        .insert(HEADER_BEDROCK_INPUT, HeaderValue::from_static("15"));
+    resp.headers
+        .insert(HEADER_BEDROCK_OUTPUT, HeaderValue::from_static("42"));
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert_eq!(ctx.get_metadata("token.input"), Some("15"), "header input tokens");
+    assert!(
+        ctx.get_metadata("token.cache_read").is_none(),
+        "response headers carry no cache breakdown"
+    );
+    assert!(
+        ctx.get_metadata("token.cache_write").is_none(),
+        "response headers carry no cache breakdown"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -1100,6 +1274,31 @@ async fn run_json_extraction(
         ctx.get_metadata("token.input").map(str::to_owned),
         ctx.get_metadata("token.output").map(str::to_owned),
         ctx.get_metadata("token.total").map(str::to_owned),
+    )
+}
+
+/// Run a full `on_response` -> `on_response_body` cycle and return the prompt
+/// cache breakdown metadata for either the JSON or the SSE path.
+async fn run_cache_extraction(
+    provider: ProviderKind,
+    content_type: &str,
+    body_bytes: &[u8],
+) -> (Option<String>, Option<String>) {
+    let filter = make_filter(provider);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type(content_type);
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::copy_from_slice(body_bytes));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    (
+        ctx.get_metadata("token.cache_read").map(str::to_owned),
+        ctx.get_metadata("token.cache_write").map(str::to_owned),
     )
 }
 

@@ -22,12 +22,15 @@ jobs:
 
   validate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Extract version from tag
         id: version
@@ -49,10 +52,13 @@ jobs:
   test:
     needs: [validate]
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
 
       - name: Setup Rust
@@ -74,15 +80,18 @@ jobs:
   container:
     needs: [validate, test]
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Publish container image
         uses: praxis-proxy/conventions/.github/actions/ghcr-publish@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
@@ -96,10 +105,13 @@ jobs:
   github-release:
     needs: [validate, container]
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Generate release notes
         env:

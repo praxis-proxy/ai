@@ -60,6 +60,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`aws_sigv4_sign`](aws_sigv4_sign.md) | Signs outbound requests to AWS services using `SigV4`. |
 
+### Azure
+
+| Filter | Description |
+|--------|-------------|
+| [`azure_ad`](azure_ad.md) | Injects an Azure AD (Entra ID) bearer token into outbound requests. |
+
 ### Callout
 
 | Filter | Description |

@@ -10,6 +10,8 @@
 
 pub mod agentic;
 pub mod aws;
+#[cfg(feature = "azure-ad-filter")]
+pub mod azure;
 #[cfg(feature = "http-callout-filter")]
 pub mod callout;
 pub mod guardrails;
@@ -24,6 +26,8 @@ mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
 pub use aws::Sigv4SignFilter;
+#[cfg(feature = "azure-ad-filter")]
+pub use azure::AzureAdFilter;
 #[cfg(feature = "http-callout-filter")]
 pub use callout::HttpCalloutFilter;
 pub use guardrails::AiGuardrailsFilter;
@@ -88,6 +92,8 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            #[cfg(feature = "praxis-main")]
+            session_stores: None,
             metrics_route: None,
             peer_identity: None,
             request: req,
@@ -112,6 +118,8 @@ pub(crate) mod test_utils {
             cluster_retry_state_released: false,
             #[cfg(feature = "praxis-main")]
             endpoint_reselector: None,
+            #[cfg(feature = "praxis-main")]
+            pinned_endpoint_address: None,
             rewritten_path: None,
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,

@@ -1,0 +1,46 @@
+# Azure AD (Entra ID) upstream authentication
+#
+# Acquires an Entra ID bearer token via the client-credentials grant
+# and injects "Authorization: Bearer <token>" on every proxied
+# request to Azure OpenAI. The token is cached in memory and refreshed
+# in the background before it expires; the downstream client never
+# sees Entra ID.
+#
+# This filter only injects the Authorization header — it does NOT
+# manage the upstream Host. Point the backend cluster at your Azure
+# OpenAI endpoint (and set tls.sni) the same way you would for any
+# other upstream. In this example the cluster points at a local test
+# double (127.0.0.1:3000); in production use, e.g.,
+# mycompany.openai.azure.com:443 with TLS enabled.
+#
+# Required environment variables:
+#   AZURE_CLIENT_SECRET
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - azure-openai
+
+filter_chains:
+  - name: azure-openai
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/openai/"
+            cluster: azure-openai
+      - filter: load_balancer
+        clusters:
+          - name: azure-openai
+            endpoints:
+              - "127.0.0.1:3000"
+      - filter: azure_ad
+        tenant_id: 00000000-0000-0000-0000-000000000000
+        client_id: 11111111-1111-1111-1111-111111111111
+        scope: https://cognitiveservices.azure.com/.default
+        client_secret_env_var: AZURE_CLIENT_SECRET
+        # authority_host: login.microsoftonline.com  # optional, for sovereign clouds
+        # refresh_ratio: 0.75                         # optional, refresh at 75% of TTL
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

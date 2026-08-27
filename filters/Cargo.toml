@@ -18,6 +18,9 @@ apis = ["praxis-ai-apis/default"]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
 http-callout-filter = ["experimental"]
+# Experimental: the azure_ad (Entra ID) upstream authentication filter. Work in
+# progress; the config surface may change. Activates the `experimental` marker.
+azure-ad-filter = ["experimental"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = []
@@ -54,6 +57,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 zeroize = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]

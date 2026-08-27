@@ -139,6 +139,11 @@ pub(super) async fn handle_get_conversation(
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
 
     match store.get_conversation(tenant_id, conversation_id).await {
         Ok(Some(record)) => {
@@ -164,6 +169,11 @@ pub(super) async fn handle_update_conversation(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
     if body.is_empty() {
         return Ok(FilterAction::Reject(invalid_input_response_with(
             "Missing required parameter: 'metadata'.",
@@ -228,6 +238,11 @@ pub(super) async fn handle_delete_conversation(
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
 
     match store.delete_conversation(tenant_id, conversation_id).await {
         Ok(true) => {
@@ -259,6 +274,11 @@ pub(super) async fn handle_create_items(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
     let input: CreateConversationItemsRequest = match parse_json_body(body) {
         Ok(v) => v,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
@@ -339,6 +359,11 @@ pub(super) async fn handle_list_items(
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
     let includes = match parse_include(ctx.request.uri.query()) {
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
@@ -381,6 +406,7 @@ pub(super) async fn handle_list_items(
 }
 
 /// Handle `GET /v1/conversations/{id}/items/{item_id}` — retrieve one item.
+#[expect(clippy::too_many_lines, reason = "decode both path parameters then look up")]
 pub(super) async fn handle_get_item(
     ctx: &HttpFilterContext<'_>,
     store: &dyn ConversationItemStore,
@@ -388,13 +414,18 @@ pub(super) async fn handle_get_item(
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
     let includes = match parse_include(ctx.request.uri.query()) {
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let item_id = match decode_item_id_path_segment(item_id) {
+    let item_id = match decoded_path_param("item id", item_id) {
         Ok(id) => id,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(action) => return action,
     };
     let item_id = item_id.as_ref();
     match store.get_conversation_item(tenant_id, conversation_id, item_id).await {
@@ -424,9 +455,14 @@ pub(super) async fn handle_delete_item(
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let item_id = match decode_item_id_path_segment(item_id) {
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
+    let item_id = match decoded_path_param("item id", item_id) {
+        Ok(id) => id,
+        Err(action) => return action,
     };
     let item_id = item_id.as_ref();
     let existing = match store.get_conversation(tenant_id, conversation_id).await {
@@ -614,11 +650,19 @@ pub(super) fn generated_item_id(ctx: &HttpFilterContext<'_>) -> String {
     format!("item_{raw_id}")
 }
 
-/// Decode an item ID path segment the same way clients encode path parameters.
-fn decode_item_id_path_segment(item_id: &str) -> Result<Cow<'_, str>, String> {
-    percent_decode_str(item_id)
+/// Decode a URI path parameter the same way clients encode path segments.
+fn decode_path_segment<'a>(kind: &str, value: &'a str) -> Result<Cow<'a, str>, String> {
+    percent_decode_str(value)
         .decode_utf8()
-        .map_err(|e| format!("item id path segment must be valid UTF-8: {e}"))
+        .map_err(|e| format!("{kind} path segment must be valid UTF-8: {e}"))
+}
+
+/// Decode a path parameter or return the invalid-input rejection.
+fn decoded_path_param<'a>(
+    kind: &'static str,
+    value: &'a str,
+) -> Result<Cow<'a, str>, Result<FilterAction, FilterError>> {
+    decode_path_segment(kind, value).map_err(|msg| invalid_input_response(&msg).map(FilterAction::Reject))
 }
 
 /// Move a stored conversation into its public response contract.
@@ -984,12 +1028,12 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // decode_item_id_path_segment
+    // decode_path_segment
     // -------------------------------------------------------------------------
 
     #[test]
     fn decode_item_id_path_segment_invalid_utf8_returns_error() {
-        let result = decode_item_id_path_segment("%FF%FE");
+        let result = decode_path_segment("item id", "%FF%FE");
         assert!(result.is_err(), "invalid UTF-8 should return error");
         assert!(
             result.unwrap_err().contains("valid UTF-8"),
@@ -1195,18 +1239,38 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // decode_item_id_path_segment — additional cases
+    // decode_path_segment — additional cases
     // -------------------------------------------------------------------------
 
     #[test]
     fn decode_item_id_plain_ascii_passes_through() {
-        let result = decode_item_id_path_segment("item_abc123").unwrap();
+        let result = decode_path_segment("item id", "item_abc123").unwrap();
         assert_eq!(result.as_ref(), "item_abc123");
     }
 
     #[test]
     fn decode_item_id_percent_encoded_ascii() {
-        let result = decode_item_id_path_segment("item%5Fabc").unwrap();
+        let result = decode_path_segment("item id", "item%5Fabc").unwrap();
         assert_eq!(result.as_ref(), "item_abc", "percent-encoded underscore should decode");
+    }
+
+    #[test]
+    fn decode_conversation_id_percent_encoded_ascii() {
+        let result = decode_path_segment("conversation id", "conv%5Fabc").unwrap();
+        assert_eq!(
+            result.as_ref(),
+            "conv_abc",
+            "percent-encoded conversation underscore should decode"
+        );
+    }
+
+    #[test]
+    fn decode_conversation_id_invalid_utf8_returns_error() {
+        let result = decode_path_segment("conversation id", "%FF%FE");
+        assert!(result.is_err(), "invalid UTF-8 should return error");
+        assert!(
+            result.unwrap_err().contains("conversation id"),
+            "error should name the conversation id segment"
+        );
     }
 }

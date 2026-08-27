@@ -893,7 +893,7 @@ filter_chains:
             on_result:
               filter: openai_responses_format
               key: background
-              result: true
+              result: "true"
             rejoin: shared_load_balancer
             chains:
               - name: background_chain

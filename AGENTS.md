@@ -3,6 +3,10 @@
 This file provides guidance to coding agents when working
 with code in this repository.
 
+AI tools may assist with implementation, but do not add Claude or another AI
+tool as a commit collaborator, co-author, or signatory. Commit sign-off belongs
+to the human contributor responsible for the change.
+
 ## Requirements
 
 - Rust stable 1.96+

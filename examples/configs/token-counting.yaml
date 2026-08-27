@@ -4,6 +4,17 @@
 # non-streaming) and makes counts available to downstream filters
 # via filter metadata as token.input, token.output, and token.total.
 #
+# For providers that support prompt caching, the cached portion of the
+# input is also reported as token.cache_read and token.cache_write.
+# Both are a breakdown of token.input, not an addition to it, so
+# summing them with token.input would double-count.
+#
+# Each cache key is set only when the provider reported that count. An
+# absent key means the response carried no cache information; a zero
+# means the provider reported a cache miss. Providers whose API has no
+# cache write concept, such as OpenAI and Google, never set
+# token.cache_write.
+#
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/token-counting.yaml
 #   curl http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'

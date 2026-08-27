@@ -1853,6 +1853,88 @@ async fn encoded_item_id_path_segments_are_decoded() {
     assert_eq!(rejection.status, 200, "encoded item ID should be deletable");
 }
 
+fn encoded_conversation_path(conv_id: &str) -> String {
+    format!("/v1/conversations/{}", conv_id.replace('_', "%5F"))
+}
+
+async fn reject_path(filter: &dyn HttpFilter, method: Method, path: &str) -> praxis_filter::Rejection {
+    let req = make_request(method, path);
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for {path}, got {action:?}");
+    };
+    rejection
+}
+
+#[tokio::test]
+async fn encoded_conversation_id_path_segments_are_decoded() {
+    let filter = build_test_filter();
+    let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"k": "1"})).await;
+    let path = encoded_conversation_path(&conv_id);
+
+    let rejection = reject_path(filter.as_ref(), Method::GET, &path).await;
+    assert_eq!(rejection.status, 200, "GET encoded conversation ID should resolve");
+    assert_eq!(rejection_body(&rejection)["id"], conv_id);
+
+    let req = make_request(Method::POST, &path);
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&serde_json::json!({"metadata": {"k": "2"}})).unwrap(),
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from encoded update");
+    };
+    assert_eq!(rejection.status, 200, "POST encoded conversation ID should update");
+    assert_eq!(rejection_body(&rejection)["metadata"]["k"], "2");
+
+    let items_path = format!("{path}/items");
+    let req = make_request(Method::POST, &items_path);
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "items": [{"id": "item_enc", "type": "message", "role": "user", "content": "hi"}]
+        }))
+        .unwrap(),
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from encoded create items");
+    };
+    assert_eq!(rejection.status, 200, "POST encoded conversation items should create");
+
+    let rejection = reject_path(filter.as_ref(), Method::GET, &items_path).await;
+    assert_eq!(rejection.status, 200, "GET encoded conversation items should list");
+    assert_eq!(rejection_body(&rejection)["data"][0]["id"], "item_enc");
+
+    let item_path = format!("{items_path}/item_enc");
+    let rejection = reject_path(filter.as_ref(), Method::GET, &item_path).await;
+    assert_eq!(rejection.status, 200, "GET encoded conversation item should resolve");
+
+    let rejection = reject_path(filter.as_ref(), Method::DELETE, &item_path).await;
+    assert_eq!(rejection.status, 200, "DELETE encoded conversation item should resolve");
+
+    let rejection = reject_path(filter.as_ref(), Method::DELETE, &path).await;
+    assert_eq!(rejection.status, 200, "DELETE encoded conversation ID should resolve");
+    assert_eq!(rejection_body(&rejection)["id"], conv_id);
+
+    let rejection = reject_path(filter.as_ref(), Method::GET, &path).await;
+    assert_eq!(rejection.status, 404, "deleted conversation should stay gone");
+}
+
+#[tokio::test]
+async fn encoded_conversation_id_invalid_utf8_is_rejected() {
+    let filter = build_test_filter();
+    let rejection = reject_path(filter.as_ref(), Method::GET, "/v1/conversations/%FF%FE").await;
+    assert_eq!(
+        rejection.status, 400,
+        "invalid UTF-8 conversation ID should be rejected"
+    );
+}
+
 #[tokio::test]
 async fn item_list_after_cursor_decodes_query_plus_as_space() {
     let filter = build_test_filter();
