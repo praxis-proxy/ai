@@ -56,11 +56,14 @@
 //! scope: https://cognitiveservices.azure.com/.default
 //! client_secret_env_var: AZURE_CLIENT_SECRET
 //! authority_host: login.microsoftonline.com   # optional, for sovereign clouds
-//! refresh_ratio: 0.75                          # optional, refresh at 75% of TTL
+//! refresh_ratio: 0.75                          # optional, refresh at 75% of the usable lifetime
 //! ```
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -198,10 +201,12 @@ async fn fetch_token(
     Ok((authorization, Duration::from_secs(token.expires_in)))
 }
 
-/// Compute how long to wait before the next refresh: `ttl * ratio`,
-/// floored at [`MIN_REFRESH_DELAY`].
-fn refresh_delay(ttl: Duration, ratio: f64) -> Duration {
-    ttl.mul_f64(ratio).max(MIN_REFRESH_DELAY)
+/// Compute how long to wait before the next refresh: `lifetime * ratio`,
+/// floored at [`MIN_REFRESH_DELAY`]. Callers pass the skew-adjusted
+/// usable lifetime, not the raw TTL, so the refresh always fires while
+/// the cached token is still valid.
+fn refresh_delay(lifetime: Duration, ratio: f64) -> Duration {
+    lifetime.mul_f64(ratio).max(MIN_REFRESH_DELAY)
 }
 
 /// Safety margin to subtract from a token's TTL before caching its
@@ -239,7 +244,8 @@ struct RefresherParams {
     /// `OAuth2` scope (e.g. `https://cognitiveservices.azure.com/.default`).
     scope: String,
 
-    /// Fraction of a token's TTL at which to refresh it.
+    /// Fraction of a token's usable lifetime (TTL minus the expiry
+    /// safety margin) at which to refresh it.
     refresh_ratio: f64,
 
     /// Shared cache the filter's hot path reads from.
@@ -337,18 +343,30 @@ async fn refresh_once(client: &reqwest::Client, params: &RefresherParams) -> Opt
                     "azure_ad: token TTL is unusually short; validity margin reduced"
                 );
             }
-            let expires_at = Instant::now() + ttl.saturating_sub(effective_skew(ttl));
-            params.shared.store(Arc::new(Some(CachedToken {
-                authorization,
-                expires_at,
-            })));
-            Some(refresh_delay(ttl, params.refresh_ratio))
+            Some(publish_token(params, authorization, ttl))
         },
         Err(error) => {
             warn!(%error, "azure_ad: token refresh failed; will retry");
             None
         },
     }
+}
+
+/// Cache a freshly fetched token and return the delay until the next
+/// scheduled refresh.
+///
+/// Both the cached expiry and the refresh schedule are computed from the
+/// skew-adjusted usable lifetime. Scheduling from the raw TTL instead
+/// (`ratio * ttl`) can land past `ttl - skew`, leaving a window every
+/// cycle where the cached token is already invalid but the refresh has
+/// not fired yet — deterministic 503s on a healthy token endpoint.
+fn publish_token(params: &RefresherParams, authorization: HeaderValue, ttl: Duration) -> Duration {
+    let usable = ttl.saturating_sub(effective_skew(ttl));
+    params.shared.store(Arc::new(Some(CachedToken {
+        authorization,
+        expires_at: Instant::now() + usable,
+    })));
+    refresh_delay(usable, params.refresh_ratio)
 }
 
 /// Repeatedly acquire a token, publish it to the shared cache, and sleep
@@ -364,7 +382,14 @@ async fn refresh_loop(params: RefresherParams, shutdown: CancellationToken) {
 
     let mut failures: u32 = 0;
     loop {
-        let delay = if let Some(delay) = refresh_once(&client, &params).await {
+        // Race the fetch against cancellation so a pipeline drop is not
+        // blocked behind an in-flight token request (up to its 30s
+        // timeout) — `RefreshHandle::drop` only waits `JOIN_TIMEOUT`.
+        let refreshed = tokio::select! {
+            refreshed = refresh_once(&client, &params) => refreshed,
+            () = shutdown.cancelled() => break,
+        };
+        let delay = if let Some(delay) = refreshed {
             failures = 0;
             delay
         } else {
@@ -395,6 +420,11 @@ pub struct AzureAdFilter {
     /// Lock-free cache of the current token, populated by the background
     /// refresher and read on every request.
     token: Arc<ArcSwap<Option<CachedToken>>>,
+
+    /// Whether the filter is currently failing closed, so the missing-
+    /// token condition is logged on state transitions instead of once
+    /// per rejected request.
+    failing: AtomicBool,
 
     /// Background refresher; stops when the filter is dropped.
     _refresh: RefreshHandle,
@@ -437,6 +467,7 @@ impl AzureAdFilter {
 
         Ok(Self {
             token: shared,
+            failing: AtomicBool::new(false),
             _refresh: refresh,
         })
     }
@@ -471,9 +502,12 @@ impl praxis_filter::HttpFilter for AzureAdFilter {
         &self,
         ctx: &mut praxis_filter::HttpFilterContext<'_>,
     ) -> Result<praxis_filter::FilterAction, FilterError> {
-        let cached = self.token.load_full();
+        let cached = self.token.load();
         match cached.as_ref() {
             Some(token) if token.is_valid(Instant::now()) => {
+                if self.failing.swap(false, Ordering::Relaxed) {
+                    warn!("azure_ad: valid token available again; resuming request forwarding");
+                }
                 // Cheap: clone a pre-formatted, sensitive HeaderValue.
                 ctx.request_headers_to_set
                     .push((header::AUTHORIZATION, token.authorization.clone()));
@@ -481,7 +515,11 @@ impl praxis_filter::HttpFilter for AzureAdFilter {
             },
             _ => {
                 // Fail closed: never forward an unauthenticated request.
-                warn!("azure_ad: no valid cached token; rejecting with 503");
+                // Log on the state transition, not per rejected request,
+                // so a token outage under load cannot flood the logs.
+                if !self.failing.swap(true, Ordering::Relaxed) {
+                    warn!("azure_ad: no valid cached token; rejecting requests with 503 until one is available");
+                }
                 Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(
                     503,
                 )))
@@ -516,8 +554,9 @@ pub(crate) struct AzureAdConfig {
     #[serde(default = "default_authority_host")]
     pub(crate) authority_host: String,
 
-    /// Fraction of a token's TTL at which to refresh it. Must be in the
-    /// open interval `(0, 1)`.
+    /// Fraction of a token's usable lifetime (TTL minus the expiry
+    /// safety margin) at which to refresh it. Must be in the open
+    /// interval `(0, 1)`.
     #[serde(default = "default_refresh_ratio")]
     pub(crate) refresh_ratio: f64,
 }
@@ -812,6 +851,7 @@ mod tests {
     fn test_filter(token: Option<CachedToken>) -> AzureAdFilter {
         AzureAdFilter {
             token: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(token)),
+            failing: std::sync::atomic::AtomicBool::new(false),
             _refresh: RefreshHandle {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 thread: None,
@@ -933,13 +973,21 @@ mod tests {
         assert!(delay >= MIN_REFRESH_DELAY, "refresh delay must respect the floor");
 
         let cached = shared.load_full();
-        match &*cached {
-            Some(token) => assert!(
-                token.is_valid(std::time::Instant::now()),
-                "a 40s token must be usable now, not cached already-expired"
-            ),
-            None => panic!("a successful fetch must cache a token"),
-        }
+        let token = cached.as_ref().as_ref().expect("a successful fetch must cache a token");
+        let now = std::time::Instant::now();
+        assert!(
+            token.is_valid(now),
+            "a 40s token must be usable now, not cached already-expired"
+        );
+        // Regression: the refresh must be scheduled from the
+        // skew-adjusted usable lifetime. Scheduling from the raw
+        // TTL (0.75 * 40s = 30s) lands past the cached expiry
+        // (40s - 20s skew = 20s), leaving a guaranteed window of
+        // 503s every cycle even with a healthy token endpoint.
+        assert!(
+            token.is_valid(now + delay),
+            "the cached token must still be valid when the scheduled refresh fires"
+        );
         server.join().unwrap();
     }
 
