@@ -84,6 +84,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request (and eventually response) bodies. The provider determines whether content should be passed, blocked, or redacted. |
 
+### Identity Guard
+
+| Filter | Description |
+|--------|-------------|
+| [`identity_header_guard`](identity_header_guard.md) | Captures request headers matching a configured prefix into `filter_metadata` and removes them from the upstream request. |
+
 ### Inference
 
 | Filter | Description |

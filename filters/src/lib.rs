@@ -17,6 +17,7 @@ pub mod callout;
 #[cfg(feature = "gcp-adc-filter")]
 pub mod gcp;
 pub mod guardrails;
+mod identity_guard;
 pub mod inference;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
@@ -35,6 +36,7 @@ pub use callout::HttpCalloutFilter;
 #[cfg(feature = "gcp-adc-filter")]
 pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;
+pub use identity_guard::IdentityHeaderGuardFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
