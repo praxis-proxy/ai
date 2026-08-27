@@ -60,9 +60,7 @@ pub(super) fn parse_openai(body: &[u8]) -> Option<TokenUsage> {
     if let Ok(response) = serde_json::from_slice::<OpenAiResponse>(body)
         && let Some(usage) = response.usage
     {
-        let cache_read = usage
-            .prompt_tokens_details
-            .and_then(|details| details.cached_tokens);
+        let cache_read = usage.prompt_tokens_details.and_then(|details| details.cached_tokens);
         return Some(
             TokenUsage::new(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
                 .with_cache(cache_read, NO_CACHE_WRITE),
@@ -92,11 +90,8 @@ pub(super) fn parse_openai(body: &[u8]) -> Option<TokenUsage> {
 fn responses_api_usage(usage: ResponsesApiUsage) -> TokenUsage {
     // `input_tokens` already includes any cached tokens, so the cache read
     // count is recorded as a breakdown of the input rather than added to it.
-    let cache_read = usage
-        .input_tokens_details
-        .and_then(|details| details.cached_tokens);
-    TokenUsage::new(usage.input_tokens, usage.output_tokens, usage.total_tokens)
-        .with_cache(cache_read, NO_CACHE_WRITE)
+    let cache_read = usage.input_tokens_details.and_then(|details| details.cached_tokens);
+    TokenUsage::new(usage.input_tokens, usage.output_tokens, usage.total_tokens).with_cache(cache_read, NO_CACHE_WRITE)
 }
 
 /// Wrapper for OpenAI Responses API `response.completed` SSE events.
@@ -352,11 +347,7 @@ mod tests {
             Some(120),
             "cached input should be reported as a cache-read breakdown"
         );
-        assert_eq!(
-            usage.cache_write_tokens(),
-            None,
-            "OpenAI reports no cache-write count"
-        );
+        assert_eq!(usage.cache_write_tokens(), None, "OpenAI reports no cache-write count");
     }
 
     #[test]
