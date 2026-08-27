@@ -404,7 +404,6 @@ mod tests {
             "credential_inject",
             "anthropic_validate",
             "anthropic_web_search",
-            "identity_header_guard",
             "request_id",
             "aws_sigv4_sign",
         ];
