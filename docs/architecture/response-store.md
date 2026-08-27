@@ -141,19 +141,19 @@ pass-through traffic is not held.
 
 ## Key Files
 
-- `filter/src/builtins/http/ai/openai/responses/store/filter.rs`:
+- `apis/src/openai/responses/store/filter.rs`:
   filter implementation and lifecycle
-- `filter/src/builtins/http/ai/openai/responses/store/config.rs`:
+- `apis/src/openai/responses/store/config.rs`:
   configuration, SSRF validation
-- `filter/src/builtins/http/ai/store/trait_def.rs`:
+- `apis/src/store/trait_def.rs`:
   `ResponseStore` trait
-- `filter/src/builtins/http/ai/store/types.rs`:
+- `apis/src/store/types.rs`:
   `ResponseRecord`, `StoreError`
-- `filter/src/builtins/http/ai/store/sqlite.rs`:
+- `apis/src/store/sqlite.rs`:
   SQLite backend
-- `filter/src/builtins/http/ai/store/postgres.rs`:
+- `apis/src/store/postgres.rs`:
   PostgreSQL backend
-- `filter/src/builtins/http/ai/store/schemas.rs`:
+- `apis/src/store/schemas.rs`:
   DDL generation and identifier validation
 
 ## Related

@@ -14,7 +14,10 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::StreamEventsState;
-use crate::openai::{responses::state::ResponsesState, sse::responses::ResponsesEvent};
+use crate::openai::{
+    responses::{state::ResponsesState, usage::merge_usage},
+    sse::responses::ResponsesEvent,
+};
 
 /// Process a single SSE event, updating `ResponsesState` in
 /// extensions and per-filter accumulation state.
@@ -105,30 +108,6 @@ pub(super) fn accumulate_response_object(
 
     debug!(status, "complete response received, ResponsesState updated");
     had_prior_usage
-}
-
-/// Saturating recursive sum for numeric token-usage fields.
-pub(crate) fn merge_usage(accumulated: &mut Value, current: &Value) {
-    match (accumulated, current) {
-        (Value::Object(accumulated), Value::Object(current)) => {
-            for (key, value) in current {
-                match accumulated.get_mut(key) {
-                    Some(existing) => merge_usage(existing, value),
-                    None => {
-                        accumulated.insert(key.clone(), value.clone());
-                    },
-                }
-            }
-        },
-        (Value::Number(accumulated), Value::Number(current)) => {
-            if let (Some(left), Some(right)) = (accumulated.as_u64(), current.as_u64()) {
-                *accumulated = serde_json::Number::from(left.saturating_add(right));
-            } else {
-                *accumulated = current.clone();
-            }
-        },
-        (accumulated, current) => current.clone_into(accumulated),
-    }
 }
 
 /// Push a new output item to the incremental accumulator.

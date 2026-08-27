@@ -3,7 +3,10 @@
 
 //! Input item pagination for the `OpenAI` Responses API.
 
-use crate::store::{ResponseRecord, StoreError};
+use crate::{
+    openai::include::{IncludeFields, project_item},
+    store::{ResponseRecord, StoreError},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -98,7 +101,15 @@ pub struct InputItemPage {
 ///
 /// Returns [`StoreError::InvalidInput`] if the cursor is malformed
 /// or overflows while calculating the page window.
-pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<InputItemPage, StoreError> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "pagination logic benefits from single-function locality"
+)]
+pub fn list_input_items(
+    record: &ResponseRecord,
+    params: &ListParams,
+    includes: IncludeFields,
+) -> Result<InputItemPage, StoreError> {
     let mut items = normalize_input_items(record);
     if params.order == Order::Descending {
         items.reverse();
@@ -118,7 +129,15 @@ pub fn list_input_items(record: &ResponseRecord, params: &ListParams) -> Result<
         .min(items.len());
     let has_more = end < items.len();
 
-    let data: Vec<serde_json::Value> = items.iter().skip(offset).take(limit).cloned().collect();
+    let data: Vec<serde_json::Value> = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|mut item| {
+            project_item(&mut item, includes);
+            item
+        })
+        .collect();
 
     let next_cursor = page_next_cursor(&data, end, has_more);
 

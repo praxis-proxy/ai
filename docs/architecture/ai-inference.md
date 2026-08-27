@@ -170,18 +170,16 @@ Persists non-streaming Responses API responses. See
 
 ## Key Files
 
-- `filter/src/builtins/http/ai/classifier/mod.rs`:
+- `apis/src/classifier/mod.rs`:
   pure format classifier
-- `filter/src/builtins/http/ai/openai/responses/mod.rs`:
+- `apis/src/openai/responses/mod.rs`:
   `ResponsesFormatFilter`
-- `filter/src/builtins/http/ai/inference/model_to_header.rs`:
+- `filters/src/inference/model_to_header.rs`:
   `ModelToHeaderFilter`
-- `filter/src/builtins/http/ai/prompt_enrich/`:
+- `filters/src/prompt_enrich/`:
   prompt enrichment filter
-- `filter/src/builtins/http/ai/anthropic/`:
+- `apis/src/anthropic/`:
   Anthropic Messages format filter
-- `filter/src/body/mode.rs`:
-  `BodyMode::StreamBuffer` definition
 
 ## Related
 

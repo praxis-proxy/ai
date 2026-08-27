@@ -10,6 +10,7 @@
 )]
 pub(crate) mod api_client;
 pub(crate) mod conversations;
+pub(crate) mod include;
 mod operation;
 pub(crate) mod responses;
 pub(crate) mod sse;

@@ -1518,6 +1518,40 @@ fn task_routing_rejects_zero_ttl() {
 }
 
 #[test]
+fn task_routing_rejects_ttl_above_ceiling() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        task_routing:
+          enabled: true
+          ttl_seconds: 18446744073709551615
+        "#,
+    )
+    .unwrap();
+    let err = A2aFilter::from_config(&yaml).err().expect("should fail");
+    assert!(
+        err.to_string().contains("ttl_seconds") && err.to_string().contains("exceeds maximum"),
+        "ttl_seconds=u64::MAX should be rejected: {err}"
+    );
+}
+
+#[test]
+fn task_routing_rejects_terminal_ttl_above_ceiling() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        task_routing:
+          enabled: true
+          terminal_ttl_seconds: 18446744073709551615
+        "#,
+    )
+    .unwrap();
+    let err = A2aFilter::from_config(&yaml).err().expect("should fail");
+    assert!(
+        err.to_string().contains("terminal_ttl_seconds") && err.to_string().contains("exceeds maximum"),
+        "terminal_ttl_seconds=u64::MAX should be rejected: {err}"
+    );
+}
+
+#[test]
 fn task_routing_rejects_zero_max_response_body_bytes() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -2810,7 +2844,7 @@ async fn sse_streaming_capture_invalid_json_does_not_fail() {
 }
 
 #[tokio::test]
-async fn sse_streaming_capture_oversized_scratch_clears_state() {
+async fn sse_streaming_capture_oversized_scratch_drops_event_and_continues() {
     let filter = make_task_routing_filter_with_config(
         r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "max_response_body_bytes": 32}}"#,
     );
@@ -2826,9 +2860,13 @@ async fn sse_streaming_capture_oversized_scratch_clears_state() {
 
     assert!(
         store.get_by_task_id("task-big").is_none(),
-        "oversized SSE scratch should skip capture"
+        "oversized SSE event should be discarded, not parsed"
     );
-    assert_sse_capture_cleared(&ctx);
+    assert_eq!(
+        ctx.get_metadata("a2a.response.sse_capture_enabled"),
+        Some("true"),
+        "capture should remain enabled after discarding one oversized event"
+    );
 }
 
 #[tokio::test]
@@ -3178,7 +3216,7 @@ async fn sse_streaming_capture_artifact_update_event() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn valid_task_before_oversized_sse_frame_stores_route_and_clears_capture() {
+async fn valid_task_before_and_after_oversized_sse_frame_are_both_stored() {
     let filter = make_task_routing_filter_with_config(
         r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "max_response_body_bytes": 128}}"#,
     );
@@ -3189,11 +3227,13 @@ async fn valid_task_before_oversized_sse_frame_stores_route_and_clears_capture()
     seed_sse_capture(&mut ctx);
 
     // First event (~110 bytes) fits within 128-byte limit.
-    // Second event (~200+ bytes) overflows.
+    // Second event (~200+ bytes) overflows and is dropped.
+    // Third event fits again, verifying capture recovered.
     let padding = "x".repeat(100);
     let sse = format!(
         "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"task\":{{\"id\":\"task-pre-overflow\",\"status\":{{\"state\":\"TASK_STATE_WORKING\"}}}}}}}}\n\n\
-         data: {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"task\":{{\"id\":\"task-big\",\"status\":{{\"state\":\"TASK_STATE_WORKING\"}},\"padding\":\"{padding}\"}}}}}}\n\n"
+         data: {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"task\":{{\"id\":\"task-big\",\"status\":{{\"state\":\"TASK_STATE_WORKING\"}},\"padding\":\"{padding}\"}}}}}}\n\n\
+         data: {{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"task\":{{\"id\":\"task-post-overflow\",\"status\":{{\"state\":\"TASK_STATE_WORKING\"}}}}}}}}\n\n"
     );
     let sse_data = sse.as_bytes();
     let mut body = Some(Bytes::from(sse_data.to_vec()));
@@ -3202,9 +3242,17 @@ async fn valid_task_before_oversized_sse_frame_stores_route_and_clears_capture()
     assert_eq!(
         store.get_by_task_id("task-pre-overflow").as_deref(),
         Some("agent-a"),
-        "completed event before overflow should still be captured"
+        "event before overflow should still be captured"
     );
-    assert_sse_capture_cleared(&ctx);
+    assert!(
+        store.get_by_task_id("task-big").is_none(),
+        "the oversized event itself should be discarded"
+    );
+    assert_eq!(
+        store.get_by_task_id("task-post-overflow").as_deref(),
+        Some("agent-a"),
+        "capture should recover and store the event after the oversized one"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -3388,7 +3436,6 @@ fn scan_json_balance_is_a_no_op_once_invalid() {
     );
     assert!(!state.is_complete(), "an invalid scan must never report complete");
 }
-
 
 #[test]
 fn scan_json_balance_persists_across_chunk_calls() {

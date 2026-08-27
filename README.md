@@ -114,7 +114,7 @@ Released container images are available from
 development instructions are in the [development guide].
 
 ```console
-docker pull ghcr.io/praxis-proxy/ai:0.1
+docker pull ghcr.io/praxis-proxy/ai:0.2
 ```
 
 Podman can pull the same OCI image. See the [quickstart] for a source build

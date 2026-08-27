@@ -17,15 +17,18 @@ use tracing::debug;
 use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
-        CreateConversationRequest, DeletedConversationResource, IncludeField, IncludeFields, ItemOrder,
-        MAX_ITEMS_PER_REQUEST, Metadata, UpdateConversationRequest,
+        CreateConversationRequest, DeletedConversationResource, ItemOrder, MAX_ITEMS_PER_REQUEST, Metadata,
+        UpdateConversationRequest,
     },
     validate::{MetadataError, validate_metadata},
 };
 use crate::{
-    openai::responses::{
-        DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
-        store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
+    openai::{
+        include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
+        responses::{
+            DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
+            store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
+        },
     },
     store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
 };
@@ -136,6 +139,11 @@ pub(super) async fn handle_get_conversation(
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
 
     match store.get_conversation(tenant_id, conversation_id).await {
         Ok(Some(record)) => {
@@ -161,6 +169,11 @@ pub(super) async fn handle_update_conversation(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
     if body.is_empty() {
         return Ok(FilterAction::Reject(invalid_input_response_with(
             "Missing required parameter: 'metadata'.",
@@ -225,6 +238,11 @@ pub(super) async fn handle_delete_conversation(
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
 
     match store.delete_conversation(tenant_id, conversation_id).await {
         Ok(true) => {
@@ -256,11 +274,16 @@ pub(super) async fn handle_create_items(
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
     let input: CreateConversationItemsRequest = match parse_json_body(body) {
         Ok(v) => v,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let includes = match parse_include_fields(ctx.request.uri.query()) {
+    let includes = match parse_include(ctx.request.uri.query()) {
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
@@ -336,7 +359,12 @@ pub(super) async fn handle_list_items(
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let includes = match parse_include_fields(ctx.request.uri.query()) {
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
+    let includes = match parse_include(ctx.request.uri.query()) {
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
@@ -378,6 +406,7 @@ pub(super) async fn handle_list_items(
 }
 
 /// Handle `GET /v1/conversations/{id}/items/{item_id}` — retrieve one item.
+#[expect(clippy::too_many_lines, reason = "decode both path parameters then look up")]
 pub(super) async fn handle_get_item(
     ctx: &HttpFilterContext<'_>,
     store: &dyn ConversationItemStore,
@@ -385,19 +414,24 @@ pub(super) async fn handle_get_item(
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let includes = match parse_include_fields(ctx.request.uri.query()) {
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
+        Ok(id) => id,
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
+    let includes = match parse_include(ctx.request.uri.query()) {
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let item_id = match decode_item_id_path_segment(item_id) {
+    let item_id = match decoded_path_param("item id", item_id) {
         Ok(id) => id,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(action) => return action,
     };
     let item_id = item_id.as_ref();
     match store.get_conversation_item(tenant_id, conversation_id, item_id).await {
         Ok(Some(record)) => {
             let mut item_data = record.item_data;
-            project_conversation_item(&mut item_data, includes);
+            project_item(&mut item_data, includes);
             let item = ConversationItem::from_value(item_data);
             Ok(FilterAction::Reject(json_response(200, &item)?))
         },
@@ -421,9 +455,14 @@ pub(super) async fn handle_delete_item(
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
     let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-    let item_id = match decode_item_id_path_segment(item_id) {
+    let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(action) => return action,
+    };
+    let conversation_id = conversation_id.as_ref();
+    let item_id = match decoded_path_param("item id", item_id) {
+        Ok(id) => id,
+        Err(action) => return action,
     };
     let item_id = item_id.as_ref();
     let existing = match store.get_conversation(tenant_id, conversation_id).await {
@@ -611,11 +650,19 @@ pub(super) fn generated_item_id(ctx: &HttpFilterContext<'_>) -> String {
     format!("item_{raw_id}")
 }
 
-/// Decode an item ID path segment the same way clients encode path parameters.
-fn decode_item_id_path_segment(item_id: &str) -> Result<Cow<'_, str>, String> {
-    percent_decode_str(item_id)
+/// Decode a URI path parameter the same way clients encode path segments.
+fn decode_path_segment<'a>(kind: &str, value: &'a str) -> Result<Cow<'a, str>, String> {
+    percent_decode_str(value)
         .decode_utf8()
-        .map_err(|e| format!("item id path segment must be valid UTF-8: {e}"))
+        .map_err(|e| format!("{kind} path segment must be valid UTF-8: {e}"))
+}
+
+/// Decode a path parameter or return the invalid-input rejection.
+fn decoded_path_param<'a>(
+    kind: &'static str,
+    value: &'a str,
+) -> Result<Cow<'a, str>, Result<FilterAction, FilterError>> {
+    decode_path_segment(kind, value).map_err(|msg| invalid_input_response(&msg).map(FilterAction::Reject))
 }
 
 /// Move a stored conversation into its public response contract.
@@ -648,162 +695,11 @@ fn conversation_items_response(
             last_id = record.item_id;
         }
         let mut item_data = record.item_data;
-        project_conversation_item(&mut item_data, includes);
+        project_item(&mut item_data, includes);
         data.push(ConversationItem::from_value(item_data));
     }
 
     ConversationItemList::new(data, has_more, first_id, last_id)
-}
-
-/// Remove optional fields that were not requested through `include`.
-///
-/// Projection changes only the response-owned value after the complete item
-/// representation has crossed the storage boundary.
-fn project_conversation_item(item: &mut Value, includes: IncludeFields) {
-    let Some(object) = item.as_object_mut() else {
-        return;
-    };
-    match projection_kind(object) {
-        ProjectionKind::Reasoning => remove_unless_included(
-            object,
-            "encrypted_content",
-            includes.contains(IncludeField::ReasoningEncryptedContent),
-        ),
-        ProjectionKind::FileSearch => remove_unless_included(
-            object,
-            "results",
-            includes.contains(IncludeField::FileSearchCallResults),
-        ),
-        ProjectionKind::WebSearch => project_web_search_fields(object, includes),
-        ProjectionKind::CodeInterpreter => remove_unless_included(
-            object,
-            "outputs",
-            includes.contains(IncludeField::CodeInterpreterCallOutputs),
-        ),
-        ProjectionKind::ComputerOutput => project_computer_output_fields(object, includes),
-        ProjectionKind::Message => project_message_fields(object, includes),
-        ProjectionKind::Other => {},
-    }
-}
-
-/// Item variants with fields controlled by `include`.
-#[derive(Clone, Copy)]
-enum ProjectionKind {
-    /// Reasoning item with optional encrypted content.
-    Reasoning,
-    /// File-search call with optional results.
-    FileSearch,
-    /// Web-search call with optional results and sources.
-    WebSearch,
-    /// Code-interpreter call with optional outputs.
-    CodeInterpreter,
-    /// Computer-call output with an optional image URL.
-    ComputerOutput,
-    /// Message with optional fields in typed content parts.
-    Message,
-    /// Item without any fields controlled by `include`.
-    Other,
-}
-
-/// Classify an item without retaining a borrow into the mutable object.
-fn projection_kind(object: &Map<String, Value>) -> ProjectionKind {
-    match object.get("type").and_then(Value::as_str) {
-        Some("reasoning") => ProjectionKind::Reasoning,
-        Some("file_search_call") => ProjectionKind::FileSearch,
-        Some("web_search_call") => ProjectionKind::WebSearch,
-        Some("code_interpreter_call") => ProjectionKind::CodeInterpreter,
-        Some("computer_call_output") => ProjectionKind::ComputerOutput,
-        Some("message") => ProjectionKind::Message,
-        _ => ProjectionKind::Other,
-    }
-}
-
-/// Remove one top-level field unless it was explicitly requested.
-fn remove_unless_included(object: &mut Map<String, Value>, field: &str, included: bool) {
-    if !included {
-        object.remove(field);
-    }
-}
-
-/// Project web-search fields controlled by independent include values.
-fn project_web_search_fields(object: &mut Map<String, Value>, includes: IncludeFields) {
-    remove_unless_included(object, "results", includes.contains(IncludeField::WebSearchCallResults));
-    if !includes.contains(IncludeField::WebSearchCallActionSources)
-        && let Some(action) = object.get_mut("action").and_then(Value::as_object_mut)
-    {
-        action.remove("sources");
-    }
-}
-
-/// Project the nested image URL from a computer-call output.
-fn project_computer_output_fields(object: &mut Map<String, Value>, includes: IncludeFields) {
-    if !includes.contains(IncludeField::ComputerCallOutputImageUrl)
-        && let Some(output) = object.get_mut("output").and_then(Value::as_object_mut)
-    {
-        output.remove("image_url");
-    }
-}
-
-/// Project optional fields from typed message content parts.
-fn project_message_fields(object: &mut Map<String, Value>, includes: IncludeFields) {
-    let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for part in content {
-        let Some(part) = part.as_object_mut() else {
-            continue;
-        };
-        if part.get("type").and_then(Value::as_str) == Some("input_image")
-            && !includes.contains(IncludeField::MessageInputImageImageUrl)
-        {
-            part.remove("image_url");
-        } else if part.get("type").and_then(Value::as_str) == Some("output_text")
-            && !includes.contains(IncludeField::MessageOutputTextLogprobs)
-        {
-            part.remove("logprobs");
-        }
-    }
-}
-
-/// Parse both official SDK encodings for the array-valued `include` query:
-/// repeated `include=value` pairs and bracketed `include[]=value` pairs.
-fn parse_include_fields(query: Option<&str>) -> Result<IncludeFields, String> {
-    let Some(query) = query else {
-        return Ok(IncludeFields::default());
-    };
-
-    let mut includes = IncludeFields::default();
-    for pair in query.split('&') {
-        let Some((raw_key, raw_value)) = pair.split_once('=') else {
-            let key = decode_query_component_strict(pair)?;
-            if matches!(key.as_ref(), "include" | "include[]") {
-                return Err("'include' query parameter requires a value".to_owned());
-            }
-            continue;
-        };
-        let key = decode_query_component_strict(raw_key)?;
-        if !matches!(key.as_ref(), "include" | "include[]") {
-            continue;
-        }
-        let value = decode_query_component_strict(raw_value)?;
-        let field = IncludeField::parse(&value).ok_or_else(|| format!("unsupported include value: '{value}'"))?;
-        includes.insert(field);
-    }
-    Ok(includes)
-}
-
-/// Strictly decode one query component, including form-style `+` spaces.
-fn decode_query_component_strict(value: &str) -> Result<Cow<'_, str>, String> {
-    if value.contains('+') {
-        let normalized = value.replace('+', " ");
-        return percent_decode_str(&normalized)
-            .decode_utf8()
-            .map(|decoded| Cow::Owned(decoded.into_owned()))
-            .map_err(|e| format!("query parameter must be valid UTF-8: {e}"));
-    }
-    percent_decode_str(value)
-        .decode_utf8()
-        .map_err(|e| format!("query parameter must be valid UTF-8: {e}"))
 }
 
 /// Parse and validate cursor-based pagination parameters from a query string.
@@ -1132,12 +1028,12 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // decode_item_id_path_segment
+    // decode_path_segment
     // -------------------------------------------------------------------------
 
     #[test]
     fn decode_item_id_path_segment_invalid_utf8_returns_error() {
-        let result = decode_item_id_path_segment("%FF%FE");
+        let result = decode_path_segment("item id", "%FF%FE");
         assert!(result.is_err(), "invalid UTF-8 should return error");
         assert!(
             result.unwrap_err().contains("valid UTF-8"),
@@ -1343,173 +1239,38 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // include parsing and projection
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn parse_include_fields_supports_python_and_node_sdk_encodings() {
-        let includes = parse_include_fields(Some(
-            "include=reasoning.encrypted_content&include%5B%5D=message.output_text.logprobs",
-        ))
-        .unwrap();
-
-        assert!(
-            includes.contains(IncludeField::ReasoningEncryptedContent),
-            "repeated-key encoding should parse reasoning encrypted content"
-        );
-        assert!(
-            includes.contains(IncludeField::MessageOutputTextLogprobs),
-            "bracket encoding should parse output-text log probabilities"
-        );
-        assert!(
-            !includes.contains(IncludeField::FileSearchCallResults),
-            "unrequested include values must remain absent"
-        );
-    }
-
-    #[test]
-    fn parse_include_fields_rejects_unknown_or_malformed_values() {
-        let unknown = parse_include_fields(Some("include=future.secret_field")).unwrap_err();
-        assert!(
-            unknown.contains("unsupported include value"),
-            "unknown values should produce an unsupported-value diagnostic: {unknown}"
-        );
-
-        let missing = parse_include_fields(Some("include")).unwrap_err();
-        assert!(
-            missing.contains("requires a value"),
-            "missing include values should identify the required value: {missing}"
-        );
-
-        let invalid_utf8 = parse_include_fields(Some("include=%FF")).unwrap_err();
-        assert!(
-            invalid_utf8.contains("valid UTF-8"),
-            "invalid encoding should identify the UTF-8 requirement: {invalid_utf8}"
-        );
-    }
-
-    #[test]
-    #[expect(clippy::too_many_lines, reason = "one fixture covers every include projection path")]
-    fn projection_removes_every_unrequested_include_gated_field() {
-        let mut items = vec![
-            serde_json::json!({
-                "type": "reasoning",
-                "encrypted_content": "secret",
-                "summary": []
-            }),
-            serde_json::json!({
-                "type": "file_search_call",
-                "results": [{"file_id": "file_1"}],
-                "status": "completed"
-            }),
-            serde_json::json!({
-                "type": "web_search_call",
-                "results": [{"url": "https://example.com"}],
-                "action": {
-                    "type": "search",
-                    "sources": [{"type": "url", "url": "https://example.com"}]
-                }
-            }),
-            serde_json::json!({
-                "type": "code_interpreter_call",
-                "outputs": [{"type": "logs", "logs": "done"}],
-                "status": "completed"
-            }),
-            serde_json::json!({
-                "type": "computer_call_output",
-                "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AA=="}
-            }),
-            serde_json::json!({
-                "type": "message",
-                "content": [
-                    {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "auto"},
-                    {"type": "output_text", "text": "answer", "annotations": [], "logprobs": []},
-                    {"type": "input_text", "text": "keep me"}
-                ]
-            }),
-        ];
-
-        for item in &mut items {
-            project_conversation_item(item, IncludeFields::default());
-        }
-
-        assert!(
-            items[0].get("encrypted_content").is_none(),
-            "reasoning encrypted content should be omitted"
-        );
-        assert!(
-            items[1].get("results").is_none(),
-            "file-search results should be omitted"
-        );
-        assert!(
-            items[2].get("results").is_none(),
-            "web-search results should be omitted"
-        );
-        assert!(
-            items[2]["action"].get("sources").is_none(),
-            "web-search action sources should be omitted"
-        );
-        assert!(
-            items[3].get("outputs").is_none(),
-            "code-interpreter outputs should be omitted"
-        );
-        assert!(
-            items[4]["output"].get("image_url").is_none(),
-            "computer-output image URLs should be omitted"
-        );
-        assert!(
-            items[5]["content"][0].get("image_url").is_none(),
-            "message input-image URLs should be omitted"
-        );
-        assert!(
-            items[5]["content"][1].get("logprobs").is_none(),
-            "message output-text log probabilities should be omitted"
-        );
-        assert_eq!(items[5]["content"][2]["text"], "keep me");
-    }
-
-    #[test]
-    fn projection_preserves_every_requested_include_gated_field() {
-        let mut includes = IncludeFields::default();
-        for field in [
-            IncludeField::FileSearchCallResults,
-            IncludeField::WebSearchCallResults,
-            IncludeField::WebSearchCallActionSources,
-            IncludeField::MessageInputImageImageUrl,
-            IncludeField::ComputerCallOutputImageUrl,
-            IncludeField::CodeInterpreterCallOutputs,
-            IncludeField::ReasoningEncryptedContent,
-            IncludeField::MessageOutputTextLogprobs,
-        ] {
-            includes.insert(field);
-        }
-        let original = serde_json::json!({
-            "type": "message",
-            "content": [
-                {"type": "input_image", "image_url": "https://example.com/image.png"},
-                {"type": "output_text", "logprobs": [{"token": "x"}]}
-            ]
-        });
-        let mut projected = original.clone();
-
-        project_conversation_item(&mut projected, includes);
-
-        assert_eq!(projected, original);
-    }
-
-    // -------------------------------------------------------------------------
-    // decode_item_id_path_segment — additional cases
+    // decode_path_segment — additional cases
     // -------------------------------------------------------------------------
 
     #[test]
     fn decode_item_id_plain_ascii_passes_through() {
-        let result = decode_item_id_path_segment("item_abc123").unwrap();
+        let result = decode_path_segment("item id", "item_abc123").unwrap();
         assert_eq!(result.as_ref(), "item_abc123");
     }
 
     #[test]
     fn decode_item_id_percent_encoded_ascii() {
-        let result = decode_item_id_path_segment("item%5Fabc").unwrap();
+        let result = decode_path_segment("item id", "item%5Fabc").unwrap();
         assert_eq!(result.as_ref(), "item_abc", "percent-encoded underscore should decode");
+    }
+
+    #[test]
+    fn decode_conversation_id_percent_encoded_ascii() {
+        let result = decode_path_segment("conversation id", "conv%5Fabc").unwrap();
+        assert_eq!(
+            result.as_ref(),
+            "conv_abc",
+            "percent-encoded conversation underscore should decode"
+        );
+    }
+
+    #[test]
+    fn decode_conversation_id_invalid_utf8_returns_error() {
+        let result = decode_path_segment("conversation id", "%FF%FE");
+        assert!(result.is_err(), "invalid UTF-8 should return error");
+        assert!(
+            result.unwrap_err().contains("conversation id"),
+            "error should name the conversation id segment"
+        );
     }
 }

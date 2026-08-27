@@ -9,8 +9,13 @@
 //! inference routing, prompt enrichment, and token usage handling.
 
 pub mod agentic;
+pub mod aws;
+#[cfg(feature = "azure-ad-filter")]
+pub mod azure;
 #[cfg(feature = "http-callout-filter")]
 pub mod callout;
+#[cfg(feature = "gcp-adc-filter")]
+pub mod gcp;
 pub mod guardrails;
 pub mod inference;
 #[cfg(feature = "opentelemetry")]
@@ -22,8 +27,13 @@ mod time_to_first_token;
 mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
+pub use aws::Sigv4SignFilter;
+#[cfg(feature = "azure-ad-filter")]
+pub use azure::AzureAdFilter;
 #[cfg(feature = "http-callout-filter")]
 pub use callout::HttpCalloutFilter;
+#[cfg(feature = "gcp-adc-filter")]
+pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
 pub use prompt_enrich::PromptEnrichFilter;
@@ -86,6 +96,8 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
+            #[cfg(feature = "praxis-main")]
+            session_stores: None,
             metrics_route: None,
             peer_identity: None,
             request: req,
@@ -110,6 +122,8 @@ pub(crate) mod test_utils {
             cluster_retry_state_released: false,
             #[cfg(feature = "praxis-main")]
             endpoint_reselector: None,
+            #[cfg(feature = "praxis-main")]
+            pinned_endpoint_address: None,
             rewritten_path: None,
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,

@@ -538,8 +538,46 @@ async fn sse_final_event_without_trailing_blank_line() {
 // SSE: Scratch Overflow
 // -----------------------------------------------------------------------------
 
+/// Regression test for #674: an oversized event must not disable
+/// extraction for the rest of the stream. The scanner recovers at the
+/// next event boundary, so a terminal usage event arriving afterward is
+/// still captured and treated as authoritative (no overflow status).
 #[tokio::test]
-async fn sse_overflow_finalizes_partial_counts() {
+async fn sse_oversized_event_recovers_and_captures_terminal_usage() {
+    let mut events = b"data: ".to_vec();
+    events.extend(std::iter::repeat_n(b'x', DEFAULT_MAX_SCRATCH_BYTES + 1));
+    events.extend_from_slice(b"\n\n");
+    events.extend_from_slice(
+        b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\n",
+    );
+
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::from(events));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("10"),
+        "terminal usage should be captured after the oversized event is discarded"
+    );
+    assert_eq!(ctx.get_metadata("token.output"), Some("20"));
+    assert_eq!(ctx.get_metadata("token.total"), Some("30"));
+    assert!(
+        ctx.get_metadata("token.status").is_none(),
+        "recovered terminal usage after a dropped content event is authoritative"
+    );
+}
+
+#[tokio::test]
+async fn sse_overflow_does_not_finalize_mid_stream() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -558,10 +596,84 @@ async fn sse_overflow_finalizes_partial_counts() {
     let mut body2 = Some(Bytes::from(overflow_chunk));
     drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
 
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "overflow mid-stream should not finalize early; already-accumulated counts wait for end_of_stream"
+    );
+
+    let mut body3 = Some(Bytes::from_static(b"\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut body3, true).unwrap());
+
     assert_eq!(ctx.get_metadata("token.input"), Some("10"));
     assert_eq!(ctx.get_metadata("token.output"), Some("20"));
     assert_eq!(ctx.get_metadata("token.total"), Some("30"));
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "a drop after captured usage means later events (possibly a usage correction) were lost"
+    );
     assert_no_working_metadata(&ctx);
+}
+
+#[tokio::test]
+async fn sse_overflow_with_no_usage_sets_overflow_status() {
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let overflow_chunk = vec![b'x'; DEFAULT_MAX_SCRATCH_BYTES + 1];
+    let mut body = Some(Bytes::from(overflow_chunk));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "no usage was ever captured, so no counts should be written"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "billing consumers must not mistake this for zero usage"
+    );
+}
+
+/// Anthropic/Bedrock split usage across events. If partial counts were
+/// stored and the terminal usage event itself overflows, emit the
+/// partials *and* `token.status = overflow` so they are not treated as
+/// a complete capture.
+#[tokio::test]
+async fn sse_partial_then_oversized_terminal_event_sets_overflow_status() {
+    let mut filter = make_filter(ProviderKind::Anthropic);
+    filter.max_scratch_bytes = 256;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut events = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25}}}\n\n".to_vec();
+    events.extend_from_slice(b"data: ");
+    events.extend(std::iter::repeat_n(b'x', 257));
+    events.extend_from_slice(b"\n\n");
+    let mut body = Some(Bytes::from(events));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert_eq!(ctx.get_metadata("token.input"), Some("25"), "partial input kept");
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("0"),
+        "terminal output was dropped"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "partial maxima are not a complete capture when the terminal event overflowed"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -591,8 +703,10 @@ fn on_response_body_noop_without_mode() {
 // Buffer Overflow
 // -----------------------------------------------------------------------------
 
+/// Regression test for #674: overflow must not be indistinguishable
+/// from a genuine zero-usage response.
 #[tokio::test]
-async fn json_overflow_sets_nothing() {
+async fn json_overflow_sets_explicit_status_not_zero() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -608,14 +722,103 @@ async fn json_overflow_sets_nothing() {
 
     assert!(
         ctx.get_metadata("token.input").is_none(),
-        "overflow should not set tokens"
+        "overflow should not set counts"
     );
-    let working_keys: Vec<_> = ctx
-        .filter_metadata
-        .keys()
-        .filter(|k| k.starts_with(META_PREFIX))
-        .collect();
-    assert!(working_keys.is_empty(), "overflow should clear all working metadata");
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "billing consumers must not mistake missing counts for zero usage"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+/// A valid response with usage near the end but larger than the
+/// configured limit exhibits the same overflow signal, not silence.
+#[tokio::test]
+async fn json_valid_usage_beyond_configured_limit_sets_overflow_status() {
+    let mut filter = make_filter(ProviderKind::OpenAi);
+    filter.max_body_bytes = 64;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let padding = "x".repeat(200);
+    let json = format!(
+        r#"{{"id":"resp-1","padding":"{padding}","usage":{{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}}}"#
+    );
+    let mut body = Some(Bytes::from(json.into_bytes()));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(ctx.get_metadata("token.input").is_none());
+    assert_eq!(ctx.get_metadata("token.status"), Some("overflow"));
+}
+
+#[test]
+fn max_body_bytes_configurable_via_yaml() {
+    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_body_bytes: 4096").unwrap();
+    let filter = TokenCountFilter::from_config(&config).unwrap();
+
+    assert_eq!(filter.name(), "token_count");
+}
+
+#[test]
+fn max_scratch_bytes_configurable_via_yaml() {
+    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_scratch_bytes: 512").unwrap();
+    let filter = TokenCountFilter::from_config(&config).unwrap();
+
+    assert_eq!(filter.name(), "token_count");
+}
+
+#[test]
+fn from_config_rejects_zero_max_body_bytes() {
+    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_body_bytes: 0").unwrap();
+    match TokenCountFilter::from_config(&config) {
+        Err(err) => assert!(
+            err.to_string().contains("max_body_bytes"),
+            "should reject zero max_body_bytes: {err}"
+        ),
+        Ok(_) => panic!("should reject zero max_body_bytes"),
+    }
+}
+
+#[test]
+fn from_config_rejects_zero_max_scratch_bytes() {
+    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_scratch_bytes: 0").unwrap();
+    match TokenCountFilter::from_config(&config) {
+        Err(err) => assert!(
+            err.to_string().contains("max_scratch_bytes"),
+            "should reject zero max_scratch_bytes: {err}"
+        ),
+        Ok(_) => panic!("should reject zero max_scratch_bytes"),
+    }
+}
+
+#[test]
+fn from_config_rejects_max_body_bytes_above_ceiling() {
+    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_body_bytes: 67108865").unwrap();
+    match TokenCountFilter::from_config(&config) {
+        Err(err) => assert!(
+            err.to_string().contains("exceeds maximum"),
+            "should reject max_body_bytes above 64 MiB: {err}"
+        ),
+        Ok(_) => panic!("should reject max_body_bytes above 64 MiB"),
+    }
+}
+
+#[test]
+fn from_config_rejects_max_scratch_bytes_above_ceiling() {
+    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_scratch_bytes: 67108865").unwrap();
+    match TokenCountFilter::from_config(&config) {
+        Err(err) => assert!(
+            err.to_string().contains("max_scratch_bytes") && err.to_string().contains("exceeds maximum"),
+            "should reject max_scratch_bytes above 64 MiB: {err}"
+        ),
+        Ok(_) => panic!("should reject max_scratch_bytes above 64 MiB"),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -836,13 +1039,191 @@ fn on_response_body_noop_for_bedrock_invoke_model() {
 }
 
 // -----------------------------------------------------------------------------
+// Prompt Cache Breakdown
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn json_anthropic_records_cache_breakdown() {
+    let json = br#"{"usage":{"input_tokens":50,"output_tokens":100,"cache_creation_input_tokens":1000,"cache_read_input_tokens":5000}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Anthropic, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("5000"), "Anthropic cache read tokens");
+    assert_eq!(cache_write.as_deref(), Some("1000"), "Anthropic cache write tokens");
+}
+
+#[tokio::test]
+async fn json_openai_records_cached_tokens() {
+    let json =
+        br#"{"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":900}}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("900"), "OpenAI cached prompt tokens");
+    assert_eq!(
+        cache_write, None,
+        "OpenAI has no cache write field, so no cache write metadata is written"
+    );
+}
+
+#[tokio::test]
+async fn json_google_records_cached_content_tokens() {
+    let json =
+        br#"{"usageMetadata":{"promptTokenCount":1200,"candidatesTokenCount":40,"cachedContentTokenCount":1100}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Google, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("1100"), "Google cached content tokens");
+    assert_eq!(
+        cache_write, None,
+        "Google has no cache write field, so no cache write metadata is written"
+    );
+}
+
+#[tokio::test]
+async fn json_without_cache_records_no_metadata() {
+    let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"total_tokens":57}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(
+        cache_read, None,
+        "a response with no cache information writes no cache read metadata"
+    );
+    assert_eq!(
+        cache_write, None,
+        "a response with no cache information writes no cache write metadata"
+    );
+}
+
+#[tokio::test]
+async fn json_with_zero_cached_tokens_records_zero() {
+    let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+
+    let (cache_read, _cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(
+        cache_read.as_deref(),
+        Some("0"),
+        "a reported cache miss is recorded as zero, distinct from absent"
+    );
+}
+
+#[tokio::test]
+async fn sse_anthropic_records_cache_breakdown() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":500}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::Anthropic, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(cache_read.as_deref(), Some("500"), "cache read from message_start");
+    assert_eq!(cache_write.as_deref(), Some("100"), "cache write from message_start");
+}
+
+#[tokio::test]
+async fn sse_anthropic_without_cache_records_no_metadata() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::Anthropic, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        cache_read, None,
+        "a stream with no cache fields writes no cache read metadata"
+    );
+    assert_eq!(
+        cache_write, None,
+        "a stream with no cache fields writes no cache write metadata"
+    );
+}
+
+#[tokio::test]
+async fn sse_openai_final_usage_records_cached_tokens() {
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        "data: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":900}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::OpenAi, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        cache_read.as_deref(),
+        Some("900"),
+        "cached tokens from final usage event"
+    );
+    assert_eq!(
+        cache_write, None,
+        "OpenAI has no cache write field, so no cache write metadata is written"
+    );
+}
+
+#[tokio::test]
+async fn sse_google_final_usage_records_cached_tokens() {
+    let events = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        "data: {\"usageMetadata\":{\"promptTokenCount\":1200,\"candidatesTokenCount\":40,\"cachedContentTokenCount\":1100}}\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::Google, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        cache_read.as_deref(),
+        Some("1100"),
+        "cached content tokens from final usage event"
+    );
+    assert_eq!(
+        cache_write, None,
+        "Google has no cache write field, so no cache write metadata is written"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_invoke_model_headers_record_no_cache() {
+    let filter = make_filter(ProviderKind::BedrockInvokeModel);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/claude/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    resp.headers
+        .insert(HEADER_BEDROCK_INPUT, HeaderValue::from_static("15"));
+    resp.headers
+        .insert(HEADER_BEDROCK_OUTPUT, HeaderValue::from_static("42"));
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert_eq!(ctx.get_metadata("token.input"), Some("15"), "header input tokens");
+    assert!(
+        ctx.get_metadata("token.cache_read").is_none(),
+        "response headers carry no cache breakdown"
+    );
+    assert!(
+        ctx.get_metadata("token.cache_write").is_none(),
+        "response headers carry no cache breakdown"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
 use std::fmt::Write as _;
 
 fn make_filter(provider: ProviderKind) -> TokenCountFilter {
-    TokenCountFilter { provider }
+    TokenCountFilter {
+        provider,
+        max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        max_scratch_bytes: DEFAULT_MAX_SCRATCH_BYTES,
+    }
 }
 
 fn make_response_with_content_type(ct: &str) -> Response {
@@ -893,6 +1274,31 @@ async fn run_json_extraction(
         ctx.get_metadata("token.input").map(str::to_owned),
         ctx.get_metadata("token.output").map(str::to_owned),
         ctx.get_metadata("token.total").map(str::to_owned),
+    )
+}
+
+/// Run a full `on_response` -> `on_response_body` cycle and return the prompt
+/// cache breakdown metadata for either the JSON or the SSE path.
+async fn run_cache_extraction(
+    provider: ProviderKind,
+    content_type: &str,
+    body_bytes: &[u8],
+) -> (Option<String>, Option<String>) {
+    let filter = make_filter(provider);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type(content_type);
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::copy_from_slice(body_bytes));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    (
+        ctx.get_metadata("token.cache_read").map(str::to_owned),
+        ctx.get_metadata("token.cache_write").map(str::to_owned),
     )
 }
 

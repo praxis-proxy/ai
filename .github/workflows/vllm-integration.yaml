@@ -57,6 +57,7 @@ jobs:
   changes:
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     outputs:

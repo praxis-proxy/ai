@@ -177,7 +177,15 @@ fn redact_sensitive_keys(value: &mut serde_yaml::Value) {
 }
 
 /// Field names that should be redacted in config dumps.
-const SENSITIVE_FIELD_NAMES: &[&str] = &["api_key", "database_url", "key_path", "password", "secret", "token"];
+const SENSITIVE_FIELD_NAMES: &[&str] = &[
+    "api_key",
+    "credentials_file",
+    "database_url",
+    "key_path",
+    "password",
+    "secret",
+    "token",
+];
 
 /// Resolve all listeners into their dump representations.
 fn build_resolved_listeners(

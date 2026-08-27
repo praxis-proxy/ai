@@ -18,7 +18,6 @@ apis/src/                 Provider API integrations
   openai/                 OpenAI Responses and Conversations APIs
   classifier/             Shared request classification
   store/                  Response and conversation persistence
-  token_usage/            Provider token-usage parsing
 
 filters/src/              Cross-provider behavior
   agentic/                MCP and A2A

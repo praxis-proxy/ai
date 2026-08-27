@@ -3,9 +3,9 @@
 # Evaluates all incoming requests against a NeMo Guardrails service
 # before forwarding to the upstream provider.
 #
-#   passed   → request forwarded to the upstream unchanged
+#   success  → request forwarded to the upstream unchanged
 #   blocked  → 403 returned to the client (triggered rail names in body)
-#   modified → 403 returned to the client (triggered rail names in body)
+#   error    → 500 returned to the client
 #
 # Start a local NeMo Guardrails instance before running this config
 #

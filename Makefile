@@ -8,6 +8,11 @@ CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2
 OPENAI_CONFORMANCE_ARGS ?=
 V                ?=
 
+# Experimental filter features are off by default in builds, so lint and
+# test explicitly enable them — otherwise the gated filter code is never
+# compiled, linted, or tested by CI.
+EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter
+
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
@@ -69,6 +74,7 @@ test:
 test-unit:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
+	cargo test -p praxis-ai-filters --features $(EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
 	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
 
@@ -77,6 +83,8 @@ test-schema:
 
 test-integration:
 	cargo test -p praxis-tests-integration $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features $(EXPERIMENTAL_FEATURES) --test suite \
+		-- examples::azure_ad examples::gcp_adc examples::lakera_guard $(if $(V),--nocapture)
 
 test-inference-fixtures:
 	cargo test -p praxis-test-utils $(_NOCAPTURE)
@@ -108,6 +116,9 @@ test-environment:
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets \
+		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter \
+		-- -D warnings
 	cargo +nightly fmt --all -- --check
 	cargo machete --with-metadata .
 	cargo xtask lint-deps

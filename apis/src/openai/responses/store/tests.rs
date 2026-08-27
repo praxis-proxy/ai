@@ -21,7 +21,10 @@ use super::{
     list_input_items,
 };
 use crate::{
-    openai::responses::state::ResponsesState,
+    openai::{
+        include::{IncludeField, IncludeFields},
+        responses::state::ResponsesState,
+    },
     store::{ResponseRecord, ResponseStore as _, ResponseStoreRegistry, SqliteResponseStore},
 };
 
@@ -3725,24 +3728,6 @@ fn parse_query_params_unknown_order_rejected() {
 }
 
 #[test]
-fn parse_query_params_include_bracket_rejected() {
-    let err = super::filter::parse_query_params(Some("include[]=reasoning.encrypted_content")).unwrap_err();
-    assert!(
-        err.contains("not supported"),
-        "should reject include[] parameter: {err}"
-    );
-}
-
-#[test]
-fn parse_query_params_include_bare_rejected() {
-    let err = super::filter::parse_query_params(Some("include=reasoning.encrypted_content")).unwrap_err();
-    assert!(
-        err.contains("not supported"),
-        "should reject bare include parameter: {err}"
-    );
-}
-
-#[test]
 fn parse_query_params_unknown_parameter_rejected() {
     let err = super::filter::parse_query_params(Some("foo=bar")).unwrap_err();
     assert!(
@@ -3969,7 +3954,9 @@ fn make_record_with_input(input: serde_json::Value) -> ResponseRecord {
 #[test]
 fn list_input_items_scalar_input_normalized_to_message_item() {
     let record = make_record_with_input(json!("Hello"));
-    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    let params = ListParams::default();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(page.data.len(), 1, "string input should produce one message item");
     assert_eq!(
         page.data[0],
@@ -3987,7 +3974,9 @@ fn list_input_items_scalar_input_normalized_to_message_item() {
 #[test]
 fn list_input_items_null_input_returns_empty_page() {
     let record = make_record_with_input(json!(null));
-    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    let params = ListParams::default();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert!(page.data.is_empty(), "null input should yield no items");
     assert!(!page.has_more);
     assert!(page.next_cursor.is_none());
@@ -3996,7 +3985,9 @@ fn list_input_items_null_input_returns_empty_page() {
 #[test]
 fn list_input_items_empty_array_returns_empty_page() {
     let record = make_record_with_input(json!([]));
-    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    let params = ListParams::default();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert!(page.data.is_empty(), "empty array input should yield empty page");
     assert!(!page.has_more);
     assert!(page.next_cursor.is_none());
@@ -4013,7 +4004,8 @@ fn list_input_items_ascending_preserves_natural_order() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(page.data[0]["id"], "a");
     assert_eq!(page.data[1]["id"], "b");
     assert_eq!(page.data[2]["id"], "c");
@@ -4030,7 +4022,8 @@ fn list_input_items_descending_reverses_order() {
         order: Order::Descending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(page.data[0]["id"], "c");
     assert_eq!(page.data[1]["id"], "b");
     assert_eq!(page.data[2]["id"], "a");
@@ -4048,7 +4041,8 @@ fn list_input_items_limit_zero_clamped_to_one() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(page.data.len(), 1, "limit=0 should be clamped to 1");
     assert!(page.has_more);
 }
@@ -4062,7 +4056,8 @@ fn list_input_items_limit_above_max_clamped() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(
         page.data.len(),
         5,
@@ -4082,7 +4077,8 @@ fn list_input_items_cursor_after_last_returns_empty_page() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert!(page.data.is_empty(), "cursor after last item should yield empty page");
     assert!(!page.has_more);
 }
@@ -4099,7 +4095,8 @@ fn list_input_items_cursor_after_first_skips_it() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(page.data.len(), 2);
     assert_eq!(page.data[0]["id"], "b");
     assert_eq!(page.data[1]["id"], "c");
@@ -4117,7 +4114,8 @@ fn list_input_items_numeric_cursor_fallback() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(page.data.len(), 2, "numeric cursor 1 should skip first item");
     assert_eq!(page.data[0]["val"], 2);
     assert_eq!(page.data[1]["val"], 3);
@@ -4134,7 +4132,8 @@ fn list_input_items_invalid_cursor_returns_error() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let result = list_input_items(&record, &params);
+    let includes = IncludeFields::default();
+    let result = list_input_items(&record, &params, includes);
     assert!(result.is_err(), "non-numeric cursor not matching any ID should error");
 }
 
@@ -4151,7 +4150,8 @@ fn list_input_items_next_cursor_uses_item_id() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert!(page.has_more);
     assert_eq!(
         page.next_cursor.as_deref(),
@@ -4168,7 +4168,9 @@ fn list_input_items_assigns_synthetic_ids_to_id_less_array_items() {
     ]));
     // Default order is descending, but synthetic IDs must stay tied to
     // each item's original stored position, not its display position.
-    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    let params = ListParams::default();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(
         page.data[0]["id"], "msg_resp_test_input_1",
         "the assistant message (original index 1) should surface first in descending order"
@@ -4191,7 +4193,8 @@ fn list_input_items_mixed_existing_and_synthetic_ids_paginate_correctly() {
         ..Default::default()
     };
 
-    let page1 = list_input_items(&record, &base_params).unwrap();
+    let includes = IncludeFields::default();
+    let page1 = list_input_items(&record, &base_params, includes).unwrap();
     assert_eq!(
         page1.data[0]["id"], "a",
         "the item's existing id must be preserved, not overwritten"
@@ -4210,6 +4213,7 @@ fn list_input_items_mixed_existing_and_synthetic_ids_paginate_correctly() {
             cursor: cursor_after_a,
             ..base_params.clone()
         },
+        includes,
     )
     .unwrap();
     assert_eq!(
@@ -4228,6 +4232,7 @@ fn list_input_items_mixed_existing_and_synthetic_ids_paginate_correctly() {
             cursor: Some("msg_resp_test_input_1".to_owned()),
             ..base_params
         },
+        includes,
     )
     .unwrap();
     assert!(
@@ -4250,7 +4255,8 @@ fn list_input_items_next_cursor_uses_synthetic_id_when_input_lacks_ids() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert!(page.has_more);
     assert_eq!(
         page.next_cursor.as_deref(),
@@ -4272,7 +4278,8 @@ fn list_input_items_numeric_cursor_still_works_as_fallback_for_synthetic_ids() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(
         page.data.len(),
         2,
@@ -4290,7 +4297,8 @@ fn list_input_items_no_next_cursor_when_no_more() {
         order: Order::Ascending,
         ..Default::default()
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert!(!page.has_more);
     assert!(
         page.next_cursor.is_none(),
@@ -4309,7 +4317,9 @@ fn list_input_items_default_limit_is_default_page_limit() {
 #[test]
 fn list_input_items_object_input_wrapped_as_single_item() {
     let record = make_record_with_input(json!({"type": "message", "role": "user", "content": "hi"}));
-    let page = list_input_items(&record, &ListParams::default()).unwrap();
+    let params = ListParams::default();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(page.data.len(), 1);
     assert_eq!(page.data[0]["type"], "message");
 }
@@ -4327,7 +4337,8 @@ fn list_input_items_descending_cursor_operates_on_reversed_order() {
         limit: 2,
         order: Order::Descending,
     };
-    let page = list_input_items(&record, &params).unwrap();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).unwrap();
     assert_eq!(page.data.len(), 2, "should return items after cursor in reversed order");
     assert_eq!(page.data[0]["id"], "b");
     assert_eq!(page.data[1]["id"], "a");
@@ -4734,6 +4745,194 @@ async fn get_input_items_tenant_isolation() {
     assert_eq!(
         rejection.status, 404,
         "input_items should return 404 when response belongs to different tenant"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// GET /v1/responses/{id}/input_items include projection
+// -----------------------------------------------------------------------------
+
+/// Stored input covering a top-level include-gated field (reasoning
+/// `encrypted_content`) and a nested one (message `input_image.image_url`).
+fn include_fixture_input() -> serde_json::Value {
+    json!([
+        {
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "stored-secret"
+        },
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "auto"},
+                {"type": "input_text", "text": "keep me"}
+            ]
+        }
+    ])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_omits_include_gated_fields_when_not_requested() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_include_default", "default", include_fixture_input()).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_include_default/input_items?order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "input_items without include should return 200");
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "both stored items should be listed");
+    assert!(
+        data[0].get("encrypted_content").is_none(),
+        "unrequested encrypted reasoning must be omitted"
+    );
+    assert!(
+        data[1]["content"][0].get("image_url").is_none(),
+        "unrequested input-image URLs must be omitted"
+    );
+    assert_eq!(
+        data[1]["content"][1]["text"], "keep me",
+        "content not gated by include must survive projection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_include_reveals_requested_field_for_both_sdk_encodings() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_include_reveal", "default", include_fixture_input()).await;
+
+    for query in [
+        "include=reasoning.encrypted_content&order=asc",
+        "include%5B%5D=reasoning.encrypted_content&order=asc",
+    ] {
+        let path = format!("/v1/responses/resp_include_reveal/input_items?{query}");
+        let req = crate::test_utils::make_request(http::Method::GET, &path);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        let rejection = expect_reject(action);
+        assert_eq!(rejection.status, 200, "include should be accepted for {query}");
+
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(
+            data[0]["encrypted_content"], "stored-secret",
+            "{query} should reveal the requested stored field"
+        );
+        assert!(
+            data[1]["content"][0].get("image_url").is_none(),
+            "{query} must not reveal include-gated fields it did not request"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_include_applies_to_paginated_window() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_include_page", "default", include_fixture_input()).await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_include_page/input_items?include=reasoning.encrypted_content&limit=1&order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200, "include should combine with pagination params");
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(
+        data.len(),
+        1,
+        "limit should still bound the page when include is present"
+    );
+    assert_eq!(body["has_more"], true, "a second page should remain available");
+    assert_eq!(
+        body["last_id"], "reasoning_1",
+        "projection must not strip the item ID used as the pagination cursor"
+    );
+    assert_eq!(
+        data[0]["encrypted_content"], "stored-secret",
+        "requested field should be present on the paginated item"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_rejects_malformed_include_values() {
+    let filter = make_filter();
+    init_store_and_seed(&filter, "resp_include_bad", "default", include_fixture_input()).await;
+
+    for (query, expected) in [
+        ("include=future.secret_field", "unsupported include value"),
+        ("include%5B%5D=future.secret_field", "unsupported include value"),
+        ("include", "requires a value"),
+    ] {
+        let path = format!("/v1/responses/resp_include_bad/input_items?{query}");
+        let req = crate::test_utils::make_request(http::Method::GET, &path);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        let rejection = expect_reject(action);
+        assert_eq!(rejection.status, 400, "{query} should be rejected as invalid input");
+
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(expected),
+            "{query} should explain the problem, got '{message}'"
+        );
+    }
+}
+
+#[test]
+fn list_input_items_projects_each_page_item_with_requested_includes() {
+    let record = make_record_with_input(include_fixture_input());
+    let mut includes = IncludeFields::default();
+    includes.insert(IncludeField::ReasoningEncryptedContent);
+    let params = ListParams {
+        cursor: None,
+        limit: 1,
+        order: Order::Ascending,
+    };
+
+    let page = list_input_items(&record, &params, includes).unwrap();
+    assert_eq!(page.data.len(), 1, "limit should bound the projected page");
+    assert!(page.has_more, "a second item should remain");
+    assert_eq!(
+        page.data[0]["encrypted_content"], "stored-secret",
+        "requested include should preserve the encrypted reasoning content"
+    );
+
+    let next_params = ListParams {
+        cursor: page.next_cursor.clone(),
+        limit: 1,
+        order: Order::Ascending,
+    };
+    let next_page = list_input_items(&record, &next_params, includes).unwrap();
+    assert!(
+        next_page.data[0]["content"][0].get("image_url").is_none(),
+        "include values that were not requested must stay projected out on later pages"
+    );
+    assert_eq!(
+        next_page.data[0]["content"][1]["text"], "keep me",
+        "non-gated content must survive projection"
+    );
+    assert_eq!(
+        record.input[1]["content"][0]["image_url"], "https://example.com/image.png",
+        "projection must not mutate the stored record"
     );
 }
 

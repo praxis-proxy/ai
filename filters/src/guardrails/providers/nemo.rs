@@ -53,16 +53,17 @@ struct NemoRequest {
 /// Incoming response payload for `NeMo`
 #[derive(Deserialize)]
 struct NemoResponse {
-    /// Overall verdict: `"passed"`, `"blocked"`, or `"modified"`.
+    /// Overall verdict: `"success"`, `"blocked"`, or `"error"`.
     status: String,
 
     /// Per-rail evaluation results. The names of rails whose `status` is
-    /// `"blocked"` are joined to form the [`GuardResult::Block::reason`] /
-    /// [`GuardResult::Redact::reason`] string.
+    /// `"blocked"` are joined to form the [`GuardResult::Block::reason`]
+    /// string.
     rails_status: Option<serde_json::Value>,
 
-    /// Post-processing text. Only present when `status` is `"modified"`; absent for all other statuses.
-    content: Option<String>,
+    /// Error details returned when `status` is `"error"`.
+    /// Contains `"error"` and optionally `"details"` keys.
+    guardrails_data: Option<serde_json::Value>,
 }
 
 /// `NeMo` Guardrails provider.
@@ -127,7 +128,7 @@ impl GuardProvider for NemoProvider {
         let response_body = read_response_body(response).await?;
         let nemo_response: NemoResponse = serde_json::from_slice(&response_body)
             .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): failed to parse response: {e}").into() })?;
-        map_nemo_response(nemo_response)
+        map_nemo_response(&nemo_response)
     }
 }
 
@@ -181,17 +182,21 @@ async fn read_response_body(response: reqwest::Response) -> Result<Bytes, Filter
 }
 
 /// Map a deserialized [`NemoResponse`] to a [`GuardResult`].
-fn map_nemo_response(nemo: NemoResponse) -> Result<GuardResult, FilterError> {
+///
+/// The `/v1/guardrail/checks` endpoint returns three statuses:
+/// - `"success"` - all rails passed
+/// - `"blocked"` - at least one rail blocked the content
+/// - `"error"` - `NeMo` internal processing error (fail-closed)
+fn map_nemo_response(nemo: &NemoResponse) -> Result<GuardResult, FilterError> {
     match nemo.status.as_str() {
-        "passed" => Ok(GuardResult::Pass),
+        "success" => Ok(GuardResult::Pass),
         "blocked" => {
             let reason = blocked_rail_names(nemo.rails_status.as_ref());
             Ok(GuardResult::Block { reason })
         },
-        "modified" => {
-            let reason = blocked_rail_names(nemo.rails_status.as_ref());
-            let modified_text = nemo.content.unwrap_or_default();
-            Ok(GuardResult::Redact { modified_text, reason })
+        "error" => {
+            let detail = extract_error_detail(nemo.guardrails_data.as_ref());
+            Err(format!("ai_guardrails (nemo): NeMo returned error status: {detail}").into())
         },
         other => Err(format!("ai_guardrails (nemo): unknown status '{other}'").into()),
     }
@@ -214,11 +219,28 @@ fn blocked_rail_names(rails_status: Option<&serde_json::Value>) -> String {
     names.join(", ")
 }
 
+/// Extract a human-readable error string from the `guardrails_data` object
+/// returned by `NeMo` when `status` is `"error"`.
+///
+/// Expected shape: `{"error": "...", "details": "..."}`.
+fn extract_error_detail(data: Option<&serde_json::Value>) -> String {
+    let Some(obj) = data.and_then(|v| v.as_object()) else {
+        return "no details available".to_owned();
+    };
+    let error = obj.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+    match obj.get("details").and_then(|v| v.as_str()) {
+        Some(details) => format!("{error} ({details})"),
+        None => error.to_owned(),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::str_to_string, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -236,7 +258,7 @@ mod tests {
     fn blocked_rail_names_filters_out_non_blocked_rails() {
         let rails = serde_json::json!({
             "toxicity": {"status": "blocked"},
-            "jailbreak": {"status": "passed"},
+            "jailbreak": {"status": "success"},
         });
         assert_eq!(
             blocked_rail_names(Some(&rails)),
@@ -264,5 +286,101 @@ mod tests {
     fn blocked_rail_names_non_object_rails_status_returns_empty_string() {
         let rails = serde_json::json!("not an object");
         assert_eq!(blocked_rail_names(Some(&rails)), "");
+    }
+
+    #[test]
+    fn map_nemo_response_success_returns_pass() {
+        let resp = NemoResponse {
+            status: "success".to_string(),
+            rails_status: None,
+            guardrails_data: None,
+        };
+        let result = map_nemo_response(&resp).unwrap();
+        assert!(matches!(result, GuardResult::Pass));
+    }
+
+    #[test]
+    fn map_nemo_response_blocked_returns_block_with_reason() {
+        let resp = NemoResponse {
+            status: "blocked".to_string(),
+            rails_status: Some(serde_json::json!({
+                "toxicity": {"status": "blocked"},
+            })),
+            guardrails_data: None,
+        };
+        let result = map_nemo_response(&resp).unwrap();
+        assert!(
+            matches!(result, GuardResult::Block { reason } if reason == "toxicity"),
+            "blocked response should produce GuardResult::Block with rail name as reason"
+        );
+    }
+
+    #[test]
+    fn map_nemo_response_error_extracts_guardrails_data() {
+        let resp = NemoResponse {
+            status: "error".to_string(),
+            rails_status: None,
+            guardrails_data: Some(serde_json::json!({
+                "error": "Could not load guardrails configuration.",
+                "details": "Invalid config path /app/config/nonexistent-config."
+            })),
+        };
+        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
+        assert!(
+            err_msg.contains("Could not load guardrails configuration."),
+            "{err_msg}"
+        );
+        assert!(err_msg.contains("Invalid config path"), "{err_msg}");
+    }
+
+    #[test]
+    fn map_nemo_response_error_without_guardrails_data() {
+        let resp = NemoResponse {
+            status: "error".to_string(),
+            rails_status: None,
+            guardrails_data: None,
+        };
+        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
+        assert!(err_msg.contains("no details available"), "{err_msg}");
+    }
+
+    #[test]
+    fn map_nemo_response_error_with_error_key_only() {
+        let resp = NemoResponse {
+            status: "error".to_string(),
+            rails_status: None,
+            guardrails_data: Some(serde_json::json!({"error": "Internal failure"})),
+        };
+        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
+        assert!(err_msg.contains("Internal failure"), "{err_msg}");
+        assert!(
+            !err_msg.contains("Internal failure ("),
+            "should not append details in parens when details key is absent: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn map_nemo_response_error_with_missing_error_key() {
+        let resp = NemoResponse {
+            status: "error".to_string(),
+            rails_status: None,
+            guardrails_data: Some(serde_json::json!({"unexpected": "shape"})),
+        };
+        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
+        assert!(err_msg.contains("unknown error"), "{err_msg}");
+    }
+
+    #[test]
+    fn map_nemo_response_unknown_status_returns_error() {
+        let resp = NemoResponse {
+            status: "garbage".to_string(),
+            rails_status: None,
+            guardrails_data: None,
+        };
+        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
+        assert!(
+            err_msg.contains("unknown status 'garbage'"),
+            "unknown status should produce a descriptive error: {err_msg}"
+        );
     }
 }
