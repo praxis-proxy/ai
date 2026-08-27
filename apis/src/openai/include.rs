@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use utoipa::ToSchema;
 
-// The spellings match OpenAI's `IncludeEnum` exactly. Runtime query parsing
+/// The spellings match OpenAI's `IncludeEnum` exactly. Runtime query parsing
 /// and generated `OpenAPI` both consume this enum.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub(crate) enum IncludeField {
