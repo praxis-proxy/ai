@@ -1,0 +1,47 @@
+# GCP ADC upstream authentication (experimental skeleton)
+#
+# Establishes the gcp_adc filter's configuration surface and
+# fail-closed behavior. Token acquisition is NOT implemented
+# yet: the token cache is never populated, so every proxied
+# request is rejected with 503. Fetch (GKE metadata or a
+# service-account key file) lands with the shared background
+# refresh primitive tracked in praxis#555/#1042/#1043; once it
+# does, the filter will inject "Authorization: Bearer <token>"
+# on every proxied request to Vertex AI.
+#
+# This filter only injects Authorization — it does NOT set Host
+# or path. Point the cluster at your Vertex regional endpoint
+# (and tls.sni) the same way as any other upstream.
+#
+# Experimental: rebuild with --features gcp-adc-filter.
+# Configuration may change before graduation.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features gcp-adc-filter -- \
+#     -c examples/configs/gcp-adc.yaml
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - vertex
+
+filter_chains:
+  - name: vertex
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: vertex
+      - filter: load_balancer
+        clusters:
+          - name: vertex
+            endpoints:
+              - "127.0.0.1:3000"
+      - filter: gcp_adc
+        # source: adc   # default: GOOGLE_APPLICATION_CREDENTIALS, else GKE metadata
+        # scope: https://www.googleapis.com/auth/cloud-platform
+        # refresh_ratio: 0.75
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

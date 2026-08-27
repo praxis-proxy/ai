@@ -8,6 +8,8 @@ use praxis_filter::FilterRegistry;
 
 #[cfg(feature = "azure-ad-filter")]
 use crate::AzureAdFilter;
+#[cfg(feature = "gcp-adc-filter")]
+use crate::GcpAdcFilter;
 #[cfg(feature = "http-callout-filter")]
 use crate::HttpCalloutFilter;
 use crate::{
@@ -38,6 +40,8 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     register_aws_filters(registry);
     #[cfg(feature = "azure-ad-filter")]
     register_azure_filters(registry);
+    #[cfg(feature = "gcp-adc-filter")]
+    register_gcp_filters(registry);
     register_general_ai_filters(registry);
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
@@ -84,6 +88,12 @@ fn register_aws_filters(registry: &mut FilterRegistry) {
 #[cfg(feature = "azure-ad-filter")]
 fn register_azure_filters(registry: &mut FilterRegistry) {
     register_routing_security_filter(registry, "azure_ad", AzureAdFilter::from_config);
+}
+
+/// Register GCP-specific filters.
+#[cfg(feature = "gcp-adc-filter")]
+fn register_gcp_filters(registry: &mut FilterRegistry) {
+    register_routing_security_filter(registry, "gcp_adc", GcpAdcFilter::from_config);
 }
 
 /// Register general-purpose AI filters.
@@ -397,32 +407,30 @@ mod tests {
         }
     }
 
+    /// Assert `name` is registered iff `enabled`.
+    fn assert_experimental_registration(names: &[&str], name: &str, enabled: bool) {
+        if enabled {
+            assert!(
+                names.contains(&name),
+                "{name} must register when its feature is enabled"
+            );
+        } else {
+            assert!(
+                !names.contains(&name),
+                "{name} must not register when its feature is disabled"
+            );
+        }
+    }
+
     /// Experimental filters register only when their cargo feature is enabled.
     #[test]
     fn build_ai_registry_gates_experimental_filters() {
         let registry = build_ai_registry();
         let names = registry.available_filters();
 
-        #[cfg(feature = "http-callout-filter")]
-        assert!(
-            names.contains(&"http_callout"),
-            "http_callout must register when its feature is enabled"
-        );
-        #[cfg(not(feature = "http-callout-filter"))]
-        assert!(
-            !names.contains(&"http_callout"),
-            "http_callout must not register when its feature is disabled"
-        );
-        #[cfg(feature = "azure-ad-filter")]
-        assert!(
-            names.contains(&"azure_ad"),
-            "azure_ad must register when its feature is enabled"
-        );
-        #[cfg(not(feature = "azure-ad-filter"))]
-        assert!(
-            !names.contains(&"azure_ad"),
-            "azure_ad must not register when its feature is disabled"
-        );
+        assert_experimental_registration(&names, "http_callout", cfg!(feature = "http-callout-filter"));
+        assert_experimental_registration(&names, "azure_ad", cfg!(feature = "azure-ad-filter"));
+        assert_experimental_registration(&names, "gcp_adc", cfg!(feature = "gcp-adc-filter"));
     }
 
     #[test]
@@ -433,5 +441,7 @@ mod tests {
         assert!(registry.is_security_filter("aws_sigv4_sign"));
         #[cfg(feature = "azure-ad-filter")]
         assert!(registry.is_security_filter("azure_ad"));
+        #[cfg(feature = "gcp-adc-filter")]
+        assert!(registry.is_security_filter("gcp_adc"));
     }
 }
