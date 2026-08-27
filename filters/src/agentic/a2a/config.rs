@@ -30,6 +30,13 @@ const DEFAULT_TTL_SECONDS: u64 = 3_600; // 1 hour
 /// Default TTL for terminal task routes (5 minutes).
 const DEFAULT_TERMINAL_TTL_SECONDS: u64 = 300; // 5 minutes
 
+/// Maximum TTL for in-memory task and context routes (30 days).
+///
+/// Operator ceiling for process-local route stickiness, chosen well
+/// below the `Instant + Duration` overflow that panics on
+/// `Duration::from_secs(u64::MAX)`.
+const MAX_TTL_SECONDS: u64 = 2_592_000;
+
 /// Default maximum response body bytes for task route capture (64 `KiB`).
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 65_536;
 
@@ -92,10 +99,12 @@ pub(crate) struct TaskRoutingConfig {
     pub store: TaskRouteStore,
 
     /// TTL in seconds for terminal task routes (0 = remove immediately).
+    /// Must be at most 2,592,000 (30 days).
     #[serde(default = "default_terminal_ttl_seconds")]
     pub terminal_ttl_seconds: u64,
 
-    /// TTL in seconds for non-terminal task routes.
+    /// TTL in seconds for non-terminal task routes. Must be greater
+    /// than 0 and at most 2,592,000 (30 days).
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u64,
 }
@@ -319,9 +328,8 @@ pub(crate) fn build_config(cfg: A2aConfig) -> Result<A2aConfig, FilterError> {
 
 /// Validate task routing configuration.
 fn validate_task_routing(tr: &TaskRoutingConfig) -> Result<(), FilterError> {
-    if tr.ttl_seconds == 0 {
-        return Err("a2a: task_routing.ttl_seconds must be greater than 0".into());
-    }
+    validate_task_routing_ttl("ttl_seconds", tr.ttl_seconds, false)?;
+    validate_task_routing_ttl("terminal_ttl_seconds", tr.terminal_ttl_seconds, true)?;
 
     validate_max_body_bytes("a2a: task_routing", tr.max_response_body_bytes)?;
 
@@ -342,6 +350,23 @@ fn validate_task_routing(tr: &TaskRoutingConfig) -> Result<(), FilterError> {
         .into());
     }
 
+    Ok(())
+}
+
+/// Reject a task-routing TTL that is out of range.
+///
+/// `allow_zero` is true for `terminal_ttl_seconds` (0 means remove the
+/// route immediately). Non-terminal `ttl_seconds` must be greater than 0.
+fn validate_task_routing_ttl(field: &str, value: u64, allow_zero: bool) -> Result<(), FilterError> {
+    if value == 0 {
+        if allow_zero {
+            return Ok(());
+        }
+        return Err(format!("a2a: task_routing.{field} must be greater than 0").into());
+    }
+    if value > MAX_TTL_SECONDS {
+        return Err(format!("a2a: task_routing.{field} ({value}) exceeds maximum ({MAX_TTL_SECONDS})").into());
+    }
     Ok(())
 }
 
@@ -710,6 +735,48 @@ method_aliases:
         };
         let result = validate_task_routing(&tr);
         assert!(result.is_err(), "ttl_seconds=0 should be rejected");
+    }
+
+    #[test]
+    fn validate_task_routing_rejects_ttl_above_ceiling() {
+        let tr = TaskRoutingConfig {
+            enabled: true,
+            ttl_seconds: u64::MAX,
+            ..TaskRoutingConfig::default()
+        };
+        let err = validate_task_routing(&tr).unwrap_err();
+        assert!(
+            err.to_string().contains("ttl_seconds") && err.to_string().contains("exceeds maximum"),
+            "ttl_seconds=u64::MAX should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_task_routing_rejects_terminal_ttl_above_ceiling() {
+        let tr = TaskRoutingConfig {
+            enabled: true,
+            terminal_ttl_seconds: u64::MAX,
+            ..TaskRoutingConfig::default()
+        };
+        let err = validate_task_routing(&tr).unwrap_err();
+        assert!(
+            err.to_string().contains("terminal_ttl_seconds") && err.to_string().contains("exceeds maximum"),
+            "terminal_ttl_seconds=u64::MAX should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_task_routing_accepts_max_ttl() {
+        let tr = TaskRoutingConfig {
+            enabled: true,
+            ttl_seconds: MAX_TTL_SECONDS,
+            terminal_ttl_seconds: MAX_TTL_SECONDS,
+            ..TaskRoutingConfig::default()
+        };
+        assert!(
+            validate_task_routing(&tr).is_ok(),
+            "TTL equal to the documented maximum should be accepted"
+        );
     }
 
     #[test]

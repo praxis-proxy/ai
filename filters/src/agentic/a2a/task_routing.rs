@@ -67,6 +67,15 @@ struct TaskRoute {
     expires_at: Instant,
 }
 
+/// Build a route whose expiry is `now + ttl`, or `None` if that instant
+/// is not representable.
+fn try_route(cluster: &str, ttl: Duration) -> Option<TaskRoute> {
+    Some(TaskRoute {
+        cluster: Arc::from(cluster),
+        expires_at: Instant::now().checked_add(ttl)?,
+    })
+}
+
 // -----------------------------------------------------------------------------
 // ExtractedTaskRoute
 // -----------------------------------------------------------------------------
@@ -153,9 +162,9 @@ impl LocalTaskRouteStore {
     /// Store a task route mapping with the given TTL.
     ///
     /// Silently ignores task IDs that fail validation (control chars,
-    /// too long) and rejects new inserts when the store is at
-    /// [`MAX_TASK_ROUTES`] capacity. Overwrites of existing keys are
-    /// always allowed regardless of capacity.
+    /// too long) and TTLs that overflow [`Instant`]. Rejects new inserts
+    /// when the store is at [`MAX_TASK_ROUTES`] capacity. Overwrites of
+    /// existing keys are always allowed regardless of capacity.
     ///
     /// Periodically sweeps expired entries (at most once per
     /// [`EVICTION_INTERVAL`]) to bound memory growth.
@@ -169,9 +178,9 @@ impl LocalTaskRouteStore {
             return;
         }
 
-        let route = TaskRoute {
-            cluster: Arc::from(cluster),
-            expires_at: Instant::now() + ttl,
+        let Some(route) = try_route(cluster, ttl) else {
+            tracing::warn!("task route store: TTL overflows Instant, insert skipped");
+            return;
         };
 
         let mut tasks = self.tasks.write().expect("task route store lock poisoned");
@@ -231,10 +240,10 @@ impl LocalTaskRouteStore {
 
     /// Store a context route mapping with the given TTL.
     ///
-    /// Applies the same ID validation rules as [`Self::put`].
-    /// Context routes use a separate capacity limit ([`MAX_CONTEXT_ROUTES`])
-    /// and a separate eviction clock from task routes, so the two maps
-    /// cannot interfere.
+    /// Applies the same ID validation rules as [`Self::put`], including
+    /// skipping TTLs that overflow [`Instant`]. Context routes use a
+    /// separate capacity limit ([`MAX_CONTEXT_ROUTES`]) and a separate
+    /// eviction clock from task routes, so the two maps cannot interfere.
     ///
     /// # Panics
     ///
@@ -245,9 +254,9 @@ impl LocalTaskRouteStore {
             return;
         }
 
-        let route = TaskRoute {
-            cluster: Arc::from(cluster),
-            expires_at: Instant::now() + ttl,
+        let Some(route) = try_route(cluster, ttl) else {
+            tracing::warn!("context route store: TTL overflows Instant, insert skipped");
+            return;
         };
 
         let mut contexts = self.contexts.write().expect("context route store lock poisoned");
@@ -500,6 +509,16 @@ mod tests {
     }
 
     #[test]
+    fn local_store_put_skips_insert_when_ttl_overflows_instant() {
+        let store = LocalTaskRouteStore::new();
+        store.put("task-1", "agent-a", Duration::from_secs(u64::MAX));
+        assert!(
+            store.get_by_task_id("task-1").is_none(),
+            "overflowing TTL must not panic or insert a task route"
+        );
+    }
+
+    #[test]
     fn local_store_expired_task_route_misses_and_removes_entry() {
         let store = LocalTaskRouteStore::new();
         store.put("task-1", "agent-a", Duration::from_millis(50));
@@ -635,6 +654,16 @@ mod tests {
             cluster.as_deref(),
             Some("agent-a"),
             "stored context route should be retrievable"
+        );
+    }
+
+    #[test]
+    fn local_store_put_context_skips_insert_when_ttl_overflows_instant() {
+        let store = LocalTaskRouteStore::new();
+        store.put_context("ctx-1", "agent-a", Duration::from_secs(u64::MAX));
+        assert!(
+            store.get_by_context_id("ctx-1").is_none(),
+            "overflowing TTL must not panic or insert a context route"
         );
     }
 
