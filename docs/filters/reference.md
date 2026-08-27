@@ -72,6 +72,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`http_callout`](http_callout.md) | Calls an external HTTP service during request processing and feeds its response into branch-chain evaluation. |
 
+### GCP
+
+| Filter | Description |
+|--------|-------------|
+| [`gcp_adc`](gcp_adc.md) | Injects a GCP `OAuth2` access token into outbound requests. |
+
 ### Guardrails
 
 | Filter | Description |

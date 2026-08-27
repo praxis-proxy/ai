@@ -27,6 +27,8 @@ default = []
 http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 # Experimental: the azure_ad (Entra ID) auth filter (see praxis-ai-filters).
 azure-ad-filter = ["praxis-ai-filters/azure-ad-filter", "experimental"]
+# Experimental: the gcp_adc (GCP ADC) auth filter (see praxis-ai-filters).
+gcp-adc-filter = ["praxis-ai-filters/gcp-adc-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.
 experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]

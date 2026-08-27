@@ -21,6 +21,10 @@ http-callout-filter = ["experimental"]
 # Experimental: the azure_ad (Entra ID) upstream authentication filter. Work in
 # progress; the config surface may change. Activates the `experimental` marker.
 azure-ad-filter = ["experimental"]
+# Experimental: the gcp_adc (Application Default Credentials) upstream
+# authentication filter. Work in progress; the config surface may change.
+# Activates the `experimental` marker.
+gcp-adc-filter = ["experimental"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = []

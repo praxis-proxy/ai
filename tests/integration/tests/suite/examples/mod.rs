@@ -18,6 +18,8 @@ mod credential_injection;
 mod file_search_callout;
 mod full_flow;
 mod full_flow_agentic;
+#[cfg(feature = "gcp-adc-filter")]
+mod gcp_adc;
 mod guardrails;
 mod inference_fallback;
 #[cfg(feature = "http-callout-filter")]

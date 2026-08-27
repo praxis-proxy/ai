@@ -1790,6 +1790,7 @@ fn format_title(category_name: &str) -> String {
             "mcp" => "MCP".to_owned(),
             "a2a" => "A2A".to_owned(),
             "aws" => "AWS".to_owned(),
+            "gcp" => "GCP".to_owned(),
             other => capitalize(other),
         })
         .collect::<Vec<_>>()
