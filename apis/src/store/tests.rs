@@ -12,7 +12,10 @@ use super::{
     SqliteResponseStore, SslMode, StoreError,
     trait_def::{ConversationItemStore, ResponseStore},
 };
-use crate::openai::responses::store::{ListParams, Order, list_input_items};
+use crate::openai::{
+    include::IncludeFields,
+    responses::store::{ListParams, Order, list_input_items},
+};
 
 // -----------------------------------------------------------------------------
 // Schema Initialization
@@ -246,6 +249,7 @@ fn input_items_from_array_input() {
             limit: 2,
             ..ListParams::default()
         },
+        IncludeFields::default(),
     )
     .expect("list should succeed");
 
@@ -264,6 +268,7 @@ fn input_items_from_array_input() {
             limit: 2,
             ..ListParams::default()
         },
+        IncludeFields::default(),
     )
     .expect("list should succeed");
 
@@ -289,6 +294,7 @@ fn input_items_uses_item_id_cursor() {
             order: Order::Ascending,
             ..ListParams::default()
         },
+        IncludeFields::default(),
     )
     .expect("list should succeed");
 
@@ -305,6 +311,7 @@ fn input_items_uses_item_id_cursor() {
             limit: 2,
             order: Order::Ascending,
         },
+        IncludeFields::default(),
     )
     .expect("list should succeed");
 
@@ -320,7 +327,9 @@ fn input_items_from_string_input() {
         ..make_response_record("resp_1", "tenant_a", 1000)
     };
 
-    let page = list_input_items(&record, &ListParams::default()).expect("list should succeed");
+    let params = ListParams::default();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).expect("list should succeed");
 
     assert_eq!(page.data.len(), 1, "string input should yield 1 item");
     assert_eq!(
@@ -341,6 +350,7 @@ fn input_items_honors_sort_order() {
         input: json!(["first", "second", "third"]),
         ..make_response_record("resp_1", "tenant_a", 1000)
     };
+    let includes = IncludeFields::default();
 
     let ascending = list_input_items(
         &record,
@@ -348,9 +358,11 @@ fn input_items_honors_sort_order() {
             order: Order::Ascending,
             ..ListParams::default()
         },
+        IncludeFields::default(),
     )
     .expect("ascending list should succeed");
-    let descending = list_input_items(&record, &ListParams::default()).expect("descending list should succeed");
+    let descending =
+        list_input_items(&record, &ListParams::default(), includes).expect("descending list should succeed");
 
     assert_eq!(
         ascending.data,
@@ -380,6 +392,7 @@ fn input_items_limit_zero_clamps_to_one() {
             limit: 0,
             ..ListParams::default()
         },
+        IncludeFields::default(),
     )
     .expect("list should succeed");
 
@@ -398,6 +411,7 @@ fn input_items_limit_zero_clamps_to_one() {
             limit: 0,
             ..ListParams::default()
         },
+        IncludeFields::default(),
     )
     .expect("list should succeed");
 
@@ -420,6 +434,7 @@ fn input_items_rejects_overflowing_cursor() {
             limit: 1,
             ..ListParams::default()
         },
+        IncludeFields::default(),
     );
 
     let Err(err) = result else {
@@ -439,7 +454,9 @@ fn input_items_from_empty_array() {
         ..make_response_record("resp_1", "tenant_a", 1000)
     };
 
-    let page = list_input_items(&record, &ListParams::default()).expect("list should succeed");
+    let params = ListParams::default();
+    let includes = IncludeFields::default();
+    let page = list_input_items(&record, &params, includes).expect("list should succeed");
 
     assert!(page.data.is_empty(), "empty array should return no items");
     assert!(!page.has_more, "should have no more items");
