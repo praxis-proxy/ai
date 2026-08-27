@@ -1160,29 +1160,50 @@ async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_vector_store()
 
 #[tokio::test]
 async fn open_and_closed_failure_modes_are_distinct() {
-    let closed_server = MockServer::json(500, &json!({"error":"failed"}));
-    let closed = make_filter(closed_server.port, "callout_failure_mode: closed\n");
-    let mut closed_ctx = make_context(Some(one_pending_state(&["vs-a"])));
-    assert!(matches!(
-        closed.on_request(&mut closed_ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert_eq!(
-        closed_ctx.extensions.get::<ResponsesState>().unwrap().output_items()[0]["status"],
-        "searching"
-    );
+    for (status, body) in [
+        (401, json!({"error":"unauthorized"}).to_string()),
+        (403, "not-json".to_owned()),
+        (404, String::new()),
+        (429, "plain text".to_owned()),
+        (500, json!({"error":"failed"}).to_string()),
+    ] {
+        let closed_body = body.clone();
+        let closed_server = MockServer::start_with(move |_path| MockResponse {
+            body: closed_body.clone(),
+            body_delay: Duration::ZERO,
+            status,
+        });
+        let closed = make_filter(closed_server.port, "callout_failure_mode: closed\n");
+        let mut closed_ctx = make_context(Some(one_pending_state(&["vs-a"])));
+        assert!(matches!(
+            closed.on_request(&mut closed_ctx).await.unwrap(),
+            FilterAction::Reject(_)
+        ));
+        assert_eq!(
+            closed_ctx.extensions.get::<ResponsesState>().unwrap().output_items()[0]["status"],
+            "searching",
+            "status {status}"
+        );
 
-    let open_server = MockServer::json(500, &json!({"error":"failed"}));
-    let open = make_filter(open_server.port, "callout_failure_mode: open\n");
-    let mut open_ctx = make_context(Some(one_pending_state(&["vs-a"])));
-    assert!(matches!(
-        open.on_request(&mut open_ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let state = open_ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[0]["status"], "incomplete");
-    assert!(state.output_items()[0].get("results").is_none());
-    assert!(state.messages.iter().any(|item| item["type"] == "function_call_output"));
+        let open_server = MockServer::start_with(move |_path| MockResponse {
+            body: body.clone(),
+            body_delay: Duration::ZERO,
+            status,
+        });
+        let open = make_filter(open_server.port, "callout_failure_mode: open\n");
+        let mut open_ctx = make_context(Some(one_pending_state(&["vs-a"])));
+        assert!(matches!(
+            open.on_request(&mut open_ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        let state = open_ctx.extensions.get::<ResponsesState>().unwrap();
+        assert_eq!(state.output_items()[0]["status"], "incomplete", "status {status}");
+        assert!(state.output_items()[0].get("results").is_none());
+        assert!(
+            state.messages.iter().any(|item| item["type"] == "function_call_output"),
+            "status {status}"
+        );
+    }
 }
 
 #[tokio::test]

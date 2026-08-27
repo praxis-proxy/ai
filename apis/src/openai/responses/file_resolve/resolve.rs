@@ -129,9 +129,9 @@ impl std::fmt::Display for ResolveError {
 /// file ID context that the shared client does not carry.
 fn map_api_error(err: ApiClientError, file_id: &str) -> ResolveError {
     match err {
-        ApiClientError::CalloutFailed { detail } => ResolveError::CalloutFailed {
+        ApiClientError::Transport { .. } => ResolveError::CalloutFailed {
             file_id: file_id.to_owned(),
-            detail,
+            detail: "Files API transport request failed".to_owned(),
         },
         ApiClientError::InvalidResourceId { resource_id, detail } => ResolveError::InvalidFileId {
             file_id: resource_id,
@@ -140,10 +140,6 @@ fn map_api_error(err: ApiClientError, file_id: &str) -> ResolveError {
         ApiClientError::ResponseTooLarge { limit } => ResolveError::TooLarge {
             reference: file_id.to_owned(),
             limit,
-        },
-        ApiClientError::DecodeFailed { detail } => ResolveError::CalloutFailed {
-            file_id: file_id.to_owned(),
-            detail: format!("metadata response invalid: {detail}"),
         },
     }
 }
@@ -371,11 +367,21 @@ impl FilesApiClient {
             .resource_url(FILES_PATH_PREFIX, file_id, None)
             .map_err(|e| map_api_error(e, file_id))?;
 
-        let body = self
+        let response = self
             .client
-            .get_json(url, request_headers)
+            .get(&url, request_headers, self.client.max_response_bytes())
             .await
             .map_err(|e| map_api_error(e, file_id))?;
+        if !(200..300).contains(&response.status) {
+            return Err(ResolveError::CalloutFailed {
+                file_id: file_id.to_owned(),
+                detail: format!("Files API returned status {}", response.status),
+            });
+        }
+        let body = serde_json::from_slice(&response.body).map_err(|_error| ResolveError::CalloutFailed {
+            file_id: file_id.to_owned(),
+            detail: "metadata response invalid".to_owned(),
+        })?;
 
         Ok(parse_file_metadata(&body))
     }
@@ -394,8 +400,9 @@ impl FilesApiClient {
             .resource_url(FILES_PATH_PREFIX, file_id, Some("content"))
             .map_err(|e| map_api_error(e, file_id))?;
 
-        self.client
-            .get_bytes(&url, request_headers, max_content_bytes)
+        let response = self
+            .client
+            .get(&url, request_headers, max_content_bytes)
             .await
             .map_err(|e| match e {
                 ApiClientError::ResponseTooLarge { .. } => ResolveError::TooLarge {
@@ -403,7 +410,15 @@ impl FilesApiClient {
                     limit: max_resolved_bytes,
                 },
                 other => map_api_error(other, file_id),
-            })
+            })?;
+        if !(200..300).contains(&response.status) {
+            return Err(ResolveError::CalloutFailed {
+                file_id: file_id.to_owned(),
+                detail: format!("Files API returned status {}", response.status),
+            });
+        }
+
+        Ok(response.body)
     }
 
     /// Fetch metadata and content, returning the base64 content
@@ -1000,6 +1015,62 @@ mod tests {
                 max_resolved_bytes,
             },
         )
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the metadata and content matrices keep non-success body shapes explicit"
+    )]
+    async fn non_success_files_responses_fail_before_body_decoding() {
+        for body in [r#"{"error":{"message":"missing"}}"#, "not-json", "", "plain text"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = body.to_owned();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _read = stream.read(&mut request).unwrap();
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let client = test_client(&format!("http://{address}"));
+            let Err(err) = client.fetch_metadata("file-missing", &http::HeaderMap::new()).await else {
+                panic!("metadata response must fail for a non-success status");
+            };
+            assert!(
+                matches!(err, ResolveError::CalloutFailed { .. }),
+                "metadata status must win over body shape: {err}"
+            );
+        }
+
+        for body in [r#"{"error":{"message":"failed"}}"#, "not-json", "", "plain text"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = body.to_owned();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _read = stream.read(&mut request).unwrap();
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let client = test_client(&format!("http://{address}"));
+            let err = client
+                .fetch_content("file-failed", &http::HeaderMap::new(), 1024, 1024)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ResolveError::CalloutFailed { .. }),
+                "content status must win over body shape: {err}"
+            );
+        }
     }
 
     #[tokio::test]
