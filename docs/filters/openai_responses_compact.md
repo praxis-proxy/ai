@@ -9,7 +9,13 @@ Summarizes conversation history when the token count exceeds a configured thresh
 
 `compact_threshold` in `context_management` must be an integer. Floating-point values (e.g. `0.9`) are ignored and compaction is skipped.
 
-Compaction only applies to multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history. Single-turn requests are released without compaction.
+Compaction applies in two scenarios:
+
+- **Rehydrated history** — stored history loaded via `previous_response_id` or `conversation`. Only the stored history is summarized; the current turn is preserved.
+
+- **Explicit compact** — `POST /v1/responses/compact` with a `response_id`. Loads stored messages, summarizes them, and persists a new compacted response.
+
+Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because `state.input == state.messages` — there is no separable "current turn" to preserve after summarization. Requests without rehydrated history are released without compaction.
 
 ## Configuration
 
@@ -18,6 +24,7 @@ Compaction only applies to multi-turn requests where `openai_responses_rehydrate
 | `inference_url` | string | yes | URL of the inference backend for summarization calls. E.g., `"http://localhost:11434/v1/chat/completions"` |
 | `default_model` | string | no | Default model for summarization when not overridden in the request's `context_management`. |
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
+| `summary_prefix` | string | no | Prefix prepended to the summary when translating compaction items to backend messages. Defaults to `"[Previous conversation summary]\n\n"`. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `callout_failure_mode` | `closed` \| `open` | no | Failure mode for the inference callout. |
 | `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
@@ -39,6 +46,7 @@ filter: openai_responses_compact
 inference_url: "http://localhost:11434/v1/chat/completions"
 default_model: gpt-4o-mini
 tiktoken_encoding: cl100k_base
+summary_prefix: "[Previous conversation summary]\n\n"
 timeout_ms: 30000
 callout_failure_mode: closed
 status_on_error: 502

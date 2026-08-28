@@ -36,6 +36,12 @@ pub(super) struct CompactFilterConfig {
     #[serde(default = "default_tiktoken_encoding")]
     pub tiktoken_encoding: String,
 
+    /// Prefix prepended to the summary when translating compaction
+    /// items to backend messages. Defaults to
+    /// `"[Previous conversation summary]\n\n"`.
+    #[serde(default)]
+    pub summary_prefix: Option<String>,
+
     /// Callout timeout in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
@@ -75,6 +81,9 @@ pub(super) struct ValidatedConfig {
     /// Tiktoken encoding name.
     pub tiktoken_encoding: String,
 
+    /// Prefix prepended to the summary in backend messages.
+    pub summary_prefix: String,
+
     /// Shared callout settings (timeout, failure mode, status).
     pub callout: CalloutSettings,
 }
@@ -89,6 +98,7 @@ const SUPPORTED_ENCODINGS: &[&str] = &["cl100k_base", "o200k_base"];
 /// Returns [`FilterError`] if `inference_url` is empty,
 /// `tiktoken_encoding` is not a supported encoding name,
 /// `timeout_ms` is zero, or `status_on_error` is out of range.
+#[expect(clippy::too_many_lines, reason = "all validations belong together")]
 pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig, FilterError> {
     if raw.inference_url.is_empty() {
         return Err(FilterError::from("openai_responses_compact: inference_url is empty"));
@@ -115,6 +125,10 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
         inference_url: raw.inference_url.clone(),
         default_model: raw.default_model.clone(),
         tiktoken_encoding: raw.tiktoken_encoding.clone(),
+        summary_prefix: raw
+            .summary_prefix
+            .clone()
+            .unwrap_or_else(|| crate::openai::responses::compact::DEFAULT_SUMMARY_PREFIX.to_owned()),
         callout: CalloutSettings {
             timeout_ms,
             failure_mode: raw.callout_failure_mode.unwrap_or(FailureMode::Closed),

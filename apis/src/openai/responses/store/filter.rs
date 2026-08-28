@@ -60,7 +60,7 @@ use tracing::{debug, trace, warn};
 use super::{
     super::{
         DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
-        error::responses_error_rejection, state::ResponsesState,
+        compact::is_explicit_compact_request, error::responses_error_rejection, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
@@ -211,6 +211,18 @@ impl ResponseStoreFilter {
                 .await
                 .as_ref()
                 .map(Arc::clone)
+        }
+    }
+
+    /// Best-effort store init for the explicit compact endpoint.
+    ///
+    /// The compact filter handles a missing store with its own error,
+    /// so a failed init here does not reject the request.
+    async fn try_init_store_for_compact(&self, ctx: &HttpFilterContext<'_>) {
+        if is_explicit_compact_request(ctx)
+            && let Some(store) = &self.get_or_init_store().await
+        {
+            register_store_in_context(ctx, store);
         }
     }
 
@@ -721,6 +733,7 @@ impl HttpFilter for ResponseStoreFilter {
         }
 
         if !should_init_store_for_request(ctx) {
+            self.try_init_store_for_compact(ctx).await;
             return Ok(FilterAction::Continue);
         }
 
@@ -754,6 +767,8 @@ impl HttpFilter for ResponseStoreFilter {
                 Some(store) => register_store_in_context(ctx, store),
                 None => return Ok(FilterAction::Reject(reject_store_error())),
             }
+        } else {
+            self.try_init_store_for_compact(ctx).await;
         }
         Ok(FilterAction::Continue)
     }
