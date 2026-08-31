@@ -10,7 +10,7 @@ use praxis_filter::{
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
-use crate::callout_policy::FailureMode;
+use crate::callout_policy::{self, FailureMode};
 
 /// Default callout timeout (10 seconds — search APIs can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -203,34 +203,16 @@ fn build_validated_config(
         provider: raw.provider,
         api_key: SecretString::from(api_key),
         default_context_size: validate_context_size(filter_name, raw.default_context_size.as_deref())?,
-        timeout_ms: validate_timeout_ms(filter_name, raw.timeout_ms)?,
+        timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
         failure_mode: raw.on_failure.unwrap_or(FailureMode::Closed),
-        status_on_error: validate_status_on_error(filter_name, raw.status_on_error)?,
+        status_on_error: callout_policy::validate_status_on_error(
+            filter_name,
+            raw.status_on_error,
+            DEFAULT_STATUS_ON_ERROR,
+        )?,
         base_url: raw.base_url.clone(),
     })
-}
-
-/// Validate timeout, applying the default and rejecting zero.
-fn validate_timeout_ms(filter_name: &'static str, raw: Option<u64>) -> Result<u64, FilterError> {
-    let value = raw.unwrap_or(DEFAULT_TIMEOUT_MS);
-    if value == 0 {
-        return Err(FilterError::from(format!(
-            "{filter_name}: timeout_ms must be greater than 0"
-        )));
-    }
-    Ok(value)
-}
-
-/// Validate HTTP status code, applying the default and rejecting out-of-range.
-fn validate_status_on_error(filter_name: &'static str, raw: Option<u16>) -> Result<u16, FilterError> {
-    let value = raw.unwrap_or(DEFAULT_STATUS_ON_ERROR);
-    if !(100..=599).contains(&value) {
-        return Err(FilterError::from(format!(
-            "{filter_name}: status_on_error must be between 100 and 599, got {value}"
-        )));
-    }
-    Ok(value)
 }
 
 /// Validate `default_context_size`, defaulting to `Medium` when
