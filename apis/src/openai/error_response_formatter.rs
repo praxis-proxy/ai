@@ -20,17 +20,26 @@ use praxis_filter::{ErrorResponseContext, ErrorResponseFormatter, FormattedError
 /// Mapping:
 /// - `error.message` ← `context.message`
 /// - `error.code` ← `context.code` (Praxis machine-readable code)
-/// - `error.type` ← `"server_error"` for 5xx, `context.code` otherwise
+/// - `error.type` ← standardized OpenAI error type based on HTTP status code
 /// - `error.param` ← always `null`
 pub(crate) struct OpenAiErrorFormatter;
 
+/// Maps an HTTP status code to a standardized OpenAI error type string.
+fn map_error_type(status: u16) -> &'static str {
+    match status {
+        500..=599 => "server_error",
+        429 => "rate_limit_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        400 | 422 => "invalid_request_error",
+        _ => "api_error",
+    }
+}
+
 impl ErrorResponseFormatter for OpenAiErrorFormatter {
     fn format(&self, context: &ErrorResponseContext<'_>) -> FormattedErrorResponse {
-        let error_type = if context.status >= 500 {
-            "server_error"
-        } else {
-            context.code
-        };
+        let error_type = map_error_type(context.status);
 
         let body = serde_json::json!({
             "error": {
@@ -103,6 +112,20 @@ mod tests {
     }
 
     #[test]
+    fn json_escaping_handles_unicode() {
+        let ctx = ErrorResponseContext::new("server_error", "Connection to サーバー failed 🔥 (مرحبا)", 500);
+        let response = OpenAiErrorFormatter.format(&ctx);
+
+        let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            parsed["error"]["message"].as_str().unwrap(),
+            "Connection to サーバー failed 🔥 (مرحبا)"
+        );
+
+        assert!(std::str::from_utf8(&response.body).is_ok());
+    }
+
+    #[test]
     fn fivex_status_uses_server_error_type() {
         for status in [500, 502, 503, 504] {
             let ctx = ErrorResponseContext::new("some_code", "some message", status);
@@ -121,13 +144,31 @@ mod tests {
     }
 
     #[test]
-    fn fourx_status_uses_code_as_type() {
-        let ctx = ErrorResponseContext::new("rate_limit_exceeded", "Too many requests", 429);
-        let response = OpenAiErrorFormatter.format(&ctx);
+    fn fourx_status_maps_to_openai_error_types() {
+        let cases = [
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (422, "invalid_request_error"),
+            (429, "rate_limit_error"),
+            (418, "api_error"),
+        ];
 
-        let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(parsed["error"]["type"], "rate_limit_exceeded");
-        assert_eq!(parsed["error"]["code"], "rate_limit_exceeded");
+        for (status, expected_type) in cases {
+            let ctx = ErrorResponseContext::new("custom_code", "test error", status);
+            let response = OpenAiErrorFormatter.format(&ctx);
+
+            let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(
+                parsed["error"]["type"], expected_type,
+                "status {status} should map to error type '{expected_type}'"
+            );
+            assert_eq!(
+                parsed["error"]["code"], "custom_code",
+                "status {status} should preserve the Praxis code"
+            );
+        }
     }
 
     #[test]
