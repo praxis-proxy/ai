@@ -46,17 +46,23 @@ impl ErrorResponseFormatter for AnthropicErrorFormatter {
     }
 }
 
-/// Map a Praxis-selected HTTP status to an Anthropic error type.
+/// Map an HTTP error status to an Anthropic error type.
 ///
-/// Only statuses that Praxis may synthesize for fatal proxy failures
-/// are mapped. The mapping is consistent with the existing
-/// `error_type_for_status` in `to_openai/response.rs`.
+/// The mapping is consistent with the existing `error_type_for_status` in
+/// `to_openai/response.rs`.
 fn anthropic_error_type(status: u16) -> &'static str {
     match status {
+        401 => "authentication_error",
+        402 => "billing_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        409 => "conflict_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
         504 => "timeout_error",
         529 => "overloaded_error",
-        429 => "rate_limit_error",
-        _ => "api_error",
+        500..=599 => "api_error",
+        _ => "invalid_request_error",
     }
 }
 
@@ -121,13 +127,31 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_produces_rate_limit_error_type() {
-        let formatter = AnthropicErrorFormatter::new("req_429".to_owned());
-        let ctx = ErrorResponseContext::new("rate_limit_exceeded", "Too many requests", 429);
-        let response = formatter.format(&ctx);
+    fn fourx_status_maps_to_anthropic_error_types() {
+        let cases = [
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (402, "billing_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (409, "conflict_error"),
+            (413, "request_too_large"),
+            (422, "invalid_request_error"),
+            (429, "rate_limit_error"),
+            (418, "invalid_request_error"),
+        ];
 
-        let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(parsed["error"]["type"], "rate_limit_error");
+        for (status, expected_type) in cases {
+            let formatter = AnthropicErrorFormatter::new("req_4xx".to_owned());
+            let ctx = ErrorResponseContext::new("test_code", "test message", status);
+            let response = formatter.format(&ctx);
+
+            let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(
+                parsed["error"]["type"], expected_type,
+                "status {status} should map to error type '{expected_type}'"
+            );
+        }
     }
 
     #[test]
@@ -144,7 +168,7 @@ mod tests {
 
     #[test]
     fn top_level_type_is_always_error() {
-        for status in [400, 429, 500, 502, 504, 529] {
+        for status in [400, 401, 403, 404, 413, 429, 500, 502, 504, 529] {
             let formatter = AnthropicErrorFormatter::new("req_type".to_owned());
             let ctx = ErrorResponseContext::new("test", "test", status);
             let response = formatter.format(&ctx);
@@ -170,7 +194,7 @@ mod tests {
             "overloaded_error",
         ];
 
-        for status in [400, 429, 500, 502, 503, 504, 529] {
+        for status in [400, 401, 402, 403, 404, 409, 413, 422, 429, 500, 502, 503, 504, 529] {
             let formatter = AnthropicErrorFormatter::new("req_vocab".to_owned());
             let ctx = ErrorResponseContext::new("test_code", "test message", status);
             let response = formatter.format(&ctx);
@@ -208,12 +232,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fourx_defaults_to_api_error() {
-        let formatter = AnthropicErrorFormatter::new("req_4xx".to_owned());
-        let ctx = ErrorResponseContext::new("unknown_code", "unknown error", 418);
+    fn json_escaping_handles_unicode() {
+        let formatter = AnthropicErrorFormatter::new("req_unicode".to_owned());
+        let ctx = ErrorResponseContext::new("server_error", "Connection to サーバー failed 🔥 (مرحبا)", 500);
         let response = formatter.format(&ctx);
 
         let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(parsed["error"]["type"], "api_error");
+        assert_eq!(
+            parsed["error"]["message"].as_str().unwrap(),
+            "Connection to サーバー failed 🔥 (مرحبا)"
+        );
+
+        assert!(std::str::from_utf8(&response.body).is_ok());
     }
 }
