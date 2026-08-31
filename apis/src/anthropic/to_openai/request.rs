@@ -498,8 +498,6 @@ fn non_empty_lines(lines: &[String]) -> Option<String> {
 // Parameter Mapping
 // -----------------------------------------------------------------------------
 
-/// Map Anthropic parameters to Chat Completions-compatible equivalents.
-///
 /// Copy `stream` and request streaming usage when enabled.
 fn convert_stream(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
     let Some(stream) = obj.get("stream") else {
@@ -518,6 +516,8 @@ fn convert_stream(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
     }
 }
 
+/// Map Anthropic parameters to Chat Completions-compatible equivalents.
+///
 /// `top_k` has no standard Chat Completions equivalent but is preserved
 /// as an extra body parameter for backends that support it
 /// (e.g. vLLM).
