@@ -159,7 +159,7 @@ struct ResponseEnvelope<'a> {
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// default_context_size: medium
 /// timeout_ms: 10000
-/// provider_failure_mode: closed
+/// on_failure: closed
 /// status_on_error: 502
 /// max_body_bytes: 67108864
 /// ```

@@ -27,13 +27,13 @@ default_context_size: medium
     AnthropicWebSearchFilter::from_config(&config).unwrap()
 }
 
-fn test_filter_impl_with_base_url(base_url: &str, provider_failure_mode: &str) -> AnthropicWebSearchFilter {
+fn test_filter_impl_with_base_url(base_url: &str, on_failure: &str) -> AnthropicWebSearchFilter {
     let config = serde_yaml::from_str(&format!(
         r#"
 provider: you
 api_key: test-key
 default_context_size: medium
-provider_failure_mode: {provider_failure_mode}
+on_failure: {on_failure}
 base_url: "{base_url}"
 "#,
     ))

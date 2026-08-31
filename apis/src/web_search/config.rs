@@ -117,7 +117,7 @@ pub(crate) struct WebSearchFilterConfig {
 
     /// Failure mode for search provider callouts.
     #[serde(default)]
-    pub(crate) provider_failure_mode: Option<FailureMode>,
+    pub(crate) on_failure: Option<FailureMode>,
 
     /// HTTP status code to return when rejecting on error.
     #[serde(default)]
@@ -204,7 +204,7 @@ fn build_validated_config(
         default_context_size: validate_context_size(filter_name, raw.default_context_size.as_deref())?,
         timeout_ms: validate_timeout_ms(filter_name, raw.timeout_ms)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
-        failure_mode: raw.provider_failure_mode.unwrap_or(FailureMode::Closed),
+        failure_mode: raw.on_failure.unwrap_or(FailureMode::Closed),
         status_on_error: validate_status_on_error(filter_name, raw.status_on_error)?,
         base_url: raw.base_url.clone(),
     })
@@ -293,7 +293,7 @@ mod tests {
             default_context_size: None,
             timeout_ms: None,
             max_body_bytes: None,
-            provider_failure_mode: None,
+            on_failure: None,
             status_on_error: None,
             base_url: None,
         }
@@ -333,8 +333,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_preserves_provider_failure_mode() {
-        let yaml = serde_yaml::from_str("\nprovider: brave\napi_key: test-key\nprovider_failure_mode: open\n").unwrap();
+    fn parse_config_preserves_on_failure() {
+        let yaml = serde_yaml::from_str("\nprovider: brave\napi_key: test-key\non_failure: open\n").unwrap();
 
         let raw: WebSearchFilterConfig = parse_filter_config("openai_web_search", &yaml).unwrap();
         let validated = build_config("openai_web_search", &raw).unwrap();
@@ -371,7 +371,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("high".into());
         cfg.timeout_ms = Some(15_000);
-        cfg.provider_failure_mode = Some(FailureMode::Open);
+        cfg.on_failure = Some(FailureMode::Open);
         cfg.status_on_error = Some(503);
         let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.default_context_size, SearchContextSize::High);
