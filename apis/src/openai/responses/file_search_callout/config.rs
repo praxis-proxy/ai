@@ -57,7 +57,7 @@ pub(crate) struct FileSearchFilterConfig {
     pub allow_private_url: bool,
 
     /// Behaviour when a vector-store callout fails.
-    pub callout_failure_mode: Option<FailureMode>,
+    pub on_failure: Option<FailureMode>,
 
     /// Headers to forward from the original request to the
     /// vector store API for authentication and tenant isolation.
@@ -111,7 +111,7 @@ pub(crate) fn build_config_with_client(
     client: SubRequestClient,
 ) -> Result<ValidatedConfig, FilterError> {
     let vector_store_url = parse_vector_store_url(&cfg.vector_store_url, cfg.allow_private_url)?;
-    let failure_mode = cfg.callout_failure_mode.unwrap_or(FailureMode::Closed);
+    let failure_mode = cfg.on_failure.unwrap_or(FailureMode::Closed);
     let (max_response_bytes, max_total_response_bytes) =
         response_limits(cfg.max_response_bytes, cfg.max_total_response_bytes)?;
     let max_state_bytes = validated_state_limit(cfg.max_state_bytes)?;

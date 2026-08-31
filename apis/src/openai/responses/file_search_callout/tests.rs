@@ -1173,7 +1173,7 @@ async fn open_and_closed_failure_modes_are_distinct() {
             body_delay: Duration::ZERO,
             status,
         });
-        let closed = make_filter(closed_server.port, "callout_failure_mode: closed\n");
+        let closed = make_filter(closed_server.port, "on_failure: closed\n");
         let mut closed_ctx = make_context(Some(one_pending_state(&["vs-a"])));
         assert!(matches!(
             closed.on_request(&mut closed_ctx).await.unwrap(),
@@ -1190,7 +1190,7 @@ async fn open_and_closed_failure_modes_are_distinct() {
             body_delay: Duration::ZERO,
             status,
         });
-        let open = make_filter(open_server.port, "callout_failure_mode: open\n");
+        let open = make_filter(open_server.port, "on_failure: open\n");
         let mut open_ctx = make_context(Some(one_pending_state(&["vs-a"])));
         assert!(matches!(
             open.on_request(&mut open_ctx).await.unwrap(),
@@ -1211,7 +1211,7 @@ async fn aggregate_budget_stops_later_searches_and_marks_call_incomplete() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, "small"));
     let filter = make_filter(
         server.port,
-        "callout_failure_mode: open\nmax_response_bytes: 512\nmax_total_response_bytes: 512\n",
+        "on_failure: open\nmax_response_bytes: 512\nmax_total_response_bytes: 512\n",
     );
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b"])));
 
@@ -1240,7 +1240,7 @@ async fn malformed_success_bodies_are_charged_to_the_aggregate_budget() {
     });
     let filter = make_filter(
         server.port,
-        "callout_failure_mode: open\nmax_response_bytes: 1\nmax_total_response_bytes: 4\n",
+        "on_failure: open\nmax_response_bytes: 1\nmax_total_response_bytes: 4\n",
     );
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b", "vs-c", "vs-d", "vs-e"])));
 
@@ -1322,7 +1322,7 @@ async fn one_execution_deadline_covers_later_concurrency_chunks() {
 #[tokio::test]
 async fn fail_closed_stops_scheduling_after_the_current_chunk() {
     let server = MockServer::json(500, &json!({"error": "failed"}));
-    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
+    let filter = make_filter(server.port, "on_failure: closed\n");
     let store_ids: Vec<String> = (0..=MAX_CONCURRENT_SEARCHES)
         .map(|index| format!("vs-{index}"))
         .collect();
@@ -1375,7 +1375,7 @@ async fn aggregate_results_are_score_sorted_and_limited_to_top_k() {
             Duration::ZERO,
         ),
     ]);
-    let filter = make_filter(server.port, "callout_failure_mode: open\n");
+    let filter = make_filter(server.port, "on_failure: open\n");
     let mut state = one_pending_state(&["vs-a", "vs-b"]);
     state.tools[0]["max_num_results"] = json!(3);
     state.include.push("file_search_call.results".to_owned());
@@ -1405,7 +1405,7 @@ async fn fail_open_retains_successful_results_from_a_partial_fan_out() {
         ),
         ("vs-b", 500, json!({"error": "failed"}), Duration::ZERO),
     ]);
-    let filter = make_filter(server.port, "callout_failure_mode: open\n");
+    let filter = make_filter(server.port, "on_failure: open\n");
     let mut state = one_pending_state(&["vs-a", "vs-b"]);
     state.include.push("file_search_call.results".to_owned());
     let mut ctx = make_context(Some(state));
@@ -1424,7 +1424,7 @@ async fn fail_open_retains_successful_results_from_a_partial_fan_out() {
 #[tokio::test]
 async fn outbound_query_store_id_and_request_body_are_bounded() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "callout_failure_mode: open\n");
+    let filter = make_filter(server.port, "on_failure: open\n");
 
     let oversized_store = "s".repeat(MAX_VECTOR_STORE_ID_BYTES + 1);
     let mut store_ctx = make_context(Some(one_pending_state(&[&oversized_store])));
@@ -1458,7 +1458,7 @@ async fn outbound_query_store_id_and_request_body_are_bounded() {
 #[tokio::test]
 async fn malformed_execution_fields_fail_without_silent_normalization() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
+    let filter = make_filter(server.port, "on_failure: closed\n");
 
     let mut invalid_stores = one_pending_state(&["vs-a"]);
     invalid_stores.tools[0]["vector_store_ids"] = json!(["vs-a", 7]);
@@ -1490,7 +1490,7 @@ async fn malformed_execution_fields_fail_without_silent_normalization() {
 #[tokio::test]
 async fn missing_file_search_tool_fields_fail_closed() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
+    let filter = make_filter(server.port, "on_failure: closed\n");
 
     let mut missing_ids = one_pending_state(&["vs-a"]);
     missing_ids.tools[0].as_object_mut().unwrap().remove("vector_store_ids");
@@ -1514,7 +1514,7 @@ async fn missing_file_search_tool_fields_fail_closed() {
 #[tokio::test]
 async fn fail_open_isolates_a_malformed_pending_call() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "callout_failure_mode: open\n");
+    let filter = make_filter(server.port, "on_failure: open\n");
     let malformed = json!({
         "type":"file_search_call","id":"fs-bad","status":"searching","queries":["valid", 7]
     });

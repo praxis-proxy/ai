@@ -109,7 +109,7 @@ struct CompactionParams {
 /// default_model: gpt-4o-mini
 /// tiktoken_encoding: cl100k_base
 /// timeout_ms: 30000
-/// callout_failure_mode: closed
+/// on_failure: closed
 /// status_on_error: 502
 /// ```
 pub struct CompactFilter {
