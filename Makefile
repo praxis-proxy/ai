@@ -11,7 +11,7 @@ V                ?=
 # Experimental filter features are off by default in builds, so lint and
 # test explicitly enable them — otherwise the gated filter code is never
 # compiled, linted, or tested by CI.
-EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter
+EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
@@ -20,6 +20,7 @@ endif
 .PHONY: all build release check clean \
 	test test-unit test-schema test-integration test-inference-fixtures \
 	test-postgres-unit test-postgres-integration test-environment \
+	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
@@ -84,7 +85,8 @@ test-schema:
 test-integration:
 	cargo test -p praxis-tests-integration $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features $(EXPERIMENTAL_FEATURES) --test suite \
-		-- examples::azure_ad examples::gcp_adc examples::lakera_guard $(if $(V),--nocapture)
+		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit \
+		$(if $(V),--nocapture)
 
 test-inference-fixtures:
 	cargo test -p praxis-test-utils $(_NOCAPTURE)
@@ -97,6 +99,13 @@ test-postgres-unit:
 test-postgres-integration:
 	cargo test -p praxis-tests-integration --test suite openai_response_store_postgres -- --ignored $(_NOCAPTURE)
 
+test-token-rate-limit-valkey-unit:
+	cargo test -p praxis-ai-filters --features token-rate-limit-filter valkey $(_NOCAPTURE)
+
+test-token-rate-limit-valkey-integration:
+	cargo test -p praxis-tests-integration --features token-rate-limit-filter --test suite \
+		mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas $(_NOCAPTURE)
+
 openai-conformance:
 	cargo xtask openai-conformance $(OPENAI_CONFORMANCE_ARGS)
 
@@ -104,6 +113,7 @@ check-openai-conformance-reference:
 	cargo xtask openai-conformance-reference --check
 
 test-openai-conformance: openai-conformance
+
 
 test-environment:
 	cargo test -p praxis-ai-llmd-ext-proc $(_NOCAPTURE)
@@ -117,7 +127,7 @@ test-environment:
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets \
-		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter \
+		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter \
 		-- -D warnings
 	cargo +nightly fmt --all -- --check
 	cargo machete --with-metadata .
@@ -215,6 +225,8 @@ help:
 	@echo "  test-inference-fixtures  inference fixture and replay tests"
 	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
+	@echo "  test-token-rate-limit-valkey-unit        token_rate_limit Valkey unit tests (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
+	@echo "  test-token-rate-limit-valkey-integration token_rate_limit Valkey integration test (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-environment     llm-d ext_proc environment tests"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"

@@ -21,9 +21,10 @@ use super::{
         MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchResult, VectorStoreSearchRequest,
         VectorStoreSearchResponse, request_error,
     },
-    config::{FileSearchFilterConfig, ValidatedConfig, build_config},
+    config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
     *,
 };
+use crate::subrequest::{SubRequestError, SubResponse};
 // -----------------------------------------------------------------------------
 // Configuration and transport validation
 // -----------------------------------------------------------------------------
@@ -98,6 +99,65 @@ fn config_rejects_dns_and_sensitive_ip_targets_by_default() {
 fn config_private_override_is_explicit() {
     let config = parse_config("vector_store_url: 'http://localhost:8001'\nallow_private_url: true\n").unwrap();
     assert_eq!(config.api_client.api_base_url(), "http://localhost:8001");
+}
+
+#[tokio::test]
+async fn build_config_with_client_shares_connector_circuit_state() {
+    use praxis_core::{
+        circuit::CircuitBreakerConfig,
+        subrequest::{SubRequestClient, SubRequestConnector, SubRequestConnectorOptions, SubRequestError},
+    };
+
+    let shared = SubRequestClient::with_max_response_bytes(
+        SubRequestConnector::with_options(SubRequestConnectorOptions {
+            keepalive_pool_size: 4,
+            max_connections: None,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                threshold: 1,
+                recovery_window: Duration::from_secs(30),
+                half_open_timeout: Duration::from_secs(30),
+            }),
+        }),
+        usize::MAX,
+    );
+    let raw: FileSearchFilterConfig = serde_yaml::from_str(
+        "
+vector_store_url: http://127.0.0.1:9
+allow_private_url: true
+",
+    )
+    .unwrap();
+    let inherited = build_config_with_client(&raw, shared.clone()).unwrap();
+    let isolated = build_config(&raw).unwrap();
+    let peer_addr = closed_loopback_addr();
+
+    let first = execute_against(&shared, &peer_addr).await;
+    assert!(
+        matches!(first, Err(SubRequestError::Connect(_))),
+        "first refusal should record a failure on the shared connector; got {first:?}"
+    );
+    let second = execute_against(&shared, &peer_addr).await;
+    assert!(
+        matches!(second, Err(SubRequestError::CircuitOpen { .. })),
+        "shared connector should open after threshold 1; got {second:?}"
+    );
+
+    let inherited_result = execute_against(inherited.api_client.subrequest_client(), &peer_addr).await;
+    assert!(
+        matches!(inherited_result, Err(SubRequestError::CircuitOpen { .. })),
+        "from_config_with_client must keep the callout on the same connector Arc; got {inherited_result:?}"
+    );
+
+    let isolated_debug = format!("{:?}", isolated.api_client.subrequest_client());
+    assert!(
+        isolated_debug.contains("circuit_breakers: false"),
+        "isolated from_config must not install a breaker; got {isolated_debug}"
+    );
+    let isolated_result = execute_against(isolated.api_client.subrequest_client(), &peer_addr).await;
+    assert!(
+        matches!(isolated_result, Err(SubRequestError::Connect(_))),
+        "isolated client must not observe the shared connector's open circuit; got {isolated_result:?}"
+    );
 }
 
 #[test]
@@ -1830,6 +1890,29 @@ fn parse_config(yaml: &str) -> Result<ValidatedConfig, FilterError> {
     let raw: FileSearchFilterConfig =
         serde_yaml::from_str(yaml).map_err(|error| -> FilterError { error.to_string().into() })?;
     build_config(&raw)
+}
+
+fn closed_loopback_addr() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr.to_string()
+}
+
+async fn execute_against(client: &SubRequestClient, peer_addr: &str) -> Result<SubResponse, SubRequestError> {
+    use bytes::Bytes;
+    use http::HeaderMap;
+    use pingora_core::upstreams::peer::HttpPeer;
+    use praxis_core::subrequest::SubRequest;
+
+    let peer = HttpPeer::new(peer_addr.to_owned(), false, String::new());
+    let request = SubRequest {
+        method: http::Method::GET,
+        uri: "/".parse().unwrap(),
+        headers: HeaderMap::new(),
+        body: Bytes::new(),
+    };
+    Box::pin(client.execute(&peer, &request, 1024, Duration::from_secs(2), None)).await
 }
 
 fn make_filter(port: u16, extra: &str) -> Box<dyn HttpFilter> {

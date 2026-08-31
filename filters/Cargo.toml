@@ -25,6 +25,15 @@ azure-ad-filter = ["experimental"]
 # authentication filter. Work in progress; the config surface may change.
 # Activates the `experimental` marker.
 gcp-adc-filter = ["experimental"]
+# Experimental: the token_rate_limit filter. Its parent proposal
+# (00121_token-rate-limiting in praxis-proxy/enhancements) is not yet
+# `accepted`, and open design questions remain (bucket-keying strategy,
+# HA/clustered-Valkey failure modes, how this relates to Kuadrant's
+# TokenRateLimitPolicy) -- see ai#796. Activates the `experimental` marker.
+# Also pulls in `redis` and `thiserror`, which only this filter uses --
+# optional so the rest of the crate (and its consumers) don't compile the
+# Valkey client and its transitive deps unless this feature is on.
+token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = []
@@ -51,6 +60,7 @@ pingora-core.workspace = true
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
+redis = { workspace = true, optional = true }
 reqwest.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -58,6 +68,7 @@ serde_json_canonicalizer = { workspace = true }
 serde_json_path = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
+thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

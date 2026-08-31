@@ -18,7 +18,10 @@ use praxis_protocol::{CertWatcherShutdowns, ListenerPipelines, Protocol as _, ht
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::pipelines::resolve_pipelines;
+use crate::{
+    pipelines::resolve_pipelines,
+    subrequest::{create_subrequest_client, spawn_circuit_eviction_if_configured},
+};
 
 // -----------------------------------------------------------------------------
 // Config Path Resolution
@@ -126,26 +129,6 @@ struct ServerState {
     health_shutdown: Arc<Mutex<CancellationToken>>,
 }
 
-/// Create a [`SubRequestClient`] from the runtime configuration.
-///
-/// Called early in startup so the shared client can be captured by
-/// filter factories during registry construction.
-///
-/// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-fn create_subrequest_client(config: &Config) -> praxis_core::subrequest::SubRequestClient {
-    let pool_size = config
-        .runtime
-        .subrequest_pool_size
-        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
-    let subrequest_connector =
-        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections);
-    let subrequest_response_ceiling = config.body_limits.max_response_bytes.unwrap_or(usize::MAX);
-    praxis_core::subrequest::SubRequestClient::with_max_response_bytes(
-        subrequest_connector,
-        subrequest_response_ceiling,
-    )
-}
-
 /// Build filter pipelines, health checks, and registries.
 fn build_server_state(
     config: &Config,
@@ -161,6 +144,11 @@ fn build_server_state(
 
     let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_health_check_tasks(config, Arc::clone(health_registry), &health_shutdown);
+    // Dedicated token: `health_shutdown` is cancelled on every reload, but
+    // circuit-breaker config is restart-required and eviction must keep running.
+    let circuit_eviction_shutdown = CancellationToken::new();
+    let _circuit_eviction =
+        spawn_circuit_eviction_if_configured(config, &subrequest_client, &circuit_eviction_shutdown);
 
     ServerState {
         pipelines: Arc::new(pipelines),

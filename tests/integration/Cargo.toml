@@ -18,6 +18,9 @@ azure-ad-filter = ["praxis-ai-proxy/azure-ad-filter"]
 # Experimental: gates the gcp_adc example test, which needs the gcp_adc
 # filter registered in the in-process proxy registry.
 gcp-adc-filter = ["praxis-ai-proxy/gcp-adc-filter"]
+# Experimental: gates the token_rate_limit example tests, which need the
+# token_rate_limit filter registered in the in-process proxy registry.
+token-rate-limit-filter = ["praxis-ai-proxy/token-rate-limit-filter"]
 llmd-ext-proc = ["praxis-test-utils/llmd-ext-proc"]
 no-mac-cert-rotation-tests = [] # We use this to disable testing cert rotation on macOS
 praxis-main = ["praxis-test-utils/praxis-main"]

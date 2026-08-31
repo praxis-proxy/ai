@@ -32,17 +32,7 @@ pub(crate) fn load_and_validate_for_cli(
 /// Validate a parsed configuration by building filter pipelines.
 pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     praxis_core::logging::validate_log_overrides(config)?;
-    let pool_size = config
-        .runtime
-        .subrequest_pool_size
-        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
-    let subrequest_connector =
-        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections);
-    let subrequest_response_ceiling = config.body_limits.max_response_bytes.unwrap_or(usize::MAX);
-    let subrequest_client = praxis_core::subrequest::SubRequestClient::with_max_response_bytes(
-        subrequest_connector,
-        subrequest_response_ceiling,
-    );
+    let subrequest_client = praxis_ai::create_subrequest_client(config);
     let registry = praxis_ai::build_full_registry(&subrequest_client);
     let health_registry = praxis_core::health::build_health_registry(&config.clusters);
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
@@ -171,6 +161,33 @@ filter_chains:
             err.contains("nonexistent_chain"),
             "error should mention the missing chain name: {err}"
         );
+    }
+
+    #[test]
+    fn validate_accepts_subrequest_circuit_breaker_config() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: static_response
+        status: 200
+runtime:
+  subrequest_circuit_breaker:
+    consecutive_failures: 3
+    recovery_window_secs: 30
+"#,
+        )
+        .unwrap();
+        assert!(
+            config.runtime.subrequest_circuit_breaker.is_some(),
+            "CLI validation path should parse runtime.subrequest_circuit_breaker"
+        );
+        validate_config_for_startup(&config).expect("configured circuit breaker should not fail startup validation");
     }
 
     static CWD_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

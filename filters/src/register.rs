@@ -12,6 +12,8 @@ use crate::AzureAdFilter;
 use crate::GcpAdcFilter;
 #[cfg(feature = "http-callout-filter")]
 use crate::HttpCalloutFilter;
+#[cfg(feature = "token-rate-limit-filter")]
+use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
     PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
@@ -117,15 +119,25 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "time_to_first_token" => TimeToFirstTokenFilter::from_config
+    );
+    register_token_filters(registry);
+}
+
+/// Register token counting/usage/rate-limiting filters.
+fn register_token_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
         http "token_count" => TokenCountFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
         http "token_usage_headers" => TokenUsageHeadersFilter::from_config
     );
+    #[cfg(feature = "token-rate-limit-filter")]
     praxis_filter::register_filters!(
         @register registry,
-        http "time_to_first_token" => TimeToFirstTokenFilter::from_config
+        http "token_rate_limit" => TokenRateLimitFilter::from_config
     );
 }
 
@@ -431,6 +443,7 @@ mod tests {
         assert_experimental_registration(&names, "http_callout", cfg!(feature = "http-callout-filter"));
         assert_experimental_registration(&names, "azure_ad", cfg!(feature = "azure-ad-filter"));
         assert_experimental_registration(&names, "gcp_adc", cfg!(feature = "gcp-adc-filter"));
+        assert_experimental_registration(&names, "token_rate_limit", cfg!(feature = "token-rate-limit-filter"));
     }
 
     #[test]

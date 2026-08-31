@@ -27,9 +27,14 @@ use tokio::sync::Notify;
 // Shared Test Client
 // -----------------------------------------------------------------------------
 
-/// Default sub-request client for integration tests.
+/// Default sub-request client for registry-only tests without a config.
 fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
     praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
+}
+
+/// Shared client honoring runtime connector settings, including the circuit breaker.
+fn configured_subrequest_client(config: &Config) -> praxis_core::subrequest::SubRequestClient {
+    praxis_ai::create_subrequest_client(config)
 }
 
 // -----------------------------------------------------------------------------
@@ -44,7 +49,12 @@ fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
 /// [`FilterEntry`]: praxis_core::config::FilterEntry
-fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &FilterRegistry) -> Arc<FilterPipeline> {
+fn resolve_listener_pipeline(
+    config: &Config,
+    listener: &Listener,
+    registry: &FilterRegistry,
+    client: &praxis_core::subrequest::SubRequestClient,
+) -> Arc<FilterPipeline> {
     let chains: HashMap<&str, &[_]> = config
         .filter_chains
         .iter()
@@ -67,13 +77,7 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
             config.insecure_options.allow_unbounded_body,
         )
         .unwrap();
-    let pool_size = config
-        .runtime
-        .subrequest_pool_size
-        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
-    pipeline.set_subrequest_client(praxis_core::subrequest::SubRequestClient::new(
-        praxis_core::subrequest::SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections),
-    ));
+    pipeline.set_subrequest_client(client.clone());
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
     Arc::new(pipeline)
 }
@@ -88,13 +92,14 @@ fn resolve_listener_pipeline(config: &Config, listener: &Listener, registry: &Fi
 ///
 /// [`build_with_chains`]: FilterPipeline::build_with_chains
 pub fn build_pipeline(config: &Config) -> FilterPipeline {
-    let registry = praxis_ai::build_full_registry(&test_subrequest_client());
+    let client = configured_subrequest_client(config);
+    let registry = praxis_ai::build_full_registry(&client);
     let listener = config
         .listeners
         .first()
         .expect("config must have at least one listener");
 
-    Arc::try_unwrap(resolve_listener_pipeline(config, listener, &registry))
+    Arc::try_unwrap(resolve_listener_pipeline(config, listener, &registry, &client))
         .unwrap_or_else(|_| panic!("pipeline Arc should have single owner"))
 }
 
@@ -276,12 +281,18 @@ impl Drop for ProxyGuard {
 /// and the optional admin endpoint.
 ///
 /// [`Server`]: pingora_core::server::Server
-fn build_pingora_server(config: &Config, registry: &FilterRegistry) -> pingora_core::server::Server {
+fn build_pingora_server(
+    config: &Config,
+    registry: &FilterRegistry,
+    client: &praxis_core::subrequest::SubRequestClient,
+) -> pingora_core::server::Server {
     let mut server = praxis_core::server::build_http_server(config.shutdown_timeout_secs, &RuntimeOptions::default());
 
     let mut cert_shutdowns = Vec::new();
     for listener in &config.listeners {
-        let pipeline = Arc::new(ArcSwap::from(resolve_listener_pipeline(config, listener, registry)));
+        let pipeline = Arc::new(ArcSwap::from(resolve_listener_pipeline(
+            config, listener, registry, client,
+        )));
         load_http_handler(&mut server, listener, pipeline, &mut cert_shutdowns).unwrap();
     }
     drop(cert_shutdowns);
@@ -300,14 +311,18 @@ fn build_pingora_server(config: &Config, registry: &FilterRegistry) -> pingora_c
 
 /// Build a [`ProxyGuard`] by spawning a Pingora server that
 /// shuts down when the guard is dropped.
-fn spawn_proxy_server(config: &Config, registry: &FilterRegistry) -> ProxyGuard {
+fn spawn_proxy_server(
+    config: &Config,
+    registry: &FilterRegistry,
+    client: &praxis_core::subrequest::SubRequestClient,
+) -> ProxyGuard {
     let addr = config
         .listeners
         .first()
         .expect("config must have at least one listener")
         .address
         .clone();
-    let server = build_pingora_server(config, registry);
+    let server = build_pingora_server(config, registry, client);
 
     let notify = Arc::new(Notify::new());
     let watch_notify = Arc::clone(&notify);
@@ -345,7 +360,11 @@ fn spawn_proxy_server(config: &Config, registry: &FilterRegistry) -> ProxyGuard 
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_proxy(config: &Config) -> ProxyGuard {
-    start_proxy_with_registry(config, &praxis_ai::build_full_registry(&test_subrequest_client()))
+    let client = configured_subrequest_client(config);
+    let registry = praxis_ai::build_full_registry(&client);
+    let guard = spawn_proxy_server(config, &registry, &client);
+    crate::net::wait::wait_for_http(&guard.addr);
+    guard
 }
 
 /// Start the proxy server without issuing an HTTP readiness request.
@@ -357,7 +376,9 @@ pub fn start_proxy(config: &Config) -> ProxyGuard {
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_proxy_no_wait(config: &Config) -> ProxyGuard {
-    spawn_proxy_server(config, &praxis_ai::build_full_registry(&test_subrequest_client()))
+    let client = configured_subrequest_client(config);
+    let registry = praxis_ai::build_full_registry(&client);
+    spawn_proxy_server(config, &registry, &client)
 }
 
 /// Start the proxy with a custom filter registry.
@@ -369,7 +390,8 @@ pub fn start_proxy_no_wait(config: &Config) -> ProxyGuard {
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_proxy_with_registry(config: &Config, registry: &FilterRegistry) -> ProxyGuard {
-    let guard = spawn_proxy_server(config, registry);
+    let client = configured_subrequest_client(config);
+    let guard = spawn_proxy_server(config, registry, &client);
     crate::net::wait::wait_for_http(&guard.addr);
     guard
 }
@@ -484,7 +506,9 @@ pub fn start_reloadable_proxy(yaml: &str) -> ReloadableProxyGuard {
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_tls_proxy(config: &Config, client_config: &Arc<rustls::ClientConfig>) -> ProxyGuard {
-    let guard = spawn_proxy_server(config, &praxis_ai::build_full_registry(&test_subrequest_client()));
+    let client = configured_subrequest_client(config);
+    let registry = praxis_ai::build_full_registry(&client);
+    let guard = spawn_proxy_server(config, &registry, &client);
     crate::net::tls::wait_for_https(&guard.addr, client_config);
     guard
 }
@@ -499,7 +523,9 @@ pub fn start_tls_proxy(config: &Config, client_config: &Arc<rustls::ClientConfig
 ///
 /// Panics if `config.listeners` is empty.
 pub fn start_tls_proxy_no_wait(config: &Config) -> ProxyGuard {
-    spawn_proxy_server(config, &praxis_ai::build_full_registry(&test_subrequest_client()))
+    let client = configured_subrequest_client(config);
+    let registry = praxis_ai::build_full_registry(&client);
+    spawn_proxy_server(config, &registry, &client)
 }
 
 // -----------------------------------------------------------------------------

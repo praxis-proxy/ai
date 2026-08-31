@@ -1,0 +1,155 @@
+name: Tests (Token Rate Limit Valkey Backend)
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+#
+# Every `token_rate_limit` test that needs a live Valkey/Redis (cross-instance
+# shared state, background-worker reconciliation, EVAL fault injection) is
+# gated on TOKEN_RATE_LIMIT_VALKEY_URL: unset, it early-returns rather than
+# failing, so `make test-unit`/`make test-integration` stay green on a
+# contributor's laptop with no Valkey running. That gate was never wired to
+# an actual Valkey anywhere in CI either, so it silently took the same
+# early-return path there too -- this workflow is that wiring, split out
+# (like postgres.yaml) so the common fast test/integration jobs don't all
+# pay for a service container on every unrelated change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "filters/src/token_rate_limit/**"
+      - "tests/integration/tests/suite/examples/token_rate_limit.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/valkey.yaml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "filters/src/token_rate_limit/**"
+      - "tests/integration/tests/suite/examples/token_rate_limit.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/valkey.yaml"
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable verbose test output (V=1)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  V: ${{ inputs.debug && '1' || '' }}
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Path filter for merge_group (which does not support on.paths)
+  # ----------------------------------------------------------------------------
+
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant path changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
+                                         "${{ github.event.merge_group.head_sha }}" -- \
+            'filters/src/token_rate_limit/' \
+            'tests/integration/tests/suite/examples/token_rate_limit.rs' \
+            'Cargo.toml' \
+            'Cargo.lock' \
+            'Makefile' \
+            '.github/workflows/valkey.yaml')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ----------------------------------------------------------------------------
+  # token_rate_limit Valkey unit tests (praxis-ai-filters)
+  # ----------------------------------------------------------------------------
+
+  unit:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    services:
+      valkey:
+        image: docker.io/valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TOKEN_RATE_LIMIT_VALKEY_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: token_rate_limit Valkey unit tests
+        run: make test-token-rate-limit-valkey-unit
+
+  # ----------------------------------------------------------------------------
+  # token_rate_limit Valkey integration test (cross-instance shared state)
+  # ----------------------------------------------------------------------------
+
+  integration:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    services:
+      valkey:
+        image: docker.io/valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TOKEN_RATE_LIMIT_VALKEY_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: token_rate_limit Valkey integration test
+        run: make test-token-rate-limit-valkey-integration

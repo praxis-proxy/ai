@@ -239,6 +239,9 @@ struct EnumInfo {
     variants: Vec<String>,
     /// Whether serde tries variants by shape instead of by variant tag.
     untagged: bool,
+    /// `#[serde(tag = "...")]` discriminator key name, for internally
+    /// tagged enums. `None` for untagged/externally tagged enums.
+    tag: Option<String>,
     /// Source shape for each variant.
     variant_shapes: Vec<EnumVariantShape>,
     /// Named fields from struct-like variants.
@@ -858,6 +861,8 @@ fn append_rendered_fields(
                 doc: field.doc.clone(),
                 required: required_kind(field),
             });
+        } else if let Some(tag_field) = flattened_tag_field(prefix, field, items) {
+            out.push(tag_field);
         }
 
         let nested_prefix = if field.flatten {
@@ -895,6 +900,26 @@ fn append_nested_fields(
         append_rendered_fields(prefix, &info.fields, items, stack, out);
         stack.pop();
     }
+}
+
+/// Synthesize the discriminator field row for a `#[serde(flatten)]`
+/// field whose type is an internally tagged enum (`#[serde(tag =
+/// "...")]`). The tag itself (e.g. `algorithm`) is a real, required
+/// YAML key, but has no corresponding field on any of the enum's
+/// variants for [`append_rendered_fields`] to otherwise pick up --
+/// without this, it's silently missing from the generated table.
+/// Returns `None` for untagged/externally tagged/non-enum flattened
+/// fields, which have no single discriminator key to document here.
+fn flattened_tag_field(prefix: &str, field: &RawField, items: &ModuleItems) -> Option<FieldInfo> {
+    let type_name = nested_type_name(&field.ty)?;
+    let info = items.enums.get(&type_name)?;
+    let tag = info.tag.as_ref()?;
+    Some(FieldInfo {
+        name: field_path(prefix, tag),
+        type_str: render_enum_type(info, &items.enums),
+        doc: field.doc.clone(),
+        required: required_kind(field),
+    })
 }
 
 /// Return the rendered requirement kind for a raw field.
@@ -1031,9 +1056,18 @@ fn serde_field_name(field: &syn::Field, rename_all: Option<&str>) -> String {
             field
                 .ident
                 .as_ref()
-                .map(|ident| apply_rename(&ident.to_string(), rename_all))
+                .map(|ident| apply_rename(strip_raw_ident_prefix(&ident.to_string()), rename_all))
         })
         .unwrap_or_default()
+}
+
+/// Strip a raw identifier's `r#` prefix (e.g. `r#match` -> `match`), which
+/// `syn::Ident::to_string()` preserves but serde's own field-name
+/// resolution does not -- a raw identifier is only needed to use a
+/// reserved keyword as a Rust binding, it has no effect on the
+/// serialized/deserialized field name.
+fn strip_raw_ident_prefix(ident: &str) -> &str {
+    ident.strip_prefix("r#").unwrap_or(ident)
 }
 
 /// Return whether a serde attribute contains a given nested key.
@@ -1087,6 +1121,7 @@ fn serde_lit_value(attr: &syn::Attribute, name: &str) -> Option<String> {
 fn extract_enum_info(e: &syn::ItemEnum) -> EnumInfo {
     let rename_all = detect_rename_all(&e.attrs);
     let untagged = has_serde_attr(&e.attrs, "untagged");
+    let tag = e.attrs.iter().find_map(|attr| serde_lit_value(attr, "tag"));
     let variants = e
         .variants
         .iter()
@@ -1098,7 +1133,23 @@ fn extract_enum_info(e: &syn::ItemEnum) -> EnumInfo {
         })
         .collect();
     let variant_shapes = e.variants.iter().map(enum_variant_shape).collect();
-    let mut variant_fields: Vec<Vec<RawField>> = e.variants.iter().map(parse_variant_fields).collect();
+    let variant_fields: Vec<Vec<RawField>> = e.variants.iter().map(parse_variant_fields).collect();
+    let fields = flatten_variant_fields_marking_one_of(variant_fields);
+
+    EnumInfo {
+        variants,
+        untagged,
+        tag,
+        variant_shapes,
+        fields,
+    }
+}
+
+/// Flatten every variant's fields into one list, marking each as
+/// [`RequirementHint::OneOf`] when more than one variant has its own
+/// named fields (a struct-like tagged/untagged enum), since only one
+/// variant's fields are ever present in a given YAML document.
+fn flatten_variant_fields_marking_one_of(mut variant_fields: Vec<Vec<RawField>>) -> Vec<RawField> {
     let named_variant_count = variant_fields.iter().filter(|fields| !fields.is_empty()).count();
     if named_variant_count > 1 {
         for fields in &mut variant_fields {
@@ -1107,14 +1158,7 @@ fn extract_enum_info(e: &syn::ItemEnum) -> EnumInfo {
             }
         }
     }
-    let fields = variant_fields.into_iter().flatten().collect();
-
-    EnumInfo {
-        variants,
-        untagged,
-        variant_shapes,
-        fields,
-    }
+    variant_fields.into_iter().flatten().collect()
 }
 
 /// Return the source shape for an enum variant.
@@ -1968,6 +2012,33 @@ mod tests {
     }
 
     #[test]
+    fn strip_raw_ident_prefix_removes_the_r_hash_prefix() {
+        assert_eq!(strip_raw_ident_prefix("r#match"), "match");
+        assert_eq!(strip_raw_ident_prefix("r#type"), "type");
+        assert_eq!(
+            strip_raw_ident_prefix("estimate_tokens"),
+            "estimate_tokens",
+            "non-raw idents pass through"
+        );
+    }
+
+    #[test]
+    fn parse_config_fields_renders_a_raw_ident_field_without_its_r_hash_prefix() {
+        let file: syn::File = syn::parse_str(
+            "#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct Cfg { r#match: Option<String> }",
+        )
+        .unwrap();
+        let syn::Item::Struct(s) = &file.items[0] else {
+            panic!("expected a struct item");
+        };
+        let fields = parse_config_fields(s).unwrap();
+        assert_eq!(
+            fields[0].name, "match",
+            "the YAML field name must be the bare keyword, not the Rust raw-identifier spelling"
+        );
+    }
+
+    #[test]
     fn first_paragraph_extracts_before_blank_line() {
         let doc = "First line.\nSecond line.\n\nSecond paragraph.";
         assert_eq!(
@@ -2338,6 +2409,41 @@ mod tests {
             prefix_field.map(|field| field.required),
             Some(RequiredKind::OneOf),
             "flattened prefix path should be marked as one-of"
+        );
+    }
+
+    #[test]
+    fn flattened_internally_tagged_enum_synthesizes_a_tag_field() {
+        let source = "
+            #[derive(Debug, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct OuterConfig { rules: Vec<RuleConfig> }
+            #[derive(Debug, Deserialize)]
+            struct RuleConfig {
+                /// Which admission algorithm this rule enforces.
+                #[serde(flatten)]
+                algorithm: RuleAlgorithm,
+            }
+            #[derive(Debug, Deserialize)]
+            #[serde(tag = \"algorithm\", rename_all = \"snake_case\")]
+            enum RuleAlgorithm { SlidingWindow { window: String }, TokenBucket { refill_rate: f64 } }
+        ";
+        let file: syn::File = syn::parse_str(source).unwrap();
+        let mut items = ModuleItems::new();
+        parse_file_items(&file, &mut items);
+        let filter = build_filter(&items, "test", Some("OuterConfig"));
+
+        let tag_field = filter
+            .fields
+            .iter()
+            .find(|field| field.name == "rules[].algorithm")
+            .expect("the tag discriminator itself must render as a documented field");
+        assert_eq!(tag_field.type_str, "`sliding_window` \\| `token_bucket`");
+        assert_eq!(tag_field.required, RequiredKind::Yes);
+        assert_eq!(tag_field.doc, "Which admission algorithm this rule enforces.");
+        assert!(
+            filter.fields.iter().any(|field| field.name == "rules[].window"),
+            "tagged variants' own fields must still render alongside the tag"
         );
     }
 

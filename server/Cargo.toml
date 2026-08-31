@@ -29,6 +29,8 @@ http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 azure-ad-filter = ["praxis-ai-filters/azure-ad-filter", "experimental"]
 # Experimental: the gcp_adc (GCP ADC) auth filter (see praxis-ai-filters).
 gcp-adc-filter = ["praxis-ai-filters/gcp-adc-filter", "experimental"]
+# Experimental: the token_rate_limit filter (see praxis-ai-filters).
+token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.
 experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]
@@ -63,4 +65,8 @@ cargo_metadata = { workspace = true }
 praxis-ai-build-support = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+pingora-core = { workspace = true }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,92 @@
+# Token Rate Limiting
+#
+# Reserves an estimated token cost at admission time and reconciles
+# that reservation against actual provider-reported usage once the
+# response completes. Rejects with 429 when the bucket can't cover
+# the estimate.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-rate-limit.yaml
+#   curl -i http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# This is the agreed M1/M2/M6 core of the token rate limiting proposal
+# (00121_token-rate-limiting.md in praxis-proxy/enhancements, tracked by
+# epic ai#121):
+#   - M1: a single sliding-window budget (one catch-all rule)
+#   - M2: reservation-based admission, reconciled against actual usage
+#   - M6: 429 responses with token-denominated rate limit headers
+#
+# `rules:` (per `ai#789`/`praxis#551`) lets each rule pick its own
+# admission algorithm and match condition; a rule with no `match:` is a
+# catch-all applying to every request that reaches it. This example
+# uses one such catch-all rule. `window`/`capacity` match the proposal's
+# own field names: "Windows are sliding: a `window: 1h` budget tracks
+# usage in the most recent 60 minutes from the current instant." State
+# defaults to in-process; set a filter-level `backend: {kind: valkey,
+# url: ..., namespace: ...}` (a sibling of `rules:`, not per-rule) to
+# share every rule's budget across every gateway instance/replica over
+# one shared connection.
+#
+# Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
+# for the full rationale): CEL/composite bucket keys, configurable
+# estimation strategies (M3, `reserved_tokens` below is a fixed
+# placeholder), token-type-aware accounting (M4), and
+# observability/metering (M7/M8/S3).
+#
+# token_rate_limit is declared *before* token_count: response hooks
+# run in reverse declared order, so token_count's on_response_body
+# (which writes token.total to filter_metadata) runs before
+# token_rate_limit's on_response_body reads it back to reconcile the
+# reservation. This mirrors the token_usage_headers/token_count
+# ordering in examples/configs/token-counting.yaml.
+#
+# Assumes request identity is already resolved upstream (this filter
+# doesn't authenticate callers) -- a catch-all rule like the one below
+# reserves quota for every request that reaches it, including probes
+# and health checks. Scope with an explicit `match:` per rule, or place
+# an identity/auth filter earlier in the pipeline. Tracked in grid#101.
+#
+# The X-RateLimit-*-Tokens response headers always reflect the
+# reservation-time snapshot, never this response's own reconciliation
+# — headers are committed before the body (and thus actual usage) is
+# known. Reconciliation still affects every *subsequent* request's
+# admission decision.
+#
+# Supported token_count provider values:
+#   openai | anthropic | google | bedrock | azure
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: backend
+
+      - filter: token_rate_limit
+        rules:
+          - name: default
+            algorithm: sliding_window
+            window: 1h             # sliding window duration
+            capacity: 100000       # max tokens admitted within `window`
+            reserved_tokens: 500   # fixed cost reserved per request at admission
+
+      - filter: token_count
+        provider: openai   # openai | anthropic | google | bedrock | azure
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

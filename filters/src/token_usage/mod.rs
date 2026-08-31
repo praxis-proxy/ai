@@ -23,6 +23,18 @@ const META_TOKEN_INPUT: &str = "token.input";
 const META_TOKEN_OUTPUT: &str = "token.output";
 
 /// Metadata key for the total token count.
+///
+/// `pub(crate)` only under `token-rate-limit-filter`, so that experimental
+/// filter's reconciliation path can reference this constant directly
+/// instead of duplicating the string literal — see the duplication risk
+/// this avoids: [`ai#351`](https://github.com/praxis-proxy/ai/issues/351)
+/// (cached-token double-counting caused by a second, independent parsing
+/// path drifting from this one). Private otherwise, so this stable filter's
+/// public surface is unaffected when the experimental feature is disabled.
+#[cfg(feature = "token-rate-limit-filter")]
+pub(crate) const META_TOKEN_TOTAL: &str = "token.total";
+/// Metadata key for the total token count.
+#[cfg(not(feature = "token-rate-limit-filter"))]
 const META_TOKEN_TOTAL: &str = "token.total";
 
 /// Metadata key signaling that usage could not be captured because the

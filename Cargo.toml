@@ -43,6 +43,7 @@ notify = "8.2.0"
 quote = "1.0.47"
 rand = "0.10.2"
 rcgen = "0.14.9"
+redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }

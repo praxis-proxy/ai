@@ -18,6 +18,15 @@
 #   callout_failure_mode:     closed (fail closed) or open (fail open)
 #   forward_headers:          Headers to forward from the client request
 #                             (e.g. Authorization) to the vector store API
+#
+# Shared sub-request connector settings under `runtime` are restart-required.
+# When `runtime.subrequest_circuit_breaker` is set, client-aware filters such
+# as this one inherit peer-level failure isolation from the shared client:
+#
+# runtime:
+#   subrequest_circuit_breaker:
+#     consecutive_failures: 5
+#     recovery_window_secs: 30
 
 listeners:
   - name: ai-gateway
