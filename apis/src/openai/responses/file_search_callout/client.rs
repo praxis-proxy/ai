@@ -14,8 +14,7 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize, de::Visitor};
 use serde_json::Value;
 
-use crate::callout_policy::FailureMode;
-use crate::openai::api_client::ApiClient;
+use crate::{callout_policy::FailureMode, openai::api_client::ApiClient};
 
 // -----------------------------------------------------------------------------
 // Constants

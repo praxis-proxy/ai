@@ -845,10 +845,13 @@ fn serve_file_request(mut stream: std::net::TcpStream) {
 
 #[tokio::test]
 async fn file_url_resolved_to_data_uri() {
-    use crate::{callout_policy::OnMissing, openai::responses::file_resolve::{
-        resolve::resolve_input,
-        resolve_url::{FileUrlResolver, NormalizedOrigin},
-    }};
+    use crate::{
+        callout_policy::OnMissing,
+        openai::responses::file_resolve::{
+            resolve::resolve_input,
+            resolve_url::{FileUrlResolver, NormalizedOrigin},
+        },
+    };
 
     // Start TCP stub serving file content
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1006,10 +1009,7 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
 
 #[tokio::test]
 async fn file_url_passthrough_when_no_resolver() {
-    use crate::{
-        callout_policy::OnMissing,
-        openai::responses::file_resolve::resolve::resolve_input,
-    };
+    use crate::{callout_policy::OnMissing, openai::responses::file_resolve::resolve::resolve_input};
 
     // Build body with file_url
     let mut body = json!({
@@ -1041,9 +1041,10 @@ async fn file_url_in_shorthand_message_resolved() {
     use crate::{
         callout_policy::OnMissing,
         openai::responses::file_resolve::{
-        resolve::resolve_input,
-        resolve_url::{FileUrlResolver, NormalizedOrigin},
-    }};
+            resolve::resolve_input,
+            resolve_url::{FileUrlResolver, NormalizedOrigin},
+        },
+    };
 
     // Start TCP stub
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1109,7 +1110,8 @@ async fn file_url_in_function_call_output_resolved() {
         openai::responses::file_resolve::{
             resolve::resolve_input,
             resolve_url::{FileUrlResolver, NormalizedOrigin},
-    }};
+        },
+    };
 
     // Start TCP stub
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1173,10 +1175,8 @@ async fn file_url_in_function_call_output_resolved() {
 async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
     use crate::{
         callout_policy::OnMissing,
-        openai::responses::file_resolve::{
-            resolve::resolve_input,
-            resolve_url::FileUrlResolver,
-    }};
+        openai::responses::file_resolve::{resolve::resolve_input, resolve_url::FileUrlResolver},
+    };
 
     let mut body = json!({
         "input": [{
@@ -1214,10 +1214,8 @@ async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
 async fn file_url_failed_is_not_swallowed_by_on_missing_continue() {
     use crate::{
         callout_policy::OnMissing,
-        openai::responses::file_resolve::{
-            resolve::resolve_input,
-            resolve_url::FileUrlResolver,
-    }};
+        openai::responses::file_resolve::{resolve::resolve_input, resolve_url::FileUrlResolver},
+    };
 
     // Regression test for #542: simulate an attacker-controlled origin
     // that redirects to a metadata-style target. Praxis's resolver
@@ -1280,10 +1278,8 @@ async fn file_url_failed_is_not_swallowed_by_on_missing_continue() {
 async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
     use crate::{
         callout_policy::OnMissing,
-        openai::responses::file_resolve::{
-            resolve::resolve_input,
-            resolve_url::FileUrlResolver,
-    }};
+        openai::responses::file_resolve::{resolve::resolve_input, resolve_url::FileUrlResolver},
+    };
 
     // Regression test for #542: an oversized file_url response must
     // also reject the request under on_missing: continue, not just

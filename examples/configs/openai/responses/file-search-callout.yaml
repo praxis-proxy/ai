@@ -15,7 +15,7 @@
 #   timeout_ms:               Whole-call timeout in milliseconds
 #   max_response_bytes:       Maximum response bytes retained per callout
 #   max_total_response_bytes: Maximum successful bytes across one fan-out
-#   on_failure:     closed (fail closed) or open (fail open)
+#   on_failure:               closed (fail closed) or open (fail open)
 #   forward_headers:          Headers to forward from the client request
 #                             (e.g. Authorization) to the vector store API
 

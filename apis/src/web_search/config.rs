@@ -3,13 +3,14 @@
 
 //! Configuration for protocol-neutral web-search providers.
 
-use crate::callout_policy::FailureMode;
 use praxis_filter::{
     FilterError, body::MAX_JSON_BODY_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
+
+use crate::callout_policy::FailureMode;
 
 /// Default callout timeout (10 seconds — search APIs can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
