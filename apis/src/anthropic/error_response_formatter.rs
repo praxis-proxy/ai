@@ -7,14 +7,12 @@
 //! Anthropic error envelope that Anthropic SDKs expect. Installed as
 //! a request extension after positive Anthropic classification.
 //!
-//! # Known gap
+//! # Note on response headers
 //!
-//! `FormattedErrorResponse` in praxis-filter 0.5.3 carries only `body`
-//! and `content_type` — there is no `response_headers` field. Seb
-//! confirmed the Anthropic `request-id` response header must use the
-//! same value as the JSON `request_id`, but the Praxis contract needs
-//! to be extended first. The request ID is included in the JSON body;
-//! the response header is deferred until Praxis adds support.
+//! `FormattedErrorResponse` provides `body` and `content_type`. When Praxis
+//! supports custom response headers on formatted error responses, the matching
+//! `request-id` response header can be emitted alongside the JSON body.
+//! Currently, the request ID is included in the JSON body.
 
 use praxis_filter::{ErrorResponseContext, ErrorResponseFormatter, FormattedErrorResponse};
 
