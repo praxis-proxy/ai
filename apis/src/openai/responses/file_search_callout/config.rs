@@ -11,10 +11,8 @@ use serde::Deserialize;
 
 use super::client::MAX_CONCURRENT_SEARCHES;
 use crate::{
-    openai::{
-        api_client::{self, ApiClient, ApiClientConfig},
-        responses::config_validation::FailureMode,
-    },
+    callout_policy::FailureMode,
+    openai::api_client::{self, ApiClient, ApiClientConfig},
     subrequest::SubRequestClient,
 };
 

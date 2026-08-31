@@ -3,6 +3,7 @@
 
 //! Configuration for protocol-neutral web-search providers.
 
+use crate::callout_policy::FailureMode;
 use praxis_filter::{
     FilterError, body::MAX_JSON_BODY_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes,
@@ -85,20 +86,6 @@ impl SearchContextSize {
             Self::High => 10,
         }
     }
-}
-
-// -----------------------------------------------------------------------------
-// FailureMode
-// -----------------------------------------------------------------------------
-
-/// What happens when a search callout fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FailureMode {
-    /// Reject the request on search failure (default).
-    Closed,
-    /// Continue without search results on failure.
-    Open,
 }
 
 // -----------------------------------------------------------------------------

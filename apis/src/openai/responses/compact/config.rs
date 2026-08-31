@@ -6,7 +6,7 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::openai::responses::config_validation::{self, CalloutSettings, FailureMode};
+use crate::callout_policy::{self, CalloutSettings, FailureMode};
 
 /// Default callout timeout (30 seconds — summarization can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -103,9 +103,9 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
     }
 
     let timeout_ms =
-        config_validation::validate_timeout_ms("openai_responses_compact", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
+        callout_policy::validate_timeout_ms("openai_responses_compact", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
 
-    let status_on_error = config_validation::validate_status_on_error(
+    let status_on_error = callout_policy::validate_status_on_error(
         "openai_responses_compact",
         raw.status_on_error,
         DEFAULT_STATUS_ON_ERROR,

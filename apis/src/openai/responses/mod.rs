@@ -25,7 +25,6 @@
 pub(crate) mod agentic_loop;
 pub(crate) mod compact;
 mod config;
-pub(crate) mod config_validation;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;

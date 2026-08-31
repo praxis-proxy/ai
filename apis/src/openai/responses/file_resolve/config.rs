@@ -7,7 +7,7 @@ use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
 use super::resolve_url::NormalizedOrigin;
-use crate::openai::api_client;
+use crate::{callout_policy::OnMissing, openai::api_client};
 
 /// Default HTTP timeout for Files API callout requests (30 000 ms).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -20,25 +20,6 @@ const MAX_CONFIGURABLE_FILE_REFERENCES: usize = 128;
 
 /// Maximum allowed timeout (300 000 ms / 5 minutes).
 const MAX_TIMEOUT_MS: u64 = 300_000;
-
-/// Behavior when a `file_id` reference cannot be fetched.
-///
-/// Applies only to `file_id` (Files API availability). `file_url`
-/// resolution failures are always rejected regardless of this
-/// setting: a failed `file_url` fetch is a security-relevant signal
-/// (the target may be malicious or unreachable for policy reasons),
-/// not a simple availability gap, so it must never be downgraded to
-/// an implicit passthrough of the original URL to the backend.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum OnMissing {
-    /// Leave the `file_id` reference unchanged and continue.
-    #[default]
-    Continue,
-
-    /// Return an error response to the client.
-    Reject,
-}
 
 /// Mode for handling `file_url` content parts.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]

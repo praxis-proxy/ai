@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use super::*;
-use crate::openai::responses::config_validation::FailureMode;
+use crate::callout_policy::FailureMode;
 
 // =============================================================================
 // Config tests

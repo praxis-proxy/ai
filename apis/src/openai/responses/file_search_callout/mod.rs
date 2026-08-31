@@ -41,9 +41,9 @@ use self::{
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
+    callout_policy::FailureMode,
     openai::responses::{
         bounded_json_size,
-        config_validation::FailureMode,
         error::responses_error_rejection,
         state::{MAX_CITATION_FILES, ResponsesState},
         usage::merge_usage,

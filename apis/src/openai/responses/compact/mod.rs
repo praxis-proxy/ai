@@ -47,7 +47,7 @@ use tracing::{debug, warn};
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
 use crate::{
-    openai::responses::config_validation::FailureMode,
+    callout_policy::FailureMode,
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
