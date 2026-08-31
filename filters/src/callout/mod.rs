@@ -25,10 +25,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use config::{FailureModeConfig, HttpCalloutConfig, Phase, expand_env_vars, validate_callout_url};
+use config::{HttpCalloutConfig, Phase, expand_env_vars, validate_callout_url};
 use extract::{BodyShaper, CompiledExtraction};
 use http::HeaderMap;
 use pingora_core::upstreams::peer::HttpPeer;
+use praxis_ai_apis::callout_policy::FailureMode;
 use praxis_core::{
     circuit::CircuitBreakerConfig as CoreCircuitBreakerConfig,
     connectivity::is_private_ip,
@@ -97,7 +98,7 @@ pub struct HttpCalloutFilter {
     extractions: Vec<CompiledExtraction>,
 
     /// Behavior on callout failure.
-    failure_mode: FailureModeConfig,
+    failure_mode: FailureMode,
 
     /// Downstream headers to copy into the callout request.
     forward_headers: Vec<http::HeaderName>,
@@ -316,8 +317,8 @@ impl HttpCalloutFilter {
     /// I/O), per the configured failure mode.
     fn failure_action(&self) -> FilterAction {
         match self.failure_mode {
-            FailureModeConfig::Open => FilterAction::Continue,
-            FailureModeConfig::Closed => Self::build_rejection(self.status_on_error),
+            FailureMode::Open => FilterAction::Continue,
+            FailureMode::Closed => Self::build_rejection(self.status_on_error),
         }
     }
 
