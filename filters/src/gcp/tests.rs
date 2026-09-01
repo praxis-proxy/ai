@@ -176,9 +176,21 @@ fn accepts_loopback_and_default_metadata_host() {
     GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: metadata.google.internal"))
         .expect("the real metadata server must be accepted");
     GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: 127.0.0.1:9000"))
-        .expect("a loopback address must be accepted for tests");
-    GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: localhost:9000"))
-        .expect("localhost must be accepted for tests");
+        .expect("a loopback IP address must be accepted for tests");
+}
+
+#[test]
+fn rejects_localhost_metadata_host() {
+    // Unlike a literal loopback IP, `localhost` is a hostname resolved
+    // via DNS/`/etc/hosts` and could be remapped to point anywhere --
+    // accepting it would defeat the loopback restriction entirely.
+    let err = GcpAdcFilter::from_config(&yaml("metadata_host: localhost:9000"))
+        .err()
+        .expect("localhost must be rejected, it is not a fixed address");
+    assert!(
+        err.to_string().contains("metadata_host"),
+        "error should name metadata_host: {err}"
+    );
 }
 
 #[test]

@@ -27,7 +27,7 @@ Whenever no valid token can be produced — none cached and the inline fetch fai
 | `scope` | string | no | `OAuth2` scope requested with the access token. |
 | `service_account` | string | no | Metadata service account email, or `default` (the default). Only used with the `metadata` and `adc` sources; rejected for `key_file`. Interpolated into the metadata path, so it must be `default` or a service-account email (letters, digits, `@`, `.`, `-`, `_`). |
 | `credentials_file` | string | no | Path to a service-account key JSON file. Required when `source` is `key_file`; rejected for the other sources (`adc` reads `GOOGLE_APPLICATION_CREDENTIALS` instead). |
-| `metadata_host` | string | no | GCE/GKE metadata server host. Override for testing (point at a local mock) or a non-default metadata server; production deployments should not need to set this. |
+| `metadata_host` | string | no | GCE/GKE metadata server host. Defaults to the real metadata server; the only other accepted value is a `127.0.0.1` loopback address, to point tests at a local mock. The metadata endpoint is only safe to reach over plain HTTP because it never leaves the VM/host, so nothing else is accepted (not even `localhost`, which is a resolvable hostname rather than a fixed address). |
 
 ## Example
 
