@@ -5,7 +5,8 @@
 //!
 //! Praxis core owns subscriber installation, OTLP export, propagation,
 //! sampling, request lifecycle spans, and provider-hop client spans. AI owns
-//! only the semantic routing decision made by `intelligent_route`.
+//! only the semantic decisions made by `intelligent_route` (edge routing
+//! selection) and `provider_route` (provider-local backend resolution).
 
 use std::sync::Arc;
 
@@ -60,6 +61,40 @@ impl<'a> RoutingSelection<'a> {
     }
 }
 
+/// Borrowed, validated attributes for a provider-local routing decision span.
+struct ProviderRouteSelection<'a> {
+    /// Configured provider-boundary identifier.
+    provider_id: &'a str,
+    /// Provider-local backend cluster resolved for the candidate.
+    cluster: &'a str,
+    /// Configured model accepted by the resolved route.
+    model: &'a str,
+    /// Validated candidate identifier supplied by the trusted edge hop.
+    candidate_id: &'a str,
+    /// Edge serving-overlay revision, when supplied and validated.
+    revision: Option<&'a str>,
+}
+
+impl<'a> ProviderRouteSelection<'a> {
+    /// Project only bounded provider-route state; request and credential state
+    /// is not accepted by this constructor.
+    fn new(
+        provider_id: &'a Arc<str>,
+        cluster: &'a Arc<str>,
+        model: &'a Arc<str>,
+        candidate_id: &'a str,
+        revision: Option<&'a str>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.as_ref(),
+            cluster: cluster.as_ref(),
+            model: model.as_ref(),
+            candidate_id,
+            revision,
+        }
+    }
+}
+
 /// Emit a bounded child span for a completed routing decision.
 ///
 /// No prompt, body, credential, authorization header, cookie, session key, or
@@ -96,11 +131,46 @@ pub(crate) fn record_routing_selection(
     let _entered = span.enter();
 }
 
+/// Emit a bounded child span for a completed `provider_route` resolution.
+///
+/// Records the resolved backend cluster the request was routed to; it is not
+/// proof that a downstream endpoint, pod, or model server successfully served
+/// the request. `provider_id` is the configured provider-boundary identifier,
+/// not necessarily the mTLS peer identity. `overlay_revision` is the
+/// edge-supplied serving overlay revision after syntax and trust-boundary
+/// validation; it is correlation evidence, not a provider-local config
+/// revision or an authorization decision.
+///
+/// No prompt, body, credential, authorization header, cookie, session key, or
+/// raw request identifier is recorded. When the feature is disabled this call
+/// site is compiled out entirely.
+pub(crate) fn record_provider_route_selection(
+    provider_id: &Arc<str>,
+    cluster: &Arc<str>,
+    model: &Arc<str>,
+    candidate_id: &str,
+    overlay_revision: Option<&str>,
+) {
+    let selection = ProviderRouteSelection::new(provider_id, cluster, model, candidate_id, overlay_revision);
+    let span = tracing::info_span!(
+        "provider.route",
+        "provider.id" = selection.provider_id,
+        "provider.backend.cluster" = selection.cluster,
+        "provider.route.model" = selection.model,
+        "provider.route.candidate_id" = selection.candidate_id,
+        "overlay.revision" = Empty,
+    );
+    if let Some(revision) = selection.revision {
+        span.record("overlay.revision", revision);
+    }
+    let _entered = span.enter();
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::RoutingSelection;
+    use super::{ProviderRouteSelection, RoutingSelection, record_provider_route_selection};
     use crate::routing::descriptor::{AdmissionState, CapabilityKind, RouteCandidate};
 
     #[test]
@@ -144,6 +214,34 @@ mod tests {
         assert_eq!(fields.revision, None, "missing overlay revision must remain absent");
     }
 
+    #[test]
+    fn projects_only_validated_provider_route_attributes() {
+        let provider_id: Arc<str> = Arc::from("provider-a");
+        let cluster: Arc<str> = Arc::from("cluster-a");
+        let model: Arc<str> = Arc::from("model-a");
+        let fields = ProviderRouteSelection::new(&provider_id, &cluster, &model, "candidate-a", Some("revision-a"));
+
+        assert_eq!(fields.provider_id, "provider-a");
+        assert_eq!(fields.cluster, "cluster-a");
+        assert_eq!(fields.model, "model-a");
+        assert_eq!(fields.candidate_id, "candidate-a");
+        assert_eq!(fields.revision, Some("revision-a"));
+
+        // Keep a smoke assertion around the tracing macro in addition to the
+        // projection contract above.
+        record_provider_route_selection(&provider_id, &cluster, &model, "candidate-a", Some("revision-a"));
+    }
+
+    #[test]
+    fn provider_route_optional_revision_remains_absent() {
+        let provider_id: Arc<str> = Arc::from("provider-a");
+        let cluster: Arc<str> = Arc::from("cluster-a");
+        let model: Arc<str> = Arc::from("model-a");
+        let fields = ProviderRouteSelection::new(&provider_id, &cluster, &model, "candidate-a", None);
+
+        assert_eq!(fields.revision, None);
+    }
+
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
@@ -153,6 +251,7 @@ mod tests {
         RouteCandidate {
             admission_state: AdmissionState::NewAndExisting,
             cluster: Arc::from("provider-a"),
+            credential: None,
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: Arc::from("model-a"),

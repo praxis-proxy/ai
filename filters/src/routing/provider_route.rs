@@ -25,10 +25,10 @@ use super::{
     descriptor,
     metadata::{
         CandidateCredential, OVERLAY_REVISION_HEADER, PROVIDER_ATTRIBUTION_HEADER,
-        PROVIDER_ATTRIBUTION_RESPONSE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_OVERLAY_REVISION_HEADER,
-        PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID, PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL,
-        PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID, PROVIDER_ROUTE_REQUEST_ID,
-        SELECTED_CANDIDATE_HEADER, set_credential_metadata,
+        PROVIDER_ATTRIBUTION_RESPONSE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_INFERENCE_RESPONSE_HEADER,
+        PROVIDER_OVERLAY_REVISION_HEADER, PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID,
+        PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL, PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID,
+        PROVIDER_ROUTE_REQUEST_ID, SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
 };
 
@@ -57,7 +57,7 @@ struct ProviderRouteFilterConfig {
     /// Exact provider-local candidate mappings.
     routes: Vec<ProviderRouteConfig>,
 
-    /// Add a provider attribution response header for demo evidence.
+    /// Add provider gateway and selected-backend response attribution headers.
     #[serde(default)]
     emit_demo_attribution: bool,
 }
@@ -121,7 +121,7 @@ struct ProviderRoute {
 /// conditional/fail-open boundary filters, and branch-conditional provider
 /// consumers.
 pub struct ProviderRouteFilter {
-    /// Emit a demo attribution header on responses.
+    /// Emit provider gateway and selected-backend attribution on responses.
     emit_demo_attribution: bool,
     /// Header name containing the requested model.
     model_header: HeaderName,
@@ -151,23 +151,8 @@ impl ProviderRouteFilter {
         if cfg.routes.is_empty() || cfg.routes.len() > MAX_PROVIDER_ROUTES {
             return Err(format!("provider_route: routes must contain 1-{MAX_PROVIDER_ROUTES} entries").into());
         }
-
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
-        let mut routes = HashMap::with_capacity(cfg.routes.len());
-        for route in cfg.routes {
-            validate_route(&route)?;
-            let candidate_id: Arc<str> = Arc::from(route.candidate_id.as_str());
-            let provider_route = ProviderRoute {
-                cluster: Arc::from(route.cluster.as_str()),
-                credential: route.credential,
-                model: Arc::from(route.model.as_str()),
-                paths: route.paths.into_iter().map(Arc::from).collect(),
-            };
-            if routes.insert(candidate_id, provider_route).is_some() {
-                return Err("provider_route: duplicate candidate_id".into());
-            }
-        }
-
+        let routes = build_routes(cfg.routes, cfg.emit_demo_attribution)?;
         Ok(Box::new(Self {
             emit_demo_attribution: cfg.emit_demo_attribution,
             model_header,
@@ -176,6 +161,41 @@ impl ProviderRouteFilter {
             routes,
         }))
     }
+}
+
+/// Validate and resolve the configured provider-local candidate routes.
+fn build_routes(
+    route_configs: Vec<ProviderRouteConfig>,
+    emit_demo_attribution: bool,
+) -> Result<HashMap<Arc<str>, ProviderRoute>, FilterError> {
+    let mut routes = HashMap::with_capacity(route_configs.len());
+    for route in route_configs {
+        validate_route(&route)?;
+        if emit_demo_attribution {
+            validate_attribution_cluster(&route.cluster)?;
+        }
+        let candidate_id: Arc<str> = Arc::from(route.candidate_id.as_str());
+        let provider_route = ProviderRoute {
+            cluster: Arc::from(route.cluster.as_str()),
+            credential: route.credential,
+            model: Arc::from(route.model.as_str()),
+            paths: route.paths.into_iter().map(Arc::from).collect(),
+        };
+        if routes.insert(candidate_id, provider_route).is_some() {
+            return Err("provider_route: duplicate candidate_id".into());
+        }
+    }
+    Ok(routes)
+}
+
+/// Validate the cluster value before using it in a provider-owned header.
+fn validate_attribution_cluster(cluster: &str) -> Result<(), FilterError> {
+    HeaderValue::from_str(cluster).map_err(|error| {
+        FilterError::from(format!(
+            "provider_route: cluster must be a valid HTTP header value: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 #[async_trait]
@@ -227,6 +247,15 @@ impl HttpFilter for ProviderRouteFilter {
         set_credential_metadata(ctx, route.credential.as_ref());
         set_provider_headers(ctx, &self.provider_id_header, &request_id, overlay_revision.as_deref())?;
 
+        #[cfg(feature = "opentelemetry")]
+        crate::opentelemetry::record_provider_route_selection(
+            &self.provider_id,
+            &route.cluster,
+            &route.model,
+            &candidate_id,
+            overlay_revision.as_deref(),
+        );
+
         Ok(FilterAction::Continue)
     }
 
@@ -234,6 +263,11 @@ impl HttpFilter for ProviderRouteFilter {
         if !self.emit_demo_attribution {
             return Ok(FilterAction::Continue);
         }
+        let inference_provider = ctx
+            .get_metadata(PROVIDER_ROUTE_CLUSTER)
+            .map(HeaderValue::from_str)
+            .transpose()
+            .map_err(|error| FilterError::from(format!("provider_route: invalid provider cluster header: {error}")))?;
         let Some(response) = ctx.response_header.as_mut() else {
             return Ok(FilterAction::Continue);
         };
@@ -241,6 +275,12 @@ impl HttpFilter for ProviderRouteFilter {
             HeaderName::from_static(PROVIDER_ATTRIBUTION_RESPONSE_HEADER),
             self.provider_id_header.clone(),
         );
+        if let Some(inference_provider) = inference_provider {
+            response.headers.insert(
+                HeaderName::from_static(PROVIDER_INFERENCE_RESPONSE_HEADER),
+                inference_provider,
+            );
+        }
         ctx.response_headers_modified = true;
         Ok(FilterAction::Continue)
     }
@@ -264,6 +304,8 @@ fn strip_edge_headers(ctx: &mut HttpFilterContext<'_>) {
         .push(HeaderName::from_static(PROVIDER_OVERLAY_REVISION_HEADER));
     ctx.request_headers_to_remove
         .push(HeaderName::from_static(PROVIDER_ATTRIBUTION_HEADER));
+    ctx.request_headers_to_remove
+        .push(HeaderName::from_static(PROVIDER_INFERENCE_RESPONSE_HEADER));
     ctx.request_headers_to_remove.push(AUTHORIZATION);
 }
 
@@ -453,6 +495,10 @@ mod tests {
             HeaderName::from_static(PROVIDER_OVERLAY_REVISION_HEADER),
             HeaderValue::from_static("spoofed-revision"),
         );
+        req.headers.insert(
+            HeaderName::from_static(PROVIDER_INFERENCE_RESPONSE_HEADER),
+            HeaderValue::from_static("client-supplied-backend"),
+        );
         let mut ctx = test_utils::make_filter_context(&req);
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -460,6 +506,7 @@ mod tests {
         assert!(matches!(action, FilterAction::Continue));
         for name in [
             PROVIDER_ATTRIBUTION_HEADER,
+            PROVIDER_INFERENCE_RESPONSE_HEADER,
             PROVIDER_REQUEST_ID_HEADER,
             PROVIDER_OVERLAY_REVISION_HEADER,
         ] {
@@ -715,6 +762,49 @@ mod tests {
         assert!(ctx.get_metadata(PROVIDER_ROUTE_REQUEST_ID).is_some());
     }
 
+    #[tokio::test]
+    async fn distinct_candidates_resolve_independent_cluster_metadata() {
+        let f = ProviderRouteFilter::from_config(&two_route_config()).unwrap();
+        let req_a = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        let req_b = request_with_peer_context("/v1/chat/completions", "def456", "req-2", "sim-model-v1");
+        let mut ctx_a = test_utils::make_filter_context(&req_a);
+        let mut ctx_b = test_utils::make_filter_context(&req_b);
+
+        let (action_a, action_b) = tokio::join!(f.on_request(&mut ctx_a), f.on_request(&mut ctx_b));
+
+        assert!(matches!(action_a.unwrap(), FilterAction::Continue));
+        assert!(matches!(action_b.unwrap(), FilterAction::Continue));
+        assert_eq!(ctx_a.get_metadata(PROVIDER_ROUTE_CLUSTER), Some("mock-backend"));
+        assert_eq!(ctx_b.get_metadata(PROVIDER_ROUTE_CLUSTER), Some("other-backend"));
+        assert_ne!(
+            ctx_a.get_metadata(PROVIDER_ROUTE_CLUSTER),
+            ctx_b.get_metadata(PROVIDER_ROUTE_CLUSTER),
+            "independent requests against the same filter instance must not leak cluster metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_id_metadata_is_stable_and_distinct_from_cluster() {
+        let f = ProviderRouteFilter::from_config(&two_route_config()).unwrap();
+
+        for (candidate_id, request_id, expected_cluster) in [
+            ("abc123", "req-1", "mock-backend"),
+            ("def456", "req-2", "other-backend"),
+        ] {
+            let req = request_with_peer_context("/v1/chat/completions", candidate_id, request_id, "sim-model-v1");
+            let mut ctx = test_utils::make_filter_context(&req);
+            let action = f.on_request(&mut ctx).await.unwrap();
+            assert!(matches!(action, FilterAction::Continue));
+            assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_ID), Some("test-provider"));
+            assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_CLUSTER), Some(expected_cluster));
+            assert_ne!(
+                ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_ID),
+                ctx.get_metadata(PROVIDER_ROUTE_CLUSTER),
+                "provider_id must remain distinct from the resolved backend cluster"
+            );
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Provider Attribution
     // -------------------------------------------------------------------------
@@ -736,7 +826,11 @@ mod tests {
     #[tokio::test]
     async fn emits_demo_attribution_response_header() {
         let f = make_filter("abc123");
-        let req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        let mut req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        req.headers.insert(
+            HeaderName::from_static(PROVIDER_INFERENCE_RESPONSE_HEADER),
+            HeaderValue::from_static("client-supplied-value"),
+        );
         let mut ctx = test_utils::make_filter_context(&req);
         let _action = f.on_request(&mut ctx).await.unwrap();
         let mut resp = test_utils::make_response();
@@ -748,6 +842,13 @@ mod tests {
             value.map(|v| v.to_str().unwrap()),
             Some("test-provider"),
             "demo attribution response header"
+        );
+        assert_eq!(
+            resp.headers
+                .get(PROVIDER_INFERENCE_RESPONSE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("mock-backend"),
+            "trusted provider route must override client attribution"
         );
     }
 
@@ -772,6 +873,7 @@ mod tests {
         assert!(matches!(action, FilterAction::Continue));
         assert!(!ctx.response_headers_modified);
         assert!(resp.headers.get(PROVIDER_ATTRIBUTION_RESPONSE_HEADER).is_none());
+        assert!(resp.headers.get(PROVIDER_INFERENCE_RESPONSE_HEADER).is_none());
     }
 
     // -------------------------------------------------------------------------
@@ -887,6 +989,19 @@ mod tests {
     }
 
     #[test]
+    fn invalid_cluster_header_rejected_when_response_attribution_is_enabled() {
+        let yaml = "provider_id: p\nemit_demo_attribution: true\nroutes:\n  - candidate_id: a\n    model: m\n    paths: [/x]\n    cluster: \"bad\\0value\"\n";
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let error = ProviderRouteFilter::from_config(&val)
+            .err()
+            .expect("invalid cluster header value must fail construction");
+        assert!(
+            error.to_string().contains("cluster must be a valid HTTP header value"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn duplicate_candidate_id_rejected() {
         let yaml = "provider_id: p\nroutes:\n  - candidate_id: a\n    model: m\n    paths: [/x]\n    cluster: c\n  - candidate_id: a\n    model: m2\n    paths: [/y]\n    cluster: c2\n";
         let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
@@ -983,6 +1098,24 @@ mod tests {
     fn make_filter(candidate_id: &str) -> Box<dyn HttpFilter> {
         let config = provider_config(candidate_id, "sim-model-v1", &["/v1/chat/completions"], "mock-backend");
         ProviderRouteFilter::from_config(&config).unwrap()
+    }
+
+    /// Config with two candidates mapped to distinct backend clusters, for
+    /// isolation and attribution tests across independent requests.
+    fn two_route_config() -> serde_yaml::Value {
+        serde_yaml::from_str(
+            "provider_id: test-provider\n\
+             routes:\n\
+             \x20 - candidate_id: abc123\n\
+             \x20   cluster: mock-backend\n\
+             \x20   model: sim-model-v1\n\
+             \x20   paths: [/v1/chat/completions]\n\
+             \x20 - candidate_id: def456\n\
+             \x20   cluster: other-backend\n\
+             \x20   model: sim-model-v1\n\
+             \x20   paths: [/v1/chat/completions]\n",
+        )
+        .unwrap()
     }
 
     fn credential_provider_config() -> serde_yaml::Value {

@@ -703,10 +703,16 @@ async fn fetch_tools(
 /// entries with `type: "function"` entries and translating any
 /// MCP `tool_choice` references.
 ///
-/// Returns `None` when no rewrite is needed (unparseable body,
-/// empty tools array, or no resolved entries). The caller is
-/// responsible for checking the serialized size against
+/// Returns `None` only when the body cannot be rewritten at all
+/// (unparseable body, non-object root, or missing `tools` array).
+/// The caller is responsible for checking the serialized size against
 /// `max_body_bytes` before committing.
+///
+/// A resolved MCP entry is always dropped from the outgoing tools
+/// array, even when it produced zero permitted tools; otherwise the
+/// entry's `authorization`/`headers` credentials would leak to the
+/// inference backend. When every tool resolves away this yields an
+/// empty `tools` array rather than the original (credentialed) body.
 ///
 /// MCP entries that were not resolved (no `server_url` or deferred)
 /// are left unchanged for upstream to handle.
@@ -726,10 +732,12 @@ fn rewrite_request_body(
         return Ok(None);
     };
 
+    // An empty `rewritten` array here means every tool in the request
+    // was a resolved MCP entry that produced zero permitted tools.
+    // Commit the emptied array anyway: returning `None` would make the
+    // caller forward the *original* body, leaking those entries'
+    // `authorization`/`headers` credentials to the inference backend.
     let (rewritten, generated_names) = rewrite_tools_array(tools, per_entry);
-    if rewritten.is_empty() {
-        return Ok(None);
-    }
     detect_name_collisions(&rewritten, &generated_names)?;
 
     let rewritten_count = rewritten.len();
@@ -824,10 +832,7 @@ fn rewrite_tool_choice(
 
     match choice_type {
         Some("mcp") => rewrite_mcp_tool_choice(obj, &choice_obj, tool_map, resolved_labels),
-        Some("allowed_tools") => {
-            rewrite_allowed_tools_choice(obj, &choice_obj, tool_map);
-            Ok(())
-        },
+        Some("allowed_tools") => rewrite_allowed_tools_choice(obj, &choice_obj, tool_map, resolved_labels),
         _ => Ok(()),
     }
 }
@@ -874,17 +879,76 @@ fn rewrite_mcp_tool_choice(
 
 /// Rewrite MCP selectors inside an `allowed_tools`-typed
 /// `tool_choice`.
+///
+/// Resolved selectors expand to their generated function refs. A
+/// selector whose `server_label` was resolved locally but yields no
+/// eligible tool is dropped, so a locally consumed MCP reference never
+/// reaches the backend. Genuinely unresolved selectors (deferred,
+/// connector-only, or unknown labels) are preserved for upstream.
+///
+/// If dropping locally consumed selectors leaves the list empty,
+/// emitting `tools: []` would be a schema-invalid `allowed_tools`
+/// choice. A `mode: "required"` choice is then rejected as unsatisfiable
+/// with [`ResolveError::EmptyResolvedToolChoice`] (matching the
+/// server-level MCP `tool_choice` behavior); any other mode is
+/// normalized to `"none"`, because the restriction now permits no tool
+/// and the model must not fall back to any other tool still supplied in
+/// the request.
 fn rewrite_allowed_tools_choice(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     choice_obj: &serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-) {
+    resolved_labels: &HashSet<String>,
+) -> Result<(), ResolveError> {
     let Some(tools_arr) = choice_obj.get("tools").and_then(serde_json::Value::as_array) else {
-        return;
+        return Ok(());
     };
 
+    let (new_tools, changed, dropped_label) = rebuild_allowed_tools_selectors(tools_arr, tool_map, resolved_labels);
+
+    if !changed {
+        return Ok(());
+    }
+
+    if new_tools.is_empty() {
+        // Every selector was a locally resolved server that produced no
+        // eligible tool, so the restricted set is now empty. An empty
+        // `allowed_tools` is invalid, so resolve it by mode.
+        if choice_obj.get("mode").and_then(serde_json::Value::as_str) == Some("required") {
+            // `required` over an empty set is unsatisfiable: reject.
+            return Err(ResolveError::EmptyResolvedToolChoice(
+                dropped_label.unwrap_or_else(|| "unknown".to_owned()),
+            ));
+        }
+        // `auto` restricted the model to this now-empty set. Normalize to
+        // `"none"` rather than removing `tool_choice`: removal would let
+        // the model call any other tool left in the request, which the
+        // original choice deliberately excluded.
+        obj.insert("tool_choice".to_owned(), serde_json::Value::String("none".to_owned()));
+        return Ok(());
+    }
+
+    let mut new_choice = choice_obj.clone();
+    new_choice.insert("tools".to_owned(), serde_json::Value::Array(new_tools));
+    obj.insert("tool_choice".to_owned(), serde_json::Value::Object(new_choice));
+    Ok(())
+}
+
+/// Rebuild an `allowed_tools` selector list: expand resolved MCP
+/// selectors to their function refs, drop locally consumed
+/// resolved-empty selectors, and preserve unresolved ones.
+///
+/// Returns the rebuilt selector list, whether it differs from the
+/// input, and the first dropped `server_label` (used for error
+/// reporting when the list collapses to empty).
+fn rebuild_allowed_tools_selectors(
+    tools_arr: &[serde_json::Value],
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+    resolved_labels: &HashSet<String>,
+) -> (Vec<serde_json::Value>, bool, Option<String>) {
     let mut new_tools = Vec::with_capacity(tools_arr.len());
     let mut changed = false;
+    let mut dropped_label: Option<String> = None;
 
     for tool_ref in tools_arr {
         if tool_ref.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
@@ -895,16 +959,36 @@ fn rewrite_allowed_tools_choice(
         expand_mcp_selector(tool_ref, tool_map, &mut new_tools);
         if new_tools.len() > before {
             changed = true;
+        } else if selector_label_resolved(tool_ref, resolved_labels) {
+            // The server was resolved locally but exposes no matching
+            // tool; the selector is locally consumed. Drop it so the
+            // MCP reference never reaches the inference backend.
+            changed = true;
+            if dropped_label.is_none() {
+                dropped_label = tool_ref
+                    .get("server_label")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
         } else {
+            // Unresolved (deferred / connector-only / unknown) selector:
+            // preserve it for the backend to handle.
             new_tools.push(tool_ref.clone());
         }
     }
 
-    if changed {
-        let mut new_choice = choice_obj.clone();
-        new_choice.insert("tools".to_owned(), serde_json::Value::Array(new_tools));
-        obj.insert("tool_choice".to_owned(), serde_json::Value::Object(new_choice));
-    }
+    (new_tools, changed, dropped_label)
+}
+
+/// Whether an MCP `tool_choice` selector targets a `server_label`
+/// that was resolved locally. Such a selector is locally consumed and
+/// must not survive into the backend request even when it produced
+/// zero eligible tools.
+fn selector_label_resolved(selector: &serde_json::Value, resolved_labels: &HashSet<String>) -> bool {
+    selector
+        .get("server_label")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|label| resolved_labels.contains(label))
 }
 
 /// Expand a single MCP selector into function tool references.
