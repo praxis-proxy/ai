@@ -61,6 +61,7 @@ praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 redis = { workspace = true, optional = true }
+rand = { workspace = true }
 reqwest.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }

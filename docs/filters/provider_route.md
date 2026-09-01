@@ -28,4 +28,4 @@ These names are AI-owned rather than Praxis-reserved because Praxis intentionall
 | `routes[].credential.secretRef.namespace` | string | yes | Secret namespace. |
 | `routes[].model` | string | yes | Exact model accepted for this candidate. |
 | `routes[].paths` | string[] | yes | Exact inference paths accepted for this candidate. |
-| `emit_demo_attribution` | bool | no | Add a provider attribution response header for demo evidence. |
+| `emit_demo_attribution` | bool | no | Add provider gateway and selected-backend response attribution headers. |
