@@ -3,28 +3,17 @@
 
 //! Shared failure-policy vocabulary for outbound AI callouts.
 //!
-//! Every filter that calls an external service answers one of
-//! two different questions (the first listed value of each is
-//! its default):
-//!
-//! | Question | Type | YAML key | Values |
-//! | --- | --- | --- | --- |
-//! | The callout did not produce a usable answer. Serve the request anyway? | [`FailureMode`] | `on_failure` | `closed`, `open` |
-//! | The callout answered, and the answer is that the resource does not exist. Serve the request without it? | [`OnMissing`] | `on_missing` | `continue`, `reject` |
-//!
 //! # Classification is filter-specific
 //!
 //! These enums are a vocabulary: they fix the accepted values
 //! and the default, not which conditions a filter routes through
 //! which key. Each filter's `on_failure` / `on_missing` field docs
-//! are authoritative.
+//! and behavior are authoritative.
 //!
 //! # Naming
 //!
-//! The external key is `on_failure`. Pipeline entries already own a
-//! structural `failure_mode` key that governs how the pipeline reacts
-//! when a filter returns an error. `on_failure` pairs with `on_missing`,
-//! which keeps the two policies reading as one family in configuration.
+//! The external keys are `on_failure` and `on_missing`. A structural
+//! `failure_mode` key is already owned by Core's pipeline entries.
 
 use praxis_filter::FilterError;
 use serde::Deserialize;
@@ -53,17 +42,17 @@ pub enum FailureMode {
 // OnMissing
 // -----------------------------------------------------------------------------
 
-/// What happens when a callout succeeds and answers that the
-/// requested resource does not exist. Configured as `on_missing`.
+/// What happens when a requested resource cannot be fetched. Configured
+/// as `on_missing`.
 ///
-/// A filter may narrow the set of references this governs, but must never
+/// A filter may narrow the set of resources this governs, but must never
 /// widen it to cover failures that carry a security signal (e.g. a file
 /// URL that cannot be resolved - the target may be malicious or unreachable
 /// for policy reasons).
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OnMissing {
-    /// Leave the reference unchanged and continue (default).
+    /// Continue without the resource.
     #[default]
     Continue,
 
