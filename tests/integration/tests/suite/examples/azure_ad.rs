@@ -11,12 +11,12 @@
 //! sets for a test binary — so construction succeeds with no env
 //! mutation.
 //!
-//! The token itself is acquired in the background from the configured
-//! authority. This test points `authority_host` at a closed local port
-//! so no real network call is made and no token is ever cached: the
-//! cache stays empty and every request must fail closed with 503. The
-//! full "token injected, reaches upstream" path is covered by the unit
-//! tests in `filters/src/azure/azure_ad.rs`.
+//! The token itself is acquired inline, on the request that finds the
+//! cache stale (cache-through, not refresh-ahead). This test points
+//! `authority_host` at a closed local port so the inline fetch fails
+//! deterministically and no token is ever cached: every request must
+//! fail closed with 503. The full "token injected, reaches upstream"
+//! path is covered by the unit tests in `filters/src/azure/azure_ad.rs`.
 
 use std::collections::HashMap;
 
