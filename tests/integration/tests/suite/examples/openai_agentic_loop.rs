@@ -133,6 +133,107 @@ fn client_function_call_returns_without_server_execution() {
 }
 
 // -----------------------------------------------------------------------------
+// IRR Rejection Preservation (regression for #663)
+// -----------------------------------------------------------------------------
+//
+// The agentic-loop filter rejects (400/508) from its `on_response_body` hook,
+// which runs inside IRR. These tests assert IRR surfaces that rejection as a
+// client-visible status instead of aborting the response body.
+// https://github.com/praxis-proxy/ai/issues/663
+
+#[test]
+fn multiple_function_calls_returns_client_visible_400() {
+    let response = serde_json::json!({
+        "id": "resp_parallel_calls",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": r#"{"location":"SF"}"#,
+                "status": "completed"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_2",
+                "call_id": "call_2",
+                "name": "get_time",
+                "arguments": r#"{"timezone":"PST"}"#,
+                "status": "completed"
+            }
+        ]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_agentic_rejection_config(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "IRR must preserve the response-body rejection status: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("rejection body should be valid JSON");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "openai_agentic_loop supports exactly one function call per round"
+    );
+    assert_eq!(model.requests().len(), 1, "the rejection must stop iteration");
+}
+
+#[test]
+fn iteration_limit_returns_client_visible_508() {
+    let function_response = |id: &str, call_id: &str| {
+        serde_json::json!({
+            "id": id,
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": format!("fc_{call_id}"),
+                "call_id": call_id,
+                "name": "get_weather",
+                "arguments": r#"{"location":"SF"}"#,
+                "status": "completed"
+            }]
+        })
+        .to_string()
+    };
+    let model = StatefulCapturingBackend::new(vec![
+        (200, function_response("resp_1", "call_1")),
+        (200, function_response("resp_2", "call_2")),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_agentic_rejection_config(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        508,
+        "IRR must preserve the iteration-limit rejection status: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("rejection body should be valid JSON");
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(body["error"]["message"], "agentic loop iteration limit exceeded");
+    assert_eq!(model.requests().len(), 2, "one loop is allowed before the limit");
+}
+
+// -----------------------------------------------------------------------------
 // Round-Trip: Resolve MCP → Inference → tools/call → Inference
 // -----------------------------------------------------------------------------
 
@@ -422,6 +523,23 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
+}
+
+fn load_agentic_rejection_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop-fixture.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop fixture");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    // Route action=loop back to inference so the loop re-enters and can reach the
+    // iteration limit (508). Without this, IRR terminates after the first pass via
+    // the default `done: true` branch.
+    let terminal_on_result = "            on_result:\n              - default: true\n                done: true";
+    let looping_on_result = "            on_result:\n              - filter: openai_agentic_loop\n                key: action\n                value: loop\n                next: inference\n              - default: true\n                done: true";
+    let patched = yaml.replacen(terminal_on_result, looping_on_result, 1);
+    assert_ne!(
+        patched, yaml,
+        "expected to inject the loop action into agentic-loop-fixture.yaml; its on_result block may have changed"
+    );
+    praxis_core::config::Config::from_yaml(&patched).expect("parse agentic-loop rejection config")
 }
 
 fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
