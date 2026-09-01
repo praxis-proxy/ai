@@ -292,10 +292,7 @@ impl ResponsesState {
         let mut response = self.response_object.clone();
         if let Some(obj) = response.as_object_mut() {
             if !self.accumulated_output.is_empty() {
-                obj.insert(
-                    "output".to_owned(),
-                    Value::Array(self.accumulated_output.clone()),
-                );
+                obj.insert("output".to_owned(), Value::Array(self.accumulated_output.clone()));
             }
             if !self.usage.is_null() {
                 obj.insert("usage".to_owned(), self.usage.clone());
@@ -329,29 +326,19 @@ fn normalize_input(body: &Value) -> Vec<Value> {
 
 /// Extract a JSON array field by name, defaulting to empty.
 fn extract_array_field(body: &Value, field: &str) -> Vec<Value> {
-    body.get(field)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+    body.get(field).and_then(Value::as_array).cloned().unwrap_or_default()
 }
 
 /// Extract a string field by name.
 fn extract_string(body: &Value, field: &str) -> Option<String> {
-    body.get(field)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+    body.get(field).and_then(Value::as_str).map(ToOwned::to_owned)
 }
 
 /// Extract an array of strings by name, defaulting to empty.
 fn extract_string_array(body: &Value, field: &str) -> Vec<String> {
     body.get(field)
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect())
         .unwrap_or_default()
 }
 
