@@ -169,8 +169,9 @@ fn validate_dns(filter_name: &str, host: &str, allow_private: bool) -> Result<()
         return Ok(());
     }
     Err(format!(
-        "{filter_name}: base URL host '{host}' is a DNS name; \
-         use a literal IP address or set the allow-private option to true to allow DNS targets"
+        "{filter_name}: base URL host '{host}' is a DNS name; DNS targets are unsupported in \
+         protected mode. Use a public IP literal, or set the allow-private option to true, which \
+         also permits DNS results resolving to local-sensitive addresses"
     )
     .into())
 }

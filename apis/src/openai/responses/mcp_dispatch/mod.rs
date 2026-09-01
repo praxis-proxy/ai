@@ -580,33 +580,32 @@ fn process_call_result(
     match result {
         Ok(r) => {
             let is_error = r.is_error.unwrap_or(false);
-            let non_text = r
-                .content
-                .iter()
-                .filter(|b| !matches!(b, rmcp::model::ContentBlock::Text(_)))
-                .count();
-            if non_text > 0 {
-                warn!(
-                    tool_name,
-                    call_id, non_text, "non-text content blocks discarded from MCP response"
-                );
+            match content_blocks_to_output(&r.content) {
+                Ok(output_text) => {
+                    debug!(
+                        tool_name,
+                        call_id,
+                        is_error,
+                        content_count = r.content.len(),
+                        "MCP tool call completed"
+                    );
+                    build_success_result(
+                        call_id,
+                        server_label,
+                        tool_name,
+                        arguments_string,
+                        &output_text,
+                        is_error,
+                    )
+                },
+                Err(e) => {
+                    warn!(
+                        tool_name, call_id, error = %e,
+                        "failed to serialize MCP content blocks; returning tool error"
+                    );
+                    build_error_result(call_id, server_label, tool_name, arguments_string, &e)
+                },
             }
-            let output_text = content_blocks_to_text(&r.content);
-            debug!(
-                tool_name,
-                call_id,
-                is_error,
-                content_count = r.content.len(),
-                "MCP tool call completed"
-            );
-            build_success_result(
-                call_id,
-                server_label,
-                tool_name,
-                arguments_string,
-                &output_text,
-                is_error,
-            )
         },
         Err(e) => {
             warn!(tool_name, call_id, error = %e, "MCP tool call failed");
@@ -676,17 +675,32 @@ async fn execute_single_call(
 // Result Construction
 // -----------------------------------------------------------------------------
 
-/// Extract text from rmcp `ContentBlock` values, joining
-/// multiple text blocks with newlines.
-fn content_blocks_to_text(blocks: &[rmcp::model::ContentBlock]) -> String {
-    blocks
+/// Serialize rmcp `ContentBlock` values into a lossless string for the
+/// Responses `output` field.
+///
+/// Text-only results keep the simple newline-joined form for readability and
+/// backward compatibility. Any result carrying non-text content (image, audio,
+/// embedded resource, or resource link) is serialized as the compact JSON MCP
+/// content array so that no block is silently dropped.
+///
+/// Returns `Err` when the content cannot be represented, so the caller can
+/// surface an explicit tool error instead of a lossy empty success.
+fn content_blocks_to_output(blocks: &[rmcp::model::ContentBlock]) -> Result<String, String> {
+    if blocks
         .iter()
-        .filter_map(|block| match block {
-            rmcp::model::ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .all(|block| matches!(block, rmcp::model::ContentBlock::Text(_)))
+    {
+        return Ok(blocks
+            .iter()
+            .filter_map(|block| match block {
+                rmcp::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
+    serde_json::to_string(blocks).map_err(|e| format!("failed to serialize MCP content blocks: {e}"))
 }
 
 /// Build result structs for a successful MCP call.
