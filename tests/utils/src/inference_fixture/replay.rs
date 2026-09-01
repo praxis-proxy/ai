@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Data-driven materialization and replay of two-sided inference fixtures.
 
 use std::{

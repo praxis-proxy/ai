@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Scripted HTTP/1 replay backend for inference fixture tests.
 
 use std::{

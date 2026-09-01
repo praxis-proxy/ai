@@ -28,6 +28,22 @@ jobs:
       - name: Build container image
         run: docker build -t praxis-ai:ci -f Containerfile .
 
+      - name: Verify image license label and legal files
+        run: |
+          label=$(docker inspect \
+            --format='{{ index .Config.Labels "org.opencontainers.image.licenses" }}' \
+            praxis-ai:ci)
+          echo "License label: ${label}"
+          [ "${label}" = "Apache-2.0" ] \
+            || { echo "::error::expected Apache-2.0 license label, got '${label}'"; exit 1; }
+          docker run --rm --entrypoint sh praxis-ai:ci -c '
+            set -e
+            test -s /usr/share/licenses/praxis-ai/LICENSE
+            test -s /usr/share/licenses/praxis-ai/NOTICE
+            test -s /usr/share/licenses/praxis-ai/integrations/llmd/ext-proc/NOTICE
+          ' || { echo "::error::missing legal files in runtime image"; exit 1; }
+          echo "License label and legal files verified"
+
       - name: Run container
         run: docker run -d --name praxis-ai praxis-ai:ci
 

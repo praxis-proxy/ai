@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Central replay-boundary HTTP header safety policy.
 
 use std::collections::{BTreeMap, BTreeSet};
