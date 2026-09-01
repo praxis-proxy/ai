@@ -33,6 +33,9 @@ pub(crate) const PROVIDER_OVERLAY_REVISION_HEADER: &str = "x-ai-provider-routing
 /// Demo-only response attribution header.
 pub(crate) const PROVIDER_ATTRIBUTION_RESPONSE_HEADER: &str = "x-ai-demo-provider-gateway";
 
+/// Provider-local inference backend selected by `provider_route`.
+pub(crate) const PROVIDER_INFERENCE_RESPONSE_HEADER: &str = "x-ai-inference-provider";
+
 /// Admission state of the selected route candidate.
 pub(crate) const ROUTE_ADMISSION_STATE: &str = "intelligent_route.admission_state";
 /// Backend cluster selected by `intelligent_route`.

@@ -14,8 +14,9 @@ use super::contracts::{
 use crate::openai::{
     include::IncludeField,
     operation::{
-        MediaTypeSpec, OpenAiHandlingMode, OpenAiHttpMethod, OpenAiOperationSpec, OwnedOperationContract,
-        ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec, schema_binding,
+        MediaTypeSpec, OpenAiApiFamily, OpenAiHandlingMode, OpenAiHttpMethod, OpenAiOperationSpec, OpenAiRequestBody,
+        OpenAiTransport, OperationEntry, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec,
+        ResponseSpec, RouteParams, match_operation, schema_binding,
     },
 };
 
@@ -35,6 +36,12 @@ impl Deref for ConversationOperationSpec {
     type Target = OpenAiOperationSpec;
 
     fn deref(&self) -> &Self::Target {
+        &self.definition
+    }
+}
+
+impl OperationEntry for ConversationOperationSpec {
+    fn spec(&self) -> &OpenAiOperationSpec {
         &self.definition
     }
 }
@@ -83,6 +90,39 @@ macro_rules! operation_contract {
                 content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
             }],
         })
+    };
+}
+
+/// Derive the runtime request-body shape from a registry request declaration.
+///
+/// All Conversations bodies are JSON; other families supply multipart or binary
+/// shapes through the same shared [`OpenAiRequestBody`] type.
+macro_rules! request_body_shape {
+    ([none]) => {
+        OpenAiRequestBody::None
+    };
+    ([required $schema:ty]) => {
+        OpenAiRequestBody::Json { required: true }
+    };
+    ([optional $schema:ty]) => {
+        OpenAiRequestBody::Json { required: false }
+    };
+}
+
+/// Derive the runtime request-body shape from an operation contract declaration.
+///
+/// Reads the same `request:` token as [`operation_contract`], so the body shape
+/// and the generated contract cannot drift apart.
+#[expect(
+    unused_macro_rules,
+    reason = "non-owning form is part of the registry API but current Conversations operations are all local"
+)]
+macro_rules! contract_request_body {
+    (none {}) => {
+        OpenAiRequestBody::None
+    };
+    (owned { parameters: [$($parameter:expr),* $(,)?],request: $request:tt,response: $response:ty $(,)? }) => {
+        request_body_shape!($request)
     };
 }
 
@@ -140,11 +180,14 @@ macro_rules! conversation_operations {
                 ConversationOperationSpec {
                     operation: ConversationOperation::$operation,
                     definition: OpenAiOperationSpec {
+                        family: OpenAiApiFamily::Conversations,
                         operation_id: $operation_id,
                         method: OpenAiHttpMethod::$method,
+                        transport: OpenAiTransport::Http,
                         spec_path: $path,
                         runtime_path: concat!("/v1", $path),
                         mode: OpenAiHandlingMode::$mode,
+                        request_body: contract_request_body!($contract_kind $contract),
                         owned_contract: operation_contract!($contract_kind $contract),
                     },
                 },
@@ -293,48 +336,24 @@ conversation_operations! {
     },
 }
 
-/// Path parameters borrowed directly from the request URI.
-#[derive(Clone, Copy, Debug, Default)]
-struct RouteParams<'a> {
-    /// Conversation identifier path segment.
-    conversation_id: Option<&'a str>,
-    /// Conversation item identifier path segment.
-    item_id: Option<&'a str>,
-}
-
-impl<'a> RouteParams<'a> {
-    /// Record a parameter recognized by the Conversations registry.
-    fn insert(&mut self, name: &str, value: &'a str) -> Option<()> {
-        let slot = match name {
-            "conversation_id" => &mut self.conversation_id,
-            "item_id" => &mut self.item_id,
-            _ => return None,
-        };
-        if slot.replace(value).is_some() {
-            return None;
-        }
-        Some(())
-    }
-}
-
 /// One matched runtime route.
 #[derive(Clone, Copy)]
 pub(crate) struct MatchedConversationRoute<'a> {
     /// Matched operation metadata.
     pub spec: &'static ConversationOperationSpec,
-    /// Borrowed path parameters.
+    /// Borrowed path parameters, captured by the shared matcher.
     params: RouteParams<'a>,
 }
 
 impl<'a> MatchedConversationRoute<'a> {
     /// Return the borrowed conversation ID path segment.
-    pub(crate) const fn conversation_id(&self) -> Option<&'a str> {
-        self.params.conversation_id
+    pub(crate) fn conversation_id(&self) -> Option<&'a str> {
+        self.params.get("conversation_id")
     }
 
     /// Return the borrowed item ID path segment.
-    pub(crate) const fn item_id(&self) -> Option<&'a str> {
-        self.params.item_id
+    pub(crate) fn item_id(&self) -> Option<&'a str> {
+        self.params.get("item_id")
     }
 }
 
@@ -345,41 +364,14 @@ pub const fn operation_specs() -> &'static [ConversationOperationSpec] {
 }
 
 /// Match an HTTP method and runtime path to a Conversations operation.
+///
+/// Conversations is reached over plain HTTP only; matching rules, precedence,
+/// and path normalization live in the shared operation module.
 pub(crate) fn match_route<'a>(method: &str, path: &'a str) -> Option<MatchedConversationRoute<'a>> {
-    let path = path.strip_suffix('/').filter(|path| !path.is_empty()).unwrap_or(path);
-    OPERATION_SPECS
-        .iter()
-        .filter(|spec| spec.method.as_str() == method)
-        .find_map(|spec| {
-            match_path_template(spec.runtime_path, path).map(|params| MatchedConversationRoute { spec, params })
-        })
-}
-
-/// Match one path against a template with `{param}` placeholders.
-fn match_path_template<'a>(template: &'static str, path: &'a str) -> Option<RouteParams<'a>> {
-    let mut template_segments = template.split('/');
-    let mut path_segments = path.split('/');
-    let mut params = RouteParams::default();
-
-    loop {
-        match (template_segments.next(), path_segments.next()) {
-            (None, None) => return Some(params),
-            (Some(template_segment), Some(path_segment)) => {
-                if let Some(name) = template_segment
-                    .strip_prefix('{')
-                    .and_then(|segment| segment.strip_suffix('}'))
-                {
-                    if path_segment.is_empty() {
-                        return None;
-                    }
-                    params.insert(name, path_segment)?;
-                } else if template_segment != path_segment {
-                    return None;
-                }
-            },
-            _ => return None,
-        }
-    }
+    match_operation(OPERATION_SPECS, method, path, OpenAiTransport::Http).map(|matched| MatchedConversationRoute {
+        spec: matched.spec,
+        params: matched.params,
+    })
 }
 
 #[cfg(test)]
@@ -389,6 +381,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::openai::operation::MAX_PATH_PARAMS;
 
     #[test]
     fn registry_has_unique_local_conversations_operations() {
@@ -407,6 +400,42 @@ mod tests {
         assert!(OPERATION_SPECS.iter().all(|spec| spec.mode == OpenAiHandlingMode::Local
             && spec.mode.owns_contract()
             && spec.owned_contract().is_some()));
+    }
+
+    #[test]
+    fn declared_request_body_shape_matches_generated_contract() {
+        for spec in OPERATION_SPECS {
+            let contract_has_body = spec.owned_contract().is_some_and(|contract| contract.request.is_some());
+            assert_eq!(
+                spec.request_body.is_present(),
+                contract_has_body,
+                "request_body shape drifted from the generated contract for {:?}",
+                spec.operation
+            );
+            if let Some(request) = spec.owned_contract().and_then(|contract| contract.request) {
+                assert_eq!(
+                    spec.request_body.is_required(),
+                    request.required,
+                    "required flag drifted from the generated contract for {:?}",
+                    spec.operation
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conversations_bodies_are_json_and_bodyless_reads_have_none() {
+        for spec in OPERATION_SPECS {
+            match spec.operation {
+                ConversationOperation::CreateConversation => {
+                    assert_eq!(spec.request_body, OpenAiRequestBody::Json { required: false });
+                },
+                ConversationOperation::UpdateConversation | ConversationOperation::CreateConversationItems => {
+                    assert_eq!(spec.request_body, OpenAiRequestBody::Json { required: true });
+                },
+                _ => assert_eq!(spec.request_body, OpenAiRequestBody::None),
+            }
+        }
     }
 
     #[test]
@@ -447,5 +476,26 @@ mod tests {
     #[test]
     fn rejects_empty_parameter() {
         assert!(match_route("GET", "/v1/conversations/").is_none());
+    }
+
+    #[test]
+    fn template_parameters_fit_capacity() {
+        for spec in OPERATION_SPECS {
+            let declared = spec.runtime_path.split('/').filter(|s| s.starts_with('{')).count();
+            assert!(
+                declared <= MAX_PATH_PARAMS,
+                "{} declares {declared} path parameters, above the {MAX_PATH_PARAMS} capacity",
+                spec.runtime_path
+            );
+        }
+    }
+
+
+    #[test]
+    fn unmatched_parameter_name_returns_none() {
+        let route = match_route("GET", "/v1/conversations/conv_123/items/item_456").unwrap();
+        assert_eq!(route.conversation_id(), Some("conv_123"));
+        assert_eq!(route.item_id(), Some("item_456"));
+        assert_eq!(route.params.get("file_id"), None);
     }
 }
