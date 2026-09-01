@@ -12,6 +12,9 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
+use serde_json::Value;
+
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 
@@ -34,19 +37,19 @@ pub(crate) struct ResponsesState {
     ///
     /// Preserves the full object from the request so filters can
     /// inspect both the strategy type and any parameters.
-    pub context_management: Option<serde_json::Value>,
+    pub context_management: Option<Value>,
 
     /// Conversation scope for multi-turn state.
     ///
     /// Can be a string ID or an object with `id`. Controls which
     /// stored conversation this request belongs to.
-    pub conversation: Option<serde_json::Value>,
+    pub conversation: Option<Value>,
 
     /// Public output retained across local file-search inference rounds.
     ///
     /// This is request-local continuation state. Private search context stays
     /// in [`Self::messages`] and is never exposed through Conversations.
-    pub file_search_output_items: Vec<serde_json::Value>,
+    pub file_search_output_items: Vec<Value>,
 
     /// Additional fields to include in the response.
     ///
@@ -66,7 +69,7 @@ pub(crate) struct ResponsesState {
     /// Preserved as-is so downstream filters can inspect what the
     /// client actually sent, independent of conversation history
     /// resolved by `rehydrate`.
-    pub input: Vec<serde_json::Value>,
+    pub input: Vec<Value>,
 
     /// Current agentic loop iteration (0-indexed). Incremented by
     /// `openai_agentic_loop` at the start of each new inference round.
@@ -84,7 +87,7 @@ pub(crate) struct ResponsesState {
     ///
     /// Built by `openai_mcp_tool_resolve` from `tools/list` responses.
     /// Consumed by `mcp_tool` (#27) for dispatch routing.
-    pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
+    pub mcp_tool_map: HashMap<(String, String), Value>,
 
     /// Resolved conversation history sent to the backend.
     ///
@@ -94,7 +97,7 @@ pub(crate) struct ResponsesState {
     /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
-    pub messages: Vec<serde_json::Value>,
+    pub messages: Vec<Value>,
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
@@ -105,7 +108,7 @@ pub(crate) struct ResponsesState {
     /// This may include output-only metadata items omitted from
     /// [`Self::messages`] because it is not forwarded to backend
     /// inference.
-    pub persisted_messages: Vec<serde_json::Value>,
+    pub persisted_messages: Vec<Value>,
 
     /// ID of a previous response to continue from.
     ///
@@ -114,19 +117,19 @@ pub(crate) struct ResponsesState {
     pub previous_response_id: Option<String>,
 
     /// MCP tool listings recovered from the previous response.
-    pub previous_tools: Vec<serde_json::Value>,
+    pub previous_tools: Vec<Value>,
 
     /// Token usage reported by the previous response.
-    pub previous_usage: Option<serde_json::Value>,
+    pub previous_usage: Option<Value>,
 
     /// Parsed request body as received from the client.
-    pub request_body: serde_json::Value,
+    pub request_body: Value,
 
     /// Whether provider-visible request fields require outbound serialization.
     pub request_body_rebuild: RequestBodyRebuild,
 
     /// The constructed response object for the current iteration.
-    pub response_object: serde_json::Value,
+    pub response_object: Value,
 
     /// Tool calls from the current inference response only.
     ///
@@ -134,7 +137,7 @@ pub(crate) struct ResponsesState {
     /// before `stream_events` writes new ones. Without explicit
     /// clearing, stale tool calls from a previous iteration cause
     /// duplicate dispatch.
-    pub tool_calls: Vec<serde_json::Value>,
+    pub tool_calls: Vec<Value>,
 
     /// Web search calls from the current inference response only.
     ///
@@ -143,20 +146,20 @@ pub(crate) struct ResponsesState {
     /// items have a different shape (`action.query` instead of
     /// `name`/`arguments`) and must not trigger the
     /// one-function-call-per-round limit.
-    pub web_search_calls: Vec<serde_json::Value>,
+    pub web_search_calls: Vec<Value>,
 
     /// Tool choice setting. Reset to `"auto"` by `openai_agentic_loop`
     /// after the first iteration; the original value from the
     /// request only applies to the first inference call.
-    pub tool_choice: serde_json::Value,
+    pub tool_choice: Value,
 
     /// Processed tool definitions from the request.
-    pub tools: Vec<serde_json::Value>,
+    pub tools: Vec<Value>,
 
     /// Token usage accumulated across all iterations within the
     /// request. `stream_events` merges per-iteration usage into
     /// the running total.
-    pub usage: serde_json::Value,
+    pub usage: Value,
 
     /// Output items accumulated across all agentic loop iterations.
     ///
@@ -164,7 +167,7 @@ pub(crate) struct ResponsesState {
     /// appended here so the final response contains the complete
     /// trace. `openai_agentic_loop` writes model items, `mcp_dispatch`
     /// writes `mcp_call` and `mcp_approval_request` items.
-    pub accumulated_output: Vec<serde_json::Value>,
+    pub accumulated_output: Vec<Value>,
 }
 
 /// Whether the proxy can preserve the original request bytes.
@@ -197,14 +200,14 @@ impl Default for ResponsesState {
             previous_response_id: None,
             previous_tools: Vec::new(),
             previous_usage: None,
-            request_body: serde_json::Value::Null,
+            request_body: Value::Null,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
-            response_object: serde_json::Value::Null,
+            response_object: Value::Null,
             tool_calls: Vec::new(),
             web_search_calls: Vec::new(),
-            tool_choice: serde_json::Value::String("auto".to_owned()),
+            tool_choice: Value::String("auto".to_owned()),
             tools: Vec::new(),
-            usage: serde_json::Value::Null,
+            usage: Value::Null,
             accumulated_output: Vec::new(),
         }
     }
@@ -212,13 +215,13 @@ impl Default for ResponsesState {
 
 impl ResponsesState {
     /// Create initial state from a parsed request body.
-    pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
+    pub(crate) fn from_request_body(body: Value) -> Self {
         let messages = normalize_input(&body);
         let persisted_messages = messages.clone();
         let tool_choice = body
             .get("tool_choice")
             .cloned()
-            .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
+            .unwrap_or_else(|| Value::String("auto".to_owned()));
 
         let tools = extract_array_field(&body, "tools");
         Self {
@@ -245,29 +248,29 @@ impl ResponsesState {
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
-    pub(crate) fn output_items(&self) -> &[serde_json::Value] {
+    pub(crate) fn output_items(&self) -> &[Value] {
         self.response_object
             .get("output")
-            .and_then(serde_json::Value::as_array)
+            .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
 
     /// Mutably borrow public output, creating a valid array when absent.
-    pub(crate) fn output_items_mut(&mut self) -> &mut Vec<serde_json::Value> {
+    pub(crate) fn output_items_mut(&mut self) -> &mut Vec<Value> {
         if !self.response_object.is_object() {
-            self.response_object = serde_json::Value::Object(serde_json::Map::new());
+            self.response_object = Value::Object(serde_json::Map::new());
         }
-        let serde_json::Value::Object(response) = &mut self.response_object else {
+        let Value::Object(response) = &mut self.response_object else {
             unreachable!("response_object was normalized to an object")
         };
         let output = response
             .entry("output".to_owned())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            .or_insert_with(|| Value::Array(Vec::new()));
         if !output.is_array() {
-            *output = serde_json::Value::Array(Vec::new());
+            *output = Value::Array(Vec::new());
         }
-        let serde_json::Value::Array(items) = output else {
+        let Value::Array(items) = output else {
             unreachable!("output was normalized to an array")
         };
         items
@@ -277,6 +280,31 @@ impl ResponsesState {
     pub(crate) fn request_body_requires_rebuild(&self) -> bool {
         self.request_body_rebuild == RequestBodyRebuild::Required
     }
+
+    /// Build the final response body from accumulated state.
+    ///
+    /// Replaces `response_object["output"]` with the full `accumulated_output`
+    /// (all rounds), stamps accumulated usage, and serializes back to body bytes.
+    pub(crate) fn finalize_response_body(&self, body: &mut Option<Bytes>) {
+        if !self.response_object.is_object() {
+            return;
+        }
+        let mut response = self.response_object.clone();
+        if let Some(obj) = response.as_object_mut() {
+            if !self.accumulated_output.is_empty() {
+                obj.insert(
+                    "output".to_owned(),
+                    Value::Array(self.accumulated_output.clone()),
+                );
+            }
+            if !self.usage.is_null() {
+                obj.insert("usage".to_owned(), self.usage.clone());
+            }
+        }
+        if let Ok(serialized) = serde_json::to_vec(&response) {
+            *body = Some(Bytes::from(serialized));
+        }
+    }
 }
 
 /// Normalize the `input` field into a message array.
@@ -284,11 +312,11 @@ impl ResponsesState {
 /// The Responses API `input` can be a string (single user message),
 /// a single item object, or an array of items. Normalizes all three
 /// forms to a `Vec<Value>`.
-fn normalize_input(body: &serde_json::Value) -> Vec<serde_json::Value> {
+fn normalize_input(body: &Value) -> Vec<Value> {
     match body.get("input") {
-        Some(serde_json::Value::Array(arr)) => arr.clone(),
-        Some(input @ serde_json::Value::Object(_)) => vec![input.clone()],
-        Some(serde_json::Value::String(s)) => {
+        Some(Value::Array(arr)) => arr.clone(),
+        Some(input @ Value::Object(_)) => vec![input.clone()],
+        Some(Value::String(s)) => {
             vec![serde_json::json!({
                 "type": "message",
                 "role": "user",
@@ -300,27 +328,27 @@ fn normalize_input(body: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 /// Extract a JSON array field by name, defaulting to empty.
-fn extract_array_field(body: &serde_json::Value, field: &str) -> Vec<serde_json::Value> {
+fn extract_array_field(body: &Value, field: &str) -> Vec<Value> {
     body.get(field)
-        .and_then(serde_json::Value::as_array)
+        .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
 }
 
 /// Extract a string field by name.
-fn extract_string(body: &serde_json::Value, field: &str) -> Option<String> {
+fn extract_string(body: &Value, field: &str) -> Option<String> {
     body.get(field)
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
 
 /// Extract an array of strings by name, defaulting to empty.
-fn extract_string_array(body: &serde_json::Value, field: &str) -> Vec<String> {
+fn extract_string_array(body: &Value, field: &str) -> Vec<String> {
     body.get(field)
-        .and_then(serde_json::Value::as_array)
+        .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .filter_map(serde_json::Value::as_str)
+                .filter_map(Value::as_str)
                 .map(ToOwned::to_owned)
                 .collect()
         })
@@ -329,7 +357,7 @@ fn extract_string_array(body: &serde_json::Value, field: &str) -> Vec<String> {
 
 /// Extract a `u32` field by name, logging when a value is present
 /// but not representable as `u32`.
-fn extract_u32(body: &serde_json::Value, field: &str) -> Option<u32> {
+fn extract_u32(body: &Value, field: &str) -> Option<u32> {
     let raw = body.get(field)?;
     let result = raw.as_u64().and_then(|v| u32::try_from(v).ok());
     if result.is_none() {
@@ -339,8 +367,8 @@ fn extract_u32(body: &serde_json::Value, field: &str) -> Option<u32> {
 }
 
 /// Extract a bool field by name, returning a default if absent.
-fn extract_bool_or(body: &serde_json::Value, field: &str, default: bool) -> bool {
-    body.get(field).and_then(serde_json::Value::as_bool).unwrap_or(default)
+fn extract_bool_or(body: &Value, field: &str, default: bool) -> bool {
+    body.get(field).and_then(Value::as_bool).unwrap_or(default)
 }
 
 // -----------------------------------------------------------------------------
