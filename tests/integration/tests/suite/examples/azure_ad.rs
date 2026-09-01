@@ -44,8 +44,8 @@ fn azure_ad_fails_closed_without_token() {
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let patched = praxis_test_utils::patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
     // Use an always-set env var so filter construction succeeds, and
-    // point the authority at a closed port so the background refresher
-    // can never acquire a token (deterministic fail-closed).
+    // point the authority at a closed port so the inline cache-through
+    // fetch can never acquire a token (deterministic fail-closed).
     let patched = patched.replace(
         "        client_secret_env_var: AZURE_CLIENT_SECRET",
         "        client_secret_env_var: CARGO_PKG_NAME\n        authority_host: 127.0.0.1:1",

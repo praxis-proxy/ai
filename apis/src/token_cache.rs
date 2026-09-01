@@ -21,6 +21,7 @@
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
+use tracing::warn;
 
 // -----------------------------------------------------------------------------
 // Margin
@@ -29,7 +30,7 @@ use tokio::sync::RwLock;
 /// Safety margin to subtract from a TTL before treating a cached value
 /// as expired, capped at half the TTL so a short-lived credential stays
 /// usable for part of its life instead of being cached already-expired.
-pub(crate) fn effective_margin(ttl: Duration, margin: Duration) -> Duration {
+fn effective_margin(ttl: Duration, margin: Duration) -> Duration {
     margin.min(ttl / 2)
 }
 
@@ -89,6 +90,11 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
     ///
     /// Returns whatever `fetch` returns on failure. Nothing is cached
     /// in that case, so the next call tries again.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "guard's last use is immediately before each return; an explicit drop() would just \
+                   restate that, not shorten the actual hold time"
+    )]
     pub async fn get_or_refresh<F, Fut, E>(&self, fetch: F) -> Result<T, E>
     where
         F: FnOnce() -> Fut + Send,
@@ -105,17 +111,22 @@ impl<T: Clone + Send + Sync> TokenCache<T> {
         let mut guard = self.cache.write().await;
         let fresh = valid_cached_value(guard.as_ref());
         if let Some(value) = fresh {
-            drop(guard);
             return Ok(value);
         }
 
         let (value, ttl) = fetch().await?;
+        if ttl <= self.margin {
+            warn!(
+                ttl_secs = ttl.as_secs(),
+                margin_secs = self.margin.as_secs(),
+                "token TTL is unusually short; validity margin reduced"
+            );
+        }
         let expires_at = Instant::now() + ttl.saturating_sub(effective_margin(ttl, self.margin));
         *guard = Some(Entry {
             value: value.clone(),
             expires_at,
         });
-        drop(guard);
         Ok(value)
     }
 }
