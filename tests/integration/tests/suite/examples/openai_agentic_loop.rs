@@ -467,10 +467,33 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
     let input = second_body["input"]
         .as_array()
         .expect("second model request input should be an array");
-    let has_search_result = input.iter().any(|item| item["type"] == "web_search_call");
+
+    // #808: a hosted web_search_call is not a valid OpenResponses input item
+    // (vLLM's Harmony conversion rejects it with HTTP 400), so the continuation
+    // must never forward it to the inference backend.
     assert!(
-        has_search_result,
-        "second inference input should contain web_search_call result"
+        input.iter().all(|item| item["type"] != "web_search_call"),
+        "second inference input must not contain hosted web_search_call items: {input:?}"
+    );
+
+    // The search result reaches the model through a backend-valid
+    // function_call / function_call_output bridge instead.
+    let has_web_search_call = input
+        .iter()
+        .any(|item| item["type"] == "function_call" && item["name"] == "web_search");
+    assert!(
+        has_web_search_call,
+        "second inference input should carry a synthetic web_search function_call: {input:?}"
+    );
+    let function_output = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("second inference input should contain a function_call_output");
+    assert!(
+        function_output["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("blog.rust-lang.org")),
+        "second inference should receive the web search results: {function_output:?}"
     );
 }
 
@@ -504,7 +527,9 @@ fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) ->
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        &format!(
+            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
+        ),
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse web search config")
 }
