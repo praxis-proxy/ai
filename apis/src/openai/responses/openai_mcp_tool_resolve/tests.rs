@@ -1323,6 +1323,175 @@ fn rewrite_tools_array_expands_resolved_nonempty() {
 }
 
 // =========================================================================
+// Credential isolation: entries resolving to zero permitted tools
+// =========================================================================
+
+/// A request whose only MCP entry resolves to zero permitted tools
+/// must still be rewritten: the original `type: "mcp"` entry — and
+/// its `authorization`/`headers` credentials — must never survive
+/// into the body handed to the inference backend.
+///
+/// Regression test for the credential-isolation leak where
+/// `rewrite_request_body` returned `None` for an empty rewritten
+/// tools array, causing the caller to forward the original body
+/// (credentials included) verbatim.
+#[test]
+#[expect(clippy::too_many_lines, reason = "comprehensive credential-isolation assertions")]
+fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": "https://mcp.example.test/mcp",
+            "authorization": "Bearer super-secret-token",
+            "headers": {"x-api-key": "another-secret"}
+        }]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let per_entry = vec![EntryResolution::Resolved(Vec::new())];
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["weather".to_owned()]);
+
+    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+        .expect("rewrite must not error")
+        .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
+
+    let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
+    assert_eq!(
+        rewritten["tools"],
+        serde_json::json!([]),
+        "the resolved-empty MCP entry must be dropped, leaving an empty tools array"
+    );
+
+    let raw = String::from_utf8(serialized.as_bytes().to_vec()).unwrap();
+    assert!(
+        !raw.contains("super-secret-token"),
+        "authorization credential must not survive into the backend request: {raw}"
+    );
+    assert!(
+        !raw.contains("another-secret"),
+        "custom header credential must not survive into the backend request: {raw}"
+    );
+    assert!(
+        !raw.contains("\"mcp\""),
+        "no type:mcp entry may survive into the backend request: {raw}"
+    );
+}
+
+/// A mixed request where one MCP entry resolves to concrete tools and
+/// a second resolves to zero must drop only the empty entry's
+/// credentials while keeping the resolved function tools.
+#[test]
+#[expect(clippy::too_many_lines, reason = "comprehensive credential-isolation assertions")]
+fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": "https://weather.example.test/mcp"
+            },
+            {
+                "type": "mcp",
+                "server_label": "empty",
+                "server_url": "https://empty.example.test/mcp",
+                "authorization": "Bearer empty-secret-token"
+            }
+        ]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let per_entry = vec![
+        EntryResolution::Resolved(vec![mcp_tool_to_function_tool(
+            "weather",
+            &serde_json::json!({"name": "get_weather", "description": "A"}),
+        )]),
+        EntryResolution::Resolved(Vec::new()),
+    ];
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
+
+    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+        .expect("rewrite must not error")
+        .expect("mixed request must be rewritten");
+
+    let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
+    let tools = rewritten["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 1, "only the resolved-nonempty entry survives: {tools:?}");
+    assert_eq!(tools[0]["name"], "weather__get_weather", "resolved tool preserved");
+
+    let raw = String::from_utf8(serialized.as_bytes().to_vec()).unwrap();
+    assert!(
+        !raw.contains("empty-secret-token"),
+        "empty entry credential must not leak: {raw}"
+    );
+}
+
+/// Regression: an `allowed_tools` choice restricting the model to an MCP
+/// server that resolves to zero tools, while an unrelated top-level
+/// function tool survives. The emptied choice must normalize to `"none"`,
+/// never be removed — removing it would let the model call the unrelated
+/// function that the original choice deliberately excluded.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "request fixture plus tool_choice normalization and survival assertions"
+)]
+fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_tools_empties() {
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": "https://weather.example.test/mcp",
+                "authorization": "Bearer super-secret-token"
+            },
+            {"type": "function", "name": "unrelated_local_tool"}
+        ],
+        "tool_choice": {
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "mcp", "server_label": "weather"}]
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    // The single MCP entry resolves to zero permitted tools.
+    let per_entry = vec![EntryResolution::Resolved(Vec::new())];
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["weather".to_owned()]);
+
+    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+        .expect("rewrite must not error")
+        .expect("resolved-empty entry must trigger a rewrite");
+
+    let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
+    assert_eq!(
+        rewritten["tool_choice"], "none",
+        "emptied auto allowed_tools must normalize to \"none\", not be removed: {rewritten}"
+    );
+    let tools = rewritten["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 1, "the unrelated function tool must survive: {tools:?}");
+    assert_eq!(
+        tools[0]["name"], "unrelated_local_tool",
+        "unrelated top-level tool preserved"
+    );
+
+    let raw = String::from_utf8(serialized.as_bytes().to_vec()).unwrap();
+    assert!(
+        !raw.contains("super-secret-token"),
+        "empty entry credential must not leak: {raw}"
+    );
+}
+
+// =========================================================================
 // Body Rewrite: MCP to Function
 // =========================================================================
 
@@ -1913,6 +2082,126 @@ fn rewrite_tool_choice_mixed_resolved_and_unresolved_selectors() {
         .iter()
         .any(|t| t["type"] == "mcp" && t["server_label"] == "deferred_server");
     assert!(has_preserved, "unresolved MCP selector should be preserved");
+}
+
+/// A server-level MCP selector for a label that resolved to zero
+/// tools must be dropped from an `allowed_tools` `tool_choice`,
+/// mirroring the top-level MCP `tool_choice` handling. The native
+/// selector must not reach the backend.
+#[test]
+fn rewrite_tool_choice_drops_resolved_empty_server_selector_in_allowed_tools() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "empty_server"},
+                {"type": "function", "name": "calc"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert!(
+        tool_refs.iter().all(|t| t["type"] != "mcp"),
+        "resolved-empty MCP selector must be dropped, not preserved: {tool_refs:?}"
+    );
+    assert!(
+        tool_refs.iter().any(|t| t["name"] == "calc"),
+        "unrelated function selector must be preserved"
+    );
+}
+
+/// A named MCP selector whose server resolved but whose tool is not
+/// in the resolved set is dropped, while a genuinely unresolved
+/// (deferred) selector on another label is preserved.
+#[test]
+fn rewrite_tool_choice_drops_resolved_empty_named_selector_keeps_unresolved() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "empty_server", "name": "gone"},
+                {"type": "mcp", "server_label": "deferred_server"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert_eq!(
+        tool_refs.len(),
+        1,
+        "only the unresolved selector should remain: {tool_refs:?}"
+    );
+    assert_eq!(tool_refs[0]["type"], "mcp", "deferred selector preserved");
+    assert_eq!(
+        tool_refs[0]["server_label"], "deferred_server",
+        "the preserved selector must be the unresolved one"
+    );
+}
+
+/// When every selector in an `allowed_tools` choice targets a locally
+/// resolved server that produced zero eligible tools, a
+/// `mode: "required"` choice is unsatisfiable. It must be rejected
+/// rather than rewritten to an empty (schema-invalid) `allowed_tools`.
+#[test]
+fn rewrite_tool_choice_rejects_allowed_tools_when_all_selectors_resolved_empty_required() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [{"type": "mcp", "server_label": "empty_server"}]
+        }),
+    );
+
+    let err = rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap_err();
+    assert!(
+        matches!(err, ResolveError::EmptyResolvedToolChoice(_)),
+        "an all-empty required allowed_tools choice must be rejected, not emitted as empty: {err}"
+    );
+}
+
+/// When every selector in a non-required `allowed_tools` choice
+/// resolves to zero eligible tools, the restricted set is empty. It must
+/// normalize to `"none"` — never to an empty (schema-invalid)
+/// `allowed_tools`, and never removed (which would broaden access to any
+/// other tool still supplied in the request).
+#[test]
+fn rewrite_tool_choice_normalizes_empty_auto_allowed_tools_to_none() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "mcp", "server_label": "empty_server"}]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+    assert_eq!(
+        obj["tool_choice"], "none",
+        "a vacuous auto allowed_tools choice must normalize to \"none\", not be emptied or removed: {obj:?}"
+    );
 }
 
 // =========================================================================
@@ -2954,5 +3243,142 @@ fn rewrite_tool_choice_passes_unresolved_label_zero_tools() {
     assert_eq!(
         obj["tool_choice"]["type"], "mcp",
         "unresolved label should be left unchanged"
+    );
+}
+
+// =========================================================================
+// Credential isolation end-to-end (real rmcp MCP server)
+// =========================================================================
+
+use rmcp::{
+    ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
+};
+
+/// Request payload for the single-tool server's `get_weather` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WeatherRequest {
+    /// City to look up the weather for.
+    #[schemars(description = "City to look up")]
+    city: String,
+}
+
+/// Minimal MCP server exposing a single, non-read-only tool.
+#[derive(Debug, Clone)]
+struct SingleToolMcpServer {
+    /// Router holding the server's generated tool handlers.
+    tool_router: ToolRouter<Self>,
+}
+
+#[expect(clippy::unused_self, reason = "rmcp macro-generated code")]
+#[tool_router]
+impl SingleToolMcpServer {
+    /// Construct the server with its generated tool router.
+    fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// The single non-read-only tool the server advertises.
+    #[tool(description = "Get current weather for a city")]
+    fn get_weather(&self, Parameters(req): Parameters<WeatherRequest>) -> String {
+        format!("weather in {}", req.city)
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for SingleToolMcpServer {
+    /// Advertise tool support so `tools/list` returns `get_weather`.
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Single-tool MCP server for credential-isolation tests")
+    }
+}
+
+/// Start the single-tool MCP server on an ephemeral loopback port.
+///
+/// Returns the server URL and a `CancellationToken` that shuts the
+/// server down when cancelled or dropped.
+async fn start_single_tool_mcp_server() -> (String, tokio_util::sync::CancellationToken) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<SingleToolMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(SingleToolMcpServer::new()), std::sync::Arc::default(), config);
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct)
+}
+
+/// End-to-end regression: a credentialed MCP entry whose permitted
+/// tool set filters down to zero must not forward its credentials to
+/// the inference backend. `tools/list` succeeds (returning one
+/// non-read-only tool), but `allowed_tools.read_only = true` removes
+/// it, so the entry resolves to zero permitted tools. The resolved
+/// MCP entry — and its `authorization` — must be stripped from the
+/// body handed downstream.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "e2e setup plus credential-isolation assertions")]
+async fn zero_permitted_tools_does_not_leak_credentials_to_backend() {
+    let (server_url, ct) = start_single_tool_mcp_server().await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("allow_loopback: true").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": server_url,
+            "authorization": "Bearer super-secret-token",
+            "allowed_tools": {"tool_names": ["get_weather"], "read_only": true}
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    ct.cancel();
+
+    assert!(matches!(action, FilterAction::Continue), "should continue");
+
+    let committed = body.as_ref().expect("body present");
+    let raw = String::from_utf8(committed.to_vec()).unwrap();
+    assert!(
+        !raw.contains("super-secret-token"),
+        "credential leaked to backend request body: {raw}"
+    );
+    assert!(
+        !raw.contains("\"mcp\""),
+        "resolved MCP entry leaked to backend request body: {raw}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_slice(committed).unwrap();
+    assert_eq!(
+        parsed["tools"],
+        serde_json::json!([]),
+        "all tools filtered out → empty tools array"
     );
 }

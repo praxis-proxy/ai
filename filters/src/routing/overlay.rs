@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
+    group_index::{self, GroupIndex},
     metadata::{CandidateCredential, CredentialRef},
 };
 
@@ -219,6 +220,42 @@ pub(crate) struct OverlayDocument {
     /// Network name.  Used for scope validation in envelope mode.
     #[serde(default)]
     pub(super) network: Option<String>,
+
+    /// Optional request-time selection policy.
+    #[serde(default)]
+    pub(crate) selection_policy: Option<SelectionPolicy>,
+}
+
+/// Request-time selection algorithm used within the first viable group.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PickerPolicy {
+    /// Select the first admitted candidate.
+    #[default]
+    Deterministic,
+    /// Rotate equally through candidates in the active group.
+    RoundRobin,
+    /// Select a candidate uniformly at random from the active group.
+    Random,
+}
+
+impl PickerPolicy {
+    /// Return the bounded metadata representation.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+            Self::RoundRobin => "round_robin",
+            Self::Random => "random",
+        }
+    }
+}
+
+/// Wire wrapper kept extensible independently from routing and scoring policy.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SelectionPolicy {
+    /// Selection mode applied locally by `intelligent_route`.
+    pub(crate) mode: PickerPolicy,
 }
 
 /// A single routing candidate from the overlay.
@@ -253,6 +290,10 @@ pub(crate) struct OverlayCandidate {
     /// Producer-assigned rank within the overlay (lower is better).
     #[serde(default)]
     pub(crate) rank: Option<u32>,
+
+    /// Producer-defined priority group. Lower groups are attempted first.
+    #[serde(default)]
+    pub(crate) selection_group: Option<u32>,
 
     /// Producer-assigned locality tier (e.g. `"same_region"`).
     #[serde(default)]
@@ -318,6 +359,12 @@ struct OverlaySecretRef {
 pub(crate) struct RouteSnapshot {
     /// Validated route candidates.
     pub(crate) candidates: Vec<RouteCandidate>,
+
+    /// Validated lookup and snapshot-scoped selection state.
+    pub(crate) group_index: GroupIndex,
+
+    /// Effective request-time selection mode.
+    pub(crate) selection_mode: PickerPolicy,
 
     /// Whether this snapshot was loaded from an envelope or legacy payload.
     pub(crate) contract_format: ContractFormat,
@@ -468,10 +515,18 @@ impl RouteSnapshot {
 
         descriptor::validate_local_site(&envelope.overlay.local_site)?;
         let candidates = overlay_to_candidates(&envelope.overlay)?;
+        let group_index = group_index::build(&candidates)?;
         let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
+        let selection_mode = envelope
+            .overlay
+            .selection_policy
+            .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
+        warn_if_selection_policy_has_no_groups(selection_mode, &group_index);
 
         Ok(Self {
             candidates,
+            group_index,
+            selection_mode,
             contract_format: ContractFormat::Envelope,
             content_hash,
             generated_at,
@@ -488,10 +543,17 @@ impl RouteSnapshot {
 
         descriptor::validate_local_site(&doc.local_site)?;
         let candidates = overlay_to_candidates(&doc)?;
+        let group_index = group_index::build(&candidates)?;
         let generated_at = doc.generated_at.map(|s| Arc::from(s.as_str()));
+        let selection_mode = doc
+            .selection_policy
+            .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
+        warn_if_selection_policy_has_no_groups(selection_mode, &group_index);
 
         Ok(Self {
             candidates,
+            group_index,
+            selection_mode,
             contract_format: ContractFormat::Legacy,
             content_hash,
             generated_at,
@@ -507,6 +569,8 @@ impl RouteSnapshot {
     pub(crate) fn from_static(candidates: Vec<RouteCandidate>, local_site: Arc<str>) -> Self {
         Self {
             candidates,
+            group_index: GroupIndex::new(),
+            selection_mode: PickerPolicy::Deterministic,
             contract_format: ContractFormat::Legacy,
             content_hash: [0; 32],
             generated_at: None,
@@ -515,6 +579,18 @@ impl RouteSnapshot {
             semantic_revision: None,
         }
     }
+}
+
+/// Warn when a non-deterministic policy has no grouped candidates to select.
+fn warn_if_selection_policy_has_no_groups(selection_mode: PickerPolicy, group_index: &GroupIndex) -> bool {
+    let should_warn = selection_mode != PickerPolicy::Deterministic && group_index.is_empty();
+    if should_warn {
+        tracing::warn!(
+            selection_mode = ?selection_mode,
+            "routing: selection policy is set but no candidates have selection_group; policy will not take effect"
+        );
+    }
+    should_warn
 }
 
 // -----------------------------------------------------------------------------
@@ -614,6 +690,9 @@ fn compute_semantic_digest(overlay_value: &serde_json::Value) -> Result<String, 
     if let Some(network) = overlay_value.get("network") {
         semantic.insert("network".to_owned(), network.clone());
     }
+    if let Some(selection_policy) = overlay_value.get("selection_policy") {
+        semantic.insert("selection_policy".to_owned(), selection_policy.clone());
+    }
     let semantic_value = serde_json::Value::Object(semantic);
     let canonical = serde_json_canonicalizer::to_vec(&semantic_value)
         .map_err(|e| FilterError::from(format!("routing: canonicalization error: {e}")))?;
@@ -691,7 +770,8 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
 /// Apply producer-supplied metadata to validated candidates.
 ///
 /// Zips the validated candidate list with the original overlay entries
-/// and sets `admission_state`, `rank`, `selection_tier`, and `stable_id`.
+/// and sets `admission_state`, `rank`, `selection_group`, `selection_tier`,
+/// and `stable_id`.
 /// Called after [`validate_candidates`] so `deny_unknown_fields` on
 /// [`CandidateConfig`] is never bypassed.
 ///
@@ -706,6 +786,7 @@ pub(super) fn enrich_from_overlay(
                 .map_err(|e| FilterError::from(format!("routing: candidate {i}: {e}")))?;
         }
         c.rank = oc.rank;
+        c.selection_group = oc.selection_group;
         if let Some(t) = &oc.selection_tier {
             if t.trim().is_empty() || t.len() > 128 {
                 return Err(format!("routing: candidate {i}: selection_tier must be 1-128 non-blank bytes").into());
@@ -942,11 +1023,23 @@ fn handle_overlay_reload(
         return;
     };
 
-    if is_unchanged(&content, snapshot) {
+    let current = snapshot.load();
+    let content_hash: [u8; 32] = Sha256::digest(&content).into();
+    if content_hash == current.content_hash {
+        tracing::debug!("intelligent_route: overlay snapshot is unchanged");
         return;
     }
 
-    apply_overlay(path, &content, snapshot, expected_scope);
+    match RouteSnapshot::from_overlay_with_scope(&content, expected_scope) {
+        Ok(new_snap) => {
+            if is_semantically_unchanged(&current, &new_snap) {
+                tracing::debug!("intelligent_route: overlay snapshot is semantically unchanged");
+                return;
+            }
+            apply_overlay(new_snap, snapshot);
+        },
+        Err(e) => log_overlay_reload_error(path, snapshot, &e),
+    }
 }
 
 /// Read the overlay file with a bounded read.
@@ -990,64 +1083,51 @@ pub(crate) fn read_overlay_bounded(path: &Path) -> Result<Vec<u8>, std::io::Erro
     Ok(buf)
 }
 
-/// Check whether the content hash matches the current snapshot.
-fn is_unchanged(content: &[u8], snapshot: &ArcSwap<RouteSnapshot>) -> bool {
-    let new_hash: [u8; 32] = Sha256::digest(content).into();
-    let unchanged = new_hash == snapshot.load().content_hash;
-    if unchanged {
-        tracing::debug!("intelligent_route: overlay content unchanged (hash match)");
-    }
-    unchanged
+/// Return whether a validated candidate preserves the current semantic revision.
+fn is_semantically_unchanged(current: &RouteSnapshot, candidate: &RouteSnapshot) -> bool {
+    current.semantic_revision.is_some() && candidate.semantic_revision == current.semantic_revision
 }
 
 /// Parse the overlay and swap the snapshot on success.
-#[expect(clippy::too_many_lines, reason = "error and success paths with structured logging")]
-fn apply_overlay(
-    path: &Path,
-    content: &[u8],
-    snapshot: &ArcSwap<RouteSnapshot>,
-    expected_scope: Option<&ExpectedOverlayScope>,
-) {
-    match RouteSnapshot::from_overlay_with_scope(content, expected_scope) {
-        Ok(new_snap) => {
-            let previous_serving_revision = snapshot
-                .load()
-                .semantic_revision
-                .as_deref()
-                .unwrap_or("none")
-                .to_owned();
-            let accepted_revision = new_snap.semantic_revision.as_deref().unwrap_or("none").to_owned();
-            let schema_version = new_snap.schema_version.as_deref().unwrap_or("none").to_owned();
-            let candidate_count = new_snap.candidates.len();
-            let local_site = Arc::clone(&new_snap.local_site);
-            let contract_format = new_snap.contract_format;
-            snapshot.store(Arc::new(new_snap));
-            tracing::info!(
-                candidate_count,
-                local_site = &*local_site,
-                contract_format = ?contract_format,
-                schema_version = %schema_version,
-                accepted_revision = %accepted_revision,
-                serving_revision = %accepted_revision,
-                previous_serving_revision = %previous_serving_revision,
-                "intelligent_route: overlay reloaded"
-            );
-        },
-        Err(e) => {
-            let serving_rev = snapshot
-                .load()
-                .semantic_revision
-                .as_deref()
-                .unwrap_or("none")
-                .to_owned();
-            tracing::error!(
-                path = %path.display(),
-                error = %e,
-                retained_serving_revision = %serving_rev,
-                "intelligent_route: overlay reload failed, retaining previous snapshot"
-            );
-        },
-    }
+fn apply_overlay(new_snap: RouteSnapshot, snapshot: &ArcSwap<RouteSnapshot>) {
+    let previous_serving_revision = snapshot
+        .load()
+        .semantic_revision
+        .as_deref()
+        .unwrap_or("none")
+        .to_owned();
+    let accepted_revision = new_snap.semantic_revision.as_deref().unwrap_or("none").to_owned();
+    let schema_version = new_snap.schema_version.as_deref().unwrap_or("none").to_owned();
+    let candidate_count = new_snap.candidates.len();
+    let local_site = Arc::clone(&new_snap.local_site);
+    let contract_format = new_snap.contract_format;
+    snapshot.store(Arc::new(new_snap));
+    tracing::info!(
+        candidate_count,
+        local_site = &*local_site,
+        contract_format = ?contract_format,
+        schema_version = %schema_version,
+        accepted_revision = %accepted_revision,
+        serving_revision = %accepted_revision,
+        previous_serving_revision = %previous_serving_revision,
+        "intelligent_route: overlay reloaded"
+    );
+}
+
+/// Log a rejected overlay while retaining the last-known-good snapshot.
+fn log_overlay_reload_error(path: &Path, snapshot: &ArcSwap<RouteSnapshot>, error: &FilterError) {
+    let serving_rev = snapshot
+        .load()
+        .semantic_revision
+        .as_deref()
+        .unwrap_or("none")
+        .to_owned();
+    tracing::error!(
+        path = %path.display(),
+        error = %error,
+        retained_serving_revision = %serving_rev,
+        "intelligent_route: overlay reload failed, retaining previous snapshot"
+    );
 }
 
 /// Set up a [`RecommendedWatcher`] that sends to the given channel
@@ -1143,6 +1223,85 @@ mod tests {
         assert_eq!(doc.candidates[0].name, "llama-3");
         assert!(doc.candidates[0].fresh);
         assert!(doc.candidates[0].credential.is_none());
+    }
+
+    #[test]
+    fn missing_selection_policy_uses_deterministic_mode() {
+        let json = r#"{
+            "local_site": "site-a",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "llama-3",
+                "site": "site-a",
+                "cluster": "local-inference"
+            }]
+        }"#;
+        let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        assert_eq!(snapshot.selection_mode, PickerPolicy::Deterministic);
+        assert!(snapshot.group_index.is_empty());
+    }
+
+    #[test]
+    fn round_robin_policy_and_group_survive_overlay_load() {
+        let json = r#"{
+            "local_site": "site-a",
+            "selection_policy": {"mode": "roundRobin"},
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "llama-3",
+                "site": "site-a",
+                "cluster": "local-inference",
+                "selection_group": 0
+            }]
+        }"#;
+        let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        assert_eq!(snapshot.selection_mode, PickerPolicy::RoundRobin);
+        assert_eq!(snapshot.candidates[0].selection_group, Some(0));
+    }
+
+    #[test]
+    fn non_deterministic_policy_without_groups_requests_warning() {
+        assert!(warn_if_selection_policy_has_no_groups(
+            PickerPolicy::RoundRobin,
+            &GroupIndex::new(),
+        ));
+        assert!(!warn_if_selection_policy_has_no_groups(
+            PickerPolicy::Deterministic,
+            &GroupIndex::new(),
+        ));
+    }
+
+    #[test]
+    fn selection_policy_ignores_unknown_forward_compatible_fields() {
+        let json = r#"{
+            "local_site": "site-a",
+            "selection_policy": {
+                "mode": "roundRobin",
+                "futureField": "ignored"
+            },
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "llama-3",
+                "site": "site-a",
+                "cluster": "local-inference",
+                "selection_group": 0
+            }]
+        }"#;
+        let snapshot = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        assert_eq!(snapshot.selection_mode, PickerPolicy::RoundRobin);
+    }
+
+    #[test]
+    fn malformed_group_metadata_fails_closed() {
+        let mixed = r#"{
+            "local_site": "site-a",
+            "candidates": [
+                {"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0},
+                {"kind":"inference_model","name":"m","site":"b","cluster":"b"}
+            ]
+        }"#;
+        let error = RouteSnapshot::from_overlay(mixed.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("mixes grouped and ungrouped"));
     }
 
     #[test]
@@ -1804,6 +1963,29 @@ mod tests {
     }
 
     #[test]
+    fn semantic_digest_changes_when_only_selection_policy_changes() {
+        let base = serde_json::json!({
+            "local_site": "site-a",
+            "network": "test-net",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "m",
+                "site": "site-a",
+                "cluster": "c",
+                "selection_group": 0
+            }],
+            "selection_policy": {"mode": "deterministic"}
+        });
+        let mut changed = base.clone();
+        changed["selection_policy"]["mode"] = serde_json::json!("roundRobin");
+
+        assert_ne!(
+            compute_semantic_digest(&base).unwrap(),
+            compute_semantic_digest(&changed).unwrap(),
+        );
+    }
+
+    #[test]
     fn legacy_accepted_without_schema_version() {
         let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"site-a","cluster":"c","fresh":true}]}"#;
         let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
@@ -2171,6 +2353,68 @@ mod tests {
             Some("75b057d750d9db77030ecd5a073c235c56b2b0460d3d517340b3e44020e83056"),
             "revision must match manifest"
         );
+    }
+
+    #[test]
+    fn semantic_equivalent_rewrite_does_not_replace_picker_state() {
+        let mut valid: serde_json::Value = serde_json::from_str(&make_envelope_json("site-a", "m", "a", "n")).unwrap();
+        valid["overlay"]["selection_policy"] = serde_json::json!({"mode": "roundRobin"});
+        valid["overlay"]["candidates"][0]["selection_group"] = serde_json::json!(0);
+        let digest = compute_semantic_digest(&valid["overlay"]).unwrap();
+        valid["revision"]["value"] = serde_json::json!(digest);
+        valid["content_digest"]["value"] = valid["revision"]["value"].clone();
+
+        let initial = serde_json::to_vec(&valid).unwrap();
+        let snapshot = ArcSwap::from_pointee(RouteSnapshot::from_overlay(&initial).unwrap());
+        let before = snapshot.load_full();
+        assert_eq!(before.selection_mode, PickerPolicy::RoundRobin);
+
+        valid["overlay"]["generated_at"] = serde_json::json!("2099-12-31T23:59:59Z");
+        valid["provenance"]["rendered_at"] = serde_json::json!("2099-12-31T23:59:59Z");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay.json");
+        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+
+        handle_overlay_reload(&path, &snapshot, None);
+
+        assert!(Arc::ptr_eq(&before, &snapshot.load_full()));
+    }
+
+    fn select_round_robin_cluster(snapshot: &RouteSnapshot) -> String {
+        crate::routing::picker::select_candidate(
+            &snapshot.candidates,
+            &snapshot.group_index,
+            CapabilityKind::InferenceModel,
+            "m",
+            snapshot.selection_mode,
+        )
+        .unwrap()
+        .0
+        .cluster
+        .to_string()
+    }
+
+    #[test]
+    fn new_snapshot_has_independent_picker_state() {
+        let json_v1 = r#"{
+            "local_site":"site-a",
+            "selection_policy":{"mode":"roundRobin"},
+            "candidates":[
+                {"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0},
+                {"kind":"inference_model","name":"m","site":"b","cluster":"b","selection_group":0}
+            ]
+        }"#;
+        let json_v2 = json_v1.replace("\"cluster\":\"a\"", "\"cluster\":\"c\"");
+        let first = RouteSnapshot::from_overlay(json_v1.as_bytes()).unwrap();
+        let second = RouteSnapshot::from_overlay(json_v2.as_bytes()).unwrap();
+
+        let first_selection = select_round_robin_cluster(&first);
+        let second_selection = select_round_robin_cluster(&first);
+        let fresh_selection = select_round_robin_cluster(&second);
+
+        assert_eq!(first_selection, "a");
+        assert_eq!(second_selection, "b");
+        assert_eq!(fresh_selection, "c");
     }
 
     #[test]

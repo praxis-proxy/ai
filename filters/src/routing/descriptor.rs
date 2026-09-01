@@ -175,7 +175,8 @@ fn default_fresh() -> bool {
 ///
 /// Created by [`validate_candidates`] from raw config entries.
 /// All string fields are bounded and non-blank.  Overlay-specific
-/// fields (`admission_state`, `rank`, `selection_tier`, `stable_id`)
+/// fields (`admission_state`, `rank`, `selection_group`, `selection_tier`,
+/// `stable_id`)
 /// are populated by [`enrich_from_overlay`] after validation.
 ///
 /// [`enrich_from_overlay`]: super::overlay::enrich_from_overlay
@@ -209,6 +210,9 @@ pub(crate) struct RouteCandidate {
 
     /// Producer-assigned rank within the overlay (lower is better).
     pub rank: Option<u32>,
+
+    /// Producer-assigned priority group (lower is preferred).
+    pub selection_group: Option<u32>,
 
     /// Producer-assigned locality tier (e.g. `"same_region"`).
     pub selection_tier: Option<Arc<str>>,
@@ -298,6 +302,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             kind: c.kind,
             name: Arc::from(c.name.as_str()),
             rank: None,
+            selection_group: None,
             selection_tier: None,
             site: Arc::from(c.site.as_str()),
             stable_id,
