@@ -157,6 +157,31 @@ fn rejects_structural_characters_in_metadata_host() {
 }
 
 #[test]
+fn rejects_non_loopback_non_default_metadata_host() {
+    // Structurally valid hostname, but not the real metadata server or a
+    // loopback test address -- must still be rejected, or a misconfigured
+    // metadata_host would send the access token over a real network in
+    // cleartext.
+    let err = GcpAdcFilter::from_config(&yaml("metadata_host: evil.example.com"))
+        .err()
+        .expect("non-loopback, non-default metadata_host must be rejected");
+    assert!(
+        err.to_string().contains("metadata_host"),
+        "error should name metadata_host: {err}"
+    );
+}
+
+#[test]
+fn accepts_loopback_and_default_metadata_host() {
+    GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: metadata.google.internal"))
+        .expect("the real metadata server must be accepted");
+    GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: 127.0.0.1:9000"))
+        .expect("a loopback address must be accepted for tests");
+    GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: localhost:9000"))
+        .expect("localhost must be accepted for tests");
+}
+
+#[test]
 fn validate_service_account_accepts_email_and_default() {
     validate_service_account("default").expect("default is valid");
     validate_service_account("foo@project.iam.gserviceaccount.com").expect("SA email is valid");

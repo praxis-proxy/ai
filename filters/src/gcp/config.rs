@@ -102,6 +102,7 @@ pub(super) fn validate_config(config: &GcpAdcConfig) -> Result<(), FilterError> 
         return Err("gcp_adc: scope must not be empty".into());
     }
     validate_url_component("metadata_host", &config.metadata_host)?;
+    validate_metadata_host(&config.metadata_host)?;
     match config.source {
         GcpAdcSource::KeyFile => validate_key_file_fields(config),
         GcpAdcSource::Metadata | GcpAdcSource::Adc => validate_metadata_fields(config),
@@ -121,6 +122,28 @@ pub(super) fn validate_url_component(field: &str, value: &str) -> Result<(), Fil
         return Err(format!(
             "gcp_adc: {field} '{value}' is invalid: it must be a bare value with no scheme, \
              path, query, '@', or whitespace"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Reject a `metadata_host` that isn't the real GCE/GKE metadata server or
+/// a loopback address (used only to point tests at a local mock).
+///
+/// The metadata endpoint is safe to reach over plain HTTP specifically
+/// because it is link-local and never routable off the VM/host. Any other
+/// host configured here would send the same plaintext request -- and
+/// receive the access token in the response -- over a real network path.
+fn validate_metadata_host(value: &str) -> Result<(), FilterError> {
+    let host = value.split(':').next().unwrap_or(value);
+    let is_safe = value == "metadata.google.internal" || host == "127.0.0.1" || host == "localhost";
+    if !is_safe {
+        return Err(format!(
+            "gcp_adc: metadata_host '{value}' must be 'metadata.google.internal' or a loopback \
+             address (127.0.0.1/localhost, for tests) -- the metadata endpoint is only safe over \
+             plain HTTP because it never leaves the VM; anything else would send the access \
+             token over a real network in cleartext"
         )
         .into());
     }
