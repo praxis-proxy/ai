@@ -391,8 +391,7 @@ fn partial_verified_identity_blocks_lower_tiers() {
     );
     assert!(
         state.username.is_empty(),
-        "raw header must not extend a partially verified identity: {}",
-        state.username
+        "raw header must not extend a partially verified identity"
     );
 }
 
