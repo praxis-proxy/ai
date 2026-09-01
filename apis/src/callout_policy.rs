@@ -4,19 +4,20 @@
 //! Shared failure-policy vocabulary for outbound AI callouts.
 //!
 //! Every filter that calls an external service answers one of
-//! two *different* questions. Choose the type that matches the
-//! question (the first listed value of each is its default):
+//! two different questions (the first listed value of each is
+//! its default):
 //!
 //! | Question | Type | YAML key | Values |
 //! | --- | --- | --- | --- |
-//! | The callout did not produce an answer: DNS, connect, timeout, TLS, non-2xx, unparseable body. Serve the request anyway? | [`FailureMode`] | `on_failure` | `closed`, `open` |
-//! | The callout answered successfully, and the answer is that the resource does not exist. Serve the request without it? | [`OnMissing`] | `on_missing` | `continue`, `reject` |
+//! | The callout did not produce a usable answer. Serve the request anyway? | [`FailureMode`] | `on_failure` | `closed`, `open` |
+//! | The callout answered, and the answer is that the resource does not exist. Serve the request without it? | [`OnMissing`] | `on_missing` | `continue`, `reject` |
 //!
-//! These stay separate deliberately. A callout failure is an
-//! *unknown*: the proxy cannot tell whether the resource exists, so
-//! `on_failure: open` is a decision to serve a request whose
-//! enrichment silently did not happen. A missing resource is a
-//! *known* answer from a working upstream.
+//! # Classification is filter-specific
+//!
+//! These enums are a vocabulary: they fix the accepted values
+//! and the default, not which conditions a filter routes through
+//! which key. Each filter's `on_failure` / `on_missing` field docs
+//! are authoritative.
 //!
 //! # Naming
 //!
@@ -32,11 +33,8 @@ use serde::Deserialize;
 // FailureMode
 // -----------------------------------------------------------------------------
 
-/// What happens when an outbound callout fails to produce an answer.
-///
-/// Covers transport faults (DNS, connect, timeout, TLS), upstream
-/// error statuses, and responses that cannot be parsed. Configured as
-/// `on_failure`.
+/// What happens when an outbound callout does not produce a usable
+/// answer. Configured as `on_failure`.
 ///
 /// For a callout that succeeds but reports an absent resource, use
 /// [`OnMissing`].
@@ -56,11 +54,7 @@ pub enum FailureMode {
 // -----------------------------------------------------------------------------
 
 /// What happens when a callout succeeds and answers that the
-/// requested resource does not exist.
-///
-/// Configured as `on_missing`. The callout answered successfully, but the
-/// resource is absent. For a callout that produced no answer at all,
-/// see [`FailureMode`].
+/// requested resource does not exist. Configured as `on_missing`.
 ///
 /// A filter may narrow the set of references this governs, but must never
 /// widen it to cover failures that carry a security signal (e.g. a file
