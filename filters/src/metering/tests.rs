@@ -72,6 +72,59 @@ metering_url: "http://metering:8080"
     assert!(filter.default_model.is_none());
 }
 
+// -----------------------------------------------------------------------------
+// Fallback Runtime Behavior
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn default_username_meters_anonymous_request() {
+    // Unroutable metering URL makes the balance check fail instantly;
+    // fail-open (the default) still admits and stores the metering state.
+    let filter = filter_from_yaml("metering_url: \"http://127.0.0.1:1\"\ndefault_username: \"anonymous\"\n");
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        !ctx.filter_state.is_empty(),
+        "default_username must cause metering state to be stored"
+    );
+}
+
+#[test]
+fn default_model_is_used_when_no_model_was_captured() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ndefault_model: \"unknown\"\n");
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let ctx = make_filter_context(&req);
+    let state = state_for("alice", "");
+
+    assert_eq!(filter.resolve_report_model(&ctx, &state), "unknown");
+}
+
+#[test]
+fn captured_model_wins_over_default_model() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ndefault_model: \"unknown\"\n");
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert(META_METERING_MODEL.to_owned(), "gpt-4".to_owned());
+    let state = state_for("alice", "");
+
+    assert_eq!(filter.resolve_report_model(&ctx, &state), "gpt-4");
+}
+
+#[test]
+fn empty_model_without_default_stays_empty() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let ctx = make_filter_context(&req);
+    let state = state_for("alice", "");
+
+    assert_eq!(filter.resolve_report_model(&ctx, &state), "");
+}
+
 #[test]
 fn config_empty_prefix_fails() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(

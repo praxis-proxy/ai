@@ -283,15 +283,21 @@ impl ExternalMeteringFilter {
         }
     }
 
+    /// Resolve the model to report: the captured model, else the
+    /// body/header metadata, else the configured default.
+    fn resolve_report_model(&self, ctx: &HttpFilterContext<'_>, state: &MeteringState) -> String {
+        if !state.model.is_empty() {
+            return state.model.clone();
+        }
+        if let Some(model) = ctx.filter_metadata.get(META_METERING_MODEL) {
+            return model.clone();
+        }
+        self.default_model.clone().unwrap_or_default()
+    }
+
     /// Emit the terminal usage or error event for a completed request.
     fn report(&self, ctx: &HttpFilterContext<'_>, mut state: MeteringState) {
-        if state.model.is_empty() {
-            if let Some(model) = ctx.filter_metadata.get(META_METERING_MODEL) {
-                state.model.clone_from(model);
-            } else if let Some(fallback) = self.default_model.as_ref() {
-                state.model.clone_from(fallback);
-            }
-        }
+        state.model = self.resolve_report_model(ctx, &state);
 
         let request_id = ctx.id_generator.generate(ctx.time_source);
         let provider = ctx.cluster_name().unwrap_or_default().to_owned();
