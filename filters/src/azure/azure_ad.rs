@@ -271,7 +271,15 @@ impl praxis_filter::HttpFilter for AzureAdFilter {
     ) -> Result<praxis_filter::FilterAction, FilterError> {
         let fetched = self
             .cache
-            .get_or_refresh(|| fetch_token(&self.client, &self.token_url, &self.client_id, &self.client_secret, &self.scope))
+            .get_or_refresh(|| {
+                fetch_token(
+                    &self.client,
+                    &self.token_url,
+                    &self.client_id,
+                    &self.client_secret,
+                    &self.scope,
+                )
+            })
             .await;
         match fetched {
             Ok(authorization) => {
@@ -607,7 +615,11 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == http::header::AUTHORIZATION)
             .map(|(_, value)| value.to_str().expect("ascii"));
-        assert_eq!(auth, Some("Bearer fresh"), "must inject the freshly fetched bearer token");
+        assert_eq!(
+            auth,
+            Some("Bearer fresh"),
+            "must inject the freshly fetched bearer token"
+        );
         server.join().unwrap();
     }
 
@@ -621,11 +633,17 @@ mod tests {
         let request = make_request(Method::POST, "/openai/deployments/gpt-4o/chat/completions");
 
         let mut first_ctx = make_filter_context(&request);
-        let first = filter.on_request(&mut first_ctx).await.expect("first call must not error");
+        let first = filter
+            .on_request(&mut first_ctx)
+            .await
+            .expect("first call must not error");
         assert!(matches!(first, FilterAction::Continue));
 
         let mut second_ctx = make_filter_context(&request);
-        let second = filter.on_request(&mut second_ctx).await.expect("second call must not error");
+        let second = filter
+            .on_request(&mut second_ctx)
+            .await
+            .expect("second call must not error");
         assert!(
             matches!(second, FilterAction::Continue),
             "a still-valid cache must serve the second request without a new connection"

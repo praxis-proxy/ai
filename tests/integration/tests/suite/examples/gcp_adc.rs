@@ -42,8 +42,7 @@ fn gcp_adc_fails_closed_without_token() {
         "      - filter: gcp_adc",
         "      - filter: gcp_adc\n        metadata_host: 127.0.0.1:1",
     );
-    let config =
-        praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse gcp-adc.yaml: {e}"));
+    let config = praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse gcp-adc.yaml: {e}"));
 
     let proxy = praxis_test_utils::start_proxy(&config);
     let raw = http_send(

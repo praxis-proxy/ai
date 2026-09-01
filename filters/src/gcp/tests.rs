@@ -309,7 +309,11 @@ async fn on_request_injects_bearer_on_first_fetch() {
         .iter()
         .find(|(name, _)| *name == header::AUTHORIZATION)
         .map(|(_, value)| value.to_str().expect("ascii"));
-    assert_eq!(auth, Some("Bearer fresh"), "must inject the freshly fetched bearer token");
+    assert_eq!(
+        auth,
+        Some("Bearer fresh"),
+        "must inject the freshly fetched bearer token"
+    );
     server.join().unwrap();
 }
 
@@ -324,11 +328,17 @@ async fn on_request_reuses_cached_token_without_a_second_fetch() {
     let request = make_request(Method::POST, "/v1/models");
 
     let mut first_ctx = make_filter_context(&request);
-    let first = filter.on_request(&mut first_ctx).await.expect("first call must not error");
+    let first = filter
+        .on_request(&mut first_ctx)
+        .await
+        .expect("first call must not error");
     assert!(matches!(first, FilterAction::Continue));
 
     let mut second_ctx = make_filter_context(&request);
-    let second = filter.on_request(&mut second_ctx).await.expect("second call must not error");
+    let second = filter
+        .on_request(&mut second_ctx)
+        .await
+        .expect("second call must not error");
     assert!(
         matches!(second, FilterAction::Continue),
         "a still-valid cache must serve the second request without a new connection"
@@ -344,8 +354,8 @@ async fn on_request_reuses_cached_token_without_a_second_fetch() {
 
 #[tokio::test]
 async fn on_request_fails_closed_when_metadata_unreachable() {
-    let filter = GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: 127.0.0.1:1"))
-        .expect("must construct");
+    let filter =
+        GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: 127.0.0.1:1")).expect("must construct");
     let request = make_request(Method::POST, "/v1/models");
     let mut ctx = make_filter_context(&request);
 

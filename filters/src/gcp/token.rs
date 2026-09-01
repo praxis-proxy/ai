@@ -72,7 +72,9 @@ pub(super) async fn fetch(
     scope: &str,
 ) -> Result<(HeaderValue, Duration), FilterError> {
     match source {
-        TokenSource::Metadata { service_account } => fetch_metadata_token(client, metadata_host, service_account, scope).await,
+        TokenSource::Metadata { service_account } => {
+            fetch_metadata_token(client, metadata_host, service_account, scope).await
+        },
         TokenSource::ServiceAccountKey => Err(FilterError::from(
             "gcp_adc: token fetch for source key_file is not implemented yet (requires JWT signing); \
              use source: adc or source: metadata on a GCE/GKE instance instead",
@@ -87,9 +89,8 @@ async fn fetch_metadata_token(
     service_account: &str,
     scope: &str,
 ) -> Result<(HeaderValue, Duration), FilterError> {
-    let mut url = format!(
-        "http://{metadata_host}/computeMetadata/v1/instance/service-accounts/{service_account}/token?scopes="
-    );
+    let mut url =
+        format!("http://{metadata_host}/computeMetadata/v1/instance/service-accounts/{service_account}/token?scopes=");
     url::form_urlencoded::byte_serialize(scope.as_bytes()).for_each(|piece| url.push_str(piece));
 
     let response = client

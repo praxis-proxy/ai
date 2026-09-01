@@ -135,9 +135,18 @@ mod tests {
     #[test]
     fn effective_margin_caps_at_half_ttl() {
         use std::time::Duration;
-        assert_eq!(effective_margin(Duration::from_secs(3600), Duration::from_secs(30)), Duration::from_secs(30));
-        assert_eq!(effective_margin(Duration::from_secs(40), Duration::from_secs(30)), Duration::from_secs(20));
-        assert_eq!(effective_margin(Duration::from_secs(10), Duration::from_secs(30)), Duration::from_secs(5));
+        assert_eq!(
+            effective_margin(Duration::from_secs(3600), Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            effective_margin(Duration::from_secs(40), Duration::from_secs(30)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            effective_margin(Duration::from_secs(10), Duration::from_secs(30)),
+            Duration::from_secs(5)
+        );
     }
 
     #[tokio::test]
@@ -171,7 +180,11 @@ mod tests {
 
         assert_eq!(first, 7);
         assert_eq!(second, 7);
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "a still-valid cache must not trigger a second fetch");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a still-valid cache must not trigger a second fetch"
+        );
     }
 
     #[tokio::test]
