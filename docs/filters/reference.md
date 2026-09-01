@@ -90,6 +90,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
 
+### Metering
+
+| Filter | Description |
+|--------|-------------|
+| [`external_metering`](external_metering.md) | Integrates with an external metering service for pre-request balance checks and post-response token usage reporting. |
+
 ### Prompt Enrich
 
 | Filter | Description |

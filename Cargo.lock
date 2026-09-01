@@ -2723,6 +2723,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "notify",
+ "percent-encoding",
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
