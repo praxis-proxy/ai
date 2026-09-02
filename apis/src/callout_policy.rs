@@ -192,10 +192,7 @@ mod tests {
 
     #[test]
     fn on_failure_deserializes_canonical_values() {
-        assert_eq!(
-            serde_yaml::from_str::<OnFailure>("closed").unwrap(),
-            OnFailure::Closed
-        );
+        assert_eq!(serde_yaml::from_str::<OnFailure>("closed").unwrap(), OnFailure::Closed);
         assert_eq!(serde_yaml::from_str::<OnFailure>("open").unwrap(), OnFailure::Open);
     }
 
