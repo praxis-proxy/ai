@@ -12,7 +12,7 @@ mod contracts;
 mod filter;
 mod handlers;
 pub mod openapi;
-mod routes;
+pub(crate) mod routes;
 mod validate;
 
 pub use filter::OpenaiConversationsFilter;

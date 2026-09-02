@@ -3,6 +3,7 @@
 
 //! Integration tests for example configurations.
 
+mod operation_classifier;
 mod test_utils;
 #[expect(unreachable_pub)]
 pub use test_utils::load_example_config;
