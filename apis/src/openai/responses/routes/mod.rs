@@ -43,10 +43,6 @@ impl OperationEntry for ResponsesOperationSpec {
 }
 
 /// Convert a registry body declaration into a runtime request-body shape.
-#[expect(
-    unused_macro_rules,
-    reason = "optional-body form is part of the registry API but no Responses operation uses it yet"
-)]
 macro_rules! request_body_shape {
     ([none]) => {
         OpenAiRequestBody::None
@@ -159,7 +155,9 @@ responses_operations! {
         transport: Http,
         path: "/responses/input_tokens",
         mode: Passthrough,
-        body: [required json],
+        // The pinned specification omits `required` on this requestBody,
+        // which defaults to false under OpenAPI.
+        body: [optional json],
     },
     CompactConversation {
         operation_id: "Compactconversation",
@@ -167,7 +165,9 @@ responses_operations! {
         transport: Http,
         path: "/responses/compact",
         mode: Passthrough,
-        body: [required json],
+        // The pinned specification omits `required` on this requestBody,
+        // which defaults to false under OpenAPI.
+        body: [optional json],
     },
 }
 
@@ -317,17 +317,19 @@ mod tests {
     }
 
     #[test]
-    fn body_bearing_and_bodyless_operations_report_their_shape() {
+    fn body_shapes_match_the_pinned_specification() {
         for spec in OPERATION_SPECS {
-            let expects_body = matches!(
-                spec.operation,
-                ResponsesOperation::CreateResponse
-                    | ResponsesOperation::CountInputTokens
-                    | ResponsesOperation::CompactConversation
-            );
+            let expected = match spec.operation {
+                // The only Responses operation the specification marks required.
+                ResponsesOperation::CreateResponse => OpenAiRequestBody::Json { required: true },
+                // `requestBody` present but `required` omitted, so false.
+                ResponsesOperation::CountInputTokens | ResponsesOperation::CompactConversation => {
+                    OpenAiRequestBody::Json { required: false }
+                },
+                _ => OpenAiRequestBody::None,
+            };
             assert_eq!(
-                spec.has_request_body(),
-                expects_body,
+                spec.request_body, expected,
                 "{:?} reported the wrong body shape",
                 spec.operation
             );

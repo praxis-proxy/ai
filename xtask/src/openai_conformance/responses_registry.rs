@@ -27,52 +27,60 @@ enum Comparison {
 }
 
 /// Compare one registered operation with the pinned specification.
-fn compare(
-    spec: &praxis_ai_apis::openai::ResponsesOperationSpec,
-    found: Option<&str>,
-    is_extension: bool,
-) -> Comparison {
-    let method = spec.method.as_str();
+///
+/// Takes the identifying fields rather than a spec so the comparison rules can
+/// be unit tested without constructing a registry entry.
+fn compare(method: &str, spec_path: &str, registered_id: &str, found: Option<&str>, is_extension: bool) -> Comparison {
     if is_extension {
-        return if found == Some(spec.operation_id) {
-            Comparison::Drifted(format!(
-                "{method} {} is declared a Praxis protocol extension but the pinned specification defines it",
-                spec.spec_path
-            ))
-        } else {
-            Comparison::Agrees
+        // A protocol extension exists precisely because the specification does
+        // not define the operation. Any upstream definition at this
+        // method/path is drift, whatever ID upstream chose — checking only for
+        // our own ID would never fire, since upstream would not pick it.
+        return match found {
+            Some(operation_id) => Comparison::Drifted(format!(
+                "{method} {spec_path} is declared a Praxis protocol extension but the pinned \
+                 specification now defines it as {operation_id}"
+            )),
+            None => Comparison::Agrees,
         };
     }
 
     match found {
-        Some(operation_id) if operation_id == spec.operation_id => Comparison::Agrees,
+        Some(operation_id) if operation_id == registered_id => Comparison::Agrees,
         Some(operation_id) => Comparison::Drifted(format!(
-            "{method} {} registers operation ID {} but the pinned specification says {operation_id}",
-            spec.spec_path, spec.operation_id
+            "{method} {spec_path} registers operation ID {registered_id} but the pinned specification says {operation_id}"
         )),
         None => Comparison::Drifted(format!(
-            "{method} {} is registered but absent from the pinned specification",
-            spec.spec_path
+            "{method} {spec_path} is registered but absent from the pinned specification"
         )),
     }
 }
 
-/// Compare the runtime Responses registry against the pinned specification.
-pub(super) fn check() -> Result<String, String> {
-    let reference = load_reference_source(OPENAI_REFERENCE_SPEC, Some(OPENAI_REFERENCE_MANIFEST))?;
-    let operations = project_reference(&reference, RESPONSES_SCOPE)?.operations;
+/// Counts and failures accumulated over the registry.
+struct Tally {
+    /// Specification-owned operations compared.
+    checked: usize,
+    /// Praxis protocol extensions seen.
+    extensions: usize,
+    /// Human-readable drift reasons.
+    failures: Vec<String>,
+}
 
-    let mut checked = 0_usize;
-    let mut extensions = 0_usize;
-    let mut failures = Vec::new();
+/// Compare every registered operation against the projected specification.
+fn tally(operations: &[super::model::SpecOperation]) -> Tally {
+    let mut tally = Tally {
+        checked: 0,
+        extensions: 0,
+        failures: Vec::new(),
+    };
 
     for spec in praxis_ai_apis::openai::responses_operation_specs() {
         let is_extension =
             praxis_ai_apis::openai::RESPONSES_PROTOCOL_EXTENSION_OPERATION_IDS.contains(&spec.operation_id);
         if is_extension {
-            extensions += 1;
+            tally.extensions += 1;
         } else {
-            checked += 1;
+            tally.checked += 1;
         }
 
         let found = operations
@@ -80,10 +88,29 @@ pub(super) fn check() -> Result<String, String> {
             .find(|candidate| candidate.key.method == spec.method.as_str() && candidate.key.path == spec.spec_path)
             .and_then(|candidate| candidate.operation_id.as_deref());
 
-        if let Comparison::Drifted(reason) = compare(spec, found, is_extension) {
-            failures.push(reason);
+        if let Comparison::Drifted(reason) = compare(
+            spec.method.as_str(),
+            spec.spec_path,
+            spec.operation_id,
+            found,
+            is_extension,
+        ) {
+            tally.failures.push(reason);
         }
     }
+
+    tally
+}
+
+/// Compare the runtime Responses registry against the pinned specification.
+pub(super) fn check() -> Result<String, String> {
+    let reference = load_reference_source(OPENAI_REFERENCE_SPEC, Some(OPENAI_REFERENCE_MANIFEST))?;
+    let operations = project_reference(&reference, RESPONSES_SCOPE)?.operations;
+    let Tally {
+        checked,
+        extensions,
+        failures,
+    } = tally(&operations);
 
     if failures.is_empty() {
         Ok(format!(
@@ -91,5 +118,95 @@ pub(super) fn check() -> Result<String, String> {
         ))
     } else {
         Err(failures.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Comparison, compare};
+
+    /// Return the drift reason, or `None` when the comparison agrees.
+    fn drift(comparison: Comparison) -> Option<String> {
+        match comparison {
+            Comparison::Agrees => None,
+            Comparison::Drifted(reason) => Some(reason),
+        }
+    }
+
+    #[test]
+    fn extension_absent_from_the_specification_agrees() {
+        assert!(
+            drift(compare(
+                "GET",
+                "/responses",
+                "praxis_createResponseWebSocket",
+                None,
+                true
+            ))
+            .is_none(),
+            "an extension the specification does not define is the expected state"
+        );
+    }
+
+    #[test]
+    fn extension_defined_upstream_under_any_id_is_drift() {
+        // The realistic case: upstream adds the operation under its own name.
+        let reason = drift(compare(
+            "GET",
+            "/responses",
+            "praxis_createResponseWebSocket",
+            Some("createResponseWebSocket"),
+            true,
+        ))
+        .expect("an upstream definition must be reported as drift");
+        assert!(
+            reason.contains("createResponseWebSocket"),
+            "reason should name the upstream ID"
+        );
+
+        // The degenerate case: upstream happens to use our own ID.
+        assert!(
+            drift(compare(
+                "GET",
+                "/responses",
+                "praxis_createResponseWebSocket",
+                Some("praxis_createResponseWebSocket"),
+                true
+            ))
+            .is_some(),
+            "an upstream definition is drift even when the IDs coincide"
+        );
+    }
+
+    #[test]
+    fn registered_operation_matching_the_specification_agrees() {
+        assert!(
+            drift(compare(
+                "POST",
+                "/responses",
+                "createResponse",
+                Some("createResponse"),
+                false
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn registered_operation_with_a_different_id_is_drift() {
+        let reason = drift(compare(
+            "POST",
+            "/responses",
+            "createResponseTypo",
+            Some("createResponse"),
+            false,
+        ))
+        .expect("a mismatched ID must be reported");
+        assert!(reason.contains("createResponseTypo") && reason.contains("createResponse"));
+    }
+
+    #[test]
+    fn registered_operation_absent_from_the_specification_is_drift() {
+        assert!(drift(compare("POST", "/responses/invented", "inventedOperation", None, false)).is_some());
     }
 }
