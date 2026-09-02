@@ -110,6 +110,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`time_to_first_token`](time_to_first_token.md) | Measures time-to-first-token for streaming AI responses. |
 
+### Token Rate Limit
+
+| Filter | Description |
+|--------|-------------|
+| [`token_rate_limit`](token_rate_limit.md) | Token-denominated rate limiter: reserves an estimated cost at admission, reconciles against actual usage after the response completes. Evaluates an ordered list of rules, each with its own optional match condition, algorithm choice, and budget. |
+
 ### Token Usage
 
 | Filter | Description |

@@ -14,11 +14,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.96"
 authors = ["Shane Utt <shaneutt@linux.com>"]
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/praxis-proxy/ai"
 
 [workspace.dependencies]
@@ -43,6 +43,7 @@ notify = "8.2.0"
 quote = "1.0.47"
 rand = "0.10.2"
 rcgen = "0.14.9"
+redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
@@ -92,13 +93,13 @@ praxis = { version = "0.5.3", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils" }
 
 # AI-owned llm-d ext_proc compatibility layer
-praxis-ai-llmd-ext-proc = { version = "0.2.0", path = "integrations/llmd/ext-proc" }
+praxis-ai-llmd-ext-proc = { version = "0.3.0", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
-praxis-ai-proxy = { version = "0.2.0", path = "server" }
-praxis-ai-filters = { version = "0.2.0", path = "filters" }
-praxis-ai-apis = { version = "0.2.0", path = "apis" }
-praxis-ai-build-support = { version = "0.2.0", path = "server/build_support" }
+praxis-ai-proxy = { version = "0.3.0", path = "server" }
+praxis-ai-filters = { version = "0.3.0", path = "filters" }
+praxis-ai-apis = { version = "0.3.0", path = "apis" }
+praxis-ai-build-support = { version = "0.3.0", path = "server/build_support" }
 
 # Pingora (temporary fork)
 pingora-core = { version = "0.8.2", package = "quixotic-plecostomus-core", features = ["rustls"] }

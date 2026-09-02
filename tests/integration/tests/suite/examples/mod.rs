@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024 Praxis Contributors
 
 //! Integration tests for example configurations.
@@ -53,6 +53,8 @@ mod session_replay;
 mod time_to_first_token;
 mod token_count;
 mod token_counting;
+#[cfg(feature = "token-rate-limit-filter")]
+mod token_rate_limit;
 mod token_usage_headers;
 mod vector_stores_routing;
 mod vllm_agentic_api;

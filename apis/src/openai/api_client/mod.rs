@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Shared HTTP client for OpenAI-compatible API callouts.
@@ -126,6 +126,11 @@ impl ApiClient {
         suffix: Option<&str>,
     ) -> Result<String, ApiClientError> {
         resource_url(&self.api_base_url, path_prefix, resource_id, suffix)
+    }
+
+    /// Shared sub-request client used for callouts.
+    pub(crate) fn subrequest_client(&self) -> &SubRequestClient {
+        &self.client
     }
 
     /// Send a GET request and return a bounded HTTP response.

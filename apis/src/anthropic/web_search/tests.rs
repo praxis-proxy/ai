@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 use std::{
@@ -35,6 +35,7 @@ api_key: test-key
 default_context_size: medium
 on_failure: {on_failure}
 base_url: "{base_url}"
+allow_private_base_url: true
 "#,
     ))
     .unwrap();

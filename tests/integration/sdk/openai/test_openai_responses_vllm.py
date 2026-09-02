@@ -270,7 +270,8 @@ def _write_agentic_config(
         "- filter: openai_web_search\n"
         "                provider: brave\n"
         "                api_key: test-key\n"
-        f"                base_url: http://127.0.0.1:{search_port}",
+        f"                base_url: http://127.0.0.1:{search_port}\n"
+        "                allow_private_base_url: true",
     )
 
     fd, path = tempfile.mkstemp(suffix=".yaml")

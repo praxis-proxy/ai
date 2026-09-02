@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Server bootstrap for Praxis AI.
@@ -6,10 +6,12 @@
 pub(crate) mod pipelines;
 pub(crate) mod reload;
 mod server;
+mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
 pub use praxis_core::logging::init_tracing;
 pub use server::{check_root_privilege, fatal, resolve_config_path, run_server, run_server_with_registry};
+pub use subrequest::create_subrequest_client;
 
 // -----------------------------------------------------------------------------
 // Constants

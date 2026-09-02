@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Coverage-manifest loading and inference fixture discovery.
 
 use std::{

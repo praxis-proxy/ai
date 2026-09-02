@@ -1,0 +1,68 @@
+# Token Rate Limiting -- Mixed Algorithms Per Rule
+#
+# Extends token-rate-limit.yaml with per-rule algorithm choice (ai#789 /
+# praxis#551): each rule in `rules:` independently picks sliding_window
+# or token_bucket, matched by a static header value. team-alpha gets an
+# exact trailing-window budget; team-beta gets a continuously-refilling
+# bucket. Requests matching neither rule are not rate limited by this
+# filter instance.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-rate-limit-mixed-algorithms.yaml
+#   curl -i http://localhost:8080/v1/chat/completions -H 'x-app-id: alpha' -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#   curl -i http://localhost:8080/v1/chat/completions -H 'x-app-id: beta'  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# See token-rate-limit.yaml for the full rationale on reservation-based
+# admission (M2), reconciliation, the `rules:` schema, and what's still
+# deliberately out of scope (composite/CEL keys, configurable
+# estimation, token-type-aware accounting, observability/metering).
+#
+# Supported token_count provider values:
+#   openai | anthropic | google | bedrock | azure
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: backend
+
+      - filter: token_rate_limit
+        rules:
+          - name: team-alpha
+            match:
+              headers:
+                x-app-id: alpha
+            algorithm: sliding_window
+            window: 1h                    # exact trailing-window budget
+            capacity: 100000              # max tokens admitted within `window`
+            reserved_tokens: 500          # fixed cost reserved per request at admission
+          - name: team-beta
+            match:
+              headers:
+                x-app-id: beta
+            algorithm: token_bucket
+            capacity: 50000               # max tokens held at once
+            refill_rate: 50               # tokens refilled per second, up to `capacity`
+            reserved_tokens: 200
+
+      - filter: token_count
+        provider: openai   # openai | anthropic | google | bedrock | azure
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

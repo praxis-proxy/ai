@@ -42,6 +42,8 @@ before sending requests.
 | [provider-route.yaml](configs/provider-route.yaml) | This listener requires downstream mTLS. `peer_identity_trust` authenticates and authorizes the edge gateway before AI-owned x-ai-routing-* fields can influence provider-local routing |
 | [time-to-first-token.yaml](configs/time-to-first-token.yaml) | Measures the elapsed time from request receipt to the first non-empty SSE body chunk and records a praxis_ai_ttft_seconds Prometheus histogram labeled by model |
 | [token-counting.yaml](configs/token-counting.yaml) | Extracts token usage from AI inference responses (streaming and non-streaming) and makes counts available to downstream filters via filter metadata as token.input, token.output, and token.total |
+| [token-rate-limit-mixed-algorithms.yaml](configs/token-rate-limit-mixed-algorithms.yaml) | Extends token-rate-limit.yaml with per-rule algorithm choice (ai#789 / praxis#551): each rule in `rules:` independently picks sliding_window or token_bucket, matched by a static header value. team-alpha gets an exact trailing-window budget; team-beta gets a continuously-refilling bucket |
+| [token-rate-limit.yaml](configs/token-rate-limit.yaml) | Reserves an estimated token cost at admission time and reconciles that reservation against actual provider-reported usage once the response completes |
 | [token-usage-headers.yaml](configs/token-usage-headers.yaml) | Inject Praxis-Token-Input, Praxis-Token-Output, and Praxis-Token-Total headers into downstream responses when token counts are available in filter metadata |
 
 ### Anthropic
