@@ -206,6 +206,18 @@ async fn json_openai_extracts_tokens() {
 }
 
 #[tokio::test]
+async fn json_openai_responses_extracts_tokens() {
+    let json =
+        br#"{"id":"resp_123","object":"response","usage":{"input_tokens":15,"output_tokens":42,"total_tokens":57}}"#;
+
+    let (input, output, total) = run_json_extraction(ProviderKind::OpenAi, json).await;
+
+    assert_eq!(input.as_deref(), Some("15"), "Responses API input tokens");
+    assert_eq!(output.as_deref(), Some("42"), "Responses API output tokens");
+    assert_eq!(total.as_deref(), Some("57"), "Responses API total tokens");
+}
+
+#[tokio::test]
 async fn json_anthropic_extracts_tokens() {
     let json = br#"{"usage":{"input_tokens":15,"output_tokens":42}}"#;
 
@@ -377,6 +389,20 @@ async fn sse_openai_final_usage_event() {
     assert_eq!(input.as_deref(), Some("10"), "OpenAI SSE input tokens");
     assert_eq!(output.as_deref(), Some("20"), "OpenAI SSE output tokens");
     assert_eq!(total.as_deref(), Some("30"), "OpenAI SSE total tokens");
+}
+
+#[tokio::test]
+async fn sse_openai_responses_final_usage_event() {
+    let events = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30}}}\n\n",
+    );
+
+    let (input, output, total) = run_sse_extraction(ProviderKind::OpenAi, events.as_bytes()).await;
+
+    assert_eq!(input.as_deref(), Some("10"), "Responses API SSE input tokens");
+    assert_eq!(output.as_deref(), Some("20"), "Responses API SSE output tokens");
+    assert_eq!(total.as_deref(), Some("30"), "Responses API SSE total tokens");
 }
 
 #[tokio::test]
@@ -1067,6 +1093,16 @@ async fn json_openai_records_cached_tokens() {
 }
 
 #[tokio::test]
+async fn json_openai_responses_records_cache_breakdown() {
+    let json = br#"{"id":"resp_123","object":"response","usage":{"input_tokens":1000,"output_tokens":50,"input_tokens_details":{"cached_tokens":900,"cache_write_tokens":80}}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("900"), "Responses API cache reads");
+    assert_eq!(cache_write.as_deref(), Some("80"), "Responses API cache writes");
+}
+
+#[tokio::test]
 async fn json_google_records_cached_content_tokens() {
     let json =
         br#"{"usageMetadata":{"promptTokenCount":1200,"candidatesTokenCount":40,"cachedContentTokenCount":1100}}"#;
@@ -1163,6 +1199,20 @@ async fn sse_openai_final_usage_records_cached_tokens() {
         cache_write, None,
         "OpenAI has no cache write field, so no cache write metadata is written"
     );
+}
+
+#[tokio::test]
+async fn sse_openai_responses_records_cache_breakdown() {
+    let events = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":900,\"cache_write_tokens\":80}}}}\n\n",
+    );
+
+    let (cache_read, cache_write) =
+        run_cache_extraction(ProviderKind::OpenAi, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(cache_read.as_deref(), Some("900"), "Responses API SSE cache reads");
+    assert_eq!(cache_write.as_deref(), Some("80"), "Responses API SSE cache writes");
 }
 
 #[tokio::test]

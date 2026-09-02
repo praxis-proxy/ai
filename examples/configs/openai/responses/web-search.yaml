@@ -13,6 +13,14 @@
 #   default_context_size: How many results to return (low/medium/high)
 #   timeout_ms:           Callout timeout in milliseconds
 #   provider_failure_mode: closed (reject on error) or open (skip on error)
+#   base_url:             Override the provider API base URL. Must be a
+#                         public IP literal unless allow_private_base_url
+#                         is set (SSRF/credential-disclosure guard).
+#   allow_private_base_url: Permit base_url targets on local-sensitive
+#                         addresses and DNS names (default false). DNS
+#                         targets are unsupported in protected mode;
+#                         enabling this also permits DNS results resolving
+#                         to local-sensitive addresses.
 
 listeners:
   - name: ai-gateway
