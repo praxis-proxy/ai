@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     openai::responses::{DEFAULT_TENANT_ID, TENANT_METADATA_KEY, state::ResponsesState},
-    store::{ConversationItemStore, ConversationRecord, PostgresResponseStore, SqliteResponseStore, StoreError},
+    store::{ConversationItemStore, PostgresResponseStore, SqliteResponseStore, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -601,14 +601,9 @@ async fn persist_items(
 
 /// Refresh the denormalized conversation message cache after item mutation.
 async fn refresh_message_cache(store: &dyn ConversationItemStore, tenant_id: &str, conversation_id: &str) {
-    let record = ConversationRecord {
-        conversation_id: conversation_id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
-        created_at: 0,
-        metadata: Value::Object(serde_json::Map::default()),
-        messages: Value::Null,
-    };
-    if let Err(e) = handlers::sync_conversation_messages(store, record).await {
+    // The append-back path holds no pre-mutation cache snapshot, so it syncs with
+    // `None`; the refresh then re-reads the live cache as the swap's expected value.
+    if let Err(e) = handlers::sync_conversation_messages(store, tenant_id, conversation_id, None).await {
         warn!(error = %e, conversation_id, "conversation message sync failed after append-back");
     }
 }
