@@ -285,7 +285,7 @@ fn generate_request_id() -> String {
 /// normalizing a trailing slash.
 fn is_anthropic_messages_path(path: &str) -> bool {
     let normalized = path.strip_suffix('/').unwrap_or(path);
-    normalized == "/v1/messages"
+    normalized == "/v1/messages" || normalized.starts_with("/v1/messages/")
 }
 
 /// Promote classification facts to filter results for branch conditions.
