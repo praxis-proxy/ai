@@ -117,6 +117,7 @@ impl McpDispatchFilter {
     /// Handle a tool call that requires approval.
     fn handle_approval_required(
         ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
         pending: &PendingApproval,
     ) -> Result<FilterAction, FilterError> {
         debug!(
@@ -138,6 +139,9 @@ impl McpDispatchFilter {
             return Ok(FilterAction::Continue);
         };
         state.accumulated_output.push(approval_event);
+
+        // Re-serialize the response body with the new mcp_approval_request event
+        state.finalize_response_body(body);
 
         ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "done".to_owned());
         set_action(ctx, ACTION_DONE)?;
@@ -163,7 +167,7 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadWrite
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -220,7 +224,7 @@ impl HttpFilter for McpDispatchFilter {
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        _body: &mut Option<Bytes>,
+        body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
@@ -238,7 +242,7 @@ impl HttpFilter for McpDispatchFilter {
         }
 
         if let Some(pending) = find_approval_required(&mcp_calls, &state.mcp_tool_map) {
-            return Self::handle_approval_required(ctx, &pending);
+            return Self::handle_approval_required(ctx, body, &pending);
         }
 
         ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "execute_mcp".to_owned());

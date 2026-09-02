@@ -339,13 +339,13 @@ fn evaluate_loop_decision(
 ) -> Result<FilterAction, FilterError> {
     if state.tool_calls.is_empty() && state.web_search_calls.is_empty() {
         trace!("no tool calls, signaling done");
-        finalize_response_body(state, body);
+        state.finalize_response_body(body);
         return set_done(ctx);
     }
     match check_exit_conditions(state, config) {
         Some(ExitReason::FinishReasonLength) => {
             ctx.set_metadata(META_STATUS, "incomplete");
-            finalize_response_body(state, body);
+            state.finalize_response_body(body);
             set_action(ctx, ACTION_DONE)?;
             Ok(FilterAction::Continue)
         },
@@ -359,7 +359,7 @@ fn evaluate_loop_decision(
             state.iteration += 1;
             let (tc, wsc) = (state.tool_calls.len(), state.web_search_calls.len());
             debug!(iteration = state.iteration, tc, wsc, "pending calls, signaling loop");
-            finalize_response_body(state, body);
+            state.finalize_response_body(body);
             set_action(ctx, ACTION_LOOP)?;
             Ok(FilterAction::Continue)
         },
@@ -488,29 +488,6 @@ fn is_finish_reason_length(state: &ResponsesState) -> bool {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
-
-/// Build the final response body from accumulated state.
-///
-/// Replaces `response_object["output"]` with the full
-/// `accumulated_output` (all rounds), stamps accumulated usage,
-/// and serializes back to body bytes.
-fn finalize_response_body(state: &ResponsesState, body: &mut Option<Bytes>) {
-    if !state.response_object.is_object() {
-        return;
-    }
-    let mut response = state.response_object.clone();
-    if let Some(obj) = response.as_object_mut() {
-        if !state.accumulated_output.is_empty() {
-            obj.insert("output".to_owned(), Value::Array(state.accumulated_output.clone()));
-        }
-        if !state.usage.is_null() {
-            obj.insert("usage".to_owned(), state.usage.clone());
-        }
-    }
-    if let Ok(serialized) = serde_json::to_vec(&response) {
-        *body = Some(Bytes::from(serialized));
-    }
-}
 
 /// Shorthand: set `action = "done"` and return `Continue`.
 fn set_done(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
