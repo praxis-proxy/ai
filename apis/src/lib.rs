@@ -17,7 +17,7 @@ pub mod openai;
 pub mod promotion;
 #[cfg(feature = "store")]
 pub mod store;
-pub(crate) mod subrequest;
+pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
 
