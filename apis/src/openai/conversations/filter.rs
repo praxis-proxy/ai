@@ -264,6 +264,83 @@ impl OpenaiConversationsFilter {
         }
     }
 
+    /// Arm request-body buffering for a body-carrying operation and, when an
+    /// earlier filter has already pre-read the body, dispatch it immediately.
+    async fn begin_body_operation(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        route: &MatchedConversationRoute<'_>,
+    ) -> Result<FilterAction, FilterError> {
+        ctx.set_request_body_mode(BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        });
+        let Some(body) = Self::mark_request_filters_ran(ctx) else {
+            return Ok(FilterAction::Continue);
+        };
+        let Some(store) = self.get_or_init_store().await else {
+            return Ok(FilterAction::Reject(reject_store_unavailable()));
+        };
+        Box::pin(Self::handle_post_route(ctx, store.as_ref(), route, &body)).await
+    }
+
+    /// Dispatch a bodyless conversation operation to its local handler.
+    #[expect(clippy::too_many_lines, reason = "one arm per bodyless endpoint")]
+    async fn dispatch_read_operation(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        route: &MatchedConversationRoute<'_>,
+    ) -> Result<FilterAction, FilterError> {
+        match route.spec.operation {
+            ConversationOperation::GetConversation => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get route missing id"))?;
+                let store = self.require_store().await?;
+                handlers::handle_get_conversation(ctx, store.as_ref(), id).await
+            },
+            ConversationOperation::ListConversationItems => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched list route missing id"))?;
+                let store = self.require_store().await?;
+                handlers::handle_list_items(ctx, store.as_ref(), id).await
+            },
+            ConversationOperation::GetConversationItem => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing id"))?;
+                let item_id = route
+                    .item_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing item id"))?;
+                let store = self.require_store().await?;
+                handlers::handle_get_item(ctx, store.as_ref(), id, item_id).await
+            },
+            ConversationOperation::DeleteConversation => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete route missing id"))?;
+                let store = self.require_store().await?;
+                handlers::handle_delete_conversation(ctx, store.as_ref(), id).await
+            },
+            ConversationOperation::DeleteConversationItem => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete item route missing id"))?;
+                let item_id = route.item_id().ok_or_else(|| {
+                    FilterError::from("openai_conversations: matched delete item route missing item id")
+                })?;
+                let store = self.require_store().await?;
+                handlers::handle_delete_item(ctx, store.as_ref(), id, item_id).await
+            },
+            ConversationOperation::CreateConversation
+            | ConversationOperation::UpdateConversation
+            | ConversationOperation::CreateConversationItems => Err(FilterError::from(format!(
+                "openai_conversations: dispatch_read_operation called for body operation {:?}",
+                route.spec.operation
+            ))),
+        }
+    }
+
     /// Persist conversation items synchronously using `block_in_place`.
     fn append_items_blocking(
         &self,
@@ -317,7 +394,6 @@ impl HttpFilter for OpenaiConversationsFilter {
         true
     }
 
-    #[expect(clippy::too_many_lines, reason = "dispatcher with one arm per endpoint")]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
             if should_append_back(ctx) {
@@ -326,64 +402,14 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
-        match route.spec.operation {
-            ConversationOperation::GetConversation => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched get route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_get_conversation(ctx, store.as_ref(), id).await
-            },
-            ConversationOperation::ListConversationItems => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched list route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_list_items(ctx, store.as_ref(), id).await
-            },
-            ConversationOperation::GetConversationItem => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing id"))?;
-                let item_id = route
-                    .item_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing item id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_get_item(ctx, store.as_ref(), id, item_id).await
-            },
-            ConversationOperation::DeleteConversation => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_delete_conversation(ctx, store.as_ref(), id).await
-            },
-            ConversationOperation::DeleteConversationItem => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete item route missing id"))?;
-                let item_id = route.item_id().ok_or_else(|| {
-                    FilterError::from("openai_conversations: matched delete item route missing item id")
-                })?;
-                let store = self.require_store().await?;
-                handlers::handle_delete_item(ctx, store.as_ref(), id, item_id).await
-            },
-            ConversationOperation::CreateConversation
-            | ConversationOperation::UpdateConversation
-            | ConversationOperation::CreateConversationItems => {
-                ctx.set_request_body_mode(BodyMode::StreamBuffer {
-                    max_bytes: Some(MAX_JSON_BODY_BYTES),
-                });
-                let deferred_body = Self::mark_request_filters_ran(ctx);
-                let Some(body) = deferred_body else {
-                    return Ok(FilterAction::Continue);
-                };
-                let Some(store) = self.get_or_init_store().await else {
-                    return Ok(FilterAction::Reject(reject_store_unavailable()));
-                };
-                Box::pin(Self::handle_post_route(ctx, store.as_ref(), &route, &body)).await
-            },
+        // The shared operation registry is the single source of truth for
+        // whether this operation carries a request body: body-carrying
+        // operations arm buffering, everything else dispatches from the head.
+        // Both dispatch paths are boxed so this hook's own frame stays small.
+        if route.spec.has_request_body() {
+            return Box::pin(self.begin_body_operation(ctx, &route)).await;
         }
+        Box::pin(self.dispatch_read_operation(ctx, &route)).await
     }
 
     async fn on_request_body(
