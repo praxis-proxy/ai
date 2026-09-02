@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 #![allow(unreachable_pub, reason = "migration: visibility will be tightened")]
@@ -17,7 +17,7 @@ pub mod openai;
 pub mod promotion;
 #[cfg(feature = "store")]
 pub mod store;
-pub(crate) mod subrequest;
+pub mod subrequest;
 pub(crate) mod web_search;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
