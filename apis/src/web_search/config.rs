@@ -10,7 +10,7 @@ use praxis_filter::{
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
-use crate::callout_policy::{self, FailureMode};
+use crate::callout_policy::{self, OnFailure};
 
 /// Default callout timeout (10 seconds — search APIs can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -118,7 +118,7 @@ pub(crate) struct WebSearchFilterConfig {
 
     /// Failure mode for search provider callouts.
     #[serde(default)]
-    pub(crate) on_failure: Option<FailureMode>,
+    pub(crate) on_failure: Option<OnFailure>,
 
     /// HTTP status code to return when rejecting on error.
     #[serde(default)]
@@ -164,7 +164,7 @@ pub(crate) struct ValidatedConfig {
     pub max_body_bytes: usize,
 
     /// Failure mode for search callouts.
-    pub failure_mode: FailureMode,
+    pub on_failure: OnFailure,
 
     /// HTTP status on error.
     pub status_on_error: u16,
@@ -181,7 +181,7 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("default_context_size", &self.default_context_size)
             .field("timeout_ms", &self.timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
-            .field("failure_mode", &self.failure_mode)
+            .field("on_failure", &self.on_failure)
             .field("status_on_error", &self.status_on_error)
             .field("base_url", &self.base_url)
             .finish()
@@ -220,7 +220,7 @@ fn build_validated_config(
         default_context_size: validate_context_size(filter_name, raw.default_context_size.as_deref())?,
         timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
-        failure_mode: raw.on_failure.unwrap_or(FailureMode::Closed),
+        on_failure: raw.on_failure.unwrap_or(OnFailure::Closed),
         status_on_error: callout_policy::validate_status_on_error(
             filter_name,
             raw.status_on_error,
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(cfg.default_context_size, SearchContextSize::Medium);
         assert_eq!(cfg.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert_eq!(cfg.max_body_bytes, MAX_JSON_BODY_BYTES);
-        assert_eq!(cfg.failure_mode, FailureMode::Closed);
+        assert_eq!(cfg.on_failure, OnFailure::Closed);
         assert_eq!(cfg.status_on_error, DEFAULT_STATUS_ON_ERROR);
     }
 
@@ -338,7 +338,7 @@ mod tests {
         let raw: WebSearchFilterConfig = parse_filter_config("openai_web_search", &yaml).unwrap();
         let validated = build_config("openai_web_search", &raw).unwrap();
 
-        assert_eq!(validated.failure_mode, FailureMode::Open);
+        assert_eq!(validated.on_failure, OnFailure::Open);
     }
 
     #[test]
@@ -370,12 +370,12 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("high".into());
         cfg.timeout_ms = Some(15_000);
-        cfg.on_failure = Some(FailureMode::Open);
+        cfg.on_failure = Some(OnFailure::Open);
         cfg.status_on_error = Some(503);
         let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.default_context_size, SearchContextSize::High);
         assert_eq!(validated.timeout_ms, 15_000);
-        assert_eq!(validated.failure_mode, FailureMode::Open);
+        assert_eq!(validated.on_failure, OnFailure::Open);
         assert_eq!(validated.status_on_error, 503);
     }
 

@@ -595,7 +595,7 @@ mod filter_tests {
     // -------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn failure_mode_closed_rejects() {
+    async fn on_failure_closed_rejects() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -630,7 +630,7 @@ mod filter_tests {
     }
 
     #[tokio::test]
-    async fn failure_mode_open_continues() {
+    async fn on_failure_open_continues() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -801,7 +801,7 @@ mod filter_tests {
     // -------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn timeout_triggers_failure_mode() {
+    async fn timeout_triggers_on_failure() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))

@@ -5,7 +5,7 @@
 
 use std::{net::IpAddr, time::Duration};
 
-use praxis_ai_apis::callout_policy::FailureMode;
+use praxis_ai_apis::callout_policy::OnFailure;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 use tracing::warn;
@@ -38,7 +38,7 @@ pub(crate) struct HttpCalloutConfig {
     /// structural key before this config is parsed, so it cannot be
     /// used as an alias here.
     #[serde(default)]
-    pub on_failure: FailureMode,
+    pub on_failure: OnFailure,
 
     /// HTTP status code returned when rejecting on failure.
     pub status_on_error: Option<u16>,

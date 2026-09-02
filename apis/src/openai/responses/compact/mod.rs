@@ -47,7 +47,7 @@ use tracing::{debug, warn};
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
 use crate::{
-    callout_policy::FailureMode,
+    callout_policy::OnFailure,
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
@@ -206,9 +206,9 @@ impl CompactFilter {
 
     /// Apply the configured open/closed policy on a callout error.
     fn on_callout_error(&self, message: &str, streaming: bool) -> Result<Option<String>, FilterAction> {
-        match self.config.callout.failure_mode {
-            FailureMode::Open => Ok(None),
-            FailureMode::Closed => Err(FilterAction::Reject(responses_error_rejection(
+        match self.config.callout.on_failure {
+            OnFailure::Open => Ok(None),
+            OnFailure::Closed => Err(FilterAction::Reject(responses_error_rejection(
                 self.config.callout.status_on_error,
                 "server_error",
                 message,

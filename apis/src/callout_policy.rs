@@ -19,7 +19,7 @@ use praxis_filter::FilterError;
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
-// FailureMode
+// OnFailure
 // -----------------------------------------------------------------------------
 
 /// What happens when an outbound callout does not produce a usable
@@ -29,7 +29,7 @@ use serde::Deserialize;
 /// [`OnMissing`].
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum FailureMode {
+pub enum OnFailure {
     /// Reject the request on failure (default).
     #[default]
     Closed,
@@ -71,7 +71,7 @@ pub struct CalloutSettings {
     pub timeout_ms: u64,
 
     /// Failure mode for the callout.
-    pub failure_mode: FailureMode,
+    pub on_failure: OnFailure,
 
     /// HTTP status code to return when rejecting on error.
     pub status_on_error: u16,
@@ -191,17 +191,17 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn failure_mode_deserializes_canonical_values() {
+    fn on_failure_deserializes_canonical_values() {
         assert_eq!(
-            serde_yaml::from_str::<FailureMode>("closed").unwrap(),
-            FailureMode::Closed
+            serde_yaml::from_str::<OnFailure>("closed").unwrap(),
+            OnFailure::Closed
         );
-        assert_eq!(serde_yaml::from_str::<FailureMode>("open").unwrap(), FailureMode::Open);
+        assert_eq!(serde_yaml::from_str::<OnFailure>("open").unwrap(), OnFailure::Open);
     }
 
     #[test]
-    fn failure_mode_defaults_to_closed() {
-        assert_eq!(FailureMode::default(), FailureMode::Closed);
+    fn on_failure_defaults_to_closed() {
+        assert_eq!(OnFailure::default(), OnFailure::Closed);
     }
 
     #[test]
@@ -219,9 +219,9 @@ mod tests {
     }
 
     #[test]
-    fn failure_mode_rejects_on_missing_vocabulary() {
-        assert!(serde_yaml::from_str::<FailureMode>("continue").is_err());
-        assert!(serde_yaml::from_str::<FailureMode>("reject").is_err());
+    fn on_failure_rejects_on_missing_vocabulary() {
+        assert!(serde_yaml::from_str::<OnFailure>("continue").is_err());
+        assert!(serde_yaml::from_str::<OnFailure>("reject").is_err());
         assert!(serde_yaml::from_str::<OnMissing>("open").is_err());
         assert!(serde_yaml::from_str::<OnMissing>("closed").is_err());
     }

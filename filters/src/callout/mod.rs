@@ -29,7 +29,7 @@ use config::{HttpCalloutConfig, Phase, expand_env_vars, validate_callout_url};
 use extract::{BodyShaper, CompiledExtraction};
 use http::HeaderMap;
 use pingora_core::upstreams::peer::HttpPeer;
-use praxis_ai_apis::callout_policy::{FailureMode, validate_status_on_error};
+use praxis_ai_apis::callout_policy::{OnFailure, validate_status_on_error};
 use praxis_core::{
     circuit::CircuitBreakerConfig as CoreCircuitBreakerConfig,
     connectivity::is_private_ip,
@@ -101,7 +101,7 @@ pub struct HttpCalloutFilter {
     extractions: Vec<CompiledExtraction>,
 
     /// Behavior on callout failure.
-    failure_mode: FailureMode,
+    on_failure: OnFailure,
 
     /// Downstream headers to copy into the callout request.
     forward_headers: Vec<http::HeaderName>,
@@ -165,7 +165,7 @@ impl HttpCalloutFilter {
             body_shaper,
             client,
             extractions,
-            failure_mode: cfg.on_failure,
+            on_failure: cfg.on_failure,
             forward_headers,
             headers,
             inject_headers,
@@ -319,9 +319,9 @@ impl HttpCalloutFilter {
     /// The action to take when the callout itself fails (DNS, connect,
     /// I/O), per the configured failure mode.
     fn failure_action(&self) -> FilterAction {
-        match self.failure_mode {
-            FailureMode::Open => FilterAction::Continue,
-            FailureMode::Closed => Self::build_rejection(self.status_on_error),
+        match self.on_failure {
+            OnFailure::Open => FilterAction::Continue,
+            OnFailure::Closed => Self::build_rejection(self.status_on_error),
         }
     }
 

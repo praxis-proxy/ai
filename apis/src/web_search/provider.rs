@@ -22,7 +22,7 @@ use super::{
     config::{SearchContextSize, SearchProvider},
 };
 use crate::{
-    callout_policy::FailureMode,
+    callout_policy::OnFailure,
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
 };
 
@@ -82,7 +82,7 @@ pub(crate) struct SearchClient {
     /// Default search context size.
     default_context_size: SearchContextSize,
     /// Failure mode governing what happens on errors.
-    failure_mode: FailureMode,
+    on_failure: OnFailure,
     /// HTTP status to return on rejection.
     status_on_error: u16,
     /// Override the provider's default API base URL.
@@ -97,7 +97,7 @@ impl std::fmt::Debug for SearchClient {
             .field("provider", &self.provider)
             .field("api_key", &"[REDACTED]")
             .field("default_context_size", &self.default_context_size)
-            .field("failure_mode", &self.failure_mode)
+            .field("on_failure", &self.on_failure)
             .field("status_on_error", &self.status_on_error)
             .field("base_url", &self.base_url)
             .finish()
@@ -124,7 +124,7 @@ impl SearchClient {
             provider: config.provider,
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
-            failure_mode: config.failure_mode,
+            on_failure: config.on_failure,
             status_on_error: config.status_on_error,
             base_url: config.base_url.clone(),
         })
@@ -178,11 +178,11 @@ impl SearchClient {
     /// mode this is a rejection; under open mode search is silently
     /// skipped.
     fn transport_failure_outcome(&self) -> SearchOutcome {
-        match self.failure_mode {
-            FailureMode::Closed => SearchOutcome::Rejected {
+        match self.on_failure {
+            OnFailure::Closed => SearchOutcome::Rejected {
                 status: self.status_on_error,
             },
-            FailureMode::Open => SearchOutcome::Skipped,
+            OnFailure::Open => SearchOutcome::Skipped,
         }
     }
 
@@ -307,11 +307,11 @@ impl SearchClient {
     /// parsed. Under closed mode this is an error; under open mode
     /// search is silently skipped.
     fn parse_failure_outcome(&self) -> SearchOutcome {
-        match self.failure_mode {
-            FailureMode::Closed => SearchOutcome::Rejected {
+        match self.on_failure {
+            OnFailure::Closed => SearchOutcome::Rejected {
                 status: self.status_on_error,
             },
-            FailureMode::Open => SearchOutcome::Skipped,
+            OnFailure::Open => SearchOutcome::Skipped,
         }
     }
 }
@@ -508,7 +508,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
+            on_failure: OnFailure::Closed,
             status_on_error: 502,
             base_url: None,
         };
@@ -563,7 +563,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
+            on_failure: OnFailure::Closed,
             status_on_error: 502,
             base_url: None,
         };
@@ -579,7 +579,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
+            on_failure: OnFailure::Closed,
             status_on_error: 502,
             base_url: None,
         };
@@ -602,7 +602,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
+            on_failure: OnFailure::Closed,
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
@@ -622,7 +622,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
+            on_failure: OnFailure::Closed,
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
@@ -642,7 +642,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
+            on_failure: OnFailure::Closed,
             status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
@@ -662,7 +662,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
+            on_failure: OnFailure::Closed,
             status_on_error: 502,
             base_url: None,
         };
@@ -682,7 +682,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Open,
+            on_failure: OnFailure::Open,
             status_on_error: 502,
             base_url: None,
         };
@@ -694,14 +694,14 @@ mod tests {
         );
     }
 
-    fn test_search_client(failure_mode: FailureMode) -> SearchClient {
+    fn test_search_client(on_failure: OnFailure) -> SearchClient {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
             api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 1000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode,
+            on_failure,
             status_on_error: 502,
             base_url: None,
         };
@@ -735,7 +735,7 @@ mod tests {
             .to_string(),
         );
 
-        let client = test_search_client(FailureMode::Closed);
+        let client = test_search_client(OnFailure::Closed);
         let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
         let request = SubRequest {
             method: http::Method::GET,
@@ -757,7 +757,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         spawn_http_server(listener, 500, "internal error");
 
-        let client = test_search_client(FailureMode::Closed);
+        let client = test_search_client(OnFailure::Closed);
         let url = format!("http://{addr}/search");
         let request = SubRequest {
             method: http::Method::GET,
@@ -779,7 +779,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         spawn_http_server(listener, 429, "rate limited");
 
-        let client = test_search_client(FailureMode::Open);
+        let client = test_search_client(OnFailure::Open);
         let url = format!("http://{addr}/search");
         let request = SubRequest {
             method: http::Method::GET,
@@ -804,7 +804,7 @@ mod tests {
             drop(stream);
         });
 
-        let client = test_search_client(FailureMode::Closed);
+        let client = test_search_client(OnFailure::Closed);
         let url = format!("http://{addr}/search");
         let request = SubRequest {
             method: http::Method::GET,
@@ -829,7 +829,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let mut client = test_search_client(FailureMode::Open);
+        let mut client = test_search_client(OnFailure::Open);
         client.timeout = Duration::from_millis(50);
         let url = format!("http://{addr}/search");
         let request = SubRequest {
@@ -863,7 +863,7 @@ mod tests {
             stream.write_all(&body).unwrap();
         });
 
-        let client = test_search_client(FailureMode::Closed);
+        let client = test_search_client(OnFailure::Closed);
         let url = format!("http://{addr}/search");
         let request = SubRequest {
             method: http::Method::GET,

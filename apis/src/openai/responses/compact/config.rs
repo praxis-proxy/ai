@@ -6,7 +6,7 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::callout_policy::{self, CalloutSettings, FailureMode};
+use crate::callout_policy::{self, CalloutSettings, OnFailure};
 
 /// Default callout timeout (30 seconds — summarization can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -42,7 +42,7 @@ pub(super) struct CompactFilterConfig {
 
     /// Failure mode for the inference callout.
     #[serde(default)]
-    pub on_failure: Option<FailureMode>,
+    pub on_failure: Option<OnFailure>,
 
     /// HTTP status code to return when rejecting on error.
     #[serde(default)]
@@ -117,7 +117,7 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
         tiktoken_encoding: raw.tiktoken_encoding.clone(),
         callout: CalloutSettings {
             timeout_ms,
-            failure_mode: raw.on_failure.unwrap_or(FailureMode::Closed),
+            on_failure: raw.on_failure.unwrap_or(OnFailure::Closed),
             status_on_error,
         },
     })
@@ -134,7 +134,7 @@ mod yaml_tests {
         let cfg: CompactFilterConfig =
             serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions\non_failure: open")
                 .expect("should deserialize");
-        assert_eq!(cfg.on_failure, Some(FailureMode::Open));
+        assert_eq!(cfg.on_failure, Some(OnFailure::Open));
     }
 
     #[test]
@@ -142,7 +142,7 @@ mod yaml_tests {
         let cfg: CompactFilterConfig =
             serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions\non_failure: closed")
                 .expect("should deserialize");
-        assert_eq!(cfg.on_failure, Some(FailureMode::Closed));
+        assert_eq!(cfg.on_failure, Some(OnFailure::Closed));
     }
 
     #[test]

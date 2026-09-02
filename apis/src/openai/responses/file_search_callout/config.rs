@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use super::client::MAX_CONCURRENT_SEARCHES;
 use crate::{
-    callout_policy::FailureMode,
+    callout_policy::OnFailure,
     openai::api_client::{self, ApiClient, ApiClientConfig},
     subrequest::SubRequestClient,
 };
@@ -57,7 +57,7 @@ pub(crate) struct FileSearchFilterConfig {
     pub allow_private_url: bool,
 
     /// Behaviour when a vector-store callout fails.
-    pub on_failure: Option<FailureMode>,
+    pub on_failure: Option<OnFailure>,
 
     /// Headers to forward from the original request to the
     /// vector store API for authentication and tenant isolation.
@@ -89,7 +89,7 @@ pub(crate) struct ValidatedConfig {
     pub api_client: ApiClient,
 
     /// Search failure handling policy.
-    pub failure_mode: FailureMode,
+    pub on_failure: OnFailure,
 
     /// Maximum response body size per callout.
     pub max_response_bytes: usize,
@@ -111,7 +111,7 @@ pub(crate) fn build_config_with_client(
     client: SubRequestClient,
 ) -> Result<ValidatedConfig, FilterError> {
     let vector_store_url = parse_vector_store_url(&cfg.vector_store_url, cfg.allow_private_url)?;
-    let failure_mode = cfg.on_failure.unwrap_or(FailureMode::Closed);
+    let on_failure = cfg.on_failure.unwrap_or(OnFailure::Closed);
     let (max_response_bytes, max_total_response_bytes) =
         response_limits(cfg.max_response_bytes, cfg.max_total_response_bytes)?;
     let max_state_bytes = validated_state_limit(cfg.max_state_bytes)?;
@@ -129,7 +129,7 @@ pub(crate) fn build_config_with_client(
 
     Ok(ValidatedConfig {
         api_client,
-        failure_mode,
+        on_failure,
         max_response_bytes,
         max_total_response_bytes,
         max_state_bytes,
