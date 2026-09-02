@@ -7,7 +7,7 @@ Summarizes conversation history when the token count exceeds a configured thresh
 
 ## Configuration Notes
 
-`compact_threshold` in `context_management` must be an integer. Floating-point values (e.g. `0.9`) are ignored and compaction is skipped.
+`compact_threshold` in `context_management` must be an integer of at least 1000. Invalid or missing `compact_threshold` values produce an `invalid_request_error`.
 
 Compaction only applies to multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history. Single-turn requests are released without compaction.
 

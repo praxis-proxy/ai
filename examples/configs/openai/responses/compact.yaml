@@ -15,10 +15,10 @@
 #     -d '{"model":"llama3.2:1b","input":"Explain TCP vs UDP in detail"}' \
 #     | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 #
-#   # Step 2 — follow up with compaction (threshold=200 tokens)
+#   # Step 2 — follow up with compaction (threshold=1000 tokens)
 #   curl -s -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
-#     -d "{\"model\":\"llama3.2:1b\",\"input\":\"Compare with QUIC\",\"previous_response_id\":\"$RESP_ID\",\"context_management\":[{\"type\":\"compaction\",\"compact_threshold\":200}],\"store\":false}"
+#     -d "{\"model\":\"llama3.2:1b\",\"input\":\"Compare with QUIC\",\"previous_response_id\":\"$RESP_ID\",\"context_management\":[{\"type\":\"compaction\",\"compact_threshold\":1000}],\"store\":false}"
 
 listeners:
   - name: ai-gateway
