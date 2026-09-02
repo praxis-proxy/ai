@@ -2718,7 +2718,6 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap 6.2.1",
- "futures",
  "http 1.5.0",
  "metrics",
  "metrics-util",
