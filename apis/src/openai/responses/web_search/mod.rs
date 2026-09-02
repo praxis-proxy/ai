@@ -163,10 +163,15 @@ impl WebSearchFilter {
     }
 
     /// Execute a single web search call and append results to state.
+    ///
+    /// `index` is the call's position within the pending queue. It keeps the
+    /// synthetic bridge `call_id` unique even when the hosted source ids
+    /// collide or are absent (issue #808).
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         call: &Value,
+        index: usize,
         context_size: SearchContextSize,
     ) -> Result<(), FilterAction> {
         let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
@@ -174,13 +179,23 @@ impl WebSearchFilter {
 
         let Some(query) = query else {
             warn!(call_id, "web_search_call missing action.query, skipping");
-            append_result(ctx, call_id, "incomplete", "", &[]);
+            let bridge = bridge_call_id(call_id, "", index);
+            let ids = SearchCallIds {
+                public: call_id,
+                bridge: &bridge,
+            };
+            append_result(ctx, &ids, "incomplete", "", &[]);
             return Ok(());
         };
 
         let results = resolve_search_outcome(&self.search_client, query, context_size, call_id, false).await?;
 
-        append_result(ctx, call_id, "completed", query, &results);
+        let bridge = bridge_call_id(call_id, query, index);
+        let ids = SearchCallIds {
+            public: call_id,
+            bridge: &bridge,
+        };
+        append_result(ctx, &ids, "completed", query, &results);
         Ok(())
     }
 }
@@ -240,8 +255,8 @@ impl HttpFilter for WebSearchFilter {
         let calls: Vec<Value> = state.web_search_calls.clone();
         debug!(count = calls.len(), "executing pending web search calls");
 
-        for call in &calls {
-            if let Err(rejection) = self.execute_single_search(ctx, call, context_size).await {
+        for (index, call) in calls.iter().enumerate() {
+            if let Err(rejection) = self.execute_single_search(ctx, call, index, context_size).await {
                 return Ok(rejection);
             }
         }
@@ -281,19 +296,39 @@ impl HttpFilter for WebSearchFilter {
     }
 }
 
+/// Public and bridge identifiers for one appended web-search result.
+///
+/// `public` is the hosted, client-facing `web_search_call.id` retained on the
+/// public output item. `bridge` is the bounded, deterministic id used for the
+/// backend-valid `function_call`/`function_call_output` pair, since the raw
+/// hosted id can exceed the `OpenResponses` 64-character `call_id` limit (issue
+/// #808).
+struct SearchCallIds<'a> {
+    /// Client-facing `web_search_call.id` for the public output item.
+    public: &'a str,
+    /// Bounded, backend-valid id for the synthetic bridge pair.
+    bridge: &'a str,
+}
+
 /// Append search results to [`ResponsesState`].
-fn append_result(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str, query: &str, results: &[SearchResult]) {
+fn append_result(
+    ctx: &mut HttpFilterContext<'_>,
+    ids: &SearchCallIds<'_>,
+    status: &str,
+    query: &str,
+    results: &[SearchResult],
+) {
     let include_sources = ctx
         .extensions
         .get::<ResponsesState>()
         .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES));
 
-    let output_item = build_output_item(call_id, status, query, results, include_sources);
-    let tool_result = build_tool_result_message(call_id, results);
+    let output_item = build_output_item(ids.public, status, query, results, include_sources);
+    let bridge = build_tool_result_messages(ids.bridge, query, results);
 
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-        state.messages.push(tool_result.clone());
-        state.persisted_messages.push(tool_result);
+        state.messages.extend(bridge.iter().cloned());
+        state.persisted_messages.extend(bridge);
         state.accumulated_output.push(output_item);
     }
 }
@@ -380,20 +415,68 @@ pub(crate) fn build_output_item(
     })
 }
 
-/// Build a tool result message to append to conversation history.
-pub(crate) fn build_tool_result_message(call_id: &str, results: &[SearchResult]) -> Value {
+/// Build the backend-valid continuation for a completed search.
+///
+/// A hosted `web_search_call` item is not a valid `OpenResponses` `input`
+/// type (see issue #808), so the model-facing history bridges the result
+/// through a synthetic `function_call` + `function_call_output` pair —
+/// mirroring [`file_search_callout`](super::file_search_callout). The
+/// public `web_search_call` output item is emitted separately by
+/// [`build_output_item`] and only reaches `accumulated_output`.
+///
+/// `call_id` must be a bounded, backend-valid identifier from
+/// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
+/// 64-character `call_id` limit.
+pub(crate) fn build_tool_result_messages(call_id: &str, query: &str, results: &[SearchResult]) -> [Value; 2] {
     let content = if results.is_empty() {
         "No search results found.".to_owned()
     } else {
         format_search_results(results)
     };
+    let arguments = serde_json::json!({ "query": query }).to_string();
 
-    serde_json::json!({
-        "type": "web_search_call",
-        "id": call_id,
-        "status": "completed",
-        "output": content,
-    })
+    [
+        serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "web_search",
+            "arguments": arguments,
+            "status": "completed",
+        }),
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": content,
+        }),
+    ]
+}
+
+/// FNV-1a offset basis for deterministic bridge identities.
+const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+
+/// Derive a deterministic, bounded `call_id` for the synthetic bridge.
+///
+/// A hosted `web_search_call.id` is unbounded, but the synthetic
+/// `function_call` `call_id` must stay within the `OpenResponses`
+/// 64-character limit or a conforming backend rejects the continuation
+/// (issue #808) — mirroring the bounded ids in
+/// [`file_search_callout`](super::file_search_callout).
+///
+/// `index` is the call's position in the pending queue, guaranteeing distinct
+/// ids even when `source_id` values collide or are absent — otherwise multiple
+/// bridges would share one `call_id` and their `function_call_output` pairing
+/// would be ambiguous. The `ws_{index}_{hash:016x}` form is at most 40 bytes.
+pub(crate) fn bridge_call_id(source_id: &str, query: &str, index: usize) -> String {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for part in [source_id, query] {
+        for byte in part.as_bytes().iter().copied().chain(std::iter::once(0xFF)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    format!("ws_{index}_{hash:016x}")
 }
 
 /// Write the loop control action to filter results.

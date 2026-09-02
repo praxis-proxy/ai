@@ -136,7 +136,9 @@ fn load_config_with_limits(
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
     let mut yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        &format!(
+            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
+        ),
     );
     if let Some(max_state_bytes) = max_state_bytes {
         yaml = yaml.replace(

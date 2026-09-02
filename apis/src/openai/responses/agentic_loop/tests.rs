@@ -1183,7 +1183,7 @@ async fn web_search_calls_cleared_on_prepare() {
 }
 
 #[test]
-fn web_search_call_appended_to_messages_and_persisted() {
+fn web_search_call_excluded_from_messages_but_persisted() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -1208,14 +1208,23 @@ fn web_search_call_appended_to_messages_and_persisted() {
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
+
     let msg_types: Vec<&str> = state
         .messages
         .iter()
         .filter_map(|m| m.get("type").and_then(Value::as_str))
         .collect();
     assert!(
-        msg_types.contains(&"web_search_call"),
-        "web_search_call should be in messages: {msg_types:?}"
+        !msg_types.contains(&"web_search_call"),
+        "web_search_call must NOT be forwarded to the backend via messages: {msg_types:?}"
+    );
+
+    assert!(
+        state
+            .web_search_calls
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some("ws_1")),
+        "web_search_call should be queued in web_search_calls for dispatch"
     );
 
     let persisted_types: Vec<&str> = state

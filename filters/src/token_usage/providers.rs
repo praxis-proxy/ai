@@ -9,25 +9,39 @@ use super::TokenUsage;
 
 /// Cache write counts are not reported by every provider.
 ///
-/// `OpenAI` and Google expose how much of the prompt was *read* from their cache
-/// but not how much was written to it, so those parsers leave the cache write
-/// count absent rather than claiming a zero the provider never reported.
+/// `OpenAI` Chat Completions and Google expose how much of the prompt was *read*
+/// from their cache but not how much was written to it, so those parsers leave
+/// the cache write count absent rather than claiming a zero the provider never
+/// reported.
 const NO_CACHE_WRITE: Option<u64> = None;
 
 // -----------------------------------------------------------------------------
 // OpenAI / Azure
 // -----------------------------------------------------------------------------
 
-/// `OpenAI` / Azure `OpenAI` response format.
+/// Fields needed from an `OpenAI` / Azure JSON response or SSE payload.
 #[derive(Deserialize)]
-struct OpenAiResponse {
-    /// Token usage statistics.
-    usage: Option<OpenAiUsage>,
+struct OpenAiEnvelope {
+    /// Top-level usage from Chat Completions or a non-streaming Responses API response.
+    usage: Option<OpenAiTopLevelUsage>,
+
+    /// Nested response from a Responses API streaming event.
+    response: Option<ResponsesApiResponse>,
 }
 
-/// `OpenAI` usage object.
+/// Top-level usage formats accepted by the `OpenAI` provider.
 #[derive(Deserialize)]
-struct OpenAiUsage {
+#[serde(untagged)]
+enum OpenAiTopLevelUsage {
+    /// Chat Completions usage.
+    ChatCompletions(ChatCompletionsUsage),
+    /// Non-streaming Responses API usage.
+    Responses(ResponsesApiUsage),
+}
+
+/// `OpenAI` Chat Completions usage object.
+#[derive(Deserialize)]
+struct ChatCompletionsUsage {
     /// Tokens in the prompt.
     prompt_tokens: u64,
 
@@ -53,65 +67,44 @@ struct OpenAiPromptTokensDetails {
 /// Supports both Chat Completions format (`usage.prompt_tokens`) and
 /// Responses API format (`response.usage.input_tokens`). The Responses
 /// API nests usage under a `response` wrapper and uses different field
-/// names. Cached input is already counted in the input total for both
-/// formats, so it is recorded as a breakdown rather than added to it.
+/// names. Cached input is already counted in the input total for both formats,
+/// so cache reads and writes are recorded as breakdowns rather than added to
+/// it.
 pub(super) fn parse_openai(body: &[u8]) -> Option<TokenUsage> {
-    // Chat Completions format (top-level usage).
-    if let Ok(response) = serde_json::from_slice::<OpenAiResponse>(body)
-        && let Some(usage) = response.usage
-    {
-        let cache_read = usage.prompt_tokens_details.and_then(|details| details.cached_tokens);
-        return Some(
-            TokenUsage::new(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
-                .with_cache(cache_read, NO_CACHE_WRITE),
-        );
+    let envelope: OpenAiEnvelope = serde_json::from_slice(body).ok()?;
+
+    if let Some(usage) = envelope.usage {
+        return Some(match usage {
+            OpenAiTopLevelUsage::ChatCompletions(usage) => chat_completions_usage(usage),
+            OpenAiTopLevelUsage::Responses(usage) => responses_api_usage(usage),
+        });
     }
 
-    // Responses API streaming (usage nested under response wrapper).
-    if let Ok(wrapper) = serde_json::from_slice::<ResponsesApiEvent>(body)
-        && let Some(inner) = wrapper.response
-        && let Some(usage) = inner.usage
-    {
-        return Some(responses_api_usage(usage));
-    }
-
-    // Responses API non-streaming (top-level usage with input_tokens/output_tokens).
-    if let Ok(resp) = serde_json::from_slice::<ResponsesApiDirectResponse>(body)
-        && let Some(usage) = resp.usage
-    {
-        return Some(responses_api_usage(usage));
-    }
-
-    None
+    envelope.response?.usage.map(responses_api_usage)
 }
 
-/// Converts a Responses API usage object, keeping the cached-input
-/// breakdown out of the totals.
+/// Converts a Chat Completions usage object.
+fn chat_completions_usage(usage: ChatCompletionsUsage) -> TokenUsage {
+    let cache_read = usage.prompt_tokens_details.and_then(|details| details.cached_tokens);
+    TokenUsage::new(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
+        .with_cache(cache_read, NO_CACHE_WRITE)
+}
+
+/// Converts a Responses API usage object, keeping cache breakdowns out of the
+/// totals.
 fn responses_api_usage(usage: ResponsesApiUsage) -> TokenUsage {
-    // `input_tokens` already includes any cached tokens, so the cache read
-    // count is recorded as a breakdown of the input rather than added to it.
-    let cache_read = usage.input_tokens_details.and_then(|details| details.cached_tokens);
-    TokenUsage::new(usage.input_tokens, usage.output_tokens, usage.total_tokens).with_cache(cache_read, NO_CACHE_WRITE)
-}
-
-/// Wrapper for OpenAI Responses API `response.completed` SSE events.
-#[derive(Deserialize)]
-struct ResponsesApiEvent {
-    /// The nested response object.
-    response: Option<ResponsesApiResponse>,
+    // `input_tokens` already includes cached reads and writes, so both counts
+    // are recorded as breakdowns of the input rather than added to it.
+    let (cache_read, cache_write) = usage.input_tokens_details.map_or((None, None), |details| {
+        (details.cached_tokens, details.cache_write_tokens)
+    });
+    TokenUsage::new(usage.input_tokens, usage.output_tokens, usage.total_tokens).with_cache(cache_read, cache_write)
 }
 
 /// Inner response object in Responses API events.
 #[derive(Deserialize)]
 struct ResponsesApiResponse {
     /// Token usage statistics.
-    usage: Option<ResponsesApiUsage>,
-}
-
-/// Non-streaming Responses API response with top-level usage.
-#[derive(Deserialize)]
-struct ResponsesApiDirectResponse {
-    /// Token usage (same format as streaming, at top level).
     usage: Option<ResponsesApiUsage>,
 }
 
@@ -133,6 +126,8 @@ struct ResponsesApiUsage {
 struct ResponsesApiInputTokensDetails {
     /// Tokens read from cache, already counted in `input_tokens`.
     cached_tokens: Option<u64>,
+    /// Tokens written to cache, already counted in `input_tokens`.
+    cache_write_tokens: Option<u64>,
 }
 
 // -----------------------------------------------------------------------------
@@ -337,7 +332,7 @@ mod tests {
 
     #[test]
     fn openai_responses_api_cached_tokens() {
-        let json = br#"{"type":"response.completed","response":{"id":"resp_123","usage":{"input_tokens":150,"output_tokens":42,"total_tokens":192,"input_tokens_details":{"cached_tokens":120}}}}"#;
+        let json = br#"{"type":"response.completed","response":{"id":"resp_123","usage":{"input_tokens":150,"output_tokens":42,"total_tokens":192,"input_tokens_details":{"cached_tokens":120,"cache_write_tokens":30}}}}"#;
         let usage = parse_openai(json).unwrap();
         assert_eq!(usage.input_tokens(), 150, "cached input stays part of the input total");
         assert_eq!(usage.output_tokens(), 42);
@@ -347,7 +342,11 @@ mod tests {
             Some(120),
             "cached input should be reported as a cache-read breakdown"
         );
-        assert_eq!(usage.cache_write_tokens(), None, "OpenAI reports no cache-write count");
+        assert_eq!(
+            usage.cache_write_tokens(),
+            Some(30),
+            "cache writes should be reported as a breakdown of Responses API input"
+        );
     }
 
     #[test]

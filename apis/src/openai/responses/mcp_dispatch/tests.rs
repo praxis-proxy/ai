@@ -10,7 +10,7 @@ use praxis_filter::FilterAction;
 use serde_json::json;
 
 use super::{
-    McpDispatchFilter, build_error_result, build_success_result, content_blocks_to_text, encode_function_name,
+    McpDispatchFilter, build_error_result, build_success_result, content_blocks_to_output, encode_function_name,
     execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id, extract_mcp_tool_calls,
     find_approval_required, find_by_encoded_name, is_mcp_tool_call, normalize_arguments, parse_call_arguments,
     process_call_result, resolve_tool_entry,
@@ -537,24 +537,30 @@ fn config_rejects_zero_timeout() {
 // =========================================================================
 
 #[test]
-fn content_blocks_to_text_extracts_text() {
+fn content_blocks_to_output_extracts_text() {
     let blocks = vec![rmcp::model::ContentBlock::text("hello world")];
-    let text = content_blocks_to_text(&blocks);
+    let text = content_blocks_to_output(&blocks).unwrap();
     assert_eq!(text, "hello world");
 }
 
 #[test]
-fn content_blocks_to_text_joins_multiple() {
+fn content_blocks_to_output_joins_multiple_text() {
     let blocks = vec![
         rmcp::model::ContentBlock::text("line 1"),
         rmcp::model::ContentBlock::text("line 2"),
     ];
-    let text = content_blocks_to_text(&blocks);
+    let text = content_blocks_to_output(&blocks).unwrap();
     assert_eq!(text, "line 1\nline 2");
 }
 
 #[test]
-fn content_blocks_to_text_skips_non_text() {
+fn content_blocks_to_output_empty_is_empty_string() {
+    let text = content_blocks_to_output(&[]).unwrap();
+    assert_eq!(text, "", "empty content is genuinely empty, not data loss");
+}
+
+#[test]
+fn content_blocks_to_output_preserves_non_text_losslessly() {
     let blocks = vec![
         rmcp::model::ContentBlock::text("text content"),
         rmcp::model::ContentBlock::image("base64data", "image/png"),
@@ -565,8 +571,14 @@ fn content_blocks_to_text_skips_non_text() {
             meta: None,
         }),
     ];
-    let text = content_blocks_to_text(&blocks);
-    assert_eq!(text, "text content", "should skip non-text content types");
+    let output = content_blocks_to_output(&blocks).unwrap();
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(&output).expect("output must be valid JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "#807: mixed text/non-text output must round-trip losslessly so no MCP content block is dropped"
+    );
 }
 
 // =========================================================================
@@ -906,6 +918,31 @@ fn process_call_result_multi_text_joins_with_newline() {
     ]);
     let result = process_call_result(Ok(call_result), "c1", "srv", "tool", "{}");
     assert_eq!(result.message["output"], "hello\nworld");
+}
+
+#[test]
+fn process_call_result_image_content_is_preserved() {
+    let call_result =
+        rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::image("base64data", "image/png")]);
+    let result = process_call_result(Ok(call_result), "c1", "srv", "tool", "{}");
+
+    let model_output = result.message["output"].as_str().unwrap();
+    assert!(
+        !model_output.is_empty(),
+        "#807 regression: image-only result must not produce empty model output (data loss)"
+    );
+    assert!(model_output.contains("base64data"), "image data must be preserved");
+    assert!(model_output.contains("image/png"), "image mime type must be preserved");
+
+    let client_output = result.output_item["output"].as_str().unwrap();
+    assert!(
+        !client_output.is_empty(),
+        "image-only result must not produce empty client output"
+    );
+    assert!(
+        result.output_item.get("error").is_none() || result.output_item["error"].is_null(),
+        "preserved content must not be reported as an error"
+    );
 }
 
 // =========================================================================

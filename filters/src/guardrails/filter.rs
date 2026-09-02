@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_core::subrequest::{SubRequestClient, SubRequestConnector};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
@@ -62,15 +63,45 @@ pub struct AiGuardrailsFilter {
 }
 
 impl AiGuardrailsFilter {
-    /// Create from parsed YAML config.
+    /// Create a filter from parsed YAML config.
     ///
-    /// Parses the shared config, then delegates provider-specific
-    /// config parsing and validation to the provider's `from_config`.
+    /// Uses an isolated [`SubRequestClient`] with a default pool
+    /// size of 4. Prefer [`from_config_with_client`] when a shared
+    /// client is available.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if config parsing or validation fails.
+    ///
+    /// [`FilterError`]: praxis_filter::FilterError
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = SubRequestClient::new(SubRequestConnector::new(4, None));
+        Self::build(config, client)
+    }
+
+    /// Create a filter using the shared [`SubRequestClient`].
+    ///
+    /// The shared client inherits the server-level pool size and
+    /// connection limits from the runtime configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if config parsing or validation fails.
+    ///
+    /// [`FilterError`]: praxis_filter::FilterError
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    pub fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::build(config, client)
+    }
+
+    /// Shared constructor body for [`from_config`](Self::from_config) and
+    /// [`from_config_with_client`](Self::from_config_with_client).
+    fn build(config: &serde_yaml::Value, client: SubRequestClient) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: AiGuardrailsConfig = parse_filter_config("ai_guardrails", config)?;
 
         if cfg.phase.response {
@@ -82,7 +113,7 @@ impl AiGuardrailsFilter {
         }
 
         let provider: Box<dyn GuardProvider> = match cfg.provider.provider_type {
-            ProviderType::Nemo => Box::new(NemoProvider::from_config(&cfg.provider.config)?),
+            ProviderType::Nemo => Box::new(NemoProvider::from_config(&cfg.provider.config, client)?),
         };
 
         Ok(Box::new(Self {

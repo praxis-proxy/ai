@@ -2667,7 +2667,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-build-support"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cargo_metadata",
  "tempfile",
@@ -2708,7 +2708,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2718,7 +2718,6 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap 6.2.1",
- "futures",
  "http 1.5.0",
  "metrics",
  "metrics-util",
@@ -2727,7 +2726,7 @@ dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "quixotic-plecostomus-core",
-  "rand 0.10.2",
+ "rand 0.10.2",
  "redis",
  "reqwest",
  "serde",
@@ -2748,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-llmd-ext-proc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2776,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-proxy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "cargo_metadata",
@@ -2920,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-test-utils"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2961,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-environment"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "praxis-ai-proxy",
  "praxis-proxy-core",
@@ -2971,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-integration"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2995,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-schema"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
@@ -5743,7 +5742,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "praxis-ai-apis",

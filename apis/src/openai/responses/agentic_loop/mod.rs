@@ -25,8 +25,13 @@
 //! this filter parses the response body JSON and extracts
 //! `function_call` items from the `output` array into
 //! `state.tool_calls` and `web_search_call` items into
-//! `state.web_search_calls`. It also appends these items to
-//! `state.messages` so the model sees its own calls on re-entry.
+//! `state.web_search_calls`. Client `function_call` and `reasoning`
+//! items are appended to `state.messages` so the model sees its own
+//! calls on re-entry. Hosted `web_search_call` items are **not** valid
+//! `OpenResponses` input (issue #808), so they never enter
+//! `state.messages`; they remain in `state.web_search_calls` for
+//! `openai_web_search` to dispatch and bridge into backend history, and
+//! reach the client only through `state.accumulated_output`.
 //!
 //! For streaming responses (future), `stream_events` populates
 //! `state.tool_calls` via SSE event parsing. When the body is
@@ -409,8 +414,12 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
                 state.persisted_messages.push(item.clone());
             },
             Some("web_search_call") => {
+                // A hosted web_search_call is not a valid OpenResponses input
+                // item (issue #808), so it must not enter `messages`. The
+                // openai_web_search dispatch consumes `web_search_calls` and
+                // appends a backend-valid function_call/function_call_output
+                // bridge for the next inference step.
                 state.web_search_calls.push(item.clone());
-                state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
             _ => {},

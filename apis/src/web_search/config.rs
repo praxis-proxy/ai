@@ -139,6 +139,18 @@ pub(crate) struct WebSearchFilterConfig {
     /// Override the provider's default API base URL.
     #[serde(default)]
     pub(crate) base_url: Option<String>,
+
+    /// Allow a `base_url` that targets local-sensitive addresses.
+    ///
+    /// DNS targets are unsupported in protected mode (the default):
+    /// validation cannot pin the address the HTTP client will eventually
+    /// dial, so a `base_url` host must be a public IP literal. Enabling
+    /// `allow_private_base_url` also permits DNS results resolving to
+    /// local-sensitive addresses, so a hostile or rebound resolution can
+    /// send the provider credential to a loopback, private, or
+    /// cloud-metadata endpoint.
+    #[serde(default)]
+    pub(crate) allow_private_base_url: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -211,6 +223,9 @@ fn build_validated_config(
     raw: &WebSearchFilterConfig,
     api_key: String,
 ) -> Result<ValidatedConfig, FilterError> {
+    if let Some(base_url) = raw.base_url.as_deref() {
+        crate::openai::api_client::validate_base_url(filter_name, base_url, raw.allow_private_base_url)?;
+    }
     Ok(ValidatedConfig {
         provider: raw.provider,
         api_key: SecretString::from(api_key),
@@ -309,6 +324,7 @@ mod tests {
             provider_failure_mode: None,
             status_on_error: None,
             base_url: None,
+            allow_private_base_url: false,
         }
     }
 
@@ -397,6 +413,7 @@ mod tests {
     fn build_config_base_url_threaded_through() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://localhost:9999".into());
+        cfg.allow_private_base_url = true;
         let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://localhost:9999"));
     }
@@ -405,6 +422,88 @@ mod tests {
     fn build_config_base_url_none_by_default() {
         let validated = build_config("openai_web_search", &base_config()).unwrap();
         assert!(validated.base_url.is_none());
+    }
+
+    #[test]
+    fn build_config_rejects_loopback_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://127.0.0.1:9999".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "loopback base_url must be rejected without allow_private_base_url (SSRF/credential disclosure)"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_localhost_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://localhost:9999".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "localhost base_url must be rejected without allow_private_base_url"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_cloud_metadata_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://169.254.169.254".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "link-local cloud-metadata base_url must be rejected without allow_private_base_url"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_dns_base_url_without_opt_in() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://internal.search.example:8080".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "DNS base_url must be rejected without allow_private_base_url because the dialed address cannot be pinned"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_non_http_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("file:///etc/passwd".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "non-http(s) base_url scheme must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_base_url_with_embedded_credentials() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://user:pass@8.8.8.8".into());
+        cfg.allow_private_base_url = true;
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "base_url with embedded credentials must be rejected even with allow_private_base_url"
+        );
+    }
+
+    #[test]
+    fn build_config_allows_public_ip_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("https://8.8.8.8".into());
+        let validated = build_config("openai_web_search", &cfg).unwrap();
+        assert_eq!(
+            validated.base_url.as_deref(),
+            Some("https://8.8.8.8"),
+            "public IP literal base_url should be accepted without the opt-in"
+        );
+    }
+
+    #[test]
+    fn build_config_allows_private_base_url_with_opt_in() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://127.0.0.1:9999".into());
+        cfg.allow_private_base_url = true;
+        let validated = build_config("openai_web_search", &cfg).unwrap();
+        assert_eq!(validated.base_url.as_deref(), Some("http://127.0.0.1:9999"));
     }
 
     #[test]

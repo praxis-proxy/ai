@@ -17,6 +17,7 @@ Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 | `provider_failure_mode` | `closed` \| `open` | no | Failure mode for search provider callouts. |
 | `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
 | `base_url` | string | no | Override the provider's default API base URL. |
+| `allow_private_base_url` | bool | no | Allow a `base_url` that targets local-sensitive addresses. DNS targets are unsupported in protected mode (the default): validation cannot pin the address the HTTP client will eventually dial, so a `base_url` host must be a public IP literal. Enabling `allow_private_base_url` also permits DNS results resolving to local-sensitive addresses, so a hostile or rebound resolution can send the provider credential to a loopback, private, or cloud-metadata endpoint. |
 
 ## Examples
 
