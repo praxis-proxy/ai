@@ -13,6 +13,7 @@ mod anthropic_messages;
 mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
+mod azure_translation;
 mod compact;
 mod credential_injection;
 mod external_metering;
