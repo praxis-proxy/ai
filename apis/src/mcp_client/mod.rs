@@ -70,7 +70,6 @@ impl McpDisplayUrl {
         let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) else {
             return Self::invalid();
         };
-
         let mut out = String::with_capacity(scheme.len() + host.len() + 16);
         out.push_str(scheme);
         out.push_str("://");
@@ -595,7 +594,6 @@ fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
         },
     }
 }
-
 /// Convert `rmcp::model::Tool` values to opaque JSON.
 fn tools_to_json(tools: Vec<rmcp::model::Tool>) -> Result<Vec<serde_json::Value>, McpClientError> {
     tools
