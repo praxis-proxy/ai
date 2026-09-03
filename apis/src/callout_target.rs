@@ -86,18 +86,14 @@ pub fn validate_configured_http_target(
 ) -> Result<url::Url, FilterError> {
     let parsed = validate_http_target(filter_name, raw)?;
     let host = parsed.host_str().unwrap_or_default();
-    let unbracketed = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    if !policy.allows_private() && unbracketed.trim_end_matches('.').eq_ignore_ascii_case("localhost") {
+    if !policy.allows_private() && host.trim_end_matches('.').eq_ignore_ascii_case("localhost") {
         return Err(
             format!("{filter_name}: target URL targets localhost; enable the private-target opt-in to allow").into(),
         );
     }
-    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+    if let Ok(ip) = host.parse::<IpAddr>() {
         validate_ip(filter_name, ip, policy)?;
-    } else if let Some(ip) = parse_legacy_ipv4_host(unbracketed) {
+    } else if let Some(ip) = parse_legacy_ipv4_host(host) {
         validate_ip(filter_name, IpAddr::V4(ip), policy)?;
     }
     Ok(parsed)
@@ -230,11 +226,7 @@ pub async fn build_pinned_reqwest_client(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
 
-    let unbracketed = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+    if let Ok(ip) = host.parse::<IpAddr>() {
         validate_ip(filter_name, ip, policy)?;
     } else {
         let resolved = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
