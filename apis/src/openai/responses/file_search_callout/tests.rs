@@ -458,6 +458,7 @@ fn continuation_header_replay_excludes_stale_request_metadata() {
         http::header::CONTENT_ENCODING,
         http::header::ACCEPT_ENCODING,
         http::header::HeaderName::from_static("idempotency-key"),
+        http::header::HeaderName::from_static("proxy-connection"),
         http::header::HeaderName::from_static("x-praxis-internal-test"),
     ] {
         assert!(!should_replay_original_header(&name), "{name} should not be replayed");

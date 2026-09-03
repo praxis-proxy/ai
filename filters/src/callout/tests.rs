@@ -1432,6 +1432,125 @@ mod filter_tests {
         );
     }
 
+    #[tokio::test]
+    async fn hop_by_hop_forward_headers_not_sent() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              forward_headers:
+                - "keep-alive"
+                - "proxy-connection"
+                - "te"
+                - "x-ok"
+            request:
+              phase: request_headers
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("proxy-connection", "keep-alive".parse().unwrap());
+        headers.insert("te", "trailers".parse().unwrap());
+        headers.insert("x-ok", "fine".parse().unwrap());
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers,
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        let requests = mock_server.received_requests().await.expect("recorded requests");
+        let callout = requests.first().expect("callout should have fired");
+        assert!(
+            callout.headers.get("keep-alive").is_none(),
+            "keep-alive must not reach the callout even when configured as forward_header"
+        );
+        assert!(
+            callout.headers.get("proxy-connection").is_none(),
+            "proxy-connection must not reach the callout even when configured as forward_header"
+        );
+        assert!(
+            callout.headers.get("te").is_none(),
+            "te must not reach the callout even when configured as forward_header"
+        );
+        assert_eq!(
+            callout.headers.get("x-ok").map(http::HeaderValue::as_bytes),
+            Some(&b"fine"[..]),
+            "an allowed forward header should still be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_nominated_forward_header_not_sent() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              forward_headers:
+                - "x-smuggle"
+                - "x-ok"
+            request:
+              phase: request_headers
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("connection", "x-smuggle".parse().unwrap());
+        headers.insert("x-smuggle", "secret".parse().unwrap());
+        headers.insert("x-ok", "fine".parse().unwrap());
+
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers,
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        let requests = mock_server.received_requests().await.expect("recorded requests");
+        let callout = requests.first().expect("callout should have fired");
+        assert!(
+            callout.headers.get("x-smuggle").is_none(),
+            "a header named by Connection must not reach the callout"
+        );
+        assert_eq!(
+            callout.headers.get("x-ok").map(http::HeaderValue::as_bytes),
+            Some(&b"fine"[..]),
+            "an allowed forward header should still be forwarded"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Body Shaping — non-JSON fallback
     // -------------------------------------------------------------------------

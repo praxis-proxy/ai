@@ -22,7 +22,7 @@
 mod tests;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
@@ -368,10 +368,12 @@ fn build_transport_config(
     let mut header_map = HashMap::new();
 
     if let Some(headers_obj) = headers.and_then(serde_json::Value::as_object) {
+        let nominated = connection_nominated_from_json(headers_obj);
         for (key, value) in headers_obj {
             if let Some(value_str) = value.as_str()
                 && let Ok(name) = key.parse::<http::HeaderName>()
                 && !is_blocked_mcp_header(&name)
+                && !nominated.contains(&name)
                 && let Ok(val) = http::HeaderValue::from_str(value_str)
             {
                 header_map.insert(name, val);
@@ -548,23 +550,44 @@ fn build_pinned_client(resolved: &ResolvedMcpUrl) -> Result<reqwest::Client, Mcp
     })
 }
 
+/// Field names listed by any `Connection` value in MCP tool-config headers.
+fn connection_nominated_from_json(
+    headers_obj: &serde_json::Map<String, serde_json::Value>,
+) -> HashSet<http::HeaderName> {
+    let mut nominated = HashSet::new();
+    for (key, value) in headers_obj {
+        let Ok(name) = key.parse::<http::HeaderName>() else {
+            continue;
+        };
+        if name != http::header::CONNECTION {
+            continue;
+        }
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        for token in crate::http_hop::connection_tokens(value) {
+            if let Ok(nominated_name) = token.parse::<http::HeaderName>() {
+                nominated.insert(nominated_name);
+            }
+        }
+    }
+    nominated
+}
+
 /// Headers that must not pass through from client-supplied MCP
 /// tool config into the proxy's outbound MCP transport.
 fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
+    if crate::http_hop::is_hop_by_hop(name.as_str()) {
+        return true;
+    }
     if matches!(
         *name,
         http::header::AUTHORIZATION
-            | http::header::CONNECTION
             | http::header::CONTENT_LENGTH
             | http::header::COOKIE
             | http::header::FORWARDED
             | http::header::HOST
-            | http::header::PROXY_AUTHORIZATION
             | http::header::SET_COOKIE
-            | http::header::TE
-            | http::header::TRAILER
-            | http::header::TRANSFER_ENCODING
-            | http::header::UPGRADE
     ) {
         return true;
     }

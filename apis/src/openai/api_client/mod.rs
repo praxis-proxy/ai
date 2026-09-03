@@ -29,7 +29,10 @@ pub(crate) use self::{
     error::ApiClientError,
     url::{resource_url, validate_base_url, validate_forward_headers},
 };
-use crate::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
+use crate::{
+    http_hop::{connection_nominates_header, is_hop_by_hop},
+    subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
+};
 
 /// Configuration for constructing an [`ApiClient`].
 ///
@@ -75,6 +78,11 @@ fn map_subrequest_error(err: SubRequestError) -> ApiClientError {
         SubRequestError::ResponseTooLarge { limit, .. } => ApiClientError::ResponseTooLarge { limit },
         source => ApiClientError::Transport { source },
     }
+}
+
+/// Whether a configured forward header is safe to copy from the inbound request.
+fn should_copy_forward_header(name: &http::HeaderName, request_headers: &HeaderMap) -> bool {
+    !is_hop_by_hop(name.as_str()) && !connection_nominates_header(request_headers, name)
 }
 
 impl ApiClient {
@@ -191,6 +199,9 @@ impl ApiClient {
     pub(crate) fn forward_headers(&self, request_headers: &HeaderMap) -> Vec<(http::HeaderName, http::HeaderValue)> {
         let mut headers = Vec::new();
         for name in &self.forward_header_names {
+            if !should_copy_forward_header(name, request_headers) {
+                continue;
+            }
             if let Some(value) = request_headers.get(name) {
                 headers.push((name.clone(), value.clone()));
             }
@@ -202,6 +213,9 @@ impl ApiClient {
     fn build_header_map(&self, request_headers: &HeaderMap) -> HeaderMap {
         let mut map = HeaderMap::new();
         for name in &self.forward_header_names {
+            if !should_copy_forward_header(name, request_headers) {
+                continue;
+            }
             if let Some(value) = request_headers.get(name) {
                 map.insert(name.clone(), value.clone());
             }
@@ -370,6 +384,37 @@ mod tests {
         assert!(
             forwarded.iter().any(|(n, v)| n == "x-tenant-id" && v == "tenant-1"),
             "x-tenant-id header should be forwarded"
+        );
+    }
+
+    #[test]
+    fn forward_headers_skips_connection_nominated_fields() {
+        let client = ApiClient::new(ApiClientConfig {
+            api_base_url: "http://ogx:8321".to_owned(),
+            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            timeout: Duration::from_millis(1_000),
+            max_response_bytes: 1_048_576,
+            forward_header_names: vec![
+                http::HeaderName::from_static("x-smuggle"),
+                http::HeaderName::from_static("x-tenant-id"),
+            ],
+        });
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(http::header::CONNECTION, "x-smuggle".parse().unwrap());
+        request_headers.insert("x-smuggle", "secret".parse().unwrap());
+        request_headers.insert("x-tenant-id", "tenant-1".parse().unwrap());
+
+        let forwarded = client.forward_headers(&request_headers);
+
+        assert_eq!(forwarded.len(), 1, "only the un-nominated header should be forwarded");
+        assert!(
+            forwarded.iter().any(|(n, v)| n == "x-tenant-id" && v == "tenant-1"),
+            "x-tenant-id is not listed in Connection and should still be forwarded"
+        );
+        assert!(
+            forwarded.iter().all(|(n, _)| n != "x-smuggle"),
+            "fields named by Connection must not be copied onto the outbound request"
         );
     }
 

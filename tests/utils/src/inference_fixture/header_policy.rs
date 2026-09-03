@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use http::{HeaderMap, HeaderName, HeaderValue, header};
+use praxis_ai_apis::http_hop::{connection_tokens, is_hop_by_hop};
 
 use super::FixtureError;
 
@@ -202,9 +203,7 @@ fn recorded_connection_nominations(headers: &BTreeMap<String, Vec<String>>) -> B
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
         .flat_map(|(_, values)| values)
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
+        .flat_map(|value| connection_tokens(value))
         .map(str::to_ascii_lowercase)
         .collect()
 }
@@ -216,13 +215,7 @@ fn http_connection_nominations(headers: &HeaderMap) -> Result<BTreeSet<String>, 
         let value = value
             .to_str()
             .map_err(|_source| runtime_error("replay Connection header is not text"))?;
-        nominated.extend(
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_ascii_lowercase),
-        );
+        nominated.extend(connection_tokens(value).map(str::to_ascii_lowercase));
     }
     Ok(nominated)
 }
@@ -250,19 +243,7 @@ fn is_transport_unsafe(name: &str, nominated: &BTreeSet<String>) -> bool {
 
 /// Returns whether a name controls message framing or one HTTP hop.
 fn is_framing_or_hop_header(name: &str) -> bool {
-    matches!(
-        name,
-        "connection"
-            | "content-length"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
+    name == "content-length" || is_hop_by_hop(name)
 }
 
 /// Returns whether a normalized name belongs in a fixture.
