@@ -18,6 +18,11 @@
 //! `conversation`. Single-turn requests (no stored history, even with
 //! `context_management` set) are released without compaction because
 //! there is no prior history to summarize.
+//!
+//! Praxis runs `StreamBuffer` body hooks before header-phase request
+//! filters. Configuration therefore requires an explicit
+//! `allow_pre_security_callout: true` acknowledgement and should only
+//! be used behind an outer authentication and authorization boundary.
 
 pub(super) mod config;
 
@@ -47,7 +52,7 @@ use tracing::{debug, warn};
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
 use crate::{
-    openai::responses::config_validation::FailureMode,
+    callout_policy::OnFailure,
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
@@ -57,6 +62,9 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
+
+/// Minimum allowed `compact_threshold` for compaction (1,000 tokens).
+const MIN_COMPACT_THRESHOLD: u64 = 1_000; // 1,000 tokens
 
 /// System prompt for the summarization call.
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
@@ -71,6 +79,7 @@ capture everything needed to continue coherently.";
 // -----------------------------------------------------------------------------
 
 /// Parsed compaction parameters from the request's `context_management`.
+#[derive(Debug, Eq, PartialEq)]
 struct CompactionParams {
     /// Token threshold above which compaction triggers.
     compact_threshold: u64,
@@ -85,18 +94,24 @@ struct CompactionParams {
 /// Summarizes conversation history when the token count exceeds a
 /// configured threshold.
 ///
-/// `compact_threshold` in `context_management` must be an integer.
-/// Floating-point values (e.g. `0.9`) are ignored and compaction
-/// is skipped.
+/// `compact_threshold` in `context_management` must be an integer
+/// of at least 1000. Invalid or missing `compact_threshold` values
+/// produce an `invalid_request_error`.
 ///
 /// Compaction only applies to multi-turn requests where
 /// `openai_responses_rehydrate` has loaded stored conversation
 /// history. Single-turn requests are released without compaction.
 ///
+/// Praxis runs `StreamBuffer` body hooks before header-phase request
+/// filters. This filter therefore requires
+/// `allow_pre_security_callout: true` and should only be used behind
+/// an outer authentication and authorization boundary.
+///
 /// # YAML
 ///
 /// ```yaml
 /// filter: openai_responses_compact
+/// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// default_model: llama3.2:1b
 /// ```
@@ -105,11 +120,12 @@ struct CompactionParams {
 ///
 /// ```yaml
 /// filter: openai_responses_compact
+/// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// default_model: gpt-4o-mini
 /// tiktoken_encoding: cl100k_base
 /// timeout_ms: 30000
-/// callout_failure_mode: closed
+/// on_failure: closed
 /// status_on_error: 502
 /// ```
 pub struct CompactFilter {
@@ -206,9 +222,9 @@ impl CompactFilter {
 
     /// Apply the configured open/closed policy on a callout error.
     fn on_callout_error(&self, message: &str, streaming: bool) -> Result<Option<String>, FilterAction> {
-        match self.config.callout.failure_mode {
-            FailureMode::Open => Ok(None),
-            FailureMode::Closed => Err(FilterAction::Reject(responses_error_rejection(
+        match self.config.callout.on_failure {
+            OnFailure::Open => Ok(None),
+            OnFailure::Closed => Err(FilterAction::Reject(responses_error_rejection(
                 self.config.callout.status_on_error,
                 "server_error",
                 message,
@@ -238,6 +254,10 @@ impl HttpFilter for CompactFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "filter request body handling is inherently sequential"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -254,12 +274,17 @@ impl HttpFilter for CompactFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Release);
         };
+        let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return Ok(FilterAction::Release),
+            Err(msg) => {
+                let rej = responses_error_rejection(400, "invalid_request_error", &msg, streaming);
+                return Ok(FilterAction::Reject(rej));
+            },
+        };
         if !state.history_rehydrated {
             return Ok(FilterAction::Release);
         }
-        let Some((params, conversation_text)) = should_compact(state, &self.config.tiktoken_encoding) else {
-            return Ok(FilterAction::Release);
-        };
         let compaction = self.execute_compaction(state, &params, streaming, &conversation_text);
         let summary = match compaction.await {
             Ok(Some(s)) => s,
@@ -288,11 +313,19 @@ impl HttpFilter for CompactFilter {
 /// The token estimate includes instructions and tool definitions in
 /// addition to conversation messages, since all three contribute to
 /// the rendered context sent to the model.
-fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(CompactionParams, String)> {
-    let params = extract_compaction_config(&state.context_management)?;
+#[expect(clippy::too_many_lines, reason = "token threshold estimation is sequential")]
+fn should_compact(
+    state: &ResponsesState,
+    tiktoken_encoding: &str,
+) -> Result<Option<(CompactionParams, String)>, String> {
+    let Some(params) = extract_compaction_config(&state.context_management)? else {
+        return Ok(None);
+    };
 
     let conversation_text = build_conversation_text(&state.messages);
-    let message_tokens = get_token_count(&conversation_text, tiktoken_encoding)?;
+    let Some(message_tokens) = get_token_count(&conversation_text, tiktoken_encoding) else {
+        return Ok(None);
+    };
 
     let overhead_text = build_context_overhead_text(state);
     let overhead_tokens = if overhead_text.is_empty() {
@@ -310,7 +343,7 @@ fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(Co
             threshold = params.compact_threshold,
             "under threshold, skipping"
         );
-        return None;
+        return Ok(None);
     }
     debug!(
         token_count,
@@ -319,7 +352,7 @@ fn should_compact(state: &ResponsesState, tiktoken_encoding: &str) -> Option<(Co
         threshold = params.compact_threshold,
         "threshold exceeded, compacting"
     );
-    Some((params, conversation_text))
+    Ok(Some((params, conversation_text)))
 }
 
 /// Build the text for instructions and tool definitions that live
@@ -354,9 +387,14 @@ fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
 /// The `context_management` field is an array like:
 /// `[{"type": "compaction", "compact_threshold": 50000}]`
 ///
-/// Returns `None` if no compaction entry is found.
-fn extract_compaction_config(context_management: &Option<Value>) -> Option<CompactionParams> {
-    let array = context_management.as_ref()?.as_array()?;
+/// Returns:
+/// - `Ok(None)` if no compaction entry is present.
+/// - `Ok(Some(params))` if a valid compaction entry is present.
+/// - `Err(msg)` if a compaction entry is present but has an invalid `compact_threshold` or `compaction_model`.
+fn extract_compaction_config(context_management: &Option<Value>) -> Result<Option<CompactionParams>, String> {
+    let Some(array) = context_management.as_ref().and_then(Value::as_array) else {
+        return Ok(None);
+    };
 
     for entry in array {
         let Some(entry_type) = entry.get("type").and_then(|v| v.as_str()) else {
@@ -365,23 +403,30 @@ fn extract_compaction_config(context_management: &Option<Value>) -> Option<Compa
         if entry_type != "compaction" {
             continue;
         }
-        let Some(raw_threshold) = entry.get("compact_threshold") else {
-            continue;
+
+        let err_msg = "compact_threshold must be an integer of at least 1000";
+        let raw_threshold = entry.get("compact_threshold").ok_or_else(|| err_msg.to_owned())?;
+        let compact_threshold = raw_threshold.as_u64().ok_or_else(|| err_msg.to_owned())?;
+        if compact_threshold < MIN_COMPACT_THRESHOLD {
+            return Err(err_msg.to_owned());
+        }
+
+        let compaction_model = if let Some(m) = entry.get("compaction_model") {
+            let model_str = m
+                .as_str()
+                .ok_or_else(|| "compaction_model must be a string".to_owned())?;
+            Some(model_str.to_owned())
+        } else {
+            None
         };
-        let Some(compact_threshold) = raw_threshold.as_u64() else {
-            warn!(value = %raw_threshold, "compact_threshold is not a valid integer, skipping compaction");
-            continue;
-        };
-        let compaction_model = entry
-            .get("compaction_model")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        return Some(CompactionParams {
+
+        return Ok(Some(CompactionParams {
             compact_threshold,
             compaction_model,
-        });
+        }));
     }
-    None
+
+    Ok(None)
 }
 
 /// Resolve the tiktoken singleton for the given encoding name.

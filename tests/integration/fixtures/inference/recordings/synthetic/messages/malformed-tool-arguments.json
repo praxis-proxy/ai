@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "scenario_id": "messages/malformed-tool-arguments",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-malformed-tool-model",
+    "source_id": "controlled-malformed-tool-arguments"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_1": "call_recorded_0001",
+      "chatcmpl-malformed-tool": "chatcmpl-recorded-0002"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "Use the weather tool.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-malformed-tool-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "upstream response could not be transformed",
+                "type": "api_error"
+              },
+              "request_id": null,
+              "type": "error"
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "content": "Use the weather tool.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-malformed-tool-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "tool_calls",
+                  "index": 0,
+                  "message": {
+                    "content": null,
+                    "role": "assistant",
+                    "tool_calls": [
+                      {
+                        "function": {
+                          "arguments": "not{json",
+                          "name": "get_weather"
+                        },
+                        "id": "call_recorded_0001",
+                        "type": "function"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "id": "chatcmpl-recorded-0002",
+              "model": "synthetic-malformed-tool-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 5,
+                "prompt_tokens": 10,
+                "total_tokens": 15
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

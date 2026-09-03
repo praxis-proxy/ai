@@ -26,7 +26,7 @@ before sending requests.
 | [aws-sigv4.yaml](configs/aws-sigv4.yaml) | Signs outbound requests to an AWS service (Bedrock, in this example) using Signature Version 4. Credentials are static, sourced from environment variables — see the module docs on Sigv4SignFilter for the planned OIDC/default-credential-chain follow-up |
 | [azure-ad.yaml](configs/azure-ad.yaml) | Acquires an Entra ID bearer token via the client-credentials grant and injects "Authorization: Bearer <token>" on every proxied request to Azure OpenAI |
 | [credential-injection.yaml](configs/credential-injection.yaml) | Injects per-cluster API credentials into upstream requests and strips client-provided credentials to prevent forwarding |
-| [gcp-adc.yaml](configs/gcp-adc.yaml) | Establishes the gcp_adc filter's configuration surface and fail-closed behavior |
+| [gcp-adc.yaml](configs/gcp-adc.yaml) | Acquires an OAuth2 access token from the GCE/GKE metadata server (source: adc or metadata) and injects "Authorization: Bearer <token>" on every proxied request to Vertex AI |
 | [intelligent-route-all-capabilities.yaml](configs/intelligent-route-all-capabilities.yaml) | Demonstrates every candidate capability and selection input handled by intelligent_route today |
 | [intelligent-route-inference.yaml](configs/intelligent-route-inference.yaml) | Routes requests to different upstream clusters based on the inference model name extracted from a configured request header.  The header value is set by an earlier filter such as `json_body_field` |
 | [intelligent-route-mcp.yaml](configs/intelligent-route-mcp.yaml) | Routes MCP `tools/call` requests to the cluster that owns the requested tool, using the `mcp.name` metadata set by the `mcp` filter |
@@ -71,6 +71,7 @@ before sending requests.
 | [prompts-routing.yaml](configs/openai/prompts/prompts-routing.yaml) | Routes OpenAI Prompts API requests to a dedicated Prompts API backend |
 | [agentic-loop-fixture.yaml](configs/openai/responses/agentic-loop-fixture.yaml) | Minimal agentic loop pipeline for inference fixture replay |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the openai_agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
+| [body-size-limits.yaml](configs/openai/responses/body-size-limits.yaml) | Demonstrates how raw request body size is enforced across a chain of OpenAI Responses filters that each buffer the request body |
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates the compaction flow: store a response, rehydrate it on the next turn, and count tokens to check if compaction is needed |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |

@@ -60,6 +60,8 @@ pub(super) struct StreamEventsState {
     completion_state: CompletionState,
     /// Accumulated function-call argument deltas, keyed by item id or output index.
     tool_call_args: std::collections::HashMap<String, String>,
+    /// Tool-call keys whose arguments exceeded the configured byte cap.
+    rejected_tool_call_args: std::collections::HashSet<String>,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
 }
@@ -142,6 +144,7 @@ impl HttpFilter for OpenaiStreamEventsFilter {
                 completed_at: None,
                 completion_state: CompletionState::Open,
                 tool_call_args: std::collections::HashMap::new(),
+                rejected_tool_call_args: std::collections::HashSet::new(),
                 max_tool_call_argument_bytes: self.max_tool_call_argument_bytes,
             });
         }

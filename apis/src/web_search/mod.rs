@@ -8,8 +8,14 @@ pub(crate) mod provider;
 
 use std::fmt::Write as _;
 
-pub(crate) use config::{SearchContextSize, ValidatedConfig, WebSearchFilterConfig, build_config};
+pub(crate) use config::{
+    OpenAiWebSearchConfig, SearchContextSize, ValidatedConfig, WebSearchFilterConfig, build_config,
+};
 pub(crate) use provider::{SearchClient, SearchOutcome, SearchResult};
+
+/// Bounded tool-result message fed to the model when a search provider fails,
+/// so both provider loops continue with a truthful failure instead of rejecting.
+pub(crate) const SEARCH_UNAVAILABLE: &str = "Web search unavailable.";
 
 /// Format search results as readable text for a model prompt.
 pub(crate) fn format_search_results(results: &[SearchResult]) -> String {

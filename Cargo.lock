@@ -846,6 +846,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-epoch"
 version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2804,9 +2813,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ec89978e6b37d982f7b4e80816d473637cecaa548d5a0f640a6d8cfecf73904"
+checksum = "13aceb4ee3eff4f5c73d528f8803bffe9f979bc49e56b62cbdfacf090f9fe354"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -2825,14 +2834,16 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55832a48bd2c8e8079b9e1023f14594ac4583b5b2803e3a0c334e5f73fe81c30"
+checksum = "40057cbaa0e3d0e91e77173560532408117b95570a405fd12f445431f5be8cdc"
 dependencies = [
  "bytes",
+ "chrono",
  "dashmap 6.2.1",
  "http 1.5.0",
  "metrics",
+ "percent-encoding",
  "praxis-proxy-tls",
  "quixotic-plecostomus-core",
  "quixotic-plecostomus-http",
@@ -2842,16 +2853,18 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "yaml_serde",
 ]
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9be5f77647237cae66bd8c28a9dac8a7dbf72c6c8f9d769f1987fede0bd16dd4"
+checksum = "98c84f1ccd01894ba939685446f0a433303eefb691cacd746b38513821408ccc"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "bytes",
  "dashmap 6.2.1",
@@ -2876,9 +2889,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7aebef930606ffa665975cc1101d1581ba86e2976e9f36e674c3ddd9d07d919"
+checksum = "86e415a81a87c52f6d7dafae7723c1ef35d8a80f17a7aef2d7baff909a65abb1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2893,6 +2906,7 @@ dependencies = [
  "quixotic-plecostomus-core",
  "quixotic-plecostomus-http",
  "quixotic-plecostomus-proxy",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tokio",
@@ -2902,14 +2916,13 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90c7769f7d662c1cc13a868b24576d604cc30ea0fc0907153f16ca837402d91e"
+checksum = "15f85b8155a01acb3a85ca9f6809bd51de81889484c9a62123fdbaa07dd2612f"
 dependencies = [
  "arc-swap",
  "notify",
  "rustls",
- "rustls-pemfile",
  "serde",
  "thiserror 2.0.20",
  "tokio",
@@ -4347,9 +4360,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 dependencies = [
  "serde",
 ]
@@ -4586,6 +4599,12 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
 
 [[package]]
 name = "syn"
@@ -5013,6 +5032,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.20",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

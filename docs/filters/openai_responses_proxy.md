@@ -15,7 +15,7 @@ When no `ResponsesState` exists, preserves the request body apart from removing 
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
+| `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* when it rebuilds the outbound body from `ResponsesState`. Raw request body size is governed by the pipeline's `body_limits`, not this field. This bounds only the rebuilt body, which can grow larger than the raw input when conversation history is rehydrated. |
 
 ## Examples
 
@@ -29,5 +29,5 @@ filter: openai_responses_proxy
 
 ```yaml
 filter: openai_responses_proxy
-max_body_bytes: 67108864
+max_rewritten_body_bytes: 67108864
 ```

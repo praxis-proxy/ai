@@ -3,10 +3,13 @@
 
 //! Tests for the GCP ADC example configuration.
 //!
-//! Token fetch is not implemented in this skeleton, so the cache stays
-//! empty and every request must fail closed with 503. The full "token
-//! injected, reaches upstream" path is covered by unit tests in
-//! `filters/src/gcp/`.
+//! `GcpAdcFilter` acquires a token inline, on the request that finds the
+//! cache stale (cache-through, not refresh-ahead). This test points
+//! `metadata_host` at a closed local port so the inline fetch fails
+//! deterministically (no real network call to `metadata.google.internal`)
+//! and no token is ever cached: every request must fail closed with 503.
+//! The full "token injected, reaches upstream" path is covered by the
+//! unit tests in `filters/src/gcp/`.
 
 use std::collections::HashMap;
 
@@ -29,11 +32,17 @@ fn gcp_adc_fails_closed_without_token() {
     let backend_guard = start_header_echo_backend();
     let backend_port = backend_guard.port();
     let proxy_port = free_port();
-    let config = super::load_example_config(
-        "gcp-adc.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3000", backend_port)]),
+
+    let path = praxis_test_utils::example_config_path("gcp-adc.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let patched = praxis_test_utils::patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
+    // Point the metadata server at a closed port so the inline fetch
+    // fails deterministically, with no real network dependency.
+    let patched = patched.replace(
+        "      - filter: gcp_adc",
+        "      - filter: gcp_adc\n        metadata_host: 127.0.0.1:1",
     );
+    let config = praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse gcp-adc.yaml: {e}"));
 
     let proxy = praxis_test_utils::start_proxy(&config);
     let raw = http_send(

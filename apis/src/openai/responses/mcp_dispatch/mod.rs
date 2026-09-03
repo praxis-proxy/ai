@@ -49,7 +49,8 @@ use std::{collections::HashMap, time::Duration};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -87,13 +88,10 @@ const ACTION_DONE: &str = "done";
 /// ```yaml
 /// filter: openai_mcp_dispatch
 /// timeout_ms: 30000
-/// max_body_bytes: 67108864
 /// ```
 pub struct McpDispatchFilter {
     /// Allow connections to loopback addresses.
     allow_loopback: bool,
-    /// Maximum response body bytes.
-    max_body_bytes: usize,
     /// Timeout for MCP tool calls.
     timeout: Duration,
 }
@@ -109,7 +107,6 @@ impl McpDispatchFilter {
         let validated = build_config(cfg)?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
-            max_body_bytes: validated.max_body_bytes,
             timeout: Duration::from_millis(validated.timeout_ms),
         }))
     }
@@ -117,6 +114,7 @@ impl McpDispatchFilter {
     /// Handle a tool call that requires approval.
     fn handle_approval_required(
         ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
         pending: &PendingApproval,
     ) -> Result<FilterAction, FilterError> {
         debug!(
@@ -139,6 +137,9 @@ impl McpDispatchFilter {
         };
         state.accumulated_output.push(approval_event);
 
+        // Re-serialize the response body with the new mcp_approval_request event
+        state.finalize_response_body(body);
+
         ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "done".to_owned());
         set_action(ctx, ACTION_DONE)?;
 
@@ -157,18 +158,22 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. This filter only reads the body.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadWrite
     }
 
     fn response_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. This filter only reads the body.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -220,7 +225,7 @@ impl HttpFilter for McpDispatchFilter {
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        _body: &mut Option<Bytes>,
+        body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
@@ -238,7 +243,7 @@ impl HttpFilter for McpDispatchFilter {
         }
 
         if let Some(pending) = find_approval_required(&mcp_calls, &state.mcp_tool_map) {
-            return Self::handle_approval_required(ctx, &pending);
+            return Self::handle_approval_required(ctx, body, &pending);
         }
 
         ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "execute_mcp".to_owned());

@@ -33,7 +33,7 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 | `openai_doc_extract` | — | ReadWrite / StreamBuffer | — | — |
 | `openai_file_resolve` | — | ReadWrite / StreamBuffer | — | — |
 | `openai_file_search_callout` | ✓ | ReadOnly / StreamBuffer | — | ReadWrite / StreamBuffer |
-| `openai_mcp_dispatch` | — | ReadOnly / StreamBuffer | — | ReadOnly / StreamBuffer |
+| `openai_mcp_dispatch` | — | ReadOnly / StreamBuffer | — | ReadWrite / StreamBuffer |
 | `openai_mcp_tool_resolve` | — | ReadWrite / StreamBuffer | — | — |
 | `openai_response_store` | ✓ | ReadOnly / Stream | ✓ | ReadOnly / StreamBuffer |
 | `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — |

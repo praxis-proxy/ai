@@ -14,7 +14,7 @@ The enclosing iterative router owns model re-entry. Streaming requests are rejec
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `allow_private_url` | bool | no | Allow URLs that target local-sensitive addresses. DNS names are rejected unless this is enabled because validation cannot pin the address that the HTTP client will eventually dial. |
-| `callout_failure_mode` | `closed` \| `open` | no | Behaviour when a vector-store callout fails. |
+| `on_failure` | `closed` \| `open` | no | Behaviour when a vector-store callout fails. |
 | `forward_headers` | string[] | no | Headers to forward from the original request to the vector store API for authentication and tenant isolation. No downstream headers are forwarded by default. |
 | `max_response_bytes` | integer | no | Maximum response body size in bytes per callout. |
 | `max_total_response_bytes` | integer | no | Maximum cumulative successful response bytes per filter execution. |

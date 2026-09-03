@@ -23,9 +23,9 @@
 //! rejecting provider-owned parameter combinations.
 
 pub(crate) mod agentic_loop;
+mod body_limits;
 pub(crate) mod compact;
 mod config;
-pub(crate) mod config_validation;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
@@ -37,6 +37,12 @@ pub(crate) mod openai_mcp_tool_resolve;
 pub(crate) mod openai_responses_proxy;
 pub(crate) mod openai_tool_parse;
 pub(crate) mod responses_to_chat_completions;
+#[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
+#[allow(
+    dead_code,
+    reason = "the Responses operation registry is consumed by the openai_operation classifier"
+)]
+pub(crate) mod routes;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;
@@ -71,7 +77,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
+    body::MAX_JSON_BODY_BYTES, builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
 };
 use tracing::{debug, trace};
 
@@ -193,7 +199,6 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// ```yaml
 /// filter: openai_responses_format
 /// on_invalid: continue
-/// max_body_bytes: 67108864
 /// headers:
 ///   format: x-praxis-ai-format
 ///   model: x-praxis-ai-model
@@ -231,8 +236,10 @@ impl HttpFilter for ResponsesFormatFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. This classifier only reads the body.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 

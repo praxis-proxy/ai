@@ -450,6 +450,60 @@ insecure_options:
     }
 
     #[test]
+    fn resolve_pipelines_transport_limit_governs_openai_responses_raw_body() {
+        // Every OpenAI Responses body filter declares a 64 MiB StreamBuffer
+        // ceiling. The pipeline's body_limits.max_request_bytes is the only
+        // raw transport cap: it must clamp the merged StreamBuffer down to the
+        // configured limit, proving a filter's large declaration cannot widen
+        // the raw buffer past what the transport allows.
+        let config = Config::from_yaml(
+            r#"
+insecure_options:
+  skip_pipeline_validation: true
+body_limits:
+  max_request_bytes: 1048576
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_file_resolve
+        files_api_url: "http://files-api:8321"
+        allow_private_files_api_url: true
+        allow_pre_security_callout: true
+      - filter: openai_doc_extract
+        allow_pre_security_callout: true
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
+      - filter: openai_responses_proxy
+"#,
+        )
+        .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        let client = test_client();
+        praxis_ai_filters::register_ai_filters(&mut registry, Some(&client));
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &client,
+        )
+        .unwrap();
+        let pipeline = pipelines.get("web").unwrap().load();
+        let caps = pipeline.body_capabilities();
+        assert_eq!(
+            caps.request_body_mode,
+            praxis_filter::BodyMode::StreamBuffer {
+                max_bytes: Some(1_048_576)
+            },
+            "the pipeline body_limits ceiling must clamp the filters' 64 MiB StreamBuffer to the transport cap"
+        );
+    }
+
+    #[test]
     fn resolve_pipelines_allows_router_without_lb() {
         let config = Config::from_yaml(
             r#"

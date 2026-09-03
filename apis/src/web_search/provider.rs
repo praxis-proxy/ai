@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 
 use super::{
     ValidatedConfig,
-    config::{FailureMode, SearchContextSize, SearchProvider},
+    config::{SearchContextSize, SearchProvider},
 };
 use crate::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
 
@@ -49,15 +49,12 @@ pub(crate) struct SearchResult {
 /// Outcome of a search execution.
 #[derive(Debug)]
 pub(crate) enum SearchOutcome {
-    /// Search succeeded with results.
+    /// Search succeeded. An empty vector is a successful zero-result search.
     Results(Vec<SearchResult>),
-    /// Search failed but failure mode is open — continue without results.
-    Skipped,
-    /// Search failed and failure mode is closed — reject the request.
-    Rejected {
-        /// HTTP status code to return.
-        status: u16,
-    },
+    /// Search failed — timeout, transport error, non-2xx status, oversized
+    /// response, or unparseable body. Callers continue with a truthful failed
+    /// tool result rather than exposing provider details to the client.
+    Failed,
 }
 
 // -----------------------------------------------------------------------------
@@ -78,10 +75,6 @@ pub(crate) struct SearchClient {
     api_key: SecretString,
     /// Default search context size.
     default_context_size: SearchContextSize,
-    /// Failure mode governing what happens on errors.
-    failure_mode: FailureMode,
-    /// HTTP status to return on rejection.
-    status_on_error: u16,
     /// Override the provider's default API base URL.
     base_url: Option<String>,
 }
@@ -94,8 +87,6 @@ impl std::fmt::Debug for SearchClient {
             .field("provider", &self.provider)
             .field("api_key", &"[REDACTED]")
             .field("default_context_size", &self.default_context_size)
-            .field("failure_mode", &self.failure_mode)
-            .field("status_on_error", &self.status_on_error)
             .field("base_url", &self.base_url)
             .finish()
     }
@@ -121,8 +112,6 @@ impl SearchClient {
             provider: config.provider,
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
-            failure_mode: config.failure_mode,
-            status_on_error: config.status_on_error,
             base_url: config.base_url.clone(),
         })
     }
@@ -153,6 +142,10 @@ impl SearchClient {
     }
 
     /// Map a sub-request result to a [`SearchOutcome`].
+    ///
+    /// Non-2xx statuses and transport errors (including timeouts and
+    /// oversized responses) map to [`SearchOutcome::Failed`]. Detailed
+    /// diagnostics are logged; provider specifics never reach the client.
     fn map_search_result(&self, result: Result<SubResponse, SubRequestError>) -> SearchOutcome {
         match result {
             Ok(response) if (200..300).contains(&(response.status as usize)) => self.parse_response(&response.body),
@@ -162,24 +155,12 @@ impl SearchClient {
                     status = response.status,
                     "search callout returned non-2xx"
                 );
-                self.transport_failure_outcome()
+                SearchOutcome::Failed
             },
             Err(e) => {
                 warn!(provider = self.provider.as_str(), error = %e, "search callout failed");
-                self.transport_failure_outcome()
+                SearchOutcome::Failed
             },
-        }
-    }
-
-    /// Outcome for a transport or non-2xx failure. Under closed
-    /// mode this is a rejection; under open mode search is silently
-    /// skipped.
-    fn transport_failure_outcome(&self) -> SearchOutcome {
-        match self.failure_mode {
-            FailureMode::Closed => SearchOutcome::Rejected {
-                status: self.status_on_error,
-            },
-            FailureMode::Open => SearchOutcome::Skipped,
         }
     }
 
@@ -281,7 +262,7 @@ impl SearchClient {
             Ok(v) => v,
             Err(e) => {
                 warn!(provider = self.provider.as_str(), error = %e, "failed to parse search response");
-                return self.parse_failure_outcome();
+                return SearchOutcome::Failed;
             },
         };
 
@@ -298,18 +279,6 @@ impl SearchClient {
         );
 
         SearchOutcome::Results(results)
-    }
-
-    /// Outcome for a response that arrived as 2xx but could not be
-    /// parsed. Under closed mode this is an error; under open mode
-    /// search is silently skipped.
-    fn parse_failure_outcome(&self) -> SearchOutcome {
-        match self.failure_mode {
-            FailureMode::Closed => SearchOutcome::Rejected {
-                status: self.status_on_error,
-            },
-            FailureMode::Open => SearchOutcome::Skipped,
-        }
     }
 }
 
@@ -505,8 +474,6 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
             base_url: None,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -560,8 +527,6 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
             base_url: None,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client());
@@ -576,8 +541,6 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
             base_url: None,
         };
 
@@ -599,8 +562,6 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -619,8 +580,6 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -639,8 +598,6 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
             base_url: Some("http://localhost:9999".into()),
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -652,54 +609,48 @@ mod tests {
     }
 
     #[test]
-    fn parse_failure_closed_mode_rejects() {
+    fn parse_failure_returns_failed() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
             api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Closed,
-            status_on_error: 502,
             base_url: None,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
         assert!(
-            matches!(outcome, SearchOutcome::Rejected { status: 502 }),
-            "closed mode should reject on parse failure"
+            matches!(outcome, SearchOutcome::Failed),
+            "an unparseable 2xx body should map to Failed: {outcome:?}"
         );
     }
 
     #[test]
-    fn parse_failure_open_mode_skips() {
+    fn parse_empty_results_is_successful_zero_result_search() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
             api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode: FailureMode::Open,
-            status_on_error: 502,
             base_url: None,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
-        let outcome = client.parse_response(b"not json");
+        let outcome = client.parse_response(br#"{"web":{"results":[]}}"#);
         assert!(
-            matches!(outcome, SearchOutcome::Skipped),
-            "open mode should skip on parse failure"
+            matches!(&outcome, SearchOutcome::Results(results) if results.is_empty()),
+            "a parseable 2xx body with zero results is a successful empty search: {outcome:?}"
         );
     }
 
-    fn test_search_client(failure_mode: FailureMode) -> SearchClient {
+    fn test_search_client() -> SearchClient {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
             api_key: SecretString::from("test-key".to_owned()),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 1000,
             max_body_bytes: 64 * 1024 * 1024,
-            failure_mode,
-            status_on_error: 502,
             base_url: None,
         };
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
@@ -732,7 +683,7 @@ mod tests {
             .to_string(),
         );
 
-        let client = test_search_client(FailureMode::Closed);
+        let client = test_search_client();
         let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
         let request = SubRequest {
             method: http::Method::GET,
@@ -749,12 +700,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_non_2xx_closed_rejects() {
+    async fn search_non_2xx_returns_failed() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         spawn_http_server(listener, 500, "internal error");
 
-        let client = test_search_client(FailureMode::Closed);
+        let client = test_search_client();
         let url = format!("http://{addr}/search");
         let request = SubRequest {
             method: http::Method::GET,
@@ -765,35 +716,13 @@ mod tests {
 
         let outcome = client.execute_search(&url, request).await;
         assert!(
-            matches!(outcome, SearchOutcome::Rejected { status: 502 }),
-            "non-2xx under closed mode should reject: {outcome:?}"
+            matches!(outcome, SearchOutcome::Failed),
+            "a non-2xx status should map to Failed: {outcome:?}"
         );
     }
 
     #[tokio::test]
-    async fn search_non_2xx_open_skips() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        spawn_http_server(listener, 429, "rate limited");
-
-        let client = test_search_client(FailureMode::Open);
-        let url = format!("http://{addr}/search");
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
-
-        let outcome = client.execute_search(&url, request).await;
-        assert!(
-            matches!(outcome, SearchOutcome::Skipped),
-            "non-2xx under open mode should skip: {outcome:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn search_connection_failure_closed_rejects() {
+    async fn search_connection_failure_returns_failed() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -801,7 +730,7 @@ mod tests {
             drop(stream);
         });
 
-        let client = test_search_client(FailureMode::Closed);
+        let client = test_search_client();
         let url = format!("http://{addr}/search");
         let request = SubRequest {
             method: http::Method::GET,
@@ -812,13 +741,13 @@ mod tests {
 
         let outcome = client.execute_search(&url, request).await;
         assert!(
-            matches!(outcome, SearchOutcome::Rejected { status: 502 }),
-            "connection failure under closed mode should reject: {outcome:?}"
+            matches!(outcome, SearchOutcome::Failed),
+            "a transport failure should map to Failed: {outcome:?}"
         );
     }
 
     #[tokio::test]
-    async fn search_timeout_open_skips() {
+    async fn search_timeout_returns_failed() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -826,7 +755,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let mut client = test_search_client(FailureMode::Open);
+        let mut client = test_search_client();
         client.timeout = Duration::from_millis(50);
         let url = format!("http://{addr}/search");
         let request = SubRequest {
@@ -838,13 +767,13 @@ mod tests {
 
         let outcome = client.execute_search(&url, request).await;
         assert!(
-            matches!(outcome, SearchOutcome::Skipped),
-            "timeout under open mode should skip: {outcome:?}"
+            matches!(outcome, SearchOutcome::Failed),
+            "a timeout should map to Failed: {outcome:?}"
         );
     }
 
     #[tokio::test]
-    async fn search_oversized_response_closed_rejects() {
+    async fn search_oversized_response_returns_failed() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -860,7 +789,7 @@ mod tests {
             stream.write_all(&body).unwrap();
         });
 
-        let client = test_search_client(FailureMode::Closed);
+        let client = test_search_client();
         let url = format!("http://{addr}/search");
         let request = SubRequest {
             method: http::Method::GET,
@@ -871,8 +800,8 @@ mod tests {
 
         let outcome = client.execute_search(&url, request).await;
         assert!(
-            matches!(outcome, SearchOutcome::Rejected { status: 502 }),
-            "oversized response under closed mode should reject: {outcome:?}"
+            matches!(outcome, SearchOutcome::Failed),
+            "an oversized response should map to Failed: {outcome:?}"
         );
     }
 }

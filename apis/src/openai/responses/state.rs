@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
+
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 
@@ -276,6 +278,31 @@ impl ResponsesState {
     /// Return whether provider-visible request state requires serialization.
     pub(crate) fn request_body_requires_rebuild(&self) -> bool {
         self.request_body_rebuild == RequestBodyRebuild::Required
+    }
+
+    /// Build the final response body from accumulated state.
+    ///
+    /// Replaces `response_object["output"]` with the full `accumulated_output`
+    /// (all rounds), stamps accumulated usage, and serializes back to body bytes.
+    pub(crate) fn finalize_response_body(&self, body: &mut Option<Bytes>) {
+        if !self.response_object.is_object() {
+            return;
+        }
+        let mut response = self.response_object.clone();
+        if let Some(obj) = response.as_object_mut() {
+            if !self.accumulated_output.is_empty() {
+                obj.insert(
+                    "output".to_owned(),
+                    serde_json::Value::Array(self.accumulated_output.clone()),
+                );
+            }
+            if !self.usage.is_null() {
+                obj.insert("usage".to_owned(), self.usage.clone());
+            }
+        }
+        if let Ok(serialized) = serde_json::to_vec(&response) {
+            *body = Some(Bytes::from(serialized));
+        }
     }
 }
 

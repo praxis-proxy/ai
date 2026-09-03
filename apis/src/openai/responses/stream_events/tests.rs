@@ -434,6 +434,7 @@ fn body_passes_through_unchanged() {
         completed_at: None,
         completion_state: CompletionState::Open,
         tool_call_args: std::collections::HashMap::new(),
+        rejected_tool_call_args: std::collections::HashSet::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
     });
 
@@ -460,6 +461,7 @@ fn parse_error_sets_metadata() {
         completed_at: None,
         completion_state: CompletionState::Open,
         tool_call_args: std::collections::HashMap::new(),
+        rejected_tool_call_args: std::collections::HashSet::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
     });
 
@@ -789,6 +791,106 @@ async fn tool_call_argument_bytes_cap_enforced() {
         !state.tool_call_args.contains_key("item:fc_big"),
         "exceeding max_tool_call_argument_bytes should drop the accumulator entry"
     );
+    assert!(
+        state.rejected_tool_call_args.contains("item:fc_big"),
+        "an overflowing tool call should remain rejected"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_argument_bytes_cap_rejects_restart_after_overflow() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
+    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let item = json!({
+        "item": {
+            "type": "function_call",
+            "id": "fc_restart",
+            "call_id": "call_restart",
+            "name": "restart_fn",
+            "arguments": "",
+            "status": "in_progress"
+        },
+        "output_index": 0
+    });
+    let mut added = Some(make_sse_chunk("response.output_item.added", &item));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+
+    let oversized = json!({"item_id": "fc_restart", "output_index": 0, "delta": "012345678901234567890"});
+    let mut delta = Some(make_sse_chunk("response.function_call_arguments.delta", &oversized));
+    filter.on_response_body(&mut ctx, &mut delta, false).unwrap();
+
+    let restart = json!({"item_id": "fc_restart", "output_index": 0, "delta": "{\"x\":1}"});
+    let mut delta = Some(make_sse_chunk("response.function_call_arguments.delta", &restart));
+    filter.on_response_body(&mut ctx, &mut delta, false).unwrap();
+
+    let done = json!({"item_id": "fc_restart", "output_index": 0});
+    let mut done_body = Some(make_sse_chunk("response.function_call_arguments.done", &done));
+    filter.on_response_body(&mut ctx, &mut done_body, false).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.is_empty(),
+        "a rejected tool call should not be finalized"
+    );
+    assert_eq!(state.output_items()[0]["arguments"], "");
+    assert_eq!(state.output_items()[0]["status"], "in_progress");
+}
+
+#[tokio::test]
+async fn tool_call_argument_bytes_cap_rejects_oversized_done_payload() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
+    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let item = json!({
+        "item": {
+            "type": "function_call",
+            "id": "fc_done_big",
+            "call_id": "call_done_big",
+            "name": "done_fn",
+            "arguments": "",
+            "status": "in_progress"
+        },
+        "output_index": 0
+    });
+    let mut added = Some(make_sse_chunk("response.output_item.added", &item));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+
+    let done = json!({
+        "item_id": "fc_done_big",
+        "output_index": 0,
+        "arguments": "012345678901234567890"
+    });
+    let mut done_body = Some(make_sse_chunk("response.function_call_arguments.done", &done));
+    filter.on_response_body(&mut ctx, &mut done_body, false).unwrap();
+
+    let retry = json!({
+        "item_id": "fc_done_big",
+        "output_index": 0,
+        "arguments": "{\"x\":1}"
+    });
+    let mut retry_body = Some(make_sse_chunk("response.function_call_arguments.done", &retry));
+    filter.on_response_body(&mut ctx, &mut retry_body, false).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.is_empty(),
+        "an oversized done payload should keep the tool call rejected"
+    );
+    assert_eq!(state.output_items()[0]["arguments"], "");
+    assert_eq!(state.output_items()[0]["status"], "in_progress");
 }
 
 #[tokio::test]

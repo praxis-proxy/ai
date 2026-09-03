@@ -27,13 +27,12 @@ default_context_size: medium
     AnthropicWebSearchFilter::from_config(&config).unwrap()
 }
 
-fn test_filter_impl_with_base_url(base_url: &str, provider_failure_mode: &str) -> AnthropicWebSearchFilter {
+fn test_filter_impl_with_base_url(base_url: &str) -> AnthropicWebSearchFilter {
     let config = serde_yaml::from_str(&format!(
         r#"
 provider: you
 api_key: test-key
 default_context_size: medium
-provider_failure_mode: {provider_failure_mode}
 base_url: "{base_url}"
 allow_private_base_url: true
 "#,
@@ -128,6 +127,10 @@ fn valid_you_body() -> String {
         }
     })
     .to_string()
+}
+
+fn empty_you_body() -> String {
+    json!({"results": {"web": [], "news": []}}).to_string()
 }
 
 #[test]
@@ -508,12 +511,12 @@ async fn initial_request_body_is_not_mutated() {
 #[tokio::test]
 async fn pending_search_executes_and_appends_tool_result() {
     let search = start_you_search_stub(200, valid_you_body());
-    let filter = test_filter_impl_with_base_url(search.base_url(), "closed");
+    let filter = test_filter_impl_with_base_url(search.base_url());
     let pending = pending_search("potato");
 
-    let results = filter.execute_pending_search(&pending).await.unwrap();
+    let outcome = filter.execute_pending_search(&pending).await;
     let mut rebuilt = base_request();
-    append_search_turns(&mut rebuilt, assistant_content("potato"), pending, &results).unwrap();
+    append_search_turns(&mut rebuilt, assistant_content("potato"), pending, &outcome).unwrap();
 
     assert_eq!(rebuilt["model"], "openai/gpt-oss-20b");
     assert_eq!(rebuilt["system"], "Answer with sources.");
@@ -533,6 +536,10 @@ async fn pending_search_executes_and_appends_tool_result() {
             .unwrap()
             .contains("Potato - Wikipedia")
     );
+    assert!(
+        messages[messages.len() - 1]["content"][0].get("is_error").is_none(),
+        "a successful search must not mark the tool result as an error"
+    );
     assert_eq!(search.last_json()["query"], "potato");
     assert!(
         search
@@ -543,34 +550,51 @@ async fn pending_search_executes_and_appends_tool_result() {
 }
 
 #[tokio::test]
-async fn closed_provider_failure_returns_anthropic_error() {
+async fn provider_failure_appends_is_error_tool_result() {
     let search = start_you_search_stub(503, "unavailable".to_owned());
-    let filter = test_filter_impl_with_base_url(search.base_url(), "closed");
+    let filter = test_filter_impl_with_base_url(search.base_url());
     let pending = pending_search("potato");
 
-    let result = filter.execute_pending_search(&pending).await;
+    let outcome = filter.execute_pending_search(&pending).await;
+    assert!(
+        matches!(&outcome, SearchOutcome::Failed),
+        "a provider 5xx must map to a failed outcome, got {outcome:?}"
+    );
 
-    let Err(rejection) = result else {
-        panic!("expected rejection");
-    };
-    assert_eq!(rejection.status, 502);
-    assert!(String::from_utf8_lossy(rejection.body.as_ref().unwrap()).contains("api_error"));
+    let mut rebuilt = base_request();
+    append_search_turns(&mut rebuilt, assistant_content("potato"), pending, &outcome).unwrap();
+
+    let result_block = &rebuilt["messages"].as_array().unwrap().last().unwrap()["content"][0];
+    assert_eq!(result_block["type"], "tool_result");
+    assert_eq!(result_block["tool_use_id"], "toolu_search_1");
+    assert_eq!(result_block["content"], "Web search unavailable.");
+    assert_eq!(
+        result_block["is_error"], true,
+        "a failed search must mark the tool result with is_error"
+    );
 }
 
 #[tokio::test]
-async fn open_provider_failure_appends_no_results_tool_result() {
-    let search = start_you_search_stub(503, "unavailable".to_owned());
-    let filter = test_filter_impl_with_base_url(search.base_url(), "open");
+async fn empty_results_appends_no_results_tool_result() {
+    let search = start_you_search_stub(200, empty_you_body());
+    let filter = test_filter_impl_with_base_url(search.base_url());
     let pending = pending_search("potato");
 
-    let results = filter.execute_pending_search(&pending).await.unwrap();
-    let mut rebuilt = base_request();
-    append_search_turns(&mut rebuilt, assistant_content("potato"), pending, &results).unwrap();
+    let outcome = filter.execute_pending_search(&pending).await;
+    assert!(
+        matches!(&outcome, SearchOutcome::Results(results) if results.is_empty()),
+        "a successful empty search must be a zero-result outcome, got {outcome:?}"
+    );
 
-    let content = rebuilt["messages"].as_array().unwrap().last().unwrap()["content"][0]["content"]
-        .as_str()
-        .unwrap();
-    assert_eq!(content, "No search results found.");
+    let mut rebuilt = base_request();
+    append_search_turns(&mut rebuilt, assistant_content("potato"), pending, &outcome).unwrap();
+
+    let result_block = &rebuilt["messages"].as_array().unwrap().last().unwrap()["content"][0];
+    assert_eq!(result_block["content"], "No search results found.");
+    assert!(
+        result_block.get("is_error").is_none(),
+        "a successful empty search must not mark the tool result as an error"
+    );
 }
 
 #[test]

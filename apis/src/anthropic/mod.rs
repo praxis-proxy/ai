@@ -3,6 +3,7 @@
 
 //! Anthropic protocol filters.
 
+pub(crate) mod error_response_formatter;
 mod messages_format;
 mod protocol;
 mod stream_events;
