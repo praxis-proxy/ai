@@ -226,9 +226,7 @@ pub async fn build_pinned_reqwest_client(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        validate_ip(filter_name, ip, policy)?;
-    } else {
+    if host.parse::<IpAddr>().is_err() {
         let resolved = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
             .await
             .map_err(|_elapsed| -> FilterError { format!("{filter_name}: DNS resolution timed out").into() })?
