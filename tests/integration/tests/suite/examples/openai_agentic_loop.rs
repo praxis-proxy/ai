@@ -964,11 +964,35 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
     let second_request: serde_json::Value =
         serde_json::from_str(&requests[1]).expect("second model request should be JSON");
     drop(requests);
+    let input = second_request["input"]
+        .as_array()
+        .expect("second model request input should be an array");
+
+    // #808: a hosted web_search_call is not a valid OpenResponses input item, so
+    // the streamed continuation must never forward it to the inference backend.
     assert!(
-        second_request["input"]
-            .as_array()
-            .is_some_and(|input| input.iter().any(|item| item["type"] == "web_search_call")),
-        "the second inference should receive the completed web-search result"
+        input.iter().all(|item| item["type"] != "web_search_call"),
+        "second inference input must not contain hosted web_search_call items: {input:?}"
+    );
+
+    // The completed search reaches the model through a backend-valid
+    // function_call / function_call_output bridge instead.
+    let has_web_search_call = input
+        .iter()
+        .any(|item| item["type"] == "function_call" && item["name"] == "web_search");
+    assert!(
+        has_web_search_call,
+        "second inference input should carry a synthetic web_search function_call: {input:?}"
+    );
+    let function_output = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .expect("second inference input should contain a function_call_output");
+    assert!(
+        function_output["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("blog.rust-lang.org")),
+        "second inference should receive the web search results: {function_output:?}"
     );
 }
 
