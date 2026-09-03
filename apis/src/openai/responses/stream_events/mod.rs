@@ -135,11 +135,15 @@ impl OpenaiStreamEventsFilter {
 
     /// Install fresh parser state for one inference stream.
     fn arm(&self, ctx: &mut HttpFilterContext<'_>) {
-        let (iteration, output_index_offset) = ctx.extensions.get::<ResponsesState>().map_or((0, 0), |state| {
-            (
-                state.iteration,
-                u64::try_from(state.accumulated_output.len()).unwrap_or(u64::MAX),
-            )
+        let (iteration, output_index_offset) = ctx.extensions.get_mut::<ResponsesState>().map_or((0, 0), |state| {
+            let output_index_offset = u64::try_from(state.accumulated_output.len()).unwrap_or(u64::MAX);
+            // Invalidate the previous round's terminal response object before a
+            // resumed round begins. Only this round's own terminal event may
+            // repopulate it; otherwise a provider `error` in the resumed round
+            // would leave the prior round's completed response live and let the
+            // store persist stale success as the logical result.
+            state.response_object = Value::Null;
+            (state.iteration, output_index_offset)
         });
         ctx.insert_filter_state(StreamEventsState {
             frame_parser: SseFrameParser::new(self.parser_config.max_buffer_bytes),

@@ -344,7 +344,10 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a terminal incomplete stream must yield Continue so the committed SSE stream is forwarded"
+    );
     assert_action(&ctx, "done");
     assert!(
         ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
@@ -398,7 +401,10 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a terminal failed stream must yield Continue so the committed SSE stream is forwarded"
+    );
     assert_action(&ctx, "done");
     assert!(
         ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
@@ -437,12 +443,25 @@ fn streamed_web_search_call_is_available_to_dispatch_filter() {
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streamed web_search_call round must yield Continue while it loops for dispatch"
+    );
     assert_action(&ctx, "loop");
     assert_eq!(
         ctx.extensions.get::<ResponsesState>().unwrap().web_search_calls.len(),
         1,
         "streamed web-search calls must be visible to openai_web_search"
+    );
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.get("type").and_then(Value::as_str) == Some("web_search_call")),
+        "a hosted web_search_call is not a valid OpenResponses input item and must not \
+         enter model-facing messages (issue #808)"
     );
 }
 
@@ -466,7 +485,10 @@ fn multiple_streamed_function_calls_end_with_sse_error() {
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streamed cardinality error must yield Continue after selecting the terminal SSE error"
+    );
     assert_action(&ctx, "done");
     assert_eq!(
         ctx.get_metadata("responses.stream_error_code"),
@@ -506,7 +528,10 @@ fn multiple_streamed_function_calls_do_not_finalize_body() {
     let mut body: Option<Bytes> = None;
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streamed cardinality error must yield Continue without buffering a replacement body"
+    );
     assert_action(&ctx, "done");
     assert!(
         body.is_none(),
@@ -543,7 +568,10 @@ fn streaming_iteration_limit_ends_with_sse_error() {
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an exhausted streamed loop must yield Continue after selecting the terminal SSE error"
+    );
     assert_action(&ctx, "done");
     assert_eq!(
         ctx.get_metadata("responses.stream_error_code"),

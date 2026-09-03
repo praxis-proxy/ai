@@ -488,8 +488,12 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 state.persisted_messages.push(item);
             },
             Some("web_search_call") => {
+                // Mirror `collect_output_items`: a hosted web_search_call is not
+                // a valid OpenResponses input item (issue #808), so it must not
+                // enter `messages`. The openai_web_search dispatch consumes
+                // `web_search_calls` and appends a backend-valid
+                // function_call/function_call_output bridge for the next round.
                 state.web_search_calls.push(item.clone());
-                state.messages.push(item.clone());
                 state.persisted_messages.push(item);
             },
             _ => {},

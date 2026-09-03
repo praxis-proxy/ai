@@ -1105,6 +1105,100 @@ async fn second_error_after_terminal_is_rejected() {
 }
 
 #[tokio::test]
+async fn resumed_round_error_does_not_persist_prior_round_success() {
+    // A successful round followed by a resumed round that only emits a provider
+    // `error` must not persist the previous round's completed response as the
+    // logical result. Re-arming invalidates the prior `response_object`, and the
+    // error round never repopulates it, so `build_record` skips persistence.
+    let filter = make_logical_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+
+    // Round 1: a completed response carrying a tool call, transitioning the loop.
+    filter.on_request(&mut ctx).await.unwrap();
+    let function_call = json!({
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "weather__get",
+        "arguments": "{}",
+        "status": "completed"
+    });
+    let mut terminal = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {"id": "resp_first", "status": "completed", "output": [function_call.clone()]},
+            "sequence_number": 1
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    ctx.filter_results
+        .entry("openai_mcp_dispatch")
+        .or_default()
+        .set("action", "loop")
+        .unwrap();
+    let mut first_eos = None;
+    filter.on_response_body(&mut ctx, &mut first_eos, true).unwrap();
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .response_object
+            .get("id")
+            .and_then(serde_json::Value::as_str),
+        Some("resp_first"),
+        "round 1 completion should populate the response object"
+    );
+
+    // Resume round 2.
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.iteration = 1;
+    state.accumulated_output = vec![function_call, json!({"type": "mcp_call", "id": "mcp_1"})];
+    ctx.filter_results.remove("openai_mcp_dispatch");
+    filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .response_object
+            .is_null(),
+        "re-arming must invalidate the prior round's response object"
+    );
+
+    // Round 2 emits only a provider error, with no terminal lifecycle event.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_second", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+    let mut error = Some(make_sse_chunk(
+        "error",
+        &json!({"code": "server_error", "message": "backend exploded"}),
+    ));
+    filter.on_response_body(&mut ctx, &mut error, false).unwrap();
+
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .response_object
+            .is_null(),
+        "a resumed provider error must not resurrect the prior round's success for persistence"
+    );
+}
+
+#[tokio::test]
 async fn tool_call_argument_bytes_cap_enforced() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
     let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
