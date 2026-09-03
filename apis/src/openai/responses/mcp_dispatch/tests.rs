@@ -180,7 +180,7 @@ fn parse_approval_filter_non_object_non_array_value() {
 fn filter_response_body_access() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
-    assert_eq!(filter.response_body_access(), praxis_filter::BodyAccess::ReadOnly);
+    assert_eq!(filter.response_body_access(), praxis_filter::BodyAccess::ReadWrite);
 }
 
 #[test]
@@ -1068,6 +1068,41 @@ fn on_response_body_approval_emits_correct_arguments() {
         event["arguments"], "{\"city\":\"Paris\"}",
         "approval event arguments must not be double-encoded"
     );
+}
+
+#[test]
+fn on_response_body_approval_serializes_approval_request_into_body() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "c1",
+            "arguments": "{\"city\":\"Paris\"}"
+        })],
+        response_object: json!({
+            "id": "resp_123",
+            "output": []
+        }),
+        ..ResponsesState::default()
+    };
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(r#"{"id":"resp_123","output":[]}"#));
+    let result = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(result, FilterAction::Continue));
+
+    let bytes = body.expect("response body should be serialized with approval request");
+    let response_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let output = response_json["output"].as_array().expect("output should be an array");
+    assert_eq!(output.len(), 1, "output array should contain 1 item");
+    assert_eq!(
+        output[0]["type"], "mcp_approval_request",
+        "output item should be mcp_approval_request"
+    );
+    assert_eq!(output[0]["id"], "c1");
 }
 
 // =========================================================================
