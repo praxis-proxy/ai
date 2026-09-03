@@ -308,6 +308,7 @@ fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut Responses
             "invalid_request_error",
             "openai_agentic_loop supports exactly one function call per round",
         )?;
+        return Ok(false);
     }
     Ok(true)
 }

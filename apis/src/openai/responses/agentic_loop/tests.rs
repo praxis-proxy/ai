@@ -480,6 +480,46 @@ fn multiple_streamed_function_calls_end_with_sse_error() {
 }
 
 #[test]
+fn multiple_streamed_function_calls_do_not_finalize_body() {
+    // A streamed cardinality error must terminate through the SSE-error path
+    // without falling through to `evaluate_loop_decision`, which would serialize
+    // `response_object` into the body. With `logical_stream: false` nothing
+    // downstream would overwrite it, so the JSON would leak to the client after
+    // the SSE events.
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.tool_calls = vec![
+        json!({"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"}),
+        json!({"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}),
+    ];
+    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "done");
+    assert!(
+        body.is_none(),
+        "a streamed SSE error must not serialize a JSON body onto the committed stream"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a locally terminated stream must not be persisted"
+    );
+}
+
+#[test]
 fn streaming_iteration_limit_ends_with_sse_error() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 1").unwrap();
     let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
