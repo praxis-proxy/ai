@@ -228,7 +228,8 @@ impl ApiClient {
     /// the caller's response-size limit.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the request's independently owned transport fields stay explicit"
+        clippy::too_many_lines,
+        reason = "the request's independently owned transport fields and credential-origin binding stay explicit"
     )]
     async fn execute_url(
         &self,
