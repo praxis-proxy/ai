@@ -211,6 +211,9 @@ filter_chains:
           - name: dead_upstream
             endpoints:
               - "127.0.0.1:{backend_port}"
+
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
@@ -238,6 +241,9 @@ filter_chains:
           - name: dead_upstream
             endpoints:
               - "127.0.0.1:{backend_port}"
+
+insecure_options:
+  allow_private_endpoints: true
 "#
     )
 }
