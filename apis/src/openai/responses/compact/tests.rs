@@ -12,6 +12,7 @@ use crate::callout_policy::OnFailure;
 
 fn base_config() -> CompactFilterConfig {
     CompactFilterConfig {
+        allow_pre_security_callout: true,
         inference_url: "http://localhost:11434/v1/chat/completions".to_owned(),
         default_model: "gpt-4o-mini".to_owned(),
         tiktoken_encoding: "cl100k_base".to_owned(),
@@ -30,6 +31,42 @@ fn build_config_applies_defaults() {
     assert_eq!(cfg.callout.timeout_ms, 30_000);
     assert_eq!(cfg.callout.on_failure, OnFailure::Closed);
     assert_eq!(cfg.callout.status_on_error, 502);
+}
+
+#[test]
+fn build_config_rejects_missing_pre_security_ack() {
+    let mut cfg = base_config();
+    cfg.allow_pre_security_callout = false;
+    let err = build_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("allow_pre_security_callout"),
+        "should mention allow_pre_security_callout: {err}"
+    );
+}
+
+#[test]
+fn from_config_missing_pre_security_ack() {
+    let yaml =
+        serde_yaml::from_str::<serde_yaml::Value>("inference_url: http://localhost/v1/chat/completions").unwrap();
+    let err = CompactFilter::from_config(&yaml)
+        .err()
+        .expect("should fail without allow_pre_security_callout");
+    assert!(
+        err.to_string().contains("allow_pre_security_callout"),
+        "should mention allow_pre_security_callout: {err}"
+    );
+}
+
+#[test]
+fn from_config_accepts_pre_security_ack() {
+    let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions",
+    )
+    .unwrap();
+    assert!(
+        CompactFilter::from_config(&yaml).is_ok(),
+        "explicit allow_pre_security_callout should construct"
+    );
 }
 
 #[test]
@@ -432,7 +469,7 @@ fn conversation_text_skips_empty_compaction_summary() {
 
 fn make_filter(on_failure: &str) -> CompactFilter {
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
-        "inference_url: http://localhost/v1/chat/completions\non_failure: {on_failure}"
+        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions\non_failure: {on_failure}"
     ))
     .unwrap();
     let cfg: CompactFilterConfig = serde_yaml::from_value(yaml).unwrap();

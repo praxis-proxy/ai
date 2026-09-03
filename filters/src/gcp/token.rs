@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Credential-source resolution for [`GcpAdcFilter`].
+//! Credential-source resolution and token fetch for [`GcpAdcFilter`].
 //!
-//! Token HTTP fetch (metadata server, `JWT` bearer) is added in follow-up
-//! PRs. This module only classifies the source at construct time.
+//! [`fetch`] acquires a token for the [`Metadata`](TokenSource::Metadata)
+//! source from the GCE/GKE metadata server. The
+//! [`ServiceAccountKey`](TokenSource::ServiceAccountKey) source (a parsed
+//! `type: service_account` key file) is resolved and validated at
+//! construct time but its token fetch is not implemented yet — it needs
+//! `JWT` signing, which this workspace does not currently depend on — so
+//! [`fetch`] returns a clear error for it rather than the cache silently
+//! staying empty forever.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
+use http::HeaderValue;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -17,7 +24,7 @@ use super::config::{GcpAdcConfig, GcpAdcSource};
 // TokenSource
 // -----------------------------------------------------------------------------
 
-/// Resolved credential source used by the background refresher.
+/// Resolved credential source used to fetch a token.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TokenSource {
     /// GCE/GKE/Cloud Run metadata server.
@@ -27,8 +34,89 @@ pub(super) enum TokenSource {
     },
 
     /// Parsed `type: service_account` key file. Fetch is not implemented
-    /// in this skeleton; the cache stays empty and requests fail closed.
+    /// yet (requires `JWT` signing); [`fetch`] returns an error for this
+    /// source so requests fail closed with a clear reason.
     ServiceAccountKey,
+}
+
+// -----------------------------------------------------------------------------
+// Fetch
+// -----------------------------------------------------------------------------
+
+/// Response body from the GCE/GKE metadata server's token endpoint.
+/// Extra fields (`token_type`, …) are ignored.
+#[derive(Debug, Deserialize)]
+struct MetadataTokenResponse {
+    /// The `OAuth2` access token.
+    access_token: String,
+
+    /// Token lifetime in seconds.
+    expires_in: u64,
+}
+
+/// Acquire a token for `source`.
+///
+/// Kept free of caching concerns so it fits
+/// [`TokenCache::get_or_refresh`](praxis_ai_apis::token_cache::TokenCache::get_or_refresh)'s
+/// `fetch` closure shape directly.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the metadata request fails, returns a
+/// non-success status, or its body cannot be parsed; or, for
+/// [`TokenSource::ServiceAccountKey`], always (not implemented).
+pub(super) async fn fetch(
+    client: &reqwest::Client,
+    source: &TokenSource,
+    metadata_host: &str,
+    scope: &str,
+) -> Result<(HeaderValue, Duration), FilterError> {
+    match source {
+        TokenSource::Metadata { service_account } => {
+            fetch_metadata_token(client, metadata_host, service_account, scope).await
+        },
+        TokenSource::ServiceAccountKey => Err(FilterError::from(
+            "gcp_adc: token fetch for source key_file is not implemented yet (requires JWT signing); \
+             use source: adc or source: metadata on a GCE/GKE instance instead",
+        )),
+    }
+}
+
+/// Acquire a token from the GCE/GKE metadata server.
+async fn fetch_metadata_token(
+    client: &reqwest::Client,
+    metadata_host: &str,
+    service_account: &str,
+    scope: &str,
+) -> Result<(HeaderValue, Duration), FilterError> {
+    let mut url =
+        format!("http://{metadata_host}/computeMetadata/v1/instance/service-accounts/{service_account}/token?scopes=");
+    url::form_urlencoded::byte_serialize(scope.as_bytes()).for_each(|piece| url.push_str(piece));
+
+    let response = client
+        .get(url)
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await
+        .map_err(|e| FilterError::from(format!("gcp_adc: metadata token request failed: {e}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(FilterError::from(format!(
+            "gcp_adc: metadata server returned HTTP status {status}"
+        )));
+    }
+
+    let token: MetadataTokenResponse = response
+        .json()
+        .await
+        .map_err(|e| FilterError::from(format!("gcp_adc: failed to parse metadata token response: {e}")))?;
+
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {}", token.access_token))
+        .map_err(|e| FilterError::from(format!("gcp_adc: token is not a valid header value: {e}")))?;
+    authorization.set_sensitive(true);
+
+    Ok((authorization, Duration::from_secs(token.expires_in)))
 }
 
 // -----------------------------------------------------------------------------

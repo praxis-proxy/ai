@@ -1,13 +1,15 @@
-# GCP ADC upstream authentication (experimental skeleton)
+# GCP ADC upstream authentication (experimental)
 #
-# Establishes the gcp_adc filter's configuration surface and
-# fail-closed behavior. Token acquisition is NOT implemented
-# yet: the token cache is never populated, so every proxied
-# request is rejected with 503. Fetch (GKE metadata or a
-# service-account key file) lands with the shared background
-# refresh primitive tracked in praxis#555/#1042/#1043; once it
-# does, the filter will inject "Authorization: Bearer <token>"
-# on every proxied request to Vertex AI.
+# Acquires an OAuth2 access token from the GCE/GKE metadata server
+# (source: adc or metadata) and injects "Authorization: Bearer
+# <token>" on every proxied request to Vertex AI. The token is
+# cached in memory (cache-through: a request that finds the cache
+# stale fetches a fresh token inline before proceeding); the
+# downstream client never sees GCP credentials.
+#
+# source: key_file (a service-account key JSON file) is not
+# implemented yet -- it needs JWT signing -- and fails closed with
+# a clear "not implemented" reason.
 #
 # This filter only injects Authorization — it does NOT set Host
 # or path. Point the cluster at your Vertex regional endpoint
@@ -41,7 +43,6 @@ filter_chains:
       - filter: gcp_adc
         # source: adc   # default: GOOGLE_APPLICATION_CREDENTIALS, else GKE metadata
         # scope: https://www.googleapis.com/auth/cloud-platform
-        # refresh_ratio: 0.75
 
 insecure_options:
   allow_private_endpoints: true # example proxies to a local backend

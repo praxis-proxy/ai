@@ -11,10 +11,13 @@ Summarizes conversation history when the token count exceeds a configured thresh
 
 Compaction only applies to multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history. Single-turn requests are released without compaction.
 
+Praxis runs `StreamBuffer` body hooks before header-phase request filters. This filter therefore requires `allow_pre_security_callout: true` and should only be used behind an outer authentication and authorization boundary.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `allow_pre_security_callout` | bool | no | Allow summarization callouts from the `StreamBuffer` pre-read phase, before header-phase security filters execute. This must be explicitly enabled only when an outer trust boundary authenticates and authorizes requests before they reach this listener. |
 | `inference_url` | string | yes | URL of the inference backend for summarization calls. E.g., `"http://localhost:11434/v1/chat/completions"` |
 | `default_model` | string | no | Default model for summarization when not overridden in the request's `context_management`. |
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
@@ -28,6 +31,7 @@ Compaction only applies to multi-turn requests where `openai_responses_rehydrate
 
 ```yaml
 filter: openai_responses_compact
+allow_pre_security_callout: true
 inference_url: "http://localhost:11434/v1/chat/completions"
 default_model: llama3.2:1b
 ```
@@ -36,6 +40,7 @@ default_model: llama3.2:1b
 
 ```yaml
 filter: openai_responses_compact
+allow_pre_security_callout: true
 inference_url: "http://localhost:11434/v1/chat/completions"
 default_model: gpt-4o-mini
 tiktoken_encoding: cl100k_base

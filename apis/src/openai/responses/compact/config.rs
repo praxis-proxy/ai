@@ -22,6 +22,15 @@ const DEFAULT_STATUS_ON_ERROR: u16 = 502;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CompactFilterConfig {
+    /// Allow summarization callouts from the `StreamBuffer` pre-read
+    /// phase, before header-phase security filters execute.
+    ///
+    /// This must be explicitly enabled only when an outer trust
+    /// boundary authenticates and authorizes requests before they
+    /// reach this listener.
+    #[serde(default)]
+    pub allow_pre_security_callout: bool,
+
     /// URL of the inference backend for summarization calls.
     /// E.g., `"http://localhost:11434/v1/chat/completions"`
     pub inference_url: String,
@@ -86,10 +95,12 @@ const SUPPORTED_ENCODINGS: &[&str] = &["cl100k_base", "o200k_base"];
 ///
 /// # Errors
 ///
-/// Returns [`FilterError`] if `inference_url` is empty,
-/// `tiktoken_encoding` is not a supported encoding name,
-/// `timeout_ms` is zero, or `status_on_error` is out of range.
+/// Returns [`FilterError`] if `allow_pre_security_callout` is not
+/// `true`, `inference_url` is empty, `tiktoken_encoding` is not a
+/// supported encoding name, `timeout_ms` is zero, or
+/// `status_on_error` is out of range.
 pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig, FilterError> {
+    validate_pre_security_callout(raw)?;
     if raw.inference_url.is_empty() {
         return Err(FilterError::from("openai_responses_compact: inference_url is empty"));
     }
@@ -123,6 +134,17 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
     })
 }
 
+/// Require explicit acknowledgement of the pre-read security boundary.
+fn validate_pre_security_callout(cfg: &CompactFilterConfig) -> Result<(), FilterError> {
+    if !cfg.allow_pre_security_callout {
+        return Err(
+            "openai_responses_compact: 'allow_pre_security_callout' must be true because StreamBuffer body callouts run before header-phase security filters; place authentication and authorization in an outer trust boundary"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
@@ -150,5 +172,15 @@ mod yaml_tests {
         let cfg: CompactFilterConfig =
             serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions").expect("should deserialize");
         assert_eq!(cfg.on_failure, None);
+    }
+
+    #[test]
+    fn pre_security_callout_defaults_to_false() {
+        let cfg: CompactFilterConfig =
+            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions").expect("should deserialize");
+        assert!(
+            !cfg.allow_pre_security_callout,
+            "pre-security callouts must be disabled until explicitly acknowledged"
+        );
     }
 }

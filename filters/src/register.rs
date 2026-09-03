@@ -23,7 +23,7 @@ use crate::{
 /// Register all in-tree AI HTTP filters into `registry`.
 ///
 /// When `subrequest_client` is provided, filters that make HTTP
-/// callouts (`openai_file_resolve`, `openai_web_search`,
+/// callouts (`ai_guardrails`, `openai_file_resolve`, `openai_web_search`,
 /// `anthropic_web_search`) capture the
 /// shared client instead of creating isolated per-filter connectors.
 ///
@@ -45,6 +45,7 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     #[cfg(feature = "gcp-adc-filter")]
     register_gcp_filters(registry);
     register_general_ai_filters(registry);
+    register_ai_guardrails(registry, subrequest_client);
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
     register_routing_filters(registry);
@@ -100,10 +101,6 @@ fn register_gcp_filters(registry: &mut FilterRegistry) {
 
 /// Register general-purpose AI filters.
 fn register_general_ai_filters(registry: &mut FilterRegistry) {
-    praxis_filter::register_filters!(
-        @register registry,
-        http "ai_guardrails" => AiGuardrailsFilter::from_config
-    );
     #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -278,6 +275,28 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 // -----------------------------------------------------------------------------
 // Sub-request-aware registration
 // -----------------------------------------------------------------------------
+
+/// Register `ai_guardrails` with the shared client when
+/// available, otherwise fall back to an isolated per-filter connector.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "ai_guardrails",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    AiGuardrailsFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'ai_guardrails'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "ai_guardrails" => AiGuardrailsFilter::from_config
+        );
+    }
+}
 
 /// Register `anthropic_web_search` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.

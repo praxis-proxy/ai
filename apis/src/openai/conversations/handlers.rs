@@ -12,7 +12,7 @@ use serde::{
     de::{DeserializeOwned, MapAccess, Visitor, value::MapAccessDeserializer},
 };
 use serde_json::{Map, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{
     contracts::{
@@ -32,6 +32,16 @@ use crate::{
     },
     store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
 };
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Maximum compare-and-swap retries before [`sync_conversation_messages`] gives
+/// up on refreshing the cache. Each failed swap means another writer refreshed
+/// the cache first from the same authoritative rows, so a small bound absorbs
+/// realistic append contention.
+const MAX_SYNC_ATTEMPTS: usize = 8;
 
 // -----------------------------------------------------------------------------
 // ItemListParams
@@ -266,7 +276,6 @@ pub(super) async fn handle_delete_conversation(
 
 /// Handle `POST /v1/conversations/{id}/items` — create items.
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
-#[expect(clippy::large_stack_frames, reason = "Pingora context types are large")]
 pub(super) async fn handle_create_items(
     ctx: &HttpFilterContext<'_>,
     store: &dyn ConversationItemStore,
@@ -337,7 +346,7 @@ pub(super) async fn handle_create_items(
     if let Err(e) = store.create_conversation_items(&item_records).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
-    if let Err(e) = sync_conversation_messages(store, existing).await {
+    if let Err(e) = sync_conversation_messages(store, tenant_id, conversation_id, Some(existing.messages)).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     debug!(
@@ -481,7 +490,8 @@ pub(super) async fn handle_delete_item(
         .await
     {
         Ok(true) => {
-            if let Err(e) = sync_conversation_messages(store, existing).await {
+            if let Err(e) = sync_conversation_messages(store, tenant_id, conversation_id, Some(existing.messages)).await
+            {
                 return Ok(FilterAction::Reject(store_error_response(&e)?));
             }
             debug!(conversation_id, item_id, tenant_id, "conversation item deleted");
@@ -918,27 +928,108 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
 
 /// Refresh the denormalized conversation message cache from item rows.
 ///
+/// The cache is rebuilt from the authoritative item rows and written back with
+/// a compare-and-swap so a slower writer cannot clobber a newer cache with a
+/// stale snapshot. Concurrent item appends each insert their rows and then
+/// refresh this cache; without the compare-and-swap a slow writer could commit
+/// an older `messages` snapshot after a newer writer, dropping the newer
+/// writer's items from the denormalized history that rehydration consumes
+/// (#662).
+///
+/// A caller that read the cache just before its row mutation passes that value
+/// as `snapshot` to seed the first swap's expected value, skipping a redundant
+/// reload; the value written is always a fresh rebuild, so the snapshot only
+/// decides whether that first swap lands. Callers without a snapshot (the
+/// response append-back path) pass `None`. On a conflict the snapshot is dropped
+/// and later attempts re-read the live cache, so every committed row is visible
+/// to the retry's rebuild and the cache converges to include all items.
+///
+/// Callers invoke this only after the authoritative item-row mutation is durably
+/// committed, so the cache is a derived view that any later write rebuilds. If
+/// the retries are exhausted under sustained contention this returns `Ok(())`
+/// rather than an error: failing here would report an already-committed
+/// create/delete as failed and drive the client into duplicate-item or
+/// not-found retries. Genuine store errors — including the conversation
+/// disappearing mid-sync — still propagate.
+///
 /// This currently re-reads all items on every mutation. Conversations are not
 /// assumed to be small: the OpenAI contract has no cumulative item or byte
 /// ceiling. Replace this full-history rebuild with incremental processing; do
 /// not add a non-spec conversation limit as a workaround. Tracked in #532.
 pub(super) async fn sync_conversation_messages(
     store: &dyn ConversationItemStore,
-    record: ConversationRecord,
+    tenant_id: &str,
+    conversation_id: &str,
+    mut snapshot: Option<Value>,
 ) -> Result<(), StoreError> {
-    let messages =
-        Value::Array(collect_conversation_messages(store, &record.tenant_id, &record.conversation_id).await?);
-    let updated = store
-        .update_conversation_messages(&record.tenant_id, &record.conversation_id, &messages)
-        .await?;
-    if updated {
-        Ok(())
-    } else {
-        Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {}",
-            record.conversation_id
-        )))
+    for _ in 0..MAX_SYNC_ATTEMPTS {
+        if Box::pin(try_sync_conversation_messages(
+            store,
+            tenant_id,
+            conversation_id,
+            snapshot.take(),
+        ))
+        .await?
+        {
+            return Ok(());
+        }
     }
+
+    // The item-row mutation this refresh follows is already durably committed and
+    // any later write rebuilds the cache, so abandoning the refresh must not fail
+    // the request that already succeeded.
+    warn!(
+        conversation_id,
+        attempts = MAX_SYNC_ATTEMPTS,
+        "conversation message cache refresh abandoned after repeated compare-and-swap \
+         contention; a later write will rebuild it"
+    );
+    Ok(())
+}
+
+/// Attempt one compare-and-swap refresh of the denormalized message cache.
+///
+/// `expected` seeds the swap's expected value: `Some` is the caller's snapshot,
+/// read before its row mutation, which lets this attempt skip reloading the
+/// cache; `None` re-reads the live cache (and reports a disappeared
+/// conversation). Either way the value written is a fresh rebuild from the item
+/// rows, so a stale `expected` only ever loses the swap — it never writes stale
+/// data.
+///
+/// Returns `Ok(true)` when the cache is up to date — either already current or
+/// swapped in this call — and `Ok(false)` when a concurrent writer won the swap
+/// and the caller should retry with a freshly read snapshot.
+async fn try_sync_conversation_messages(
+    store: &dyn ConversationItemStore,
+    tenant_id: &str,
+    conversation_id: &str,
+    expected: Option<Value>,
+) -> Result<bool, StoreError> {
+    // Optimistic first pass: the caller's pre-mutation snapshot is the expected
+    // value, so no cache reload is needed. The rebuild below is still fresh, so a
+    // snapshot that no longer matches only costs a lost swap and a retry.
+    if let Some(expected) = expected {
+        let messages = Value::Array(collect_conversation_messages(store, tenant_id, conversation_id).await?);
+        return store
+            .compare_and_swap_conversation_messages(tenant_id, conversation_id, &expected, &messages)
+            .await;
+    }
+
+    // No snapshot: read the live cache as the expected value before rebuilding, so
+    // the rebuilt view is at least as fresh as the cache it replaces and a
+    // successful swap can never drop a committed row.
+    let Some(current) = store.get_conversation(tenant_id, conversation_id).await? else {
+        return Err(StoreError::Database(format!(
+            "conversation disappeared during message sync: {conversation_id}"
+        )));
+    };
+    let messages = Value::Array(collect_conversation_messages(store, tenant_id, conversation_id).await?);
+    if current.messages == messages {
+        return Ok(true);
+    }
+    store
+        .compare_and_swap_conversation_messages(tenant_id, conversation_id, &current.messages, &messages)
+        .await
 }
 
 /// Collect all item JSON values for a conversation in ascending order.
@@ -970,7 +1061,12 @@ async fn collect_conversation_messages(
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
     use super::*;
+    use crate::store::SqliteResponseStore;
 
     // -------------------------------------------------------------------------
     // store_error_response
@@ -1272,5 +1368,437 @@ mod tests {
             result.unwrap_err().contains("conversation id"),
             "error should name the conversation id segment"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // sync_conversation_messages — denormalized cache consistency (#662)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sync_repairs_stale_cache_from_item_rows() {
+        let store = cache_sync_store().await;
+        seed_conversation(&store, "conv_stale", &["a", "b", "c"]).await;
+        // Corrupt the denormalized cache so it omits every item.
+        store
+            .update_conversation_messages("tenant_a", "conv_stale", &Value::Array(vec![]))
+            .await
+            .expect("stale update should succeed");
+
+        // The append-back path supplies no snapshot, so it re-reads the live cache.
+        sync_conversation_messages(&store, "tenant_a", "conv_stale", None)
+            .await
+            .expect("sync should succeed");
+
+        // Sync should rebuild the cache from all item rows.
+        assert_cache_ids(&store, "conv_stale", &["a", "b", "c"]).await;
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_clobber_concurrent_cache_update() {
+        let inner = cache_sync_store().await;
+        // Seed conversation with item "a" and a matching cache.
+        seed_conversation(&inner, "conv_race", &["a"]).await;
+        // Writer A reads the cache (the create path's snapshot) before appending its
+        // own item "x" (rows now [a, x]; cache still [a]).
+        let snapshot = read_cache(&inner, "conv_race").await;
+        inner
+            .create_conversation_items(&[cache_item("x", "conv_race", 2)])
+            .await
+            .expect("append should succeed");
+
+        // A concurrent writer commits item "b" and refreshes the cache during
+        // A's rebuild read.
+        let store = InterferingStore::new(
+            inner,
+            Interference::ConcurrentAppendOnFirstList,
+            Some(cache_item("b", "conv_race", 3)),
+        );
+
+        sync_conversation_messages(&store, "tenant_a", "conv_race", Some(snapshot))
+            .await
+            .expect("sync should converge under contention");
+
+        // The cache must retain both the concurrent writer's item (b) and writer A's (x).
+        assert_cache_ids(&store, "conv_race", &["a", "b", "x"]).await;
+    }
+
+    #[tokio::test]
+    async fn sync_missing_conversation_reports_error() {
+        let store = cache_sync_store().await;
+        let err = sync_conversation_messages(&store, "tenant_a", "conv_missing", None)
+            .await
+            .expect_err("sync on a missing conversation should error");
+        assert!(
+            matches!(err, StoreError::Database(_)),
+            "missing conversation should map to a database error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_reports_success_when_cache_never_converges() {
+        let inner = cache_sync_store().await;
+        seed_conversation(&inner, "conv_contended", &["a", "b"]).await;
+        // Leave the cache stale versus the item rows so every attempt reaches the
+        // compare-and-swap instead of returning early on an already-current cache.
+        inner
+            .update_conversation_messages("tenant_a", "conv_contended", &Value::Array(vec![]))
+            .await
+            .expect("stale update should succeed");
+
+        // Every compare-and-swap loses the race, so the retry budget is exhausted.
+        let store = InterferingStore::new(inner, Interference::AlwaysLoseCas, None);
+
+        // The item mutation this refresh follows is already durable, so exhausting
+        // retries must not surface as an error — callers turn a sync error into an
+        // HTTP 500 for a committed create/delete, which clients retry into
+        // duplicate-item or not-found responses (#662 review follow-up).
+        sync_conversation_messages(&store, "tenant_a", "conv_contended", None)
+            .await
+            .expect("cache-sync exhaustion must not fail an already-committed mutation");
+
+        assert_eq!(
+            store.cas_attempts.load(Ordering::SeqCst),
+            MAX_SYNC_ATTEMPTS,
+            "every retry should attempt the compare-and-swap before giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_uses_caller_snapshot_without_reloading_cache() {
+        let inner = cache_sync_store().await;
+        seed_conversation(&inner, "conv_snap", &["a"]).await;
+        // The create path reads the cache before appending, so capture that snapshot.
+        let snapshot = read_cache(&inner, "conv_snap").await;
+        inner
+            .create_conversation_items(&[cache_item("x", "conv_snap", 2)])
+            .await
+            .expect("append should succeed");
+        let store = InterferingStore::new(inner, Interference::PassThrough, None);
+
+        sync_conversation_messages(&store, "tenant_a", "conv_snap", Some(snapshot))
+            .await
+            .expect("sync should succeed on the first attempt");
+
+        assert_eq!(
+            store.read_attempts.load(Ordering::SeqCst),
+            0,
+            "a matching snapshot must satisfy the first swap without reloading the cache"
+        );
+        assert_eq!(
+            store.cas_attempts.load(Ordering::SeqCst),
+            1,
+            "a valid snapshot should land the swap on the first attempt"
+        );
+
+        // The swap should write the freshly rebuilt history.
+        assert_cache_ids(&store, "conv_snap", &["a", "x"]).await;
+    }
+
+    #[tokio::test]
+    async fn sync_falls_back_to_fresh_read_after_snapshot_conflict() {
+        let inner = cache_sync_store().await;
+        seed_conversation(&inner, "conv_fallback", &["a"]).await;
+        inner
+            .create_conversation_items(&[cache_item("x", "conv_fallback", 2)])
+            .await
+            .expect("append should succeed");
+        let store = InterferingStore::new(inner, Interference::PassThrough, None);
+
+        // A stale snapshot (empty) never matches the live cache, so the first swap
+        // loses and the sync must re-read the live cache to converge.
+        sync_conversation_messages(&store, "tenant_a", "conv_fallback", Some(Value::Array(vec![])))
+            .await
+            .expect("sync should converge after falling back to a fresh read");
+
+        assert_eq!(
+            store.cas_attempts.load(Ordering::SeqCst),
+            2,
+            "the stale snapshot should cost one lost swap before the fresh-read retry"
+        );
+        assert_eq!(
+            store.read_attempts.load(Ordering::SeqCst),
+            1,
+            "exactly one fresh cache read should follow the snapshot conflict"
+        );
+
+        // The fallback retry should rebuild the full history.
+        assert_cache_ids(&store, "conv_fallback", &["a", "x"]).await;
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    /// Build an items-enabled in-memory SQLite store for cache-sync tests.
+    async fn cache_sync_store() -> SqliteResponseStore {
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_responses",
+            "test_conversations",
+            Some("test_conversation_items"),
+            None,
+        )
+        .await
+        .expect("store creation should succeed")
+    }
+
+    /// A conversation item whose `item_data` carries its own id for assertions.
+    fn cache_item(item_id: &str, conversation_id: &str, position: i64) -> ConversationItemRecord {
+        ConversationItemRecord {
+            item_id: item_id.to_owned(),
+            tenant_id: "tenant_a".to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            item_data: serde_json::json!({
+                "id": item_id,
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": item_id}],
+            }),
+            created_at: 1000,
+            position,
+        }
+    }
+
+    /// Sorted item ids extracted from a denormalized `messages` cache value.
+    fn cache_ids(messages: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = messages
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Read the denormalized `messages` cache for a conversation.
+    async fn read_cache(store: &SqliteResponseStore, conversation_id: &str) -> Value {
+        ConversationItemStore::get_conversation(store, "tenant_a", conversation_id)
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist")
+            .messages
+    }
+
+    /// Assert the denormalized cache holds exactly `expected` item ids (sorted).
+    async fn assert_cache_ids(store: &dyn ConversationItemStore, conversation_id: &str, expected: &[&str]) {
+        let refreshed = store
+            .get_conversation("tenant_a", conversation_id)
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist");
+        let expected: Vec<String> = expected.iter().copied().map(str::to_owned).collect();
+        assert_eq!(
+            cache_ids(&refreshed.messages),
+            expected,
+            "cache should contain exactly the expected item ids"
+        );
+    }
+
+    /// Seed a conversation record plus its item rows and a matching cache.
+    async fn seed_conversation(store: &SqliteResponseStore, conversation_id: &str, item_ids: &[&str]) {
+        let items: Vec<ConversationItemRecord> = item_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| cache_item(id, conversation_id, i64::try_from(i + 1).unwrap()))
+            .collect();
+        let messages = Value::Array(items.iter().map(|it| it.item_data.clone()).collect());
+        store
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: conversation_id.to_owned(),
+                tenant_id: "tenant_a".to_owned(),
+                created_at: 1000,
+                metadata: Value::Object(Map::new()),
+                messages,
+            })
+            .await
+            .expect("seed conversation should succeed");
+        if !items.is_empty() {
+            store
+                .create_conversation_items(&items)
+                .await
+                .expect("seed items should succeed");
+        }
+    }
+
+    /// How an [`InterferingStore`] perturbs an in-flight `sync_conversation_messages`.
+    enum Interference {
+        /// Every compare-and-swap reports a lost race, modeling a conversation under
+        /// sustained contention where this writer never wins the swap.
+        AlwaysLoseCas,
+        /// The first `list_conversation_items` call (the rebuild read) returns the
+        /// pre-injection rows, then commits an extra item row and refreshes the
+        /// denormalized cache to include it — the #662 interleaving where a slower
+        /// writer must not clobber the newer cache with its stale snapshot.
+        ConcurrentAppendOnFirstList,
+        /// No injected fault: delegate every operation. Used to observe the snapshot
+        /// fast path and its cache-read count in isolation.
+        PassThrough,
+    }
+
+    /// Store wrapper that injects a controlled concurrency fault into the cache-sync
+    /// path while delegating every other operation to a real SQLite store.
+    struct InterferingStore {
+        cas_attempts: AtomicUsize,
+        fired: AtomicBool,
+        injected_item: Option<ConversationItemRecord>,
+        inner: SqliteResponseStore,
+        interference: Interference,
+        read_attempts: AtomicUsize,
+    }
+
+    impl InterferingStore {
+        /// Wrap a real store with a controlled fault and zeroed observation counters.
+        fn new(
+            inner: SqliteResponseStore,
+            interference: Interference,
+            injected_item: Option<ConversationItemRecord>,
+        ) -> Self {
+            Self {
+                cas_attempts: AtomicUsize::new(0),
+                fired: AtomicBool::new(false),
+                injected_item,
+                inner,
+                interference,
+                read_attempts: AtomicUsize::new(0),
+            }
+        }
+
+        /// Commit the concurrent writer's item and refresh the cache from all rows.
+        async fn commit_concurrent_writer(&self, tenant_id: &str, conversation_id: &str) -> Result<(), StoreError> {
+            let Some(item) = self.injected_item.as_ref() else {
+                return Ok(());
+            };
+            self.inner.create_conversation_items(std::slice::from_ref(item)).await?;
+            let all = self
+                .inner
+                .list_conversation_items(tenant_id, conversation_id, None, MAX_PAGE_LIMIT, true)
+                .await?;
+            let cache = Value::Array(all.into_iter().map(|r| r.item_data).collect());
+            self.inner
+                .update_conversation_messages(tenant_id, conversation_id, &cache)
+                .await
+                .map(|_updated| ())
+        }
+    }
+
+    #[async_trait]
+    impl ConversationItemStore for InterferingStore {
+        async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
+            self.inner.upsert_conversation(record).await
+        }
+
+        async fn update_conversation_messages(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            messages: &Value,
+        ) -> Result<bool, StoreError> {
+            self.inner
+                .update_conversation_messages(tenant_id, conversation_id, messages)
+                .await
+        }
+
+        async fn compare_and_swap_conversation_messages(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            expected_messages: &Value,
+            messages: &Value,
+        ) -> Result<bool, StoreError> {
+            self.cas_attempts.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.interference, Interference::AlwaysLoseCas) {
+                // Model a writer that is always beaten to the swap.
+                return Ok(false);
+            }
+            self.inner
+                .compare_and_swap_conversation_messages(tenant_id, conversation_id, expected_messages, messages)
+                .await
+        }
+
+        async fn get_conversation(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+        ) -> Result<Option<ConversationRecord>, StoreError> {
+            self.read_attempts.fetch_add(1, Ordering::SeqCst);
+            ConversationItemStore::get_conversation(&self.inner, tenant_id, conversation_id).await
+        }
+
+        async fn delete_conversation(&self, tenant_id: &str, conversation_id: &str) -> Result<bool, StoreError> {
+            self.inner.delete_conversation(tenant_id, conversation_id).await
+        }
+
+        async fn create_conversation_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+            self.inner.create_conversation_items(items).await
+        }
+
+        async fn list_conversation_items(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            after_item_id: Option<&str>,
+            limit: u32,
+            ascending: bool,
+        ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+            let rows = self
+                .inner
+                .list_conversation_items(tenant_id, conversation_id, after_item_id, limit, ascending)
+                .await?;
+            if matches!(self.interference, Interference::ConcurrentAppendOnFirstList)
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                self.commit_concurrent_writer(tenant_id, conversation_id).await?;
+            }
+            Ok(rows)
+        }
+
+        async fn get_existing_conversation_item_ids(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            item_ids: &[&str],
+        ) -> Result<Vec<String>, StoreError> {
+            self.inner
+                .get_existing_conversation_item_ids(tenant_id, conversation_id, item_ids)
+                .await
+        }
+
+        async fn get_conversation_item(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            item_id: &str,
+        ) -> Result<Option<ConversationItemRecord>, StoreError> {
+            self.inner
+                .get_conversation_item(tenant_id, conversation_id, item_id)
+                .await
+        }
+
+        async fn delete_conversation_item(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            item_id: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner
+                .delete_conversation_item(tenant_id, conversation_id, item_id)
+                .await
+        }
+
+        async fn conversation_item_position(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            item_id: &str,
+        ) -> Result<Option<i64>, StoreError> {
+            self.inner
+                .conversation_item_position(tenant_id, conversation_id, item_id)
+                .await
+        }
+
+        async fn max_item_position(&self, tenant_id: &str, conversation_id: &str) -> Result<i64, StoreError> {
+            self.inner.max_item_position(tenant_id, conversation_id).await
+        }
     }
 }

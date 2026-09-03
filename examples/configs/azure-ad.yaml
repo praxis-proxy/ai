@@ -2,9 +2,9 @@
 #
 # Acquires an Entra ID bearer token via the client-credentials grant
 # and injects "Authorization: Bearer <token>" on every proxied
-# request to Azure OpenAI. The token is cached in memory and refreshed
-# in the background before it expires; the downstream client never
-# sees Entra ID.
+# request to Azure OpenAI. The token is cached in memory (cache-through:
+# a request that finds the cache stale fetches a fresh token inline
+# before proceeding); the downstream client never sees Entra ID.
 #
 # This filter only injects the Authorization header — it does NOT
 # manage the upstream Host. Point the backend cluster at your Azure
@@ -40,7 +40,6 @@ filter_chains:
         scope: https://cognitiveservices.azure.com/.default
         client_secret_env_var: AZURE_CLIENT_SECRET
         # authority_host: login.microsoftonline.com  # optional, for sovereign clouds
-        # refresh_ratio: 0.75                         # optional, refresh at 75% of TTL
 
 insecure_options:
   allow_private_endpoints: true # example proxies to a local backend

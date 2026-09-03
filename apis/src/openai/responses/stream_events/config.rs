@@ -32,8 +32,9 @@ pub(crate) struct StreamEventsConfig {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 
-    /// Maximum bytes accumulated per function-call argument string
-    /// from `function_call_arguments.delta` events. Default: 1 MiB.
+    /// Maximum bytes accepted per function-call argument string from
+    /// `function_call_arguments.delta` or `function_call_arguments.done` events.
+    /// Default: 1 MiB.
     #[serde(default)]
     pub max_tool_call_argument_bytes: Option<usize>,
 }

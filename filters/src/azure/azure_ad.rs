@@ -11,19 +11,30 @@
 //! # Overview
 //!
 //! Enterprise Azure deployments prohibit static API keys and require an
-//! `OAuth2` bearer token from Entra ID. This filter acquires such a token
-//! via the **client-credentials** grant, caches it, refreshes it in the
-//! background before it expires, and injects `Authorization: Bearer
-//! <token>` on every proxied request. The downstream client is unaware
-//! of Entra ID.
+//! `OAuth2` bearer token from Entra ID. This filter acquires such a
+//! token via the **client-credentials** grant and injects
+//! `Authorization: Bearer <token>` on every proxied request. The
+//! downstream client is unaware of Entra ID.
+//!
+//! # Caching: cache-through, not refresh-ahead
+//!
+//! There is no background refresh thread. Every request checks the
+//! cached token; if it is still valid (outside the [`EXPIRY_SKEW`]
+//! safety margin) it is used immediately with no network call. If it is
+//! missing or stale, that request's handling acquires a fresh token
+//! inline before proceeding — see
+//! [`praxis_ai_apis::token_cache::TokenCache`] for the exact
+//! cache-through/double-checked-locking contract, including how
+//! concurrent requests that all observe a stale cache still trigger at
+//! most one token-endpoint call.
 //!
 //! # Scope
 //!
 //! This filter currently supports the **client-secret** credential only.
 //! Managed identity (AKS/IMDS), client certificates (`private_key_jwt`
 //! assertions), and OIDC/workload-identity federation are planned
-//! follow-ups; they slot into the same token-cache/refresh machinery
-//! this filter already uses, with no change to request handling.
+//! follow-ups; they slot into the same cache-through machinery this
+//! filter already uses, with no change to request handling.
 //!
 //! # Routing vs. authentication
 //!
@@ -38,14 +49,11 @@
 //!
 //! # Failure behavior
 //!
-//! The filter **fails closed**: until the first token is acquired, and
-//! whenever the cached token is missing or expired, requests are
-//! rejected with `503` rather than forwarded unauthenticated. Token
-//! acquisition happens asynchronously in the background so that building
-//! or hot-reloading a pipeline never blocks on a network round-trip to
-//! Entra ID. Repeated acquisition failures back off exponentially (up to
-//! 15 minutes) so an unreachable endpoint does not become a tight retry
-//! loop.
+//! The filter **fails closed**: whenever no valid token can be produced
+//! — none cached and the inline fetch fails — the request is rejected
+//! with `503` rather than forwarded unauthenticated. There is no
+//! server-side retry loop; a failed fetch is not cached, so the next
+//! request simply tries again.
 //!
 //! # YAML config
 //!
@@ -56,23 +64,17 @@
 //! scope: https://cognitiveservices.azure.com/.default
 //! client_secret_env_var: AZURE_CLIENT_SECRET
 //! authority_host: login.microsoftonline.com   # optional, for sovereign clouds
-//! refresh_ratio: 0.75                          # optional, refresh at 75% of the usable lifetime
 //! ```
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
-use arc_swap::ArcSwap;
 use http::{HeaderValue, header};
+use praxis_ai_apis::token_cache::TokenCache;
 use praxis_filter::FilterError;
 use serde::Deserialize;
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 // -----------------------------------------------------------------------------
@@ -81,55 +83,11 @@ use tracing::warn;
 
 /// Treat a cached token as expired this long before its real expiry, so
 /// a token is never injected onto a request that could outlive it in
-/// flight.
+/// flight. Passed to [`TokenCache::new`] as its safety margin.
 const EXPIRY_SKEW: Duration = Duration::from_secs(30);
-
-/// Base delay before retrying after a failed token acquisition. Grows
-/// exponentially with consecutive failures, capped at
-/// [`MAX_RETRY_BACKOFF`].
-const RETRY_BACKOFF: Duration = Duration::from_secs(30);
-
-/// Upper bound on the exponential retry backoff, so a persistently
-/// unreachable token endpoint settles into an infrequent poll rather than
-/// a tight loop.
-const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(900);
-
-/// Lower bound on the scheduled refresh delay, so a pathologically small
-/// `expires_in` from the token endpoint cannot spin the refresher.
-const MIN_REFRESH_DELAY: Duration = Duration::from_secs(1);
 
 /// Timeout for a single token-endpoint round-trip.
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long [`RefreshHandle::drop`] waits for the refresher thread to
-/// exit before giving up and logging.
-const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
-
-// -----------------------------------------------------------------------------
-// Cached token
-// -----------------------------------------------------------------------------
-
-/// A bearer token cached in memory, pre-formatted for injection.
-///
-/// The token is stored as a ready-to-use `Authorization` header value so
-/// the request hot path does no string work — it clones a `HeaderValue`
-/// and nothing more.
-struct CachedToken {
-    /// The complete `Authorization` header value (`"Bearer <token>"`),
-    /// marked sensitive so it is redacted from header debug output.
-    authorization: HeaderValue,
-
-    /// Instant, already adjusted by [`EXPIRY_SKEW`], after which the
-    /// token must not be used.
-    expires_at: Instant,
-}
-
-impl CachedToken {
-    /// Whether the token is still safe to inject at `now`.
-    fn is_valid(&self, now: Instant) -> bool {
-        now < self.expires_at
-    }
-}
 
 // -----------------------------------------------------------------------------
 // Token endpoint
@@ -150,8 +108,9 @@ struct TokenResponse {
 /// client-credentials grant.
 ///
 /// Returns the ready-to-inject `Authorization` header value and the
-/// token's lifetime. Kept free of [`CachedToken`]/[`Instant`] so it can
-/// be unit-tested against a local mock endpoint.
+/// token's lifetime. Kept free of caching concerns so it can be
+/// unit-tested against a local mock endpoint, and so it fits
+/// [`TokenCache::get_or_refresh`]'s `fetch` closure shape directly.
 ///
 /// # Errors
 ///
@@ -201,208 +160,6 @@ async fn fetch_token(
     Ok((authorization, Duration::from_secs(token.expires_in)))
 }
 
-/// Compute how long to wait before the next refresh: `lifetime * ratio`,
-/// floored at [`MIN_REFRESH_DELAY`]. Callers pass the skew-adjusted
-/// usable lifetime, not the raw TTL, so the refresh always fires while
-/// the cached token is still valid.
-fn refresh_delay(lifetime: Duration, ratio: f64) -> Duration {
-    lifetime.mul_f64(ratio).max(MIN_REFRESH_DELAY)
-}
-
-/// Safety margin to subtract from a token's TTL before caching its
-/// expiry. Normally [`EXPIRY_SKEW`], but never more than half the TTL, so
-/// a short-lived token stays usable for part of its life instead of being
-/// cached already-expired (which would fail every request closed).
-fn effective_skew(ttl: Duration) -> Duration {
-    EXPIRY_SKEW.min(ttl / 2)
-}
-
-/// Exponential backoff after `failures` consecutive fetch failures:
-/// `RETRY_BACKOFF * 2^(failures - 1)`, capped at [`MAX_RETRY_BACKOFF`].
-fn retry_backoff(failures: u32) -> Duration {
-    // Bound the shift so it can never exceed u32 width; the result is
-    // capped anyway, so a large shift just saturates to the ceiling.
-    let shift = failures.saturating_sub(1).min(20);
-    RETRY_BACKOFF.saturating_mul(1_u32 << shift).min(MAX_RETRY_BACKOFF)
-}
-
-// -----------------------------------------------------------------------------
-// Background refresher
-// -----------------------------------------------------------------------------
-
-/// Inputs the background refresher needs to acquire and cache tokens.
-struct RefresherParams {
-    /// Fully-formed token endpoint URL.
-    token_url: String,
-
-    /// Application (client) ID.
-    client_id: String,
-
-    /// Client secret, resolved from the configured environment variable.
-    client_secret: String,
-
-    /// `OAuth2` scope (e.g. `https://cognitiveservices.azure.com/.default`).
-    scope: String,
-
-    /// Fraction of a token's usable lifetime (TTL minus the expiry
-    /// safety margin) at which to refresh it.
-    refresh_ratio: f64,
-
-    /// Shared cache the filter's hot path reads from.
-    shared: Arc<ArcSwap<Option<CachedToken>>>,
-}
-
-/// Owns the background refresher thread and stops it on drop.
-///
-/// Dropping the handle cancels the refresher (the filter pipeline was
-/// swapped or shut down) and joins the thread, bounded by
-/// [`JOIN_TIMEOUT`]. This is the shutdown signal required for background
-/// tasks.
-struct RefreshHandle {
-    /// Cancellation signal for the refresher loop.
-    shutdown: CancellationToken,
-
-    /// Refresher thread join handle.
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Drop for RefreshHandle {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "Drop is sync; tokio::time::sleep cannot be used here (mirrors routing::overlay)"
-    )]
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-        if let Some(handle) = self.thread.take() {
-            let start = Instant::now();
-            while !handle.is_finished() {
-                if start.elapsed() >= JOIN_TIMEOUT {
-                    warn!(
-                        timeout_secs = JOIN_TIMEOUT.as_secs(),
-                        "azure_ad: token refresher thread did not exit within timeout"
-                    );
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            drop(handle.join());
-        }
-    }
-}
-
-/// Spawn the background token refresher on a dedicated thread with its
-/// own current-thread runtime (mirrors `routing::overlay`), so token
-/// acquisition never blocks the pipeline build or the request hot path.
-fn spawn_refresher(params: RefresherParams) -> RefreshHandle {
-    let shutdown = CancellationToken::new();
-    let token = shutdown.clone();
-
-    let thread = std::thread::Builder::new()
-        .name("azure-ad-token-refresher".to_owned())
-        .spawn(
-            move || match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime.block_on(refresh_loop(params, token)),
-                Err(error) => {
-                    warn!(%error, "azure_ad: failed to create refresher runtime; tokens will not be acquired");
-                },
-            },
-        );
-
-    let thread = match thread {
-        Ok(handle) => Some(handle),
-        Err(error) => {
-            // Without the refresher the cache stays empty and every
-            // request fails closed (503) — safe, but log loudly.
-            warn!(%error, "azure_ad: failed to spawn token refresher thread; requests will fail closed");
-            None
-        },
-    };
-
-    RefreshHandle { shutdown, thread }
-}
-
-/// Acquire a token once and publish it to the shared cache.
-///
-/// Returns `Some(delay)` — the delay until the next scheduled refresh —
-/// on success, or `None` on failure. On failure the cache is left
-/// untouched, so a still-valid token keeps serving.
-async fn refresh_once(client: &reqwest::Client, params: &RefresherParams) -> Option<Duration> {
-    match fetch_token(
-        client,
-        &params.token_url,
-        &params.client_id,
-        &params.client_secret,
-        &params.scope,
-    )
-    .await
-    {
-        Ok((authorization, ttl)) => {
-            if ttl <= EXPIRY_SKEW {
-                warn!(
-                    ttl_secs = ttl.as_secs(),
-                    "azure_ad: token TTL is unusually short; validity margin reduced"
-                );
-            }
-            Some(publish_token(params, authorization, ttl))
-        },
-        Err(error) => {
-            warn!(%error, "azure_ad: token refresh failed; will retry");
-            None
-        },
-    }
-}
-
-/// Cache a freshly fetched token and return the delay until the next
-/// scheduled refresh.
-///
-/// Both the cached expiry and the refresh schedule are computed from the
-/// skew-adjusted usable lifetime. Scheduling from the raw TTL instead
-/// (`ratio * ttl`) can land past `ttl - skew`, leaving a window every
-/// cycle where the cached token is already invalid but the refresh has
-/// not fired yet — deterministic 503s on a healthy token endpoint.
-fn publish_token(params: &RefresherParams, authorization: HeaderValue, ttl: Duration) -> Duration {
-    let usable = ttl.saturating_sub(effective_skew(ttl));
-    params.shared.store(Arc::new(Some(CachedToken {
-        authorization,
-        expires_at: Instant::now() + usable,
-    })));
-    refresh_delay(usable, params.refresh_ratio)
-}
-
-/// Repeatedly acquire a token, publish it to the shared cache, and sleep
-/// until the next refresh — until cancelled.
-async fn refresh_loop(params: RefresherParams, shutdown: CancellationToken) {
-    let client = match reqwest::Client::builder().timeout(TOKEN_REQUEST_TIMEOUT).build() {
-        Ok(client) => client,
-        Err(error) => {
-            warn!(%error, "azure_ad: failed to build HTTP client; requests will fail closed");
-            return;
-        },
-    };
-
-    let mut failures: u32 = 0;
-    loop {
-        // Race the fetch against cancellation so a pipeline drop is not
-        // blocked behind an in-flight token request (up to its 30s
-        // timeout) — `RefreshHandle::drop` only waits `JOIN_TIMEOUT`.
-        let refreshed = tokio::select! {
-            refreshed = refresh_once(&client, &params) => refreshed,
-            () = shutdown.cancelled() => break,
-        };
-        let delay = if let Some(delay) = refreshed {
-            failures = 0;
-            delay
-        } else {
-            failures = failures.saturating_add(1);
-            retry_backoff(failures)
-        };
-        tokio::select! {
-            () = tokio::time::sleep(delay) => {},
-            () = shutdown.cancelled() => break,
-        }
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Filter
 // -----------------------------------------------------------------------------
@@ -417,29 +174,41 @@ async fn refresh_loop(params: RefresherParams, shutdown: CancellationToken) {
 /// See the module docs for scope (client-secret only), the
 /// routing-vs-authentication separation, and the fail-closed behavior.
 pub struct AzureAdFilter {
-    /// Lock-free cache of the current token, populated by the background
-    /// refresher and read on every request.
-    token: Arc<ArcSwap<Option<CachedToken>>>,
+    /// Cache-through token cache; see the module docs and
+    /// [`praxis_ai_apis::token_cache`].
+    cache: TokenCache<HeaderValue>,
+
+    /// HTTP client used for token-endpoint requests, built once with
+    /// [`TOKEN_REQUEST_TIMEOUT`].
+    client: reqwest::Client,
+
+    /// Fully-formed token endpoint URL.
+    token_url: String,
+
+    /// Application (client) ID.
+    client_id: String,
+
+    /// Client secret, resolved from the configured environment variable.
+    client_secret: String,
+
+    /// `OAuth2` scope (e.g. `https://cognitiveservices.azure.com/.default`).
+    scope: String,
 
     /// Whether the filter is currently failing closed, so the missing-
     /// token condition is logged on state transitions instead of once
     /// per rejected request.
     failing: AtomicBool,
-
-    /// Background refresher; stops when the filter is dropped.
-    _refresh: RefreshHandle,
 }
 
 impl AzureAdFilter {
     /// Build a filter from parsed config, resolving the client secret
-    /// from its environment variable and spawning the refresher.
+    /// from its environment variable.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if `refresh_ratio` is out of range,
-    /// `authority_host` or `tenant_id` contain URL-structural characters,
-    /// or the configured secret environment variable is unset or not
-    /// UTF-8.
+    /// Returns [`FilterError`] if `authority_host` or `tenant_id` contain
+    /// URL-structural characters, the configured secret environment
+    /// variable is unset or not UTF-8, or the HTTP client fails to build.
     fn new(config: AzureAdConfig) -> Result<Self, FilterError> {
         validate_config(&config)?;
 
@@ -454,21 +223,19 @@ impl AzureAdFilter {
             "https://{}/{}/oauth2/v2.0/token",
             config.authority_host, config.tenant_id
         );
-        let shared = Arc::new(ArcSwap::from_pointee(None));
+        let client = reqwest::Client::builder()
+            .timeout(TOKEN_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| FilterError::from(format!("azure_ad: failed to build HTTP client: {e}")))?;
 
-        let refresh = spawn_refresher(RefresherParams {
+        Ok(Self {
+            cache: TokenCache::new(EXPIRY_SKEW),
+            client,
             token_url,
             client_id: config.client_id,
             client_secret,
             scope: config.scope,
-            refresh_ratio: config.refresh_ratio,
-            shared: Arc::clone(&shared),
-        });
-
-        Ok(Self {
-            token: shared,
             failing: AtomicBool::new(false),
-            _refresh: refresh,
         })
     }
 
@@ -502,23 +269,33 @@ impl praxis_filter::HttpFilter for AzureAdFilter {
         &self,
         ctx: &mut praxis_filter::HttpFilterContext<'_>,
     ) -> Result<praxis_filter::FilterAction, FilterError> {
-        let cached = self.token.load();
-        match cached.as_ref() {
-            Some(token) if token.is_valid(Instant::now()) => {
+        let fetched = self
+            .cache
+            .get_or_refresh(|| {
+                fetch_token(
+                    &self.client,
+                    &self.token_url,
+                    &self.client_id,
+                    &self.client_secret,
+                    &self.scope,
+                )
+            })
+            .await;
+        match fetched {
+            Ok(authorization) => {
                 if self.failing.swap(false, Ordering::Relaxed) {
                     warn!("azure_ad: valid token available again; resuming request forwarding");
                 }
                 // Cheap: clone a pre-formatted, sensitive HeaderValue.
-                ctx.request_headers_to_set
-                    .push((header::AUTHORIZATION, token.authorization.clone()));
+                ctx.request_headers_to_set.push((header::AUTHORIZATION, authorization));
                 Ok(praxis_filter::FilterAction::Continue)
             },
-            _ => {
+            Err(error) => {
                 // Fail closed: never forward an unauthenticated request.
                 // Log on the state transition, not per rejected request,
                 // so a token outage under load cannot flood the logs.
                 if !self.failing.swap(true, Ordering::Relaxed) {
-                    warn!("azure_ad: no valid cached token; rejecting requests with 503 until one is available");
+                    warn!(%error, "azure_ad: no valid token available; rejecting requests with 503 until one is acquired");
                 }
                 Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(
                     503,
@@ -553,23 +330,11 @@ pub(crate) struct AzureAdConfig {
     /// `login.microsoftonline.us`).
     #[serde(default = "default_authority_host")]
     pub(crate) authority_host: String,
-
-    /// Fraction of a token's usable lifetime (TTL minus the expiry
-    /// safety margin) at which to refresh it. Must be in the open
-    /// interval `(0, 1)`.
-    #[serde(default = "default_refresh_ratio")]
-    pub(crate) refresh_ratio: f64,
 }
 
 /// Validate the config fields [`AzureAdFilter::new`] relies on before it
-/// reads the secret and spawns the refresher.
+/// reads the secret.
 fn validate_config(config: &AzureAdConfig) -> Result<(), FilterError> {
-    if !(config.refresh_ratio > 0.0 && config.refresh_ratio < 1.0) {
-        return Err(FilterError::from(format!(
-            "azure_ad: refresh_ratio must be between 0 and 1 (exclusive), got {}",
-            config.refresh_ratio
-        )));
-    }
     validate_url_component("authority_host", &config.authority_host)?;
     validate_url_component("tenant_id", &config.tenant_id)?;
     Ok(())
@@ -603,11 +368,6 @@ fn default_authority_host() -> String {
     "login.microsoftonline.com".to_owned()
 }
 
-/// Default value for [`AzureAdConfig::refresh_ratio`].
-fn default_refresh_ratio() -> f64 {
-    0.75
-}
-
 /// Parse and validate the `azure_ad` filter's YAML config.
 ///
 /// # Errors
@@ -637,11 +397,7 @@ mod tests {
     use http::Method;
     use praxis_filter::{FilterAction, HttpFilter as _};
 
-    use super::{
-        AzureAdFilter, CachedToken, EXPIRY_SKEW, MAX_RETRY_BACKOFF, MIN_REFRESH_DELAY, RETRY_BACKOFF, RefreshHandle,
-        RefresherParams, effective_skew, fetch_token, parse_azure_ad_config, refresh_delay, refresh_once,
-        retry_backoff, validate_url_component,
-    };
+    use super::{AzureAdConfig, AzureAdFilter, fetch_token, parse_azure_ad_config, validate_url_component};
     use crate::test_utils::{make_filter_context, make_request};
 
     fn yaml(body: &str) -> serde_yaml::Value {
@@ -667,26 +423,20 @@ mod tests {
             config.authority_host, "login.microsoftonline.com",
             "authority_host should default"
         );
-        assert!(
-            (config.refresh_ratio - 0.75).abs() < f64::EPSILON,
-            "refresh_ratio should default to 0.75"
-        );
     }
 
     #[test]
-    fn parses_optional_authority_host_and_refresh_ratio() {
+    fn parses_optional_authority_host() {
         let config = parse_azure_ad_config(&yaml(
             "tenant_id: tid\n\
              client_id: cid\n\
              scope: s\n\
              client_secret_env_var: AZURE_CLIENT_SECRET\n\
-             authority_host: login.microsoftonline.us\n\
-             refresh_ratio: 0.5\n",
+             authority_host: login.microsoftonline.us\n",
         ))
         .expect("full config should parse");
 
         assert_eq!(config.authority_host, "login.microsoftonline.us");
-        assert!((config.refresh_ratio - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -712,30 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_out_of_range_refresh_ratio() {
-        for bad in [0.0, 1.0, 1.5, -0.1] {
-            let cfg = super::AzureAdConfig {
-                tenant_id: "tid".to_owned(),
-                client_id: "cid".to_owned(),
-                scope: "s".to_owned(),
-                client_secret_env_var: "AZURE_TEST_UNSET_SECRET".to_owned(),
-                authority_host: super::default_authority_host(),
-                refresh_ratio: bad,
-            };
-            match AzureAdFilter::new(cfg) {
-                Ok(_) => panic!("out-of-range refresh_ratio ({bad}) must be rejected"),
-                Err(err) => assert!(
-                    format!("{err}").contains("refresh_ratio"),
-                    "error must name the offending field, got: {err}"
-                ),
-            }
-        }
-    }
-
-    #[test]
     fn from_config_propagates_missing_secret() {
-        // refresh_ratio is valid, so construction proceeds to the
-        // credential resolution step and fails there.
         let err = AzureAdFilter::from_config(&yaml(
             "tenant_id: tid\n\
              client_id: cid\n\
@@ -777,13 +504,12 @@ mod tests {
 
     #[test]
     fn new_rejects_authority_host_with_userinfo_override() {
-        let cfg = super::AzureAdConfig {
+        let cfg = AzureAdConfig {
             tenant_id: "tid".to_owned(),
             client_id: "cid".to_owned(),
             scope: "s".to_owned(),
             client_secret_env_var: "AZURE_TEST_UNSET_SECRET".to_owned(),
             authority_host: "login.microsoftonline.com@evil.com".to_owned(),
-            refresh_ratio: 0.75,
         };
         match AzureAdFilter::new(cfg) {
             Ok(_) => panic!("malicious authority_host must be rejected"),
@@ -792,125 +518,6 @@ mod tests {
                 "error must name the offending field, got: {err}"
             ),
         }
-    }
-
-    // -- Pure helpers ---------------------------------------------------------
-
-    #[test]
-    fn refresh_delay_is_ttl_times_ratio() {
-        let delay = refresh_delay(std::time::Duration::from_secs(3600), 0.75);
-        assert_eq!(delay, std::time::Duration::from_secs(2700));
-    }
-
-    #[test]
-    fn refresh_delay_is_floored() {
-        // 1s * 0.75 = 750ms, below the floor.
-        let delay = refresh_delay(std::time::Duration::from_secs(1), 0.75);
-        assert_eq!(delay, MIN_REFRESH_DELAY);
-    }
-
-    #[test]
-    fn effective_skew_is_capped_at_half_ttl() {
-        use std::time::Duration;
-        // Long tokens get the full skew.
-        assert_eq!(effective_skew(Duration::from_secs(3600)), EXPIRY_SKEW);
-        // Short tokens get at most half their TTL, so they are never
-        // cached already-expired.
-        assert_eq!(effective_skew(Duration::from_secs(40)), Duration::from_secs(20));
-        assert_eq!(effective_skew(Duration::from_secs(10)), Duration::from_secs(5));
-    }
-
-    #[test]
-    fn retry_backoff_grows_then_caps() {
-        assert_eq!(retry_backoff(0), RETRY_BACKOFF, "no failures yet -> base delay");
-        assert_eq!(retry_backoff(1), RETRY_BACKOFF, "first failure -> base delay");
-        assert_eq!(retry_backoff(2), RETRY_BACKOFF * 2);
-        assert_eq!(retry_backoff(3), RETRY_BACKOFF * 4);
-        assert_eq!(retry_backoff(1000), MAX_RETRY_BACKOFF, "large failure count -> capped");
-    }
-
-    #[test]
-    fn cached_token_expiry() {
-        let now = std::time::Instant::now();
-        let token = CachedToken {
-            authorization: http::HeaderValue::from_static("Bearer x"),
-            expires_at: now + std::time::Duration::from_secs(60),
-        };
-        assert!(token.is_valid(now), "token in the future must be valid");
-        assert!(
-            !token.is_valid(now + std::time::Duration::from_secs(61)),
-            "token past expiry must be invalid"
-        );
-    }
-
-    // -- on_request -----------------------------------------------------------
-
-    /// Build a filter directly around a given cache, without spawning a
-    /// refresher thread (the `RefreshHandle` has no thread, so its
-    /// `Drop` only cancels a token).
-    fn test_filter(token: Option<CachedToken>) -> AzureAdFilter {
-        AzureAdFilter {
-            token: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(token)),
-            failing: std::sync::atomic::AtomicBool::new(false),
-            _refresh: RefreshHandle {
-                shutdown: tokio_util::sync::CancellationToken::new(),
-                thread: None,
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn on_request_injects_bearer_when_token_valid() {
-        let filter = test_filter(Some(CachedToken {
-            authorization: http::HeaderValue::from_static("Bearer test-token"),
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
-        }));
-        let request = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&request);
-
-        let action = filter.on_request(&mut ctx).await.expect("must not error");
-        assert!(matches!(action, FilterAction::Continue));
-
-        let auth = ctx
-            .request_headers_to_set
-            .iter()
-            .find(|(name, _)| *name == http::header::AUTHORIZATION)
-            .map(|(_, value)| value.to_str().expect("ascii"));
-        assert_eq!(auth, Some("Bearer test-token"), "must inject the cached bearer token");
-    }
-
-    #[tokio::test]
-    async fn on_request_fails_closed_when_no_token() {
-        let filter = test_filter(None);
-        let request = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&request);
-
-        let action = filter.on_request(&mut ctx).await.expect("must reject, not error");
-        assert!(
-            matches!(action, FilterAction::Reject(r) if r.status == 503),
-            "no cached token must fail closed with 503"
-        );
-        assert!(
-            ctx.request_headers_to_set.is_empty(),
-            "no headers must be set when failing closed"
-        );
-    }
-
-    #[tokio::test]
-    async fn on_request_fails_closed_when_token_expired() {
-        let filter = test_filter(Some(CachedToken {
-            authorization: http::HeaderValue::from_static("Bearer stale"),
-            // Expired well beyond the skew.
-            expires_at: std::time::Instant::now() - (EXPIRY_SKEW + std::time::Duration::from_secs(1)),
-        }));
-        let request = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&request);
-
-        let action = filter.on_request(&mut ctx).await.expect("must reject, not error");
-        assert!(
-            matches!(action, FilterAction::Reject(r) if r.status == 503),
-            "expired token must fail closed with 503"
-        );
     }
 
     // -- fetch_token against a mock endpoint ----------------------------------
@@ -951,69 +558,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_once_caches_usable_token_for_short_ttl() {
-        // A TTL below the full EXPIRY_SKEW must still yield a token that
-        // is valid right now — regression for the skew-saturates-to-zero
-        // bug that would cache an already-expired token and 503 forever.
-        let (url, server) = mock_token_endpoint(r#"{"access_token":"short","expires_in":40}"#);
-        let shared = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None));
-        let params = RefresherParams {
-            token_url: url,
-            client_id: "cid".to_owned(),
-            client_secret: "secret".to_owned(),
-            scope: "scope".to_owned(),
-            refresh_ratio: 0.75,
-            shared: std::sync::Arc::clone(&shared),
-        };
-        let client = reqwest::Client::new();
-
-        let delay = refresh_once(&client, &params)
-            .await
-            .expect("short-ttl fetch must succeed");
-        assert!(delay >= MIN_REFRESH_DELAY, "refresh delay must respect the floor");
-
-        let cached = shared.load_full();
-        let token = cached.as_ref().as_ref().expect("a successful fetch must cache a token");
-        let now = std::time::Instant::now();
-        assert!(
-            token.is_valid(now),
-            "a 40s token must be usable now, not cached already-expired"
-        );
-        // Regression: the refresh must be scheduled from the
-        // skew-adjusted usable lifetime. Scheduling from the raw
-        // TTL (0.75 * 40s = 30s) lands past the cached expiry
-        // (40s - 20s skew = 20s), leaving a guaranteed window of
-        // 503s every cycle even with a healthy token endpoint.
-        assert!(
-            token.is_valid(now + delay),
-            "the cached token must still be valid when the scheduled refresh fires"
-        );
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn refresh_once_returns_none_on_failure() {
-        // Closed port -> fetch fails -> no token cached, None returned so
-        // the loop applies backoff.
-        let shared = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None));
-        let params = RefresherParams {
-            token_url: "http://127.0.0.1:1/token".to_owned(),
-            client_id: "cid".to_owned(),
-            client_secret: "secret".to_owned(),
-            scope: "scope".to_owned(),
-            refresh_ratio: 0.75,
-            shared: std::sync::Arc::clone(&shared),
-        };
-        let client = reqwest::Client::new();
-
-        assert!(
-            refresh_once(&client, &params).await.is_none(),
-            "a failed fetch must return None"
-        );
-        assert!(shared.load_full().is_none(), "a failed fetch must not cache a token");
-    }
-
-    #[tokio::test]
     async fn fetch_token_errors_on_non_success_status() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1033,5 +577,102 @@ mod tests {
             .expect_err("401 must produce an error");
         assert!(format!("{err}").contains("401"), "error must carry the status: {err}");
         server.join().unwrap();
+    }
+
+    // -- on_request: cache-through end to end ----------------------------------
+
+    /// Build a filter with a real, always-set secret env var (so
+    /// construction never fails on credential resolution) and then point
+    /// its token endpoint at `token_url` — bypassing `authority_host`/
+    /// `tenant_id` URL construction entirely so tests can target a local
+    /// mock server directly.
+    fn filter_at(token_url: &str) -> AzureAdFilter {
+        let config = parse_azure_ad_config(&yaml(
+            "tenant_id: tid\n\
+             client_id: cid\n\
+             scope: scope\n\
+             client_secret_env_var: CARGO_PKG_NAME\n",
+        ))
+        .expect("test config must parse");
+        let mut filter =
+            AzureAdFilter::new(config).expect("construction must succeed with an always-set secret env var");
+        filter.token_url = token_url.to_owned();
+        filter
+    }
+
+    #[tokio::test]
+    async fn on_request_injects_bearer_on_first_fetch() {
+        let (url, server) = mock_token_endpoint(r#"{"access_token":"fresh","expires_in":3600}"#);
+        let filter = filter_at(&url);
+        let request = make_request(Method::POST, "/openai/deployments/gpt-4o/chat/completions");
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("must not error");
+        assert!(matches!(action, FilterAction::Continue));
+
+        let auth = ctx
+            .request_headers_to_set
+            .iter()
+            .find(|(name, _)| *name == http::header::AUTHORIZATION)
+            .map(|(_, value)| value.to_str().expect("ascii"));
+        assert_eq!(
+            auth,
+            Some("Bearer fresh"),
+            "must inject the freshly fetched bearer token"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_request_reuses_cached_token_without_a_second_fetch() {
+        // The mock endpoint accepts exactly one connection; a second
+        // on_request call must not attempt a second fetch, or it would
+        // fail to connect and 503 instead of continuing.
+        let (url, server) = mock_token_endpoint(r#"{"access_token":"once","expires_in":3600}"#);
+        let filter = filter_at(&url);
+        let request = make_request(Method::POST, "/openai/deployments/gpt-4o/chat/completions");
+
+        let mut first_ctx = make_filter_context(&request);
+        let first = filter
+            .on_request(&mut first_ctx)
+            .await
+            .expect("first call must not error");
+        assert!(matches!(first, FilterAction::Continue));
+
+        let mut second_ctx = make_filter_context(&request);
+        let second = filter
+            .on_request(&mut second_ctx)
+            .await
+            .expect("second call must not error");
+        assert!(
+            matches!(second, FilterAction::Continue),
+            "a still-valid cache must serve the second request without a new connection"
+        );
+        let auth = second_ctx
+            .request_headers_to_set
+            .iter()
+            .find(|(name, _)| *name == http::header::AUTHORIZATION)
+            .map(|(_, value)| value.to_str().expect("ascii"));
+        assert_eq!(auth, Some("Bearer once"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_request_fails_closed_when_fetch_fails() {
+        // A closed local port: the connection is refused immediately, no
+        // real network dependency.
+        let filter = filter_at("http://127.0.0.1:1/token");
+        let request = make_request(Method::POST, "/openai/deployments/gpt-4o/chat/completions");
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("must reject, not error");
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "a failed fetch must fail closed with 503"
+        );
+        assert!(
+            ctx.request_headers_to_set.is_empty(),
+            "no headers must be set when failing closed"
+        );
     }
 }

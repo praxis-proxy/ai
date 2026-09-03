@@ -455,6 +455,19 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
         "final response should be the second model response after web search"
     );
 
+    // A successful search updates the model's placeholder in place, so the public
+    // response carries exactly one completed web_search_call for ws_1.
+    let output = response["output"].as_array().expect("final response output array");
+    let search_calls: Vec<&serde_json::Value> =
+        output.iter().filter(|item| item["type"] == "web_search_call").collect();
+    assert_eq!(
+        search_calls.len(),
+        1,
+        "final response must contain exactly one web_search_call, got: {output:#?}"
+    );
+    assert_eq!(search_calls[0]["id"], "ws_1");
+    assert_eq!(search_calls[0]["status"], "completed");
+
     let model_reqs = model.requests();
     assert_eq!(
         model_reqs.len(),
@@ -497,6 +510,109 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
     );
 }
 
+#[test]
+fn web_search_provider_failure_continues_loop_with_failed_result() {
+    let first_response = serde_json::json!({
+        "id": "resp_ws_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust 2025 edition"}
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_ws_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "I could not search, but here is what I know."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    spawn_failing_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust 2025 edition features",
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a provider failure must not reject the Response"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_ws_2",
+        "the loop must continue to a second inference after the search fails"
+    );
+
+    // The public response must carry exactly one web_search_call for ws_1, marked
+    // failed — not a contradictory completed placeholder plus a failed duplicate.
+    let output = response["output"].as_array().expect("final response output array");
+    let search_calls: Vec<&serde_json::Value> =
+        output.iter().filter(|item| item["type"] == "web_search_call").collect();
+    assert_eq!(
+        search_calls.len(),
+        1,
+        "final response must contain exactly one web_search_call, got: {output:#?}"
+    );
+    assert_eq!(search_calls[0]["id"], "ws_1");
+    assert_eq!(
+        search_calls[0]["status"], "failed",
+        "the single web_search_call must reflect the failed outcome"
+    );
+
+    let model_reqs = model.requests();
+    assert_eq!(
+        model_reqs.len(),
+        2,
+        "model backend should receive two requests (initial + post-failure)"
+    );
+
+    let second_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[1].body).expect("second model request should be valid JSON");
+    let input = second_body["input"]
+        .as_array()
+        .expect("second model request input should be an array");
+    // The model receives the failure through a backend-valid function_call_output
+    // bridge carrying the bounded notice — never a hosted web_search_call, which
+    // is not a valid OpenResponses input (issue #808).
+    assert!(
+        input.iter().all(|item| item["type"] != "web_search_call"),
+        "the continuation must not feed the model a hosted web_search_call: {input:#?}"
+    );
+    let has_failure_notice = input
+        .iter()
+        .any(|item| item["type"] == "function_call_output" && item["output"] == "Web search unavailable.");
+    assert!(
+        has_failure_notice,
+        "the model must receive a truthful failure notice via function_call_output: {input:#?}"
+    );
+}
+
 fn spawn_search_mock(listener: std::net::TcpListener) {
     use std::io::{Read as _, Write as _};
     let body = serde_json::json!({
@@ -515,6 +631,22 @@ fn spawn_search_mock(listener: std::net::TcpListener) {
         let _n = stream.read(&mut buf).unwrap();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+}
+
+/// Serve a single 5xx so the search client maps the callout to a failed outcome.
+fn spawn_failing_search_mock(listener: std::net::TcpListener) {
+    use std::io::{Read as _, Write as _};
+    let body = r#"{"error":"service unavailable"}"#;
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let _n = stream.read(&mut buf).unwrap();
+        let response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();

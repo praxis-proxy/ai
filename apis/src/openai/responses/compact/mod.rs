@@ -18,6 +18,11 @@
 //! `conversation`. Single-turn requests (no stored history, even with
 //! `context_management` set) are released without compaction because
 //! there is no prior history to summarize.
+//!
+//! Praxis runs `StreamBuffer` body hooks before header-phase request
+//! filters. Configuration therefore requires an explicit
+//! `allow_pre_security_callout: true` acknowledgement and should only
+//! be used behind an outer authentication and authorization boundary.
 
 pub(super) mod config;
 
@@ -93,10 +98,16 @@ struct CompactionParams {
 /// `openai_responses_rehydrate` has loaded stored conversation
 /// history. Single-turn requests are released without compaction.
 ///
+/// Praxis runs `StreamBuffer` body hooks before header-phase request
+/// filters. This filter therefore requires
+/// `allow_pre_security_callout: true` and should only be used behind
+/// an outer authentication and authorization boundary.
+///
 /// # YAML
 ///
 /// ```yaml
 /// filter: openai_responses_compact
+/// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// default_model: llama3.2:1b
 /// ```
@@ -105,6 +116,7 @@ struct CompactionParams {
 ///
 /// ```yaml
 /// filter: openai_responses_compact
+/// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// default_model: gpt-4o-mini
 /// tiktoken_encoding: cl100k_base

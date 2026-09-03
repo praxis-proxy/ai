@@ -15,9 +15,6 @@ use crate::callout_policy::{self, OnFailure};
 /// Default callout timeout (10 seconds — search APIs can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
-/// Default HTTP status when the search callout fails in closed mode.
-const DEFAULT_STATUS_ON_ERROR: u16 = 502;
-
 // -----------------------------------------------------------------------------
 // SearchProvider
 // -----------------------------------------------------------------------------
@@ -116,14 +113,6 @@ pub(crate) struct WebSearchFilterConfig {
     #[serde(default)]
     pub(crate) max_body_bytes: Option<usize>,
 
-    /// Failure mode for search provider callouts.
-    #[serde(default)]
-    pub(crate) on_failure: Option<OnFailure>,
-
-    /// HTTP status code to return when rejecting on error.
-    #[serde(default)]
-    pub(crate) status_on_error: Option<u16>,
-
     /// Override the provider's default API base URL.
     #[serde(default)]
     pub(crate) base_url: Option<String>,
@@ -163,12 +152,6 @@ pub(crate) struct ValidatedConfig {
     /// Maximum request body bytes to buffer.
     pub max_body_bytes: usize,
 
-    /// Failure mode for search callouts.
-    pub on_failure: OnFailure,
-
-    /// HTTP status on error.
-    pub status_on_error: u16,
-
     /// Override the provider's default API base URL.
     pub base_url: Option<String>,
 }
@@ -181,8 +164,6 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("default_context_size", &self.default_context_size)
             .field("timeout_ms", &self.timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
-            .field("on_failure", &self.on_failure)
-            .field("status_on_error", &self.status_on_error)
             .field("base_url", &self.base_url)
             .finish()
     }
@@ -220,12 +201,6 @@ fn build_validated_config(
         default_context_size: validate_context_size(filter_name, raw.default_context_size.as_deref())?,
         timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
-        on_failure: raw.on_failure.unwrap_or(OnFailure::Closed),
-        status_on_error: callout_policy::validate_status_on_error(
-            filter_name,
-            raw.status_on_error,
-            DEFAULT_STATUS_ON_ERROR,
-        )?,
         base_url: raw.base_url.clone(),
     })
 }
@@ -291,8 +266,6 @@ mod tests {
             default_context_size: None,
             timeout_ms: None,
             max_body_bytes: None,
-            on_failure: None,
-            status_on_error: None,
             base_url: None,
             allow_private_base_url: false,
         }
@@ -306,8 +279,6 @@ mod tests {
         assert_eq!(cfg.default_context_size, SearchContextSize::Medium);
         assert_eq!(cfg.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert_eq!(cfg.max_body_bytes, MAX_JSON_BODY_BYTES);
-        assert_eq!(cfg.on_failure, OnFailure::Closed);
-        assert_eq!(cfg.status_on_error, DEFAULT_STATUS_ON_ERROR);
     }
 
     #[test]
@@ -332,16 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_preserves_on_failure() {
-        let yaml = serde_yaml::from_str("\nprovider: brave\napi_key: test-key\non_failure: open\n").unwrap();
-
-        let raw: WebSearchFilterConfig = parse_filter_config("openai_web_search", &yaml).unwrap();
-        let validated = build_config("openai_web_search", &raw).unwrap();
-
-        assert_eq!(validated.on_failure, OnFailure::Open);
-    }
-
-    #[test]
     fn build_config_rejects_zero_timeout() {
         let mut cfg = base_config();
         cfg.timeout_ms = Some(0);
@@ -359,24 +320,13 @@ mod tests {
     }
 
     #[test]
-    fn build_config_rejects_invalid_status() {
-        let mut cfg = base_config();
-        cfg.status_on_error = Some(999);
-        assert!(build_config("openai_web_search", &cfg).is_err());
-    }
-
-    #[test]
     fn build_config_custom_values() {
         let mut cfg = base_config();
         cfg.default_context_size = Some("high".into());
         cfg.timeout_ms = Some(15_000);
-        cfg.on_failure = Some(OnFailure::Open);
-        cfg.status_on_error = Some(503);
         let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.default_context_size, SearchContextSize::High);
         assert_eq!(validated.timeout_ms, 15_000);
-        assert_eq!(validated.on_failure, OnFailure::Open);
-        assert_eq!(validated.status_on_error, 503);
     }
 
     #[test]
