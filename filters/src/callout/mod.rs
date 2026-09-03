@@ -111,6 +111,9 @@ pub struct HttpCalloutFilter {
     /// Static headers to send with every callout.
     headers: Vec<(http::HeaderName, http::HeaderValue)>,
 
+    /// Authority from the configured URL, used as the callout `Host`.
+    target_authority: http::HeaderValue,
+
     /// Callout response headers to inject into the upstream
     /// request on success.
     inject_headers: Vec<http::HeaderName>,
@@ -155,6 +158,7 @@ impl HttpCalloutFilter {
 
         let body_shaper = BodyShaper::compile(&cfg.target.body)?;
         let headers = parse_static_headers(&cfg)?;
+        let target_authority = parse_target_authority(&cfg.target.url)?;
         let forward_headers = parse_header_names(&cfg.target.forward_headers, "forward_header")?;
         warn_on_disallowed_forward_headers(&forward_headers);
         let extractions = compile_extractions(&cfg)?;
@@ -180,6 +184,7 @@ impl HttpCalloutFilter {
             max_depth: cfg.max_depth.unwrap_or(1),
             phase: cfg.request.phase,
             status_on_error,
+            target_authority,
             timeout: cfg.target.timeout,
             url: cfg.target.url,
         }))
@@ -211,7 +216,7 @@ impl HttpCalloutFilter {
     }
 
     /// Assemble the callout request headers: static configured headers,
-    /// safely-forwarded client headers, and the enforced `Host`.
+    /// safely-forwarded client headers, and the target-bound `Host`.
     fn build_callout_headers(&self, ctx: &HttpFilterContext<'_>) -> HeaderMap {
         let mut headers = HeaderMap::new();
 
@@ -230,7 +235,9 @@ impl HttpCalloutFilter {
             }
         }
 
-        // The shared URL executor supplies the configured authority as Host.
+        // Host is security-sensitive: the shared executor preserves an
+        // explicitly supplied value, so bind it here to the target URL.
+        headers.insert(http::header::HOST, self.target_authority.clone());
         headers
     }
 
@@ -399,6 +406,18 @@ fn parse_static_headers(cfg: &HttpCalloutConfig) -> Result<Vec<(http::HeaderName
             Ok((name, value))
         })
         .collect()
+}
+
+/// Extract the authority that must be used for the outbound `Host` header.
+fn parse_target_authority(url: &str) -> Result<http::HeaderValue, FilterError> {
+    let uri: http::Uri = url
+        .parse()
+        .map_err(|e| -> FilterError { format!("http_callout: invalid target URL '{url}': {e}").into() })?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| FilterError::from(format!("http_callout: target URL has no authority: {url}")))?;
+    http::HeaderValue::from_str(authority.as_str())
+        .map_err(|e| format!("http_callout: invalid target authority '{}': {e}", authority.as_str()).into())
 }
 
 /// Parse a list of header name strings.

@@ -925,6 +925,44 @@ mod filter_tests {
         assert!(matches!(action, FilterAction::Continue), "forward_headers should work");
     }
 
+    #[tokio::test]
+    async fn static_host_is_overwritten_with_target_authority_on_wire() {
+        let mock_server = MockServer::start().await;
+        let authority = mock_server.address().to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .and(wiremock::matchers::header("host", authority))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              headers:
+                - name: "Host"
+                  value: "attacker.example"
+            request:
+              phase: request_headers
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = test_filter(&yaml).unwrap();
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+    }
+
     // -------------------------------------------------------------------------
     // Inject Headers
     // -------------------------------------------------------------------------
