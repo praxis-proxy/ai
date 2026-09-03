@@ -798,8 +798,11 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 8
-        timeout_ms: 120000
-        step_timeout_ms: 60000
+        # Generous deadlines: file-search inference runs on CPU-only vLLM under
+        # heavy CI load (postgres + vLLM + OGX co-located), which can exceed a
+        # 60s step budget. Matches the agentic config's IRR timeouts.
+        timeout_ms: 300000
+        step_timeout_ms: 300000
         max_response_bytes: 67108864
         max_state_bytes: 136314880
         steps:
@@ -829,6 +832,7 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference"
+                    read_timeout_ms: 300000
                     endpoints:
                       - "{vllm_endpoint}"
             on_result:
