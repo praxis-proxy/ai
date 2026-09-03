@@ -48,7 +48,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use tracing::debug;
 
@@ -86,7 +87,7 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// ```yaml
 /// filter: openai_mcp_tool_resolve
 /// timeout_ms: 5000
-/// max_body_bytes: 67108864
+/// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
 /// ```
 pub struct McpToolResolveFilter {
@@ -96,8 +97,9 @@ pub struct McpToolResolveFilter {
     /// Connector ID to server URL mapping.
     connectors: HashMap<String, url::Url>,
 
-    /// Maximum request body bytes for `StreamBuffer`.
-    max_body_bytes: usize,
+    /// Maximum size in bytes of the body produced after expanding
+    /// `mcp` tool entries into `function` entries.
+    max_rewritten_body_bytes: usize,
 
     /// Maximum number of distinct MCP servers per request.
     max_servers: usize,
@@ -130,7 +132,7 @@ impl McpToolResolveFilter {
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
             connectors,
-            max_body_bytes: validated.max_body_bytes,
+            max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_servers: validated.max_servers,
             max_tools: validated.max_tools,
             timeout: Duration::from_millis(validated.timeout_ms),
@@ -174,7 +176,7 @@ impl McpToolResolveFilter {
         let Some(serialized) = rewrite_request_body(&original_bytes, per_entry, &tool_map, &resolved_labels)? else {
             return Ok(FilterAction::Continue);
         };
-        check_body_size(&serialized, self.max_body_bytes)?;
+        check_body_size(&serialized, self.max_rewritten_body_bytes)?;
         serialized.commit(body, self.name(), "tools");
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
@@ -265,8 +267,11 @@ impl HttpFilter for McpToolResolveFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. max_rewritten_body_bytes bounds only
+        // the post-expansion body produced during resolution.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -334,12 +339,12 @@ enum ResolveError {
         max: usize,
     },
 
-    /// Expanded request body exceeds `max_body_bytes`.
+    /// Expanded request body exceeds `max_rewritten_body_bytes`.
     #[error("expanded request body is {actual} bytes, exceeding the {limit} byte limit")]
     BodyTooLarge {
         /// Serialized body size after MCP tool expansion.
         actual: usize,
-        /// Configured `max_body_bytes` limit.
+        /// Configured `max_rewritten_body_bytes` limit.
         limit: usize,
     },
 
@@ -401,17 +406,17 @@ struct Resolution {
 // Private Helpers
 // -----------------------------------------------------------------------------
 
-/// Reject the expanded body if it exceeds `max_body_bytes`.
-fn check_body_size(serialized: &SerializedJson, max_body_bytes: usize) -> Result<(), ResolveError> {
-    if serialized.len() > max_body_bytes {
+/// Reject the expanded body if it exceeds `max_rewritten_body_bytes`.
+fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize) -> Result<(), ResolveError> {
+    if serialized.len() > max_rewritten_body_bytes {
         debug!(
             actual = serialized.len(),
-            limit = max_body_bytes,
+            limit = max_rewritten_body_bytes,
             "expanded request body exceeds configured limit"
         );
         return Err(ResolveError::BodyTooLarge {
             actual: serialized.len(),
-            limit: max_body_bytes,
+            limit: max_rewritten_body_bytes,
         });
     }
     Ok(())
@@ -706,7 +711,7 @@ async fn fetch_tools(
 /// Returns `None` only when the body cannot be rewritten at all
 /// (unparseable body, non-object root, or missing `tools` array).
 /// The caller is responsible for checking the serialized size against
-/// `max_body_bytes` before committing.
+/// `max_rewritten_body_bytes` before committing.
 ///
 /// A resolved MCP entry is always dropped from the outgoing tools
 /// array, even when it produced zero permitted tools; otherwise the

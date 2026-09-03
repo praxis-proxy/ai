@@ -192,27 +192,31 @@ fn filter_request_body_access() {
 
 #[test]
 fn filter_response_body_mode() {
-    let config = serde_yaml::from_str::<serde_yaml::Value>("max_body_bytes: 1024").unwrap();
+    let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
     assert!(
         matches!(
             filter.response_body_mode(),
-            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
+            praxis_filter::BodyMode::StreamBuffer {
+                max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
+            }
         ),
-        "should return StreamBuffer with configured max_bytes"
+        "should buffer up to the absolute ceiling; body_limits governs the raw cap"
     );
 }
 
 #[test]
 fn filter_request_body_mode() {
-    let config = serde_yaml::from_str::<serde_yaml::Value>("max_body_bytes: 1024").unwrap();
+    let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
     assert!(
         matches!(
             filter.request_body_mode(),
-            praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) }
+            praxis_filter::BodyMode::StreamBuffer {
+                max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
+            }
         ),
-        "should return StreamBuffer with configured max_bytes"
+        "should buffer up to the absolute ceiling; body_limits governs the raw cap"
     );
 }
 
@@ -510,7 +514,15 @@ fn arguments_string_is_parsed_to_object() {
 fn config_defaults() {
     let yaml = serde_yaml::from_str::<McpDispatchConfig>("{}").unwrap();
     assert_eq!(yaml.timeout_ms, 30_000);
-    assert_eq!(yaml.max_body_bytes, praxis_filter::body::DEFAULT_JSON_BODY_MAX_BYTES);
+}
+
+#[test]
+fn config_rejects_legacy_max_body_bytes() {
+    // Raw body size is governed by body_limits, not per-filter. This
+    // read-only dispatcher never produced a body, so the knob was removed
+    // entirely and is now rejected as an unknown field.
+    let result = serde_yaml::from_str::<McpDispatchConfig>("max_body_bytes: 1024");
+    assert!(result.is_err(), "legacy max_body_bytes should be rejected");
 }
 
 #[test]
@@ -782,9 +794,7 @@ fn from_config_minimal() {
 
 #[test]
 fn from_config_with_all_fields() {
-    let config =
-        serde_yaml::from_str::<serde_yaml::Value>("timeout_ms: 5000\nmax_body_bytes: 1048576\nallow_loopback: true")
-            .unwrap();
+    let config = serde_yaml::from_str::<serde_yaml::Value>("timeout_ms: 5000\nallow_loopback: true").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
     assert_eq!(filter.name(), "openai_mcp_dispatch");
 }

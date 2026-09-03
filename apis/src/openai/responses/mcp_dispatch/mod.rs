@@ -49,7 +49,8 @@ use std::{collections::HashMap, time::Duration};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -87,13 +88,10 @@ const ACTION_DONE: &str = "done";
 /// ```yaml
 /// filter: openai_mcp_dispatch
 /// timeout_ms: 30000
-/// max_body_bytes: 67108864
 /// ```
 pub struct McpDispatchFilter {
     /// Allow connections to loopback addresses.
     allow_loopback: bool,
-    /// Maximum response body bytes.
-    max_body_bytes: usize,
     /// Timeout for MCP tool calls.
     timeout: Duration,
 }
@@ -109,7 +107,6 @@ impl McpDispatchFilter {
         let validated = build_config(cfg)?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
-            max_body_bytes: validated.max_body_bytes,
             timeout: Duration::from_millis(validated.timeout_ms),
         }))
     }
@@ -161,8 +158,10 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. This filter only reads the body.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -171,8 +170,10 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. This filter only reads the body.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 

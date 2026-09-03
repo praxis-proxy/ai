@@ -215,7 +215,7 @@ fn reject_file_url_failed_returns_502() {
 
 #[test]
 fn reject_rewritten_body_too_large_returns_413() {
-    let action = reject_rewritten_body_too_large(2048, 1024);
+    let action = reject_rewritten_body_too_large(2048, 1024, false);
     match action {
         FilterAction::Reject(r) => {
             assert_eq!(r.status, 413, "oversized rewritten body should produce 413");
@@ -227,31 +227,6 @@ fn reject_rewritten_body_too_large_returns_413() {
 // -----------------------------------------------------------------------------
 // on_request_body
 // -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn rejects_oversized_raw_body_before_resolution() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "files_api_url: \"http://127.0.0.1:9\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\non_missing: reject\nmax_body_bytes: 64",
-    )
-    .unwrap();
-    let filter = FileResolveFilter::from_config(&yaml).unwrap();
-    let req = Box::leak(Box::new(crate::test_utils::make_request(
-        http::Method::POST,
-        "/v1/responses",
-    )));
-    let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_file","file_id":"file-never-fetched"}]}]}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    assert!(
-        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
-        "the resolver's own body limit must be enforced before parsing or callouts"
-    );
-}
 
 #[tokio::test]
 async fn skips_non_responses_request() {
@@ -687,7 +662,7 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
     let unresolved_len = serialized_outbound_body_len(&state).unwrap();
 
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\nmax_body_bytes: {unresolved_len}"
+        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\nmax_rewritten_body_bytes: {unresolved_len}"
     ))
     .unwrap();
     let filter = FileResolveFilter::from_config(&yaml).unwrap();
@@ -705,6 +680,86 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
     assert!(
         matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
         "resolved rehydrated history should respect the resolver's final body limit"
+    );
+}
+
+#[tokio::test]
+async fn max_resolved_bytes_bounds_individual_content_independent_of_rewritten_limit() {
+    let files_api_url = start_files_api_stub();
+    // The stub serves 7 bytes of content for file-history. A tiny
+    // max_resolved_bytes must reject it even though the rewritten-body
+    // limit is left at the 64 MiB ceiling: the two limits are decoupled.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\non_missing: reject\nmax_resolved_bytes: 1\nmax_rewritten_body_bytes: 67108864"
+    ))
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+    let request_body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
+        "a small max_resolved_bytes must reject oversized inline content regardless of max_rewritten_body_bytes"
+    );
+}
+
+#[tokio::test]
+async fn max_resolved_bytes_default_allows_resolution() {
+    let files_api_url = start_files_api_stub();
+    // Same request as the decoupling reject test, but with a large
+    // max_resolved_bytes: the content now fits and resolution succeeds,
+    // proving the previous rejection was attributable to max_resolved_bytes.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\nmax_resolved_bytes: 67108864\nmax_rewritten_body_bytes: 67108864"
+    ))
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+    let request_body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a large max_resolved_bytes should allow the same content to resolve"
+    );
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    let part = &rewritten["input"][0]["content"][0];
+    assert!(
+        part.get("file_id").is_none(),
+        "file_id should be removed after resolution"
+    );
+    assert_eq!(
+        part["file_data"], "aGlzdG9yeQ==",
+        "resolved content should be inlined as base64"
     );
 }
 

@@ -128,6 +128,72 @@ pub(crate) struct WebSearchFilterConfig {
 }
 
 // -----------------------------------------------------------------------------
+// OpenAiWebSearchConfig (YAML deserialization)
+// -----------------------------------------------------------------------------
+
+// Mirrors `WebSearchFilterConfig` minus `max_body_bytes` and validates through
+// the shared `build_config` via `into_shared`. Keep the remaining fields in
+// sync with `WebSearchFilterConfig`.
+
+/// Reads the request body but never rewrites it, so `openai_web_search`
+/// exposes no `max_body_bytes` knob: raw request body size is governed by the
+/// pipeline's `body_limits`, not a per-filter limit (which praxis core merges
+/// to the largest sibling buffer and would therefore be bypassable).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenAiWebSearchConfig {
+    /// Search backend provider.
+    provider: SearchProvider,
+
+    /// API key for the search provider (supports `${ENV_VAR}`).
+    /// Wrapped in [`SecretString`] to prevent accidental logging.
+    api_key: SecretString,
+
+    /// Default search context size when the client omits it.
+    #[serde(default)]
+    default_context_size: Option<String>,
+
+    /// Callout timeout in milliseconds.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+
+    /// Override the provider's default API base URL.
+    #[serde(default)]
+    base_url: Option<String>,
+
+    /// Allow a `base_url` that targets local-sensitive addresses.
+    ///
+    /// DNS targets are unsupported in protected mode (the default):
+    /// validation cannot pin the address the HTTP client will eventually
+    /// dial, so a `base_url` host must be a public IP literal. Enabling
+    /// `allow_private_base_url` also permits DNS results resolving to
+    /// local-sensitive addresses, so a hostile or rebound resolution can
+    /// send the provider credential to a loopback, private, or
+    /// cloud-metadata endpoint.
+    #[serde(default)]
+    allow_private_base_url: bool,
+}
+
+impl OpenAiWebSearchConfig {
+    /// Convert into the shared [`WebSearchFilterConfig`] for validation reuse.
+    ///
+    /// `max_body_bytes` is fixed to `None`: `openai_web_search` defers raw
+    /// request body size to the pipeline's `body_limits` and buffers to the
+    /// absolute JSON ceiling, so it carries no per-filter raw-body cap.
+    pub(crate) fn into_shared(self) -> WebSearchFilterConfig {
+        WebSearchFilterConfig {
+            provider: self.provider,
+            api_key: self.api_key,
+            default_context_size: self.default_context_size,
+            timeout_ms: self.timeout_ms,
+            max_body_bytes: None,
+            base_url: self.base_url,
+            allow_private_base_url: self.allow_private_base_url,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // ValidatedConfig (post-validation)
 // -----------------------------------------------------------------------------
 

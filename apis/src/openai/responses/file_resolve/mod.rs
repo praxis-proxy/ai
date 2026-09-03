@@ -70,7 +70,8 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -81,7 +82,10 @@ use self::{
     },
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
-use super::{openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState};
+use super::{
+    body_limits::reject_rewritten_body_too_large, openai_responses_proxy::serialized_outbound_body_len,
+    state::ResponsesState,
+};
 use crate::{
     callout_policy::OnMissing,
     classifier::is_responses_create,
@@ -125,7 +129,8 @@ use crate::{
 ///   - x-tenant-id
 /// on_missing: continue
 /// timeout_ms: 30000
-/// max_body_bytes: 67108864
+/// max_rewritten_body_bytes: 67108864
+/// max_resolved_bytes: 67108864
 /// max_file_references: 32
 /// ```
 ///
@@ -212,7 +217,7 @@ impl FileResolveFilter {
             api_client,
             FilesApiClientOptions {
                 max_file_references: validated.max_file_references,
-                max_resolved_bytes: validated.max_body_bytes,
+                max_resolved_bytes: validated.max_resolved_bytes,
             },
         );
 
@@ -259,8 +264,11 @@ impl HttpFilter for FileResolveFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. max_rewritten_body_bytes bounds only
+        // the body produced after inlining resolved file content.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -292,9 +300,6 @@ impl HttpFilter for FileResolveFilter {
             trace!("no body, releasing");
             return Ok(FilterAction::Release);
         };
-        if raw.len() > self.config.max_body_bytes {
-            return Ok(reject_raw_body_too_large(raw.len(), self.config.max_body_bytes));
-        }
 
         let mut parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
@@ -309,12 +314,17 @@ impl HttpFilter for FileResolveFilter {
 }
 
 /// Run resolution and rewrite the body if any references were resolved.
+#[expect(clippy::too_many_lines, reason = "sequential resolve, rewrite, and size-check flow")]
 async fn resolve_and_rewrite(
     filter: &FileResolveFilter,
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     parsed: &mut serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
+    let streaming = ctx
+        .get_metadata("openai_responses_format.stream")
+        .is_some_and(|v| v == "true");
+    let max_bytes = filter.config.max_rewritten_body_bytes;
     let mut budget = filter.client.resolution_budget();
     let count = match resolve_current_input(filter, ctx, parsed, &mut budget).await {
         Ok(count) => count,
@@ -325,20 +335,20 @@ async fn resolve_and_rewrite(
         if let Err(e) = update_state(filter, ctx, None, &mut budget).await {
             return Ok(reject_resolve_error(&e));
         }
-        if let Some(rejection) = reject_oversized_state_body(ctx, filter.config.max_body_bytes)? {
+        if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes, streaming)? {
             return Ok(rejection);
         }
         return Ok(FilterAction::Continue);
     }
 
     debug!(count, "resolved file_id references");
-    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
+    if let Some(rejection) = rewrite_body(body, parsed, max_bytes, streaming, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
         return Ok(reject_resolve_error(&e));
     }
-    if let Some(rejection) = reject_oversized_state_body(ctx, filter.config.max_body_bytes)? {
+    if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes, streaming)? {
         return Ok(rejection);
     }
 
@@ -349,7 +359,8 @@ async fn resolve_and_rewrite(
 /// that `openai_responses_proxy` will later serialize from state.
 fn reject_oversized_state_body(
     ctx: &HttpFilterContext<'_>,
-    max_body_bytes: usize,
+    max_rewritten_body_bytes: usize,
+    streaming: bool,
 ) -> Result<Option<FilterAction>, FilterError> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return Ok(None);
@@ -357,7 +368,14 @@ fn reject_oversized_state_body(
     let len = serialized_outbound_body_len(state).map_err(|e| -> FilterError {
         format!("openai_file_resolve: failed to measure rebuilt request body: {e}").into()
     })?;
-    Ok((len > max_body_bytes).then(|| reject_rewritten_body_too_large(len, max_body_bytes)))
+    Ok((len > max_rewritten_body_bytes).then(|| {
+        warn!(
+            actual = len,
+            limit = max_rewritten_body_bytes,
+            "rebuilt state body exceeds configured limit"
+        );
+        reject_rewritten_body_too_large(len, max_rewritten_body_bytes, streaming)
+    }))
 }
 
 /// Resolve references in the request body's current input.
@@ -414,13 +432,23 @@ async fn update_state(
 fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
-    max_body_bytes: usize,
+    max_rewritten_body_bytes: usize,
+    streaming: bool,
     filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
     let rewritten = serialize_json_body(parsed)
         .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
-    if rewritten.len() > max_body_bytes {
-        return Ok(Some(reject_rewritten_body_too_large(rewritten.len(), max_body_bytes)));
+    if rewritten.len() > max_rewritten_body_bytes {
+        warn!(
+            actual = rewritten.len(),
+            limit = max_rewritten_body_bytes,
+            "rewritten request body exceeds configured limit"
+        );
+        return Ok(Some(reject_rewritten_body_too_large(
+            rewritten.len(),
+            max_rewritten_body_bytes,
+            streaming,
+        )));
     }
     rewritten.commit(body, filter_name, "input");
     Ok(None)
@@ -659,43 +687,6 @@ fn reject_resolve_error(err: &ResolveError) -> FilterAction {
 
     FilterAction::Reject(
         Rejection::status(status)
-            .with_header("content-type", "application/json")
-            .with_body(Bytes::from(body)),
-    )
-}
-
-/// Build a rejection before parsing or resolving an oversized raw body.
-fn reject_raw_body_too_large(actual: usize, limit: usize) -> FilterAction {
-    warn!(actual, limit, "buffered request body exceeds configured limit");
-    let body = serde_json::json!({
-        "error": {
-            "message": format!("request body exceeds {limit} bytes"),
-            "type": "file_resolve_error"
-        }
-    })
-    .to_string();
-
-    FilterAction::Reject(
-        Rejection::status(413)
-            .with_header("content-type", "application/json")
-            .with_body(Bytes::from(body)),
-    )
-}
-
-/// Build a rejection response when the final rewritten JSON body
-/// is too large.
-fn reject_rewritten_body_too_large(actual: usize, limit: usize) -> FilterAction {
-    warn!(actual, limit, "rewritten request body exceeds configured limit");
-    let body = serde_json::json!({
-        "error": {
-            "message": format!("resolved request body exceeds {limit} bytes"),
-            "type": "file_resolve_error"
-        }
-    })
-    .to_string();
-
-    FilterAction::Reject(
-        Rejection::status(413)
             .with_header("content-type", "application/json")
             .with_body(Bytes::from(body)),
     )

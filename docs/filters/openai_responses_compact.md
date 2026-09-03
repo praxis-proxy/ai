@@ -7,7 +7,7 @@ Summarizes conversation history when the token count exceeds a configured thresh
 
 ## Configuration Notes
 
-`compact_threshold` in `context_management` must be an integer. Floating-point values (e.g. `0.9`) are ignored and compaction is skipped.
+`compact_threshold` in `context_management` must be an integer of at least 1000. Invalid or missing `compact_threshold` values produce an `invalid_request_error`.
 
 Compaction only applies to multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history. Single-turn requests are released without compaction.
 
@@ -24,7 +24,7 @@ Praxis runs `StreamBuffer` body hooks before header-phase request filters. This 
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `on_failure` | `closed` \| `open` | no | Failure mode for the inference callout. |
-| `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
+| `status_on_error` | integer | no | HTTP error status code (`400..=599`) to return when rejecting on error. |
 
 ## Examples
 

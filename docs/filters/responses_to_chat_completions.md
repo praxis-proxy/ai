@@ -25,5 +25,5 @@ filter: responses_to_chat_completions
 
 ```yaml
 filter: responses_to_chat_completions
-max_body_bytes: 67108864
+max_rewritten_body_bytes: 67108864
 ```

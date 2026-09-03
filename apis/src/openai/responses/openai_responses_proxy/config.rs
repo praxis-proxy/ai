@@ -3,11 +3,10 @@
 
 //! Configuration types for the Responses proxy filter.
 
-use praxis_filter::{
-    FilterError, body::MAX_JSON_BODY_BYTES,
-    builtins::http::payload_processing::config_validation::validate_max_body_bytes,
-};
+use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
+
+use crate::openai::responses::body_limits::validate_size_limit;
 
 // -----------------------------------------------------------------------------
 // ResponsesProxyConfig
@@ -21,21 +20,26 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResponsesProxyConfig {
-    /// Maximum body size in bytes for `StreamBuffer` mode.
-    #[serde(default = "default_max_body_bytes")]
-    pub max_body_bytes: usize,
+    /// Maximum size in bytes of the request body this filter *produces*
+    /// when it rebuilds the outbound body from `ResponsesState`.
+    ///
+    /// Raw request body size is governed by the pipeline's `body_limits`,
+    /// not this field. This bounds only the rebuilt body, which can grow
+    /// larger than the raw input when conversation history is rehydrated.
+    #[serde(default = "default_max_rewritten_body_bytes")]
+    pub max_rewritten_body_bytes: usize,
 }
 
 impl Default for ResponsesProxyConfig {
     fn default() -> Self {
         Self {
-            max_body_bytes: MAX_JSON_BODY_BYTES,
+            max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         }
     }
 }
 
-/// Serde default for `max_body_bytes`.
-fn default_max_body_bytes() -> usize {
+/// Serde default for `max_rewritten_body_bytes`.
+fn default_max_rewritten_body_bytes() -> usize {
     MAX_JSON_BODY_BYTES
 }
 
@@ -45,6 +49,10 @@ fn default_max_body_bytes() -> usize {
 
 /// Validate the parsed configuration.
 pub(super) fn build_config(cfg: ResponsesProxyConfig) -> Result<ResponsesProxyConfig, FilterError> {
-    validate_max_body_bytes("openai_responses_proxy", cfg.max_body_bytes)?;
+    validate_size_limit(
+        "openai_responses_proxy",
+        "max_rewritten_body_bytes",
+        cfg.max_rewritten_body_bytes,
+    )?;
     Ok(cfg)
 }

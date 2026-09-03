@@ -40,7 +40,7 @@ pub(crate) struct HttpCalloutConfig {
     #[serde(default)]
     pub on_failure: OnFailure,
 
-    /// HTTP status code returned when rejecting on failure.
+    /// HTTP error status code (`400..=599`) to return when rejecting on error.
     pub status_on_error: Option<u16>,
 
     /// Circuit breaker configuration.

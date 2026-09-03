@@ -37,14 +37,15 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::state::ResponsesState;
 use crate::web_search::{
-    SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult, WebSearchFilterConfig,
+    OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult,
     build_config, format_search_results,
 };
 
@@ -90,15 +91,12 @@ const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// default_context_size: medium
 /// timeout_ms: 10000
-/// max_body_bytes: 67108864
 /// ```
 pub struct WebSearchFilter {
     /// The search client for executing queries.
     search_client: SearchClient,
     /// Default search context size.
     default_context_size: SearchContextSize,
-    /// Maximum request body bytes to buffer.
-    max_body_bytes: usize,
 }
 
 impl WebSearchFilter {
@@ -147,13 +145,12 @@ impl WebSearchFilter {
         config: &serde_yaml::Value,
         subrequest_client: crate::subrequest::SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: WebSearchFilterConfig = parse_filter_config("openai_web_search", config)?;
-        let validated = build_config("openai_web_search", &cfg)?;
+        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search", config)?;
+        let validated = build_config("openai_web_search", &cfg.into_shared())?;
         let search_client = SearchClient::from_config("openai_web_search", &validated, subrequest_client)?;
         Ok(Box::new(Self {
             search_client,
             default_context_size: validated.default_context_size,
-            max_body_bytes: validated.max_body_bytes,
         }))
     }
 
@@ -217,8 +214,11 @@ impl HttpFilter for WebSearchFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Buffer up to the absolute JSON ceiling; the pipeline's body_limits
+        // governs the real raw-request cap (merged across sibling filters and
+        // clamped to the transport ceiling by praxis core).
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -227,8 +227,11 @@ impl HttpFilter for WebSearchFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
+        // Buffer up to the absolute JSON ceiling; the pipeline's body_limits
+        // governs the real raw-response cap (merged across sibling filters and
+        // clamped to the transport ceiling by praxis core).
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 

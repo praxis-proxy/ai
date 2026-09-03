@@ -13,7 +13,7 @@ Rejects the request with HTTP 400 before any callouts if two or more resolvable 
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_body_bytes` | integer | no | Maximum request body bytes for `StreamBuffer`. |
+| `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after expanding `mcp` tool entries into `function` entries. Raw request body size is governed by the pipeline's `body_limits`, not this field. This bounds only the post-expansion body, which can grow larger than the raw input. |
 | `timeout_ms` | integer | no | Per-server timeout in milliseconds for `tools/list` calls. |
 | `max_servers` | integer | no | Maximum number of distinct MCP servers per request. |
 | `max_tools` | integer | no | Maximum number of tools returned by a single MCP server. |
@@ -35,6 +35,6 @@ filter: openai_mcp_tool_resolve
 ```yaml
 filter: openai_mcp_tool_resolve
 timeout_ms: 5000
-max_body_bytes: 67108864
+max_rewritten_body_bytes: 67108864
 max_tools: 128
 ```
