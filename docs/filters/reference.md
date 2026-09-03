@@ -82,7 +82,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request (and eventually response) bodies. The provider determines whether content should be passed, blocked, or redacted. |
+| [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request and response bodies. The provider determines whether content should be passed, blocked, or redacted. |
 
 ### Inference
 

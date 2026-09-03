@@ -22,9 +22,9 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 // AiGuardrailsFilter
 // -----------------------------------------------------------------------------
 
-/// Calls an external AI guardrail provider to evaluate request (and
-/// eventually response) bodies. The provider determines whether
-/// content should be passed, blocked, or redacted.
+/// Calls an external AI guardrail provider to evaluate request and
+/// response bodies. The provider determines whether content should
+/// be passed, blocked, or redacted.
 ///
 /// # YAML configuration
 ///
@@ -36,7 +36,7 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 ///   timeout_ms: 5000
 /// phase:
 ///   request: true
-///   response: false
+///   response: true
 /// ```
 ///
 /// # Example
@@ -104,14 +104,6 @@ impl AiGuardrailsFilter {
     fn build(config: &serde_yaml::Value, client: SubRequestClient) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: AiGuardrailsConfig = parse_filter_config("ai_guardrails", config)?;
 
-        if cfg.phase.response {
-            return Err(
-                "ai_guardrails: 'phase.response: true' is not supported yet (response-side evaluation is \
-                 tracked in #580); set 'phase.response: false' or omit it"
-                    .into(),
-            );
-        }
-
         let provider: Box<dyn GuardProvider> = match cfg.provider.provider_type {
             ProviderType::Nemo => Box::new(NemoProvider::from_config(&cfg.provider.config, client)?),
         };
@@ -130,6 +122,15 @@ impl HttpFilter for AiGuardrailsFilter {
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if self.phase.response && !is_event_stream(ctx) {
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
+            });
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -167,7 +168,66 @@ impl HttpFilter for AiGuardrailsFilter {
 
         let messages = extract_messages(bytes)?;
         let result = self.provider.evaluate(messages, GuardPhase::Request).await?;
-        record_verdict(ctx, result)
+        record_verdict(ctx, body, result, GuardPhase::Request)
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        if self.phase.response {
+            BodyAccess::ReadWrite
+        } else {
+            BodyAccess::None
+        }
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
+    fn on_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream || !self.phase.response {
+            return Ok(FilterAction::Continue);
+        }
+
+        // Only evaluate when the body was fully buffered (StreamBuffer).
+        // SSE / streaming responses stay in Stream mode and are not evaluated.
+        if !matches!(ctx.response_body_mode, BodyMode::StreamBuffer { .. }) {
+            tracing::debug!("ai_guardrails: skipping response-phase evaluation (body not buffered)");
+            return Ok(FilterAction::Continue);
+        }
+
+        let Some(bytes) = body.as_ref() else {
+            return Ok(FilterAction::Continue);
+        };
+
+        if bytes.is_empty() {
+            return Ok(FilterAction::Continue);
+        }
+
+        let evaluation = extract_response_messages(bytes).and_then(|messages| {
+            let handle = tokio::runtime::Handle::current();
+            // `on_response_body` is sync (Pingora constraint); use `block_in_place`
+            // to bridge into async. See #51 for the plan to make this truly async.
+            tokio::task::block_in_place(|| handle.block_on(self.provider.evaluate(messages, GuardPhase::Response)))
+        });
+
+        match evaluation {
+            Ok(result) => record_verdict(ctx, body, result, GuardPhase::Response),
+            Err(e) => {
+                tracing::error!(error = %e, "ai_guardrails: response-phase evaluation failed");
+                replace_body_with_error(
+                    body,
+                    &format!("Guardrail evaluation failed: {e}"),
+                    "guardrail_error",
+                    "evaluation_failed",
+                );
+                Ok(FilterAction::Continue)
+            },
+        }
     }
 }
 
@@ -175,11 +235,27 @@ impl HttpFilter for AiGuardrailsFilter {
 // Private Utilities
 // -----------------------------------------------------------------------------
 
-/// Record the provider verdict in `ctx.filter_results`
-/// and map it to the corresponding [`FilterAction`].
-fn record_verdict(ctx: &mut HttpFilterContext<'_>, result: GuardResult) -> Result<FilterAction, FilterError> {
-    // Capture label before consuming `result` in the match.
+/// Record the provider verdict in `ctx.filter_results` and map it to
+/// the corresponding [`FilterAction`].
+///
+/// The `phase` parameter controls how a `Block` verdict is enforced:
+///
+/// - **Request phase**: returns `FilterAction::Reject(403)` - headers have not been sent yet, so a clean 403 is
+///   possible.
+///
+/// - **Response phase**: response headers (including the upstream's 200 status and `Content-Length`) are already
+///   committed by the time `on_response_body` runs.  A `Reject(403)` would be converted to a 500 by Pingora (see
+///   `praxis-proxy/pingora` issue #51).  Instead, the response body is replaced with a JSON error payload and padded to
+///   the original `Content-Length` so Pingora does not report `PrematureBodyEnd`.  JSON parsers ignore trailing ASCII
+///   spaces, so clients parse the error cleanly.
+fn record_verdict(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    result: GuardResult,
+    phase: GuardPhase,
+) -> Result<FilterAction, FilterError> {
     let verdict = result.status_label();
+    let phase_label = phase.label();
     ctx.filter_results
         .entry("ai_guardrails")
         .or_default()
@@ -187,17 +263,96 @@ fn record_verdict(ctx: &mut HttpFilterContext<'_>, result: GuardResult) -> Resul
 
     match result {
         GuardResult::Pass => {
-            tracing::debug!(verdict, "ai_guardrails: provider verdict");
+            tracing::debug!(verdict, phase = phase_label, "ai_guardrails: verdict");
             Ok(FilterAction::Continue)
         },
-        GuardResult::Block { reason } => {
-            tracing::warn!(verdict, %reason, "ai_guardrails: provider verdict");
-            Ok(FilterAction::Reject(Rejection::status(403).with_body(reason)))
-        },
+        GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, phase_label, verdict)),
         GuardResult::Redact { reason, .. } => {
-            // Full body replacement deferred to #579 (NeMo mask/redact action).
-            tracing::warn!(verdict, %reason, "ai_guardrails: provider verdict; forwarding unchanged until #579");
+            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict; forwarding unchanged until #579");
             Ok(FilterAction::Continue)
+        },
+    }
+}
+
+/// Enforce a `Block` verdict for the given phase.
+fn enforce_block(
+    body: &mut Option<Bytes>,
+    reason: String,
+    phase: GuardPhase,
+    phase_label: &str,
+    verdict: &str,
+) -> FilterAction {
+    match phase {
+        GuardPhase::Request => {
+            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
+            FilterAction::Reject(Rejection::status(403).with_body(reason))
+        },
+        GuardPhase::Response => {
+            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict - replacing body");
+            replace_body_with_error(
+                body,
+                &format!("Response blocked by guardrails: {reason}"),
+                "guardrail_violation",
+                "content_blocked",
+            );
+            FilterAction::Continue
+        },
+    }
+}
+
+/// Replace the response body with an error JSON payload.
+///
+/// Used on the response side when headers are already committed and
+/// the body is the only channel for communicating errors to the client.
+fn replace_body_with_error(body: &mut Option<Bytes>, message: &str, error_type: &str, code: &str) {
+    let error_json = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": code,
+        }
+    })
+    .to_string();
+    *body = Some(fit_to_committed_length(error_json, body));
+}
+
+/// Fit `replacement` bytes to the original response body length.
+///
+/// The downstream `Content-Length` is committed by the time
+/// `on_response_body` runs - praxis has no response-side equivalent of
+/// `apply_mutated_content_length`. Emitting fewer bytes than
+/// `Content-Length` causes Pingora to report `PrematureBodyEnd` and
+/// abort the connection. Emitting more bytes is an HTTP/1.1 framing
+/// desync.
+///
+/// Pads with trailing ASCII spaces on shrink (JSON parsers ignore them);
+/// truncates on grow (safe failure mode - corrupts JSON but cannot cause
+/// response smuggling).
+pub(super) fn fit_to_committed_length(replacement: String, original_body: &Option<Bytes>) -> Bytes {
+    let original_len = original_body.as_ref().map_or(0, Bytes::len);
+    let replacement = replacement.into_bytes();
+    match replacement.len().cmp(&original_len) {
+        std::cmp::Ordering::Equal => Bytes::from(replacement),
+        std::cmp::Ordering::Less => {
+            let mut padded = replacement;
+            padded.resize(original_len, b' ');
+            Bytes::from(padded)
+        },
+        std::cmp::Ordering::Greater => {
+            tracing::warn!(
+                new_len = replacement.len(),
+                original_len,
+                "ai_guardrails: replacement body larger than committed Content-Length; truncating",
+            );
+            let prefix = replacement.get(..original_len).unwrap_or(&replacement);
+            let safe = match std::str::from_utf8(prefix) {
+                Ok(s) => s.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            let mut result = replacement;
+            result.truncate(safe);
+            result.resize(original_len, b' ');
+            Bytes::from(result)
         },
     }
 }
@@ -226,4 +381,56 @@ fn extract_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError>
     }
 
     Err("ai_guardrails: request body does not contain recognizable messages".into())
+}
+
+/// Extract assistant messages from an OpenAI Chat Completion response body.
+///
+/// Supports:
+/// - OpenAI Chat Completion response: `{"choices": [{"message": {...}}]}`
+///
+/// Each `message` object from the `choices` array is returned as-is
+/// so the guardrail provider sees the full assistant message
+/// (role, content, `tool_calls`, etc.).
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the body is not valid JSON or does not
+/// contain a recognizable choices/message structure.
+fn extract_response_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError> {
+    let mut json: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: response body is not valid JSON: {e}").into() })?;
+
+    if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        let num_choices = choices.len();
+        let messages: Vec<serde_json::Value> = choices
+            .iter_mut()
+            .filter_map(|c| c.get_mut("message").map(std::mem::take))
+            .collect();
+        if messages.is_empty() {
+            return Err("ai_guardrails: response body does not contain recognizable choices".into());
+        }
+        if messages.len() != num_choices {
+            return Err(format!(
+                "ai_guardrails: {num_choices} choices but only {} contain a message field",
+                messages.len(),
+            )
+            .into());
+        }
+        return Ok(messages);
+    }
+
+    Err("ai_guardrails: response body does not contain recognizable choices".into())
+}
+
+/// Whether the upstream response has a `text/event-stream` content type.
+fn is_event_stream(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.response_header
+        .as_ref()
+        .and_then(|r| r.headers.get("content-type"))
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
 }

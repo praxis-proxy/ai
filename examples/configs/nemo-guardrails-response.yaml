@@ -1,0 +1,45 @@
+# Guardrails (NeMo) - Response Phase Only
+#
+# Evaluates upstream responses against a NeMo Guardrails service.
+# Request-side guardrails are disabled so the request always reaches
+# the upstream. This config is used by integration tests to verify
+# response-phase behavior in isolation.
+#
+#   Response phase:
+#     success  - response forwarded to the client unchanged
+#     blocked  - response body replaced with a JSON error payload
+#                (status remains 200 because headers are already committed)
+#     error    - response body replaced with a JSON error payload
+#                (same as blocked; headers are already committed)
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - nemo-guardrails-response
+
+filter_chains:
+  - name: nemo-guardrails-response
+    filters:
+      - filter: ai_guardrails
+        provider:
+          type: nemo
+          endpoint: "http://127.0.0.1:3001/v1/guardrail/checks"
+          timeout_ms: 5000
+        phase:
+          request: false
+          response: true
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: provider
+
+      - filter: load_balancer
+        clusters:
+          - name: provider
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
