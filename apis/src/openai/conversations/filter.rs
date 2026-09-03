@@ -526,10 +526,8 @@ impl HttpFilter for OpenaiConversationsFilter {
         // yields a 2xx followed by a reset — but either way the body is withheld.
         // `failure_mode: open` is an explicit operator opt-out of that guarantee:
         // the pipeline logs this error and converts it to Continue, releasing the
-        // body even though items were lost. Only pre-commit failures (item insertion
-        // and earlier) reach this `?`: a post-commit message-cache refresh failure
-        // is tolerated inside `persist_items` because the cache is a self-healing
-        // projection (see `refresh_message_cache`).
+        // body even though items were lost. Transactional item insertion and cache
+        // rebuild failures reach this `?` before any append-back bytes are released.
         self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items)
             .inspect_err(|e| warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed"))?;
 
@@ -625,14 +623,9 @@ async fn persist_items(
     ctx: &HttpFilterContext<'_>,
     items: Vec<Value>,
 ) -> Result<(), FilterError> {
-    let max_pos = store
-        .max_item_position(tenant_id, conversation_id)
-        .await
-        .map_err(|e| -> FilterError { Box::new(e) })?;
-    let start_position = max_pos.saturating_add(1);
     let created_at = handlers::current_timestamp(ctx);
 
-    let records = handlers::build_item_records(ctx, tenant_id, conversation_id, created_at, start_position, items)
+    let records = handlers::build_item_records(ctx, tenant_id, conversation_id, created_at, 0, items)
         .map_err(|e| -> FilterError { e.into() })?;
 
     if records.is_empty() {
@@ -641,49 +634,16 @@ async fn persist_items(
 
     let count = records.len();
     store
-        .create_conversation_items(&records)
+        .create_items_and_sync_messages(tenant_id, conversation_id, &records)
         .await
         .map_err(|e| -> FilterError { Box::new(e) })?;
 
-    // Item rows are durable past this point. The message cache is a self-healing
-    // projection rebuilt from the items table on the next successful sync, so a
-    // refresh failure is not data loss and must not fail the turn: propagating it
-    // would abort a request whose items already committed and drive a client retry
-    // that re-appends the same (typically id-less) input items as duplicates
-    // (#837). Log and continue; a later successful cache-refresh re-syncs the cache.
-    refresh_message_cache(store, tenant_id, conversation_id).await;
     debug!(
         conversation_id,
         tenant_id, count, "conversation items appended from response"
     );
 
     Ok(())
-}
-
-/// Refresh the denormalized conversation message cache after item mutation.
-///
-/// The cache is a projection of the items table that `openai_responses_rehydrate`
-/// replays on the next turn. It runs *after* the item rows have committed, so it
-/// is deliberately best-effort: the sync is idempotent — it rebuilds `messages`
-/// from the durable items table — so a later successful sync re-syncs whatever this
-/// attempt left behind (a later *append* is not sufficient: its own refresh may
-/// also fail). Failing the turn here would abort a request whose
-/// items already persisted and push the client into a retry that re-appends the
-/// same items as duplicates, so a refresh failure is logged and swallowed rather
-/// than propagated (#837). A transient stale-cache window remains until the next
-/// successful sync; closing it fully (atomic item-insert + projection) is tracked
-/// separately.
-async fn refresh_message_cache(store: &dyn ConversationItemStore, tenant_id: &str, conversation_id: &str) {
-    // The append-back path holds no pre-mutation cache snapshot, so it syncs with
-    // `None`; the refresh then re-reads the live cache as the swap's expected value.
-    if let Err(e) = handlers::sync_conversation_messages(store, tenant_id, conversation_id, None).await {
-        warn!(
-            error = %e,
-            conversation_id,
-            "conversation message cache refresh failed after append-back; items are durable and the \
-             cache re-syncs on a later successful refresh (#837)"
-        );
-    }
 }
 
 // -----------------------------------------------------------------------------
