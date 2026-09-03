@@ -7,8 +7,9 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
-use futures::StreamExt as _;
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, Method, Uri};
+use praxis_ai_apis::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
 use praxis_filter::FilterError;
 use serde::{Deserialize, Serialize};
 
@@ -68,25 +69,31 @@ struct NemoResponse {
 
 /// `NeMo` Guardrails provider.
 pub(in crate::guardrails) struct NemoProvider {
-    /// Pre-configured HTTP client.
-    client: reqwest::Client,
+    /// Bounded HTTP client with admission control and circuit breaking.
+    client: SubRequestClient,
 
     /// `NeMo` endpoint URL.
     endpoint: String,
 
     /// Model name included in every request. Empty string when not configured.
     model: String,
+
+    /// Per-request deadline covering admission, connect, and I/O.
+    timeout: Duration,
 }
 
 impl NemoProvider {
     /// Parse and validate `NeMo`-specific config from the provider settings.
     ///
-    /// Builds a new `NeMo` provider with a pre-configured HTTP client.
+    /// Uses the provided [`SubRequestClient`] so callouts inherit the
+    /// runtime's admission control, circuit breaking, and deadline.
     ///
     /// # Errors
     ///
     /// Returns `FilterError` if the configuration is invalid.
-    pub fn from_config(config: &serde_yaml::Value) -> Result<Self, FilterError> {
+    ///
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    pub fn from_config(config: &serde_yaml::Value, client: SubRequestClient) -> Result<Self, FilterError> {
         let cfg: NemoConfig = serde_yaml::from_value(config.clone())
             .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): {e}").into() })?;
         if cfg.endpoint.is_empty() {
@@ -96,15 +103,11 @@ impl NemoProvider {
             return Err("ai_guardrails (nemo): 'timeout_ms' must be greater than zero".into());
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(cfg.timeout_ms))
-            .build()
-            .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): failed to build HTTP client: {e}").into() })?;
-
         Ok(Self {
             client,
             endpoint: cfg.endpoint,
             model: cfg.model,
+            timeout: Duration::from_millis(cfg.timeout_ms),
         })
     }
 }
@@ -112,21 +115,12 @@ impl NemoProvider {
 #[async_trait]
 impl GuardProvider for NemoProvider {
     async fn evaluate(&self, messages: Vec<serde_json::Value>, _phase: GuardPhase) -> Result<GuardResult, FilterError> {
-        let payload = NemoRequest {
-            model: self.model.clone(),
-            messages,
-        };
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .json(&payload)
-            .send()
+        let request = build_request(&self.model, messages)?;
+        let response = subrequest::execute_url(&self.client, &self.endpoint, request, MAX_RESPONSE_SIZE, self.timeout)
             .await
-            .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): failed to send request: {e}").into() })?;
-        check_content_length(&response)?;
+            .map_err(|error| map_subrequest_error(&error))?;
         ensure_success_status(&response)?;
-        let response_body = read_response_body(response).await?;
-        let nemo_response: NemoResponse = serde_json::from_slice(&response_body)
+        let nemo_response: NemoResponse = serde_json::from_slice(&response.body)
             .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): failed to parse response: {e}").into() })?;
         map_nemo_response(&nemo_response)
     }
@@ -136,49 +130,45 @@ impl GuardProvider for NemoProvider {
 // Private Utilities
 // -----------------------------------------------------------------------------
 
-/// Reject responses whose declared `Content-Length` exceeds [`MAX_RESPONSE_SIZE`].
-fn check_content_length(response: &reqwest::Response) -> Result<(), FilterError> {
-    let Some(len) = response.content_length() else {
-        return Ok(());
+/// Build the outbound `NeMo` JSON callout.
+fn build_request(model: &str, messages: Vec<serde_json::Value>) -> Result<SubRequest, FilterError> {
+    let payload = NemoRequest {
+        model: model.to_owned(),
+        messages,
     };
-    if usize::try_from(len).map_or(true, |l| l > MAX_RESPONSE_SIZE) {
+    let body =
+        Bytes::from(serde_json::to_vec(&payload).map_err(|e| -> FilterError {
+            format!("ai_guardrails (nemo): failed to serialize request: {e}").into()
+        })?);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(http::header::ACCEPT, HeaderValue::from_static("application/json"));
+
+    Ok(SubRequest {
+        method: Method::POST,
+        uri: Uri::default(),
+        headers,
+        body,
+    })
+}
+
+/// Map a sub-request failure to a filter error, preserving the
+/// distinct admission / circuit-open / I/O variants in the message.
+fn map_subrequest_error(error: &SubRequestError) -> FilterError {
+    format!("ai_guardrails (nemo): failed to send request: {error}").into()
+}
+
+/// Reject non-2xx HTTP responses from the provider.
+fn ensure_success_status(response: &SubResponse) -> Result<(), FilterError> {
+    if !(200..300).contains(&response.status) {
         return Err(format!(
-            "ai_guardrails (nemo): response Content-Length too large \
-             ({len} bytes, limit {MAX_RESPONSE_SIZE})"
+            "ai_guardrails (nemo): provider returned HTTP status code {}",
+            response.status
         )
         .into());
     }
     Ok(())
-}
-
-/// Reject non-2xx HTTP responses from the provider.
-fn ensure_success_status(response: &reqwest::Response) -> Result<(), FilterError> {
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("ai_guardrails (nemo): provider returned HTTP status code {status}").into());
-    }
-    Ok(())
-}
-
-/// Read the response body incrementally, aborting as soon as the
-/// running total exceeds [`MAX_RESPONSE_SIZE`].
-async fn read_response_body(response: reqwest::Response) -> Result<Bytes, FilterError> {
-    let mut stream = response.bytes_stream();
-    let mut body = BytesMut::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| -> FilterError {
-            format!("ai_guardrails (nemo): failed to read response body: {e}").into()
-        })?;
-        if body.len() + chunk.len() > MAX_RESPONSE_SIZE {
-            return Err(format!(
-                "ai_guardrails (nemo): response body too large \
-                 (limit {MAX_RESPONSE_SIZE} bytes)"
-            )
-            .into());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body.freeze())
 }
 
 /// Map a deserialized [`NemoResponse`] to a [`GuardResult`].

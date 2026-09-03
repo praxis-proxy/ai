@@ -13,7 +13,7 @@
 use std::{future::Future, net::SocketAddr, time::Duration};
 
 use pingora_core::upstreams::peer::HttpPeer;
-pub(crate) use praxis_core::subrequest::{SubRequest, SubRequestClient, SubRequestError, SubResponse};
+pub use praxis_core::subrequest::{SubRequest, SubRequestClient, SubRequestError, SubResponse};
 use tracing::debug;
 
 /// Parsed URL components needed to resolve and execute a request.
@@ -102,8 +102,16 @@ async fn with_deadline<T>(
 ///
 /// The configured timeout covers URL resolution and the complete HTTP
 /// exchange. All resolved addresses are tried in order when connecting,
-/// while the original URL authority is preserved in `Host`.
-pub(crate) async fn execute_url(
+/// while the original URL authority is preserved in `Host`. Admission
+/// control and per-peer circuit breaking are inherited from `client`.
+///
+/// # Errors
+///
+/// Returns [`SubRequestError`] when the URL cannot be parsed, DNS
+/// resolution or connect fails, the deadline is exceeded, admission
+/// or circuit breaking rejects the call, the response exceeds
+/// `max_response_bytes`, or I/O fails during the exchange.
+pub async fn execute_url(
     client: &SubRequestClient,
     url: &str,
     request: SubRequest,
