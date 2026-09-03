@@ -168,20 +168,12 @@ fn unclassified_connection_refused_returns_generic_fallback() {
 
     assert!(status >= 500, "should be 5xx, got {status}");
 
-    // Should NOT be OpenAI format
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response_body) {
-        // If it's JSON, it should not have the OpenAI error envelope
-        // RFC 9457 has "type" as a URI, OpenAI has "error" as an object
-        if parsed.get("error").is_some() {
-            // The "error" key in RFC 9457 is absent; OpenAI has it
-            // If error is an object with "type", it's OpenAI — that's wrong
-            assert!(
-                parsed["error"].get("type").is_none(),
-                "unclassified request must not get OpenAI error format"
-            );
-        }
-    }
-    // Otherwise it's plain text or RFC 9457 — both are acceptable fallbacks
+    let parsed: serde_json::Value =
+        serde_json::from_str(&response_body).expect("proxy error should be valid JSON (RFC 9457)");
+    assert!(
+        parsed.get("error").and_then(|e| e.get("type")).is_none(),
+        "unclassified request should not receive OpenAI formatted error envelope"
+    );
 }
 
 // -----------------------------------------------------------------------------
