@@ -86,14 +86,22 @@ pub fn validate_configured_http_target(
 ) -> Result<url::Url, FilterError> {
     let parsed = validate_http_target(filter_name, raw)?;
     let host = parsed.host_str().unwrap_or_default();
-    if !policy.allows_private() && host.trim_end_matches('.').eq_ignore_ascii_case("localhost") {
+    let host_without_brackets = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if !policy.allows_private()
+        && host_without_brackets
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case("localhost")
+    {
         return Err(
             format!("{filter_name}: target URL targets localhost; enable the private-target opt-in to allow").into(),
         );
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    if let Ok(ip) = host_without_brackets.parse::<IpAddr>() {
         validate_ip(filter_name, ip, policy)?;
-    } else if let Some(ip) = parse_legacy_ipv4_host(host) {
+    } else if let Some(ip) = parse_legacy_ipv4_host(host_without_brackets) {
         validate_ip(filter_name, IpAddr::V4(ip), policy)?;
     }
     Ok(parsed)
@@ -218,6 +226,12 @@ pub async fn build_pinned_reqwest_client(
     let host = parsed
         .host_str()
         .ok_or_else(|| -> FilterError { format!("{filter_name}: target URL must include a host").into() })?;
+    // `Url::host_str()` serializes IPv6 hosts with brackets; remove them
+    // before passing the host to `IpAddr` parsing or DNS resolution.
+    let host_without_brackets = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| -> FilterError { format!("{filter_name}: target URL has no usable port").into() })?;
@@ -226,8 +240,8 @@ pub async fn build_pinned_reqwest_client(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
 
-    if host.parse::<IpAddr>().is_err() {
-        let resolved = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
+    if host_without_brackets.parse::<IpAddr>().is_err() {
+        let resolved = tokio::time::timeout(timeout, tokio::net::lookup_host((host_without_brackets, port)))
             .await
             .map_err(|_elapsed| -> FilterError { format!("{filter_name}: DNS resolution timed out").into() })?
             .map_err(|error| -> FilterError {
