@@ -63,13 +63,27 @@ pub fn validate_http_target(filter_name: &str, raw: &str) -> Result<url::Url, Fi
     if parsed.host().is_none() {
         return Err(format!("{filter_name}: target URL must include a host").into());
     }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
+    if raw_authority_contains_userinfo_delimiter(raw) || !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!("{filter_name}: target URL must not contain embedded credentials").into());
     }
     if parsed.fragment().is_some() {
         return Err(format!("{filter_name}: target URL must not contain a fragment").into());
     }
     Ok(parsed)
+}
+
+/// Return whether the raw URL authority contains the userinfo delimiter.
+///
+/// `url::Url` normalizes empty userinfo (`http://@example.com`) to an empty
+/// username with no password, so checking the parsed credential values alone
+/// cannot distinguish it from a URL without userinfo.  Limit the scan to the
+/// authority so `@` in a path, query, or fragment is not treated as userinfo.
+fn raw_authority_contains_userinfo_delimiter(raw: &str) -> bool {
+    let Some((_, authority_and_rest)) = raw.split_once("://") else {
+        return false;
+    };
+    let authority = authority_and_rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.contains('@')
 }
 
 /// Validate a configured target, including address literals and localhost
@@ -269,7 +283,26 @@ mod tests {
 
     #[test]
     fn target_rejects_userinfo_for_both_policies() {
-        assert!(validate_http_target("test", "https://user:pass@example.com/path").is_err());
+        for target in [
+            "https://user:pass@example.com/path",
+            "http://@example.com",
+            "http://:@example.com",
+        ] {
+            assert!(
+                validate_http_target("test", target).is_err(),
+                "{target} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn target_allows_at_sign_outside_authority() {
+        for target in ["https://example.com/@path", "https://example.com/?q=@value"] {
+            assert!(
+                validate_http_target("test", target).is_ok(),
+                "{target} should be accepted"
+            );
+        }
     }
 
     #[test]
