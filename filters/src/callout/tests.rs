@@ -222,7 +222,7 @@ mod filter_tests {
 
     #[test]
     fn config_rejects_status_on_error_out_of_range() {
-        for bad in ["0", "99", "600", "65535"] {
+        for bad in ["0", "99", "100", "200", "204", "302", "399", "600", "65535"] {
             let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
                 r#"
                 target:

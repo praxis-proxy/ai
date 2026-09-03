@@ -95,16 +95,16 @@ pub fn validate_timeout_ms(filter: &str, raw: Option<u64>, default: u64) -> Resu
 }
 
 /// Validate `status_on_error`, applying a default and rejecting
-/// values outside the HTTP status range.
+/// values that are not HTTP error status codes (`400..=599`).
 ///
 /// # Errors
 ///
 /// Returns [`FilterError`] when the resolved value is not in
-/// `100..=599`.
+/// `400..=599`.
 pub fn validate_status_on_error(filter: &str, raw: Option<u16>, default: u16) -> Result<u16, FilterError> {
     let value = raw.unwrap_or(default);
-    if !(100..=599).contains(&value) {
-        return Err(format!("{filter}: status_on_error must be between 100 and 599, got {value}").into());
+    if !(400..=599).contains(&value) {
+        return Err(format!("{filter}: status_on_error must be between 400 and 599, got {value}").into());
     }
     Ok(value)
 }
@@ -157,7 +157,7 @@ mod tests {
     fn status_below_range_rejected() {
         let err = validate_status_on_error("test", Some(99), 502).unwrap_err();
         assert!(
-            err.to_string().contains("between 100 and 599"),
+            err.to_string().contains("between 400 and 599"),
             "below range should be rejected, got: {err}"
         );
     }
@@ -166,14 +166,25 @@ mod tests {
     fn status_above_range_rejected() {
         let err = validate_status_on_error("test", Some(600), 502).unwrap_err();
         assert!(
-            err.to_string().contains("between 100 and 599"),
+            err.to_string().contains("between 400 and 599"),
             "above range should be rejected, got: {err}"
         );
     }
 
     #[test]
+    fn status_non_error_classes_rejected() {
+        for status in [100, 101, 200, 204, 301, 399] {
+            let err = validate_status_on_error("test", Some(status), 502).unwrap_err();
+            assert!(
+                err.to_string().contains("between 400 and 599"),
+                "non-error status {status} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn status_boundaries_accepted() {
-        validate_status_on_error("test", Some(100), 502).expect("100 should be accepted");
+        validate_status_on_error("test", Some(400), 502).expect("400 should be accepted");
         validate_status_on_error("test", Some(599), 502).expect("599 should be accepted");
     }
 

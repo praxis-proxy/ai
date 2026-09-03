@@ -23,7 +23,7 @@ Praxis runs `StreamBuffer` body hooks before header-phase request filters. This 
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `on_failure` | `closed` \| `open` | no | Failure mode for the inference callout. |
-| `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
+| `status_on_error` | integer | no | HTTP error status code (`400..=599`) to return when rejecting on error. |
 
 ## Examples
 

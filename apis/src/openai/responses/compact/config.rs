@@ -53,7 +53,7 @@ pub(super) struct CompactFilterConfig {
     #[serde(default)]
     pub on_failure: Option<OnFailure>,
 
-    /// HTTP status code to return when rejecting on error.
+    /// HTTP error status code (`400..=599`) to return when rejecting on error.
     #[serde(default)]
     pub status_on_error: Option<u16>,
 }
