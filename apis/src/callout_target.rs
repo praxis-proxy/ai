@@ -319,7 +319,10 @@ mod tests {
     #[test]
     fn mixed_dns_answer_is_rejected() {
         let addrs = ["8.8.8.8:443".parse().unwrap(), "169.254.169.254:443".parse().unwrap()];
-        assert!(validate_resolved_addrs("test", &addrs, AddressPolicy::PublicOnly).is_err());
+        assert!(
+            validate_resolved_addrs("test", &addrs, AddressPolicy::PublicOnly).is_err(),
+            "mixed public and private DNS answers should be rejected"
+        );
     }
 
     #[test]
@@ -334,6 +337,9 @@ mod tests {
     #[test]
     fn mapped_loopback_is_rejected() {
         let addrs = ["[::ffff:127.0.0.1]:80".parse().unwrap()];
-        assert!(validate_resolved_addrs("test", &addrs, AddressPolicy::PublicOnly).is_err());
+        assert!(
+            validate_resolved_addrs("test", &addrs, AddressPolicy::PublicOnly).is_err(),
+            "IPv4-mapped loopback answers should be rejected"
+        );
     }
 }

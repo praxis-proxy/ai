@@ -429,12 +429,15 @@ mod tests {
             .await
             .expect_err("a derived URL on another origin must be rejected before I/O");
 
-        assert!(matches!(
-            error,
-            ApiClientError::Transport {
-                source: SubRequestError::InvalidRequest(detail),
-            } if detail.contains("configured credential origin")
-        ));
+        assert!(
+            matches!(
+                error,
+                ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest(detail),
+                } if detail.contains("configured credential origin")
+            ),
+            "cross-origin derived URLs should be rejected as invalid requests"
+        );
     }
 
     #[tokio::test]
@@ -446,12 +449,15 @@ mod tests {
             .await
             .expect_err("a malformed callout URL must be rejected before I/O");
 
-        assert!(matches!(
-            error,
-            ApiClientError::Transport {
-                source: SubRequestError::InvalidRequest(detail),
-            } if detail == "malformed callout URL"
-        ));
+        assert!(
+            matches!(
+                error,
+                ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest(detail),
+                } if detail == "malformed callout URL"
+            ),
+            "malformed callout URLs should be rejected as invalid requests"
+        );
     }
 
     #[tokio::test]
@@ -786,49 +792,73 @@ mod tests {
     )]
     fn transport_errors_preserve_kind_without_rendering_source_details() {
         let connect = map_subrequest_error(SubRequestError::Connect("attacker-controlled".to_owned()));
-        assert!(matches!(
-            connect,
-            ApiClientError::Transport {
-                source: SubRequestError::Connect(_)
-            }
-        ));
-        assert!(!connect.to_string().contains("attacker-controlled"));
+        assert!(
+            matches!(
+                connect,
+                ApiClientError::Transport {
+                    source: SubRequestError::Connect(_)
+                }
+            ),
+            "connect failures should preserve their typed transport variant"
+        );
+        assert!(
+            !connect.to_string().contains("attacker-controlled"),
+            "connect failure details should not expose attacker-controlled text"
+        );
 
         let io = map_subrequest_error(SubRequestError::Io("attacker-controlled".to_owned()));
-        assert!(matches!(
-            io,
-            ApiClientError::Transport {
-                source: SubRequestError::Io(_)
-            }
-        ));
-        assert!(!io.to_string().contains("attacker-controlled"));
+        assert!(
+            matches!(
+                io,
+                ApiClientError::Transport {
+                    source: SubRequestError::Io(_)
+                }
+            ),
+            "I/O failures should preserve their typed transport variant"
+        );
+        assert!(
+            !io.to_string().contains("attacker-controlled"),
+            "I/O failure details should not expose attacker-controlled text"
+        );
 
         let admission = map_subrequest_error(SubRequestError::AdmissionTimeout { max_connections: 1 });
-        assert!(matches!(
-            admission,
-            ApiClientError::Transport {
-                source: SubRequestError::AdmissionTimeout { .. }
-            }
-        ));
+        assert!(
+            matches!(
+                admission,
+                ApiClientError::Transport {
+                    source: SubRequestError::AdmissionTimeout { .. }
+                }
+            ),
+            "admission timeouts should preserve their typed transport variant"
+        );
 
         let circuit = map_subrequest_error(SubRequestError::CircuitOpen {
             peer: "attacker-controlled".to_owned(),
         });
-        assert!(matches!(
-            circuit,
-            ApiClientError::Transport {
-                source: SubRequestError::CircuitOpen { .. }
-            }
-        ));
-        assert!(!circuit.to_string().contains("attacker-controlled"));
+        assert!(
+            matches!(
+                circuit,
+                ApiClientError::Transport {
+                    source: SubRequestError::CircuitOpen { .. }
+                }
+            ),
+            "circuit-open errors should preserve their typed transport variant"
+        );
+        assert!(
+            !circuit.to_string().contains("attacker-controlled"),
+            "circuit-open details should not expose attacker-controlled text"
+        );
 
         let deadline = map_subrequest_error(SubRequestError::DeadlineExceeded);
-        assert!(matches!(
-            deadline,
-            ApiClientError::Transport {
-                source: SubRequestError::DeadlineExceeded
-            }
-        ));
+        assert!(
+            matches!(
+                deadline,
+                ApiClientError::Transport {
+                    source: SubRequestError::DeadlineExceeded
+                }
+            ),
+            "deadline errors should preserve their typed transport variant"
+        );
     }
 
     #[test]

@@ -419,13 +419,19 @@ mod tests {
     #[test]
     fn parse_brave_results_empty() {
         let json = json!({"web": {"results": []}});
-        assert!(parse_brave_results(&json).is_empty());
+        assert!(
+            parse_brave_results(&json).is_empty(),
+            "empty Brave results should parse as empty"
+        );
     }
 
     #[test]
     fn parse_brave_results_missing_web() {
         let json = json!({"query": "test"});
-        assert!(parse_brave_results(&json).is_empty());
+        assert!(
+            parse_brave_results(&json).is_empty(),
+            "missing Brave web results should parse as empty"
+        );
     }
 
     #[test]
@@ -460,13 +466,19 @@ mod tests {
     #[test]
     fn parse_tavily_results_empty() {
         let json = json!({"results": []});
-        assert!(parse_tavily_results(&json).is_empty());
+        assert!(
+            parse_tavily_results(&json).is_empty(),
+            "empty Tavily results should parse as empty"
+        );
     }
 
     #[test]
     fn parse_tavily_results_missing_results() {
         let json = json!({"answer": "some answer"});
-        assert!(parse_tavily_results(&json).is_empty());
+        assert!(
+            parse_tavily_results(&json).is_empty(),
+            "missing Tavily results should parse as empty"
+        );
     }
 
     #[test]
@@ -532,7 +544,10 @@ mod tests {
 
     #[test]
     fn parse_you_results_handles_missing_sections() {
-        assert!(parse_you_results(&json!({"results": {}})).is_empty());
+        assert!(
+            parse_you_results(&json!({"results": {}})).is_empty(),
+            "missing You.com result sections should parse as empty"
+        );
     }
 
     #[test]
@@ -547,7 +562,7 @@ mod tests {
             allow_private_base_url: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client());
-        assert!(client.is_ok());
+        assert!(client.is_ok(), "a valid search configuration should build a client");
     }
 
     #[test]
