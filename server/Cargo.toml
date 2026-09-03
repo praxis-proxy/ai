@@ -48,7 +48,7 @@ praxis-ai-apis = { workspace = true }
 praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
-praxis-protocol = { workspace = true }
+praxis-protocol = { workspace = true, features = ["admin-api", "config-reload"] }
 praxis-tls = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
