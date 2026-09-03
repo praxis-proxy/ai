@@ -43,12 +43,9 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::state::ResponsesState;
-use crate::{
-    openai::responses::error::responses_error_rejection,
-    web_search::{
-        SearchClient, SearchContextSize, SearchOutcome, SearchResult, WebSearchFilterConfig, build_config,
-        format_search_results,
-    },
+use crate::web_search::{
+    SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult, WebSearchFilterConfig,
+    build_config, format_search_results,
 };
 
 // -----------------------------------------------------------------------------
@@ -93,8 +90,6 @@ const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// default_context_size: medium
 /// timeout_ms: 10000
-/// provider_failure_mode: closed
-/// status_on_error: 502
 /// max_body_bytes: 67108864
 /// ```
 pub struct WebSearchFilter {
@@ -162,7 +157,12 @@ impl WebSearchFilter {
         }))
     }
 
-    /// Execute a single web search call and append results to state.
+    /// Execute a single web search call and append its outcome to state.
+    ///
+    /// A provider failure never rejects the Response. The model instead
+    /// receives a truthful `failed` `web_search_call` plus a bounded failure
+    /// message — bridged as a backend-valid `function_call`/`function_call_output`
+    /// pair — so the agentic loop can continue.
     ///
     /// `index` is the call's position within the pending queue. It keeps the
     /// synthetic bridge `call_id` unique even when the hosted source ids
@@ -173,7 +173,7 @@ impl WebSearchFilter {
         call: &Value,
         index: usize,
         context_size: SearchContextSize,
-    ) -> Result<(), FilterAction> {
+    ) {
         let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
         let query = call.get("action").and_then(|a| a.get("query")).and_then(Value::as_str);
 
@@ -185,18 +185,24 @@ impl WebSearchFilter {
                 bridge: &bridge,
             };
             append_result(ctx, &ids, "incomplete", "", &[]);
-            return Ok(());
+            return;
         };
-
-        let results = resolve_search_outcome(&self.search_client, query, context_size, call_id, false).await?;
 
         let bridge = bridge_call_id(call_id, query, index);
         let ids = SearchCallIds {
             public: call_id,
             bridge: &bridge,
         };
-        append_result(ctx, &ids, "completed", query, &results);
-        Ok(())
+        match self.search_client.search(query, Some(context_size)).await {
+            SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
+            SearchOutcome::Failed => {
+                warn!(
+                    call_id,
+                    "web search provider failed; continuing with a failed tool result"
+                );
+                append_failed(ctx, &ids, query);
+            },
+        }
     }
 }
 
@@ -256,9 +262,7 @@ impl HttpFilter for WebSearchFilter {
         debug!(count = calls.len(), "executing pending web search calls");
 
         for (index, call) in calls.iter().enumerate() {
-            if let Err(rejection) = self.execute_single_search(ctx, call, index, context_size).await {
-                return Ok(rejection);
-            }
+            self.execute_single_search(ctx, call, index, context_size).await;
         }
 
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
@@ -310,7 +314,10 @@ struct SearchCallIds<'a> {
     bridge: &'a str,
 }
 
-/// Append search results to [`ResponsesState`].
+/// Append a completed search turn to [`ResponsesState`].
+///
+/// An empty `results` slice is a successful zero-result search: the model
+/// receives `No search results found.` and the public item stays `completed`.
 fn append_result(
     ctx: &mut HttpFilterContext<'_>,
     ids: &SearchCallIds<'_>,
@@ -318,53 +325,73 @@ fn append_result(
     query: &str,
     results: &[SearchResult],
 ) {
-    let include_sources = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES));
-
+    let include_sources = include_action_sources(ctx);
     let output_item = build_output_item(ids.public, status, query, results, include_sources);
     let bridge = build_tool_result_messages(ids.bridge, query, results);
+    push_search_turn(ctx, output_item, bridge);
+}
 
+/// Append a failed search turn to [`ResponsesState`].
+///
+/// The public output item is marked `status: "failed"` and the model receives
+/// the bounded [`SEARCH_UNAVAILABLE`] message through a backend-valid
+/// `function_call`/`function_call_output` bridge — never a hosted
+/// `web_search_call`, which is not a valid `OpenResponses` input (issue #808) —
+/// so the agentic loop continues without exposing provider details to the client.
+fn append_failed(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, query: &str) {
+    let include_sources = include_action_sources(ctx);
+    let output_item = build_output_item(ids.public, "failed", query, &[], include_sources);
+    let bridge = build_failed_tool_result_messages(ids.bridge, query);
+    push_search_turn(ctx, output_item, bridge);
+}
+
+/// Whether `action.sources` should be included in output items, per the
+/// `web_search_call.action.sources` include gate.
+fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES))
+}
+
+/// Push a search turn — public output item plus the model-facing bridge pair —
+/// into state.
+///
+/// `bridge` is the backend-valid `function_call`/`function_call_output` pair.
+/// The per-element clone is required: `messages` and `persisted_messages` are
+/// distinct owners of the bridge messages. The public `output_item` is upserted
+/// so the placeholder accumulated during the response phase is replaced in
+/// place, never duplicated.
+fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2]) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
-        state.accumulated_output.push(output_item);
+        upsert_output_item(&mut state.accumulated_output, output_item);
     }
+}
+
+/// Replace the accumulated `web_search_call` sharing this id, or append it.
+///
+/// The response phase (`agentic_loop::collect_output_items`) already
+/// accumulated the model's placeholder `web_search_call` for this id. Updating
+/// it in place keeps exactly one public item per call, rather than emitting a
+/// contradictory `completed` + `failed` pair for the same id. When no
+/// placeholder exists (isolated unit contexts), the item is appended.
+fn upsert_output_item(accumulated: &mut Vec<Value>, output_item: Value) {
+    if let Some(id) = output_item.get("id").and_then(Value::as_str)
+        && let Some(slot) = accumulated.iter_mut().find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("web_search_call")
+                && item.get("id").and_then(Value::as_str) == Some(id)
+        })
+    {
+        *slot = output_item;
+        return;
+    }
+    accumulated.push(output_item);
 }
 
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
-
-/// Execute a search and resolve its outcome to a result list.
-///
-/// Returns `Err(FilterAction)` when the search is rejected under
-/// closed failure mode.
-pub(crate) async fn resolve_search_outcome(
-    search_client: &SearchClient,
-    query: &str,
-    context_size: SearchContextSize,
-    call_id: &str,
-    streaming: bool,
-) -> Result<Vec<SearchResult>, FilterAction> {
-    match search_client.search(query, Some(context_size)).await {
-        SearchOutcome::Results(r) => Ok(r),
-        SearchOutcome::Skipped => {
-            warn!(call_id, "search skipped (open failure mode)");
-            Ok(Vec::new())
-        },
-        SearchOutcome::Rejected { status } => {
-            warn!(call_id, status, "search rejected (closed failure mode)");
-            Err(FilterAction::Reject(responses_error_rejection(
-                status,
-                "server_error",
-                "web search provider unavailable",
-                streaming,
-            )))
-        },
-    }
-}
 
 /// Emit a `web_search_call` status update via filter results.
 #[cfg_attr(not(test), expect(dead_code, reason = "reserved for per-call status tracking"))]
@@ -477,6 +504,37 @@ pub(crate) fn bridge_call_id(source_id: &str, query: &str, index: usize) -> Stri
         }
     }
     format!("ws_{index}_{hash:016x}")
+}
+
+/// Build the backend-valid continuation for a failed search.
+///
+/// Mirrors [`build_tool_result_messages`] but carries the bounded
+/// [`SEARCH_UNAVAILABLE`] notice as the `function_call_output`, so the agentic
+/// loop continues with a truthful failure instead of a fabricated empty result.
+/// A hosted `web_search_call` is not a valid `OpenResponses` input item (issue
+/// #808), so a failure — like a success — must bridge through a synthetic
+/// `function_call` + `function_call_output` pair.
+///
+/// `call_id` must be a bounded, backend-valid identifier from
+/// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
+/// 64-character `call_id` limit.
+pub(crate) fn build_failed_tool_result_messages(call_id: &str, query: &str) -> [Value; 2] {
+    let arguments = serde_json::json!({ "query": query }).to_string();
+
+    [
+        serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "web_search",
+            "arguments": arguments,
+            "status": "completed",
+        }),
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": SEARCH_UNAVAILABLE,
+        }),
+    ]
 }
 
 /// Write the loop control action to filter results.

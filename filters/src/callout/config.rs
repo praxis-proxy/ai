@@ -5,6 +5,7 @@
 
 use std::{net::IpAddr, time::Duration};
 
+use praxis_ai_apis::callout_policy::OnFailure;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 use tracing::warn;
@@ -37,7 +38,7 @@ pub(crate) struct HttpCalloutConfig {
     /// structural key before this config is parsed, so it cannot be
     /// used as an alias here.
     #[serde(default)]
-    pub on_failure: FailureModeConfig,
+    pub on_failure: OnFailure,
 
     /// HTTP status code returned when rejecting on failure.
     pub status_on_error: Option<u16>,
@@ -182,22 +183,6 @@ pub(crate) enum Phase {
     /// Fire during `on_request_body` (headers + body).
     #[default]
     RequestBody,
-}
-
-// -----------------------------------------------------------------------------
-// Failure Mode
-// -----------------------------------------------------------------------------
-
-/// Behavior when a callout fails.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FailureModeConfig {
-    /// Reject the original request (fail-closed).
-    #[default]
-    Closed,
-
-    /// Allow the original request to proceed (fail-open).
-    Open,
 }
 
 // -----------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use http::Method;
@@ -16,6 +16,7 @@ use super::{
 };
 use crate::{
     openai::responses::state::ResponsesState,
+    store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
     test_utils::{make_filter_context, make_request, make_response},
 };
 
@@ -3425,6 +3426,89 @@ async fn on_response_body_appends_completed_response() {
     assert_eq!(items.len(), 2, "append-back should persist both input and output items");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_surfaces_item_insert_failure() {
+    let filter = build_failing_filter(FailingItemStore {
+        fail_create_items: true,
+        fail_message_sync: false,
+    });
+
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
+        ..ResponsesState::default()
+    });
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    // A completed response whose items cannot be persisted must not be swallowed:
+    // the filter propagates the append-back failure as an error (#837). The
+    // client-visible outcome is then the pipeline's failure-mode decision — a
+    // withheld body under the default `failure_mode: closed`, or a logged release
+    // under `open`.
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "hi from model"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let result = filter.on_response_body(&mut ctx, &mut body, true);
+
+    assert!(
+        result.is_err(),
+        "item-insert failure during append-back must propagate as an error, not a silent success"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_tolerates_message_cache_failure() {
+    let filter = build_failing_filter(FailingItemStore {
+        fail_create_items: false,
+        fail_message_sync: true,
+    });
+
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
+        ..ResponsesState::default()
+    });
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    // Items committed, but the denormalized message-cache refresh failed. The
+    // cache is a self-healing projection of the durable items table, so this is
+    // not data loss: failing the turn would drive a client retry that re-appends
+    // the same items as duplicates. The turn must succeed (Continue); the cache
+    // re-syncs on a later successful cache-refresh/sync attempt — a later append is
+    // not sufficient, since its own refresh may also fail (#837, durability boundary).
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "hi from model"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let action = filter
+        .on_response_body(&mut ctx, &mut body, true)
+        .expect("message-cache refresh failure must not fail the turn");
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "message-cache refresh failure must be tolerated (Continue), not surfaced as an error"
+    );
+}
+
 #[test]
 fn conformance_conversations_routes_match_runtime_registry() {
     let spec = generated_openapi_spec();
@@ -3528,6 +3612,132 @@ async fn create_test_conversation(filter: &dyn HttpFilter, metadata: Value) -> S
     };
     let resp = rejection_body(&rejection);
     resp["id"].as_str().unwrap().to_owned()
+}
+
+/// Build a conversations filter backed by a fault-injecting store.
+fn build_failing_filter(store: FailingItemStore) -> OpenaiConversationsFilter {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: test_conversations
+        items_table: test_items
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    OpenaiConversationsFilter::with_store_for_test(cfg, Arc::new(store))
+}
+
+/// A [`ConversationItemStore`] that fails selected operations on demand.
+///
+/// Benign methods return empty/default results; the two boolean knobs force the
+/// item-insert and message-cache-sync paths to error so append-back failure
+/// handling can be tested without a real database.
+struct FailingItemStore {
+    /// Force `create_conversation_items` to return a database error.
+    fail_create_items: bool,
+    /// Force the message-cache sync (`update_conversation_messages`) to error.
+    fail_message_sync: bool,
+}
+
+#[async_trait::async_trait]
+impl ConversationItemStore for FailingItemStore {
+    async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        if self.fail_message_sync {
+            return Err(StoreError::Database("mock message sync failure".to_owned()));
+        }
+        Ok(true)
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _expected_messages: &Value,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        Ok(true)
+    }
+
+    async fn get_conversation(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        Ok(None)
+    }
+
+    async fn delete_conversation(&self, _tenant_id: &str, _conversation_id: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        if self.fail_create_items {
+            return Err(StoreError::Database("mock item insert failure".to_owned()));
+        }
+        Ok(())
+    }
+
+    async fn list_conversation_items(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _after_item_id: Option<&str>,
+        _limit: u32,
+        _ascending: bool,
+    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_ids: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<ConversationItemRecord>, StoreError> {
+        Ok(None)
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    async fn conversation_item_position(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(None)
+    }
+
+    async fn max_item_position(&self, _tenant_id: &str, _conversation_id: &str) -> Result<i64, StoreError> {
+        Ok(0)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

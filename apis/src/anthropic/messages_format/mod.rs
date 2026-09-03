@@ -32,7 +32,7 @@ use std::borrow::Cow;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    BodyAccess, BodyMode, ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
 };
 use tracing::{debug, trace};
@@ -154,6 +154,8 @@ impl HttpFilter for AnthropicMessagesFormatFilter {
             return Ok(action);
         }
 
+        install_error_formatter(ctx, classified.format);
+
         write_metadata(ctx, &classified);
         promote_headers(ctx, &classified, &self.config);
         promote_filter_results(ctx, &classified)?;
@@ -165,6 +167,33 @@ impl HttpFilter for AnthropicMessagesFormatFilter {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Install the Anthropic error response formatter for positively
+/// classified Anthropic Messages requests.
+///
+/// Captures the request ID from the incoming `x-request-id` header,
+/// or generates a UUID when no header is present. The same ID is
+/// used in the JSON body `request_id` field.
+///
+/// **Known gap:** The matching `request-id` response header cannot
+/// be set through `FormattedErrorResponse` until Praxis adds a
+/// `response_headers` field. Only the JSON body carries the ID today.
+fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, format: AiRequestFormat) {
+    if format != AiRequestFormat::AnthropicMessages {
+        return;
+    }
+
+    let request_id = ctx
+        .request
+        .headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(generate_request_id, ToOwned::to_owned);
+
+    ctx.extensions.insert(ErrorResponseFormatterHandle::new(
+        crate::anthropic::error_response_formatter::AnthropicErrorFormatter::new(request_id),
+    ));
+}
 
 /// Check whether the format requires rejection.
 fn handle_invalid_format(format: AiRequestFormat, config: &AnthropicMessagesFormatConfig) -> Option<FilterAction> {
@@ -240,11 +269,23 @@ fn promote_headers(
     }
 }
 
+/// Generate a request identifier when the client did not send one.
+///
+/// Uses a timestamp-based hex string prefixed with `req_` to match
+/// the Anthropic convention without adding a UUID dependency.
+fn generate_request_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("req_{nanos:032x}")
+}
+
 /// Check whether the path is the Anthropic Messages endpoint,
 /// normalizing a trailing slash.
 fn is_anthropic_messages_path(path: &str) -> bool {
     let normalized = path.strip_suffix('/').unwrap_or(path);
-    normalized == "/v1/messages"
+    normalized == "/v1/messages" || normalized.starts_with("/v1/messages/")
 }
 
 /// Promote classification facts to filter results for branch conditions.

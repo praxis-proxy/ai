@@ -158,6 +158,9 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
     let Some(delta) = payload.get("delta").and_then(Value::as_str) else {
         return;
     };
+    if filter_state.rejected_tool_call_args.contains(&key) {
+        return;
+    }
 
     let buf = filter_state.tool_call_args.entry(key.clone()).or_default();
     if buf.len().saturating_add(delta.len()) > filter_state.max_tool_call_argument_bytes {
@@ -167,6 +170,7 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
             "accumulated tool-call arguments exceed max_tool_call_argument_bytes, dropping"
         );
         filter_state.tool_call_args.remove(&key);
+        filter_state.rejected_tool_call_args.insert(key);
         return;
     }
     buf.push_str(delta);
@@ -174,11 +178,15 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
 
 /// Finalize a function call from the done event's payload and push to `tool_calls`.
 fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut StreamEventsState, payload: &Value) {
-    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-
     let Some(key) = tool_call_key(payload) else {
         return;
     };
+    if filter_state.rejected_tool_call_args.contains(&key) {
+        return;
+    }
+    if reject_oversized_done(filter_state, &key, payload) {
+        return;
+    }
 
     let accumulated = filter_state.tool_call_args.remove(&key);
     let arguments = payload
@@ -188,6 +196,33 @@ fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut
         .or(accumulated)
         .unwrap_or_default();
 
+    finalize_function_call(ctx, &key, payload, &arguments);
+}
+
+/// Reject a completed function call whose `arguments` already exceed the cap.
+///
+/// Returns `true` when the call was rejected and finalization must stop.
+fn reject_oversized_done(filter_state: &mut StreamEventsState, key: &str, payload: &Value) -> bool {
+    let oversized = payload
+        .get("arguments")
+        .and_then(Value::as_str)
+        .is_some_and(|arguments| arguments.len() > filter_state.max_tool_call_argument_bytes);
+    if !oversized {
+        return false;
+    }
+    warn!(
+        key,
+        limit = filter_state.max_tool_call_argument_bytes,
+        "completed tool-call arguments exceed max_tool_call_argument_bytes, dropping"
+    );
+    filter_state.tool_call_args.remove(key);
+    filter_state.rejected_tool_call_args.insert(key.to_owned());
+    true
+}
+
+/// Apply finalized arguments to the matching output item and store the tool call.
+fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &Value, arguments: &str) {
+    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
     let tool_call = {
         let Some(item) = find_output_item_mut(state.output_items_mut(), payload) else {
             warn!(
@@ -197,7 +232,7 @@ fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut
             return;
         };
 
-        let Some(tool_call) = complete_function_call_item(item, &arguments) else {
+        let Some(tool_call) = complete_function_call_item(item, arguments) else {
             warn!(
                 key,
                 "dropping function-call arguments.done for non-function output item"

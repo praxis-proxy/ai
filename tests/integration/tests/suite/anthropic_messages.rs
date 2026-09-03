@@ -9,7 +9,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    Backend, Recording, free_port, http_send, parse_body, parse_status, start_backend_with_shutdown, start_proxy,
+    Backend, Recording, free_port, http_send, json_post, parse_body, parse_header, parse_status,
+    start_backend_with_shutdown, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -202,6 +203,60 @@ fn streaming_collects_full_text() {
         .collect();
 
     assert!(!full_text.is_empty(), "collected text should not be empty");
+}
+
+#[test]
+fn streaming_tool_calls_within_cap_completes() {
+    let backend = Backend::fixed(&tool_call_stream_sse())
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&transform_yaml(proxy_port, backend.port(), 5)).unwrap();
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &anthropic_post(
+            "/v1/messages",
+            r#"{"model":"mock-model","messages":[{"role":"user","content":"call tools"}],"max_tokens":64,"stream":true}"#,
+        ),
+    );
+    let body = parse_body(&raw);
+
+    // Three distinct tool-call indices open three blocks, all under the
+    // cap of 5, so the transform runs to completion.
+    assert!(
+        body.contains("event: message_stop"),
+        "a tool-call stream within max_tool_blocks should complete with message_stop; body: {body}"
+    );
+}
+
+#[test]
+fn streaming_tool_calls_exceeding_cap_fails_closed() {
+    let backend = Backend::fixed(&tool_call_stream_sse())
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    // Same stream as the within-cap test; only the cap changes. The third
+    // distinct tool-call index exceeds max_tool_blocks and fails closed.
+    let config = Config::from_yaml(&transform_yaml(proxy_port, backend.port(), 2)).unwrap();
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &anthropic_post(
+            "/v1/messages",
+            r#"{"model":"mock-model","messages":[{"role":"user","content":"call tools"}],"max_tokens":64,"stream":true}"#,
+        ),
+    );
+    let body = parse_body(&raw);
+
+    assert!(
+        !body.contains("event: message_stop"),
+        "exceeding max_tool_blocks should fail the stream closed before message_stop; body: {body}"
+    );
 }
 
 #[test]
@@ -408,8 +463,147 @@ fn content_block_array() {
 }
 
 // -----------------------------------------------------------------------------
+// Error Formatter Integration Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn proxy_failure_formats_anthropic_error_for_messages() {
+    let dead_port = free_port();
+    let proxy_port = free_port();
+
+    let yaml = error_formatter_yaml(proxy_port, dead_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body =
+        r#"{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(proxy.addr(), &anthropic_post("/v1/messages", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "proxy failure on unreachable upstream should return 502"
+    );
+    assert_eq!(
+        parse_header(&raw, "content-type").as_deref(),
+        Some("application/json"),
+        "Content-Type should be application/json"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("response body should be valid JSON");
+    assert_eq!(parsed["type"], "error", "Anthropic top-level type should be error");
+    assert_eq!(
+        parsed["error"]["type"], "api_error",
+        "Anthropic error type should be api_error for 502"
+    );
+    assert!(
+        parsed["error"]["message"].is_string(),
+        "error message should be a string"
+    );
+    assert!(
+        parsed["request_id"].as_str().unwrap().starts_with("req_"),
+        "request_id should be present with req_ prefix"
+    );
+}
+
+#[test]
+fn proxy_failure_formats_anthropic_error_with_custom_request_id() {
+    let dead_port = free_port();
+    let proxy_port = free_port();
+
+    let yaml = error_formatter_yaml(proxy_port, dead_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body =
+        r#"{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &anthropic_post_with_request_id("/v1/messages", body, "req_custom_123"),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "proxy failure on unreachable upstream should return 502"
+    );
+    assert_eq!(
+        parse_header(&raw, "content-type").as_deref(),
+        Some("application/json"),
+        "Content-Type should be application/json"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("response body should be valid JSON");
+    assert_eq!(parsed["type"], "error", "Anthropic top-level type should be error");
+    assert_eq!(
+        parsed["request_id"], "req_custom_123",
+        "request_id should match client x-request-id header"
+    );
+}
+
+#[test]
+fn proxy_failure_does_not_format_anthropic_error_for_unclassified_request() {
+    let dead_port = free_port();
+    let proxy_port = free_port();
+
+    let yaml = error_formatter_yaml(proxy_port, dead_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"unrelated_api":"data"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/other/endpoint", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "proxy failure on unreachable upstream should return 502"
+    );
+
+    let body_str = parse_body(&raw);
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body_str);
+    if let Ok(json) = parsed {
+        assert!(
+            json.get("type").and_then(|t| t.as_str()) != Some("error")
+                || json.get("error").and_then(|e| e.get("type")).is_none(),
+            "unclassified request should not receive Anthropic formatted error envelope"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
+
+fn error_formatter_yaml(proxy_port: u16, backend_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: test
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [passthrough]
+
+filter_chains:
+  - name: passthrough
+    filters:
+      - filter: anthropic_messages_format
+        on_invalid: continue
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: mock
+      - filter: load_balancer
+        clusters:
+          - name: mock
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+
+insecure_options:
+  allow_private_endpoints: true
+"#
+    )
+}
 
 fn passthrough_yaml(proxy_port: u16, backend_port: u16) -> String {
     format!(
@@ -443,12 +637,78 @@ insecure_options:
     )
 }
 
+fn transform_yaml(proxy_port: u16, backend_port: u16, max_tool_blocks: usize) -> String {
+    format!(
+        r#"
+listeners:
+  - name: test
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [transform]
+
+filter_chains:
+  - name: transform
+    filters:
+      - filter: anthropic_messages_format
+        on_invalid: continue
+      - filter: anthropic_to_openai
+        max_body_bytes: 1048576
+      - filter: anthropic_stream_events
+        max_tool_blocks: {max_tool_blocks}
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: mock
+      - filter: load_balancer
+        clusters:
+          - name: mock
+            endpoints:
+              - "127.0.0.1:{backend_port}"
+
+insecure_options:
+  allow_private_endpoints: true
+"#
+    )
+}
+
+/// OpenAI Chat Completions SSE with three tool-call deltas at distinct
+/// indices, a finish chunk, and the `[DONE]` sentinel. Each distinct
+/// index opens a new Anthropic tool-use content block in the transform,
+/// so the stream pins three blocks of per-block metadata.
+fn tool_call_stream_sse() -> String {
+    let block = |index: u64| {
+        format!(
+            "data: {{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":{index},\"id\":\"call_{index}\",\"function\":{{\"name\":\"f{index}\",\"arguments\":\"{{}}\"}}}}]}},\"index\":0}}]}}\n\n"
+        )
+    };
+
+    format!(
+        "{}{}{}data: {{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{{\"delta\":{{}},\"index\":0,\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+        block(0),
+        block(1),
+        block(2),
+    )
+}
+
 fn anthropic_post(path: &str, body: &str) -> String {
     format!(
         "POST {path} HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
          anthropic-version: 2023-06-01\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {body}",
+        body.len()
+    )
+}
+
+fn anthropic_post_with_request_id(path: &str, body: &str, request_id: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         anthropic-version: 2023-06-01\r\n\
+         x-request-id: {request_id}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n\
          {body}",

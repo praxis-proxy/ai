@@ -114,9 +114,9 @@ impl HttpFilter for AnthropicToOpenaiFilter {
                 .as_ref()
                 .map_or(500, |response| response.status.as_u16());
             ctx.set_metadata(RESPONSE_STATUS_KEY, status.to_string());
-            if let Some(request_id) = request_id {
-                ctx.set_metadata(RESPONSE_REQUEST_ID_KEY, request_id);
-            }
+        }
+        if let Some(request_id) = request_id {
+            ctx.set_metadata(RESPONSE_REQUEST_ID_KEY, request_id);
         }
 
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -184,9 +184,11 @@ impl HttpFilter for AnthropicToOpenaiFilter {
             let request_model = ctx
                 .filter_metadata
                 .get("anthropic_to_openai.model")
-                .cloned()
-                .unwrap_or_default();
-            transform_non_streaming_body(ctx, body, &request_model);
+                .map_or("", String::as_str);
+            let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
+            if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id) {
+                ctx.set_metadata("openai.finish_reason", finish_reason);
+            }
         }
 
         Ok(FilterAction::Continue)
@@ -333,32 +335,33 @@ fn transform_error_body(body: &mut Option<Bytes>, status: http::StatusCode, requ
 }
 
 /// Apply non-streaming JSON transformation to the response body.
-fn transform_non_streaming_body(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, request_model: &str) {
-    let bytes = match body.as_ref() {
-        Some(b) => b.as_ref(),
-        None => return,
-    };
-
-    if bytes.is_empty() {
-        return;
-    }
-
-    match response::transform_response(bytes, request_model) {
+fn transform_non_streaming_body(
+    body: &mut Option<Bytes>,
+    request_model: &str,
+    request_id: Option<&str>,
+) -> Option<String> {
+    match response::transform_response(body.as_deref().unwrap_or_default(), request_model) {
         Ok(result) => {
             debug!(
-                original_len = bytes.len(),
+                original_len = body.as_ref().map_or(0, Bytes::len),
                 transformed_len = result.body.len(),
                 original_finish_reason = result.original_finish_reason.as_str(),
                 "transformed Chat Completions-compatible response to Anthropic"
             );
-            ctx.set_metadata("openai.finish_reason", result.original_finish_reason);
             *body = Some(Bytes::from(result.body));
+            Some(result.original_finish_reason)
         },
         Err(msg) => {
             warn!(
                 error = msg.as_str(),
                 "failed to transform Chat Completions-compatible response"
             );
+            *body = Some(Bytes::from(wire::error_body(
+                "api_error",
+                "upstream response could not be transformed",
+                request_id,
+            )));
+            None
         },
     }
 }
@@ -819,56 +822,73 @@ mod tests {
     // --- transform_non_streaming_body ---
 
     #[test]
-    fn transform_non_streaming_body_none_is_noop() {
-        let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
+    fn transform_non_streaming_body_missing_body_returns_api_error() {
         let mut body: Option<Bytes> = None;
 
-        transform_non_streaming_body(&mut ctx, &mut body, "gpt-4");
+        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None);
+        let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
 
-        assert!(body.is_none());
+        assert!(finish_reason.is_none());
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert!(parsed["request_id"].is_null());
     }
 
     #[test]
-    fn transform_non_streaming_body_empty_bytes_is_noop() {
-        let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
+    fn transform_non_streaming_body_empty_bytes_returns_api_error() {
         let mut body = Some(Bytes::new());
 
-        transform_non_streaming_body(&mut ctx, &mut body, "gpt-4");
+        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None);
+        let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
 
-        assert_eq!(body.as_ref().unwrap().len(), 0, "empty bytes should not be transformed");
+        assert!(finish_reason.is_none());
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "api_error");
     }
 
     #[test]
     fn transform_non_streaming_body_success() {
-        let request = make_request(Method::POST, "/v1/messages");
-        let mut ctx = make_filter_context(&request);
         let response_json = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hello!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
         let mut body = Some(Bytes::from(response_json.to_vec()));
 
-        transform_non_streaming_body(&mut ctx, &mut body, "gpt-4");
+        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None);
 
         assert!(body.is_some());
         let parsed: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
         assert_eq!(parsed["type"], "message");
         assert_eq!(parsed["content"][0]["text"], "Hello!");
-        assert_eq!(
-            ctx.filter_metadata.get("openai.finish_reason").unwrap(),
-            "stop",
-            "finish_reason should be stored in metadata"
-        );
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
     }
 
-    #[test]
-    fn transform_non_streaming_body_invalid_json_preserves_body() {
+    #[tokio::test]
+    async fn malformed_non_streaming_success_returns_anthropic_api_error() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        let original = Bytes::from_static(b"not json");
-        let mut body = Some(original.clone());
+        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        ctx.set_metadata("anthropic_to_openai.model", "gpt-4");
+        let mut response = make_response();
+        response
+            .headers
+            .insert("x-request-id", "req_malformed".parse().unwrap());
+        ctx.response_header = Some(&mut response);
 
-        transform_non_streaming_body(&mut ctx, &mut body, "gpt-4");
+        let action = filter.on_response(&mut ctx).await.unwrap();
 
-        assert_eq!(body, Some(original), "body should not be modified on error");
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(matches!(ctx.response_body_mode, BodyMode::StreamBuffer { .. }));
+        ctx.response_header = None;
+
+        let mut body = Some(Bytes::from_static(b"not json"));
+        let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert_eq!(parsed["error"]["message"], "upstream response could not be transformed");
+        assert_eq!(parsed["request_id"], "req_malformed");
+        assert!(!ctx.filter_metadata.contains_key("openai.finish_reason"));
     }
 }

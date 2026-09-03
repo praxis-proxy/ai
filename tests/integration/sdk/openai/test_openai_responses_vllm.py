@@ -118,15 +118,38 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     return path
 
 
-def _wait_for_proxy(port: int, timeout: float = 30.0) -> None:
+def _read_log_tail(log_path: str, max_lines: int = 50) -> str:
+    """Best-effort read of a Praxis log file's tail for error diagnostics."""
+    try:
+        with open(log_path) as f:
+            lines = f.readlines()
+    except OSError as exc:
+        return f"(could not read {log_path}: {exc})"
+    if not lines:
+        return "(no output captured)"
+    return "".join(lines[-max_lines:])
+
+
+def _wait_for_proxy(port: int, proc: subprocess.Popen, log_path: str, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        # A fatal config/startup error makes Praxis exit before it ever binds
+        # the port. Surface its logs immediately instead of waiting out the
+        # full timeout with a context-free error.
+        exit_code = proc.poll()
+        if exit_code is not None:
+            raise RuntimeError(
+                f"Praxis exited with code {exit_code} before binding port {port}:\n"
+                f"{_read_log_tail(log_path)}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return
         except OSError:
             time.sleep(0.2)
-    raise TimeoutError(f"Praxis did not start within {timeout}s")
+    raise TimeoutError(
+        f"Praxis did not start within {timeout}s on port {port}:\n{_read_log_tail(log_path)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +327,7 @@ def praxis_proxy(tmp_path_factory, request):
         stderr=subprocess.STDOUT,
     )
     try:
-        _wait_for_proxy(port)
+        _wait_for_proxy(port, proc, log_path)
         started = True
         yield port
     finally:
@@ -619,7 +642,7 @@ def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
         stderr=subprocess.STDOUT,
     )
     try:
-        _wait_for_proxy(port)
+        _wait_for_proxy(port, proc, log_path)
         started = True
         yield port, mcp_server, search_server
     finally:
@@ -775,8 +798,11 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 8
-        timeout_ms: 120000
-        step_timeout_ms: 60000
+        # Generous deadlines: file-search inference runs on CPU-only vLLM under
+        # heavy CI load (postgres + vLLM + OGX co-located), which can exceed a
+        # 60s step budget. Matches the agentic config's IRR timeouts.
+        timeout_ms: 300000
+        step_timeout_ms: 300000
         max_response_bytes: 67108864
         max_state_bytes: 136314880
         steps:
@@ -790,7 +816,7 @@ filter_chains:
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
                 max_state_bytes: 136314880
-                callout_failure_mode: closed
+                on_failure: closed
                 forward_headers:
                   - authorization
               - filter: openai_responses_proxy
@@ -806,6 +832,7 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference"
+                    read_timeout_ms: 300000
                     endpoints:
                       - "{vllm_endpoint}"
             on_result:
@@ -815,6 +842,9 @@ filter_chains:
                 next: inference
               - default: true
                 done: true
+
+insecure_options:
+  allow_private_endpoints: true
 """
 
 
@@ -929,7 +959,7 @@ def file_search_proxy(tmp_path_factory, request):
         stderr=subprocess.STDOUT,
     )
     try:
-        _wait_for_proxy(port)
+        _wait_for_proxy(port, proc, log_path)
         started = True
         yield port
     finally:

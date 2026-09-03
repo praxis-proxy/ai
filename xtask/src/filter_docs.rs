@@ -337,16 +337,21 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
     items
 }
 
+/// Local configuration files whose types are shared by filters in separate
+/// API categories. Paths are relative to the workspace root.
+const LOCAL_SHARED_CONFIG_FILES: &[&str] = &["apis/src/web_search/config.rs", "apis/src/callout_policy.rs"];
+
 /// Parse local configuration types shared by filters in separate API categories.
 fn parse_local_shared_config(root: &Path, items: &mut ModuleItems) {
-    let path = root.join("apis/src/web_search/config.rs");
-    let Ok(source) = fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(file) = syn::parse_file(&source) else {
-        return;
-    };
-    parse_file_items(&file, items);
+    for rel in LOCAL_SHARED_CONFIG_FILES {
+        let Ok(source) = fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        let Ok(file) = syn::parse_file(&source) else {
+            continue;
+        };
+        parse_file_items(&file, items);
+    }
 }
 
 /// Resolve praxis crate source directories from the cargo registry via
@@ -2674,7 +2679,7 @@ mod tests {
                 RequiredKind::Yes,
                 "{filter_name} should document api_key as required"
             );
-            for expected in ["provider", "provider_failure_mode", "status_on_error", "base_url"] {
+            for expected in ["provider", "base_url"] {
                 assert!(
                     filter.filter.fields.iter().any(|field| field.name == expected),
                     "{filter_name} should document {expected}"

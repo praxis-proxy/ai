@@ -1,23 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Shared config validation helpers for Responses API filters.
+//! Shared failure-policy vocabulary for outbound AI callouts.
+//!
+//! # Classification is filter-specific
+//!
+//! These enums are a vocabulary: they fix the accepted values
+//! and the default, not which conditions a filter routes through
+//! which key. Each filter's `on_failure` / `on_missing` field docs
+//! and behavior are authoritative.
+//!
+//! # Naming
+//!
+//! The external keys are `on_failure` and `on_missing`. A structural
+//! `failure_mode` key is already owned by Core's pipeline entries.
 
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
-// FailureMode
+// OnFailure
 // -----------------------------------------------------------------------------
 
-/// What happens when a callout to an external service fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// What happens when an outbound callout does not produce a usable
+/// answer. Configured as `on_failure`.
+///
+/// For a callout that succeeds but reports an absent resource, use
+/// [`OnMissing`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum FailureMode {
+pub enum OnFailure {
     /// Reject the request on failure (default).
+    #[default]
     Closed,
+
     /// Continue without the callout result on failure.
     Open,
+}
+
+// -----------------------------------------------------------------------------
+// OnMissing
+// -----------------------------------------------------------------------------
+
+/// What happens when a requested resource cannot be fetched. Configured
+/// as `on_missing`.
+///
+/// A filter may narrow the set of resources this governs, but must never
+/// widen it to cover failures that carry a security signal (e.g. a file
+/// URL that cannot be resolved - the target may be malicious or unreachable
+/// for policy reasons).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMissing {
+    /// Continue without the resource.
+    #[default]
+    Continue,
+
+    /// Return an error response to the client.
+    Reject,
 }
 
 // -----------------------------------------------------------------------------
@@ -26,15 +66,16 @@ pub(crate) enum FailureMode {
 
 /// Common callout fields shared by filters that make HTTP callouts.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CalloutSettings {
+pub struct CalloutSettings {
     /// Callout timeout in milliseconds.
     pub timeout_ms: u64,
+
     /// Failure mode for the callout.
-    pub failure_mode: FailureMode,
+    pub on_failure: OnFailure,
+
     /// HTTP status code to return when rejecting on error.
     pub status_on_error: u16,
 }
-
 
 // -----------------------------------------------------------------------------
 // Validation helpers
@@ -45,7 +86,7 @@ pub(crate) struct CalloutSettings {
 /// # Errors
 ///
 /// Returns [`FilterError`] when the resolved value is zero.
-pub(crate) fn validate_timeout_ms(filter: &str, raw: Option<u64>, default: u64) -> Result<u64, FilterError> {
+pub fn validate_timeout_ms(filter: &str, raw: Option<u64>, default: u64) -> Result<u64, FilterError> {
     let value = raw.unwrap_or(default);
     if value == 0 {
         return Err(format!("{filter}: timeout_ms must be greater than 0").into());
@@ -60,7 +101,7 @@ pub(crate) fn validate_timeout_ms(filter: &str, raw: Option<u64>, default: u64) 
 ///
 /// Returns [`FilterError`] when the resolved value is not in
 /// `100..=599`.
-pub(crate) fn validate_status_on_error(filter: &str, raw: Option<u16>, default: u16) -> Result<u16, FilterError> {
+pub fn validate_status_on_error(filter: &str, raw: Option<u16>, default: u16) -> Result<u16, FilterError> {
     let value = raw.unwrap_or(default);
     if !(100..=599).contains(&value) {
         return Err(format!("{filter}: status_on_error must be between 100 and 599, got {value}").into());
@@ -143,5 +184,42 @@ mod tests {
             err.to_string().contains("my_filter"),
             "error should include filter name, got: {err}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Canonical vocabulary
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn on_failure_deserializes_canonical_values() {
+        assert_eq!(serde_yaml::from_str::<OnFailure>("closed").unwrap(), OnFailure::Closed);
+        assert_eq!(serde_yaml::from_str::<OnFailure>("open").unwrap(), OnFailure::Open);
+    }
+
+    #[test]
+    fn on_failure_defaults_to_closed() {
+        assert_eq!(OnFailure::default(), OnFailure::Closed);
+    }
+
+    #[test]
+    fn on_missing_defaults_to_continue() {
+        assert_eq!(OnMissing::default(), OnMissing::Continue);
+    }
+
+    #[test]
+    fn on_missing_deserializes_canonical_values() {
+        assert_eq!(
+            serde_yaml::from_str::<OnMissing>("continue").unwrap(),
+            OnMissing::Continue
+        );
+        assert_eq!(serde_yaml::from_str::<OnMissing>("reject").unwrap(), OnMissing::Reject);
+    }
+
+    #[test]
+    fn on_failure_rejects_on_missing_vocabulary() {
+        assert!(serde_yaml::from_str::<OnFailure>("continue").is_err());
+        assert!(serde_yaml::from_str::<OnFailure>("reject").is_err());
+        assert!(serde_yaml::from_str::<OnMissing>("open").is_err());
+        assert!(serde_yaml::from_str::<OnMissing>("closed").is_err());
     }
 }

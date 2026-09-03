@@ -41,9 +41,9 @@ use self::{
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
+    callout_policy::OnFailure,
     openai::responses::{
         bounded_json_size,
-        config_validation::FailureMode,
         error::responses_error_rejection,
         state::{MAX_CITATION_FILES, ResponsesState},
         usage::merge_usage,
@@ -81,7 +81,7 @@ pub struct FileSearchCalloutFilter {
     max_state_bytes: usize,
 
     /// Whether a failed callout rejects or produces an incomplete result.
-    failure_mode: FailureMode,
+    on_failure: OnFailure,
 }
 
 /// Request-local marker used to reject streaming before the first subrequest.
@@ -125,7 +125,7 @@ impl FileSearchCalloutFilter {
     fn build(validated: ValidatedConfig) -> Box<dyn HttpFilter> {
         let client = FileSearchClient::new(FileSearchClientConfig {
             api_client: validated.api_client,
-            failure_mode: validated.failure_mode,
+            on_failure: validated.on_failure,
             max_response_bytes: validated.max_response_bytes,
             max_total_response_bytes: validated.max_total_response_bytes,
             timeout: validated.timeout,
@@ -134,7 +134,7 @@ impl FileSearchCalloutFilter {
         Box::new(Self {
             client,
             max_state_bytes: validated.max_state_bytes,
-            failure_mode: validated.failure_mode,
+            on_failure: validated.on_failure,
         })
     }
 
@@ -272,7 +272,7 @@ impl FileSearchCalloutFilter {
                 "vector store search failed"
             );
         }
-        let failure = (self.failure_mode == FailureMode::Closed)
+        let failure = (self.on_failure == OnFailure::Closed)
             .then(|| batch.failures.first())
             .flatten()?;
         Some(FilterAction::Reject(responses_error_rejection(

@@ -18,6 +18,11 @@
 //! `conversation`. Single-turn requests (no stored history, even with
 //! `context_management` set) are released without compaction because
 //! there is no prior history to summarize.
+//!
+//! Praxis runs `StreamBuffer` body hooks before header-phase request
+//! filters. Configuration therefore requires an explicit
+//! `allow_pre_security_callout: true` acknowledgement and should only
+//! be used behind an outer authentication and authorization boundary.
 
 pub(super) mod config;
 
@@ -47,7 +52,7 @@ use tracing::{debug, warn};
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
 use crate::{
-    openai::responses::config_validation::FailureMode,
+    callout_policy::OnFailure,
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
@@ -93,10 +98,16 @@ struct CompactionParams {
 /// `openai_responses_rehydrate` has loaded stored conversation
 /// history. Single-turn requests are released without compaction.
 ///
+/// Praxis runs `StreamBuffer` body hooks before header-phase request
+/// filters. This filter therefore requires
+/// `allow_pre_security_callout: true` and should only be used behind
+/// an outer authentication and authorization boundary.
+///
 /// # YAML
 ///
 /// ```yaml
 /// filter: openai_responses_compact
+/// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// default_model: llama3.2:1b
 /// ```
@@ -105,11 +116,12 @@ struct CompactionParams {
 ///
 /// ```yaml
 /// filter: openai_responses_compact
+/// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// default_model: gpt-4o-mini
 /// tiktoken_encoding: cl100k_base
 /// timeout_ms: 30000
-/// callout_failure_mode: closed
+/// on_failure: closed
 /// status_on_error: 502
 /// ```
 pub struct CompactFilter {
@@ -206,9 +218,9 @@ impl CompactFilter {
 
     /// Apply the configured open/closed policy on a callout error.
     fn on_callout_error(&self, message: &str, streaming: bool) -> Result<Option<String>, FilterAction> {
-        match self.config.callout.failure_mode {
-            FailureMode::Open => Ok(None),
-            FailureMode::Closed => Err(FilterAction::Reject(responses_error_rejection(
+        match self.config.callout.on_failure {
+            OnFailure::Open => Ok(None),
+            OnFailure::Closed => Err(FilterAction::Reject(responses_error_rejection(
                 self.config.callout.status_on_error,
                 "server_error",
                 message,

@@ -25,7 +25,6 @@
 pub(crate) mod agentic_loop;
 pub(crate) mod compact;
 mod config;
-pub(crate) mod config_validation;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
@@ -37,6 +36,12 @@ pub(crate) mod openai_mcp_tool_resolve;
 pub(crate) mod openai_responses_proxy;
 pub(crate) mod openai_tool_parse;
 pub(crate) mod responses_to_chat_completions;
+#[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
+#[allow(
+    dead_code,
+    reason = "the Responses operation registry is consumed by the openai_operation classifier"
+)]
+pub(crate) mod routes;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod stream_events;

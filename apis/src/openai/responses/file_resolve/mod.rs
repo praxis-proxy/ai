@@ -75,7 +75,7 @@ use praxis_filter::{
 use tracing::{debug, trace, warn};
 
 use self::{
-    config::{FileResolveConfig, FileUrlMode, OnMissing, validate_config},
+    config::{FileResolveConfig, FileUrlMode, validate_config},
     resolve::{
         FilesApiClient, FilesApiClientOptions, ResolutionBudget, ResolveError, resolve_input_with_budget, resolve_items,
     },
@@ -83,6 +83,7 @@ use self::{
 };
 use super::{openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState};
 use crate::{
+    callout_policy::OnMissing,
     classifier::is_responses_create,
     json_body::serialize_json_body,
     openai::api_client::{ApiClient, ApiClientConfig},

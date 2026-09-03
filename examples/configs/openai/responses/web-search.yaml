@@ -12,7 +12,6 @@
 #   api_key:              Provider API key (supports ${ENV_VAR} syntax)
 #   default_context_size: How many results to return (low/medium/high)
 #   timeout_ms:           Callout timeout in milliseconds
-#   provider_failure_mode: closed (reject on error) or open (skip on error)
 #   base_url:             Override the provider API base URL. Must be a
 #                         public IP literal unless allow_private_base_url
 #                         is set (SSRF/credential-disclosure guard).
@@ -36,8 +35,6 @@ filter_chains:
         api_key: ${WEB_SEARCH_API_KEY}
         default_context_size: medium
         timeout_ms: 10000
-        provider_failure_mode: closed
-        status_on_error: 502
       - filter: router
         routes:
           - path_prefix: "/"

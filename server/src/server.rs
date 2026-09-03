@@ -227,7 +227,6 @@ fn register_admin_endpoints(
                 health_registry: Some(health_registry),
                 kv_registry: Some(kv_stores.clone()),
                 pipelines: None,
-                #[cfg(feature = "praxis-main")]
                 log_level: None,
                 verbose: config.admin.verbose,
             },

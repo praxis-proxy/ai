@@ -18,8 +18,6 @@ Detects pending web search calls in the response phase and executes them on re-e
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
-| `provider_failure_mode` | `closed` \| `open` | no | Failure mode for search provider callouts. |
-| `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
 | `base_url` | string | no | Override the provider's default API base URL. |
 | `allow_private_base_url` | bool | no | Allow a `base_url` that targets local-sensitive addresses. DNS targets are unsupported in protected mode (the default): validation cannot pin the address the HTTP client will eventually dial, so a `base_url` host must be a public IP literal. Enabling `allow_private_base_url` also permits DNS results resolving to local-sensitive addresses, so a hostile or rebound resolution can send the provider credential to a loopback, private, or cloud-metadata endpoint. |
 
@@ -41,7 +39,5 @@ provider: brave
 api_key: ${WEB_SEARCH_API_KEY}
 default_context_size: medium
 timeout_ms: 10000
-provider_failure_mode: closed
-status_on_error: 502
 max_body_bytes: 67108864
 ```

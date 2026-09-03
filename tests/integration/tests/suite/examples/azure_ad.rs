@@ -11,12 +11,12 @@
 //! sets for a test binary — so construction succeeds with no env
 //! mutation.
 //!
-//! The token itself is acquired in the background from the configured
-//! authority. This test points `authority_host` at a closed local port
-//! so no real network call is made and no token is ever cached: the
-//! cache stays empty and every request must fail closed with 503. The
-//! full "token injected, reaches upstream" path is covered by the unit
-//! tests in `filters/src/azure/azure_ad.rs`.
+//! The token itself is acquired inline, on the request that finds the
+//! cache stale (cache-through, not refresh-ahead). This test points
+//! `authority_host` at a closed local port so the inline fetch fails
+//! deterministically and no token is ever cached: every request must
+//! fail closed with 503. The full "token injected, reaches upstream"
+//! path is covered by the unit tests in `filters/src/azure/azure_ad.rs`.
 
 use std::collections::HashMap;
 
@@ -44,8 +44,8 @@ fn azure_ad_fails_closed_without_token() {
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let patched = praxis_test_utils::patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
     // Use an always-set env var so filter construction succeeds, and
-    // point the authority at a closed port so the background refresher
-    // can never acquire a token (deterministic fail-closed).
+    // point the authority at a closed port so the inline cache-through
+    // fetch can never acquire a token (deterministic fail-closed).
     let patched = patched.replace(
         "        client_secret_env_var: AZURE_CLIENT_SECRET",
         "        client_secret_env_var: CARGO_PKG_NAME\n        authority_host: 127.0.0.1:1",

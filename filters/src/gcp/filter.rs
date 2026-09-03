@@ -4,71 +4,31 @@
 //! [`GcpAdcFilter`] implementation and `HttpFilter` trait impl.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Instant,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
-use arc_swap::ArcSwap;
-use http::header;
+use http::{HeaderValue, header};
+use praxis_ai_apis::token_cache::TokenCache;
 use praxis_filter::{FilterError, parse_filter_config};
 use tracing::warn;
 
 use super::{
     config::{GcpAdcConfig, validate_config},
-    token::resolve_token_source,
+    token::{self, TokenSource, resolve_token_source},
 };
 
 // -----------------------------------------------------------------------------
-// Cached token
+// Constants
 // -----------------------------------------------------------------------------
 
-/// A bearer token cached in memory, pre-formatted for injection.
-///
-/// The only way to construct one is [`CachedToken::new`], which formats
-/// the `Authorization` value and marks it sensitive, so a token can
-/// never reach the cache unredacted (`HeaderValue`'s `Debug` output
-/// redacts sensitive values).
-#[derive(Debug)]
-pub(super) struct CachedToken {
-    /// The complete `Authorization` header value (`"Bearer <token>"`),
-    /// marked sensitive so it is redacted from header debug output.
-    authorization: http::HeaderValue,
+/// Treat a cached token as expired this long before its real expiry, so
+/// a token is never injected onto a request that could outlive it in
+/// flight. Passed to [`TokenCache::new`] as its safety margin.
+const EXPIRY_SKEW: Duration = Duration::from_secs(30);
 
-    /// Instant after which the token must not be used. The producer is
-    /// responsible for subtracting a safety skew from the real expiry.
-    expires_at: Instant,
-}
-
-impl CachedToken {
-    /// Build a cached token from a raw access token, formatting the
-    /// `Authorization` value and marking it sensitive.
-    ///
-    /// Currently only exercised by tests; token acquisition will call
-    /// this once fetch is implemented on top of the core background-task
-    /// primitive (praxis#1043).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the token is not a valid header value.
-    #[cfg(test)]
-    pub(super) fn new(access_token: &str, expires_at: Instant) -> Result<Self, FilterError> {
-        let mut authorization = http::HeaderValue::from_str(&format!("Bearer {access_token}"))
-            .map_err(|e| FilterError::from(format!("gcp_adc: token is not a valid header value: {e}")))?;
-        authorization.set_sensitive(true);
-        Ok(Self {
-            authorization,
-            expires_at,
-        })
-    }
-
-    /// Whether the token is still safe to inject at `now`.
-    pub(super) fn is_valid(&self, now: Instant) -> bool {
-        now < self.expires_at
-    }
-}
+/// Timeout for a single metadata-server round-trip.
+const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // -----------------------------------------------------------------------------
 // Filter
@@ -81,18 +41,18 @@ impl CachedToken {
 /// is a work in progress and its configuration surface may change
 /// between releases.
 ///
-/// **Token acquisition is not implemented yet.** This filter currently
-/// establishes the configuration surface, credential-source resolution,
-/// and the fail-closed request path: the token cache is never populated,
-/// so every request is rejected with `503`. Fetch (metadata server, key
-/// file) arrives with the shared background-refresh primitive tracked in
-/// praxis#555, praxis#1042, and praxis#1043 — filters must not spawn
-/// their own refresher threads.
+/// Acquires a token via Application Default Credentials (GKE metadata
+/// server) and injects `Authorization: Bearer <token>` on every proxied
+/// request, keeping GCP credentials invisible to the downstream client.
+/// There is no background refresh thread: caching is cache-through, the
+/// same as [`crate::azure::azure_ad`] — see
+/// [`praxis_ai_apis::token_cache::TokenCache`] for the exact contract.
 ///
-/// Once implemented, the filter will acquire a token via Application
-/// Default Credentials (GKE metadata or a service-account key file) and
-/// inject `Authorization: Bearer <token>` on every proxied request,
-/// keeping GCP credentials invisible to the downstream client.
+/// **Service-account key file (`source: key_file`) token fetch is not
+/// implemented yet** — it needs `JWT` signing, which this workspace does
+/// not currently depend on. Config parsing, file resolution, and
+/// validation for `key_file` all work; `on_request` fails closed with a
+/// clear "not implemented" reason instead of silently 503ing forever.
 ///
 /// Credential-source resolution happens at construct time:
 /// `GOOGLE_APPLICATION_CREDENTIALS` is read once when the pipeline is
@@ -104,9 +64,9 @@ impl CachedToken {
 /// the correct Vertex endpoint (cluster `endpoints` + `tls.sni`) is
 /// the operator's responsibility.
 ///
-/// Until a token is cached, and whenever the cached token is missing
-/// or expired, requests are rejected with `503` rather than forwarded
-/// unauthenticated.
+/// Whenever no valid token can be produced — none cached and the inline
+/// fetch fails — the request is rejected with `503` rather than
+/// forwarded unauthenticated.
 ///
 /// # YAML configuration
 ///
@@ -114,13 +74,24 @@ impl CachedToken {
 /// filter: gcp_adc
 /// source: adc
 /// scope: https://www.googleapis.com/auth/cloud-platform
-/// refresh_ratio: 0.75
 /// ```
 pub struct GcpAdcFilter {
-    /// Lock-free cache of the current token, read on every request.
-    /// Nothing populates it until token fetch is implemented on top of
-    /// the core background-task primitive (praxis#1043).
-    token: Arc<ArcSwap<Option<CachedToken>>>,
+    /// Cache-through token cache; see the struct docs and
+    /// [`praxis_ai_apis::token_cache`].
+    cache: TokenCache<HeaderValue>,
+
+    /// HTTP client used for metadata-server requests, built once with
+    /// [`TOKEN_REQUEST_TIMEOUT`].
+    client: reqwest::Client,
+
+    /// Resolved credential source.
+    source: TokenSource,
+
+    /// `OAuth2` scope requested with the access token.
+    scope: String,
+
+    /// GCE/GKE metadata server host.
+    metadata_host: String,
 
     /// Whether the filter is currently failing closed, so the missing-
     /// token condition is logged on state transitions instead of once
@@ -133,17 +104,23 @@ impl GcpAdcFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if `refresh_ratio` is out of range,
-    /// `service_account` is structurally unsafe, a field is set that its
-    /// `source` does not use, or ADC file resolution fails.
+    /// Returns [`FilterError`] if `service_account` or `metadata_host`
+    /// are structurally unsafe, a field is set that its `source` does
+    /// not use, ADC file resolution fails, or the HTTP client fails to
+    /// build.
     fn new(config: &GcpAdcConfig, application_credentials: Option<&std::path::Path>) -> Result<Self, FilterError> {
         validate_config(config)?;
-        // Resolution validates the credential source (file readable,
-        // supported `type`) at the config boundary; the resolved source
-        // is not stored until token fetch is implemented.
-        resolve_token_source(config, application_credentials)?;
+        let source = resolve_token_source(config, application_credentials)?;
+        let client = reqwest::Client::builder()
+            .timeout(TOKEN_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| FilterError::from(format!("gcp_adc: failed to build HTTP client: {e}")))?;
         Ok(Self {
-            token: Arc::new(ArcSwap::from_pointee(None)),
+            cache: TokenCache::new(EXPIRY_SKEW),
+            client,
+            source,
+            scope: config.scope.clone(),
+            metadata_host: config.metadata_host.clone(),
             failing: AtomicBool::new(false),
         })
     }
@@ -162,15 +139,6 @@ impl GcpAdcFilter {
                 .as_deref()
                 .map(std::path::Path::new),
         )?))
-    }
-
-    /// Build a filter around a given cache.
-    #[cfg(test)]
-    pub(super) fn for_test(token: Option<CachedToken>) -> Self {
-        Self {
-            token: Arc::new(ArcSwap::from_pointee(token)),
-            failing: AtomicBool::new(false),
-        }
     }
 }
 
@@ -192,19 +160,21 @@ impl praxis_filter::HttpFilter for GcpAdcFilter {
         &self,
         ctx: &mut praxis_filter::HttpFilterContext<'_>,
     ) -> Result<praxis_filter::FilterAction, FilterError> {
-        let cached = self.token.load();
-        match cached.as_ref() {
-            Some(token) if token.is_valid(Instant::now()) => {
+        let fetched = self
+            .cache
+            .get_or_refresh(|| token::fetch(&self.client, &self.source, &self.metadata_host, &self.scope))
+            .await;
+        match fetched {
+            Ok(authorization) => {
                 if self.failing.swap(false, Ordering::Relaxed) {
                     warn!("gcp_adc: valid token available again; resuming request forwarding");
                 }
-                ctx.request_headers_to_set
-                    .push((header::AUTHORIZATION, token.authorization.clone()));
+                ctx.request_headers_to_set.push((header::AUTHORIZATION, authorization));
                 Ok(praxis_filter::FilterAction::Continue)
             },
-            _ => {
+            Err(error) => {
                 if !self.failing.swap(true, Ordering::Relaxed) {
-                    warn!("gcp_adc: no valid cached token; rejecting requests with 503 until one is available");
+                    warn!(%error, "gcp_adc: no valid token available; rejecting requests with 503 until one is acquired");
                 }
                 Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(
                     503,

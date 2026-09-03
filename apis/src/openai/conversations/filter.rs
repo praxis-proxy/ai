@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     openai::responses::{DEFAULT_TENANT_ID, TENANT_METADATA_KEY, state::ResponsesState},
-    store::{ConversationItemStore, ConversationRecord, PostgresResponseStore, SqliteResponseStore, StoreError},
+    store::{ConversationItemStore, PostgresResponseStore, SqliteResponseStore, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -89,6 +89,22 @@ impl OpenaiConversationsFilter {
         Self {
             config,
             store: OnceCell::new(),
+        }
+    }
+
+    /// Build a filter around a pre-initialized store for tests.
+    ///
+    /// Pre-seeding the `OnceCell` lets tests inject a fault-injecting store
+    /// (e.g. one whose `create_conversation_items` fails) without standing up a
+    /// real database, so append-back error handling can be exercised directly.
+    #[cfg(test)]
+    pub(super) fn with_store_for_test(config: ConversationsConfig, store: Arc<dyn ConversationItemStore>) -> Self {
+        Self {
+            config,
+            // Pre-initialize the cell so `get_or_init_store` returns this store
+            // without touching a real backend. The outer `Some` marks the cell
+            // initialized; the inner `Some` is the stored (available) store.
+            store: OnceCell::new_with(Some(Some(store))),
         }
     }
 
@@ -264,6 +280,83 @@ impl OpenaiConversationsFilter {
         }
     }
 
+    /// Arm request-body buffering for a body-carrying operation and, when an
+    /// earlier filter has already pre-read the body, dispatch it immediately.
+    async fn begin_body_operation(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        route: &MatchedConversationRoute<'_>,
+    ) -> Result<FilterAction, FilterError> {
+        ctx.set_request_body_mode(BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        });
+        let Some(body) = Self::mark_request_filters_ran(ctx) else {
+            return Ok(FilterAction::Continue);
+        };
+        let Some(store) = self.get_or_init_store().await else {
+            return Ok(FilterAction::Reject(reject_store_unavailable()));
+        };
+        Box::pin(Self::handle_post_route(ctx, store.as_ref(), route, &body)).await
+    }
+
+    /// Dispatch a bodyless conversation operation to its local handler.
+    #[expect(clippy::too_many_lines, reason = "one arm per bodyless endpoint")]
+    async fn dispatch_read_operation(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        route: &MatchedConversationRoute<'_>,
+    ) -> Result<FilterAction, FilterError> {
+        match route.spec.operation {
+            ConversationOperation::GetConversation => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get route missing id"))?;
+                let store = self.require_store().await?;
+                handlers::handle_get_conversation(ctx, store.as_ref(), id).await
+            },
+            ConversationOperation::ListConversationItems => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched list route missing id"))?;
+                let store = self.require_store().await?;
+                handlers::handle_list_items(ctx, store.as_ref(), id).await
+            },
+            ConversationOperation::GetConversationItem => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing id"))?;
+                let item_id = route
+                    .item_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing item id"))?;
+                let store = self.require_store().await?;
+                handlers::handle_get_item(ctx, store.as_ref(), id, item_id).await
+            },
+            ConversationOperation::DeleteConversation => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete route missing id"))?;
+                let store = self.require_store().await?;
+                handlers::handle_delete_conversation(ctx, store.as_ref(), id).await
+            },
+            ConversationOperation::DeleteConversationItem => {
+                let id = route
+                    .conversation_id()
+                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete item route missing id"))?;
+                let item_id = route.item_id().ok_or_else(|| {
+                    FilterError::from("openai_conversations: matched delete item route missing item id")
+                })?;
+                let store = self.require_store().await?;
+                handlers::handle_delete_item(ctx, store.as_ref(), id, item_id).await
+            },
+            ConversationOperation::CreateConversation
+            | ConversationOperation::UpdateConversation
+            | ConversationOperation::CreateConversationItems => Err(FilterError::from(format!(
+                "openai_conversations: dispatch_read_operation called for body operation {:?}",
+                route.spec.operation
+            ))),
+        }
+    }
+
     /// Persist conversation items synchronously using `block_in_place`.
     fn append_items_blocking(
         &self,
@@ -317,7 +410,6 @@ impl HttpFilter for OpenaiConversationsFilter {
         true
     }
 
-    #[expect(clippy::too_many_lines, reason = "dispatcher with one arm per endpoint")]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
             if should_append_back(ctx) {
@@ -326,64 +418,14 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
-        match route.spec.operation {
-            ConversationOperation::GetConversation => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched get route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_get_conversation(ctx, store.as_ref(), id).await
-            },
-            ConversationOperation::ListConversationItems => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched list route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_list_items(ctx, store.as_ref(), id).await
-            },
-            ConversationOperation::GetConversationItem => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing id"))?;
-                let item_id = route
-                    .item_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing item id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_get_item(ctx, store.as_ref(), id, item_id).await
-            },
-            ConversationOperation::DeleteConversation => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_delete_conversation(ctx, store.as_ref(), id).await
-            },
-            ConversationOperation::DeleteConversationItem => {
-                let id = route
-                    .conversation_id()
-                    .ok_or_else(|| FilterError::from("openai_conversations: matched delete item route missing id"))?;
-                let item_id = route.item_id().ok_or_else(|| {
-                    FilterError::from("openai_conversations: matched delete item route missing item id")
-                })?;
-                let store = self.require_store().await?;
-                handlers::handle_delete_item(ctx, store.as_ref(), id, item_id).await
-            },
-            ConversationOperation::CreateConversation
-            | ConversationOperation::UpdateConversation
-            | ConversationOperation::CreateConversationItems => {
-                ctx.set_request_body_mode(BodyMode::StreamBuffer {
-                    max_bytes: Some(MAX_JSON_BODY_BYTES),
-                });
-                let deferred_body = Self::mark_request_filters_ran(ctx);
-                let Some(body) = deferred_body else {
-                    return Ok(FilterAction::Continue);
-                };
-                let Some(store) = self.get_or_init_store().await else {
-                    return Ok(FilterAction::Reject(reject_store_unavailable()));
-                };
-                Box::pin(Self::handle_post_route(ctx, store.as_ref(), &route, &body)).await
-            },
+        // The shared operation registry is the single source of truth for
+        // whether this operation carries a request body: body-carrying
+        // operations arm buffering, everything else dispatches from the head.
+        // Both dispatch paths are boxed so this hook's own frame stays small.
+        if route.spec.has_request_body() {
+            return Box::pin(self.begin_body_operation(ctx, &route)).await;
         }
+        Box::pin(self.dispatch_read_operation(ctx, &route)).await
     }
 
     async fn on_request_body(
@@ -474,9 +516,22 @@ impl HttpFilter for OpenaiConversationsFilter {
         };
 
         let conv_id = items.conversation_id;
-        if let Err(e) = self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items) {
-            warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed");
-        }
+        // Fail closed on lost items. Append-back runs at end-of-stream while the
+        // completed response body is still buffered (StreamBuffer), before any
+        // byte is released downstream. Under the default `failure_mode: closed`,
+        // the buffered body is never released after a persistence failure, so the
+        // client cannot observe a clean success that hides items which never
+        // persisted (#837). The exact downstream outcome is Pingora-timing-dependent
+        // — a not-yet-flushed header yields a clean 500, an already-committed one
+        // yields a 2xx followed by a reset — but either way the body is withheld.
+        // `failure_mode: open` is an explicit operator opt-out of that guarantee:
+        // the pipeline logs this error and converts it to Continue, releasing the
+        // body even though items were lost. Only pre-commit failures (item insertion
+        // and earlier) reach this `?`: a post-commit message-cache refresh failure
+        // is tolerated inside `persist_items` because the cache is a self-healing
+        // projection (see `refresh_message_cache`).
+        self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items)
+            .inspect_err(|e| warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed"))?;
 
         Ok(FilterAction::Continue)
     }
@@ -590,6 +645,12 @@ async fn persist_items(
         .await
         .map_err(|e| -> FilterError { Box::new(e) })?;
 
+    // Item rows are durable past this point. The message cache is a self-healing
+    // projection rebuilt from the items table on the next successful sync, so a
+    // refresh failure is not data loss and must not fail the turn: propagating it
+    // would abort a request whose items already committed and drive a client retry
+    // that re-appends the same (typically id-less) input items as duplicates
+    // (#837). Log and continue; a later successful cache-refresh re-syncs the cache.
     refresh_message_cache(store, tenant_id, conversation_id).await;
     debug!(
         conversation_id,
@@ -600,16 +661,28 @@ async fn persist_items(
 }
 
 /// Refresh the denormalized conversation message cache after item mutation.
+///
+/// The cache is a projection of the items table that `openai_responses_rehydrate`
+/// replays on the next turn. It runs *after* the item rows have committed, so it
+/// is deliberately best-effort: the sync is idempotent — it rebuilds `messages`
+/// from the durable items table — so a later successful sync re-syncs whatever this
+/// attempt left behind (a later *append* is not sufficient: its own refresh may
+/// also fail). Failing the turn here would abort a request whose
+/// items already persisted and push the client into a retry that re-appends the
+/// same items as duplicates, so a refresh failure is logged and swallowed rather
+/// than propagated (#837). A transient stale-cache window remains until the next
+/// successful sync; closing it fully (atomic item-insert + projection) is tracked
+/// separately.
 async fn refresh_message_cache(store: &dyn ConversationItemStore, tenant_id: &str, conversation_id: &str) {
-    let record = ConversationRecord {
-        conversation_id: conversation_id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
-        created_at: 0,
-        metadata: Value::Object(serde_json::Map::default()),
-        messages: Value::Null,
-    };
-    if let Err(e) = handlers::sync_conversation_messages(store, record).await {
-        warn!(error = %e, conversation_id, "conversation message sync failed after append-back");
+    // The append-back path holds no pre-mutation cache snapshot, so it syncs with
+    // `None`; the refresh then re-reads the live cache as the swap's expected value.
+    if let Err(e) = handlers::sync_conversation_messages(store, tenant_id, conversation_id, None).await {
+        warn!(
+            error = %e,
+            conversation_id,
+            "conversation message cache refresh failed after append-back; items are durable and the \
+             cache re-syncs on a later successful refresh (#837)"
+        );
     }
 }
 

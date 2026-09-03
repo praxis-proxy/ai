@@ -78,7 +78,7 @@ pub(crate) fn transform_response(body: &[u8], request_model: &str) -> Result<Tra
 
     let (stop_reason, original_finish_reason) = map_finish_reason(obj);
     let response = MessageResponse {
-        content: build_content_blocks(obj),
+        content: build_content_blocks(obj)?,
         container: None,
         id,
         model,
@@ -150,20 +150,20 @@ fn error_type_for_status(status: StatusCode) -> &'static str {
 // -----------------------------------------------------------------------------
 
 /// Extract content blocks from the first choice.
-fn build_content_blocks<'a>(obj: &'a Map<String, Value>) -> Vec<ContentBlock<'a>> {
+fn build_content_blocks<'a>(obj: &'a Map<String, Value>) -> Result<Vec<ContentBlock<'a>>, String> {
     let mut blocks = Vec::new();
 
     let choice = obj.get("choices").and_then(Value::as_array).and_then(|c| c.first());
 
     let Some(choice) = choice else {
-        return blocks;
+        return Ok(blocks);
     };
 
     let message = choice.get("message");
     extract_text_block(message, &mut blocks);
-    extract_tool_call_blocks(message, &mut blocks);
+    extract_tool_call_blocks(message, &mut blocks)?;
 
-    blocks
+    Ok(blocks)
 }
 
 /// Extract a text content block from the message if present.
@@ -176,9 +176,9 @@ fn extract_text_block<'a>(message: Option<&'a Value>, blocks: &mut Vec<ContentBl
 }
 
 /// Extract tool call blocks from the message.
-fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<ContentBlock<'a>>) {
+fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<ContentBlock<'a>>) -> Result<(), String> {
     let Some(Value::Array(tool_calls)) = message.and_then(|m| m.get("tool_calls")) else {
-        return;
+        return Ok(());
     };
 
     for tc in tool_calls {
@@ -192,11 +192,14 @@ fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<Con
             .get("function")
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
-            .unwrap_or("{}");
-        let input = serde_json::from_str::<Map<String, Value>>(args_str).unwrap_or_default();
+            .ok_or_else(|| "tool call arguments must be a JSON-encoded object string".to_owned())?;
+        let input = serde_json::from_str::<Map<String, Value>>(args_str)
+            .map_err(|error| format!("invalid tool call arguments: {error}"))?;
 
         blocks.push(ContentBlock::tool_use(id, input, name));
     }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -589,21 +592,18 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tool_call_arguments_fallback_to_empty_object() {
+    fn invalid_tool_call_arguments_fail_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"not{json"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
-        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+        let error = transform_response(body, "gpt-4").err().unwrap();
 
-        assert_eq!(parsed["content"][0]["type"], "tool_use");
-        assert_eq!(
-            parsed["content"][0]["input"],
-            json!({}),
-            "invalid JSON arguments should fallback to empty object"
+        assert!(
+            error.contains("invalid tool call arguments"),
+            "malformed arguments should fail response transformation: {error}"
         );
     }
 
     #[test]
-    fn non_object_tool_call_arguments_fallback_to_empty_object() {
+    fn non_object_tool_call_arguments_fail_transformation() {
         for arguments in ["[]", "null", "\"text\""] {
             let body = json!({
                 "id": "chatcmpl-1",
@@ -625,14 +625,23 @@ mod tests {
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5}
             });
             let encoded = serde_json::to_vec(&body).unwrap();
-            let transformed = transform_response(&encoded, "gpt-4").unwrap();
-            let parsed: Value = serde_json::from_slice(&transformed.body).unwrap();
+            let error = transform_response(&encoded, "gpt-4").err().unwrap();
 
-            assert_eq!(
-                parsed["content"][0]["input"],
-                json!({}),
-                "{arguments} should not produce a non-object tool input"
+            assert!(
+                error.contains("invalid tool call arguments"),
+                "non-object arguments {arguments} should fail response transformation: {error}"
             );
         }
+    }
+
+    #[test]
+    fn missing_tool_call_arguments_field_fails_transformation() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_time"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let error = transform_response(body, "gpt-4").err().unwrap();
+
+        assert!(
+            error.contains("tool call arguments must be a JSON-encoded object string"),
+            "an absent arguments field should fail response transformation: {error}"
+        );
     }
 }

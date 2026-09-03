@@ -39,6 +39,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.error.malformed_success
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/malformed-success
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.response.malformed_tool_arguments
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/malformed-tool-arguments
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.native.request
     scopes:
       - messages_native_passthrough
