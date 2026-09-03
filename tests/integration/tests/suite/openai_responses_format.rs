@@ -809,13 +809,12 @@ fn proxy_failure_does_not_format_openai_error_for_unclassified_request() {
     );
 
     let body_str = parse_body(&raw);
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body_str);
-    if let Ok(json) = parsed {
-        assert!(
-            json.get("error").and_then(|e| e.get("type")).is_none(),
-            "unclassified request should not receive OpenAI formatted error envelope"
-        );
-    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body_str).expect("proxy error should be valid JSON (RFC 9457)");
+    assert!(
+        parsed.get("error").and_then(|e| e.get("type")).is_none(),
+        "unclassified request should not receive OpenAI formatted error envelope"
+    );
 }
 
 // -----------------------------------------------------------------------------
