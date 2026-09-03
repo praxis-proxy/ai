@@ -239,9 +239,12 @@ impl ApiClient {
         max_response_bytes: usize,
     ) -> Result<SubResponse, ApiClientError> {
         let candidate_origin = ::url::Url::parse(url)
-            .ok()
-            .map(|url| url.origin().ascii_serialization());
-        if candidate_origin.is_none() || candidate_origin != self.target_origin {
+            .map_err(|_error| ApiClientError::Transport {
+                source: SubRequestError::InvalidRequest("malformed callout URL".to_owned()),
+            })?
+            .origin()
+            .ascii_serialization();
+        if Some(candidate_origin) != self.target_origin {
             return Err(ApiClientError::Transport {
                 source: SubRequestError::InvalidRequest(
                     "callout URL changed the configured credential origin".to_owned(),
@@ -430,6 +433,23 @@ mod tests {
             ApiClientError::Transport {
                 source: SubRequestError::InvalidRequest(detail),
             } if detail.contains("configured credential origin")
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_callout_url_is_rejected_before_origin_comparison() {
+        let client = test_client("https://api.example.com");
+
+        let error = client
+            .get("not a valid URL", &HeaderMap::new(), 1024)
+            .await
+            .expect_err("a malformed callout URL must be rejected before I/O");
+
+        assert!(matches!(
+            error,
+            ApiClientError::Transport {
+                source: SubRequestError::InvalidRequest(detail),
+            } if detail == "malformed callout URL"
         ));
     }
 
