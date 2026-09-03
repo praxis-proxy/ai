@@ -109,44 +109,62 @@ impl ResponsesEvent {
             });
         }
 
-        let event_type = data_type.to_owned();
-        Ok(Self::from_event_type(&event_type, data))
+        Ok(if let Some(ctor) = Self::known_variant(data_type) {
+            ctor(data)
+        } else {
+            let event_type = data_type.to_owned();
+            Self::Unknown { event_type, data }
+        })
     }
 
     /// Match event type string to enum variant.
+    #[cfg(test)]
     fn from_event_type(event_type: &str, data: Value) -> Self {
-        match event_type {
-            "response.created" => Self::ResponseCreated(data),
-            "response.queued" => Self::ResponseQueued(data),
-            "response.in_progress" => Self::ResponseInProgress(data),
-            "response.completed" => Self::ResponseCompleted(data),
-            "response.incomplete" => Self::ResponseIncomplete(data),
-            "response.failed" => Self::ResponseFailed(data),
-            "response.output_item.added" => Self::OutputItemAdded(data),
-            "response.output_item.done" => Self::OutputItemDone(data),
-            "response.content_part.added" => Self::ContentPartAdded(data),
-            "response.content_part.done" => Self::ContentPartDone(data),
-            "response.output_text.delta" => Self::OutputTextDelta(data),
-            "response.output_text.done" => Self::OutputTextDone(data),
-            "response.output_text.annotation.added" => Self::OutputTextAnnotationAdded(data),
-            "response.function_call_arguments.delta" => Self::FunctionCallArgumentsDelta(data),
-            "response.function_call_arguments.done" => Self::FunctionCallArgumentsDone(data),
-            "response.refusal.delta" => Self::RefusalDelta(data),
-            "response.refusal.done" => Self::RefusalDone(data),
+        if let Some(ctor) = Self::known_variant(event_type) {
+            ctor(data)
+        } else {
+            Self::Unknown {
+                event_type: event_type.to_owned(),
+                data,
+            }
+        }
+    }
+
+    /// Return a constructor for a known Responses SSE event type.
+    ///
+    /// Using `fn(Value) -> Self` lets callers match on a discriminator borrowed
+    /// from the JSON payload and then move that payload into the variant without
+    /// first allocating an owned event-type string.
+    fn known_variant(event_type: &str) -> Option<fn(Value) -> Self> {
+        Some(match event_type {
+            "response.created" => Self::ResponseCreated,
+            "response.queued" => Self::ResponseQueued,
+            "response.in_progress" => Self::ResponseInProgress,
+            "response.completed" => Self::ResponseCompleted,
+            "response.incomplete" => Self::ResponseIncomplete,
+            "response.failed" => Self::ResponseFailed,
+            "response.output_item.added" => Self::OutputItemAdded,
+            "response.output_item.done" => Self::OutputItemDone,
+            "response.content_part.added" => Self::ContentPartAdded,
+            "response.content_part.done" => Self::ContentPartDone,
+            "response.output_text.delta" => Self::OutputTextDelta,
+            "response.output_text.done" => Self::OutputTextDone,
+            "response.output_text.annotation.added" => Self::OutputTextAnnotationAdded,
+            "response.function_call_arguments.delta" => Self::FunctionCallArgumentsDelta,
+            "response.function_call_arguments.done" => Self::FunctionCallArgumentsDone,
+            "response.refusal.delta" => Self::RefusalDelta,
+            "response.refusal.done" => Self::RefusalDone,
             // OpenResponses uses `response.reasoning.*`; OpenAI's schema also
             // publishes `response.reasoning_text.*` for the same stream shape.
-            "response.reasoning.delta" | "response.reasoning_text.delta" => Self::ReasoningDelta(data),
-            "response.reasoning.done" | "response.reasoning_text.done" => Self::ReasoningDone(data),
-            "response.reasoning_summary_text.delta" => Self::ReasoningSummaryTextDelta(data),
-            "response.reasoning_summary_text.done" => Self::ReasoningSummaryTextDone(data),
-            "response.reasoning_summary_part.added" => Self::ReasoningSummaryPartAdded(data),
-            "response.reasoning_summary_part.done" => Self::ReasoningSummaryPartDone(data),
-            "error" => Self::Error(data),
-            other => Self::Unknown {
-                event_type: other.to_owned(),
-                data,
-            },
-        }
+            "response.reasoning.delta" | "response.reasoning_text.delta" => Self::ReasoningDelta,
+            "response.reasoning.done" | "response.reasoning_text.done" => Self::ReasoningDone,
+            "response.reasoning_summary_text.delta" => Self::ReasoningSummaryTextDelta,
+            "response.reasoning_summary_text.done" => Self::ReasoningSummaryTextDone,
+            "response.reasoning_summary_part.added" => Self::ReasoningSummaryPartAdded,
+            "response.reasoning_summary_part.done" => Self::ReasoningSummaryPartDone,
+            "error" => Self::Error,
+            _ => return None,
+        })
     }
 
     /// Whether this event terminates the stream.
@@ -200,6 +218,8 @@ fn canonical_event_type(event_type: &str) -> &str {
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::expect_used, reason = "tests")]
+#[expect(clippy::panic, reason = "tests")]
 mod tests {
     use serde_json::{Value, json};
 
@@ -591,5 +611,83 @@ mod tests {
             "error",
             "non-alias event types should pass through unchanged"
         );
+    }
+
+    #[test]
+    fn unknown_from_frame_retains_event_type_and_payload() {
+        let f = typed_frame("response.some_future_event", json!({"foo": "bar", "n": 1}));
+        let event = ResponsesEvent::from_frame(&f).unwrap();
+        let ResponsesEvent::Unknown { event_type, data } = event else {
+            panic!("expected Unknown, got {event:?}");
+        };
+        assert_eq!(event_type, "response.some_future_event");
+        assert_eq!(data.get("foo"), Some(&json!("bar")));
+        assert_eq!(data.get("n"), Some(&json!(1)));
+        assert_eq!(data.get("type"), Some(&json!("response.some_future_event")));
+    }
+
+    #[test]
+    fn known_event_type_does_not_retain_owned_discriminator() {
+        for event_type in ALL_CANONICAL_EVENT_TYPES {
+            let event = ResponsesEvent::from_event_type(event_type, json!({}));
+            assert!(
+                !matches!(event, ResponsesEvent::Unknown { .. }),
+                "{event_type} must not retain an owned Unknown discriminator"
+            );
+            assert_eq!(event.event_type(), *event_type);
+        }
+    }
+
+    #[test]
+    fn known_variant_constructor_avoids_owned_event_type() {
+        for event_type in ALL_CANONICAL_EVENT_TYPES {
+            assert!(
+                ResponsesEvent::known_variant(event_type).is_some(),
+                "{event_type} should have a known constructor"
+            );
+        }
+        assert!(
+            ResponsesEvent::known_variant("response.future.custom").is_none(),
+            "unknown event types must not claim a known constructor"
+        );
+
+        let data = json!({"type": "response.output_text.delta", "delta": "hi"});
+        let data_type = data.get("type").and_then(Value::as_str).unwrap();
+        let ctor = ResponsesEvent::known_variant(data_type).expect("known discriminator should resolve");
+        let event = ctor(data);
+        assert!(
+            matches!(event, ResponsesEvent::OutputTextDelta(_)),
+            "borrowed known discriminator should construct without an owned event-type string"
+        );
+    }
+
+    /// Structural proof that the known-variant path cannot allocate an
+    /// owned event-type `String`.
+    ///
+    /// `known_variant` returns `fn(Value) -> Self` — a constructor that
+    /// accepts only a `Value`, so there is no parameter through which an
+    /// owned discriminator `String` could be created. Only the `Unknown`
+    /// path calls `.to_owned()` to build `Unknown { event_type: String, .. }`.
+    ///
+    /// Checking the variant shape is a zero-overhead assertion that
+    /// replaces a process-wide `#[global_allocator]` allocation counter.
+    #[test]
+    fn from_frame_known_path_carries_no_owned_event_type() {
+        for event_type in ALL_CANONICAL_EVENT_TYPES {
+            let f = typed_frame(event_type, json!({}));
+            let event = ResponsesEvent::from_frame(&f).unwrap();
+            assert!(
+                !matches!(event, ResponsesEvent::Unknown { .. }),
+                "{event_type}: known discriminator must produce a typed variant \
+                 (no String field), not Unknown"
+            );
+        }
+
+        let f = typed_frame("response.output_text.XXXXX", json!({"delta": "hi"}));
+        let event = ResponsesEvent::from_frame(&f).unwrap();
+        let ResponsesEvent::Unknown { event_type, .. } = &event else {
+            panic!("unrecognized discriminator must produce Unknown (carries owned String)");
+        };
+        assert_eq!(event_type, "response.output_text.XXXXX");
     }
 }
