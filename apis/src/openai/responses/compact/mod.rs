@@ -187,6 +187,7 @@ impl CompactFilter {
             request,
             MAX_SUMMARIZATION_RESPONSE_BYTES,
             timeout,
+            self.config.address_policy,
         )
         .await;
         self.handle_subrequest_result(result, streaming)

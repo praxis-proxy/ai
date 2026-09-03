@@ -56,8 +56,11 @@ filter_chains:
       - filter: openai_responses_rehydrate
 
       - filter: openai_responses_compact
+        # This direct summarization callout is anonymous; no downstream or
+        # cluster authentication headers are forwarded.
         allow_pre_security_callout: true
         inference_url: "http://localhost:11434/v1/chat/completions"
+        allow_private_inference_url: true
         default_model: llama3.2:1b
         timeout_ms: 60000
 

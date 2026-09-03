@@ -79,10 +79,9 @@ fn config_rejects_ambiguous_or_invalid_urls() {
 }
 
 #[test]
-fn config_rejects_dns_and_sensitive_ip_targets_by_default() {
+fn config_rejects_sensitive_ip_targets_by_default() {
     for url in [
         "http://localhost:8001",
-        "http://vector-store.internal:8001",
         "http://127.0.0.1:8001",
         "http://10.0.0.1:8001",
         "http://169.254.169.254:8001",
@@ -93,6 +92,11 @@ fn config_rejects_dns_and_sensitive_ip_targets_by_default() {
     ] {
         assert!(parse_config(&format!("vector_store_url: '{url}'\n")).is_err(), "{url}");
     }
+
+    assert!(
+        parse_config("vector_store_url: 'http://vector-store.example:8001'\n").is_ok(),
+        "DNS targets are validated and pinned at connect time"
+    );
 }
 
 #[test]

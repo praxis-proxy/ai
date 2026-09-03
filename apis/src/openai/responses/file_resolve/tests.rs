@@ -790,6 +790,7 @@ fn make_client_for_url_with_max(files_api_url: &str, max_resolved_bytes: usize) 
         timeout: Duration::from_secs(5),
         max_response_bytes: 1_048_576,
         forward_header_names: vec![],
+        address_policy: crate::callout_target::AddressPolicy::AllowPrivate,
     });
     FilesApiClient::new(
         api,

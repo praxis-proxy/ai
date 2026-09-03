@@ -203,6 +203,9 @@ impl FileResolveFilter {
             timeout: std::time::Duration::from_millis(validated.timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names,
+            address_policy: crate::callout_target::AddressPolicy::from_allow_private(
+                validated.allow_private_files_api_url,
+            ),
         });
 
         let client = FilesApiClient::new(
