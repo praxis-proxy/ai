@@ -113,6 +113,7 @@ struct CompactionParams {
 /// filter: openai_responses_compact
 /// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
+/// allow_private_inference_url: true
 /// default_model: llama3.2:1b
 /// ```
 ///
@@ -122,6 +123,7 @@ struct CompactionParams {
 /// filter: openai_responses_compact
 /// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
+/// allow_private_inference_url: true
 /// default_model: gpt-4o-mini
 /// tiktoken_encoding: cl100k_base
 /// timeout_ms: 30000
