@@ -10,7 +10,7 @@ use praxis_filter::{
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
-use crate::callout_policy::{self, OnFailure};
+use crate::callout_policy;
 
 /// Default callout timeout (10 seconds — search APIs can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;

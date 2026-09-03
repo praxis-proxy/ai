@@ -21,10 +21,7 @@ use super::{
     ValidatedConfig,
     config::{SearchContextSize, SearchProvider},
 };
-use crate::{
-    callout_policy::OnFailure,
-    subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
-};
+use crate::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
