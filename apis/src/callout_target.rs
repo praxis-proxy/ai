@@ -8,7 +8,7 @@
 //! before the validated socket addresses are handed to the transport.  This
 //! closes the DNS-rebinding gap left by startup-only URL validation.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use praxis_core::connectivity::normalize_mapped_ipv4;
 use praxis_filter::FilterError;
@@ -97,8 +97,54 @@ pub fn validate_configured_http_target(
     }
     if let Ok(ip) = unbracketed.parse::<IpAddr>() {
         validate_ip(filter_name, ip, policy)?;
+    } else if let Some(ip) = parse_legacy_ipv4_host(unbracketed) {
+        validate_ip(filter_name, IpAddr::V4(ip), policy)?;
     }
     Ok(parsed)
+}
+
+/// Parse legacy IPv4 literals accepted by common libc resolvers.
+fn parse_legacy_ipv4_host(host: &str) -> Option<Ipv4Addr> {
+    let host = host.trim_end_matches('.');
+    let parts: Vec<_> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+
+    let mut numbers = Vec::with_capacity(parts.len());
+    for part in parts {
+        numbers.push(parse_legacy_ipv4_number(part)?);
+    }
+
+    let addr = match numbers.as_slice() {
+        [a] => *a,
+        [a, b] if *a <= 0xFF && *b <= 0x00FF_FFFF => (*a << 24) | *b,
+        [a, b, c] if *a <= 0xFF && *b <= 0xFF && *c <= 0xFFFF => (*a << 24) | (*b << 16) | *c,
+        [a, b, c, d] if numbers.iter().all(|part| *part <= 0xFF) => (*a << 24) | (*b << 16) | (*c << 8) | *d,
+        _ => return None,
+    };
+
+    Some(Ipv4Addr::from(addr))
+}
+
+/// Parse a decimal, octal, or hexadecimal legacy IPv4 component.
+fn parse_legacy_ipv4_number(part: &str) -> Option<u32> {
+    let (digits, radix) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")).map_or_else(
+        || {
+            if part.len() > 1 && part.starts_with('0') {
+                (part.get(1..).unwrap_or_default(), 8)
+            } else {
+                (part, 10)
+            }
+        },
+        |digits| (digits, 16),
+    );
+
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+
+    u32::from_str_radix(digits, radix).ok()
 }
 
 /// Validate every address returned by one DNS lookup.
@@ -220,6 +266,17 @@ mod tests {
     #[test]
     fn target_rejects_userinfo_for_both_policies() {
         assert!(validate_http_target("test", "https://user:pass@example.com/path").is_err());
+    }
+
+    #[test]
+    fn public_only_rejects_legacy_ipv4_literals() {
+        for host in ["127.1", "2130706433", "0x7f.0.0.1", "0177.0.0.1", "0x7f000001"] {
+            assert!(
+                validate_configured_http_target("test", &format!("http://{host}:8080"), AddressPolicy::PublicOnly)
+                    .is_err(),
+                "legacy IPv4 literal {host} should be rejected"
+            );
+        }
     }
 
     #[test]
