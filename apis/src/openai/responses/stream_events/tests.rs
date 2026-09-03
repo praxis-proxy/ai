@@ -151,6 +151,34 @@ async fn arms_for_typed_streaming_selection_without_classifier_metadata() {
 }
 
 #[tokio::test]
+async fn arm_publishes_logical_stream_marker_when_enabled() {
+    let (_default, mut ctx) = make_armed_context();
+    let filter = make_logical_filter();
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    // openai_agentic_loop reads and consumes this marker to fail closed on the
+    // unsafe terminal_streaming + agentic_loop without-logical_stream combo.
+    assert_eq!(
+        ctx.get_metadata("responses.logical_stream"),
+        Some("true"),
+        "logical_stream must publish the per-round marker openai_agentic_loop consumes"
+    );
+}
+
+#[tokio::test]
+async fn arm_omits_logical_stream_marker_when_disabled() {
+    let (filter, mut ctx) = make_armed_context();
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.get_metadata("responses.logical_stream").is_none(),
+        "a non-logical stream_events filter must not publish the logical_stream marker"
+    );
+}
+
+#[tokio::test]
 async fn does_not_arm_for_non_streaming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");

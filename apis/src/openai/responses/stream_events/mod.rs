@@ -163,6 +163,14 @@ impl OpenaiStreamEventsFilter {
             deferred_done: false,
         });
         ctx.set_metadata("responses.stream_completion", "open");
+        // Publish a per-round marker that `openai_agentic_loop` reads (and then
+        // consumes) to confirm this typed-streaming round can surface
+        // loop-terminal errors through `finalize_logical_stream`. Only meaningful
+        // when `logical_stream` is enabled; refreshed every round because the
+        // agentic loop overwrites it after each check.
+        if self.logical_stream {
+            ctx.set_metadata("responses.logical_stream", "true");
+        }
     }
 }
 

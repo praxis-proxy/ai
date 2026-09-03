@@ -112,6 +112,19 @@ filter_chains:
               # Parses every inference SSE stream, preserves one logical
               # response identity across rounds, and withholds per-round
               # terminal events until the IRR transition is known.
+              #
+              # REQUIRED with `openai_responses_proxy: terminal_streaming`
+              # below. Typed streaming commits `response.completed` to the
+              # client as it arrives, so a loop-terminal error detected by
+              # `openai_agentic_loop` (e.g. an SSE parse failure or a tool-call
+              # cardinality violation) can only reach the client through this
+              # filter's logical-stream finalizer, which defers each round's
+              # terminal event and can replace it with an error frame. Without
+              # `logical_stream: true` that error is silently dropped after the
+              # success is already on the wire, so `openai_agentic_loop` fails
+              # closed with a 500 before any backend request when the two are
+              # misconfigured together. (Startup validation of this pairing is
+              # left to a future Praxis-core improvement.)
               - filter: openai_stream_events
                 logical_stream: true
 

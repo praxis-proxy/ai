@@ -113,8 +113,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
@@ -220,7 +220,39 @@ impl HttpFilter for AgenticLoopFilter {
         BodyMode::Stream
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Fail closed on an unsafe terminal-streaming configuration *before* any
+        // upstream dispatch. Within each IRR round this filter's `on_request`
+        // runs after `openai_responses_proxy` has selected the typed transport
+        // and after `openai_stream_events` has published whether a logical-stream
+        // finalizer is armed, so both facts are observable here.
+        //
+        // When the sub-request will commit a typed stream (`terminal_streaming`
+        // with `"stream": true`) but no `openai_stream_events` logical-stream
+        // finalizer is present, a loop-terminal error detected later in
+        // `on_response_body` cannot reach the client: typed streaming has already
+        // committed `response.completed`, so the error would be silently dropped
+        // after a truncated success is on the wire. This is a server
+        // misconfiguration, so reject with a 500 rather than forward that
+        // truncated success. Buffered rounds retain full error handling and are
+        // unaffected.
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+            // Consume the per-round marker so a `"true"` published by another IRR
+            // step cannot satisfy a later step's check. `openai_stream_events`
+            // re-publishes it every armed round before this filter reads it.
+            let logical_stream = ctx.get_metadata("responses.logical_stream") == Some("true");
+            ctx.set_metadata("responses.logical_stream", "false");
+            if !logical_stream {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    500,
+                    "server_error",
+                    "openai_agentic_loop with openai_responses_proxy terminal_streaming requires \
+                     openai_stream_events with logical_stream: true so loop-terminal errors can \
+                     reach the client",
+                    true,
+                )));
+            }
+        }
         Ok(FilterAction::Continue)
     }
 

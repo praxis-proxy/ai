@@ -29,7 +29,7 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 
 | Filter | `on_request` | `on_request_body` | `on_response` | `on_response_body` |
 |--------|:------------:|:-----------------:|:--------------:|:------------------:|
-| `openai_agentic_loop` | — | ReadOnly / StreamBuffer | — | ReadWrite / Stream |
+| `openai_agentic_loop` | ✓ | ReadOnly / StreamBuffer | — | ReadWrite / Stream |
 | `openai_doc_extract` | — | ReadWrite / StreamBuffer | — | — |
 | `openai_file_resolve` | — | ReadWrite / StreamBuffer | — | — |
 | `openai_file_search_callout` | ✓ | ReadOnly / StreamBuffer | — | ReadWrite / StreamBuffer |

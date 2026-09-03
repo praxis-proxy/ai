@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{FilterAction, HttpFilter};
+use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
@@ -79,6 +79,74 @@ fn passthrough_without_state_on_response_body() {
     assert!(
         ctx.filter_results.is_empty(),
         "should not write filter_results without state"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// on_request: fail closed on unsafe terminal-streaming configuration
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn on_request_rejects_typed_streaming_without_logical_stream() {
+    // openai_responses_proxy already selected the typed streaming transport for
+    // this round, but openai_stream_events published no logical-stream marker
+    // (logical_stream: false or the filter is absent). A loop-terminal error
+    // could not reach the client, so this must fail closed before dispatch.
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("unsafe agentic terminal streaming must fail closed before dispatch");
+    };
+    assert_eq!(
+        rejection.status, 500,
+        "server misconfiguration must fail closed with 500, not commit a truncatable stream"
+    );
+    let error_body = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(
+        error_body.contains("server_error"),
+        "rejection must carry the server_error code: {error_body}"
+    );
+}
+
+#[tokio::test]
+async fn on_request_allows_typed_streaming_with_logical_stream() {
+    // openai_stream_events armed a logical-stream finalizer this round, so a
+    // loop-terminal error can still reach the client: proceed.
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.set_metadata("responses.logical_stream", "true");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "agentic terminal streaming with a logical-stream finalizer must proceed"
+    );
+    // The marker is consumed so a stale "true" cannot satisfy a later IRR step
+    // whose own filters did not re-publish it.
+    assert_eq!(ctx.get_metadata("responses.logical_stream"), Some("false"));
+}
+
+#[tokio::test]
+async fn on_request_allows_buffered_mode_without_logical_stream() {
+    // A buffered sub-request retains full loop-terminal error handling, so the
+    // fail-closed check does not apply even without a logical-stream finalizer.
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a buffered sub-request must not be rejected by the streaming fail-closed check"
     );
 }
 
