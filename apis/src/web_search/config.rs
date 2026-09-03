@@ -163,13 +163,10 @@ pub(crate) struct OpenAiWebSearchConfig {
 
     /// Allow a `base_url` that targets local-sensitive addresses.
     ///
-    /// DNS targets are unsupported in protected mode (the default):
-    /// validation cannot pin the address the HTTP client will eventually
-    /// dial, so a `base_url` host must be a public IP literal. Enabling
-    /// `allow_private_base_url` also permits DNS results resolving to
-    /// local-sensitive addresses, so a hostile or rebound resolution can
-    /// send the provider credential to a loopback, private, or
-    /// cloud-metadata endpoint.
+    /// DNS names are resolved once per request and every result is checked
+    /// immediately before the transport connects. By default, any private,
+    /// loopback, link-local, or otherwise non-public result rejects the
+    /// callout. Enable this only for a trusted private provider endpoint.
     #[serde(default)]
     allow_private_base_url: bool,
 }
