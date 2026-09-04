@@ -294,9 +294,9 @@ pub(crate) async fn call_tool(
                 url: display_url.clone(),
             })?;
 
-        let parsed_args = match &arguments {
-            serde_json::Value::Object(obj) => Some(obj.clone()),
-            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s).ok(),
+        let parsed_args = match arguments {
+            serde_json::Value::Object(obj) => Some(obj),
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&s).ok(),
             _ => None,
         };
         let mut params = CallToolRequestParams::new(tool_name.to_owned());
