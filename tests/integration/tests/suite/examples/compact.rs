@@ -19,6 +19,8 @@ use praxis_test_utils::{
     patch_yaml, start_proxy,
 };
 
+use super::openai_file_resolve::{start_file_url_stub, start_files_api_stub};
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -40,15 +42,54 @@ const INFERENCE_RESPONSE: &str = r#"{"id":"resp_inf","created_at":2000,"model":"
 /// Load the compact example config, replacing the SQLite URL and
 /// patching listener/backend addresses.
 fn load_compact_config(yaml: &str, db_url: &str, proxy_port: u16, backend_port: u16) -> praxis_core::config::Config {
-    let replaced = yaml
+    load_compact_config_with_files(yaml, db_url, proxy_port, backend_port, None)
+}
+
+/// Load the compact example, optionally pointing `files_api_url` at a stub.
+fn load_compact_config_with_files(
+    yaml: &str,
+    db_url: &str,
+    proxy_port: u16,
+    backend_port: u16,
+    files_api_port: Option<u16>,
+) -> praxis_core::config::Config {
+    let mut replaced = yaml
         .replace("sqlite://responses.db?mode=rwc", db_url)
         .replace("localhost:11434", &format!("127.0.0.1:{backend_port}"));
+    if let Some(files_port) = files_api_port {
+        replaced = replaced.replace("127.0.0.1:9999", &format!("127.0.0.1:{files_port}"));
+    }
     let patched = patch_yaml(
         &replaced,
         proxy_port,
         &HashMap::from([("127.0.0.1:11434", backend_port)]),
     );
     praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse")
+}
+
+/// Drop `openai_doc_extract` so a test can assert the resolve-only shape.
+fn without_doc_extract(yaml: &str) -> String {
+    yaml.replace(
+        "      - filter: openai_doc_extract\n        allow_pre_security_callout: true\n        on_unsupported: continue\n\n",
+        "",
+    )
+}
+
+/// Allow the test file-url stub origin so loopback fetches are not SSRF-blocked.
+fn with_allowed_file_url_origin(yaml: &str, origin: &str) -> String {
+    yaml.replace(
+        "        file_url: resolve\n",
+        &format!("        file_url: resolve\n        allowed_file_url_origins:\n          - \"{origin}\"\n"),
+    )
+}
+
+/// True when any object in `value` still carries `key`.
+fn json_contains_key(value: &serde_json::Value, key: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.contains_key(key) || map.values().any(|v| json_contains_key(v, key)),
+        serde_json::Value::Array(items) => items.iter().any(|v| json_contains_key(v, key)),
+        _ => false,
+    }
 }
 
 /// Start a sequenced backend that:
@@ -274,6 +315,161 @@ async fn compact_verifies_summarization_call_and_compacted_state() {
         second.contains("Compare with QUIC"),
         "second item should be the current user input"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_preserves_resolved_file_url_as_file_data() {
+    let file_url_port = start_file_url_stub();
+    let origin = format!("http://127.0.0.1:{file_url_port}");
+    let yaml = without_doc_extract(&with_allowed_file_url_origin(
+        &std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+            .expect("example config should exist"),
+        &origin,
+    ));
+    let inference =
+        compact_follow_up_and_capture(&yaml, "compact_file_url", None, &file_url_follow_up_body(file_url_port));
+
+    assert_no_unresolved_file_fields(&inference);
+    let current = &inference["input"][1];
+    assert_eq!(
+        current["content"][0]["type"], "input_file",
+        "resolve-only pipeline should keep input_file after compaction"
+    );
+    assert!(
+        current["content"][0]
+            .get("file_data")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "resolved file_data must reach the inference backend: {current}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_preserves_extracted_file_id_as_input_text() {
+    let files_api_port = start_files_api_stub();
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    let inference = compact_follow_up_and_capture(&yaml, "compact_file_id", Some(files_api_port), FILE_ID_FOLLOW_UP);
+
+    assert_no_unresolved_file_fields(&inference);
+    let current = &inference["input"][1];
+    assert_eq!(
+        current["content"][0]["type"], "input_text",
+        "doc_extract rewrite must survive compaction: {current}"
+    );
+    let text = current["content"][0]["text"]
+        .as_str()
+        .expect("extracted input_text should have a text field");
+    assert!(
+        text.contains("Hello, world!"),
+        "extracted text should include file content: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_example_extracts_file_url_and_does_not_restore_it() {
+    let file_url_port = start_file_url_stub();
+    let origin = format!("http://127.0.0.1:{file_url_port}");
+    let yaml = with_allowed_file_url_origin(
+        &std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+            .expect("example config should exist"),
+        &origin,
+    );
+    let inference = compact_follow_up_and_capture(
+        &yaml,
+        "compact_example_file_url",
+        None,
+        &file_url_follow_up_body(file_url_port),
+    );
+
+    assert_no_unresolved_file_fields(&inference);
+    let current = &inference["input"][1];
+    assert_eq!(
+        current["content"][0]["type"], "input_text",
+        "example pipeline should extract the fetched file_url: {current}"
+    );
+    let text = current["content"][0]["text"]
+        .as_str()
+        .expect("extracted input_text should have a text field");
+    assert!(
+        text.contains("Hello, world!"),
+        "extracted text should include file content: {text}"
+    );
+}
+
+const FILE_ID_FOLLOW_UP: &str = r#"{"model":"gpt-4.1","previous_response_id":"resp_compact","context_management":[{"type":"compaction","compact_threshold":1000}],"input":[{"type":"message","role":"user","content":[{"type":"input_file","file_id":"test-file-123"}]}]}"#;
+
+fn file_url_follow_up_body(file_url_port: u16) -> String {
+    format!(
+        r#"{{"model":"gpt-4.1","previous_response_id":"resp_compact","context_management":[{{"type":"compaction","compact_threshold":1000}}],"input":[{{"type":"message","role":"user","content":[{{"type":"input_file","file_url":"http://127.0.0.1:{file_url_port}/document.txt"}}]}}]}}"#
+    )
+}
+
+fn assert_no_unresolved_file_fields(inference: &serde_json::Value) {
+    let input = inference["input"]
+        .as_array()
+        .expect("inference input should be an array");
+    assert_eq!(
+        input.len(),
+        2,
+        "compacted input should have exactly 2 items: summary + current input"
+    );
+    assert_eq!(
+        input[0]["role"], "assistant",
+        "first item should be the compaction summary as an assistant message"
+    );
+    assert!(
+        !json_contains_key(inference, "file_url"),
+        "compacted outbound body must not restore file_url: {inference}"
+    );
+    assert!(
+        !json_contains_key(inference, "file_id"),
+        "compacted outbound body must not restore file_id: {inference}"
+    );
+}
+
+/// Store the first compact turn, then send `follow_up` against a sequenced
+/// backend and return the captured inference request JSON.
+fn compact_follow_up_and_capture(
+    yaml: &str,
+    db_name: &str,
+    files_api_port: Option<u16>,
+    follow_up: &str,
+) -> serde_json::Value {
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new(db_name);
+
+    let config1 = load_compact_config_with_files(yaml, db.url(), proxy_port, backend1.port(), files_api_port);
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should succeed");
+    drop(backend1);
+    drop(proxy1);
+
+    let (backend_port, captured_inference_body) =
+        start_sequenced_backend(CHAT_COMPLETIONS_RESPONSE, INFERENCE_RESPONSE);
+    let config2 = load_compact_config_with_files(yaml, db.url(), proxy_port, backend_port, files_api_port);
+    let proxy2 = start_proxy(&config2);
+    let raw2 = http_send(proxy2.addr(), &json_post("/v1/responses", follow_up));
+    assert_eq!(
+        parse_status(&raw2),
+        200,
+        "compaction follow-up should succeed, body: {raw2}"
+    );
+    drop(proxy2);
+
+    let inference_body = captured_inference_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("inference request body should have been captured");
+    serde_json::from_str(&inference_body).expect("inference body should be valid JSON")
 }
 
 #[test]

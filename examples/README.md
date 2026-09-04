@@ -72,7 +72,7 @@ before sending requests.
 | [agentic-loop-fixture.yaml](configs/openai/responses/agentic-loop-fixture.yaml) | Minimal agentic loop pipeline for inference fixture replay |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the openai_agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
 | [body-size-limits.yaml](configs/openai/responses/body-size-limits.yaml) | Demonstrates how raw request body size is enforced across a chain of OpenAI Responses filters that each buffer the request body |
-| [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates the compaction flow: store a response, rehydrate it on the next turn, and count tokens to check if compaction is needed |
+| [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates compaction after rehydrate, file resolve, and document extract so rewritten current-turn content survives history replacement |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |
 | [file-search-callout.yaml](configs/openai/responses/file-search-callout.yaml) | Demonstrates the `openai_file_search_callout` filter configuration |

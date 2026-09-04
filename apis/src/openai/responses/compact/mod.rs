@@ -8,7 +8,9 @@
 //! this filter summarizes the conversation history via a sub-request
 //! to an inference backend, replacing it with a single compaction
 //! item. Runs after `rehydrate` (which populates messages and
-//! previous usage) and after `openai_tool_parse`.
+//! previous usage) and after `openai_tool_parse`. Place
+//! `openai_file_resolve` and `openai_doc_extract` before compact so
+//! rewritten current-turn content is what compaction preserves.
 //!
 //! # Scope
 //!
@@ -33,6 +35,7 @@ pub(super) mod config;
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     reason = "tests"
 )]
 mod tests;
@@ -549,18 +552,32 @@ fn build_compaction_item(id: &str, summary: &str) -> Value {
 /// Replace conversation history with the compaction item.
 ///
 /// After replacement:
-/// - `state.messages` = `[compaction_item, ...state.input]`
-/// - `state.persisted_messages` = `[compaction_item, ...state.input]`
+/// - `state.messages` = `[compaction_item, ...current_turn]`
+/// - `state.persisted_messages` = `[compaction_item, ...current_turn]`
 ///
 /// The compaction item is `{"type": "compaction", "encrypted_content": "<base64>"}`.
-/// `state.input` holds the current request's input items (unchanged
-/// by rehydrate), so the current turn's messages are preserved.
+/// The current turn is the tail of each message list whose length
+/// matches `state.input`. File resolution and document extraction
+/// rewrite that tail in place and leave `state.input` as the original
+/// client payload, so compaction must not rebuild from `state.input`.
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
-    let mut new_messages = Vec::with_capacity(state.input.len() + 1);
-    new_messages.push(compaction_item);
-    new_messages.extend(state.input.iter().cloned());
-    state.persisted_messages = new_messages.clone();
-    state.messages = new_messages;
+    let input_len = state.input.len();
+    let message_tail = split_current_turn(&mut state.messages, input_len);
+    let persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+
+    state.messages.clear();
+    state.messages.push(compaction_item.clone());
+    state.messages.extend(message_tail);
+
+    state.persisted_messages.clear();
+    state.persisted_messages.push(compaction_item);
+    state.persisted_messages.extend(persisted_tail);
+}
+
+/// Move the current-turn tail off `items`, leaving history behind to drop.
+fn split_current_turn(items: &mut Vec<Value>, input_len: usize) -> Vec<Value> {
+    let start = items.len().saturating_sub(input_len);
+    items.split_off(start)
 }
 
 /// Format a message array as readable text for the summarization prompt.

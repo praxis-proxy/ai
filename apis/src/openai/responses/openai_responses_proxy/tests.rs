@@ -568,6 +568,55 @@ fn messages_for_backend_mixed_items() {
     assert_eq!(result[1]["role"], "user");
 }
 
+#[tokio::test]
+async fn compacted_outbound_serializes_resolved_file_data_not_file_url() {
+    const FILE_URL: &str = "https://files.internal/secret.bin";
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request_body = json!({
+        "model": "gpt-4o",
+        "previous_response_id": "resp_prev",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_url": FILE_URL}]
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.history_rehydrated = true;
+    let encoded = base64::engine::general_purpose::STANDARD.encode("summary");
+    state.messages = vec![
+        json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded}),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_data": "SGVsbG8="}]
+        }),
+    ];
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[{"type":"input_file","file_url":"https://files.internal/secret.bin"}]}],"previous_response_id":"resp_prev"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "compaction rewrite should continue with the resolved current-turn body"
+    );
+
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    let outbound_text = outbound.to_string();
+    assert!(
+        !outbound_text.contains(FILE_URL),
+        "proxy must not serialize the unresolved file_url after compaction"
+    );
+    assert_eq!(
+        outbound["input"][1]["content"][0]["file_data"], "SGVsbG8=",
+        "proxy must serialize the resolved current-turn file_data"
+    );
+}
+
 #[test]
 fn compaction_to_assistant_message_decodes_encrypted_content() {
     let encoded = base64::engine::general_purpose::STANDARD.encode("decoded summary");
