@@ -67,6 +67,16 @@ const ACTION_DONE: &str = "done";
 /// Include value that gates `action.sources` in the output item.
 const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 
+/// Server-side hard cap on web searches dispatched in one continuation.
+///
+/// Bounds the number of (potentially paid) provider requests issued per
+/// re-entry even when the client omits `max_tool_calls`. Mirrors the
+/// file-search `MAX_PENDING_CALLS` ceiling so the two built-in tools share
+/// the same per-continuation fan-out limit. The enclosing
+/// `iterative_request_router` deadlines and iteration cap bound the total
+/// across continuations.
+const MAX_WEB_SEARCH_CALLS_PER_CONTINUATION: usize = 64;
+
 /// Model-facing result for a malformed call without `action.query`.
 const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query was missing.";
 
@@ -169,13 +179,18 @@ impl WebSearchFilter {
     /// `index` is the call's position within the pending queue. It keeps the
     /// synthetic bridge `call_id` unique even when the hosted source ids
     /// collide or are absent (issue #808).
+    ///
+    /// Returns `true` when a provider request was dispatched — a `Results` or
+    /// `Failed` outcome, both charged against the call budget — and `false`
+    /// when the call was surfaced as incomplete without issuing a request
+    /// (a missing query).
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         call: &Value,
         index: usize,
         context_size: SearchContextSize,
-    ) {
+    ) -> bool {
         let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
         let query = call.get("action").and_then(|a| a.get("query")).and_then(Value::as_str);
 
@@ -187,7 +202,7 @@ impl WebSearchFilter {
                 bridge: &bridge,
             };
             append_incomplete(ctx, &ids);
-            return;
+            return false;
         };
 
         let bridge = bridge_call_id(call_id, query, index);
@@ -196,7 +211,7 @@ impl WebSearchFilter {
             bridge: &bridge,
         };
         match self.search_client.search(query, Some(context_size)).await {
-            SearchOutcome::Results(results) => append_result(ctx, &ids, query, &results),
+            SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
             SearchOutcome::Failed => {
                 warn!(
                     call_id,
@@ -204,6 +219,42 @@ impl WebSearchFilter {
                 );
                 append_failed(ctx, &ids, query);
             },
+        }
+        true
+    }
+
+    /// Execute pending web search `calls` up to `budget`, then update the
+    /// cumulative execution count and clear the pending queue.
+    ///
+    /// Calls beyond `budget` are surfaced as incomplete without issuing a
+    /// (potentially paid) provider request, honoring the client's
+    /// `max_tool_calls` allowance and the per-continuation server cap. Only
+    /// dispatched calls (a `Results` or `Failed` outcome) are charged against
+    /// the budget; a missing-query call is surfaced as incomplete without a
+    /// provider request and does not consume budget.
+    async fn execute_pending_searches(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        calls: &[Value],
+        budget: usize,
+        context_size: SearchContextSize,
+    ) {
+        let mut dispatched = 0_usize;
+        for (index, call) in calls.iter().enumerate() {
+            if dispatched >= budget {
+                append_excess_incomplete(ctx, call, index);
+                continue;
+            }
+            if self.execute_single_search(ctx, call, index, context_size).await {
+                dispatched = dispatched.saturating_add(1);
+            }
+        }
+
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.web_search_calls_executed = state
+                .web_search_calls_executed
+                .saturating_add(u32::try_from(dispatched).unwrap_or(u32::MAX));
+            state.web_search_calls.clear();
         }
     }
 }
@@ -262,19 +313,22 @@ impl HttpFilter for WebSearchFilter {
             .or_else(|| web_search_context_size_from_state(state))
             .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
 
-        // Move the web search calls out instead of cloning and then removing them from state.
+        // Compute the remaining budget while the shared immutable borrow is
+        // still live, then move the web search calls out instead of cloning
+        // and then removing them from state.
+        let budget = remaining_web_search_budget(state);
         let calls: Vec<Value> = ctx
             .extensions
             .get_mut::<ResponsesState>()
             .map(|state| mem::take(&mut state.web_search_calls))
             .unwrap_or_default();
 
-        debug!(count = calls.len(), "executing pending web search calls");
+        debug!(
+            count = calls.len(),
+            budget, "executing pending web search calls within budget"
+        );
 
-        for (index, call) in calls.iter().enumerate() {
-            self.execute_single_search(ctx, call, index, context_size).await;
-        }
-
+        self.execute_pending_searches(ctx, &calls, budget, context_size).await;
         Ok(FilterAction::Continue)
     }
 
@@ -332,14 +386,60 @@ struct SearchCallIds<'a> {
     bridge: &'a str,
 }
 
+/// Remaining web searches this continuation may dispatch.
+///
+/// Intersects the client's remaining `max_tool_calls` allowance (the
+/// declared maximum minus searches already dispatched across prior
+/// iterations) with the server-side per-continuation hard cap. When the
+/// client omits `max_tool_calls`, only the server cap applies.
+fn remaining_web_search_budget(state: &ResponsesState) -> usize {
+    let executed = usize::try_from(state.web_search_calls_executed).unwrap_or(usize::MAX);
+    let client_remaining = state.max_tool_calls.map_or(usize::MAX, |max| {
+        usize::try_from(max).unwrap_or(usize::MAX).saturating_sub(executed)
+    });
+    client_remaining.min(MAX_WEB_SEARCH_CALLS_PER_CONTINUATION)
+}
+
+/// Surface an over-budget web search call as incomplete without dispatching.
+///
+/// Preserves the requested query in the output item so the model can see which
+/// search was declined, matching the missing-query incomplete shape. No
+/// provider request is issued, so no budget is charged. `index` keeps the
+/// bridge `call_id` unique, mirroring [`WebSearchFilter::execute_single_search`].
+fn append_excess_incomplete(ctx: &mut HttpFilterContext<'_>, call: &Value, index: usize) {
+    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
+    let query = call
+        .get("action")
+        .and_then(|a| a.get("query"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let bridge = bridge_call_id(call_id, query, index);
+    let ids = SearchCallIds {
+        public: call_id,
+        bridge: &bridge,
+    };
+    append_result(ctx, &ids, "incomplete", query, &[]);
+}
+
 /// Append a completed search turn to [`ResponsesState`].
 ///
 /// An empty `results` slice is a successful zero-result search: the model
 /// receives `No search results found.` and the public item stays `completed`.
-fn append_result(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, query: &str, results: &[SearchResult]) {
+/// A non-`completed` status (an over-budget call that was never dispatched)
+/// threads through a truthful `Web search not performed.` bridge, so the
+/// model-facing history never contradicts the client-visible incomplete output
+/// item or pollutes durable rehydration history. A missing-query call uses the
+/// more specific [`append_incomplete`] instead.
+fn append_result(
+    ctx: &mut HttpFilterContext<'_>,
+    ids: &SearchCallIds<'_>,
+    status: &str,
+    query: &str,
+    results: &[SearchResult],
+) {
     let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(ids.public, "completed", query, results, include_sources);
-    let bridge = build_tool_result_messages(ids.bridge, query, results);
+    let output_item = build_output_item(ids.public, status, query, results, include_sources);
+    let bridge = build_tool_result_messages(ids.bridge, status, query, results);
     push_search_turn(ctx, output_item, bridge);
 }
 
@@ -467,7 +567,7 @@ pub(crate) fn build_output_item(
     })
 }
 
-/// Build the backend-valid continuation for a completed search.
+/// Build the backend-valid continuation for a search.
 ///
 /// A hosted `web_search_call` item is not a valid `OpenResponses` `input`
 /// type (see issue #808), so the model-facing history bridges the result
@@ -476,11 +576,24 @@ pub(crate) fn build_output_item(
 /// public `web_search_call` output item is emitted separately by
 /// [`build_output_item`] and only reaches `accumulated_output`.
 ///
+/// `status` is threaded through so a call that was never dispatched
+/// (over-budget or missing a query, `status != "completed"`) carries a
+/// truthful `Web search not performed.` output instead of a fabricated
+/// `No search results found.` result, keeping the model-facing bridge
+/// consistent with the client-visible incomplete output item.
+///
 /// `call_id` must be a bounded, backend-valid identifier from
 /// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
 /// 64-character `call_id` limit.
-pub(crate) fn build_tool_result_messages(call_id: &str, query: &str, results: &[SearchResult]) -> [Value; 2] {
-    let content = if results.is_empty() {
+pub(crate) fn build_tool_result_messages(
+    call_id: &str,
+    status: &str,
+    query: &str,
+    results: &[SearchResult],
+) -> [Value; 2] {
+    let content = if status != "completed" {
+        "Web search not performed.".to_owned()
+    } else if results.is_empty() {
         "No search results found.".to_owned()
     } else {
         format_search_results(results)
