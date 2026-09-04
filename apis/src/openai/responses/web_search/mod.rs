@@ -227,12 +227,7 @@ impl HttpFilter for WebSearchFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        // Buffer up to the absolute JSON ceiling; the pipeline's body_limits
-        // governs the real raw-response cap (merged across sibling filters and
-        // clamped to the transport ceiling by praxis core).
-        BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        }
+        BodyMode::Stream
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {

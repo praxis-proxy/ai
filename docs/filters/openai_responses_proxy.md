@@ -11,11 +11,14 @@ Reads the assembled conversation history from `ResponsesState::messages` and rep
 
 When no `ResponsesState` exists, preserves the request body apart from removing the Praxis-owned `conversation` field.
 
+Set `terminal_streaming: true` inside an iterative request router step to select Praxis's streaming transport when the effective outbound body contains `"stream": true`. Classifier metadata remains descriptive client intent; this final serializer owns the transport decision. IRR can resume one downstream stream across response-dependent transitions, but every response-body filter in a streaming-capable step must use `BodyMode::Stream`.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* when it rebuilds the outbound body from `ResponsesState`. Raw request body size is governed by the pipeline's `body_limits`, not this field. This bounds only the rebuilt body, which can grow larger than the raw input when conversation history is rehydrated. |
+| `terminal_streaming` | bool | no | Select Praxis streaming transport for effective `stream: true` requests. IRR may resume the same downstream stream after a step transition when its response filters use streaming body mode. |
 
 ## Examples
 
@@ -30,4 +33,5 @@ filter: openai_responses_proxy
 ```yaml
 filter: openai_responses_proxy
 max_rewritten_body_bytes: 67108864
+terminal_streaming: false
 ```

@@ -689,8 +689,8 @@ impl HttpFilter for ResponseStoreFilter {
         BodyAccess::ReadOnly
     }
 
-    /// `StreamBuffer` so the protocol layer assembles the complete
-    /// response body before delivering it at end-of-stream.
+    /// Streaming by default. Non-streaming Responses requests select a
+    /// bounded `StreamBuffer` dynamically in [`Self::on_request`].
     ///
     /// Non-streaming Responses API payloads are bounded by output
     /// token limits (typically under 2 MiB). The 64 MiB ceiling is
@@ -699,12 +699,16 @@ impl HttpFilter for ResponseStoreFilter {
     /// for the full model inference, so the hold-back latency from
     /// `StreamBuffer` is negligible.
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        }
+        BodyMode::Stream
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if is_responses_format(ctx) && !is_streaming_request(ctx) {
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_JSON_BODY_BYTES),
+            });
+        }
+
         if ctx.request.method == http::Method::GET {
             if let Some(action) = self.try_get_retrieval(ctx).await? {
                 return Ok(action);

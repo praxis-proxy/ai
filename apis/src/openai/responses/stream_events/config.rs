@@ -17,6 +17,12 @@ use crate::openai::sse::SseParserConfig;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StreamEventsConfig {
+    /// Treat successive IRR inference streams as one logical Responses
+    /// stream. Per-iteration lifecycle events are normalized and only the
+    /// final terminal event is exposed downstream.
+    #[serde(default)]
+    pub logical_stream: bool,
+
     /// Maximum bytes buffered for incomplete SSE lines/data across
     /// chunk boundaries. Default: 10 MiB.
     #[serde(default)]

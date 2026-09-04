@@ -150,6 +150,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.agentic.irr_terminal_streaming
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/irr-terminal-streaming
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.continuation
     scopes:
       - responses_to_chat_completions

@@ -100,6 +100,7 @@ pub(super) fn accumulate_response_object(
         }
         if let Some(Value::Array(output)) = response.get("output") {
             state.output_items_mut().clone_from(output);
+            replace_completed_tool_calls(state, output);
         }
         state.response_object = response;
         had_prior_usage
@@ -108,6 +109,20 @@ pub(super) fn accumulate_response_object(
 
     debug!(status, "complete response received, ResponsesState updated");
     had_prior_usage
+}
+
+/// Replace incremental function calls from the authoritative terminal output.
+fn replace_completed_tool_calls(state: &mut ResponsesState, output: &[Value]) {
+    state.tool_calls.clear();
+    state.tool_calls.extend(
+        output
+            .iter()
+            .filter(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call")
+                    && item.get("status").and_then(Value::as_str) == Some("completed")
+            })
+            .cloned(),
+    );
 }
 
 /// Push a new output item to the incremental accumulator.

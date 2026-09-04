@@ -104,7 +104,11 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The four make test-* steps each build a distinct cargo feature
+    # permutation (default, EXPERIMENTAL_FEATURES, llmd-ext-proc), so this
+    # job serially recompiles large parts of the tree; the llmd-ext-proc
+    # gRPC/proto build lands last. 30m was insufficient on slow runners.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:

@@ -31,7 +31,13 @@ pub(crate) fn responses_error_body(code: &str, message: &str) -> Bytes {
 ///
 /// Produces `event: error\ndata: <ResponseErrorEvent json>\n\n`.
 pub(crate) fn responses_error_sse_body(code: &str, message: &str) -> Bytes {
-    let json = serde_json::json!({
+    let json = responses_error_sse_payload(code, message);
+    Bytes::from(format!("event: error\ndata: {json}\n\n"))
+}
+
+/// Build the JSON payload for a Responses API SSE error event.
+pub(crate) fn responses_error_sse_payload(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
         "type": "error",
         "sequence_number": 0,
         "error": {
@@ -40,8 +46,7 @@ pub(crate) fn responses_error_sse_body(code: &str, message: &str) -> Bytes {
             "message": message,
             "param": null,
         },
-    });
-    Bytes::from(format!("event: error\ndata: {json}\n\n"))
+    })
 }
 
 /// Build a [`Rejection`] with the appropriate OpenAI error format.

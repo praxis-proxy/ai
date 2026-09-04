@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{FilterAction, HttpFilter};
+use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
@@ -79,6 +79,74 @@ fn passthrough_without_state_on_response_body() {
     assert!(
         ctx.filter_results.is_empty(),
         "should not write filter_results without state"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// on_request: fail closed on unsafe terminal-streaming configuration
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn on_request_rejects_typed_streaming_without_logical_stream() {
+    // openai_responses_proxy already selected the typed streaming transport for
+    // this round, but openai_stream_events published no logical-stream marker
+    // (logical_stream: false or the filter is absent). A loop-terminal error
+    // could not reach the client, so this must fail closed before dispatch.
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("unsafe agentic terminal streaming must fail closed before dispatch");
+    };
+    assert_eq!(
+        rejection.status, 500,
+        "server misconfiguration must fail closed with 500, not commit a truncatable stream"
+    );
+    let error_body = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
+    assert!(
+        error_body.contains("server_error"),
+        "rejection must carry the server_error code: {error_body}"
+    );
+}
+
+#[tokio::test]
+async fn on_request_allows_typed_streaming_with_logical_stream() {
+    // openai_stream_events armed a logical-stream finalizer this round, so a
+    // loop-terminal error can still reach the client: proceed.
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.set_metadata("responses.logical_stream", "true");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "agentic terminal streaming with a logical-stream finalizer must proceed"
+    );
+    // The marker is consumed so a stale "true" cannot satisfy a later IRR step
+    // whose own filters did not re-publish it.
+    assert_eq!(ctx.get_metadata("responses.logical_stream"), Some("false"));
+}
+
+#[tokio::test]
+async fn on_request_allows_buffered_mode_without_logical_stream() {
+    // A buffered sub-request retains full loop-terminal error handling, so the
+    // fail-closed check does not apply even without a logical-stream finalizer.
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a buffered sub-request must not be rejected by the streaming fail-closed check"
     );
 }
 
@@ -260,11 +328,11 @@ async fn preserves_unmodified_parallel_tool_calls_false() {
 }
 
 // -----------------------------------------------------------------------------
-// on_request_body: Reject Streaming
+// on_request_body: Streaming
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn rejects_streaming_request() {
+async fn accepts_streaming_request() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -275,13 +343,13 @@ async fn rejects_streaming_request() {
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
     assert!(
-        matches!(&action, FilterAction::Reject(r) if r.status == 400),
-        "stream:true should produce a 400 rejection"
+        matches!(action, FilterAction::Continue),
+        "stream:true should continue into IRR streaming"
     );
 }
 
 #[tokio::test]
-async fn streaming_rejection_preserves_state() {
+async fn streaming_request_preserves_state() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -294,7 +362,288 @@ async fn streaming_rejection_preserves_state() {
 
     assert!(
         ctx.extensions.get::<ResponsesState>().is_some(),
-        "ResponsesState must remain in extensions after streaming rejection"
+        "ResponsesState must remain in extensions for streaming response accumulation"
+    );
+}
+
+#[test]
+fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.tool_calls.push(json!({
+        "type": "function_call",
+        "call_id": "call_partial",
+        "name": "must_not_run",
+        "arguments": "{}",
+        "status": "completed"
+    }));
+    state.response_object = json!({
+        "id": "resp_incomplete",
+        "object": "response",
+        "status": "incomplete",
+        "output": [{
+            "type": "message",
+            "id": "msg_partial",
+            "status": "incomplete",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "partial"}]
+        }]
+    });
+    let partial_output = state
+        .response_object
+        .get("output")
+        .and_then(Value::as_array)
+        .expect("incomplete response should have output")
+        .clone();
+    state.output_items_mut().clone_from(&partial_output);
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a terminal incomplete stream must yield Continue so the committed SSE stream is forwarded"
+    );
+    assert_action(&ctx, "done");
+    assert!(
+        ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
+        "a tool from a truncated stream must not remain dispatchable"
+    );
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[0]["id"],
+        "msg_partial",
+        "partial output from an incomplete response must remain client-visible"
+    );
+}
+
+#[test]
+fn failed_stream_does_not_dispatch_accumulated_tool_call() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.tool_calls.push(json!({
+        "type": "function_call",
+        "call_id": "call_failed",
+        "name": "must_not_run",
+        "arguments": "{}",
+        "status": "completed"
+    }));
+    state.response_object = json!({
+        "id": "resp_failed",
+        "object": "response",
+        "status": "failed",
+        "output": [{
+            "type": "message",
+            "id": "msg_before_failure",
+            "status": "incomplete",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "before failure"}]
+        }]
+    });
+    let partial_output = state
+        .response_object
+        .get("output")
+        .and_then(Value::as_array)
+        .expect("failed response should retain partial output")
+        .clone();
+    state.output_items_mut().clone_from(&partial_output);
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a terminal failed stream must yield Continue so the committed SSE stream is forwarded"
+    );
+    assert_action(&ctx, "done");
+    assert!(
+        ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
+        "a provider-failed response must not authorize tool execution"
+    );
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[0]["id"],
+        "msg_before_failure",
+        "partial output preceding a provider failure must remain client-visible"
+    );
+}
+
+#[test]
+fn streamed_web_search_call_is_available_to_dispatch_filter() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.response_object = json!({
+        "id": "resp_search",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "Praxis"}
+        }]
+    });
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streamed web_search_call round must yield Continue while it loops for dispatch"
+    );
+    assert_action(&ctx, "loop");
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().web_search_calls.len(),
+        1,
+        "streamed web-search calls must be visible to openai_web_search"
+    );
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.get("type").and_then(Value::as_str) == Some("web_search_call")),
+        "a hosted web_search_call is not a valid OpenResponses input item and must not \
+         enter model-facing messages (issue #808)"
+    );
+}
+
+#[test]
+fn multiple_streamed_function_calls_end_with_sse_error() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.tool_calls = vec![
+        json!({"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"}),
+        json!({"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}),
+    ];
+    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streamed cardinality error must yield Continue after selecting the terminal SSE error"
+    );
+    assert_action(&ctx, "done");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("invalid_request_error"),
+        "post-commit validation must select a terminal SSE error"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
+        "invalid streamed calls must not remain dispatchable"
+    );
+}
+
+#[test]
+fn multiple_streamed_function_calls_do_not_finalize_body() {
+    // A streamed cardinality error must terminate through the SSE-error path
+    // without falling through to `evaluate_loop_decision`, which would serialize
+    // `response_object` into the body. With `logical_stream: false` nothing
+    // downstream would overwrite it, so the JSON would leak to the client after
+    // the SSE events.
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.tool_calls = vec![
+        json!({"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"}),
+        json!({"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}),
+    ];
+    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streamed cardinality error must yield Continue without buffering a replacement body"
+    );
+    assert_action(&ctx, "done");
+    assert!(
+        body.is_none(),
+        "a streamed SSE error must not serialize a JSON body onto the committed stream"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a locally terminated stream must not be persisted"
+    );
+}
+
+#[test]
+fn streaming_iteration_limit_ends_with_sse_error() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 1").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.iteration = 1;
+    state.tool_calls = vec![json!({
+        "type": "function_call",
+        "call_id": "call_limit",
+        "name": "must_not_run",
+        "status": "completed"
+    })];
+    state.response_object = json!({"id": "resp_limit", "object": "response", "status": "completed", "output": []});
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an exhausted streamed loop must yield Continue after selecting the terminal SSE error"
+    );
+    assert_action(&ctx, "done");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "an exhausted committed stream must end with an SSE error"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
+        "iteration-limit errors must not leave calls dispatchable"
     );
 }
 

@@ -248,14 +248,32 @@ fn request_body_access_is_read_only() {
 }
 
 #[test]
-fn response_body_mode_is_bounded_stream_buffer() {
+fn response_body_mode_defaults_to_stream() {
     let filter = make_filter();
     assert_eq!(
         filter.response_body_mode(),
+        BodyMode::Stream,
+        "streaming requests must not inherit a pipeline-level StreamBuffer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "request should continue");
+    assert_eq!(
+        ctx.response_body_mode,
         BodyMode::StreamBuffer {
-            max_bytes: Some(67_108_864) // 64 MiB
+            max_bytes: Some(67_108_864)
         },
-        "response body mode should be StreamBuffer capped at 64 MiB"
+        "non-streaming Responses requests should remain bounded"
     );
 }
 

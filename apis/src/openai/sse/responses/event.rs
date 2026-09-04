@@ -8,7 +8,6 @@ use serde_json::Value;
 use super::super::{SseFrame, SseParseError};
 
 /// A parsed Responses API streaming event.
-#[expect(dead_code, reason = "variants consumed by stream_events filter (#433)")]
 #[derive(Debug)]
 pub(crate) enum ResponsesEvent {
     // Response lifecycle
@@ -155,6 +154,37 @@ impl ResponsesEvent {
             self,
             Self::ResponseCompleted(_) | Self::ResponseIncomplete(_) | Self::ResponseFailed(_) | Self::Error(_)
         )
+    }
+
+    /// Borrow the JSON payload carried by this event.
+    pub fn payload(&self) -> &Value {
+        match self {
+            Self::ResponseCreated(payload)
+            | Self::ResponseQueued(payload)
+            | Self::ResponseInProgress(payload)
+            | Self::ResponseCompleted(payload)
+            | Self::ResponseIncomplete(payload)
+            | Self::ResponseFailed(payload)
+            | Self::OutputItemAdded(payload)
+            | Self::OutputItemDone(payload)
+            | Self::ContentPartAdded(payload)
+            | Self::ContentPartDone(payload)
+            | Self::OutputTextDelta(payload)
+            | Self::OutputTextDone(payload)
+            | Self::OutputTextAnnotationAdded(payload)
+            | Self::FunctionCallArgumentsDelta(payload)
+            | Self::FunctionCallArgumentsDone(payload)
+            | Self::RefusalDelta(payload)
+            | Self::RefusalDone(payload)
+            | Self::ReasoningDelta(payload)
+            | Self::ReasoningDone(payload)
+            | Self::ReasoningSummaryTextDelta(payload)
+            | Self::ReasoningSummaryTextDone(payload)
+            | Self::ReasoningSummaryPartAdded(payload)
+            | Self::ReasoningSummaryPartDone(payload)
+            | Self::Error(payload)
+            | Self::Unknown { data: payload, .. } => payload,
+        }
     }
 
     /// Return the event type string.
