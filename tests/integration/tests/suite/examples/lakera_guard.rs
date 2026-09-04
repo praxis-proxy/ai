@@ -104,23 +104,21 @@ fn load_lakera_config(proxy_port: u16, lakera_port: u16, backend_port: u16) -> p
     let path = example_config_path("lakera-guard.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
 
-    // Replace the real Lakera API URL with our mock and remove
-    // the Authorization header that references an env var.
-    //
-    // The example hardens against SSRF with `allow_private_addresses:
-    // false`, but the mock Lakera backend runs on loopback, so drop that
-    // line for the test harness — otherwise resolve_peer would (correctly)
-    // block the loopback callout.
+    // Replace the real public API with the trusted loopback mock, explicitly
+    // opt into that private target, and remove the real credential header.
     let yaml = yaml
         .replace(
-            "https://api.lakera.ai/v2/guard",
-            &format!("http://127.0.0.1:{lakera_port}/v2/guard"),
+            "          url: \"https://api.lakera.ai/v2/guard\"",
+            &format!("          url: \"http://127.0.0.1:{lakera_port}/v2/guard\""),
+        )
+        .replace(
+            "          allow_private_addresses: false",
+            "          allow_private_addresses: true",
         )
         .replace(
             "            - name: \"Authorization\"\n              value: \"Bearer ${LAKERA_API_KEY}\"\n",
             "",
-        )
-        .replace("          allow_private_addresses: false\n", "");
+        );
 
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
     praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse lakera-guard.yaml: {e}"))

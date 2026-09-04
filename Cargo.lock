@@ -2734,7 +2734,6 @@ dependencies = [
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
- "quixotic-plecostomus-core",
  "rand 0.10.2",
  "redis",
  "reqwest",

@@ -22,6 +22,7 @@ filter: ai_guardrails
 provider:
   type: nemo
   endpoint: "http://nemo:8000/v1/guardrail/checks"
+  allow_private_endpoint: true
   timeout_ms: 5000
 phase:
   request: true

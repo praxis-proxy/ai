@@ -64,6 +64,7 @@
 //! scope: https://cognitiveservices.azure.com/.default
 //! client_secret_env_var: AZURE_CLIENT_SECRET
 //! authority_host: login.microsoftonline.com   # optional, for sovereign clouds
+//! allow_private_authority: false               # opt in only for a trusted private authority
 //! ```
 
 use std::{
@@ -178,12 +179,11 @@ pub struct AzureAdFilter {
     /// [`praxis_ai_apis::token_cache`].
     cache: TokenCache<HeaderValue>,
 
-    /// HTTP client used for token-endpoint requests, built once with
-    /// [`TOKEN_REQUEST_TIMEOUT`].
-    client: reqwest::Client,
-
     /// Fully-formed token endpoint URL.
     token_url: String,
+
+    /// Connect-time address policy for the authority endpoint.
+    address_policy: praxis_ai_apis::callout_target::AddressPolicy,
 
     /// Application (client) ID.
     client_id: String,
@@ -223,15 +223,13 @@ impl AzureAdFilter {
             "https://{}/{}/oauth2/v2.0/token",
             config.authority_host, config.tenant_id
         );
-        let client = reqwest::Client::builder()
-            .timeout(TOKEN_REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| FilterError::from(format!("azure_ad: failed to build HTTP client: {e}")))?;
-
+        let address_policy =
+            praxis_ai_apis::callout_target::AddressPolicy::from_allow_private(config.allow_private_authority);
+        praxis_ai_apis::callout_target::validate_configured_http_target("azure_ad", &token_url, address_policy)?;
         Ok(Self {
             cache: TokenCache::new(EXPIRY_SKEW),
-            client,
             token_url,
+            address_policy,
             client_id: config.client_id,
             client_secret,
             scope: config.scope,
@@ -265,20 +263,32 @@ impl praxis_filter::HttpFilter for AzureAdFilter {
         praxis_filter::BodyMode::Stream
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "token refresh and fail-closed state transitions stay together"
+    )]
     async fn on_request(
         &self,
         ctx: &mut praxis_filter::HttpFilterContext<'_>,
     ) -> Result<praxis_filter::FilterAction, FilterError> {
         let fetched = self
             .cache
-            .get_or_refresh(|| {
+            .get_or_refresh(|| async {
+                let client = praxis_ai_apis::callout_target::build_pinned_reqwest_client(
+                    "azure_ad",
+                    &self.token_url,
+                    self.address_policy,
+                    TOKEN_REQUEST_TIMEOUT,
+                )
+                .await?;
                 fetch_token(
-                    &self.client,
+                    &client,
                     &self.token_url,
                     &self.client_id,
                     &self.client_secret,
                     &self.scope,
                 )
+                .await
             })
             .await;
         match fetched {
@@ -330,6 +340,10 @@ pub(crate) struct AzureAdConfig {
     /// `login.microsoftonline.us`).
     #[serde(default = "default_authority_host")]
     pub(crate) authority_host: String,
+
+    /// Allow a private authority host for a trusted internal identity service.
+    #[serde(default)]
+    pub(crate) allow_private_authority: bool,
 }
 
 /// Validate the config fields [`AzureAdFilter::new`] relies on before it
@@ -510,6 +524,7 @@ mod tests {
             scope: "s".to_owned(),
             client_secret_env_var: "AZURE_TEST_UNSET_SECRET".to_owned(),
             authority_host: "login.microsoftonline.com@evil.com".to_owned(),
+            allow_private_authority: false,
         };
         match AzureAdFilter::new(cfg) {
             Ok(_) => panic!("malicious authority_host must be rejected"),
@@ -579,6 +594,40 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn token_redirect_does_not_disclose_client_secret() {
+        let redirect_target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        redirect_target.set_nonblocking(true).unwrap();
+        let target_addr = redirect_target.local_addr().unwrap();
+
+        let redirector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirector_addr = redirector.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = redirector.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let filter = filter_at(&format!("http://{redirector_addr}/token"));
+        let request = make_request(Method::POST, "/openai/deployments/gpt-4o/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Reject(_)),
+            "redirected token fetch must fail closed"
+        );
+        server.join().unwrap();
+        assert!(
+            matches!(redirect_target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "redirect target must not receive the secret-bearing token request"
+        );
+    }
+
     // -- on_request: cache-through end to end ----------------------------------
 
     /// Build a filter with a real, always-set secret env var (so
@@ -591,7 +640,8 @@ mod tests {
             "tenant_id: tid\n\
              client_id: cid\n\
              scope: scope\n\
-             client_secret_env_var: CARGO_PKG_NAME\n",
+             client_secret_env_var: CARGO_PKG_NAME\n\
+             allow_private_authority: true\n",
         ))
         .expect("test config must parse");
         let mut filter =

@@ -13,8 +13,10 @@
 use std::{future::Future, net::SocketAddr, time::Duration};
 
 use pingora_core::upstreams::peer::HttpPeer;
-pub use praxis_core::subrequest::{SubRequest, SubRequestClient, SubRequestError, SubResponse};
+pub use praxis_core::subrequest::{FrameworkHeaders, SubRequest, SubRequestClient, SubRequestError, SubResponse};
 use tracing::debug;
+
+use crate::callout_target::{AddressPolicy, validate_http_target, validate_resolved_addrs};
 
 /// Parsed URL components needed to resolve and execute a request.
 #[derive(Debug)]
@@ -111,57 +113,121 @@ async fn with_deadline<T>(
 /// resolution or connect fails, the deadline is exceeded, admission
 /// or circuit breaking rejects the call, the response exceeds
 /// `max_response_bytes`, or I/O fails during the exchange.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request's transport policy and execution bounds remain explicit"
+)]
 pub async fn execute_url(
     client: &SubRequestClient,
     url: &str,
     request: SubRequest,
     max_response_bytes: usize,
     timeout: Duration,
+    address_policy: AddressPolicy,
 ) -> Result<SubResponse, SubRequestError> {
-    with_deadline(
-        timeout,
-        Box::pin(execute_url_inner(client, url, request, max_response_bytes, timeout)),
-    )
-    .await
+    execute_url_with_framework(client, url, request, max_response_bytes, timeout, address_policy, None).await
 }
 
-/// Resolve DNS and execute under the deadline enforced by [`execute_url`].
-async fn execute_url_inner(
+/// Parse and execute a full-URL sub-request carrying framework headers.
+///
+/// This is used by the generic callout filter to retain depth propagation
+/// while sharing the same DNS pinning and address-policy enforcement as the
+/// provider-specific clients.
+///
+/// # Errors
+///
+/// Returns [`SubRequestError`] for invalid URLs, resolution or connect
+/// failures, policy violations, timeouts, bounded-read failures, or I/O.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "framework metadata is an additional explicit transport input"
+)]
+pub async fn execute_url_with_framework(
     client: &SubRequestClient,
     url: &str,
     request: SubRequest,
     max_response_bytes: usize,
     timeout: Duration,
+    address_policy: AddressPolicy,
+    framework_headers: Option<&FrameworkHeaders>,
 ) -> Result<SubResponse, SubRequestError> {
-    let parsed = parse_url_components(url)?;
-    let addrs = resolve_addrs(&parsed.host, parsed.port).await?;
-    execute_resolved_url(client, parsed, request, &addrs, max_response_bytes, timeout).await
+    with_deadline(
+        timeout,
+        Box::pin(resolve_and_execute_url(
+            client,
+            url,
+            request,
+            max_response_bytes,
+            timeout,
+            address_policy,
+            framework_headers,
+        )),
+    )
+    .await
 }
 
-/// Try each resolved address until one connects successfully.
+/// Resolve DNS and execute the request against the validated addresses.
 #[expect(
     clippy::too_many_arguments,
-    reason = "internal helper requires parsed target and execution limits"
+    reason = "the resolution and execution inputs remain explicit"
 )]
-async fn execute_resolved_url(
+async fn resolve_and_execute_url(
     client: &SubRequestClient,
-    parsed: ParsedUrl,
-    mut request: SubRequest,
-    addrs: &[SocketAddr],
+    url: &str,
+    request: SubRequest,
     max_response_bytes: usize,
     timeout: Duration,
+    address_policy: AddressPolicy,
+    framework_headers: Option<&FrameworkHeaders>,
 ) -> Result<SubResponse, SubRequestError> {
+    validate_http_target("sub-request", url).map_err(|error| SubRequestError::InvalidRequest(error.to_string()))?;
+    let parsed = parse_url_components(url)?;
+    let addrs = resolve_addrs(&parsed.host, parsed.port).await?;
+    execute_with_addresses(
+        client,
+        parsed,
+        request,
+        max_response_bytes,
+        timeout,
+        address_policy,
+        framework_headers,
+        addrs,
+    )
+    .await
+}
+
+/// Validate addresses and try each one until the request succeeds.
+///
+/// Keeping this boundary separate gives tests a controlled DNS result set
+/// without changing production resolution behavior.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the subrequest transport inputs remain explicit"
+)]
+async fn execute_with_addresses(
+    client: &SubRequestClient,
+    parsed: ParsedUrl,
+    request: SubRequest,
+    max_response_bytes: usize,
+    timeout: Duration,
+    address_policy: AddressPolicy,
+    framework_headers: Option<&FrameworkHeaders>,
+    addrs: Vec<SocketAddr>,
+) -> Result<SubResponse, SubRequestError> {
+    let addrs = validate_resolved_addrs("sub-request", &addrs, address_policy)
+        .map_err(|error| SubRequestError::Connect(error.to_string()))?;
+    let mut request = request;
     request.uri = parsed.uri;
     if !request.headers.contains_key(http::header::HOST) {
         request.headers.insert(http::header::HOST, parsed.authority);
     }
 
     let mut last_connect_error = None;
-    for addr in addrs {
+    for addr in &addrs {
         let peer = HttpPeer::new(*addr, parsed.tls, parsed.sni.clone());
         debug!(host = %parsed.host, %addr, "sub-request: trying resolved address");
 
-        match Box::pin(client.execute(&peer, &request, max_response_bytes, timeout, None)).await {
+        match Box::pin(client.execute(&peer, &request, max_response_bytes, timeout, framework_headers)).await {
             Ok(response) => return Ok(response),
             Err(SubRequestError::Connect(error)) => {
                 debug!(host = %parsed.host, %addr, %error, "sub-request: connect failed, trying next address");
@@ -175,6 +241,37 @@ async fn execute_resolved_url(
         || format!("no addresses resolved for {}", parsed.host),
         |error| format!("all resolved addresses for {} failed: {error}", parsed.host),
     )))
+}
+
+/// Test-only entry point that substitutes controlled DNS results.
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test seam mirrors the production subrequest transport inputs"
+)]
+async fn execute_url_with_test_addresses(
+    client: &SubRequestClient,
+    url: &str,
+    request: SubRequest,
+    max_response_bytes: usize,
+    timeout: Duration,
+    address_policy: AddressPolicy,
+    framework_headers: Option<&FrameworkHeaders>,
+    addrs: Vec<SocketAddr>,
+) -> Result<SubResponse, SubRequestError> {
+    validate_http_target("sub-request", url).map_err(|error| SubRequestError::InvalidRequest(error.to_string()))?;
+    let parsed = parse_url_components(url)?;
+    execute_with_addresses(
+        client,
+        parsed,
+        request,
+        max_response_bytes,
+        timeout,
+        address_policy,
+        framework_headers,
+        addrs,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -303,20 +400,52 @@ mod tests {
         let good_addr = good_listener.local_addr().unwrap();
         let captured = capture_raw_request(good_listener);
 
-        let parsed = parse_url_components(&format!("http://example.test:{}/test", good_addr.port())).unwrap();
-        let response = Box::pin(execute_resolved_url(
+        let url = format!("http://example.test:{}/test", good_addr.port());
+        let response = Box::pin(execute_url_with_test_addresses(
             &test_client(),
-            parsed,
+            &url,
             empty_request(),
-            &[bad_addr, good_addr],
             1024,
             Duration::from_secs(5),
+            AddressPolicy::AllowPrivate,
+            None,
+            vec![bad_addr, good_addr],
         ))
         .await
         .unwrap();
 
         assert_eq!(response.status, 200);
         let _request = captured.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_mixed_resolved_addresses_before_dialing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let private_addr = listener.local_addr().unwrap();
+        let public_addr = "8.8.8.8:443".parse().unwrap();
+        let url = format!("http://example.test:{}/test", private_addr.port());
+
+        let result = Box::pin(execute_url_with_test_addresses(
+            &test_client(),
+            &url,
+            empty_request(),
+            1024,
+            Duration::from_secs(5),
+            AddressPolicy::PublicOnly,
+            None,
+            vec![public_addr, private_addr],
+        ))
+        .await;
+
+        assert!(
+            matches!(&result, Err(SubRequestError::Connect(detail)) if detail.contains("blocked non-public address")),
+            "mixed public/private answers must be rejected before transport: {result:?}"
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a rejected address set must not be dialed"
+        );
     }
 
     #[tokio::test]
@@ -327,13 +456,15 @@ mod tests {
         let authority = format!("my-virtual-host.example.com:{}", addr.port());
         let parsed = parse_url_components(&format!("http://{authority}/test")).unwrap();
 
-        Box::pin(execute_resolved_url(
+        Box::pin(execute_with_addresses(
             &test_client(),
             parsed,
             empty_request(),
-            &[addr],
             1024,
             Duration::from_secs(5),
+            AddressPolicy::AllowPrivate,
+            None,
+            vec![addr],
         ))
         .await
         .unwrap();

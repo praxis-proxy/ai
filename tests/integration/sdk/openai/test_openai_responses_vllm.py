@@ -420,7 +420,7 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert "VIOLET-7319" in second.output_text
 
-    def test_doc_extract_inline(self, openai_client):
+    def test_doc_extract_inline_file_to(self, openai_client):
         """Issue #397: inline file_data is extracted to input_text and
         consumed by vLLM inference.
 
@@ -526,7 +526,7 @@ class TestOpenAIResponsesVLLM:
             except Exception:
                 pass
 
-    def test_client_function(self, openai_client):
+    def test_client_function_call_returns(self, openai_client):
         """Client-side function tools are returned without auto-execution.
 
         The full-flow pipeline has no agentic loop, so function_call
@@ -682,7 +682,7 @@ def agentic_client(agentic_proxy):
 class TestAgenticLoopVLLM:
     """Integration tests for the agentic loop against a vLLM backend."""
 
-    def test_mcp_tool_auto_executes(
+    def test_mcp_tool_auto_executes_and_returns(
         self, agentic_client, agentic_proxy,
     ):
         """MCP tools are auto-executed by the proxy within the IRR loop.
@@ -737,7 +737,7 @@ class TestAgenticLoopVLLM:
             f"rounds; got: {output_types}"
         )
 
-    def test_client_function(self, agentic_client):
+    def test_client_function_exits_openai(self, agentic_client):
         """Client-side function tools exit the agentic loop without
         auto-execution, even when the IRR is active.
 

@@ -33,7 +33,10 @@ filter_chains:
       - filter: ai_guardrails
         provider:
           type: nemo
+          # NeMo callouts are anonymous; no downstream authentication
+          # headers are forwarded to this endpoint.
           endpoint: "http://127.0.0.1:3001/v1/guardrail/checks"
+          allow_private_endpoint: true
           timeout_ms: 5000
         phase:
           request: true

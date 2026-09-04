@@ -999,6 +999,7 @@ mod tests {
             timeout: std::time::Duration::from_millis(timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
+            address_policy: crate::callout_target::AddressPolicy::AllowPrivate,
         })
     }
 

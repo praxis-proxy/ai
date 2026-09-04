@@ -15,7 +15,7 @@ This filter resolves references inside Responses requests; it does not proxy cli
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `allow_private_files_api_url` | bool | no | Allow `files_api_url` to target private, loopback, link-local, or DNS-name hosts.  Default `false` rejects SSRF-sensitive targets; set to `true` in development or when the Files API is an internal service on a private network. |
+| `allow_private_files_api_url` | bool | no | Allow `files_api_url` to resolve to private, loopback, link-local, or otherwise non-public addresses. Default `false` permits DNS names only when every connect-time result is public. Set to `true` only when the Files API is a trusted private service. |
 | `allow_pre_security_callout` | bool | no | Allow Files API callouts from the `StreamBuffer` pre-read phase, before header-phase security filters execute. This must be explicitly enabled only when an outer trust boundary authenticates and authorizes requests before they reach this listener. Forwarded headers are the original downstream values, not mutations from request filters. |
 | `files_api_url` | string | yes | Base URL of the Files API endpoint. Example: `http://files-api:8321` |
 | `forward_headers` | string[] | no | Headers to forward from the original request to the Files API for authentication and tenant isolation. No downstream headers are forwarded by default. |

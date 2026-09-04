@@ -12,6 +12,7 @@ use crate::callout_policy::OnFailure;
 
 fn base_config() -> CompactFilterConfig {
     CompactFilterConfig {
+        allow_private_inference_url: true,
         allow_pre_security_callout: true,
         inference_url: "http://localhost:11434/v1/chat/completions".to_owned(),
         default_model: "gpt-4o-mini".to_owned(),
@@ -60,7 +61,7 @@ fn from_config_missing_pre_security_ack() {
 #[test]
 fn from_config_accepts_pre_security_ack() {
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(
-        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions",
+        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions\nallow_private_inference_url: true",
     )
     .unwrap();
     assert!(
@@ -74,6 +75,14 @@ fn build_config_rejects_empty_inference_url() {
     let mut cfg = base_config();
     cfg.inference_url = String::new();
     assert!(build_config(&cfg).is_err());
+}
+
+#[test]
+fn private_inference_target_requires_explicit_opt_in() {
+    let mut cfg = base_config();
+    cfg.allow_private_inference_url = false;
+    let error = build_config(&cfg).expect_err("loopback inference target must require opt-in");
+    assert!(error.to_string().contains("localhost"), "unexpected error: {error}");
 }
 
 #[test]
@@ -492,7 +501,7 @@ fn conversation_text_skips_empty_compaction_summary() {
 
 fn make_filter(on_failure: &str) -> CompactFilter {
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
-        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions\non_failure: {on_failure}"
+        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions\nallow_private_inference_url: true\non_failure: {on_failure}"
     ))
     .unwrap();
     let cfg: CompactFilterConfig = serde_yaml::from_value(yaml).unwrap();

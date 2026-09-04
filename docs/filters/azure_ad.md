@@ -20,4 +20,5 @@ client_id: 11111111-1111-1111-1111-111111111111
 scope: https://cognitiveservices.azure.com/.default
 client_secret_env_var: AZURE_CLIENT_SECRET
 authority_host: login.microsoftonline.com   # optional, for sovereign clouds
+allow_private_authority: false               # opt in only for a trusted private authority
 ```
