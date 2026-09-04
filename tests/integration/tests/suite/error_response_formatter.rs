@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Pipeline integration tests for provider-native error response formatters.
@@ -10,7 +10,7 @@
 //! uses the provider-native JSON shape instead of RFC 9457 Problem Details.
 
 use praxis_core::config::Config;
-use praxis_test_utils::{free_port, http_send, parse_body, parse_status, start_proxy};
+use praxis_test_utils::{free_port, http_send, json_post, parse_body, parse_status, start_proxy};
 
 // -----------------------------------------------------------------------------
 // OpenAI Tests
@@ -237,20 +237,6 @@ filter_chains:
 insecure_options:
   allow_private_endpoints: true
 "#
-    )
-}
-
-/// Build a POST request with JSON content type.
-fn json_post(path: &str, body: &str) -> String {
-    format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: localhost\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len()
     )
 }
 
