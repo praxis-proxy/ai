@@ -293,6 +293,17 @@ fn sync_state_after_rewrite(
     sync_persisted_history(persisted_messages, input_len, Some(resolved_input), budget)
 }
 
+/// Test helper that creates an isolated request extraction budget.
+#[cfg(test)]
+fn sync_state(
+    ctx: &mut HttpFilterContext<'_>,
+    resolved_body: serde_json::Value,
+    config: &DocExtractConfig,
+) -> Result<(), ExtractError> {
+    let mut budget = ExtractionBudget::new(config);
+    sync_state_after_rewrite(ctx, resolved_body, &mut budget)
+}
+
 /// Extract `input_file` parts in rehydrated history when the
 /// current input had no `input_file` parts to extract.
 fn extract_state_history(ctx: &mut HttpFilterContext<'_>, budget: &mut ExtractionBudget) -> Result<(), ExtractError> {

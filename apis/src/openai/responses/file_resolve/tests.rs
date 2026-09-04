@@ -744,6 +744,59 @@ async fn rejects_unresolvable_history_when_configured_to_reject() {
 }
 
 #[tokio::test]
+async fn sync_state_leaves_original_input_untouched() {
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-abc"}]
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state
+        .messages
+        .insert(0, json!({"role": "user", "content": "replay history"}));
+    state
+        .persisted_messages
+        .insert(0, json!({"role": "user", "content": "replay history"}));
+    ctx.extensions.insert(state);
+
+    let resolved_body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_data": "SGVsbG8="}]
+        }]
+    });
+    sync_state(&mut ctx, resolved_body, &make_client(), OnMissing::Continue)
+        .await
+        .unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let part = &state.input[0]["content"][0];
+    assert_eq!(
+        part["file_id"], "file-abc",
+        "state.input should keep the original client file_id"
+    );
+    assert!(
+        part.get("file_data").is_none(),
+        "state.input should not receive resolved file_data"
+    );
+    assert_eq!(
+        state.messages[1]["content"][0]["file_data"], "SGVsbG8=",
+        "the rewritten tail should still reach messages"
+    );
+}
+
+#[tokio::test]
 async fn sync_state_skipped_without_responses_state() {
     let req = Box::leak(Box::new(crate::test_utils::make_request(
         http::Method::POST,
