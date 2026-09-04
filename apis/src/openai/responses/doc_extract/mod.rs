@@ -155,7 +155,7 @@ impl HttpFilter for DocExtractFilter {
             return Ok(reject_raw_body_too_large(raw.len(), self.config.max_body_bytes));
         }
 
-        let mut parsed: serde_json::Value = match serde_json::from_slice(raw) {
+        let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
             Err(e) => {
                 debug!(error = %e, "body is not valid JSON, releasing");
@@ -163,21 +163,24 @@ impl HttpFilter for DocExtractFilter {
             },
         };
 
-        extract_and_rewrite(self, ctx, body, &mut parsed)
+        extract_and_rewrite(self, ctx, body, parsed)
     }
 }
 
 /// Run extraction on the current input and history, then rewrite
 /// the body and sync state.
+///
+/// Takes ownership of the parsed body so the extracted value can be
+/// moved into [`ResponsesState`] instead of deep-cloned.
 fn extract_and_rewrite(
     filter: &DocExtractFilter,
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
-    parsed: &mut serde_json::Value,
+    mut parsed: serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
     let mut budget = ExtractionBudget::new(&filter.config);
 
-    let count = match extract_current_input(parsed, &mut budget) {
+    let count = match extract_current_input(&mut parsed, &mut budget) {
         Ok(count) => count,
         Err(e) => return Ok(reject_extract_error(&e)),
     };
@@ -194,7 +197,7 @@ fn extract_and_rewrite(
     }
 
     debug!(count, "extracted input_file parts");
-    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
+    if let Some(rejection) = rewrite_body(body, &parsed, filter.config.max_body_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = sync_state_after_rewrite(ctx, parsed, &mut budget) {
@@ -260,25 +263,34 @@ fn rewrite_body(
 
 /// Sync converted content back into [`ResponsesState`] after a body
 /// rewrite.
+///
+/// Takes `resolved_body` by value and moves it into `request_body`
+/// rather than deep-cloning a tree that may carry inlined file data.
 fn sync_state_after_rewrite(
     ctx: &mut HttpFilterContext<'_>,
-    resolved_body: &serde_json::Value,
+    resolved_body: serde_json::Value,
     budget: &mut ExtractionBudget,
 ) -> Result<(), ExtractError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         return Ok(());
     };
 
-    state.request_body = resolved_body.clone();
+    state.request_body = resolved_body;
 
-    let Some(resolved_input) = resolved_body.get("input").and_then(serde_json::Value::as_array) else {
+    let input_len = state.input.len();
+    let ResponsesState {
+        request_body,
+        messages,
+        persisted_messages,
+        ..
+    } = state;
+
+    let Some(resolved_input) = request_body.get("input").and_then(serde_json::Value::as_array) else {
         return Ok(());
     };
 
-    let input_len = state.input.len();
-
-    sync_message_history(&mut state.messages, input_len, Some(resolved_input), budget)?;
-    sync_persisted_history(&mut state.persisted_messages, input_len, Some(resolved_input), budget)
+    sync_message_history(messages, input_len, Some(resolved_input), budget)?;
+    sync_persisted_history(persisted_messages, input_len, Some(resolved_input), budget)
 }
 
 /// Extract `input_file` parts in rehydrated history when the
