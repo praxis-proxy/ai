@@ -293,7 +293,7 @@ impl HttpFilter for FileResolveFilter {
             return Ok(reject_raw_body_too_large(raw.len(), self.config.max_body_bytes));
         }
 
-        let mut parsed: serde_json::Value = match serde_json::from_slice(raw) {
+        let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
             Err(e) => {
                 debug!(error = %e, "body is not valid JSON, releasing");
@@ -301,19 +301,23 @@ impl HttpFilter for FileResolveFilter {
             },
         };
 
-        resolve_and_rewrite(self, ctx, body, &mut parsed).await
+        resolve_and_rewrite(self, ctx, body, parsed).await
     }
 }
 
 /// Run resolution and rewrite the body if any references were resolved.
+///
+/// Takes ownership of the parsed body so the resolved value can be moved
+/// into [`ResponsesState`] instead of deep-cloned; nothing reads it after
+/// state synchronization.
 async fn resolve_and_rewrite(
     filter: &FileResolveFilter,
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
-    parsed: &mut serde_json::Value,
+    mut parsed: serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
     let mut budget = filter.client.resolution_budget();
-    let count = match resolve_current_input(filter, ctx, parsed, &mut budget).await {
+    let count = match resolve_current_input(filter, ctx, &mut parsed, &mut budget).await {
         Ok(count) => count,
         Err(e) => return Ok(reject_resolve_error(&e)),
     };
@@ -329,7 +333,7 @@ async fn resolve_and_rewrite(
     }
 
     debug!(count, "resolved file_id references");
-    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
+    if let Some(rejection) = rewrite_body(body, &parsed, filter.config.max_body_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
@@ -379,7 +383,7 @@ async fn resolve_current_input(
 async fn update_state(
     filter: &FileResolveFilter,
     ctx: &mut HttpFilterContext<'_>,
-    resolved_body: Option<&serde_json::Value>,
+    resolved_body: Option<serde_json::Value>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     match resolved_body {
@@ -431,10 +435,13 @@ fn rewrite_body(
 /// `messages` / `persisted_messages` with the resolved items.
 /// History messages prepended by rehydrate are also walked so
 /// that any `file_id` references in them are resolved.
+///
+/// Takes `resolved_body` by value and moves it into `request_body`
+/// rather than deep-cloning a tree that may carry inlined file data.
 #[expect(clippy::too_many_arguments, reason = "threading resolver through state sync")]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
-    resolved_body: &serde_json::Value,
+    resolved_body: serde_json::Value,
     client: &FilesApiClient,
     on_missing: OnMissing,
     url_resolver: Option<&FileUrlResolver>,
@@ -444,13 +451,20 @@ async fn sync_state_with_budget(
         return Ok(());
     };
 
-    state.request_body = resolved_body.clone();
+    state.request_body = resolved_body;
 
-    let Some(resolved_input) = resolved_body.get("input").and_then(serde_json::Value::as_array) else {
+    let input_len = state.input.len();
+    let ResponsesState {
+        request_body,
+        messages,
+        persisted_messages,
+        ..
+    } = state;
+
+    let Some(resolved_input) = request_body.get("input").and_then(serde_json::Value::as_array) else {
         return Ok(());
     };
 
-    let input_len = state.input.len();
     let resolver = HistoryResolver {
         client,
         on_missing,
@@ -458,22 +472,15 @@ async fn sync_state_with_budget(
         url_resolver,
     };
 
-    sync_message_history(&mut state.messages, input_len, Some(resolved_input), resolver, budget).await?;
-    sync_persisted_history(
-        &mut state.persisted_messages,
-        input_len,
-        Some(resolved_input),
-        resolver,
-        budget,
-    )
-    .await
+    sync_message_history(messages, input_len, Some(resolved_input), resolver, budget).await?;
+    sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await
 }
 
 /// Test helper that creates an isolated request resolution budget.
 #[cfg(test)]
 async fn sync_state(
     ctx: &mut HttpFilterContext<'_>,
-    resolved_body: &serde_json::Value,
+    resolved_body: serde_json::Value,
     client: &FilesApiClient,
     on_missing: OnMissing,
 ) -> Result<(), ResolveError> {

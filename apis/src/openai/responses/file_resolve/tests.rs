@@ -435,7 +435,8 @@ async fn sync_state_updates_responses_state() {
     });
 
     let client = make_client();
-    sync_state(&mut ctx, &resolved_body, &client, OnMissing::Continue)
+    // Clone so the assertion below can compare against the pre-move value.
+    sync_state(&mut ctx, resolved_body.clone(), &client, OnMissing::Continue)
         .await
         .unwrap();
 
@@ -571,7 +572,7 @@ async fn sync_state_uses_independent_history_offsets() {
             "content": [{"type": "input_file", "file_data": "SGVsbG8="}]
         }]
     });
-    sync_state(&mut ctx, &resolved_body, &make_client(), OnMissing::Continue)
+    sync_state(&mut ctx, resolved_body, &make_client(), OnMissing::Continue)
         .await
         .unwrap();
 
@@ -753,7 +754,7 @@ async fn sync_state_skipped_without_responses_state() {
     let resolved_body = json!({"model": "gpt-4o", "input": []});
     let client = make_client();
 
-    sync_state(&mut ctx, &resolved_body, &client, OnMissing::Continue)
+    sync_state(&mut ctx, resolved_body, &client, OnMissing::Continue)
         .await
         .unwrap();
 
