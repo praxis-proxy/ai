@@ -22,6 +22,12 @@ see the [Praxis core filter reference][core-ref].
 | [`anthropic_validate`](anthropic_validate.md) | Validates Anthropic Messages request bodies for proxy-owned JSON envelope requirements. |
 | [`anthropic_web_search`](anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
 
+### Azure
+
+| Filter | Description |
+|--------|-------------|
+| [`azure_to_openai`](azure_to_openai.md) | Transforms requests targeting Azure OpenAI deployments into standard Chat Completions-compatible form and normalizes responses back. |
+
 ### OpenAI
 
 | Filter | Description |

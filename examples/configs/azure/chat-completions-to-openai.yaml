@@ -1,0 +1,43 @@
+# Azure OpenAI to Chat Completions
+#
+# Proxies standard Chat Completions requests to an Azure OpenAI
+# deployment. The `azure_to_openai` filter injects the
+# required `api-version` query parameter, strips the `model` field
+# from the body (Azure uses the deployment name from the URL), and
+# normalizes Azure-specific response fields.
+#
+# Credential injection is handled separately by `azure_ad` or
+# `credential_inject` depending on the authentication method.
+
+listeners:
+  - name: azure-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [azure-transform]
+
+filter_chains:
+  - name: azure-transform
+    filters:
+      - filter: azure_to_openai
+        api_version: "2024-10-21"
+
+      - filter: path_rewrite
+        replace:
+          pattern: "^/v1/chat/completions$"
+          replacement: "/openai/deployments/gpt-4o/chat/completions"
+        conditions:
+          - when:
+              path_prefix: "/v1/chat/completions"
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "azure-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "azure-backend"
+            endpoints:
+              - "my-resource.openai.azure.com:443"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
