@@ -11,8 +11,8 @@
 //!
 //! The converter never buffers a full response: each [`push`](StreamConverter::push)
 //! returns only the bytes for events completed by that chunk. Framing is
-//! isolated in [`framing`] so a future shared SSE codec can replace it without
-//! touching this state machine.
+//! isolated in the `framing` module so a future shared SSE codec can replace
+//! it without touching this state machine.
 
 mod chat;
 mod events;
