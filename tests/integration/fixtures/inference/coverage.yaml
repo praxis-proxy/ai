@@ -129,6 +129,7 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
+      - responses/chat-basic-stream
     providers:
       synthetic:
         status: synthetic_only
@@ -138,6 +139,7 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
+      - responses/chat-basic-stream
     providers:
       synthetic:
         status: synthetic_only

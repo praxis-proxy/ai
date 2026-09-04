@@ -11,18 +11,22 @@
 #   3. openai_response_store initializes the shared response store.
 #   4. openai_responses_rehydrate resolves previous_response_id into the
 #      complete message history required by Chat Completions.
-#   5. responses_to_chat_completions converts the canonical request to
-#      Chat Completions and converts finite JSON responses back to a
-#      Responses resource.
-#   6. path_rewrite changes the upstream endpoint explicitly.
+#   5. openai_stream_events accumulates the translated terminal Responses
+#      resource from the SSE stream so the store can persist streamed turns.
+#   6. responses_to_chat_completions converts the canonical request to
+#      Chat Completions, converts finite JSON responses back to a Responses
+#      resource, and translates streaming Chat Completions SSE into Responses
+#      SSE events incrementally.
+#   7. path_rewrite changes the upstream endpoint explicitly.
 #
-# Response filters run in reverse order. The Chat response is therefore
-# translated into a client-visible Responses resource before
-# openai_response_store decides whether to persist it.
+# Response filters run in reverse order:
 #
-# Streaming Chat Completions SSE is intentionally passed through byte-for-byte
-# by this base filter. Pair this pipeline with the incremental Responses stream
-# converter when that filter is available.
+#   responses_to_chat_completions -> openai_stream_events -> openai_response_store
+#
+# The Chat response (finite or streamed) is therefore translated into a
+# client-visible Responses resource, its terminal resource is accumulated by
+# openai_stream_events, and openai_response_store then decides whether to
+# persist it.
 
 listeners:
   - name: responses-chat-gateway
@@ -49,8 +53,47 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
+      - filter: openai_stream_events
+        # Accumulates every Responses SSE event the converter emits below so the
+        # store can persist streamed turns. Its limits must never be tighter
+        # than the converter's: if this filter aborted a stream the client had
+        # already received, that turn would silently skip persistence.
+        #
+        # - max_events sits at or above the converter's max_stream_events, which
+        #   bounds the converter's TOTAL emitted events (terminal included), so
+        #   an accepted stream never exceeds this event budget.
+        # - max_buffer_bytes must hold the largest single frame the converter can
+        #   emit. The converter refuses to emit any frame larger than its
+        #   max_emitted_sse_frame_bytes, so this buffer is set strictly above that
+        #   ceiling (leaving SSE-framing headroom) so no frame the client receives
+        #   is ever rejected here and dropped from the store.
+        # - timeout_secs is no shorter than the converter's stream_timeout_secs.
+        max_buffer_bytes: 67108864
+        max_events: 200000
+        timeout_secs: 600
+
       - filter: responses_to_chat_completions
-        max_rewritten_body_bytes: 67108864
+        # The converter is the authority on stream bounds and fails closed when
+        # it exceeds them. Keep every limit at or below openai_stream_events'
+        # above so any stream the client receives is always within the
+        # accumulator's capacity and is never silently dropped from the store.
+        #
+        # The size ceilings form a chain, smallest to largest:
+        #   max_rewritten_body_bytes <= max_emitted_sse_frame_bytes
+        #     < accumulator max_buffer_bytes
+        # - max_rewritten_body_bytes bounds the response resource a
+        #   terminal/lifecycle frame carries.
+        # - max_emitted_sse_frame_bytes bounds the COMPLETE encoded frame (resource
+        #   plus SSE framing). Kept at or above max_rewritten_body_bytes so
+        #   legitimate frames are not rejected, and strictly below the
+        #   accumulator's max_buffer_bytes so every emitted frame fits the buffer
+        #   it is reassembled in. A frame that would exceed this ceiling fails
+        #   closed with a minimal response.failed instead of being emitted and
+        #   later dropped downstream.
+        max_rewritten_body_bytes: 33554432
+        max_emitted_sse_frame_bytes: 50331648
+        max_stream_events: 100000
+        stream_timeout_secs: 300
 
       - filter: path_rewrite
         replace:

@@ -106,14 +106,18 @@ fn responses_to_chat_completions_normalizes_finite_provider_error() {
 }
 
 #[test]
-fn responses_to_chat_completions_leaves_sse_for_stream_converter() {
-    let sse = "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
-    let backend = Backend::fixed(sse)
+fn responses_to_chat_completions_translates_streaming_sse() {
+    let chunks = vec![
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n".to_owned(),
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_owned(),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let backend = Backend::chunked(chunks)
         .header("content-type", "text/event-stream")
         .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_test_config(
-        "sse_passthrough",
+        "sse_translation",
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
     );
@@ -121,9 +125,173 @@ fn responses_to_chat_completions_leaves_sse_for_stream_converter() {
     let request = r#"{"model":"gpt-4.1-mini","input":"Hello","stream":true,"store":false}"#;
 
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
+    let body = parse_body(&raw);
 
     assert_eq!(parse_status(&raw), 200);
-    assert_eq!(parse_body(&raw), sse);
+    // The upstream Chat Completions framing never reaches the client.
+    assert!(
+        !body.contains("chat.completion.chunk"),
+        "raw Chat framing leaked: {body}"
+    );
+    assert!(!body.contains("[DONE]"), "raw Chat sentinel leaked: {body}");
+    // The client receives the canonical Responses SSE lifecycle instead.
+    assert!(
+        body.contains("event: response.created\n"),
+        "missing response.created: {body}"
+    );
+    assert!(
+        body.contains("event: response.output_text.delta\n"),
+        "missing output_text.delta: {body}"
+    );
+    assert!(
+        body.contains("event: response.completed\n"),
+        "missing response.completed: {body}"
+    );
+
+    let completed = body
+        .split("\n\n")
+        .find(|frame| frame.starts_with("event: response.completed\n"))
+        .expect("stream should contain a terminal response.completed event");
+    let data = completed
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("data: "))
+        .expect("terminal event should carry a data line");
+    let parsed: serde_json::Value = serde_json::from_str(data).expect("terminal event data should be JSON");
+    assert_eq!(parsed["response"]["status"], "completed");
+    assert_eq!(parsed["response"]["output"][0]["content"][0]["text"], "Hi");
+}
+
+#[test]
+fn responses_to_chat_completions_persists_streaming_terminal_when_stored() {
+    let chunks = vec![
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Stored\"}}]}\n\n".to_owned(),
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_owned(),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let backend = Backend::chunked(chunks)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "sse_store",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = r#"{"model":"gpt-4.1-mini","input":"Hello","stream":true,"store":true}"#;
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
+    assert_eq!(parse_status(&raw), 200);
+    let body = parse_body(&raw);
+
+    // Recover the streamed resource id from the lifecycle event.
+    let created = body
+        .split("\n\n")
+        .find(|frame| frame.starts_with("event: response.created\n"))
+        .expect("stream should contain a response.created event");
+    let data = created
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("data: "))
+        .expect("response.created should carry a data line");
+    let parsed: serde_json::Value = serde_json::from_str(data).expect("created event data should be JSON");
+    let response_id = parsed["response"]["id"]
+        .as_str()
+        .expect("created event should carry a response id")
+        .to_owned();
+
+    // The translated terminal resource must be persisted and retrievable.
+    let (status, stored_body) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    assert_eq!(status, 200, "store=true streaming response must be retrievable");
+    let stored: serde_json::Value = serde_json::from_str(&stored_body).expect("stored response should be JSON");
+    assert_eq!(stored["id"], response_id);
+    assert_eq!(stored["status"], "completed");
+    assert_eq!(stored["output"][0]["content"][0]["text"], "Stored");
+}
+
+#[test]
+fn responses_to_chat_completions_rejects_non_ok_sse_error_stream() {
+    // A non-`200` SSE body is a provider-side error stream in Chat Completions
+    // framing. Forwarding it verbatim would leak that framing to a Responses
+    // client, so the proxy must fail closed rather than pass the stream through.
+    let chunks = vec![
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"boom\"}}]}\n\n".to_owned(),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let backend = Backend::chunked(chunks)
+        .status(500)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "non_ok_sse_error_stream",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = r#"{"model":"gpt-4.1-mini","input":"Hello","stream":true,"store":false}"#;
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
+    let body = parse_body(&raw);
+
+    assert!(
+        parse_status(&raw) >= 500,
+        "a non-200 SSE error stream must fail closed: status {}",
+        parse_status(&raw)
+    );
+    // None of the upstream Chat Completions framing leaks to the client.
+    assert!(
+        !body.contains("chat.completion.chunk"),
+        "raw Chat framing leaked to a Responses client: {body}"
+    );
+    assert!(!body.contains("[DONE]"), "raw Chat sentinel leaked: {body}");
+}
+
+#[test]
+fn responses_to_chat_completions_rejects_sse_for_non_streaming_request() {
+    // The client asked for a finite (`stream:false`) response, so a backend that
+    // replies with an SSE body violates the contract. The proxy must not install
+    // streaming conversion and emit a Responses event stream the client never
+    // requested; it must fail closed with a finite JSON error instead.
+    let chunks = vec![
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n".to_owned(),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let backend = Backend::chunked(chunks)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "sse_for_non_streaming",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = r#"{"model":"gpt-4.1-mini","input":"Hello","stream":false,"store":false}"#;
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
+    let body = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "an SSE body for a non-streaming request must fail closed"
+    );
+    // No translated event stream reaches the client, and none of the upstream
+    // Chat Completions framing leaks either. (The filter emits a finite JSON
+    // error `Rejection`; asserting its exact body belongs at the unit level,
+    // because a response-phase reject after upstream 200 headers is delivered
+    // as a generic gateway error end-to-end.)
+    assert!(
+        !body.contains("event: response."),
+        "streaming events leaked to a non-streaming client: {body}"
+    );
+    assert!(
+        !body.contains("chat.completion.chunk"),
+        "raw Chat framing leaked to a non-streaming client: {body}"
+    );
+    assert!(!body.contains("[DONE]"), "raw Chat sentinel leaked: {body}");
 }
 
 #[test]
@@ -152,7 +320,11 @@ fn responses_to_chat_completions_translates_streaming_request_body() {
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
     let forwarded: serde_json::Value = serde_json::from_str(&backend.body()).expect("backend request should be JSON");
 
-    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "a finite success response cannot satisfy the streaming client representation",
+    );
     assert_eq!(forwarded["stream"], true);
     assert!(forwarded["messages"].is_array());
     assert_eq!(forwarded["messages"][0]["content"], "Hello");

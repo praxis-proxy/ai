@@ -7,11 +7,13 @@ Translates canonical Responses create requests for a Chat Completions backend.
 
 ## Configuration Notes
 
-The filter consumes the classification metadata and `ResponsesState` produced by `openai_responses_format` and `openai_responses_validate`. It converts the enriched request to Chat Completions wire format, converts finite successful Chat responses back to Responses resources, and normalizes finite provider errors while preserving their HTTP status. Chat Completions SSE is left byte-for-byte unchanged for the separate incremental stream converter.
+The filter consumes the classification metadata and `ResponsesState` produced by `openai_responses_format` and `openai_responses_validate`. It converts the enriched request to Chat Completions wire format, converts finite successful Chat responses back to Responses resources, and normalizes finite provider errors while preserving their HTTP status. Streaming Chat Completions SSE responses are translated incrementally into Responses SSE events by an internal state machine that reuses the finite translation builders for the terminal snapshot.
 
 Configure `path_rewrite` after this filter when the upstream endpoint must change from `/v1/responses` to `/v1/chat/completions`.
 
-Requests using `previous_response_id` require `openai_response_store` and `openai_responses_rehydrate` earlier in the request pipeline. The filter fails closed if stored history has not been resolved, preventing a continuation from silently losing prior turns. Chat Completions SSE response conversion is tracked separately in [issue #36](https://github.com/praxis-proxy/ai/issues/36).
+Requests using `previous_response_id` require `openai_response_store` and `openai_responses_rehydrate` earlier in the request pipeline. The filter fails closed if stored history has not been resolved, preventing a continuation from silently losing prior turns.
+
+To emit translated SSE events incrementally, this filter forces the reconciled response body mode to `Stream` for the entire filter chain. The protocol layer reconciles a single chain-wide response body mode with no per-filter provenance, so this downgrade cannot be scoped to one neighbor: it overrides every response filter's `StreamBuffer` requirement, not only `openai_response_store`'s. Only compose response-body filters after this one that tolerate incremental fragments; `openai_stream_events` and `openai_response_store` are compatible because they persist streamed turns from the accumulator, not a buffered body, whereas any other response-body rewriter needing the complete buffered body would instead receive fragments.
 
 ## Examples
 

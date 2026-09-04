@@ -54,6 +54,7 @@ impl Backend {
     /// where each entry becomes a separate chunk.
     pub fn chunked(chunks: Vec<String>) -> ChunkedBackend {
         ChunkedBackend {
+            status: 200,
             chunks,
             headers: Vec::new(),
         }
@@ -138,6 +139,9 @@ impl Backend {
 
 /// A backend that sends a chunked transfer-encoded response.
 pub struct ChunkedBackend {
+    /// Response status code.
+    status: u16,
+
     /// Response body chunks.
     chunks: Vec<String>,
 
@@ -146,6 +150,13 @@ pub struct ChunkedBackend {
 }
 
 impl ChunkedBackend {
+    /// Set the response status code (defaults to `200`).
+    #[must_use]
+    pub fn status(mut self, code: u16) -> Self {
+        self.status = code;
+        self
+    }
+
     /// Add a response header.
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
@@ -159,16 +170,25 @@ impl ChunkedBackend {
     ///
     /// Panics if the server fails to bind.
     pub fn start_with_shutdown(self) -> BackendGuard {
+        let status = self.status;
         let chunks = self.chunks;
         let headers = self.headers;
 
         spawn_tcp_server_with_shutdown(move |mut stream| {
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let _headers = read_until_headers_complete(&mut stream);
+            // Drain the entire request (headers + body) before responding. A
+            // streamed response is written chunk-by-chunk and the connection is
+            // closed at the end; if the request body were left unread in the
+            // kernel receive buffer, that close would surface as a TCP RST,
+            // which can race the proxy's incremental read and truncate the
+            // streamed body. A real upstream drains the request and sends a
+            // graceful FIN, so mirror that here to keep streaming tests stable.
+            let _request = read_full_request(&mut stream);
 
-            let mut resp =
-                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nServer: praxis-test-backend\r\n"
-                    .to_owned();
+            let reason = reason_phrase(status);
+            let mut resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nServer: praxis-test-backend\r\n"
+            );
             for (name, value) in &headers {
                 use std::fmt::Write as _;
                 let _written = write!(resp, "{name}: {value}\r\n");

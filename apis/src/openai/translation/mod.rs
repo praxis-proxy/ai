@@ -1341,6 +1341,12 @@ mod tests {
 
         assert_eq!(mapped["status"], "incomplete");
         assert_eq!(mapped["incomplete_details"], json!({"reason": "max_output_tokens"}));
+        // An incomplete response never completed, so it carries no completion time.
+        assert_eq!(
+            mapped["completed_at"],
+            Value::Null,
+            "an incomplete response must have a null completed_at: {mapped}",
+        );
     }
 
     #[test]

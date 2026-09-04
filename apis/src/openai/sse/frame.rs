@@ -132,6 +132,17 @@ impl SseFrameParser {
         Ok(frames)
     }
 
+    /// Return whether unterminated frame bytes remain buffered at end of stream.
+    ///
+    /// A clean end of stream leaves no pending line, accumulated data, or event
+    /// type; anything else indicates a frame that was cut off mid-flight. A
+    /// dangling `prev_cr` is not incompleteness: a lone trailing CR is a valid
+    /// line terminator (the parser resolves it at the next push or treats it as
+    /// the final line ending), so it does not signal a truncated frame.
+    pub fn has_incomplete_frame(&self) -> bool {
+        !self.line_buf.is_empty() || self.has_data || self.event_type.is_some()
+    }
+
     /// Return the number of bytes currently retained by the parser.
     fn buffered_bytes(&self) -> usize {
         self.line_buf
@@ -719,6 +730,44 @@ mod tests {
         assert!(
             matches!(result, Err(SseParseError::EventLimitExceeded { count: 6, limit: 5 })),
             "current_events at limit should reject the next frame"
+        );
+    }
+
+    #[test]
+    fn has_incomplete_frame_detects_partial_line_at_eof() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        parser.parse_chunk(b"data: hel").unwrap();
+        assert!(parser.has_incomplete_frame(), "partial data line should be pending");
+    }
+
+    #[test]
+    fn has_incomplete_frame_detects_data_without_blank_line() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        parser.parse_chunk(b"data: hello\n").unwrap();
+        assert!(
+            parser.has_incomplete_frame(),
+            "completed data line without a blank line should be pending"
+        );
+    }
+
+    #[test]
+    fn has_incomplete_frame_false_after_complete_frame() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        parser.parse_chunk(b"data: hello\n\n").unwrap();
+        assert!(
+            !parser.has_incomplete_frame(),
+            "a fully terminated frame should leave nothing pending"
+        );
+    }
+
+    #[test]
+    fn has_incomplete_frame_false_after_bare_cr_terminated_frame() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        let frames = parser.parse_chunk(b"data: hello\r\r").unwrap();
+        assert_eq!(frames.len(), 1, "the CR-terminated frame should dispatch");
+        assert!(
+            !parser.has_incomplete_frame(),
+            "a frame terminated by a bare CR blank line is complete, not partial"
         );
     }
 
