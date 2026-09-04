@@ -30,6 +30,17 @@ features:
         status: covered
       vllm:
         status: live_covered
+  - id: messages.streaming.usage
+    scopes:
+      - messages_to_chat_completions
+    status: live_covered
+    scenarios:
+      - messages/basic-stream
+    providers:
+      openai:
+        status: live_covered
+      vllm:
+        status: live_covered
   - id: messages.error.upstream
     scopes:
       - messages_to_chat_completions

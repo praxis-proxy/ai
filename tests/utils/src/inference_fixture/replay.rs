@@ -3651,12 +3651,18 @@ mod tests {
             path: "/v1/chat/completions".to_owned(),
             headers: BTreeMap::from([("content-type".to_owned(), vec!["application/json".to_owned()])]),
             body: RecordedBody::Json {
-                value: json!({
-                    "model": model,
-                    "max_completion_tokens": 64,
-                    "stream": stream,
-                    "messages": [{"role": "user", "content": prompt}],
-                }),
+                value: {
+                    let mut obj = json!({
+                        "model": model,
+                        "max_completion_tokens": 64,
+                        "stream": stream,
+                        "messages": [{"role": "user", "content": prompt}],
+                    });
+                    if stream {
+                        obj["stream_options"] = json!({"include_usage": true});
+                    }
+                    obj
+                },
             },
         }
     }

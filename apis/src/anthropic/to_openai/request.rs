@@ -36,9 +36,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
         chat.insert("max_completion_tokens".to_owned(), max_tokens.clone());
     }
 
-    if let Some(stream) = obj.get("stream") {
-        chat.insert("stream".to_owned(), stream.clone());
-    }
+    convert_stream(&mut chat, obj);
 
     map_parameters(&mut chat, obj);
     convert_tools(&mut chat, obj);
@@ -497,6 +495,24 @@ fn non_empty_lines(lines: &[String]) -> Option<String> {
 // -----------------------------------------------------------------------------
 // Parameter Mapping
 // -----------------------------------------------------------------------------
+
+/// Copy `stream` and request streaming usage when enabled.
+fn convert_stream(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
+    let Some(stream) = obj.get("stream") else {
+        return;
+    };
+    chat.insert("stream".to_owned(), stream.clone());
+
+    if stream.as_bool() == Some(true) {
+        let mut opts = obj
+            .get("stream_options")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        opts.insert("include_usage".to_owned(), Value::Bool(true));
+        chat.insert("stream_options".to_owned(), Value::Object(opts));
+    }
+}
 
 /// Map Anthropic parameters to Chat Completions-compatible equivalents.
 ///
@@ -1236,5 +1252,43 @@ mod tests {
         let tools = parsed["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1, "only non-filtered tools should remain");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn streaming_request_includes_usage_option() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["stream"], true, "stream should be true");
+        assert_eq!(
+            parsed["stream_options"]["include_usage"], true,
+            "stream_options.include_usage should be set"
+        );
+    }
+
+    #[test]
+    fn non_streaming_request_omits_stream_options() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "stream_options should not be present without stream:true"
+        );
+    }
+
+    #[test]
+    fn stream_false_omits_stream_options() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["stream"], false, "stream should be false");
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "stream_options should not be present when stream is false"
+        );
     }
 }
