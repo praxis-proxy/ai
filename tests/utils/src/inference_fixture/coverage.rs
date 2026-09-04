@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Coverage-manifest loading and inference fixture discovery.
 
 use std::{
@@ -1489,7 +1492,11 @@ mod tests {
             &stream,
             "messages/basic-stream",
             "Minimal streaming Anthropic Messages request translated to Chat Completions.",
-            &["messages.request.minimal", "messages.response.text", "messages.streaming.usage"],
+            &[
+                "messages.request.minimal",
+                "messages.response.text",
+                "messages.streaming.usage",
+            ],
             "Say hello in one sentence.",
             true,
             BodyKind::Sse,
@@ -1513,6 +1520,32 @@ mod tests {
             false,
             BodyKind::Json,
             429,
+            &[],
+        );
+        let malformed_success =
+            InferenceScenario::load(&root.join("scenarios/messages/malformed-success.yaml")).unwrap();
+        assert_scenario(
+            &malformed_success,
+            "messages/malformed-success",
+            "Malformed Chat Completions success converted to an Anthropic API error envelope.",
+            &["messages.error.malformed_success"],
+            "What is 2+2? Reply with just the number.",
+            false,
+            BodyKind::Json,
+            200,
+            &[],
+        );
+        let malformed_tool_arguments =
+            InferenceScenario::load(&root.join("scenarios/messages/malformed-tool-arguments.yaml")).unwrap();
+        assert_scenario(
+            &malformed_tool_arguments,
+            "messages/malformed-tool-arguments",
+            "Malformed Chat Completions tool arguments convert to an Anthropic API error envelope instead of a fabricated tool_use.",
+            &["messages.response.malformed_tool_arguments"],
+            "Use the weather tool.",
+            false,
+            BodyKind::Json,
+            200,
             &[],
         );
 

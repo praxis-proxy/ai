@@ -28,6 +28,8 @@ The manifest declares **19 features** across **5 scopes**, linked to **17 scenar
 | `messages_to_chat_completions` | `messages.response.text` | `live_covered` | `messages/basic-nonstream`<br>`messages/basic-stream` | `openai`: `covered`<br>`vllm`: `live_covered` |
 | `messages_to_chat_completions` | `messages.streaming.usage` | `live_covered` | `messages/basic-stream` | `openai`: `live_covered`<br>`vllm`: `live_covered` |
 | `messages_to_chat_completions` | `messages.error.upstream` | `synthetic_only` | `messages/upstream-error` | `synthetic`: `synthetic_only` |
+| `messages_to_chat_completions` | `messages.error.malformed_success` | `synthetic_only` | `messages/malformed-success` | `synthetic`: `synthetic_only` |
+| `messages_to_chat_completions` | `messages.response.malformed_tool_arguments` | `synthetic_only` | `messages/malformed-tool-arguments` | `synthetic`: `synthetic_only` |
 | `messages_native_passthrough` | `messages.native.request` | `live_covered` | `messages/native-basic-nonstream`<br>`messages/native-basic-stream`<br>`messages/native-tool-use` | `anthropic`: `live_covered` |
 | `messages_native_passthrough` | `messages.native.response.text` | `live_covered` | `messages/native-basic-nonstream`<br>`messages/native-basic-stream` | `anthropic`: `live_covered` |
 | `messages_native_passthrough` | `messages.native.tool_use` | `live_covered` | `messages/native-tool-use` | `anthropic`: `live_covered` |

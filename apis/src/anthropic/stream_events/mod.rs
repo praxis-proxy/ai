@@ -511,6 +511,12 @@ fn transform_chunk(
         }
     }
 
+    extract_usage_tokens(ctx, chunk);
+    Ok(())
+}
+
+/// Extract token usage from a chunk and store in filter metadata.
+fn extract_usage_tokens(ctx: &mut HttpFilterContext<'_>, chunk: &Value) {
     if let Some(usage) = chunk.get("usage") {
         if let Some(ot) = usage.get("completion_tokens").and_then(Value::as_u64) {
             ctx.set_metadata(OUTPUT_TOKENS_KEY, ot.to_string());
@@ -526,8 +532,6 @@ fn transform_chunk(
             ctx.set_metadata(CACHE_READ_TOKENS_KEY, ct.to_string());
         }
     }
-
-    Ok(())
 }
 
 /// Emit the initial `message_start` event and mark the stream as started.
