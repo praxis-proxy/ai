@@ -1312,6 +1312,26 @@ fn is_supported_function_call(tool_call: &Value) -> bool {
             })
 }
 
+/// Build an `in_progress` `Responses` resource snapshot for streaming lifecycle events.
+///
+/// Produces the same resource shape as the finite translation but with an empty
+/// output list, null usage, and `in_progress` status, matching the snapshot
+/// carried by `response.created` and `response.in_progress` streaming events.
+pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Value {
+    let service_tier = context
+        .service_tier
+        .cloned()
+        .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()));
+    let parts = ResponseResourceParts {
+        status: "in_progress",
+        incomplete_details: &Value::Null,
+        output: Vec::new(),
+        usage: &Value::Null,
+        service_tier: &service_tier,
+    };
+    response_resource(context, parts)
+}
+
 /// Values that vary between response resource snapshots.
 #[derive(Debug)]
 struct ResponseResourceParts<'a> {
@@ -1448,11 +1468,16 @@ fn max_tool_calls_value(context: &ResponseContext<'_>) -> Value {
 }
 
 /// Build the `completed_at` response field.
+///
+/// Only a `completed` response carries a completion timestamp. Every other
+/// status — `in_progress`, `incomplete`, `failed`, `cancelled` — has no
+/// completion moment, so `completed_at` is null, matching the OpenAI Responses
+/// schema where the field is populated only when the response actually completed.
 fn completed_at_value(status: &str, context: &ResponseContext<'_>) -> Value {
-    if status == "in_progress" {
-        Value::Null
-    } else {
+    if status == "completed" {
         Value::Number(context.completed_at.unwrap_or(context.created_at).into())
+    } else {
+        Value::Null
     }
 }
 
@@ -1548,12 +1573,12 @@ fn append_message_output(
 }
 
 /// Build a stable assistant message output item id.
-fn message_item_id(context: &ResponseContext<'_>) -> String {
+pub(crate) fn message_item_id(context: &ResponseContext<'_>) -> String {
     format!("msg_{}", context.response_id)
 }
 
 /// Build a schema-complete `Responses` assistant message item.
-fn message_output_item(context: &ResponseContext<'_>, status: &str, content: Vec<Value>) -> Value {
+pub(crate) fn message_output_item(context: &ResponseContext<'_>, status: &str, content: Vec<Value>) -> Value {
     json!({
         "id": message_item_id(context),
         "type": "message",
@@ -1610,7 +1635,7 @@ fn output_text_items_from_parts(parts: &[Value], logprobs: &[Value]) -> Vec<Valu
 }
 
 /// Build a single schema-complete `Responses` output text item.
-fn output_text_item(text: &str, logprobs: &[Value]) -> Value {
+pub(crate) fn output_text_item(text: &str, logprobs: &[Value]) -> Value {
     json!({
         "type": "output_text",
         "text": text,
@@ -1620,7 +1645,7 @@ fn output_text_item(text: &str, logprobs: &[Value]) -> Value {
 }
 
 /// Build a single `Responses` refusal content item.
-fn refusal_item(refusal: &str) -> Value {
+pub(crate) fn refusal_item(refusal: &str) -> Value {
     json!({
         "type": "refusal",
         "refusal": refusal
@@ -1742,7 +1767,7 @@ fn function_call_output_item(tool_call: &Value, status: &str) -> Value {
 }
 
 /// Build one `Responses` function call item from normalized parts.
-fn function_call_output_item_from_parts(call_id: &str, name: &str, arguments: &str, status: &str) -> Value {
+pub(crate) fn function_call_output_item_from_parts(call_id: &str, name: &str, arguments: &str, status: &str) -> Value {
     json!({
         "id": format!("fc_{call_id}"),
         "type": "function_call",
