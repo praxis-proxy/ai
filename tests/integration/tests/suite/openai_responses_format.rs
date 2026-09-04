@@ -5,8 +5,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    free_port, http_send, json_post, parse_body, parse_status, start_backend_with_shutdown, start_echo_backend,
-    start_header_echo_backend, start_proxy,
+    free_port, http_send, json_post, parse_body, parse_header, parse_status, start_backend_with_shutdown,
+    start_echo_backend, start_header_echo_backend, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -673,6 +673,148 @@ fn large_body_over_64k_classified_and_forwarded() {
     assert_eq!(parse_status(&raw), 200, "large body should return 200");
     let echoed = parse_body(&raw);
     assert_eq!(echoed, body, "large body should be byte-for-byte unchanged");
+}
+
+// -----------------------------------------------------------------------------
+// Error Formatter Integration Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn proxy_failure_formats_openai_error_for_responses() {
+    let dead_port = free_port();
+    let proxy_port = free_port();
+
+    let yaml = echo_yaml(proxy_port, dead_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1-mini","input":"Hello, world!"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "proxy failure on unreachable upstream should return 502"
+    );
+    assert_eq!(
+        parse_header(&raw, "content-type").as_deref(),
+        Some("application/json"),
+        "Content-Type should be application/json"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("response body should be valid JSON");
+    assert_eq!(
+        parsed["error"]["type"], "server_error",
+        "OpenAI error type should be server_error for 502"
+    );
+    assert!(parsed["error"]["param"].is_null(), "param should be null");
+    assert!(
+        parsed["error"]["message"].is_string(),
+        "error message should be a string"
+    );
+    assert!(parsed["error"]["code"].is_string(), "error code should be a string");
+}
+
+#[test]
+fn proxy_failure_formats_openai_error_for_chat_completions() {
+    let dead_port = free_port();
+    let proxy_port = free_port();
+
+    let yaml = echo_yaml(proxy_port, dead_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "proxy failure on unreachable upstream should return 502"
+    );
+    assert_eq!(
+        parse_header(&raw, "content-type").as_deref(),
+        Some("application/json"),
+        "Content-Type should be application/json"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("response body should be valid JSON");
+    assert_eq!(
+        parsed["error"]["type"], "server_error",
+        "OpenAI error type should be server_error for 502"
+    );
+    assert!(parsed["error"]["param"].is_null(), "param should be null");
+    assert!(
+        parsed["error"]["message"].is_string(),
+        "error message should be a string"
+    );
+    assert!(parsed["error"]["code"].is_string(), "error code should be a string");
+}
+
+#[test]
+fn proxy_failure_formats_openai_error_for_responses_subresource() {
+    let dead_port = free_port();
+    let proxy_port = free_port();
+
+    let yaml = echo_yaml(proxy_port, dead_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let request = format!(
+        "GET /v1/responses/resp_123 HTTP/1.1\r\n\
+         Host: localhost:{proxy_port}\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "proxy failure on unreachable upstream should return 502"
+    );
+    assert_eq!(
+        parse_header(&raw, "content-type").as_deref(),
+        Some("application/json"),
+        "Content-Type should be application/json"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("response body should be valid JSON");
+    assert_eq!(
+        parsed["error"]["type"], "server_error",
+        "OpenAI error type should be server_error for 502"
+    );
+    assert!(parsed["error"]["param"].is_null(), "param should be null");
+}
+
+#[test]
+fn proxy_failure_does_not_format_openai_error_for_unclassified_request() {
+    let dead_port = free_port();
+    let proxy_port = free_port();
+
+    let yaml = continue_yaml(proxy_port, dead_port);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"unrelated_api":"data"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/other/endpoint", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "proxy failure on unreachable upstream should return 502"
+    );
+
+    let body_str = parse_body(&raw);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body_str).expect("proxy error should be valid JSON (RFC 9457)");
+    assert!(
+        parsed.get("error").and_then(|e| e.get("type")).is_none(),
+        "unclassified request should not receive OpenAI formatted error envelope"
+    );
 }
 
 // -----------------------------------------------------------------------------

@@ -97,6 +97,28 @@ unknown_field: true
     assert!(filter.is_err(), "should reject unknown config fields");
 }
 
+#[test]
+fn from_config_rejects_max_body_bytes() {
+    // openai_web_search is a read-only reader that produces no request body,
+    // so it carries no per-filter raw-body cap: raw request size is governed
+    // by the pipeline's body_limits. A stale `max_body_bytes` is a hard error
+    // rather than a silently bypassable knob (the core merges sibling buffer
+    // modes to the larger limit).
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider: brave
+api_key: "test-key"
+max_body_bytes: 1024
+"#,
+    )
+    .unwrap();
+    let filter = WebSearchFilter::from_config(&yaml);
+    assert!(
+        filter.is_err(),
+        "openai_web_search must reject max_body_bytes; raw body size is governed by the pipeline's body_limits"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Filter trait tests
 // -----------------------------------------------------------------------------

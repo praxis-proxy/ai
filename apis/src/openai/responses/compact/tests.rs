@@ -12,6 +12,7 @@ use crate::callout_policy::OnFailure;
 
 fn base_config() -> CompactFilterConfig {
     CompactFilterConfig {
+        allow_private_inference_url: true,
         allow_pre_security_callout: true,
         inference_url: "http://localhost:11434/v1/chat/completions".to_owned(),
         default_model: "gpt-4o-mini".to_owned(),
@@ -60,7 +61,7 @@ fn from_config_missing_pre_security_ack() {
 #[test]
 fn from_config_accepts_pre_security_ack() {
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(
-        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions",
+        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions\nallow_private_inference_url: true",
     )
     .unwrap();
     assert!(
@@ -74,6 +75,14 @@ fn build_config_rejects_empty_inference_url() {
     let mut cfg = base_config();
     cfg.inference_url = String::new();
     assert!(build_config(&cfg).is_err());
+}
+
+#[test]
+fn private_inference_target_requires_explicit_opt_in() {
+    let mut cfg = base_config();
+    cfg.allow_private_inference_url = false;
+    let error = build_config(&cfg).expect_err("loopback inference target must require opt-in");
+    assert!(error.to_string().contains("localhost"), "unexpected error: {error}");
 }
 
 #[test]
@@ -124,9 +133,7 @@ fn build_config_custom_values() {
 #[test]
 fn extract_compaction_config_with_compaction_entry() {
     let cm = Some(json!([{"type": "compaction", "compact_threshold": 50_000}]));
-    let params = extract_compaction_config(&cm);
-    assert!(params.is_some());
-    let params = params.unwrap();
+    let params = extract_compaction_config(&cm).unwrap().unwrap();
     assert_eq!(params.compact_threshold, 50_000);
     assert!(params.compaction_model.is_none());
 }
@@ -138,7 +145,7 @@ fn extract_compaction_config_with_model_override() {
         "compact_threshold": 100_000,
         "compaction_model": "gpt-4o"
     }]));
-    let params = extract_compaction_config(&cm).unwrap();
+    let params = extract_compaction_config(&cm).unwrap().unwrap();
     assert_eq!(params.compact_threshold, 100_000);
     assert_eq!(params.compaction_model.as_deref(), Some("gpt-4o"));
 }
@@ -146,44 +153,69 @@ fn extract_compaction_config_with_model_override() {
 #[test]
 fn extract_compaction_config_no_compaction_entry() {
     let cm = Some(json!([{"type": "truncation", "max_tokens": 4096}]));
-    assert!(extract_compaction_config(&cm).is_none());
+    assert!(extract_compaction_config(&cm).unwrap().is_none());
 }
 
 #[test]
 fn extract_compaction_config_none() {
-    assert!(extract_compaction_config(&None).is_none());
+    assert!(extract_compaction_config(&None).unwrap().is_none());
 }
 
 #[test]
 fn extract_compaction_config_empty_array() {
     let cm = Some(json!([]));
-    assert!(extract_compaction_config(&cm).is_none());
+    assert!(extract_compaction_config(&cm).unwrap().is_none());
 }
 
 #[test]
-fn extract_compaction_config_missing_threshold_skips_compaction() {
+fn extract_compaction_config_missing_threshold_returns_error() {
     let cm = Some(json!([{"type": "compaction"}]));
-    assert!(
-        extract_compaction_config(&cm).is_none(),
-        "missing threshold should skip compaction"
-    );
+    let err = extract_compaction_config(&cm).unwrap_err();
+    assert!(err.contains("compact_threshold"));
 }
 
 #[test]
-fn extract_compaction_config_null_threshold_skips_compaction() {
+fn extract_compaction_config_null_threshold_returns_error() {
     let cm = Some(json!([{"type": "compaction", "compact_threshold": null}]));
-    assert!(
-        extract_compaction_config(&cm).is_none(),
-        "null threshold should skip compaction"
-    );
+    let err = extract_compaction_config(&cm).unwrap_err();
+    assert!(err.contains("compact_threshold"));
 }
 
 #[test]
-fn extract_compaction_config_zero_threshold_compacts_immediately() {
-    let cm = Some(json!([{"type": "compaction", "compact_threshold": 0}]));
-    let params = extract_compaction_config(&cm).unwrap();
-    assert_eq!(params.compact_threshold, 0, "explicit zero should still compact");
+fn extract_compaction_config_float_threshold_returns_error() {
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": 0.9}]));
+    let err = extract_compaction_config(&cm).unwrap_err();
+    assert!(err.contains("compact_threshold"));
 }
+
+#[test]
+fn extract_compaction_config_string_threshold_returns_error() {
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": "1000"}]));
+    let err = extract_compaction_config(&cm).unwrap_err();
+    assert!(err.contains("compact_threshold"));
+}
+
+#[test]
+fn extract_compaction_config_threshold_below_minimum_returns_error() {
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": 999}]));
+    let err = extract_compaction_config(&cm).unwrap_err();
+    assert!(err.contains("at least 1000"));
+}
+
+#[test]
+fn extract_compaction_config_minimum_threshold_succeeds() {
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": 1000}]));
+    let params = extract_compaction_config(&cm).unwrap().unwrap();
+    assert_eq!(params.compact_threshold, 1000);
+}
+
+#[test]
+fn extract_compaction_config_non_string_model_returns_error() {
+    let cm = Some(json!([{"type": "compaction", "compact_threshold": 5000, "compaction_model": 42}]));
+    let err = extract_compaction_config(&cm).unwrap_err();
+    assert!(err.contains("compaction_model"));
+}
+
 
 // =============================================================================
 // build_compaction_item tests
@@ -469,7 +501,7 @@ fn conversation_text_skips_empty_compaction_summary() {
 
 fn make_filter(on_failure: &str) -> CompactFilter {
     let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
-        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions\non_failure: {on_failure}"
+        "allow_pre_security_callout: true\ninference_url: http://localhost/v1/chat/completions\nallow_private_inference_url: true\non_failure: {on_failure}"
     ))
     .unwrap();
     let cfg: CompactFilterConfig = serde_yaml::from_value(yaml).unwrap();
@@ -619,15 +651,15 @@ fn overhead_tokens_count_with_get_token_count() {
 
 #[test]
 fn should_compact_accounts_for_overhead() {
-    let long_instructions = "x".repeat(5000);
+    let long_instructions = "word ".repeat(1500);
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4o",
         "input": "Hello",
         "instructions": long_instructions,
-        "context_management": [{"type": "compaction", "compact_threshold": 50}]
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
     }));
     state.messages = vec![json!({"role": "user", "content": "Hi"})];
-    let result = should_compact(&state, "cl100k_base");
+    let result = should_compact(&state, "cl100k_base").unwrap();
     assert!(
         result.is_some(),
         "overhead from long instructions should push total above threshold"

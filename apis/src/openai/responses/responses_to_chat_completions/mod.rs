@@ -23,7 +23,8 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -32,6 +33,7 @@ use self::{
     error::normalize_provider_error,
 };
 use super::{
+    body_limits::reject_rewritten_body_too_large,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
 };
@@ -90,7 +92,7 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 ///
 /// ```yaml
 /// filter: responses_to_chat_completions
-/// max_body_bytes: 67108864
+/// max_rewritten_body_bytes: 67108864
 /// ```
 pub struct ResponsesToChatCompletionsFilter {
     /// Parsed and validated body limits.
@@ -127,18 +129,17 @@ impl ResponsesToChatCompletionsFilter {
         };
         let serialized = serde_json::to_vec(&translated)
             .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
-        if serialized.len() > self.config.max_body_bytes {
+        if serialized.len() > self.config.max_rewritten_body_bytes {
             debug!(
                 body_bytes = serialized.len(),
-                max_bytes = self.config.max_body_bytes,
+                max_bytes = self.config.max_rewritten_body_bytes,
                 "translated request body exceeds maximum size"
             );
-            return Ok(Err(FilterAction::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
-                "request body exceeds maximum size",
+            return Ok(Err(reject_rewritten_body_too_large(
+                serialized.len(),
+                self.config.max_rewritten_body_bytes,
                 streaming,
-            ))));
+            )));
         }
         Ok(Ok(serialized))
     }
@@ -151,7 +152,7 @@ impl ResponsesToChatCompletionsFilter {
     ) -> Result<(), FilterError> {
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
             Some(RESPONSE_TRANSFORM_ERROR) => {
-                transform_provider_error(ctx, body, self.config.max_body_bytes)?;
+                transform_provider_error(ctx, body, self.config.max_rewritten_body_bytes)?;
                 Ok(())
             },
             Some(RESPONSE_TRANSFORM_SUCCESS) => self.transform_success_response(ctx, body),
@@ -166,14 +167,14 @@ impl ResponsesToChatCompletionsFilter {
         body: &mut Option<Bytes>,
     ) -> Result<(), FilterError> {
         match translate_success_response(ctx, body.as_deref().unwrap_or_default()) {
-            Ok(translated) if translated.len() <= self.config.max_body_bytes => {
+            Ok(translated) if translated.len() <= self.config.max_rewritten_body_bytes => {
                 *body = Some(translated);
                 Ok(())
             },
             Ok(translated) => {
                 debug!(
                     body_bytes = translated.len(),
-                    max_bytes = self.config.max_body_bytes,
+                    max_bytes = self.config.max_rewritten_body_bytes,
                     "translated response body exceeds maximum size"
                 );
                 Err("responses_to_chat_completions: translated response exceeds maximum size".into())
@@ -197,8 +198,11 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. max_rewritten_body_bytes bounds only
+        // the translated body this filter produces.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -230,8 +234,10 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
 
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
+        // Buffer the finite response up to the absolute ceiling; the
+        // pipeline's body_limits decides the real raw cap.
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         });
         prepare_transformed_response_headers(ctx);
 
@@ -372,16 +378,16 @@ fn captured_response_status(ctx: &HttpFilterContext<'_>) -> Result<http::StatusC
 fn transform_provider_error(
     ctx: &HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
-    max_body_bytes: usize,
+    max_rewritten_body_bytes: usize,
 ) -> Result<(), FilterError> {
     let status = captured_response_status(ctx)?;
     let normalized = normalize_provider_error(status, body.as_deref().unwrap_or_default());
     let mut transformed = responses_error_body(&normalized.code, &normalized.message);
-    if transformed.len() > max_body_bytes {
+    if transformed.len() > max_rewritten_body_bytes {
         let fallback = normalize_provider_error(status, &[]);
         transformed = responses_error_body(&fallback.code, &fallback.message);
     }
-    if transformed.len() > max_body_bytes {
+    if transformed.len() > max_rewritten_body_bytes {
         return Err("responses_to_chat_completions: normalized provider error exceeds maximum size".into());
     }
     *body = Some(transformed);

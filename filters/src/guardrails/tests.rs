@@ -18,6 +18,7 @@ fn nemo_filter(endpoint: &str) -> Box<dyn praxis_filter::HttpFilter> {
 provider:
   type: nemo
   endpoint: "{endpoint}"
+  allow_private_endpoint: true
 "#,
     ))
     .unwrap();
@@ -74,6 +75,23 @@ phase:
 
     let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
     assert_eq!(filter.name(), "ai_guardrails");
+}
+
+#[test]
+fn nemo_private_endpoint_requires_explicit_opt_in() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://127.0.0.1:8000/v1/guardrail/checks"
+"#,
+    )
+    .unwrap();
+
+    assert!(
+        AiGuardrailsFilter::from_config(&yaml).is_err(),
+        "loopback NeMo endpoint must require allow_private_endpoint"
+    );
 }
 
 #[test]

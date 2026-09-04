@@ -58,10 +58,16 @@ fn body_access_is_read_write() {
 #[test]
 fn body_mode_is_stream_buffer() {
     let filter = make_filter();
-    assert!(
-        matches!(filter.request_body_mode(), BodyMode::StreamBuffer { .. }),
-        "openai_responses_proxy must use StreamBuffer to receive complete body at EOS"
-    );
+    match filter.request_body_mode() {
+        BodyMode::StreamBuffer { max_bytes } => {
+            assert_eq!(
+                max_bytes,
+                Some(67_108_864),
+                "StreamBuffer should default to the 64 MiB ceiling; the raw cap is governed by body_limits"
+            );
+        },
+        other => panic!("openai_responses_proxy must use StreamBuffer, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -315,7 +321,7 @@ async fn preserves_other_request_fields() {
 
 #[tokio::test]
 async fn rejects_oversized_rebuilt_body_with_413() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 16").unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_rewritten_body_bytes: 16").unwrap();
     let filter = super::ResponsesProxyFilter::from_config(&yaml).unwrap();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -338,7 +344,7 @@ async fn rejects_oversized_rebuilt_body_with_413() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(&action, FilterAction::Reject(r) if r.status == 413),
-        "should reject with 413 when rebuilt body exceeds max_body_bytes"
+        "should reject with 413 when rebuilt body exceeds max_rewritten_body_bytes"
     );
 }
 

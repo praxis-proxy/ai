@@ -48,7 +48,7 @@ fn azure_ad_fails_closed_without_token() {
     // fetch can never acquire a token (deterministic fail-closed).
     let patched = patched.replace(
         "        client_secret_env_var: AZURE_CLIENT_SECRET",
-        "        client_secret_env_var: CARGO_PKG_NAME\n        authority_host: 127.0.0.1:1",
+        "        client_secret_env_var: CARGO_PKG_NAME\n        authority_host: 127.0.0.1:1\n        allow_private_authority: true",
     );
     let config =
         praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse azure-ad.yaml: {e}"));

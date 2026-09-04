@@ -1,0 +1,92 @@
+# Responses API Body-Size Enforcement
+#
+# Demonstrates how raw request body size is enforced across a chain of
+# OpenAI Responses filters that each buffer the request body.
+#
+# Every body-buffering Responses filter (openai_file_resolve,
+# openai_doc_extract, openai_tool_parse, openai_mcp_tool_resolve,
+# openai_responses_proxy) declares a StreamBuffer body mode with a
+# fixed 64 MiB ceiling. Praxis core merges those per-filter modes per
+# direction, keeping the largest, then clamps the merged mode to the
+# listener's transport ceiling. That transport ceiling — and only that
+# ceiling — bounds the RAW request body:
+#
+#   body_limits.max_request_bytes  ->  raw request transport cap
+#   body_limits.max_response_bytes ->  raw response transport cap
+#
+# Individual filters no longer carry a `max_body_bytes` knob for the raw
+# body. Filters that grow the body while rebuilding it (file resolution
+# inlining file_data, MCP tool expansion, proxy rebuild) enforce their
+# own `max_rewritten_body_bytes` / `max_resolved_bytes` semantic limits
+# on the REWRITTEN body, independent of the raw transport cap.
+#
+# Here max_request_bytes is deliberately small (1 KiB) so the transport
+# cap is easy to observe: a small Responses create request is accepted
+# and forwarded to the inference backend, while a request whose raw body
+# exceeds 1 KiB is rejected with 413 before any filter processes it.
+#
+# Example requests:
+#
+#   # Accepted — raw body under the 1 KiB transport cap
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
+#
+#   # Rejected with 413 — raw body over the 1 KiB transport cap
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"<a few KiB of text>"}'
+#
+# Security: StreamBuffer body callouts run before this listener's
+# header-phase filters. Deploy this example behind an outer
+# authentication and authorization boundary before enabling the
+# required allow_pre_security_callout acknowledgements below.
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+body_limits:
+  max_request_bytes: 1024
+  max_response_bytes: 1048576
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-body-limits]
+
+filter_chains:
+  - name: responses-body-limits
+    filters:
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:9999"
+        allow_private_files_api_url: true
+        allow_pre_security_callout: true
+
+      - filter: openai_doc_extract
+        allow_pre_security_callout: true
+        on_unsupported: continue
+
+      - filter: openai_tool_parse
+
+      - filter: openai_mcp_tool_resolve
+
+      - filter: openai_responses_proxy
+
+      - filter: router
+        routes:
+          - path_prefix: "/v1/responses"
+            cluster: "inference-backend"
+          - path_prefix: "/"
+            cluster: "default-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "default-backend"
+            endpoints:
+              - "127.0.0.1:3002"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

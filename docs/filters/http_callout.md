@@ -17,7 +17,7 @@ Makes an outbound HTTP request during request processing, optionally forwarding 
 |-------|------|---------|-------------|
 | `target` | TargetConfig | yes | Callout target configuration. |
 | `target.url` | string | yes | Absolute HTTP(S) URL to call. |
-| `target.allow_private_addresses` | bool | no | Allow the target to resolve to a private, loopback, or link-local address. Defaults to `true`, which preserves the permissive behavior of pointing a callout at a loopback/sidecar guard service (only a warning is emitted). Set to `false` to harden against SSRF and DNS-rebinding: the callout is then rejected at request time if the resolved peer address is private/loopback/link-local — including a hostname that resolves to such an address (e.g. cloud metadata at `169.254.169.254`). |
+| `target.allow_private_addresses` | bool | no | Allow the target to resolve to a private, loopback, or link-local address. Defaults to `false`. Set to `true` explicitly when a trusted loopback/sidecar or private service is the intended destination. When disabled, the callout is rejected at request time if any resolved peer address is private/loopback/link-local — including a hostname that resolves to such an address (e.g. cloud metadata at `169.254.169.254`). |
 | `target.timeout` | Duration | no | Request timeout (e.g. `"2s"`, `"500ms"`). |
 | `target.headers` | HeaderEntry[] | no | Static headers to send with every callout. |
 | `target.headers[].name` | string | yes | Header name. |
@@ -33,7 +33,7 @@ Makes an outbound HTTP request during request processing, optionally forwarding 
 | `response.extract[].result_key` | string | yes | Key to write the result under in [`FilterResultSet`]. |
 | `response.inject_headers` | string[] | no | Callout response headers to inject into the upstream request on success. |
 | `on_failure` | `closed` \| `open` | no | Behavior when the callout itself fails (DNS, connect, timeout, I/O): `open` continues the request, `closed` rejects it. Note: this is distinct from the pipeline entry's own `failure_mode` key, which governs how the pipeline reacts when a filter returns an error. Core strips `failure_mode` as a structural key before this config is parsed, so it cannot be used as an alias here. |
-| `status_on_error` | integer | no | HTTP status code returned when rejecting on failure. |
+| `status_on_error` | integer | no | HTTP error status code (`400..=599`) to return when rejecting on error. |
 | `circuit_breaker` | CircuitBreakerConfig | no | Circuit breaker configuration. |
 | `circuit_breaker.failure_threshold` | integer | yes | Consecutive failures to trip the breaker. |
 | `circuit_breaker.recovery_timeout` | Duration | yes | Recovery window (e.g. `"30s"`). |

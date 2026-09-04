@@ -27,7 +27,6 @@ fn full_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 on_invalid: reject
-max_body_bytes: 65536
 headers:
   format: x-custom-format
   model: x-custom-model
@@ -66,20 +65,13 @@ fn deny_unknown_fields_rejects_typo() {
 }
 
 #[test]
-fn zero_max_body_bytes_rejected() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 0").unwrap();
+fn legacy_max_body_bytes_rejected() {
+    // The classifier no longer carries a body-size knob; the raw cap is
+    // governed by the pipeline's body_limits. The removed field must be
+    // rejected rather than silently ignored.
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 65536").unwrap();
     let result = ResponsesFormatFilter::from_config(&yaml);
-    assert!(result.is_err(), "zero max_body_bytes should be rejected");
-}
-
-#[test]
-fn rejects_max_body_bytes_above_ceiling() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 67108865").unwrap();
-    let result = ResponsesFormatFilter::from_config(&yaml);
-    assert!(
-        result.is_err(),
-        "max_body_bytes above 64 MiB ceiling should be rejected"
-    );
+    assert!(result.is_err(), "legacy max_body_bytes should be rejected");
 }
 
 #[test]
@@ -150,8 +142,8 @@ fn body_mode_is_stream_buffer() {
         BodyMode::StreamBuffer { max_bytes } => {
             assert_eq!(
                 max_bytes,
-                Some(10_485_760),
-                "StreamBuffer should default to a bounded 10 MiB limit"
+                Some(67_108_864),
+                "StreamBuffer accepts up to the absolute 64 MiB ceiling; body_limits governs the raw cap"
             );
         },
         other => panic!("expected StreamBuffer, got {other:?}"),
@@ -533,6 +525,11 @@ async fn get_v1_responses_with_id_classifies_as_responses() {
         Some("openai_responses"),
         "GET /v1/responses/{{id}} should classify as responses"
     );
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+        "openai error response formatter should be installed for responses path"
+    );
 }
 
 #[tokio::test]
@@ -872,6 +869,11 @@ async fn get_responses_without_websocket_headers_classifies_body_normally() {
         Some("non_json"),
         "an ordinary GET list request must not be promoted as a WebSocket handshake"
     );
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_none(),
+        "openai error response formatter should not be installed for non-json"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -975,6 +977,11 @@ async fn mode_not_set_for_chat_completions() {
     assert!(
         !headers.contains_key("x-praxis-responses-mode"),
         "mode header absent for chat_completions"
+    );
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+        "openai error response formatter should be installed for chat completions"
     );
 }
 

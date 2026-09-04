@@ -13,7 +13,6 @@
 //! `StreamBuffer` pre-read makes these body-derived facts available
 //! before branch evaluation.
 
-mod config;
 pub(crate) mod parser;
 
 #[cfg(test)]
@@ -33,14 +32,12 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, trace};
 
-use self::{
-    config::{ToolParseConfig, build_config},
-    parser::{ParsedTools, parse_tools},
-};
+use self::parser::{ParsedTools, parse_tools};
 use crate::{classifier::is_responses_create, promotion::is_promotable_value};
 
 // -----------------------------------------------------------------------------
@@ -61,25 +58,25 @@ use crate::{classifier::is_responses_create, promotion::is_promotable_value};
 ///
 /// ```yaml
 /// filter: openai_tool_parse
-/// max_body_bytes: 67108864
 /// ```
-pub struct ToolParseFilter {
-    /// Parsed and validated configuration.
-    config: ToolParseConfig,
-}
+///
+/// This filter is a pure reader with no configurable fields. Raw request
+/// body size is governed by the pipeline's `body_limits`, not per-filter.
+#[derive(Default)]
+pub struct ToolParseFilter;
 
 impl ToolParseFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the YAML config is invalid.
+    /// Returns [`FilterError`] if the YAML config contains unknown fields
+    /// (such as a stale `max_body_bytes`).
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ToolParseConfig = parse_filter_config("openai_tool_parse", config)?;
-        let validated = build_config(cfg)?;
-        Ok(Box::new(Self { config: validated }))
+        let _: EmptyFilterConfig = parse_filter_config("openai_tool_parse", config)?;
+        Ok(Box::new(Self))
     }
 }
 
@@ -94,8 +91,10 @@ impl HttpFilter for ToolParseFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real cap.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 

@@ -3467,7 +3467,7 @@ async fn on_response_body_surfaces_item_insert_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_tolerates_message_cache_failure() {
+async fn on_response_body_surfaces_transaction_failure() {
     let filter = build_failing_filter(FailingItemStore {
         fail_create_items: false,
         fail_message_sync: true,
@@ -3488,25 +3488,17 @@ async fn on_response_body_tolerates_message_cache_failure() {
     ctx.response_header = Some(&mut resp);
     drop(filter.on_response(&mut ctx).await.unwrap());
 
-    // Items committed, but the denormalized message-cache refresh failed. The
-    // cache is a self-healing projection of the durable items table, so this is
-    // not data loss: failing the turn would drive a client retry that re-appends
-    // the same items as duplicates. The turn must succeed (Continue); the cache
-    // re-syncs on a later successful cache-refresh/sync attempt — a later append is
-    // not sufficient, since its own refresh may also fail (#837, durability boundary).
+    // Item insertion and message-cache rebuild are one transaction. A failure in
+    // either part must be surfaced so the fail-closed pipeline can withhold the
+    // response body rather than report a success whose conversation state was not
+    // durably persisted.
     let response_json = serde_json::json!({
         "status": "completed",
         "output": [{"type": "message", "role": "assistant", "content": "hi from model"}]
     });
     let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
-    let action = filter
-        .on_response_body(&mut ctx, &mut body, true)
-        .expect("message-cache refresh failure must not fail the turn");
-
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "message-cache refresh failure must be tolerated (Continue), not surfaced as an error"
-    );
+    let result = filter.on_response_body(&mut ctx, &mut body, true);
+    assert!(result.is_err(), "transactional item/cache failure must propagate");
 }
 
 #[test]
@@ -3637,7 +3629,7 @@ fn build_failing_filter(store: FailingItemStore) -> OpenaiConversationsFilter {
 struct FailingItemStore {
     /// Force `create_conversation_items` to return a database error.
     fail_create_items: bool,
-    /// Force the message-cache sync (`update_conversation_messages`) to error.
+    /// Force the transactional item/cache operation to error.
     fail_message_sync: bool,
 }
 
@@ -3684,6 +3676,21 @@ impl ConversationItemStore for FailingItemStore {
     async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
         if self.fail_create_items {
             return Err(StoreError::Database("mock item insert failure".to_owned()));
+        }
+        Ok(())
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        if self.fail_create_items {
+            return Err(StoreError::Database("mock item insert failure".to_owned()));
+        }
+        if self.fail_message_sync {
+            return Err(StoreError::Database("mock message sync failure".to_owned()));
         }
         Ok(())
     }
@@ -3737,6 +3744,15 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn max_item_position(&self, _tenant_id: &str, _conversation_id: &str) -> Result<i64, StoreError> {
         Ok(0)
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
     }
 }
 

@@ -12,14 +12,12 @@
 #   api_key:              Provider API key (supports ${ENV_VAR} syntax)
 #   default_context_size: How many results to return (low/medium/high)
 #   timeout_ms:           Callout timeout in milliseconds
-#   base_url:             Override the provider API base URL. Must be a
-#                         public IP literal unless allow_private_base_url
-#                         is set (SSRF/credential-disclosure guard).
+#   base_url:             Override the provider API base URL. DNS is pinned
+#                         and all resolved addresses must be public by default.
 #   allow_private_base_url: Permit base_url targets on local-sensitive
-#                         addresses and DNS names (default false). DNS
-#                         targets are unsupported in protected mode;
-#                         enabling this also permits DNS results resolving
-#                         to local-sensitive addresses.
+#                         addresses (default false). Enable only for a trusted
+#                         private provider. The configured api_key is sent only
+#                         to this validated origin; redirects are not followed.
 
 listeners:
   - name: ai-gateway

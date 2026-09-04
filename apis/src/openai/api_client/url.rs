@@ -9,17 +9,13 @@
 //! Each filter calls the validation helpers during its own config
 //! validation phase, passing its filter name for error messages.
 
-use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr},
-};
+use std::collections::HashSet;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use praxis_core::connectivity::normalize_mapped_ipv4;
 use praxis_filter::FilterError;
 
 use super::error::ApiClientError;
-use crate::openai::url_security::is_non_public_ip;
+use crate::callout_target::{AddressPolicy, validate_configured_http_target};
 
 /// Characters that could let a client-supplied resource ID escape
 /// its single URL path segment.
@@ -86,143 +82,17 @@ pub(crate) fn resource_url(
 /// Validate a base URL against SSRF-sensitive targets.
 ///
 /// Checks scheme, embedded credentials, query strings, fragments,
-/// and host address. When `allow_private` is `false`, private,
-/// loopback, link-local, CGNAT, and DNS-name hosts are rejected.
+/// and literal host address. DNS names are accepted because the shared
+/// transport validates and pins every resolved address at connect time.
 ///
 /// `filter_name` is used as a prefix in error messages so each
 /// consuming filter reports its own name.
 pub(crate) fn validate_base_url(filter_name: &str, url: &str, allow_private: bool) -> Result<(), FilterError> {
-    if url.contains('#') {
-        return Err(format!("{filter_name}: base URL must not contain a fragment").into());
-    }
-
-    let uri: http::Uri = url.parse().map_err(|e: http::uri::InvalidUri| -> FilterError {
-        format!("{filter_name}: base URL is not valid: {e}").into()
-    })?;
-
-    match uri.scheme_str() {
-        Some("http" | "https") => {},
-        _ => {
-            return Err(format!("{filter_name}: base URL must use http or https scheme").into());
-        },
-    }
-
-    if uri
-        .authority()
-        .is_some_and(|authority| authority.as_str().contains('@'))
-    {
-        return Err(format!("{filter_name}: base URL must not contain embedded credentials").into());
-    }
-
-    if uri.query().is_some() {
+    let parsed = validate_configured_http_target(filter_name, url, AddressPolicy::from_allow_private(allow_private))?;
+    if parsed.query().is_some() {
         return Err(format!("{filter_name}: base URL must not contain a query string").into());
     }
-
-    let host = uri
-        .host()
-        .ok_or_else(|| -> FilterError { format!("{filter_name}: base URL must include a host").into() })?;
-
-    validate_host(filter_name, host, allow_private)
-}
-
-/// Validate a host value against SSRF-sensitive targets.
-fn validate_host(filter_name: &str, host: &str, allow_private: bool) -> Result<(), FilterError> {
-    if !allow_private && is_localhost_name(host) {
-        return Err(format!(
-            "{filter_name}: base URL targets localhost; \
-             set the allow-private option to true to allow"
-        )
-        .into());
-    }
-
-    let ip_host = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(ip) = ip_host.parse::<IpAddr>() {
-        validate_ip(filter_name, ip, allow_private)?;
-    } else if let Some(ip) = parse_legacy_ipv4_host(host) {
-        validate_ip(filter_name, IpAddr::V4(ip), allow_private)?;
-    } else {
-        validate_dns(filter_name, host, allow_private)?;
-    }
-
     Ok(())
-}
-
-/// Validate an IP target against SSRF-sensitive ranges.
-fn validate_ip(filter_name: &str, ip: IpAddr, allow_private: bool) -> Result<(), FilterError> {
-    let ip = normalize_mapped_ipv4(ip);
-    if !allow_private && is_non_public_ip(&ip) {
-        return Err(format!(
-            "{filter_name}: base URL targets a local-sensitive address; \
-             set the allow-private option to true to allow"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Reject DNS hostnames unless private targets are opted in.
-fn validate_dns(filter_name: &str, host: &str, allow_private: bool) -> Result<(), FilterError> {
-    if allow_private {
-        return Ok(());
-    }
-    Err(format!(
-        "{filter_name}: base URL host '{host}' is a DNS name; DNS targets are unsupported in \
-         protected mode. Use a public IP literal, or set the allow-private option to true, which \
-         also permits DNS results resolving to local-sensitive addresses"
-    )
-    .into())
-}
-
-/// Return whether a host name is a localhost alias.
-fn is_localhost_name(host: &str) -> bool {
-    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
-}
-
-/// Parse legacy IPv4 literals accepted by common libc resolvers.
-fn parse_legacy_ipv4_host(host: &str) -> Option<Ipv4Addr> {
-    let host = host.trim_end_matches('.');
-    let parts: Vec<_> = host.split('.').collect();
-    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|part| part.is_empty()) {
-        return None;
-    }
-
-    let mut numbers = Vec::with_capacity(parts.len());
-    for part in parts {
-        numbers.push(parse_legacy_ipv4_number(part)?);
-    }
-
-    let addr = match numbers.as_slice() {
-        [a] => *a,
-        [a, b] if *a <= 0xFF && *b <= 0x00FF_FFFF => (*a << 24) | *b,
-        [a, b, c] if *a <= 0xFF && *b <= 0xFF && *c <= 0xFFFF => (*a << 24) | (*b << 16) | *c,
-        [a, b, c, d] if numbers.iter().all(|part| *part <= 0xFF) => (*a << 24) | (*b << 16) | (*c << 8) | *d,
-        _ => return None,
-    };
-
-    Some(Ipv4Addr::from(addr))
-}
-
-/// Parse a decimal, octal, or hexadecimal legacy IPv4 component.
-fn parse_legacy_ipv4_number(part: &str) -> Option<u32> {
-    let (digits, radix) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")).map_or_else(
-        || {
-            if part.len() > 1 && part.starts_with('0') {
-                (part.get(1..).unwrap_or_default(), 8)
-            } else {
-                (part, 10)
-            }
-        },
-        |digits| (digits, 16),
-    );
-
-    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return None;
-    }
-
-    u32::from_str_radix(digits, radix).ok()
 }
 
 // -----------------------------------------------------------------------------
@@ -409,10 +279,10 @@ mod tests {
     }
 
     #[test]
-    fn ssrf_rejects_dns_name() {
+    fn ssrf_allows_dns_name_for_connect_time_validation() {
         assert!(
-            validate_base_url("test", "http://ogx:8321", false).is_err(),
-            "DNS name should be rejected without allow_private"
+            validate_base_url("test", "http://ogx:8321", false).is_ok(),
+            "DNS names are classified and pinned by the transport at connect time"
         );
     }
 

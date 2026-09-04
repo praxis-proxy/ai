@@ -15,7 +15,6 @@
 #
 # Configuration:
 #   timeout_ms:      Per-call timeout for tools/call (default: 30000)
-#   max_body_bytes:  Maximum response body bytes (default: 64 MiB)
 #   allow_loopback:  Allow MCP servers on 127.0.0.1/localhost
 #                    (default: false)
 

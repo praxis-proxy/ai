@@ -119,15 +119,75 @@ pub(crate) struct WebSearchFilterConfig {
 
     /// Allow a `base_url` that targets local-sensitive addresses.
     ///
-    /// DNS targets are unsupported in protected mode (the default):
-    /// validation cannot pin the address the HTTP client will eventually
-    /// dial, so a `base_url` host must be a public IP literal. Enabling
-    /// `allow_private_base_url` also permits DNS results resolving to
-    /// local-sensitive addresses, so a hostile or rebound resolution can
-    /// send the provider credential to a loopback, private, or
-    /// cloud-metadata endpoint.
+    /// DNS names are resolved once per request and every result is checked
+    /// immediately before the transport connects. By default, any private,
+    /// loopback, link-local, or otherwise non-public result rejects the
+    /// callout. Enable this only for a trusted private provider endpoint.
     #[serde(default)]
     pub(crate) allow_private_base_url: bool,
+}
+
+// -----------------------------------------------------------------------------
+// OpenAiWebSearchConfig (YAML deserialization)
+// -----------------------------------------------------------------------------
+
+// Mirrors `WebSearchFilterConfig` minus `max_body_bytes` and validates through
+// the shared `build_config` via `into_shared`. Keep the remaining fields in
+// sync with `WebSearchFilterConfig`.
+
+/// Reads the request body but never rewrites it, so `openai_web_search`
+/// exposes no `max_body_bytes` knob: raw request body size is governed by the
+/// pipeline's `body_limits`, not a per-filter limit (which praxis core merges
+/// to the largest sibling buffer and would therefore be bypassable).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenAiWebSearchConfig {
+    /// Search backend provider.
+    provider: SearchProvider,
+
+    /// API key for the search provider (supports `${ENV_VAR}`).
+    /// Wrapped in [`SecretString`] to prevent accidental logging.
+    api_key: SecretString,
+
+    /// Default search context size when the client omits it.
+    #[serde(default)]
+    default_context_size: Option<String>,
+
+    /// Callout timeout in milliseconds.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+
+    /// Override the provider's default API base URL.
+    #[serde(default)]
+    base_url: Option<String>,
+
+    /// Allow a `base_url` that targets local-sensitive addresses.
+    ///
+    /// DNS names are resolved once per request and every result is checked
+    /// immediately before the transport connects. By default, any private,
+    /// loopback, link-local, or otherwise non-public result rejects the
+    /// callout. Enable this only for a trusted private provider endpoint.
+    #[serde(default)]
+    allow_private_base_url: bool,
+}
+
+impl OpenAiWebSearchConfig {
+    /// Convert into the shared [`WebSearchFilterConfig`] for validation reuse.
+    ///
+    /// `max_body_bytes` is fixed to `None`: `openai_web_search` defers raw
+    /// request body size to the pipeline's `body_limits` and buffers to the
+    /// absolute JSON ceiling, so it carries no per-filter raw-body cap.
+    pub(crate) fn into_shared(self) -> WebSearchFilterConfig {
+        WebSearchFilterConfig {
+            provider: self.provider,
+            api_key: self.api_key,
+            default_context_size: self.default_context_size,
+            timeout_ms: self.timeout_ms,
+            max_body_bytes: None,
+            base_url: self.base_url,
+            allow_private_base_url: self.allow_private_base_url,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -154,6 +214,9 @@ pub(crate) struct ValidatedConfig {
 
     /// Override the provider's default API base URL.
     pub base_url: Option<String>,
+
+    /// Connect-time private-address policy for the provider target.
+    pub allow_private_base_url: bool,
 }
 
 impl std::fmt::Debug for ValidatedConfig {
@@ -165,6 +228,7 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("base_url", &self.base_url)
+            .field("allow_private_base_url", &self.allow_private_base_url)
             .finish()
     }
 }
@@ -202,6 +266,7 @@ fn build_validated_config(
         timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
         base_url: raw.base_url.clone(),
+        allow_private_base_url: raw.allow_private_base_url,
     })
 }
 
@@ -375,13 +440,10 @@ mod tests {
     }
 
     #[test]
-    fn build_config_rejects_dns_base_url_without_opt_in() {
+    fn build_config_accepts_dns_base_url_for_connect_time_validation() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://internal.search.example:8080".into());
-        assert!(
-            build_config("openai_web_search", &cfg).is_err(),
-            "DNS base_url must be rejected without allow_private_base_url because the dialed address cannot be pinned"
-        );
+        assert!(build_config("openai_web_search", &cfg).is_ok());
     }
 
     #[test]

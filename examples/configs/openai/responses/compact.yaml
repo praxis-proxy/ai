@@ -20,10 +20,10 @@
 #     -d '{"model":"llama3.2:1b","input":"Explain TCP vs UDP in detail"}' \
 #     | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 #
-#   # Step 2 — follow up with compaction (threshold=200 tokens)
+#   # Step 2 — follow up with compaction (threshold=1000 tokens)
 #   curl -s -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
-#     -d "{\"model\":\"llama3.2:1b\",\"input\":\"Compare with QUIC\",\"previous_response_id\":\"$RESP_ID\",\"context_management\":[{\"type\":\"compaction\",\"compact_threshold\":200}],\"store\":false}"
+#     -d "{\"model\":\"llama3.2:1b\",\"input\":\"Compare with QUIC\",\"previous_response_id\":\"$RESP_ID\",\"context_management\":[{\"type\":\"compaction\",\"compact_threshold\":1000}],\"store\":false}"
 
 listeners:
   - name: ai-gateway
@@ -56,8 +56,11 @@ filter_chains:
       - filter: openai_responses_rehydrate
 
       - filter: openai_responses_compact
+        # This direct summarization callout is anonymous; no downstream or
+        # cluster authentication headers are forwarded.
         allow_pre_security_callout: true
         inference_url: "http://localhost:11434/v1/chat/completions"
+        allow_private_inference_url: true
         default_model: llama3.2:1b
         timeout_ms: 60000
 

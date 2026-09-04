@@ -38,6 +38,7 @@ mod openai_mcp_tool_resolve;
 mod openai_prompts_routing;
 mod openai_response_store;
 mod openai_response_store_postgres;
+mod openai_responses_body_size_limits;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;

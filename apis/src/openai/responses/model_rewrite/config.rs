@@ -5,10 +5,7 @@
 
 use std::collections::HashMap;
 
-use praxis_filter::{
-    FilterError, body::DEFAULT_JSON_BODY_MAX_BYTES,
-    builtins::http::payload_processing::config_validation::validate_max_body_bytes,
-};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
@@ -24,7 +21,6 @@ use serde::Deserialize;
 ///   "codex-mini-latest": "llama-3.3-70b"
 ///   "gpt-4.1-*": "qwen-2.5-72b"
 ///   "gpt-4.1-mini": "qwen-2.5-72b"
-/// max_body_bytes: 10485760
 /// on_invalid: continue
 /// headers:
 ///   effective_model: x-praxis-ai-effective-model
@@ -46,10 +42,6 @@ pub(super) struct ModelRewriteConfig {
     #[serde(default)]
     pub headers: ModelRewriteHeaders,
 
-    /// Maximum request body size to buffer before parsing.
-    #[serde(default = "default_max_body_bytes")]
-    pub max_body_bytes: usize,
-
     /// Map from client-facing model names or single-wildcard patterns
     /// to backend model names. Quote wildcard keys in YAML. Exact aliases win
     /// before wildcard aliases; wildcard aliases are matched by literal specificity.
@@ -59,11 +51,6 @@ pub(super) struct ModelRewriteConfig {
     /// Behavior when the body is not valid JSON.
     #[serde(default)]
     pub on_invalid: OnInvalidBehavior,
-}
-
-/// Default for `max_body_bytes`.
-fn default_max_body_bytes() -> usize {
-    DEFAULT_JSON_BODY_MAX_BYTES
 }
 
 // -----------------------------------------------------------------------------
@@ -152,7 +139,6 @@ pub(super) fn validate_config(cfg: &ModelRewriteConfig) -> Result<(), FilterErro
     }
 
     validate_aliases(&cfg.model_aliases)?;
-    validate_max_body_bytes("openai_responses_model_rewrite", cfg.max_body_bytes)?;
     validate_header_name("effective_model", cfg.headers.effective_model.as_deref())?;
     validate_header_name("original_model", cfg.headers.original_model.as_deref())?;
 
@@ -224,7 +210,6 @@ default_model: "llama-3.3-70b"
         .unwrap();
 
         assert_eq!(cfg.default_model.as_deref(), Some("llama-3.3-70b"));
-        assert_eq!(cfg.max_body_bytes, DEFAULT_JSON_BODY_MAX_BYTES);
         assert_eq!(cfg.on_invalid, OnInvalidBehavior::Continue);
         assert!(cfg.model_aliases.is_empty());
     }
@@ -287,7 +272,6 @@ extra: true
         let cfg = ModelRewriteConfig {
             default_model: None,
             headers: ModelRewriteHeaders::default(),
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
             model_aliases: HashMap::new(),
             on_invalid: OnInvalidBehavior::Continue,
         };
@@ -303,7 +287,6 @@ extra: true
         let cfg = ModelRewriteConfig {
             default_model: Some(String::new()),
             headers: ModelRewriteHeaders::default(),
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
             model_aliases: HashMap::new(),
             on_invalid: OnInvalidBehavior::Continue,
         };
@@ -319,7 +302,6 @@ extra: true
         let cfg = ModelRewriteConfig {
             default_model: Some("   ".into()),
             headers: ModelRewriteHeaders::default(),
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
             model_aliases: HashMap::new(),
             on_invalid: OnInvalidBehavior::Continue,
         };
@@ -335,7 +317,6 @@ extra: true
         let cfg = ModelRewriteConfig {
             default_model: Some("llama-3.3-70b".into()),
             headers: ModelRewriteHeaders::default(),
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
             model_aliases: HashMap::new(),
             on_invalid: OnInvalidBehavior::Continue,
         };
@@ -349,7 +330,6 @@ extra: true
         let cfg = ModelRewriteConfig {
             default_model: None,
             headers: ModelRewriteHeaders::default(),
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
             model_aliases: aliases,
             on_invalid: OnInvalidBehavior::Continue,
         };
@@ -363,7 +343,6 @@ extra: true
         let cfg = ModelRewriteConfig {
             default_model: Some("default-model".into()),
             headers: ModelRewriteHeaders::default(),
-            max_body_bytes: DEFAULT_JSON_BODY_MAX_BYTES,
             model_aliases: aliases,
             on_invalid: OnInvalidBehavior::Continue,
         };
@@ -447,24 +426,6 @@ extra: true
     #[test]
     fn validate_header_name_valid_accepted() {
         assert!(validate_header_name("test", Some("x-custom-header")).is_ok());
-    }
-
-    // -- validate_config: max_body_bytes --------------------------------------
-
-    #[test]
-    fn validate_zero_max_body_bytes_rejected() {
-        let cfg = ModelRewriteConfig {
-            default_model: Some("test-model".into()),
-            headers: ModelRewriteHeaders::default(),
-            max_body_bytes: 0,
-            model_aliases: HashMap::new(),
-            on_invalid: OnInvalidBehavior::Continue,
-        };
-        let err = validate_config(&cfg).unwrap_err();
-        assert!(
-            err.to_string().contains("must be greater than 0"),
-            "expected 'must be greater than 0' error, got: {err}"
-        );
     }
 
     // -- null header disables promotion ---------------------------------------
