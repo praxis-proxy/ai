@@ -102,6 +102,9 @@ enum Command {
     /// Refresh or verify the pinned complete OpenAI reference.
     OpenaiConformanceReference(openai_conformance::ReferenceArgs),
 
+    /// Regenerate or verify official Conversation item schemas.
+    OpenaiConversationItemContracts(openai_conformance::ItemContractsArgs),
+
     /// Enforce or acknowledge failures in a generated conformance report.
     OpenaiConformanceGate(openai_conformance_gate::Args),
 
@@ -136,6 +139,7 @@ fn main() {
         Command::LintFilterDocs(args) => filter_docs::lint(args),
         Command::OpenaiConformance(args) => openai_conformance::run(&args),
         Command::OpenaiConformanceReference(args) => openai_conformance::run_reference(&args),
+        Command::OpenaiConversationItemContracts(args) => openai_conformance::run_item_contracts(&args),
         Command::OpenaiConformanceGate(args) => openai_conformance_gate::run(&args),
         Command::RecordInference(args) => inference_fixtures::run_record(args),
         Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),
