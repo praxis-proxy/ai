@@ -1001,7 +1001,7 @@ fn append_message_output(
         return;
     }
 
-    output.push(message_output_item(context, status, &content_items));
+    output.push(message_output_item(context, status, content_items));
 }
 
 /// Build a stable assistant message output item id.
@@ -1010,13 +1010,13 @@ fn message_item_id(context: &ResponseContext<'_>) -> String {
 }
 
 /// Build a schema-complete `Responses` assistant message item.
-fn message_output_item(context: &ResponseContext<'_>, status: &str, content: &[Value]) -> Value {
+fn message_output_item(context: &ResponseContext<'_>, status: &str, content: Vec<Value>) -> Value {
     json!({
         "id": message_item_id(context),
         "type": "message",
         "status": status,
         "role": "assistant",
-        "content": Value::Array(content.to_vec())
+        "content": Value::Array(content)
     })
 }
 

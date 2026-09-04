@@ -201,8 +201,10 @@ fn append_text_content(text: &str, text_parts: &mut Vec<String>, content_parts: 
 fn convert_tool_use_block(block: &Value, tool_calls: &mut Vec<Value>) {
     let id = block.get("id").and_then(Value::as_str).unwrap_or("");
     let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-    let input = block.get("input").cloned().unwrap_or_else(|| Value::Object(Map::new()));
-    let args = serde_json::to_string(&input).unwrap_or_default();
+
+    let empty = Value::Object(Map::new());
+    let input = block.get("input").unwrap_or(&empty);
+    let args = serde_json::to_string(input).unwrap_or_default();
 
     tool_calls.push(json!({
         "id": id,
