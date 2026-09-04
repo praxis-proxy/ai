@@ -200,6 +200,10 @@ fn register_openai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
         @register registry,
         http "openai_conversations" => praxis_ai_apis::openai::OpenaiConversationsFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_operation" => praxis_ai_apis::openai::OpenaiOperationFilter::from_config
+    );
 }
 
 /// Register OpenAI Responses API filters.
