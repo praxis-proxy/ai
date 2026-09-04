@@ -570,16 +570,20 @@ async fn rehydrated_previous_response_id_translates_full_history() {
 
 #[tokio::test]
 async fn translated_request_over_configured_limit_is_rejected() {
-    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 32").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.extensions.insert(ResponsesState::from_request_body(json!({
+    let request_body = json!({
         "model": "gpt-4.1-mini",
-        "input": "hello"
-    })));
-    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+        "input": "x".repeat(1024),
+    });
+    let encoded = serde_json::to_vec(&request_body).unwrap();
+    context
+        .extensions
+        .insert(ResponsesState::from_request_body(request_body));
+    let mut body = Some(Bytes::from(encoded));
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
 
@@ -1378,7 +1382,7 @@ async fn finite_provider_error_uses_captured_status_without_mutable_headers() {
 
 #[tokio::test]
 async fn expanded_provider_error_falls_back_within_configured_limit() {
-    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 150").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -1398,12 +1402,12 @@ async fn expanded_provider_error_falls_back_within_configured_limit() {
     let provider_body = serde_json::to_vec(&json!({
         "error": {
             "code": "invalid_prompt",
-            "message": "x".repeat(80)
+            "message": "x".repeat(950)
         }
     }))
     .unwrap();
     assert!(
-        provider_body.len() <= 150,
+        provider_body.len() <= 1024,
         "the crafted provider error body must fit within the configured limit"
     );
     let mut body = Some(Bytes::from(provider_body));
@@ -1415,7 +1419,7 @@ async fn expanded_provider_error_falls_back_within_configured_limit() {
         "normalizing the provider error must continue"
     );
     assert!(
-        body.as_ref().unwrap().len() <= 150,
+        body.as_ref().unwrap().len() <= 1024,
         "the normalized error body must stay within max_body_bytes"
     );
     let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
@@ -1424,7 +1428,7 @@ async fn expanded_provider_error_falls_back_within_configured_limit() {
 
 #[tokio::test]
 async fn oversized_translated_success_aborts_after_headers_are_sent() {
-    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 512").unwrap();
+    let yaml = serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -1452,7 +1456,7 @@ async fn oversized_translated_success_aborts_after_headers_are_sent() {
         "model": "gpt-4.1-mini",
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": "x".repeat(1_024)},
+            "message": {"role": "assistant", "content": "x".repeat(2_048)},
             "finish_reason": "stop"
         }]
     });

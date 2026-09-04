@@ -1087,17 +1087,28 @@ fn tool_argument_limit_emits_failed() {
 
 #[test]
 fn body_byte_limit_emits_failed() {
+    const MIN_BODY_BYTES: usize = 1024;
+    let chunk = serde_json::to_string(&json!({
+        "id": "c1",
+        "object": "chat.completion.chunk",
+        "model": "gpt-4.1-mini",
+        "choices": [{
+            "index": 0,
+            "delta": {"content": "x".repeat(MIN_BODY_BYTES + 1)}
+        }]
+    }))
+    .expect("test chunk should serialize");
     let limits = StreamLimits {
-        max_body_bytes: 3,
+        max_body_bytes: MIN_BODY_BYTES,
         ..wide_limits()
     };
-    let events = run_stream(
-        &[
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"way too long"}}]}"#,
-        ],
-        limits,
-    );
+    let events = run_stream(&[&chunk], limits);
     assert_eq!(events.last().unwrap().0, "response.failed");
+    let resource = &events.last().unwrap().1["response"];
+    assert!(
+        serde_json::to_vec(resource).unwrap().len() <= MIN_BODY_BYTES,
+        "the minimal failed resource must fit the minimum configured body ceiling",
+    );
 }
 
 #[test]

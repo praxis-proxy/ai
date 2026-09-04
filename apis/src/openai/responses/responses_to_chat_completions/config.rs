@@ -68,6 +68,15 @@ const DEFAULT_MAX_EMITTED_SSE_FRAME_BYTES: usize = ACCUMULATOR_DEFAULT_BUFFER_BY
 /// to spare while still permitting tight per-frame ceilings for small responses.
 const MIN_MAX_EMITTED_SSE_FRAME_BYTES: usize = 4096;
 
+/// Minimum accepted value for `max_rewritten_body_bytes`.
+///
+/// A streaming size-limit failure must still emit a schema-complete
+/// `response.failed` resource. That constant-bounded resource is well under
+/// 1 `KiB`; accepting a smaller ceiling would make the filter exceed its own
+/// translated-body limit on the fail-closed path. Reject such configurations
+/// up front while retaining a tight, useful lower bound.
+const MIN_MAX_REWRITTEN_BODY_BYTES: usize = 1024;
+
 /// Default streaming timeout in seconds; `0` disables the guard.
 ///
 /// Set *strictly* below the `openai_stream_events` accumulator's default timeout
@@ -97,7 +106,8 @@ pub(super) struct ResponsesToChatCompletionsConfig {
     ///
     /// Raw transport body size is governed by the pipeline's `body_limits`,
     /// not this field. This bounds only the translated body, which can grow
-    /// larger than the raw input.
+    /// larger than the raw input. Values below 1 `KiB` are rejected because a
+    /// schema-complete fail-closed streaming terminal must fit this ceiling.
     #[serde(default = "default_max_rewritten_body_bytes")]
     pub max_rewritten_body_bytes: usize,
     /// Maximum bytes buffered by the streaming SSE frame parser.
@@ -202,11 +212,7 @@ fn default_max_emitted_sse_frame_bytes() -> usize {
 pub(super) fn build_config(
     config: ResponsesToChatCompletionsConfig,
 ) -> Result<ResponsesToChatCompletionsConfig, FilterError> {
-    validate_size_limit(
-        "responses_to_chat_completions",
-        "max_rewritten_body_bytes",
-        config.max_rewritten_body_bytes,
-    )?;
+    validate_rewritten_body_limit(config.max_rewritten_body_bytes)?;
     if config.max_sse_buffer_bytes == 0 {
         return Err("responses_to_chat_completions: max_sse_buffer_bytes must be greater than zero".into());
     }
@@ -230,6 +236,18 @@ pub(super) fn build_config(
         .into());
     }
     Ok(config)
+}
+
+/// Validate the translated-body ceiling, including the streaming failure floor.
+fn validate_rewritten_body_limit(limit: usize) -> Result<(), FilterError> {
+    validate_size_limit("responses_to_chat_completions", "max_rewritten_body_bytes", limit)?;
+    if limit < MIN_MAX_REWRITTEN_BODY_BYTES {
+        return Err(format!(
+            "responses_to_chat_completions: max_rewritten_body_bytes ({limit}) must be at least {MIN_MAX_REWRITTEN_BODY_BYTES} bytes so the fail-closed response.failed resource always fits",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,5 +358,23 @@ mod tests {
             ..ResponsesToChatCompletionsConfig::default()
         };
         build_config(at_floor).expect("the minimum per-frame ceiling must be accepted");
+    }
+
+    #[test]
+    fn sub_minimal_rewritten_body_ceiling_is_rejected() {
+        let below_floor = ResponsesToChatCompletionsConfig {
+            max_rewritten_body_bytes: MIN_MAX_REWRITTEN_BODY_BYTES - 1,
+            ..ResponsesToChatCompletionsConfig::default()
+        };
+        assert!(
+            build_config(below_floor).is_err(),
+            "a translated-body ceiling below the minimal failure resource must be rejected",
+        );
+
+        let at_floor = ResponsesToChatCompletionsConfig {
+            max_rewritten_body_bytes: MIN_MAX_REWRITTEN_BODY_BYTES,
+            ..ResponsesToChatCompletionsConfig::default()
+        };
+        build_config(at_floor).expect("the minimum translated-body ceiling must be accepted");
     }
 }
