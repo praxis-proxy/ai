@@ -5,14 +5,14 @@
   "provenance": {
     "kind": "live",
     "provider": "vllm",
-    "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
     "source_id": null
   },
   "normalization": {
     "version": 1,
     "linked_ids": {
-      "chatcmpl-be013f80b6e67fab": "chatcmpl-recorded-0002",
-      "msg_18c8cada960fd558": "msg_recorded_0001"
+      "chatcmpl-963946bda7756efa": "chatcmpl-recorded-0002",
+      "msg_18d22bba02eae4d5": "msg_recorded_0001"
     }
   },
   "turns": [
@@ -37,7 +37,7 @@
                   "role": "user"
                 }
               ],
-              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "model": "Qwen/Qwen2.5-0.5B-Instruct",
               "stream": true
             }
           }
@@ -54,7 +54,7 @@
             "frames": [
               {
                 "event": "message_start",
-                "data": "{\"message\":{\"container\":null,\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"role\":\"assistant\",\"stop_details\":null,\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation\":null,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"inference_geo\":null,\"input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":null,\"service_tier\":null}},\"type\":\"message_start\"}",
+                "data": "{\"message\":{\"container\":null,\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"role\":\"assistant\",\"stop_details\":null,\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation\":null,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"inference_geo\":null,\"input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":null,\"service_tier\":null}},\"type\":\"message_start\"}",
                 "id": null,
                 "retry": null
               },
@@ -84,25 +84,49 @@
               },
               {
                 "event": "content_block_delta",
-                "data": "{\"delta\":{\"text\":\" How\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "data": "{\"delta\":{\"text\":\" It\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "content_block_delta",
-                "data": "{\"delta\":{\"text\":\" can\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "data": "{\"delta\":{\"text\":\"'s\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "content_block_delta",
-                "data": "{\"delta\":{\"text\":\" I\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "data": "{\"delta\":{\"text\":\" always\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "content_block_delta",
-                "data": "{\"delta\":{\"text\":\" help\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "data": "{\"delta\":{\"text\":\" nice\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" to\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" say\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" hello\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" when\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
                 "id": null,
                 "retry": null
               },
@@ -114,13 +138,97 @@
               },
               {
                 "event": "content_block_delta",
-                "data": "{\"delta\":{\"text\":\" today\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "data": "{\"delta\":{\"text\":\" meet\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": "content_block_delta",
-                "data": "{\"delta\":{\"text\":\"?\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "data": "{\"delta\":{\"text\":\" someone\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" new\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" or\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" when\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" you\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"'re\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" on\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" a\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" journey\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" of\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" learning\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" and\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\" growth\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\".\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
                 "id": null,
                 "retry": null
               },
@@ -132,7 +240,7 @@
               },
               {
                 "event": "message_delta",
-                "data": "{\"delta\":{\"container\":null,\"stop_details\":null,\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"input_tokens\":null,\"output_tokens\":0,\"server_tool_use\":null}}",
+                "data": "{\"delta\":{\"container\":null,\"stop_details\":null,\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"input_tokens\":35,\"output_tokens\":27,\"server_tool_use\":null}}",
                 "id": null,
                 "retry": null
               },
@@ -166,7 +274,7 @@
                   "role": "user"
                 }
               ],
-              "model": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+              "model": "Qwen/Qwen2.5-0.5B-Instruct",
               "stream": true,
               "stream_options": {
                 "include_usage": true
@@ -186,67 +294,175 @@
             "frames": [
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\",\"prompt_text\":null,\"prompt_token_ids\":null}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\",\"prompt_text\":null,\"prompt_token_ids\":null}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\" How\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" It\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\" can\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"'s\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\" I\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" always\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\" help\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" nice\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\" you\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" to\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\" today\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" say\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"content\":\"?\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" hello\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null,\"stop_reason\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"RedHatAI/Qwen3-Coder-Next-NVFP4\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" when\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" you\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" meet\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" someone\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" new\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" or\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" when\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" you\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"'re\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" on\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" a\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" journey\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" of\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" learning\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" and\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\" growth\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\".\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null,\"stop_reason\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":27,\"prompt_tokens\":35,\"total_tokens\":62}}",
                 "id": null,
                 "retry": null
               }
