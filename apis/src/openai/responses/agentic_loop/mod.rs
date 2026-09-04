@@ -513,10 +513,13 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
 fn collect_streaming_output_items(state: &mut ResponsesState) {
     let output = state.output_items().to_vec();
     for item in output {
-        state.accumulated_output.push(item.clone());
+        // `output` is owned (`to_vec`), so route the owned value into its last
+        // consumer by move; only the earlier consumers of a shared item clone.
+        // Non-matching items go solely to `accumulated_output` and are moved.
         match item.get("type").and_then(Value::as_str) {
             Some("function_call" | "reasoning") => {
                 state.messages.push(item.clone());
+                state.accumulated_output.push(item.clone());
                 state.persisted_messages.push(item);
             },
             Some("web_search_call") => {
@@ -526,9 +529,12 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // `web_search_calls` and appends a backend-valid
                 // function_call/function_call_output bridge for the next round.
                 state.web_search_calls.push(item.clone());
+                state.accumulated_output.push(item.clone());
                 state.persisted_messages.push(item);
             },
-            _ => {},
+            _ => {
+                state.accumulated_output.push(item);
+            },
         }
     }
 }
