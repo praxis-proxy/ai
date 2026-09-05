@@ -18,6 +18,15 @@ features:
         status: covered
       vllm:
         status: live_covered
+  - id: messages.request.client_tool_ownership
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/typed-server-tools
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.response.text
     scopes:
       - messages_to_chat_completions
