@@ -1260,6 +1260,220 @@ async fn bedrock_invoke_model_headers_record_no_cache() {
         ctx.get_metadata("token.cache_write").is_none(),
         "response headers carry no cache breakdown"
     );
+    assert!(
+        ctx.get_metadata("token.reasoning").is_none(),
+        "response headers carry no reasoning breakdown"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Reasoning / Thinking Token Breakdown
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn json_openai_records_reasoning_tokens() {
+    let json = br#"{"usage":{"prompt_tokens":120,"completion_tokens":800,"completion_tokens_details":{"reasoning_tokens":640}}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(reasoning.as_deref(), Some("640"), "OpenAI reasoning tokens");
+}
+
+#[tokio::test]
+async fn json_openai_responses_records_reasoning_tokens() {
+    let json = br#"{"id":"resp_123","object":"response","usage":{"input_tokens":120,"output_tokens":800,"output_tokens_details":{"reasoning_tokens":640}}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(reasoning.as_deref(), Some("640"), "Responses API reasoning tokens");
+}
+
+#[tokio::test]
+async fn json_azure_records_reasoning_tokens() {
+    let json = br#"{"usage":{"prompt_tokens":120,"completion_tokens":800,"completion_tokens_details":{"reasoning_tokens":640}}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::Azure, "application/json", json).await;
+
+    assert_eq!(
+        reasoning.as_deref(),
+        Some("640"),
+        "Azure shares the OpenAI usage schema"
+    );
+}
+
+#[tokio::test]
+async fn json_anthropic_records_thinking_tokens() {
+    let json =
+        br#"{"usage":{"input_tokens":200,"output_tokens":1500,"output_tokens_details":{"thinking_tokens":1200}}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::Anthropic, "application/json", json).await;
+
+    assert_eq!(reasoning.as_deref(), Some("1200"), "Anthropic thinking tokens");
+}
+
+#[tokio::test]
+async fn json_google_records_thoughts_tokens() {
+    let json =
+        br#"{"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":80,"thoughtsTokenCount":200,"totalTokenCount":330}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::Google, "application/json", json).await;
+
+    assert_eq!(reasoning.as_deref(), Some("200"), "Google thoughts tokens");
+}
+
+#[tokio::test]
+async fn json_google_missing_total_includes_thoughts() {
+    let json = br#"{"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":80,"thoughtsTokenCount":200}}"#;
+
+    let (input, output, total) = run_json_extraction(ProviderKind::Google, json).await;
+
+    assert_eq!(input.as_deref(), Some("50"));
+    assert_eq!(output.as_deref(), Some("80"), "output stays candidatesTokenCount");
+    assert_eq!(
+        total.as_deref(),
+        Some("330"),
+        "fallback total includes thoughts when totalTokenCount is absent"
+    );
+}
+
+#[tokio::test]
+async fn json_without_reasoning_records_no_metadata() {
+    let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"total_tokens":57}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(
+        reasoning, None,
+        "a response with no reasoning information writes no reasoning metadata"
+    );
+}
+
+#[tokio::test]
+async fn json_with_zero_reasoning_tokens_records_zero() {
+    let json =
+        br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"completion_tokens_details":{"reasoning_tokens":0}}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::OpenAi, "application/json", json).await;
+
+    assert_eq!(
+        reasoning.as_deref(),
+        Some("0"),
+        "a reported zero is recorded as zero, distinct from absent"
+    );
+}
+
+#[tokio::test]
+async fn json_openai_reasoning_does_not_change_output_total() {
+    let json = br#"{"usage":{"prompt_tokens":120,"completion_tokens":800,"total_tokens":920,"completion_tokens_details":{"reasoning_tokens":640}}}"#;
+
+    let (input, output, total) = run_json_extraction(ProviderKind::OpenAi, json).await;
+
+    assert_eq!(input.as_deref(), Some("120"));
+    assert_eq!(output.as_deref(), Some("800"), "output stays completion_tokens");
+    assert_eq!(total.as_deref(), Some("920"));
+}
+
+#[tokio::test]
+async fn sse_openai_final_usage_records_reasoning_tokens() {
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        "data: {\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":800,\"completion_tokens_details\":{\"reasoning_tokens\":640}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let reasoning = run_reasoning_extraction(ProviderKind::OpenAi, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        reasoning.as_deref(),
+        Some("640"),
+        "reasoning tokens from final usage event"
+    );
+}
+
+#[tokio::test]
+async fn sse_openai_responses_records_reasoning_tokens() {
+    let events = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"output_tokens\":800,\"output_tokens_details\":{\"reasoning_tokens\":640}}}}\n\n",
+    );
+
+    let reasoning = run_reasoning_extraction(ProviderKind::OpenAi, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        reasoning.as_deref(),
+        Some("640"),
+        "Responses API reasoning tokens from response.completed"
+    );
+}
+
+#[tokio::test]
+async fn sse_anthropic_records_thinking_tokens() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":200}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1500,\"output_tokens_details\":{\"thinking_tokens\":1200}}}\n\n",
+    );
+
+    let reasoning = run_reasoning_extraction(ProviderKind::Anthropic, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        reasoning.as_deref(),
+        Some("1200"),
+        "thinking tokens from terminal message_delta"
+    );
+}
+
+#[tokio::test]
+async fn sse_anthropic_without_thinking_records_no_metadata() {
+    let events = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+    );
+
+    let reasoning = run_reasoning_extraction(ProviderKind::Anthropic, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        reasoning, None,
+        "a stream with no thinking field writes no reasoning metadata"
+    );
+}
+
+#[tokio::test]
+async fn sse_google_final_usage_records_thoughts_tokens() {
+    let events = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        "data: {\"usageMetadata\":{\"promptTokenCount\":50,\"candidatesTokenCount\":80,\"thoughtsTokenCount\":200,\"totalTokenCount\":330}}\n\n",
+    );
+
+    let reasoning = run_reasoning_extraction(ProviderKind::Google, "text/event-stream", events.as_bytes()).await;
+
+    assert_eq!(
+        reasoning.as_deref(),
+        Some("200"),
+        "thoughts tokens from final usage event"
+    );
+}
+
+#[tokio::test]
+async fn json_bedrock_converse_records_no_reasoning() {
+    let json = br#"{"usage":{"inputTokens":10,"outputTokens":20}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::Bedrock, "application/json", json).await;
+
+    assert_eq!(reasoning, None, "Bedrock Converse has no documented reasoning field");
+}
+
+#[tokio::test]
+async fn json_bedrock_anthropic_fallback_records_thinking_tokens() {
+    let json =
+        br#"{"usage":{"input_tokens":10,"output_tokens":1500,"output_tokens_details":{"thinking_tokens":1200}}}"#;
+
+    let reasoning = run_reasoning_extraction(ProviderKind::Bedrock, "application/json", json).await;
+
+    assert_eq!(
+        reasoning.as_deref(),
+        Some("1200"),
+        "Claude via InvokeModel inherits Anthropic thinking extraction"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1350,6 +1564,24 @@ async fn run_cache_extraction(
         ctx.get_metadata("token.cache_read").map(str::to_owned),
         ctx.get_metadata("token.cache_write").map(str::to_owned),
     )
+}
+
+/// Run a full `on_response` -> `on_response_body` cycle and return the
+/// reasoning metadata for either the JSON or the SSE path.
+async fn run_reasoning_extraction(provider: ProviderKind, content_type: &str, body_bytes: &[u8]) -> Option<String> {
+    let filter = make_filter(provider);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type(content_type);
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::copy_from_slice(body_bytes));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    ctx.get_metadata("token.reasoning").map(str::to_owned)
 }
 
 /// Run a full `on_response` -> `on_response_body` cycle for SSE extraction.

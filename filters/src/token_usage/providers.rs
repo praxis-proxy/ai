@@ -53,6 +53,9 @@ struct ChatCompletionsUsage {
 
     /// Breakdown of the prompt tokens (prompt caching).
     prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+
+    /// Breakdown of the completion tokens (reasoning models).
+    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
 }
 
 /// `OpenAI` prompt token breakdown.
@@ -62,6 +65,13 @@ struct OpenAiPromptTokensDetails {
     cached_tokens: Option<u64>,
 }
 
+/// `OpenAI` completion token breakdown.
+#[derive(Deserialize)]
+struct OpenAiCompletionTokensDetails {
+    /// Reasoning tokens, already counted in `completion_tokens`.
+    reasoning_tokens: Option<u64>,
+}
+
 /// Parses `OpenAI`/Azure response format.
 ///
 /// Supports both Chat Completions format (`usage.prompt_tokens`) and
@@ -69,7 +79,8 @@ struct OpenAiPromptTokensDetails {
 /// API nests usage under a `response` wrapper and uses different field
 /// names. Cached input is already counted in the input total for both formats,
 /// so cache reads and writes are recorded as breakdowns rather than added to
-/// it.
+/// it. Reasoning tokens are likewise a breakdown of `completion_tokens`
+/// (Chat Completions) or `output_tokens` (Responses API), not an addition.
 pub(super) fn parse_openai(body: &[u8]) -> Option<TokenUsage> {
     let envelope: OpenAiEnvelope = serde_json::from_slice(body).ok()?;
 
@@ -86,8 +97,12 @@ pub(super) fn parse_openai(body: &[u8]) -> Option<TokenUsage> {
 /// Converts a Chat Completions usage object.
 fn chat_completions_usage(usage: ChatCompletionsUsage) -> TokenUsage {
     let cache_read = usage.prompt_tokens_details.and_then(|details| details.cached_tokens);
+    let reasoning = usage
+        .completion_tokens_details
+        .and_then(|details| details.reasoning_tokens);
     TokenUsage::new(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
         .with_cache(cache_read, NO_CACHE_WRITE)
+        .with_reasoning(reasoning)
 }
 
 /// Converts a Responses API usage object, keeping cache breakdowns out of the
@@ -95,10 +110,14 @@ fn chat_completions_usage(usage: ChatCompletionsUsage) -> TokenUsage {
 fn responses_api_usage(usage: ResponsesApiUsage) -> TokenUsage {
     // `input_tokens` already includes cached reads and writes, so both counts
     // are recorded as breakdowns of the input rather than added to it.
+    // Reasoning tokens are a breakdown of `output_tokens`, not an addition.
     let (cache_read, cache_write) = usage.input_tokens_details.map_or((None, None), |details| {
         (details.cached_tokens, details.cache_write_tokens)
     });
-    TokenUsage::new(usage.input_tokens, usage.output_tokens, usage.total_tokens).with_cache(cache_read, cache_write)
+    let reasoning = usage.output_tokens_details.and_then(|details| details.reasoning_tokens);
+    TokenUsage::new(usage.input_tokens, usage.output_tokens, usage.total_tokens)
+        .with_cache(cache_read, cache_write)
+        .with_reasoning(reasoning)
 }
 
 /// Inner response object in Responses API events.
@@ -119,6 +138,8 @@ struct ResponsesApiUsage {
     total_tokens: Option<u64>,
     /// Breakdown of the input tokens (prompt caching).
     input_tokens_details: Option<ResponsesApiInputTokensDetails>,
+    /// Breakdown of the output tokens (reasoning models).
+    output_tokens_details: Option<ResponsesApiOutputTokensDetails>,
 }
 
 /// Responses API input token breakdown.
@@ -128,6 +149,13 @@ struct ResponsesApiInputTokensDetails {
     cached_tokens: Option<u64>,
     /// Tokens written to cache, already counted in `input_tokens`.
     cache_write_tokens: Option<u64>,
+}
+
+/// Responses API output token breakdown.
+#[derive(Deserialize)]
+struct ResponsesApiOutputTokensDetails {
+    /// Reasoning tokens, already counted in `output_tokens`.
+    reasoning_tokens: Option<u64>,
 }
 
 // -----------------------------------------------------------------------------
@@ -155,23 +183,39 @@ struct AnthropicUsage {
 
     /// Tokens read from cache (prompt caching).
     cache_read_input_tokens: Option<u64>,
+
+    /// Breakdown of the output tokens (extended thinking).
+    output_tokens_details: Option<AnthropicOutputTokensDetails>,
+}
+
+/// Anthropic output token breakdown.
+#[derive(Deserialize)]
+struct AnthropicOutputTokensDetails {
+    /// Thinking tokens, already counted in `output_tokens`.
+    thinking_tokens: Option<u64>,
 }
 
 /// Parses `Anthropic` Claude response format.
 ///
 /// When prompt caching is enabled, `input_tokens` only contains tokens after
 /// the cache breakpoint. The actual total is the sum of all input token fields,
-/// and the cache fields are also kept as a breakdown of that total.
+/// and the cache fields are also kept as a breakdown of that total. Thinking
+/// tokens are a breakdown of `output_tokens`, not an addition.
 pub(super) fn parse_anthropic(body: &[u8]) -> Option<TokenUsage> {
     let response: AnthropicResponse = serde_json::from_slice(body).ok()?;
     let usage = response.usage?;
     let cache_write = usage.cache_creation_input_tokens;
     let cache_read = usage.cache_read_input_tokens;
+    let reasoning = usage.output_tokens_details.and_then(|details| details.thinking_tokens);
     let actual_input = usage
         .input_tokens
         .saturating_add(cache_write.unwrap_or(0))
         .saturating_add(cache_read.unwrap_or(0));
-    Some(TokenUsage::new(actual_input, usage.output_tokens, None).with_cache(cache_read, cache_write))
+    Some(
+        TokenUsage::new(actual_input, usage.output_tokens, None)
+            .with_cache(cache_read, cache_write)
+            .with_reasoning(reasoning),
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -201,23 +245,33 @@ struct GoogleUsageMetadata {
 
     /// Cached tokens, already counted in `prompt_token_count` (context caching).
     cached_content_token_count: Option<u64>,
+
+    /// Thinking tokens. Unlike OpenAI/Anthropic, these are *not* included in
+    /// `candidates_token_count`; they are billed separately and already in
+    /// `total_token_count` when the provider sends that field.
+    thoughts_token_count: Option<u64>,
 }
 
 /// Parses Google `Gemini` response format.
 ///
 /// `promptTokenCount` already includes any cached tokens, so the cache read
 /// count is recorded as a breakdown of the input rather than added to it.
+/// Thinking tokens are reported separately from candidate output. When the
+/// provider omits `totalTokenCount`, the fallback total includes thoughts
+/// so billing and quota consumers do not undercount.
 pub(super) fn parse_google(body: &[u8]) -> Option<TokenUsage> {
     let response: GoogleResponse = serde_json::from_slice(body).ok()?;
     let usage = response.usage_metadata?;
     let cache_read = usage.cached_content_token_count;
+    let output = usage.candidates_token_count.unwrap_or(0);
+    let thoughts = usage.thoughts_token_count.unwrap_or(0);
+    let total = usage
+        .total_token_count
+        .unwrap_or_else(|| usage.prompt_token_count.saturating_add(output).saturating_add(thoughts));
     Some(
-        TokenUsage::new(
-            usage.prompt_token_count,
-            usage.candidates_token_count.unwrap_or(0),
-            usage.total_token_count,
-        )
-        .with_cache(cache_read, NO_CACHE_WRITE),
+        TokenUsage::new(usage.prompt_token_count, output, Some(total))
+            .with_cache(cache_read, NO_CACHE_WRITE)
+            .with_reasoning(usage.thoughts_token_count),
     )
 }
 
@@ -270,8 +324,9 @@ struct BedrockConverseUsage {
 /// # Prompt Caching
 ///
 /// The Converse API reports cache counts under a different shape than the one
-/// parsed here, so no cache breakdown is recorded for it. Claude via
-/// `InvokeModel` gets the breakdown through the Anthropic fallback below.
+/// parsed here, so no cache breakdown is recorded for it. It also has no
+/// documented reasoning-token field. Claude via `InvokeModel` gets both the
+/// cache and thinking breakdowns through the Anthropic fallback below.
 pub(super) fn parse_bedrock(body: &[u8]) -> Option<TokenUsage> {
     // Try Converse API format first (AWS recommended, works with all models)
     if let Ok(response) = serde_json::from_slice::<BedrockConverseResponse>(body)
@@ -482,6 +537,24 @@ mod tests {
         let json = br#"{"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20}}"#;
         let usage = parse_google(json).unwrap();
         assert_eq!(usage.total_tokens(), 30, "missing totalTokenCount should be computed");
+    }
+
+    #[test]
+    fn google_missing_total_includes_thoughts() {
+        let json = br#"{"usageMetadata": {
+            "promptTokenCount": 50,
+            "candidatesTokenCount": 80,
+            "thoughtsTokenCount": 200
+        }}"#;
+        let usage = parse_google(json).unwrap();
+
+        assert_eq!(usage.output_tokens(), 80, "output stays candidatesTokenCount");
+        assert_eq!(usage.reasoning_tokens(), Some(200));
+        assert_eq!(
+            usage.total_tokens(),
+            330,
+            "fallback total must include thoughts when totalTokenCount is absent"
+        );
     }
 
     #[test]
@@ -774,6 +847,11 @@ mod tests {
             None,
             "the Converse cache shape is not parsed, so no cache write is claimed"
         );
+        assert_eq!(
+            usage.reasoning_tokens(),
+            None,
+            "the Converse usage shape has no reasoning field"
+        );
     }
 
     #[test]
@@ -795,6 +873,230 @@ mod tests {
             usage.cache_write_tokens(),
             Some(100),
             "the Anthropic fallback carries the cache write through"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Reasoning / thinking token breakdown
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn openai_reasoning_tokens_are_a_subset_of_completion_tokens() {
+        let json = br#"{"usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 800,
+            "total_tokens": 920,
+            "completion_tokens_details": {"reasoning_tokens": 640}
+        }}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(usage.input_tokens(), 120);
+        assert_eq!(
+            usage.output_tokens(),
+            800,
+            "reasoning is already in completion_tokens; output must not change"
+        );
+        assert_eq!(usage.total_tokens(), 920);
+        assert_eq!(usage.reasoning_tokens(), Some(640));
+    }
+
+    #[test]
+    fn openai_reasoning_tokens_zero_is_reported_not_absent() {
+        let json = br#"{"usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "completion_tokens_details": {"reasoning_tokens": 0}
+        }}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(
+            usage.reasoning_tokens(),
+            Some(0),
+            "an explicit zero is a reported non-reasoning completion, distinct from absent"
+        );
+    }
+
+    #[test]
+    fn openai_without_completion_tokens_details_reports_no_reasoning() {
+        let json = br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20}}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(
+            usage.reasoning_tokens(),
+            None,
+            "no completion_tokens_details means no reasoning information"
+        );
+    }
+
+    #[test]
+    fn openai_null_completion_tokens_details_reports_no_reasoning() {
+        let json = br#"{"usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "completion_tokens_details": null
+        }}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(usage.reasoning_tokens(), None);
+    }
+
+    #[test]
+    fn openai_reports_cache_and_reasoning_together() {
+        let json = br#"{"usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 800,
+            "prompt_tokens_details": {"cached_tokens": 900},
+            "completion_tokens_details": {"reasoning_tokens": 640}
+        }}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(usage.cache_read_tokens(), Some(900));
+        assert_eq!(usage.reasoning_tokens(), Some(640));
+        assert_eq!(usage.output_tokens(), 800);
+        assert_eq!(usage.input_tokens(), 1000);
+    }
+
+    #[test]
+    fn openai_responses_api_reasoning_tokens_are_a_subset_of_output_tokens() {
+        let json = br#"{"type":"response.completed","response":{"usage":{
+            "input_tokens":120,
+            "output_tokens":800,
+            "total_tokens":920,
+            "output_tokens_details":{"reasoning_tokens":640}
+        }}}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(usage.input_tokens(), 120);
+        assert_eq!(
+            usage.output_tokens(),
+            800,
+            "reasoning is already in output_tokens; output must not change"
+        );
+        assert_eq!(usage.total_tokens(), 920);
+        assert_eq!(usage.reasoning_tokens(), Some(640));
+    }
+
+    #[test]
+    fn openai_responses_api_non_streaming_reasoning_tokens() {
+        let json = br#"{"id":"resp_123","object":"response","usage":{
+            "input_tokens":120,
+            "output_tokens":800,
+            "output_tokens_details":{"reasoning_tokens":640}
+        }}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(usage.reasoning_tokens(), Some(640));
+        assert_eq!(usage.output_tokens(), 800);
+    }
+
+    #[test]
+    fn openai_responses_api_reasoning_tokens_zero_is_reported_not_absent() {
+        let json = br#"{"response":{"usage":{
+            "input_tokens":10,
+            "output_tokens":20,
+            "output_tokens_details":{"reasoning_tokens":0}
+        }}}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(
+            usage.reasoning_tokens(),
+            Some(0),
+            "an explicit zero is a reported non-reasoning completion, distinct from absent"
+        );
+    }
+
+    #[test]
+    fn openai_responses_api_without_output_tokens_details_reports_no_reasoning() {
+        let json = br#"{"response":{"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let usage = parse_openai(json).unwrap();
+
+        assert_eq!(
+            usage.reasoning_tokens(),
+            None,
+            "no output_tokens_details means no reasoning information"
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_tokens_are_a_subset_of_output_tokens() {
+        let json = br#"{"usage": {
+            "input_tokens": 200,
+            "output_tokens": 1500,
+            "output_tokens_details": {"thinking_tokens": 1200}
+        }}"#;
+        let usage = parse_anthropic(json).unwrap();
+
+        assert_eq!(usage.input_tokens(), 200);
+        assert_eq!(
+            usage.output_tokens(),
+            1500,
+            "thinking is already in output_tokens; output must not change"
+        );
+        assert_eq!(usage.reasoning_tokens(), Some(1200));
+    }
+
+    #[test]
+    fn anthropic_thinking_tokens_zero_is_reported_not_absent() {
+        let json = br#"{"usage": {
+            "input_tokens": 20,
+            "output_tokens": 30,
+            "output_tokens_details": {"thinking_tokens": 0}
+        }}"#;
+        let usage = parse_anthropic(json).unwrap();
+
+        assert_eq!(usage.reasoning_tokens(), Some(0));
+    }
+
+    #[test]
+    fn anthropic_without_output_tokens_details_reports_no_reasoning() {
+        let json = br#"{"usage": {"input_tokens": 20, "output_tokens": 30}}"#;
+        let usage = parse_anthropic(json).unwrap();
+
+        assert_eq!(usage.reasoning_tokens(), None);
+    }
+
+    #[test]
+    fn google_thoughts_tokens_are_reported_separately_from_candidates() {
+        let json = br#"{"usageMetadata": {
+            "promptTokenCount": 50,
+            "candidatesTokenCount": 80,
+            "thoughtsTokenCount": 200,
+            "totalTokenCount": 330
+        }}"#;
+        let usage = parse_google(json).unwrap();
+
+        assert_eq!(usage.input_tokens(), 50);
+        assert_eq!(
+            usage.output_tokens(),
+            80,
+            "candidatesTokenCount stays the output; thoughts are not folded in"
+        );
+        assert_eq!(usage.total_tokens(), 330, "provider total includes thoughts");
+        assert_eq!(usage.reasoning_tokens(), Some(200));
+    }
+
+    #[test]
+    fn google_without_thoughts_reports_no_reasoning() {
+        let json = br#"{"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20}}"#;
+        let usage = parse_google(json).unwrap();
+
+        assert_eq!(usage.reasoning_tokens(), None);
+    }
+
+    #[test]
+    fn bedrock_anthropic_fallback_reports_thinking_tokens() {
+        let json = br#"{"usage": {
+            "input_tokens": 10,
+            "output_tokens": 1500,
+            "output_tokens_details": {"thinking_tokens": 1200}
+        }}"#;
+        let usage = parse_bedrock(json).unwrap();
+
+        assert_eq!(usage.output_tokens(), 1500);
+        assert_eq!(
+            usage.reasoning_tokens(),
+            Some(1200),
+            "Claude via InvokeModel inherits Anthropic thinking extraction"
         );
     }
 }
