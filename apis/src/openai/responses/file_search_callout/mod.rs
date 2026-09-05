@@ -1153,7 +1153,10 @@ fn combined_output_fits(state: &ResponsesState, incoming_response: &Value, max_b
 }
 
 /// Return whether an output item is a provider-hosted built-in tool call.
-fn is_builtin_tool_call(item: &Value) -> bool {
+///
+/// Shared with `openai_web_search`, which counts non-web built-in calls against
+/// the same client-declared `max_tool_calls` budget.
+pub(crate) fn is_builtin_tool_call(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
         Some(

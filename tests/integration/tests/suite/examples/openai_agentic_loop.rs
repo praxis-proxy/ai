@@ -653,6 +653,246 @@ fn spawn_failing_search_mock(listener: std::net::TcpListener) {
     });
 }
 
+/// Search mock that serves every connection and counts dispatched requests.
+///
+/// Returns a shared counter so a test can assert exactly how many provider
+/// requests the web search filter issued across an agentic-loop continuation.
+fn spawn_counting_search_mock(listener: std::net::TcpListener) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use std::{
+        io::{Read as _, Write as _},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    let counter = Arc::new(AtomicUsize::new(0));
+    let thread_counter = Arc::clone(&counter);
+    let body = serde_json::json!({
+        "web": {
+            "results": [{
+                "title": "Rust 2025 Edition",
+                "url": "https://blog.rust-lang.org/2025",
+                "description": "The Rust 2025 edition is here."
+            }]
+        }
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            let _n = stream.read(&mut buf).unwrap_or(0);
+            thread_counter.fetch_add(1, Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _written = stream.write_all(response.as_bytes());
+        }
+    });
+    counter
+}
+
+#[test]
+fn web_search_caps_multiple_calls_within_one_round() {
+    // The model requests two searches in a single turn while the client caps
+    // built-in tool calls at one. Exactly one provider request must be
+    // dispatched and the excess call must be surfaced as incomplete.
+    let first_response = serde_json::json!({
+        "id": "resp_ws_cap_1",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "type": "web_search_call",
+                "id": "ws_cap_a",
+                "status": "completed",
+                "action": {"type": "search", "query": "Rust 2025 edition"}
+            },
+            {
+                "type": "web_search_call",
+                "id": "ws_cap_b",
+                "status": "completed",
+                "action": {"type": "search", "query": "Rust async runtime"}
+            }
+        ]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_ws_cap_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Here is what I found."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_count = spawn_counting_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust news",
+        "max_tool_calls": 1,
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "capped web search round-trip should return 200"
+    );
+
+    assert_eq!(
+        search_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only one provider request may be dispatched under max_tool_calls=1"
+    );
+
+    let body = parse_body(&raw);
+    let response: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_ws_cap_2",
+        "loop should still complete and return the final model response"
+    );
+
+    let output = response["output"]
+        .as_array()
+        .expect("response output should be an array");
+    let incomplete = output.iter().any(|item| {
+        item["type"] == "web_search_call"
+            && item["status"] == "incomplete"
+            && item["action"]["query"] == "Rust async runtime"
+    });
+    assert!(
+        incomplete,
+        "the over-budget web_search_call must be surfaced as incomplete, not executed"
+    );
+
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "model backend should receive the initial request plus one post-search continuation"
+    );
+}
+
+#[test]
+fn web_search_budget_persists_across_loop_iterations() {
+    // The client caps built-in tool calls at one, but the model requests a
+    // *new* web search in a *later* loop iteration. The executed count lives
+    // in ResponsesState, which survives IRR re-entries, so the second-round
+    // search must be declined even though each individual round contains only
+    // a single call. A per-iteration counter would reset and wrongly dispatch
+    // twice.
+    let first_response = serde_json::json!({
+        "id": "resp_persist_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_persist_a",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust 2025 edition"}
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_persist_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_persist_b",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust async runtime"}
+        }]
+    });
+    let third_response = serde_json::json!({
+        "id": "resp_persist_3",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Here is what I found."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+        (200, serde_json::to_string(&third_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_count = spawn_counting_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Research Rust news",
+        "max_tool_calls": 1,
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "multi-round web search should return 200");
+
+    assert_eq!(
+        search_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the executed budget must persist across iterations: only the first-round search dispatches"
+    );
+
+    let body = parse_body(&raw);
+    let response: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_persist_3",
+        "loop should complete and return the final model response"
+    );
+
+    let output = response["output"]
+        .as_array()
+        .expect("response output should be an array");
+    let second_round_incomplete = output.iter().any(|item| {
+        item["type"] == "web_search_call"
+            && item["status"] == "incomplete"
+            && item["action"]["query"] == "Rust async runtime"
+    });
+    assert!(
+        second_round_incomplete,
+        "the second-iteration search must be declined as incomplete once the budget is spent"
+    );
+
+    assert_eq!(
+        model.requests().len(),
+        3,
+        "model backend should receive three requests across the two-search loop"
+    );
+}
+
 fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");

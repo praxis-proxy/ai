@@ -927,7 +927,7 @@ fn build_output_item_with_results() {
 
 #[test]
 fn build_tool_result_messages_empty() {
-    let [call, output] = build_tool_result_messages("ws_123", "rust", &[]);
+    let [call, output] = build_tool_result_messages("ws_123", "completed", "rust", &[]);
     assert_eq!(
         call["type"], "function_call",
         "continuation bridge is a backend-valid function_call/function_call_output pair, never a hosted web_search_call"
@@ -948,7 +948,7 @@ fn build_tool_result_messages_with_results() {
         url: "https://example.com".into(),
         snippet: "A description".into(),
     }];
-    let [call, output] = build_tool_result_messages("ws_123", "example query", &results);
+    let [call, output] = build_tool_result_messages("ws_123", "completed", "example query", &results);
     assert_eq!(call["type"], "function_call");
     assert_eq!(call["arguments"], r#"{"query":"example query"}"#);
     assert_eq!(output["type"], "function_call_output");
@@ -1052,6 +1052,17 @@ fn upsert_output_item_appends_when_no_match() {
 }
 
 #[test]
+fn build_tool_result_messages_incomplete_reports_not_performed() {
+    // A non-dispatched call (over-budget or missing query) must not be
+    // misrepresented to the model as a completed search with no results.
+    let [call, output] = build_tool_result_messages("ws_123", "incomplete", "rust", &[]);
+    assert_eq!(call["type"], "function_call");
+    assert_eq!(call["call_id"], "ws_123");
+    assert_eq!(output["type"], "function_call_output");
+    assert_eq!(output["output"], "Web search not performed.");
+}
+
+#[test]
 fn format_search_results_multiple() {
     let results = vec![
         SearchResult {
@@ -1069,4 +1080,326 @@ fn format_search_results_multiple() {
     assert!(formatted.contains("[1] First"));
     assert!(formatted.contains("[2] Second"));
     assert!(formatted.contains("\n\n"), "results should be separated by blank line");
+}
+
+// -----------------------------------------------------------------------------
+// Call budget: max_tool_calls and the server-side per-continuation cap
+// -----------------------------------------------------------------------------
+
+/// Brave mock that serves every connection and counts dispatched requests.
+fn spawn_counting_brave_mock(listener: std::net::TcpListener) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use std::{
+        io::{Read as _, Write as _},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    let counter = Arc::new(AtomicUsize::new(0));
+    let thread_counter = Arc::clone(&counter);
+    let body = serde_json::json!({
+        "web": {
+            "results": [{
+                "title": "Rust Lang",
+                "url": "https://rust-lang.org",
+                "description": "Systems programming language"
+            }]
+        }
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            let _n = stream.read(&mut buf).unwrap_or(0);
+            thread_counter.fetch_add(1, Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _written = stream.write_all(response.as_bytes());
+        }
+    });
+    counter
+}
+
+fn web_search_call(id: &str, query: &str) -> Value {
+    serde_json::json!({
+        "type": "web_search_call",
+        "id": id,
+        "action": {"type": "search", "query": query}
+    })
+}
+
+/// Find the `function_call_output` bridged for `query` in a message list.
+///
+/// The backend-valid continuation is a `function_call`/`function_call_output`
+/// pair keyed by a bounded hash id (issue #808), so the tool result is located
+/// by the query carried in the `function_call` arguments rather than by the
+/// unbounded public `web_search_call.id`.
+fn find_bridge_output<'a>(messages: &'a [Value], query: &str) -> Option<&'a Value> {
+    let needle = serde_json::json!({ "query": query }).to_string();
+    let call_id = messages.iter().find_map(|m| {
+        (m["type"] == "function_call" && m["arguments"] == needle)
+            .then(|| m["call_id"].as_str())
+            .flatten()
+    })?;
+    messages
+        .iter()
+        .find(|m| m["type"] == "function_call_output" && m["call_id"] == call_id)
+}
+
+#[test]
+fn remaining_budget_uses_server_cap_without_max_tool_calls() {
+    let state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        MAX_WEB_SEARCH_CALLS_PER_CONTINUATION,
+        "omitting max_tool_calls falls back to the server hard cap"
+    );
+}
+
+#[test]
+fn remaining_budget_caps_large_max_tool_calls_at_server_cap() {
+    let state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 1000}));
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        MAX_WEB_SEARCH_CALLS_PER_CONTINUATION,
+        "a large client budget is still bounded by the server cap"
+    );
+}
+
+#[test]
+fn remaining_budget_subtracts_prior_executions() {
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 5}));
+    assert_eq!(remaining_web_search_budget(&state), 5);
+    state.web_search_calls_executed = 2;
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        3,
+        "prior dispatches reduce the remaining client allowance"
+    );
+}
+
+#[test]
+fn remaining_budget_saturates_when_exhausted() {
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 2}));
+    state.web_search_calls_executed = 5;
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        0,
+        "an over-budget count saturates to zero remaining searches"
+    );
+}
+
+#[test]
+fn remaining_budget_subtracts_non_web_builtin_calls() {
+    // `max_tool_calls` is shared across built-in tools: a completed file search
+    // consumes the single-call budget, leaving nothing for a pending web search.
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 1}));
+    state.accumulated_output = vec![serde_json::json!({
+        "type": "file_search_call",
+        "id": "fs_1",
+        "status": "completed",
+    })];
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        0,
+        "a completed file search must exhaust the shared max_tool_calls budget"
+    );
+}
+
+#[test]
+fn remaining_budget_counts_web_and_non_web_builtin_together() {
+    // A dispatched web search (counter) and a completed file search (output
+    // item) both draw down the same shared allowance.
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 5}));
+    state.web_search_calls_executed = 2;
+    state.accumulated_output = vec![
+        serde_json::json!({"type": "file_search_call", "id": "fs_1", "status": "completed"}),
+        // A prior web_search_call output item must NOT be double counted: web
+        // searches are already tracked by web_search_calls_executed.
+        serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+        // A non-built-in item (a message) must not consume budget.
+        serde_json::json!({"type": "message", "id": "msg_1"}),
+    ];
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        2,
+        "5 - (2 web dispatched + 1 file search) = 2; the echoed web_search_call is not double counted"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_honors_client_max_tool_calls() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = spawn_counting_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 1});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![web_search_call("ws_a", "first"), web_search_call("ws_b", "second")];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only one provider request should be dispatched under max_tool_calls=1"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 1, "one search recorded as executed");
+    assert!(
+        state.web_search_calls.is_empty(),
+        "pending calls cleared after execution"
+    );
+    assert_eq!(state.accumulated_output.len(), 2, "both calls produce an output item");
+    assert_eq!(state.accumulated_output[0]["id"], "ws_a");
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["id"], "ws_b");
+    assert_eq!(
+        state.accumulated_output[1]["status"], "incomplete",
+        "the over-budget call is surfaced as incomplete, not executed"
+    );
+    assert_eq!(
+        state.accumulated_output[1]["action"]["query"], "second",
+        "the declined query is preserved in the incomplete item"
+    );
+
+    // The model-facing bridge (state.messages) and the durable rehydration
+    // history (persisted_messages) must tell the model the truth about the
+    // over-budget call: it was not performed, not a completed empty search.
+    let bridge = find_bridge_output(&state.messages, "second").expect("ws_b bridge present");
+    assert_eq!(
+        bridge["output"], "Web search not performed.",
+        "the over-budget bridge must not fabricate a no-results outcome"
+    );
+    let persisted = find_bridge_output(&state.persisted_messages, "second").expect("ws_b persisted");
+    assert_eq!(
+        persisted["output"], "Web search not performed.",
+        "durable history must not persist a false completed outcome"
+    );
+    // The dispatched call remains a truthful bridge carrying real results.
+    let dispatched = find_bridge_output(&state.messages, "first").expect("ws_a bridge present");
+    assert_ne!(
+        dispatched["output"], "Web search not performed.",
+        "the dispatched call must carry a real search outcome"
+    );
+    assert!(
+        dispatched["output"].as_str().unwrap().contains("Rust Lang"),
+        "the dispatched bridge carries the provider results"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_budget_spans_iterations() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = spawn_counting_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 2});
+    let mut state = ResponsesState::from_request_body(body);
+    // Simulate one search already dispatched in a prior IRR iteration.
+    state.web_search_calls_executed = 1;
+    state.web_search_calls = vec![web_search_call("ws_c", "third"), web_search_call("ws_d", "fourth")];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the single remaining budget slot is dispatched this round"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.web_search_calls_executed, 2,
+        "cumulative executions reach but do not exceed the client budget"
+    );
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+}
+
+#[tokio::test]
+async fn on_request_body_exhausted_budget_dispatches_nothing() {
+    // Budget is already spent, so no live provider is contacted.
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 2});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls_executed = 2;
+    state.web_search_calls = vec![web_search_call("ws_e", "fifth")];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 2, "no further searches executed");
+    assert!(state.web_search_calls.is_empty());
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
+    assert_eq!(state.accumulated_output[0]["action"]["query"], "fifth");
+}
+
+#[tokio::test]
+async fn on_request_body_without_max_tool_calls_dispatches_all_under_cap() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = spawn_counting_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![web_search_call("ws_f", "a"), web_search_call("ws_g", "b")];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both searches dispatch when the client omits max_tool_calls and the count is under the server cap"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 2);
+    assert!(
+        state
+            .accumulated_output
+            .iter()
+            .all(|item| item["status"] == "completed"),
+        "all searches completed under the server cap"
+    );
 }
