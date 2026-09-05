@@ -152,11 +152,11 @@ mod tests {
     }
 
     #[test]
-    fn simple_inputs_map_or_drop_cleanly() {
+    fn simple_inputs_map_cleanly() {
         let string_input = map(&json!({"model": "gpt-4o-mini", "instructions": "", "input": "Hello"}));
         let object_input = map(&json!({"model": "gpt-4o-mini", "input": {"role": "developer", "content": "terse"}}));
         let no_input = map(&json!({"model": "gpt-4o-mini"}));
-        let unsupported_input = map(&json!({"model": "gpt-4o-mini", "input": 42}));
+        let null_input = map(&json!({"model": "gpt-4o-mini", "input": null}));
 
         assert_eq!(string_input["messages"], json!([{"role": "user", "content": "Hello"}]));
         assert_eq!(
@@ -164,7 +164,17 @@ mod tests {
             json!([{"role": "developer", "content": "terse"}])
         );
         assert_eq!(no_input["messages"], Value::Array(Vec::new()));
-        assert_eq!(unsupported_input["messages"], Value::Array(Vec::new()));
+        assert_eq!(null_input["messages"], Value::Array(Vec::new()));
+    }
+
+    #[test]
+    fn scalar_input_returns_error() {
+        let error = map_error(&json!({"model": "gpt-4o-mini", "input": 42}));
+
+        assert_eq!(
+            error,
+            "unsupported Responses input type for Chat Completions translation: number"
+        );
     }
 
     #[test]
@@ -470,6 +480,82 @@ mod tests {
     }
 
     #[test]
+    fn scalar_message_content_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": 42}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses message input item field `content` must be a string or array of content parts"
+        );
+    }
+
+    #[test]
+    fn object_message_content_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": {"unexpected": "shape"}}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses message input item field `content` must be a string or array of content parts"
+        );
+    }
+
+    #[test]
+    fn text_content_part_with_non_string_text_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [{"type": "output_text", "text": 42}]}]
+        }));
+
+        assert_eq!(
+            error,
+            "unsupported Responses content part for Chat Completions translation: \
+             text content part requires a string `text` field"
+        );
+    }
+
+    #[test]
+    fn non_string_call_id_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"type": "function_call", "call_id": 123, "name": "f", "arguments": "{}"}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses function_call input item field `call_id` must be a string"
+        );
+    }
+
+    #[test]
+    fn non_string_function_call_arguments_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"type": "function_call", "call_id": "call_1", "name": "f", "arguments": 42}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses function_call input item field `arguments` must be a string"
+        );
+    }
+
+    #[test]
+    fn non_string_input_item_type_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"type": 42, "role": "user", "content": "hi"}]
+        }));
+
+        assert_eq!(error, "Responses input item field `type` must be a string");
+    }
+
+    #[test]
     fn unsupported_typed_input_items_are_rejected() {
         let error = super::chat_completions::responses_request_to_chat_request(&json!({
             "model": "gpt-4o-mini",
@@ -572,7 +658,7 @@ mod tests {
                 "type": "function_call",
                 "call_id": "call_weather",
                 "name": "lookup_weather",
-                "arguments": {"city": "NYC"}
+                "arguments": "{\"city\":\"NYC\"}"
             }
         }));
 
@@ -1049,13 +1135,16 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn message_item_without_content_gets_empty_content() {
-        let mapped = map(&json!({
+    fn message_item_without_content_returns_error() {
+        let error = map_error(&json!({
             "model": "m",
             "input": [{"role": "user"}]
         }));
 
-        assert_eq!(mapped["messages"][0]["content"], "");
+        assert_eq!(
+            error,
+            "Responses message input item is missing required field `content`"
+        );
     }
 
     #[test]
@@ -1072,25 +1161,23 @@ mod tests {
     }
 
     #[test]
-    fn untyped_item_with_content_key_maps_as_message() {
-        let mapped = map(&json!({
+    fn untyped_item_without_role_returns_error() {
+        let error = map_error(&json!({
             "model": "m",
             "input": [{"content": "implicit user"}]
         }));
 
-        assert_eq!(mapped["messages"][0]["role"], "user");
-        assert_eq!(mapped["messages"][0]["content"], "implicit user");
+        assert_eq!(error, "Responses message input item is missing required field `role`");
     }
 
     #[test]
-    fn non_object_input_items_are_skipped() {
-        let mapped = map(&json!({
+    fn non_object_input_items_return_error() {
+        let error = map_error(&json!({
             "model": "m",
             "input": [42, "bare string", {"role": "user", "content": "real"}]
         }));
 
-        assert_eq!(mapped["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(mapped["messages"][0]["content"], "real");
+        assert_eq!(error, "Responses input item must be a JSON object");
     }
 
     // -------------------------------------------------------------------------
@@ -1134,8 +1221,8 @@ mod tests {
     }
 
     #[test]
-    fn text_parts_without_text_field_are_skipped() {
-        let mapped = map(&json!({
+    fn text_parts_without_text_field_return_error() {
+        let error = map_error(&json!({
             "model": "m",
             "input": [{
                 "role": "user",
@@ -1146,7 +1233,11 @@ mod tests {
             }]
         }));
 
-        assert_eq!(mapped["messages"][0]["content"], "valid");
+        assert_eq!(
+            error,
+            "unsupported Responses content part for Chat Completions translation: \
+             text content part requires a string `text` field"
+        );
     }
 
     #[test]
@@ -1187,26 +1278,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn function_call_with_non_string_arguments_serializes_to_json() {
-        let mapped = map(&json!({
-            "model": "m",
-            "input": [{
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "get_weather",
-                "arguments": {"city": "NYC"}
-            }]
-        }));
-
-        assert_eq!(
-            mapped["messages"][0]["tool_calls"][0]["function"]["arguments"],
-            "{\"city\":\"NYC\"}"
-        );
-    }
-
-    #[test]
-    fn function_call_without_arguments_uses_empty_string() {
-        let mapped = map(&json!({
+    fn function_call_without_arguments_returns_error() {
+        let error = map_error(&json!({
             "model": "m",
             "input": [{
                 "type": "function_call",
@@ -1215,24 +1288,31 @@ mod tests {
             }]
         }));
 
-        assert_eq!(mapped["messages"][0]["tool_calls"][0]["function"]["arguments"], "");
+        assert_eq!(
+            error,
+            "Responses function_call input item is missing required field `arguments`"
+        );
     }
 
     #[test]
-    fn malformed_function_calls_without_call_id_or_name_are_dropped() {
-        let mapped = map(&json!({
+    fn malformed_function_calls_without_call_id_or_name_return_errors() {
+        let missing_id = map_error(&json!({
             "model": "m",
-            "input": [
-                {"type": "function_call", "name": "missing_id", "arguments": "{}"},
-                {"type": "function_call", "call_id": "missing_name", "arguments": "{}"},
-                {"type": "function_call", "call_id": "valid_call", "name": "valid_function", "arguments": "{}"}
-            ]
+            "input": [{"type": "function_call", "name": "missing_id", "arguments": "{}"}]
+        }));
+        let missing_name = map_error(&json!({
+            "model": "m",
+            "input": [{"type": "function_call", "call_id": "missing_name", "arguments": "{}"}]
         }));
 
-        let tool_calls = mapped["messages"][0]["tool_calls"].as_array().unwrap();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0]["id"], "valid_call");
-        assert_eq!(tool_calls[0]["function"]["name"], "valid_function");
+        assert_eq!(
+            missing_id,
+            "Responses function_call input item is missing required field `call_id`"
+        );
+        assert_eq!(
+            missing_name,
+            "Responses function_call input item is missing required field `name`"
+        );
     }
 
     #[test]
@@ -1249,8 +1329,8 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_without_output_uses_empty_string() {
-        let mapped = map(&json!({
+    fn function_call_output_without_output_returns_error() {
+        let error = map_error(&json!({
             "model": "m",
             "input": [
                 {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
@@ -1258,7 +1338,23 @@ mod tests {
             ]
         }));
 
-        assert_eq!(mapped["messages"][1]["content"], "");
+        assert_eq!(
+            error,
+            "Responses function_call_output input item is missing required field `output`"
+        );
+    }
+
+    #[test]
+    fn function_call_output_without_call_id_returns_error() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": [{"type": "function_call_output", "output": "done"}]
+        }));
+
+        assert_eq!(
+            error,
+            "Responses function_call_output input item is missing required field `call_id`"
+        );
     }
 
     #[test]

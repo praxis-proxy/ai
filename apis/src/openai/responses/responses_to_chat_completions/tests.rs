@@ -376,6 +376,58 @@ async fn canonical_state_is_translated_and_arms_response() {
 }
 
 #[tokio::test]
+async fn malformed_responses_input_is_rejected_before_request_translation() {
+    let cases = [
+        (
+            "scalar input",
+            json!({"model": "m", "input": 42}),
+            "unsupported Responses input type for Chat Completions translation: number",
+        ),
+        (
+            "non-object input item",
+            json!({"model": "m", "input": [42]}),
+            "Responses input item must be a JSON object",
+        ),
+        (
+            "function call without call_id",
+            json!({"model": "m", "input": [{"type": "function_call", "name": "lookup", "arguments": "{}"}]}),
+            "Responses function_call input item is missing required field `call_id`",
+        ),
+    ];
+
+    for (case, request_body, expected_message) in cases {
+        let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut context = crate::test_utils::make_filter_context(&request);
+        context.set_metadata("openai_responses_format.format", "openai_responses");
+        context
+            .extensions
+            .insert(ResponsesState::from_request_body(request_body.clone()));
+        let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
+        let mut body = Some(original.clone());
+
+        let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("{case} should be rejected");
+        };
+        assert_eq!(rejection.status, 400, "{case} should produce a client error");
+        let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["error"]["code"], "invalid_request_error", "{case}");
+        assert_eq!(parsed["error"]["message"], expected_message, "{case}");
+        assert_eq!(
+            body.as_deref(),
+            Some(original.as_ref()),
+            "{case} should not rewrite the body"
+        );
+        assert!(
+            context.get_metadata(ARMED_KEY).is_none(),
+            "{case} must not arm response processing"
+        );
+    }
+}
+
+#[tokio::test]
 async fn rehydrated_previous_response_id_translates_full_history() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
