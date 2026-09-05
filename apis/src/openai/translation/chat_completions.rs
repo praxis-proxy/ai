@@ -210,6 +210,9 @@ pub(crate) enum TranslationError {
     /// A Responses tool choice has no Chat Completions-compatible representation.
     #[error("unsupported Responses tool_choice type for Chat Completions translation: {0}")]
     UnsupportedToolChoiceType(String),
+    /// A successful Chat Completions response is missing required translation state.
+    #[error("invalid Chat Completions response: {0}")]
+    InvalidChatResponse(&'static str),
     /// A client function would be indistinguishable from synthesized web search.
     #[error("Responses function tool name `web_search` conflicts with the synthesized web_search function")]
     WebSearchFunctionNameCollision,
@@ -1077,9 +1080,7 @@ pub(crate) fn chat_response_to_response_resource(
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Chat Completions response"))?;
 
-    let finish_reason = first_choice(obj)
-        .and_then(|choice| choice.get("finish_reason"))
-        .and_then(Value::as_str);
+    let finish_reason = validate_chat_response(obj)?;
     let status = response_status(finish_reason);
     let incomplete_details = incomplete_details(finish_reason);
     let output = build_output_items(obj, context, status)?;
@@ -1094,6 +1095,148 @@ pub(crate) fn chat_response_to_response_resource(
     };
 
     Ok(response_resource(context, parts))
+}
+
+/// Validate the minimum successful Chat Completions shape used by translation.
+fn validate_chat_response(obj: &Map<String, Value>) -> Result<&str, TranslationError> {
+    let choices = obj
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or(TranslationError::InvalidChatResponse("choices must be an array"))?;
+    let choice = choices
+        .first()
+        .and_then(Value::as_object)
+        .ok_or(TranslationError::InvalidChatResponse("choices must contain an object"))?;
+    let finish_reason =
+        choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .ok_or(TranslationError::InvalidChatResponse(
+                "first choice must contain a string finish_reason",
+            ))?;
+    if !matches!(finish_reason, "stop" | "length" | "tool_calls" | "content_filter") {
+        return Err(TranslationError::InvalidChatResponse(
+            "first choice contains an unsupported finish_reason",
+        ));
+    }
+
+    validate_chat_message(choice, finish_reason)?;
+    Ok(finish_reason)
+}
+
+/// Validate the assistant message fields that the translator consumes.
+fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Result<(), TranslationError> {
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or(TranslationError::InvalidChatResponse(
+            "first choice must contain a message object",
+        ))?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err(TranslationError::InvalidChatResponse(
+            "first choice message must have the assistant role",
+        ));
+    }
+
+    let has_content = validate_chat_content(message)?;
+    let has_refusal = validate_chat_refusal(message)?;
+    let has_tool_calls = validate_chat_tool_calls(message, finish_reason)?;
+    // A completed terminal must carry at least one translatable output; without
+    // one the translator would synthesize a counterfeit `completed` response with
+    // an empty output array. Incomplete terminals (length, content_filter)
+    // truthfully carry empty output, so they are exempt.
+    let has_output = has_content || has_refusal || has_tool_calls;
+    if response_status(finish_reason) == "completed" && !has_output {
+        return Err(TranslationError::InvalidChatResponse(
+            "first choice message has no supported output",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate optional assistant content and report whether it is present.
+///
+/// `null`, empty strings, and arrays that carry no non-empty text are all
+/// treated as absent, because the emitter produces no output for any of them.
+/// Counting them as content would let a completed terminal translate into a
+/// counterfeit success with an empty output array.
+fn validate_chat_content(message: &Map<String, Value>) -> Result<bool, TranslationError> {
+    match message.get("content") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(text)) => Ok(!text.is_empty()),
+        Some(Value::Array(parts)) if parts.iter().all(is_supported_text_part) => {
+            Ok(parts.iter().any(is_nonempty_text_part))
+        },
+        Some(_) => Err(TranslationError::InvalidChatResponse(
+            "first choice message contains unsupported content",
+        )),
+    }
+}
+
+/// Validate optional assistant refusal content and report whether it is present.
+///
+/// An empty refusal string is treated as absent to match the emitter, which
+/// drops it rather than producing a refusal item.
+fn validate_chat_refusal(message: &Map<String, Value>) -> Result<bool, TranslationError> {
+    match message.get("refusal") {
+        Some(Value::String(refusal)) => Ok(!refusal.is_empty()),
+        Some(Value::Null) | None => Ok(false),
+        Some(_) => Err(TranslationError::InvalidChatResponse(
+            "first choice message contains an invalid refusal",
+        )),
+    }
+}
+
+/// Return whether one provider-specific content part can be translated as text.
+fn is_supported_text_part(part: &Value) -> bool {
+    part.get("text").is_some_and(Value::is_string)
+}
+
+/// Return whether one content part carries non-empty text the emitter will keep.
+fn is_nonempty_text_part(part: &Value) -> bool {
+    part.get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+}
+
+/// Validate optional function calls and require them for a tool-call terminal.
+fn validate_chat_tool_calls(message: &Map<String, Value>, finish_reason: &str) -> Result<bool, TranslationError> {
+    let tool_calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(tool_calls)) => tool_calls.as_slice(),
+        Some(_) => {
+            return Err(TranslationError::InvalidChatResponse(
+                "message tool_calls must be an array",
+            ));
+        },
+    };
+    if tool_calls.is_empty() {
+        if finish_reason == "tool_calls" {
+            return Err(TranslationError::InvalidChatResponse(
+                "tool_calls finish_reason requires function tool calls",
+            ));
+        }
+        return Ok(false);
+    }
+    if !tool_calls.iter().all(is_supported_function_call) {
+        return Err(TranslationError::InvalidChatResponse(
+            "message contains an invalid function tool call",
+        ));
+    }
+    Ok(true)
+}
+
+/// Return whether one Chat Completions tool call has the fields we emit.
+fn is_supported_function_call(tool_call: &Value) -> bool {
+    tool_call.get("id").is_some_and(Value::is_string)
+        && tool_call.get("type").and_then(Value::as_str) == Some("function")
+        && tool_call
+            .get("function")
+            .and_then(Value::as_object)
+            .is_some_and(|function| {
+                function.get("name").is_some_and(Value::is_string)
+                    && function.get("arguments").is_some_and(Value::is_string)
+            })
 }
 
 /// Values that vary between response resource snapshots.
@@ -1194,18 +1337,18 @@ fn chat_logprobs_content(choice: &Value) -> &[Value] {
 }
 
 /// Map a Chat Completions finish reason to a `Responses` status.
-fn response_status(finish_reason: Option<&str>) -> &'static str {
+fn response_status(finish_reason: &str) -> &'static str {
     match finish_reason {
-        Some("length" | "content_filter") => "incomplete",
+        "length" | "content_filter" => "incomplete",
         _ => "completed",
     }
 }
 
 /// Build `Responses` incomplete details from a Chat Completions finish reason.
-fn incomplete_details(finish_reason: Option<&str>) -> Value {
+fn incomplete_details(finish_reason: &str) -> Value {
     match finish_reason {
-        Some("length") => json!({"reason": "max_output_tokens"}),
-        Some("content_filter") => json!({"reason": "content_filter"}),
+        "length" => json!({"reason": "max_output_tokens"}),
+        "content_filter" => json!({"reason": "content_filter"}),
         _ => Value::Null,
     }
 }

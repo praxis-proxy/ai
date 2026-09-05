@@ -911,6 +911,39 @@ async fn malformed_success_aborts_after_headers_are_sent() {
 }
 
 #[tokio::test]
+async fn malformed_success_shape_aborts_after_headers_are_sent() {
+    let yaml = serde_yaml::from_str("{}").unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_test_123");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello"
+    })));
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from_static(b"{}");
+    let mut body = Some(original.clone());
+
+    let error = filter.on_response_body(&mut context, &mut body, true).unwrap_err();
+
+    assert!(error.to_string().contains("choices must be an array"));
+    assert_eq!(body.as_deref(), Some(original.as_ref()));
+}
+
+#[tokio::test]
 async fn finite_provider_error_uses_captured_status_without_mutable_headers() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();

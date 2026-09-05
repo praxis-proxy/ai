@@ -106,6 +106,28 @@ fn responses_to_chat_completions_normalizes_finite_provider_error() {
 }
 
 #[test]
+fn responses_to_chat_completions_rejects_malformed_finite_success() {
+    let backend = Backend::fixed("{}")
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "malformed_finite_success",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = r#"{"model":"gpt-4.1-mini","input":"Hello","stream":false,"store":false}"#;
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("error response should be JSON");
+
+    assert_eq!(parse_status(&raw), 500);
+    assert_eq!(response["error"]["type"], "server_error");
+    assert_eq!(response["error"]["code"], "internal_proxy_error");
+}
+
+#[test]
 fn responses_to_chat_completions_leaves_sse_for_stream_converter() {
     let sse = "data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
     let backend = Backend::fixed(sse)
