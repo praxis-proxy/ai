@@ -388,14 +388,35 @@ struct SearchCallIds<'a> {
 
 /// Remaining web searches this continuation may dispatch.
 ///
-/// Intersects the client's remaining `max_tool_calls` allowance (the
-/// declared maximum minus searches already dispatched across prior
-/// iterations) with the server-side per-continuation hard cap. When the
-/// client omits `max_tool_calls`, only the server cap applies.
+/// Intersects the client's remaining `max_tool_calls` allowance with the
+/// server-side per-continuation hard cap. When the client omits
+/// `max_tool_calls`, only the server cap applies.
+///
+/// `max_tool_calls` is a single budget shared across *every* built-in tool
+/// type, so the allowance is the declared maximum minus all built-in calls
+/// already consumed — web searches dispatched across prior iterations
+/// ([`ResponsesState::web_search_calls_executed`]) *plus* completed non-web
+/// built-in calls (e.g. file search) accumulated this response. Without the
+/// second term a mixed pipeline could dispatch a full web-search allowance on
+/// top of already-executed file searches and overshoot the client's cap. Web
+/// searches are counted through the dedicated counter rather than by scanning
+/// [`ResponsesState::accumulated_output`] to avoid the echoed-call/result
+/// double count documented on that field; non-web built-in calls have no such
+/// counter and are counted directly, mirroring
+/// [`remaining_file_search_call_budget`](super::file_search_callout).
 fn remaining_web_search_budget(state: &ResponsesState) -> usize {
-    let executed = usize::try_from(state.web_search_calls_executed).unwrap_or(usize::MAX);
+    let web_executed = usize::try_from(state.web_search_calls_executed).unwrap_or(usize::MAX);
+    let other_builtin_calls = state
+        .accumulated_output
+        .iter()
+        .filter(|item| {
+            super::file_search_callout::is_builtin_tool_call(item)
+                && item.get("type").and_then(Value::as_str) != Some("web_search_call")
+        })
+        .count();
+    let used = web_executed.saturating_add(other_builtin_calls);
     let client_remaining = state.max_tool_calls.map_or(usize::MAX, |max| {
-        usize::try_from(max).unwrap_or(usize::MAX).saturating_sub(executed)
+        usize::try_from(max).unwrap_or(usize::MAX).saturating_sub(used)
     });
     client_remaining.min(MAX_WEB_SEARCH_CALLS_PER_CONTINUATION)
 }

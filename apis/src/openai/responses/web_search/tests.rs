@@ -1194,6 +1194,46 @@ fn remaining_budget_saturates_when_exhausted() {
     );
 }
 
+#[test]
+fn remaining_budget_subtracts_non_web_builtin_calls() {
+    // `max_tool_calls` is shared across built-in tools: a completed file search
+    // consumes the single-call budget, leaving nothing for a pending web search.
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 1}));
+    state.accumulated_output = vec![serde_json::json!({
+        "type": "file_search_call",
+        "id": "fs_1",
+        "status": "completed",
+    })];
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        0,
+        "a completed file search must exhaust the shared max_tool_calls budget"
+    );
+}
+
+#[test]
+fn remaining_budget_counts_web_and_non_web_builtin_together() {
+    // A dispatched web search (counter) and a completed file search (output
+    // item) both draw down the same shared allowance.
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 5}));
+    state.web_search_calls_executed = 2;
+    state.accumulated_output = vec![
+        serde_json::json!({"type": "file_search_call", "id": "fs_1", "status": "completed"}),
+        // A prior web_search_call output item must NOT be double counted: web
+        // searches are already tracked by web_search_calls_executed.
+        serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+        // A non-built-in item (a message) must not consume budget.
+        serde_json::json!({"type": "message", "id": "msg_1"}),
+    ];
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        2,
+        "5 - (2 web dispatched + 1 file search) = 2; the echoed web_search_call is not double counted"
+    );
+}
+
 #[tokio::test]
 async fn on_request_body_honors_client_max_tool_calls() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
