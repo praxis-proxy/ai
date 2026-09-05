@@ -1471,6 +1471,68 @@ async fn on_response_stays_armed_for_sse_with_charset() {
 }
 
 #[tokio::test]
+async fn on_request_strips_accept_encoding_when_arming() {
+    let (filter, mut ctx) = make_armed_context();
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>().is_some(),
+        "test setup should arm the SSE parser"
+    );
+    assert!(
+        ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
+        "arming logical parsing must strip Accept-Encoding so the backend returns plaintext SSE"
+    );
+}
+
+#[tokio::test]
+async fn on_request_keeps_accept_encoding_when_not_arming() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
+    ctx.current_filter_id = Some(0);
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>().is_none(),
+        "non-streaming request must not arm"
+    );
+    assert!(
+        !ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
+        "Accept-Encoding must only be stripped when logical parsing is armed"
+    );
+}
+
+#[tokio::test]
+async fn on_response_disarms_for_content_encoded_sse() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    // A non-compliant backend returns a gzip-encoded event stream despite the
+    // stripped Accept-Encoding. The raw SSE parser cannot decode it, so the
+    // filter must decline rather than parse opaque bytes into a spurious error.
+    let resp = Box::leak(Box::new(crate::test_utils::make_response()));
+    resp.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    resp.headers
+        .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+    ctx.response_header = Some(resp);
+
+    filter.on_response(&mut ctx).await.unwrap();
+
+    assert!(
+        ctx.get_filter_state::<StreamEventsState>().is_none(),
+        "filter should disarm for a Content-Encoding SSE response it cannot parse"
+    );
+}
+
+#[tokio::test]
 async fn disarmed_filter_passes_error_body_through() {
     let (filter, mut ctx) = make_armed_context();
     filter.on_request(&mut ctx).await.unwrap();

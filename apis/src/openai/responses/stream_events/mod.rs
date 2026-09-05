@@ -209,6 +209,11 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         if is_responses && is_streaming {
             trace!("arming stream_events for streaming Responses API request");
             self.arm(ctx);
+            // The SSE frame parser consumes raw bytes, so a compressed upstream
+            // body would be parsed as opaque data — suppressing the stream and
+            // failing an otherwise valid request. Strip `Accept-Encoding` whenever
+            // logical parsing is armed so a compliant backend returns plaintext SSE.
+            ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         }
 
         Ok(FilterAction::Continue)
@@ -221,6 +226,17 @@ impl HttpFilter for OpenaiStreamEventsFilter {
 
         if !is_success_sse_response(ctx) {
             debug!("disarming stream_events: response is not 2xx text/event-stream");
+            ctx.remove_filter_state::<StreamEventsState>();
+            return Ok(FilterAction::Continue);
+        }
+
+        // Defense in depth: `on_request` strips `Accept-Encoding`, but a
+        // non-compliant backend may still return an encoded body. The SSE
+        // parser cannot decode it, so decline to parse and let the response
+        // pass through untransformed rather than corrupt an otherwise valid
+        // stream into a spurious error.
+        if response_is_encoded(ctx) {
+            debug!("disarming stream_events: response carries Content-Encoding");
             ctx.remove_filter_state::<StreamEventsState>();
             return Ok(FilterAction::Continue);
         }
@@ -588,6 +604,18 @@ fn is_success_sse_response(ctx: &HttpFilterContext<'_>) -> bool {
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(is_event_stream_content_type)
+}
+
+/// Whether the upstream response advertises a `Content-Encoding`.
+///
+/// The SSE frame parser consumes raw bytes, so a compressed body would be
+/// parsed as opaque data. `on_request` strips `Accept-Encoding` to keep a
+/// compliant backend from encoding; this guards the residual case of a
+/// non-compliant backend that encodes anyway.
+fn response_is_encoded(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.response_header
+        .as_ref()
+        .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_ENCODING))
 }
 
 
