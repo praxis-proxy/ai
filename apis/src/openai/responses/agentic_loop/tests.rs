@@ -152,6 +152,11 @@ async fn tool_choice_reset_after_first_iteration() {
         "tool_choice should be reset to auto after first iteration"
     );
     assert_eq!(
+        state.original_tool_choice,
+        Some(json!("required")),
+        "client-visible tool_choice should survive internal continuation resets"
+    );
+    assert_eq!(
         state.request_body["tool_choice"], "auto",
         "tool_choice should be inserted into request_body for proxy serialization"
     );

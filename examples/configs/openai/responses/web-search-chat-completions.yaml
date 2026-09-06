@@ -1,0 +1,89 @@
+# Responses Web Search with a Chat Completions Backend
+#
+# Accepts finite OpenAI Responses requests with hosted web search while
+# targeting a backend that only implements /v1/chat/completions. The
+# compatibility filter privately exposes web_search to that backend as a
+# strict function tool. The existing openai_web_search executor handles the
+# returned call and IRR drives the second inference round.
+#
+# Request order inside IRR:
+#   openai_web_search -> openai_agentic_loop
+#     -> responses_to_chat_completions -> path_rewrite -> router
+#
+# Response filters run in reverse. Each Chat Completions response is therefore
+# converted into a Responses resource before openai_agentic_loop sees it. A
+# private function_call(name="web_search") becomes a canonical web_search_call,
+# which openai_web_search executes on the next iteration.
+#
+# This pipeline is finite only. Streaming composition depends on the separate
+# Chat SSE conversion and streaming-across-IRR work.
+
+listeners:
+  - name: responses-web-search-chat-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-web-search-chat]
+
+filter_chains:
+  - name: responses-web-search-chat
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: openai_tool_parse
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 11
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_web_search
+                provider: brave
+                api_key: ${WEB_SEARCH_API_KEY}
+
+              - filter: openai_agentic_loop
+                max_infer_iters: 10
+
+              - filter: responses_to_chat_completions
+                max_rewritten_body_bytes: 67108864
+
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+
+              - filter: router
+                routes:
+                  - path: "/v1/chat/completions"
+                    cluster: "chat-completions-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "chat-completions-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_web_search
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

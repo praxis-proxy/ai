@@ -1,0 +1,35 @@
+version: 1
+id: responses/chat-web-search
+description: Hosted Responses web search is synthesized as a bounded Chat Completions function tool.
+protocol: openai_responses
+example_config: openai/responses/web-search-chat-completions-fixture.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.web_search
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Find the latest Praxis Proxy release.
+          store: false
+          stream: false
+          tools:
+            - type: web_search
+              search_context_size: high
+          tool_choice:
+            type: web_search
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

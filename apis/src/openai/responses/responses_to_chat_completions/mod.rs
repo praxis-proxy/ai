@@ -69,6 +69,9 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// It converts the enriched request to Chat Completions wire format, converts
 /// finite successful Chat responses back to Responses resources, and
 /// normalizes finite provider errors while preserving their HTTP status.
+/// Supported hosted web-search tools are exposed to the Chat backend as a
+/// private, bounded `web_search` function. Returned calls are restored to
+/// canonical `web_search_call` output before downstream agentic filters run.
 /// Chat Completions SSE is left byte-for-byte unchanged for the separate
 /// incremental stream converter.
 ///
@@ -81,6 +84,10 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// resolved, preventing a continuation from silently losing prior turns.
 /// Chat Completions SSE response conversion is tracked separately in
 /// [issue #36](https://github.com/praxis-proxy/ai/issues/36).
+/// For finite web-search loops, place `openai_web_search` and
+/// `openai_agentic_loop` before this filter in an iterative-router step. The
+/// reverse response order then restores the hosted call before those filters
+/// inspect it.
 ///
 /// # YAML
 ///
@@ -282,7 +289,12 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
         ctx.set_metadata(ARMED_KEY, "true");
-        ctx.set_metadata(CREATED_AT_KEY, ctx.time_source.now().as_secs().to_string());
+        let now = ctx.time_source.now().as_secs();
+        let created_at = ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .map_or(now, |state| *state.response_created_at.get_or_insert(now));
+        ctx.set_metadata(CREATED_AT_KEY, created_at.to_string());
 
         Ok(FilterAction::Continue)
     }
@@ -298,6 +310,14 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
         Some(format) => {
             trace!(format, "releasing request classified as a different API format");
             Some(FilterAction::Release)
+        },
+        None if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.response_id.is_some()) =>
+        {
+            trace!("using canonical Responses state across an iterative router metadata boundary");
+            None
         },
         None => {
             warn!(
@@ -346,8 +366,16 @@ fn ensure_previous_response_rehydrated(state: &ResponsesState, streaming: bool) 
 
 /// Return the client stream preference captured by the classifier.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream")
-        .is_some_and(|value| value == "true")
+    ctx.get_metadata("openai_responses_format.stream").map_or_else(
+        || {
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.request_body.get("stream"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        },
+        |value| value == "true",
+    )
 }
 
 /// Detect an SSE media type while response headers are still available.
@@ -444,20 +472,25 @@ fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
 
 /// Convert a finite successful Chat response into a Responses resource.
 fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Result<Bytes, FilterError> {
-    let response_id = ctx
-        .get_metadata("responses.response_id")
-        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing response id".into() })?;
-    let created_at = ctx
-        .get_metadata(CREATED_AT_KEY)
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing creation timestamp".into() })?;
     let state = ctx
         .extensions
         .get::<ResponsesState>()
         .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing Responses state".into() })?;
-    let response_context =
+    let response_id = ctx
+        .get_metadata("responses.response_id")
+        .or(state.response_id.as_deref())
+        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing response id".into() })?;
+    let created_at = ctx
+        .get_metadata(CREATED_AT_KEY)
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(state.response_created_at)
+        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing creation timestamp".into() })?;
+    let mut response_context =
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
             .with_completed_at(ctx.time_source.now().as_secs());
+    if let Some(original_tool_choice) = state.original_tool_choice.as_ref() {
+        response_context.tool_choice = Some(original_tool_choice);
+    }
     let provider_response: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
     let translated = chat_response_to_response_resource(&provider_response, &response_context)

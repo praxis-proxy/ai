@@ -16,6 +16,7 @@ mod azure_ad;
 mod compact;
 mod credential_injection;
 mod file_search_callout;
+mod file_search_chat_completions;
 mod full_flow;
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]
@@ -60,3 +61,4 @@ mod token_usage_headers;
 mod vector_stores_routing;
 mod vllm_agentic_api;
 mod web_search;
+mod web_search_chat_completions;

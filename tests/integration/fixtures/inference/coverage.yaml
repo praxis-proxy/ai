@@ -18,6 +18,15 @@ features:
         status: covered
       vllm:
         status: live_covered
+  - id: messages.request.client_tool_ownership
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/typed-server-tools
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.response.text
     scopes:
       - messages_to_chat_completions
@@ -138,6 +147,24 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.web_search
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-web-search
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.file_search
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-file-search
     providers:
       synthetic:
         status: synthetic_only

@@ -46,7 +46,7 @@ use tracing::{debug, warn};
 use super::state::ResponsesState;
 use crate::web_search::{
     OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult,
-    build_config, format_search_results,
+    build_config, format_search_results, is_web_search_tool_type,
 };
 
 // -----------------------------------------------------------------------------
@@ -64,6 +64,9 @@ const ACTION_DONE: &str = "done";
 
 /// Include value that gates `action.sources` in the output item.
 const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
+
+/// Model-facing result for a malformed call without `action.query`.
+const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query was missing.";
 
 // -----------------------------------------------------------------------------
 // WebSearchFilter
@@ -181,7 +184,7 @@ impl WebSearchFilter {
                 public: call_id,
                 bridge: &bridge,
             };
-            append_result(ctx, &ids, "incomplete", "", &[]);
+            append_incomplete(ctx, &ids);
             return;
         };
 
@@ -191,7 +194,7 @@ impl WebSearchFilter {
             bridge: &bridge,
         };
         match self.search_client.search(query, Some(context_size)).await {
-            SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
+            SearchOutcome::Results(results) => append_result(ctx, &ids, query, &results),
             SearchOutcome::Failed => {
                 warn!(
                     call_id,
@@ -259,6 +262,7 @@ impl HttpFilter for WebSearchFilter {
 
         let context_size = ctx
             .get_metadata("tool_parse.search_context_size")
+            .or_else(|| web_search_context_size_from_state(state))
             .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
 
         let calls: Vec<Value> = state.web_search_calls.clone();
@@ -303,6 +307,18 @@ impl HttpFilter for WebSearchFilter {
     }
 }
 
+/// Recover per-request search context after IRR resets step-local metadata.
+fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
+    state.tools.iter().find_map(|tool| {
+        let tool_type = tool.get("type").and_then(Value::as_str)?;
+        if is_web_search_tool_type(tool_type) {
+            tool.get("search_context_size").and_then(Value::as_str)
+        } else {
+            None
+        }
+    })
+}
+
 /// Public and bridge identifiers for one appended web-search result.
 ///
 /// `public` is the hosted, client-facing `web_search_call.id` retained on the
@@ -321,16 +337,23 @@ struct SearchCallIds<'a> {
 ///
 /// An empty `results` slice is a successful zero-result search: the model
 /// receives `No search results found.` and the public item stays `completed`.
-fn append_result(
-    ctx: &mut HttpFilterContext<'_>,
-    ids: &SearchCallIds<'_>,
-    status: &str,
-    query: &str,
-    results: &[SearchResult],
-) {
+fn append_result(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, query: &str, results: &[SearchResult]) {
     let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(ids.public, status, query, results, include_sources);
+    let output_item = build_output_item(ids.public, "completed", query, results, include_sources);
     let bridge = build_tool_result_messages(ids.bridge, query, results);
+    push_search_turn(ctx, output_item, bridge);
+}
+
+/// Append a malformed search turn to [`ResponsesState`].
+///
+/// The public item remains `incomplete`, while the backend-valid bridge carries
+/// the missing arguments and an explicit failure message. This prevents the
+/// next inference iteration and persisted replay from treating a missing query
+/// as a successful search with zero results.
+fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
+    let include_sources = include_action_sources(ctx);
+    let output_item = build_output_item(ids.public, "incomplete", "", &[], include_sources);
+    let bridge = build_incomplete_tool_result_messages(ids.bridge);
     push_search_turn(ctx, output_item, bridge);
 }
 
@@ -477,6 +500,28 @@ pub(crate) fn build_tool_result_messages(call_id: &str, query: &str, results: &[
             "type": "function_call_output",
             "call_id": call_id,
             "output": content,
+        }),
+    ]
+}
+
+/// Build the backend-valid continuation for a call missing `action.query`.
+///
+/// The synthetic function call is fully generated, so its status is
+/// `completed`; the empty arguments and explicit output truthfully describe
+/// the incomplete hosted-tool execution.
+pub(crate) fn build_incomplete_tool_result_messages(call_id: &str) -> [Value; 2] {
+    [
+        serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "web_search",
+            "arguments": "{}",
+            "status": "completed",
+        }),
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": MISSING_QUERY_OUTPUT,
         }),
     ]
 }

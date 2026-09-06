@@ -1,0 +1,101 @@
+# Responses File Search with a Chat Completions Backend
+#
+# Accepts finite OpenAI Responses requests with hosted file search while
+# targeting a backend that only implements /v1/chat/completions. The
+# compatibility filter privately exposes file_search to that backend as a
+# function tool, then the existing file-search callout executes the returned
+# function call and drives one more finite inference round.
+#
+# Request order:
+#   1. openai_responses_format classifies the client request.
+#   2. openai_responses_validate creates canonical ResponsesState.
+#   3. iterative_request_router owns the finite model-search-model loop.
+#   4. openai_file_search_callout executes pending hosted search calls.
+#   5. responses_to_chat_completions synthesizes the private function tool.
+#   6. path_rewrite selects /v1/chat/completions explicitly.
+#
+# Response filters run in reverse order. Each Chat Completions response is
+# therefore converted into a Responses resource before
+# openai_file_search_callout inspects it. A returned
+# function_call(name="file_search") is normalized to file_search_call,
+# executed through the vector store, and retained in the client-visible final
+# Responses output.
+#
+# This pipeline is finite only. Streaming file-search orchestration is not
+# supported.
+
+listeners:
+  - name: responses-file-search-chat-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-file-search-chat]
+
+filter_chains:
+  - name: responses-file-search-chat
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 8
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_response_bytes: 67108864
+        max_state_bytes: 136314880
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_file_search_callout
+                vector_store_url: http://127.0.0.1:8001
+                allow_private_url: true
+                timeout_ms: 5000
+                max_response_bytes: 10485760
+                max_total_response_bytes: 67108864
+                max_state_bytes: 136314880
+                on_failure: closed
+                forward_headers:
+                  - authorization
+
+              - filter: responses_to_chat_completions
+                max_rewritten_body_bytes: 67108864
+
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+
+              - filter: router
+                routes:
+                  - path: "/v1/chat/completions"
+                    cluster: "chat-completions-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "chat-completions-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_file_search_callout
+                key: pending
+                value: "true"
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

@@ -181,6 +181,7 @@ async fn validates_previous_response_and_sets_metadata() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("responses.response_id", "resp_current");
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -216,6 +217,7 @@ async fn validates_previous_response_and_sets_metadata() {
         state.messages[2]["content"], "What next?",
         "current input should be last"
     );
+    assert_eq!(state.response_id.as_deref(), Some("resp_current"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1351,6 +1353,7 @@ async fn rehydrates_from_conversation_string_id() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("responses.response_id", "resp_conversation");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"turn two","conversation":"conv_abc"}"#,
     ));
@@ -1379,6 +1382,7 @@ async fn rehydrates_from_conversation_string_id() {
         3,
         "persisted_messages should mirror messages for conversation rehydration"
     );
+    assert_eq!(state.response_id.as_deref(), Some("resp_conversation"));
 }
 
 #[tokio::test]

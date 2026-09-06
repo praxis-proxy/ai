@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "scenario_id": "responses/chat-web-search",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-chat-web-search",
+    "source_id": "controlled-chat-web-search-translation"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_search_1": "call_recorded_0002",
+      "chatcmpl_web_search": "chatcmpl-recorded-0003",
+      "resp_controlled": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": ["application/json"]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Find the latest Praxis Proxy release.",
+              "model": "synthetic-chat-web-search",
+              "store": false,
+              "stream": false,
+              "tool_choice": {"type": "web_search"},
+              "tools": [{"search_context_size": "high", "type": "web_search"}]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": ["application/json"]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": "1970-01-01T00:00:00Z",
+              "error": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "Find the latest Praxis Proxy release.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "max_tool_calls": null,
+              "metadata": {},
+              "model": "synthetic-chat-web-search",
+              "object": "response",
+              "output": [{
+                "action": {"query": "Praxis Proxy latest release", "type": "search"},
+                "id": "call_recorded_0002",
+                "status": "completed",
+                "type": "web_search_call"
+              }],
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt_cache_key": null,
+              "reasoning": null,
+              "safety_identifier": null,
+              "service_tier": "default",
+              "status": "completed",
+              "store": false,
+              "temperature": 1.0,
+              "text": {"format": {"type": "text"}},
+              "tool_choice": {"type": "web_search"},
+              "tools": [{"search_context_size": "high", "type": "web_search"}],
+              "top_logprobs": 0,
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 17
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": ["application/json"]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [{"content": "Find the latest Praxis Proxy release.", "role": "user"}],
+              "model": "synthetic-chat-web-search",
+              "stream": false,
+              "tool_choice": {"function": {"name": "web_search"}, "type": "function"},
+              "tools": [{
+                "function": {
+                  "description": "Search the web for up-to-date information.",
+                  "name": "web_search",
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {"query": {"maxLength": 4096, "minLength": 1, "type": "string"}},
+                    "required": ["query"],
+                    "type": "object"
+                  },
+                  "strict": true
+                },
+                "type": "function"
+              }]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": ["application/json"]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [{
+                "finish_reason": "tool_calls",
+                "index": 0,
+                "message": {
+                  "content": null,
+                  "role": "assistant",
+                  "tool_calls": [{
+                    "function": {"arguments": "{\"query\":\"Praxis Proxy latest release\"}", "name": "web_search"},
+                    "id": "call_recorded_0002",
+                    "type": "function"
+                  }]
+                }
+              }],
+              "created": 0,
+              "id": "chatcmpl-recorded-0003",
+              "model": "synthetic-chat-web-search",
+              "object": "chat.completion",
+              "usage": {"completion_tokens": 5, "prompt_tokens": 12, "total_tokens": 17}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

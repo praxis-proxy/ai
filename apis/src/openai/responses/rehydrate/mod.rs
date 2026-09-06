@@ -139,7 +139,8 @@ impl RehydrateFilter {
             };
         let previous_tools = collect_mcp_tool_listings(&record);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
-        let state = build_state(parsed_body, stored, previous_tools, previous_usage);
+        let mut state = build_state(parsed_body, stored, previous_tools, previous_usage);
+        state.response_id = ctx.get_metadata("responses.response_id").map(ToOwned::to_owned);
         write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
         ctx.extensions.insert(state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
@@ -176,7 +177,8 @@ impl RehydrateFilter {
             Ok(s) => s,
             Err(action) => return Ok(action),
         };
-        let state = build_state(parsed_body, stored, vec![], None);
+        let mut state = build_state(parsed_body, stored, vec![], None);
+        state.response_id = ctx.get_metadata("responses.response_id").map(ToOwned::to_owned);
         write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
         ctx.extensions.insert(state);
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");

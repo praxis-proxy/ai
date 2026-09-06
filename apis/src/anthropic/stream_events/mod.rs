@@ -86,7 +86,8 @@ const ARMED_KEY: &str = "anthropic_stream.armed";
 /// filter sets `anthropic_messages_format.stream` or
 /// `anthropic_to_openai.streaming` metadata to `"true"` and
 /// the backend response has `Content-Type: text/event-stream`
-/// (with or without parameters such as `charset=utf-8`).
+/// (with or without parameters such as `charset=utf-8`) and does
+/// not carry a `Content-Encoding` header.
 /// No `response_conditions` configuration is needed.
 ///
 /// # YAML
@@ -164,7 +165,8 @@ impl HttpFilter for AnthropicStreamEventsFilter {
         BodyMode::Stream
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         Ok(FilterAction::Continue)
     }
 
@@ -398,6 +400,15 @@ fn should_arm(ctx: &HttpFilterContext<'_>) -> bool {
 
     if !is_sse {
         debug!("streaming request but non-SSE response; skipping stream transformation");
+        return false;
+    }
+
+    let is_encoded = ctx
+        .response_header
+        .as_ref()
+        .is_some_and(|response| response.headers.contains_key(http::header::CONTENT_ENCODING));
+    if is_encoded {
+        debug!("streaming SSE response is encoded; skipping stream transformation");
         return false;
     }
 
@@ -949,6 +960,20 @@ mod tests {
         assert_eq!(filter.name(), "anthropic_stream_events", "filter name should match");
     }
 
+    #[tokio::test]
+    async fn on_request_prevents_upstream_response_encoding() {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
+            "stream transformation requires an unencoded upstream representation"
+        );
+    }
+
     #[test]
     fn incremental_text_chunks_transformed_immediately() {
         let (filter, mut ctx) = make_filter_and_context();
@@ -1229,6 +1254,36 @@ mod tests {
             "non-SSE response should preserve original content type"
         );
         assert!(!is_armed(&ctx), "filter should not arm for non-SSE response");
+    }
+
+    #[tokio::test]
+    async fn encoded_sse_response_passes_through_unchanged() {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut resp = crate::test_utils::make_response();
+        resp.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        resp.headers
+            .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+        ctx.response_header = Some(&mut resp);
+        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+
+        drop(filter.on_response(&mut ctx).await.unwrap());
+
+        assert!(!is_armed(&ctx), "filter should not arm for an encoded SSE response");
+        assert!(
+            !ctx.response_headers_modified,
+            "encoded SSE response headers should remain unchanged"
+        );
+
+        let encoded = Bytes::from_static(b"\x1f\x8bencoded-sse");
+        let mut body = Some(encoded.clone());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+        assert_eq!(body, Some(encoded), "encoded SSE bytes should pass through unchanged");
     }
 
     #[tokio::test]

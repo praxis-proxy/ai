@@ -1041,5 +1041,151 @@ class TestFileSearchVLLM:
             )
 
 
+# ---------------------------------------------------------------------------
+# File search via Chat Completions translation (issue #296)
+# ---------------------------------------------------------------------------
+
+FILE_SEARCH_CHAT_CONFIG_PATH = (
+    "examples/configs/openai/responses/file-search-chat-completions.yaml"
+)
+
+
+def _write_file_search_chat_config(praxis_port: int) -> str:
+    """Patch the shipped file-search-chat-completions example for testing.
+
+    Exercises the real example config (per repo test requirements) while
+    retargeting the vector-store callout at OGX and the model backend at
+    vLLM's /v1/chat/completions endpoint.
+    """
+    with open(FILE_SEARCH_CHAT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+    config = config.replace("127.0.0.1:8001", _ogx_endpoint())
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+@pytest.fixture(scope="session")
+def file_search_chat_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy with the file-search Chat Completions pipeline."""
+    port = _free_port()
+    config_path = _write_file_search_chat_config(port)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("file-search-chat")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== File search (chat) proxy logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def file_search_chat_client(file_search_chat_proxy):
+    """Return an OpenAI client pointed at the file-search chat proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{file_search_chat_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+class TestFileSearchChatCompletionsVLLM:
+    """Issue #296: hosted file_search against a Chat Completions backend.
+
+    Unlike TestFileSearchVLLM (which proxies vLLM's native /v1/responses),
+    this drives responses_to_chat_completions: the native file_search tool
+    is synthesized into a private chat `function`, vLLM's
+    /v1/chat/completions emits the call, the proxy runs the OGX vector-store
+    search, and drives one more finite inference round -- without ever
+    exposing the private function to the client.
+    """
+
+    def test_file_search_translated_to_chat_function_round_trip(
+        self, file_search_chat_client, vector_store
+    ):
+        store_id, marker = vector_store
+        response = file_search_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST use the file_search tool to find the Praxis marker "
+                "in the indexed report. Do not answer from memory. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "file_search",
+                    "vector_store_ids": [store_id],
+                }
+            ],
+            include=["file_search_call.results"],
+            store=False,
+            max_output_tokens=512,
+        )
+
+        assert response.status in ("completed", "incomplete"), (
+            f"response should reach a terminal status; got {response.status}"
+        )
+
+        output_types = [item.type for item in response.output]
+
+        # The synthesized private function must never leak to the client; it
+        # is normalized back to a hosted file_search_call.
+        assert all(t != "function_call" for t in output_types), (
+            "the private file_search function must not surface as a client "
+            f"function_call; got output types: {output_types}"
+        )
+
+        file_search_items = [
+            item for item in response.output if item.type == "file_search_call"
+        ]
+        assert file_search_items, (
+            "the synthesized file_search function call should be normalized "
+            f"back to a file_search_call; got output types: {output_types}"
+        )
+        for item in file_search_items:
+            assert item.status in ("completed", "incomplete"), (
+                f"file_search_call status should be terminal; got: {item.status}"
+            )
+
+        # Results come from OGX deterministically (not the model), so the
+        # indexed marker must round-trip through the model->search->model flow.
+        # If a future OGX result shape omits content text, relax this to
+        # asserting file_search results are simply non-empty.
+        payload = json.dumps(response.model_dump(), default=str)
+        assert marker in payload, (
+            "OGX search results (via include=file_search_call.results) should "
+            f"contain the indexed marker {marker!r}; got: {payload}"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))

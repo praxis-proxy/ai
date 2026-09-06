@@ -769,6 +769,7 @@ async fn forced_tool_choice_resets_after_search_execution() {
     ));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.tool_choice, "auto");
+    assert_eq!(state.original_tool_choice, Some(json!({"type":"file_search"})));
     assert!(state.request_body.get("tool_choice").is_none());
 }
 

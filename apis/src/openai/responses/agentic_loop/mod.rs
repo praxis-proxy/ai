@@ -311,7 +311,8 @@ fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState
     set_request_body_field(state, "parallel_tool_calls", Value::Bool(false));
 
     if state.iteration > 0 {
-        state.tool_choice = json!("auto");
+        let original = std::mem::replace(&mut state.tool_choice, json!("auto"));
+        state.original_tool_choice.get_or_insert(original);
         set_request_body_field(state, "tool_choice", json!("auto"));
         ctx.request_headers_to_set
             .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));

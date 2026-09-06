@@ -59,6 +59,44 @@ jobs:
           done
 
   # ----------------------------------------------------------------------------
+  # Close Non-Fork PRs
+  # ----------------------------------------------------------------------------
+
+  close-non-fork-prs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
+          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
+
+      - name: Close PRs not opened from a fork
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Contributions must come from a fork. A PR whose head branch lives in
+          # this repository (isCrossRepository == false) is closed, except for
+          # bot-authored PRs such as Dependabot, which legitimately push branches
+          # to this repository, and PRs carrying the skip/non-fork-close label.
+          prs=$(gh pr list --base main --state open --limit 100 \
+            --json number,isCrossRepository,author,labels \
+            --jq '[.[]
+              | select(.isCrossRepository == false)
+              | select(.author.is_bot == false)
+              | select(.labels | map(.name) | any(. == "skip/non-fork-close") | not)
+            ] | .[].number')
+
+          for number in $prs; do
+            gh pr close "$number" --comment "Closed: pull requests must be opened from a fork, not from a branch in this repository. Please push your branch to your fork and open a new pull request from there."
+          done
+
+  # ----------------------------------------------------------------------------
   # Close Stale Draft PRs
   # ----------------------------------------------------------------------------
 
