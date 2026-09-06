@@ -201,6 +201,7 @@ pub(crate) enum RequestBodyRebuild {
 }
 
 impl Default for ResponsesState {
+    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
         Self {
             citation_files: HashMap::new(),
