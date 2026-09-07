@@ -1387,11 +1387,12 @@ impl StreamConverter {
         // Emit the in-progress lifecycle first, but tolerate its own frame-size
         // trip: the `response.created`/`response.in_progress` snapshot echoes
         // request-controlled fields (instructions, input, ...) and can itself
-        // exceed the per-frame ceiling. `ensure_lifecycle` then emits nothing and
-        // marks the lifecycle started, so a coherent (minimal) `response.failed`
-        // can still terminate the stream below.
+        // exceed the per-frame ceiling. A tiny event budget can likewise be too
+        // small for the atomic lifecycle pair. `ensure_lifecycle` then emits
+        // nothing and marks the lifecycle started, so the reserved
+        // `response.failed` terminal can still close the stream below.
         match self.ensure_lifecycle(inputs, out) {
-            Ok(()) | Err(ConvertError::FrameSizeLimit) => {},
+            Ok(()) | Err(ConvertError::FrameSizeLimit | ConvertError::EventLimit) => {},
             Err(other) => return Err(other),
         }
         // A failed response has no completion moment, so no completed_at timestamp.

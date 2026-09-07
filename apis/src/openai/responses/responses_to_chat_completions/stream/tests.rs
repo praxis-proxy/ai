@@ -1211,6 +1211,34 @@ fn event_limit_emits_failed() {
 }
 
 #[test]
+fn empty_stream_with_tiny_event_budget_still_emits_failed() {
+    let body = request_body();
+    for max_stream_events in [1, 2] {
+        let limits = StreamLimits {
+            max_stream_events,
+            ..wide_limits()
+        };
+        let mut conv = converter(limits);
+        let inputs = SnapshotInputs {
+            request_body: &body,
+            original_tool_choice: None,
+            now: NOW,
+        };
+        let raw = conv
+            .finish(&inputs)
+            .expect("empty stream failure should remain serializable")
+            .expect("empty stream must emit a failure terminal even under a tiny event budget");
+        let events = parse_events(&raw);
+        assert_eq!(
+            types(&events),
+            vec!["response.failed"],
+            "the reserved terminal must survive when the lifecycle pair cannot fit at budget {max_stream_events}",
+        );
+        assert_eq!(events[0].1["sequence_number"], 0);
+    }
+}
+
+#[test]
 fn tool_call_limit_emits_failed() {
     let limits = StreamLimits {
         max_tool_calls: 1,
