@@ -8,11 +8,16 @@
     reason = "utoipa macro-generated schema builders allocate large temporary values"
 )]
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use utoipa::{
-    ToSchema,
-    openapi::schema::{AnyOfBuilder, ArrayBuilder, Object, ObjectBuilder, Ref, Schema, Type},
+    PartialSchema, ToSchema,
+    openapi::{
+        RefOr,
+        schema::{AnyOfBuilder, ArrayBuilder, Object, ObjectBuilder, Ref, Schema, SchemaType, Type},
+    },
 };
 
 use super::item_schema::validate_input_item;
@@ -44,12 +49,60 @@ pub(super) struct UpdateConversationRequest {
 }
 
 /// Request body accepted by `POST /conversations/{conversation_id}/items`.
-#[derive(Debug, Deserialize, ToSchema)]
+///
+/// The `OpenAPI` schema is hand-built by the [`PartialSchema`] impl below so the
+/// emitted component omits the top-level `type: object`, matching OpenAI's inline
+/// `createConversationItems` request body (`properties.items` + `required:
+/// [items]` only).
+#[derive(Debug, Deserialize)]
 pub(super) struct CreateConversationItemsRequest {
     /// Items to create.
     #[serde(default)]
-    #[schema(value_type = Vec<InputItem>, required = true, max_items = 20)]
     pub(super) items: Option<Vec<InputItem>>,
+}
+
+impl PartialSchema for CreateConversationItemsRequest {
+    /// Emit the append-items body schema without a top-level `type: object`.
+    ///
+    /// utoipa's `ObjectBuilder` defaults `schema_type` to [`Type::Object`], so a
+    /// derived schema would add `type: object` at the top level. The pinned
+    /// OpenAI `createConversationItems` body has no top-level type — only
+    /// `properties.items` and `required: [items]` — so the type is cleared with
+    /// [`SchemaType::AnyValue`], which utoipa omits from the serialized schema.
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(Schema::Object(
+            ObjectBuilder::new()
+                .schema_type(SchemaType::AnyValue)
+                .description(Some(
+                    "Request body accepted by `POST /conversations/{conversation_id}/items`.",
+                ))
+                .property(
+                    "items",
+                    ArrayBuilder::new()
+                        .items(Ref::from_schema_name("InputItem"))
+                        .description(Some("Items to create."))
+                        .max_items(Some(MAX_ITEMS_PER_REQUEST)),
+                )
+                .required("items")
+                .build(),
+        ))
+    }
+}
+
+impl ToSchema for CreateConversationItemsRequest {
+    /// Preserve the derived component name referenced by the request body.
+    fn name() -> Cow<'static, str> {
+        Cow::Borrowed("CreateConversationItemsRequest")
+    }
+
+    /// Forward the referenced `InputItem` union exactly as the derive did.
+    fn schemas(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+        schemas.push((
+            <InputItem as ToSchema>::name().into_owned(),
+            <InputItem as PartialSchema>::schema(),
+        ));
+        <InputItem as ToSchema>::schemas(schemas);
+    }
 }
 
 /// Metadata supplied with a conversation.
