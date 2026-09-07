@@ -484,6 +484,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "sequential setup, execution, and wire assertions")]
     async fn execute_overwrites_conflicting_host_header() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -496,13 +497,15 @@ mod tests {
             http::HeaderValue::from_static("attacker.example.com"),
         );
 
-        Box::pin(execute_resolved_url(
+        Box::pin(execute_with_addresses(
             &test_client(),
             parsed,
             request,
-            &[addr],
             1024,
             Duration::from_secs(5),
+            AddressPolicy::AllowPrivate,
+            None,
+            vec![addr],
         ))
         .await
         .unwrap();
