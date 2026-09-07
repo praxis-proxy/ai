@@ -112,6 +112,8 @@ enum ConvertError {
     Serialize(serde_json::Error),
     /// A Chat chunk was not valid JSON.
     MalformedJson,
+    /// Accumulated stream state could not form a valid terminal response.
+    InvalidTerminalResource,
     /// The upstream response contained more than one choice.
     MultipleChoices,
     /// The single choice used an index other than zero.
@@ -1253,8 +1255,10 @@ impl StreamConverter {
         let finish = self.finish_reason.clone().unwrap_or_default();
         let context = self.response_context(inputs, Some(inputs.now));
         let synthetic = self.synthetic_completion(&finish);
-        let mut resource = chat_response_to_response_resource(&synthetic, &context)
-            .unwrap_or_else(|_| in_progress_response_resource(&context));
+        let mut resource = chat_response_to_response_resource(&synthetic, &context).map_err(|error| {
+            tracing::trace!(%error, "accumulated stream state could not form a valid terminal response");
+            ConvertError::InvalidTerminalResource
+        })?;
         self.order_output_by_stream_index(&mut resource);
         self.order_message_content_by_stream_index(&mut resource);
         // The finite path rejects a serialized response exceeding `max_body_bytes`
@@ -1790,6 +1794,7 @@ fn is_recognized_finish_reason(reason: &str) -> bool {
 fn failure_message(error: &ConvertError) -> &'static str {
     match error {
         ConvertError::MalformedJson => "upstream returned a malformed streaming chunk",
+        ConvertError::InvalidTerminalResource => "upstream stream could not form a valid terminal response",
         ConvertError::MultipleChoices | ConvertError::InvalidChoiceIndex => {
             "upstream returned an unsupported multi-choice stream"
         },

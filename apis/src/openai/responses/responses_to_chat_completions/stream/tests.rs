@@ -828,6 +828,36 @@ fn tool_call_without_identity_fails_closed() {
 }
 
 #[test]
+fn invalid_terminal_resource_fails_closed() {
+    for (finish_reason, label) in [
+        ("stop", "empty completed response"),
+        ("tool_calls", "missing tool call"),
+    ] {
+        let chunk = format!(
+            r#"{{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{{"index":0,"delta":{{}},"finish_reason":"{finish_reason}"}}]}}"#,
+        );
+        let events = run_stream(&[&chunk], wide_limits());
+
+        assert!(
+            !events
+                .iter()
+                .any(|(event_type, _)| matches!(event_type.as_str(), "response.completed" | "response.incomplete")),
+            "{label} must not emit a successful terminal: {events:?}",
+        );
+        let (event_type, payload) = events.last().expect("a malformed terminal must emit response.failed");
+        assert_eq!(event_type, "response.failed", "{label} must fail closed");
+        assert_eq!(
+            payload["response"]["status"], "failed",
+            "{label} must carry a failed resource"
+        );
+        assert!(
+            payload["response"]["output"].as_array().is_some_and(Vec::is_empty),
+            "{label} must not manufacture output: {payload}",
+        );
+    }
+}
+
+#[test]
 fn tool_call_fragment_without_index_fails_closed() {
     // The Chat Completions streaming format correlates tool-call fragments by
     // their `index`. Two distinct calls that both omit `index` would otherwise
