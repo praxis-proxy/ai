@@ -551,12 +551,11 @@ fn collect_mcp_tool_listings_from_items(
 
         let label = item.get("server_label").and_then(Value::as_str)?;
         let tools = item.get("tools").and_then(Value::as_array)?;
-        let names = mcp_tool_names(tools);
-        let mut dedupe_names = names.clone();
-        dedupe_names.sort();
-        dedupe_names.dedup();
+        let mut names = mcp_tool_names(tools);
+        names.sort();
+        names.dedup();
 
-        if !seen.insert((label.to_owned(), dedupe_names)) {
+        if !seen.insert((label.to_owned(), names)) {
             return None;
         }
 
