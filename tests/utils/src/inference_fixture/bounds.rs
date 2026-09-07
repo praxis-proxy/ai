@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Replay input and scripted response resource bounds.
 
 use std::io::Read as _;

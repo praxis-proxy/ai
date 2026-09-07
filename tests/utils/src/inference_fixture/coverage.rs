@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Coverage-manifest loading and inference fixture discovery.
 
 use std::{
@@ -1224,6 +1227,10 @@ mod tests {
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
@@ -1232,6 +1239,9 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
             ]
@@ -1244,7 +1254,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
@@ -1252,32 +1266,42 @@ mod tests {
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 13);
-        assert_eq!(report.scenarios_total, 11);
-        assert_eq!(report.recordings_total, 16);
+        assert_eq!(report.features_total, 20);
+        assert_eq!(report.scenarios_total, 18);
+        assert_eq!(report.recordings_total, 23);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
                 "messages/basic-nonstream",
                 "messages/basic-stream",
+                "messages/malformed-success",
+                "messages/malformed-tool-arguments",
                 "messages/native-basic-nonstream",
                 "messages/native-basic-stream",
                 "messages/native-tool-use",
+                "messages/typed-server-tools",
                 "messages/upstream-error",
                 "responses/agentic-parallel-tool-calls",
                 "responses/chat-basic-nonstream",
+                "responses/chat-basic-stream",
+                "responses/chat-file-search",
+                "responses/chat-web-search",
+                "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 13);
+        assert_eq!(manifest.features.len(), 20);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1294,6 +1318,10 @@ mod tests {
                     ]
                 ),
                 (
+                    &"messages.request.client_tool_ownership".to_owned(),
+                    &vec!["messages/typed-server-tools".to_owned()]
+                ),
+                (
                     &"messages.response.text".to_owned(),
                     &vec![
                         "messages/basic-nonstream".to_owned(),
@@ -1301,8 +1329,20 @@ mod tests {
                     ]
                 ),
                 (
+                    &"messages.response.malformed_tool_arguments".to_owned(),
+                    &vec!["messages/malformed-tool-arguments".to_owned()]
+                ),
+                (
+                    &"messages.streaming.usage".to_owned(),
+                    &vec!["messages/basic-stream".to_owned()]
+                ),
+                (
                     &"messages.error.upstream".to_owned(),
                     &vec!["messages/upstream-error".to_owned()]
+                ),
+                (
+                    &"messages.error.malformed_success".to_owned(),
+                    &vec!["messages/malformed-success".to_owned()]
                 ),
                 (
                     &"messages.native.request".to_owned(),
@@ -1344,15 +1384,33 @@ mod tests {
                 ),
                 (
                     &"responses.chat.request".to_owned(),
-                    &vec!["responses/chat-basic-nonstream".to_owned()]
+                    &vec![
+                        "responses/chat-basic-nonstream".to_owned(),
+                        "responses/chat-basic-stream".to_owned(),
+                    ]
                 ),
                 (
                     &"responses.chat.response.text".to_owned(),
-                    &vec!["responses/chat-basic-nonstream".to_owned()]
+                    &vec![
+                        "responses/chat-basic-nonstream".to_owned(),
+                        "responses/chat-basic-stream".to_owned(),
+                    ]
+                ),
+                (
+                    &"responses.chat.web_search".to_owned(),
+                    &vec!["responses/chat-web-search".to_owned()]
+                ),
+                (
+                    &"responses.chat.file_search".to_owned(),
+                    &vec!["responses/chat-file-search".to_owned()]
                 ),
                 (
                     &"responses.agentic.parallel_tool_calls".to_owned(),
                     &vec!["responses/agentic-parallel-tool-calls".to_owned()]
+                ),
+                (
+                    &"responses.agentic.irr_terminal_streaming".to_owned(),
+                    &vec!["responses/irr-terminal-streaming".to_owned()]
                 ),
                 (
                     &"responses.chat.continuation".to_owned(),
@@ -1377,10 +1435,7 @@ mod tests {
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
-            vec![
-                ("openai", CoverageStatus::Covered),
-                ("vllm", CoverageStatus::LiveCovered),
-            ]
+            vec![("synthetic", CoverageStatus::SyntheticOnly)]
         );
         assert_eq!(
             manifest.features[2]
@@ -1388,9 +1443,43 @@ mod tests {
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
-            vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            vec![
+                ("openai", CoverageStatus::Covered),
+                ("vllm", CoverageStatus::LiveCovered),
+            ]
         );
-        for feature in &manifest.features[3..6] {
+        for feature in &manifest.features[3..4] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            );
+        }
+        assert_eq!(
+            manifest.features[4]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("openai", CoverageStatus::LiveCovered),
+                ("vllm", CoverageStatus::LiveCovered),
+            ]
+        );
+        for feature in &manifest.features[5..7] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            );
+        }
+        for feature in &manifest.features[7..10] {
             assert_eq!(
                 feature
                     .providers
@@ -1400,7 +1489,7 @@ mod tests {
                 vec![("anthropic", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[6..9] {
+        for feature in &manifest.features[10..13] {
             assert_eq!(
                 feature
                     .providers
@@ -1413,7 +1502,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[9..] {
+        for feature in &manifest.features[13..] {
             assert_eq!(
                 feature
                     .providers
@@ -1444,7 +1533,11 @@ mod tests {
             &stream,
             "messages/basic-stream",
             "Minimal streaming Anthropic Messages request translated to Chat Completions.",
-            &["messages.request.minimal", "messages.response.text"],
+            &[
+                "messages.request.minimal",
+                "messages.response.text",
+                "messages.streaming.usage",
+            ],
             "Say hello in one sentence.",
             true,
             BodyKind::Sse,
@@ -1468,6 +1561,32 @@ mod tests {
             false,
             BodyKind::Json,
             429,
+            &[],
+        );
+        let malformed_success =
+            InferenceScenario::load(&root.join("scenarios/messages/malformed-success.yaml")).unwrap();
+        assert_scenario(
+            &malformed_success,
+            "messages/malformed-success",
+            "Malformed Chat Completions success converted to an Anthropic API error envelope.",
+            &["messages.error.malformed_success"],
+            "What is 2+2? Reply with just the number.",
+            false,
+            BodyKind::Json,
+            200,
+            &[],
+        );
+        let malformed_tool_arguments =
+            InferenceScenario::load(&root.join("scenarios/messages/malformed-tool-arguments.yaml")).unwrap();
+        assert_scenario(
+            &malformed_tool_arguments,
+            "messages/malformed-tool-arguments",
+            "Malformed Chat Completions tool arguments convert to an Anthropic API error envelope instead of a fabricated tool_use.",
+            &["messages.response.malformed_tool_arguments"],
+            "Use the weather tool.",
+            false,
+            BodyKind::Json,
+            200,
             &[],
         );
 
@@ -1691,6 +1810,61 @@ mod tests {
         assert!(
             continuation.expect.upstream_sse_events.is_empty(),
             "non-streaming continuation turn must have no upstream SSE events"
+        );
+
+        let responses_chat_stream =
+            InferenceScenario::load(&root.join("scenarios/responses/chat-basic-stream.yaml")).unwrap();
+        assert_eq!(responses_chat_stream.version, 1);
+        assert_eq!(responses_chat_stream.id, "responses/chat-basic-stream");
+        assert_eq!(
+            responses_chat_stream.description,
+            "Streaming OpenAI Responses request translated to Chat Completions SSE."
+        );
+        assert_eq!(responses_chat_stream.protocol, InferenceProtocol::OpenaiResponses);
+        assert_eq!(
+            responses_chat_stream.example_config,
+            "openai/responses/responses-to-chat-completions.yaml"
+        );
+        assert_eq!(responses_chat_stream.upstream_authority, "127.0.0.1:3001");
+        assert_eq!(
+            responses_chat_stream.features,
+            ["responses.chat.request", "responses.chat.response.text"]
+        );
+        assert_eq!(responses_chat_stream.turns.len(), 1);
+        let turn = &responses_chat_stream.turns[0];
+        assert_eq!(turn.name, "initial");
+        assert_eq!(turn.request.method, "POST");
+        assert_eq!(turn.request.path, "/v1/responses");
+        assert_eq!(turn.expect.client_status, 200);
+        assert_eq!(turn.expect.client_body_kind, BodyKind::Sse);
+        assert_eq!(turn.expect.upstream_path, "/v1/chat/completions");
+        assert_eq!(turn.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &turn.request.body else {
+            panic!("translated streaming Responses request body must be JSON");
+        };
+        assert_eq!(value["model"], "${MODEL}");
+        assert_eq!(value["input"], "Say hello in one sentence.");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], true);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
+        assert_eq!(
+            turn.expect.client_sse_events,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(turn.expect.client_sse_repeatable_events, ["response.output_text.delta"]);
+        assert!(
+            turn.expect.upstream_sse_events.is_empty(),
+            "Chat Completions upstream chunks are data-only frames"
         );
     }
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Filter 18: resolve MCP tool declarations into concrete tool
@@ -48,7 +48,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use tracing::debug;
 
@@ -86,7 +87,7 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// ```yaml
 /// filter: openai_mcp_tool_resolve
 /// timeout_ms: 5000
-/// max_body_bytes: 67108864
+/// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
 /// ```
 pub struct McpToolResolveFilter {
@@ -96,8 +97,9 @@ pub struct McpToolResolveFilter {
     /// Connector ID to server URL mapping.
     connectors: HashMap<String, url::Url>,
 
-    /// Maximum request body bytes for `StreamBuffer`.
-    max_body_bytes: usize,
+    /// Maximum size in bytes of the body produced after expanding
+    /// `mcp` tool entries into `function` entries.
+    max_rewritten_body_bytes: usize,
 
     /// Maximum number of distinct MCP servers per request.
     max_servers: usize,
@@ -130,7 +132,7 @@ impl McpToolResolveFilter {
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
             connectors,
-            max_body_bytes: validated.max_body_bytes,
+            max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_servers: validated.max_servers,
             max_tools: validated.max_tools,
             timeout: Duration::from_millis(validated.timeout_ms),
@@ -174,7 +176,7 @@ impl McpToolResolveFilter {
         let Some(serialized) = rewrite_request_body(&original_bytes, per_entry, &tool_map, &resolved_labels)? else {
             return Ok(FilterAction::Continue);
         };
-        check_body_size(&serialized, self.max_body_bytes)?;
+        check_body_size(&serialized, self.max_rewritten_body_bytes)?;
         serialized.commit(body, self.name(), "tools");
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
@@ -265,8 +267,11 @@ impl HttpFilter for McpToolResolveFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. max_rewritten_body_bytes bounds only
+        // the post-expansion body produced during resolution.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -334,12 +339,12 @@ enum ResolveError {
         max: usize,
     },
 
-    /// Expanded request body exceeds `max_body_bytes`.
+    /// Expanded request body exceeds `max_rewritten_body_bytes`.
     #[error("expanded request body is {actual} bytes, exceeding the {limit} byte limit")]
     BodyTooLarge {
         /// Serialized body size after MCP tool expansion.
         actual: usize,
-        /// Configured `max_body_bytes` limit.
+        /// Configured `max_rewritten_body_bytes` limit.
         limit: usize,
     },
 
@@ -401,17 +406,17 @@ struct Resolution {
 // Private Helpers
 // -----------------------------------------------------------------------------
 
-/// Reject the expanded body if it exceeds `max_body_bytes`.
-fn check_body_size(serialized: &SerializedJson, max_body_bytes: usize) -> Result<(), ResolveError> {
-    if serialized.len() > max_body_bytes {
+/// Reject the expanded body if it exceeds `max_rewritten_body_bytes`.
+fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize) -> Result<(), ResolveError> {
+    if serialized.len() > max_rewritten_body_bytes {
         debug!(
             actual = serialized.len(),
-            limit = max_body_bytes,
+            limit = max_rewritten_body_bytes,
             "expanded request body exceeds configured limit"
         );
         return Err(ResolveError::BodyTooLarge {
             actual: serialized.len(),
-            limit: max_body_bytes,
+            limit: max_rewritten_body_bytes,
         });
     }
     Ok(())
@@ -703,10 +708,16 @@ async fn fetch_tools(
 /// entries with `type: "function"` entries and translating any
 /// MCP `tool_choice` references.
 ///
-/// Returns `None` when no rewrite is needed (unparseable body,
-/// empty tools array, or no resolved entries). The caller is
-/// responsible for checking the serialized size against
-/// `max_body_bytes` before committing.
+/// Returns `None` only when the body cannot be rewritten at all
+/// (unparseable body, non-object root, or missing `tools` array).
+/// The caller is responsible for checking the serialized size against
+/// `max_rewritten_body_bytes` before committing.
+///
+/// A resolved MCP entry is always dropped from the outgoing tools
+/// array, even when it produced zero permitted tools; otherwise the
+/// entry's `authorization`/`headers` credentials would leak to the
+/// inference backend. When every tool resolves away this yields an
+/// empty `tools` array rather than the original (credentialed) body.
 ///
 /// MCP entries that were not resolved (no `server_url` or deferred)
 /// are left unchanged for upstream to handle.
@@ -726,10 +737,12 @@ fn rewrite_request_body(
         return Ok(None);
     };
 
+    // An empty `rewritten` array here means every tool in the request
+    // was a resolved MCP entry that produced zero permitted tools.
+    // Commit the emptied array anyway: returning `None` would make the
+    // caller forward the *original* body, leaking those entries'
+    // `authorization`/`headers` credentials to the inference backend.
     let (rewritten, generated_names) = rewrite_tools_array(tools, per_entry);
-    if rewritten.is_empty() {
-        return Ok(None);
-    }
     detect_name_collisions(&rewritten, &generated_names)?;
 
     let rewritten_count = rewritten.len();
@@ -824,10 +837,7 @@ fn rewrite_tool_choice(
 
     match choice_type {
         Some("mcp") => rewrite_mcp_tool_choice(obj, &choice_obj, tool_map, resolved_labels),
-        Some("allowed_tools") => {
-            rewrite_allowed_tools_choice(obj, &choice_obj, tool_map);
-            Ok(())
-        },
+        Some("allowed_tools") => rewrite_allowed_tools_choice(obj, &choice_obj, tool_map, resolved_labels),
         _ => Ok(()),
     }
 }
@@ -874,17 +884,76 @@ fn rewrite_mcp_tool_choice(
 
 /// Rewrite MCP selectors inside an `allowed_tools`-typed
 /// `tool_choice`.
+///
+/// Resolved selectors expand to their generated function refs. A
+/// selector whose `server_label` was resolved locally but yields no
+/// eligible tool is dropped, so a locally consumed MCP reference never
+/// reaches the backend. Genuinely unresolved selectors (deferred,
+/// connector-only, or unknown labels) are preserved for upstream.
+///
+/// If dropping locally consumed selectors leaves the list empty,
+/// emitting `tools: []` would be a schema-invalid `allowed_tools`
+/// choice. A `mode: "required"` choice is then rejected as unsatisfiable
+/// with [`ResolveError::EmptyResolvedToolChoice`] (matching the
+/// server-level MCP `tool_choice` behavior); any other mode is
+/// normalized to `"none"`, because the restriction now permits no tool
+/// and the model must not fall back to any other tool still supplied in
+/// the request.
 fn rewrite_allowed_tools_choice(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     choice_obj: &serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
-) {
+    resolved_labels: &HashSet<String>,
+) -> Result<(), ResolveError> {
     let Some(tools_arr) = choice_obj.get("tools").and_then(serde_json::Value::as_array) else {
-        return;
+        return Ok(());
     };
 
+    let (new_tools, changed, dropped_label) = rebuild_allowed_tools_selectors(tools_arr, tool_map, resolved_labels);
+
+    if !changed {
+        return Ok(());
+    }
+
+    if new_tools.is_empty() {
+        // Every selector was a locally resolved server that produced no
+        // eligible tool, so the restricted set is now empty. An empty
+        // `allowed_tools` is invalid, so resolve it by mode.
+        if choice_obj.get("mode").and_then(serde_json::Value::as_str) == Some("required") {
+            // `required` over an empty set is unsatisfiable: reject.
+            return Err(ResolveError::EmptyResolvedToolChoice(
+                dropped_label.unwrap_or_else(|| "unknown".to_owned()),
+            ));
+        }
+        // `auto` restricted the model to this now-empty set. Normalize to
+        // `"none"` rather than removing `tool_choice`: removal would let
+        // the model call any other tool left in the request, which the
+        // original choice deliberately excluded.
+        obj.insert("tool_choice".to_owned(), serde_json::Value::String("none".to_owned()));
+        return Ok(());
+    }
+
+    let mut new_choice = choice_obj.clone();
+    new_choice.insert("tools".to_owned(), serde_json::Value::Array(new_tools));
+    obj.insert("tool_choice".to_owned(), serde_json::Value::Object(new_choice));
+    Ok(())
+}
+
+/// Rebuild an `allowed_tools` selector list: expand resolved MCP
+/// selectors to their function refs, drop locally consumed
+/// resolved-empty selectors, and preserve unresolved ones.
+///
+/// Returns the rebuilt selector list, whether it differs from the
+/// input, and the first dropped `server_label` (used for error
+/// reporting when the list collapses to empty).
+fn rebuild_allowed_tools_selectors(
+    tools_arr: &[serde_json::Value],
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+    resolved_labels: &HashSet<String>,
+) -> (Vec<serde_json::Value>, bool, Option<String>) {
     let mut new_tools = Vec::with_capacity(tools_arr.len());
     let mut changed = false;
+    let mut dropped_label: Option<String> = None;
 
     for tool_ref in tools_arr {
         if tool_ref.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
@@ -895,16 +964,36 @@ fn rewrite_allowed_tools_choice(
         expand_mcp_selector(tool_ref, tool_map, &mut new_tools);
         if new_tools.len() > before {
             changed = true;
+        } else if selector_label_resolved(tool_ref, resolved_labels) {
+            // The server was resolved locally but exposes no matching
+            // tool; the selector is locally consumed. Drop it so the
+            // MCP reference never reaches the inference backend.
+            changed = true;
+            if dropped_label.is_none() {
+                dropped_label = tool_ref
+                    .get("server_label")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
         } else {
+            // Unresolved (deferred / connector-only / unknown) selector:
+            // preserve it for the backend to handle.
             new_tools.push(tool_ref.clone());
         }
     }
 
-    if changed {
-        let mut new_choice = choice_obj.clone();
-        new_choice.insert("tools".to_owned(), serde_json::Value::Array(new_tools));
-        obj.insert("tool_choice".to_owned(), serde_json::Value::Object(new_choice));
-    }
+    (new_tools, changed, dropped_label)
+}
+
+/// Whether an MCP `tool_choice` selector targets a `server_label`
+/// that was resolved locally. Such a selector is locally consumed and
+/// must not survive into the backend request even when it produced
+/// zero eligible tools.
+fn selector_label_resolved(selector: &serde_json::Value, resolved_labels: &HashSet<String>) -> bool {
+    selector
+        .get("server_label")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|label| resolved_labels.contains(label))
 }
 
 /// Expand a single MCP selector into function tool references.

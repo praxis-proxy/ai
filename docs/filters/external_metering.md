@@ -14,6 +14,7 @@ Tenant identity is resolved from the highest-trust source available: verified `{
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `metering_url` | string | yes | Base URL of the external metering service (required). |
+| `allow_private_endpoint` | bool | no | Allow the metering endpoint to resolve to non-public addresses (loopback, private, link-local). Defaults to `false`, so callouts are rejected before connecting unless the operator opts in. |
 | `timeout_seconds` | integer | no | HTTP timeout in seconds for all metering calls. |
 | `feature_key` | string | no | Entitlement feature key used in balance check URL path. |
 | `source` | string | no | `CloudEvents` `source` field value. |

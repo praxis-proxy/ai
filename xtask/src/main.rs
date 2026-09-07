@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024 Praxis Contributors
 
 //! Development tasks for Praxis AI.
@@ -51,6 +51,10 @@ enum Command {
     /// Validate inference fixture coverage.
     CheckInference(inference_fixtures::CheckArgs),
 
+    /// Check the runtime Responses operation registry against
+    /// the pinned OpenAI specification.
+    CheckResponsesRegistry,
+
     /// Start a quick HTTP test server returning a static
     /// response to every request.
     Echo(echo::Args),
@@ -98,6 +102,9 @@ enum Command {
     /// Refresh or verify the pinned complete OpenAI reference.
     OpenaiConformanceReference(openai_conformance::ReferenceArgs),
 
+    /// Regenerate or verify official Conversation item schemas.
+    OpenaiConversationItemContracts(openai_conformance::ItemContractsArgs),
+
     /// Enforce or acknowledge failures in a generated conformance report.
     OpenaiConformanceGate(openai_conformance_gate::Args),
 
@@ -118,6 +125,7 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::CheckInference(args) => inference_fixtures::run_check(&args),
+        Command::CheckResponsesRegistry => openai_conformance::run_responses_registry_check(),
         Command::Echo(args) => echo::run(args),
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),
@@ -131,6 +139,7 @@ fn main() {
         Command::LintFilterDocs(args) => filter_docs::lint(args),
         Command::OpenaiConformance(args) => openai_conformance::run(&args),
         Command::OpenaiConformanceReference(args) => openai_conformance::run_reference(&args),
+        Command::OpenaiConversationItemContracts(args) => openai_conformance::run_item_contracts(&args),
         Command::OpenaiConformanceGate(args) => openai_conformance_gate::run(&args),
         Command::RecordInference(args) => inference_fixtures::run_record(args),
         Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),

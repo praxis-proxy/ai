@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Configuration for protocol-neutral web-search providers.
@@ -10,11 +10,10 @@ use praxis_filter::{
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
+use crate::callout_policy;
+
 /// Default callout timeout (10 seconds — search APIs can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
-
-/// Default HTTP status when the search callout fails in closed mode.
-const DEFAULT_STATUS_ON_ERROR: u16 = 502;
 
 // -----------------------------------------------------------------------------
 // SearchProvider
@@ -88,20 +87,6 @@ impl SearchContextSize {
 }
 
 // -----------------------------------------------------------------------------
-// FailureMode
-// -----------------------------------------------------------------------------
-
-/// What happens when a search callout fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FailureMode {
-    /// Reject the request on search failure (default).
-    Closed,
-    /// Continue without search results on failure.
-    Open,
-}
-
-// -----------------------------------------------------------------------------
 // WebSearchFilterConfig (YAML deserialization)
 // -----------------------------------------------------------------------------
 
@@ -128,17 +113,81 @@ pub(crate) struct WebSearchFilterConfig {
     #[serde(default)]
     pub(crate) max_body_bytes: Option<usize>,
 
-    /// Failure mode for search provider callouts.
-    #[serde(default)]
-    pub(crate) provider_failure_mode: Option<FailureMode>,
-
-    /// HTTP status code to return when rejecting on error.
-    #[serde(default)]
-    pub(crate) status_on_error: Option<u16>,
-
     /// Override the provider's default API base URL.
     #[serde(default)]
     pub(crate) base_url: Option<String>,
+
+    /// Allow a `base_url` that targets local-sensitive addresses.
+    ///
+    /// DNS names are resolved once per request and every result is checked
+    /// immediately before the transport connects. By default, any private,
+    /// loopback, link-local, or otherwise non-public result rejects the
+    /// callout. Enable this only for a trusted private provider endpoint.
+    #[serde(default)]
+    pub(crate) allow_private_base_url: bool,
+}
+
+// -----------------------------------------------------------------------------
+// OpenAiWebSearchConfig (YAML deserialization)
+// -----------------------------------------------------------------------------
+
+// Mirrors `WebSearchFilterConfig` minus `max_body_bytes` and validates through
+// the shared `build_config` via `into_shared`. Keep the remaining fields in
+// sync with `WebSearchFilterConfig`.
+
+/// Reads the request body but never rewrites it, so `openai_web_search`
+/// exposes no `max_body_bytes` knob: raw request body size is governed by the
+/// pipeline's `body_limits`, not a per-filter limit (which praxis core merges
+/// to the largest sibling buffer and would therefore be bypassable).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenAiWebSearchConfig {
+    /// Search backend provider.
+    provider: SearchProvider,
+
+    /// API key for the search provider (supports `${ENV_VAR}`).
+    /// Wrapped in [`SecretString`] to prevent accidental logging.
+    api_key: SecretString,
+
+    /// Default search context size when the client omits it.
+    #[serde(default)]
+    default_context_size: Option<String>,
+
+    /// Callout timeout in milliseconds.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+
+    /// Override the provider's default API base URL.
+    #[serde(default)]
+    base_url: Option<String>,
+
+    /// Allow a `base_url` that targets local-sensitive addresses.
+    ///
+    /// DNS names are resolved once per request and every result is checked
+    /// immediately before the transport connects. By default, any private,
+    /// loopback, link-local, or otherwise non-public result rejects the
+    /// callout. Enable this only for a trusted private provider endpoint.
+    #[serde(default)]
+    allow_private_base_url: bool,
+}
+
+impl OpenAiWebSearchConfig {
+    /// Convert into the shared [`WebSearchFilterConfig`] for validation reuse.
+    ///
+    /// `max_body_bytes` is fixed to `None`: `openai_web_search` defers raw
+    /// request body size to the pipeline's `body_limits` and buffers to the
+    /// absolute JSON ceiling, so it carries no per-filter raw-body cap.
+    pub(crate) fn into_shared(self) -> WebSearchFilterConfig {
+        WebSearchFilterConfig {
+            provider: self.provider,
+            api_key: self.api_key,
+            default_context_size: self.default_context_size,
+            timeout_ms: self.timeout_ms,
+            max_body_bytes: None,
+            base_url: self.base_url,
+            allow_private_base_url: self.allow_private_base_url,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -163,14 +212,11 @@ pub(crate) struct ValidatedConfig {
     /// Maximum request body bytes to buffer.
     pub max_body_bytes: usize,
 
-    /// Failure mode for search callouts.
-    pub failure_mode: FailureMode,
-
-    /// HTTP status on error.
-    pub status_on_error: u16,
-
     /// Override the provider's default API base URL.
     pub base_url: Option<String>,
+
+    /// Connect-time private-address policy for the provider target.
+    pub allow_private_base_url: bool,
 }
 
 impl std::fmt::Debug for ValidatedConfig {
@@ -181,9 +227,8 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("default_context_size", &self.default_context_size)
             .field("timeout_ms", &self.timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
-            .field("failure_mode", &self.failure_mode)
-            .field("status_on_error", &self.status_on_error)
             .field("base_url", &self.base_url)
+            .field("allow_private_base_url", &self.allow_private_base_url)
             .finish()
     }
 }
@@ -211,38 +256,18 @@ fn build_validated_config(
     raw: &WebSearchFilterConfig,
     api_key: String,
 ) -> Result<ValidatedConfig, FilterError> {
+    if let Some(base_url) = raw.base_url.as_deref() {
+        crate::openai::api_client::validate_base_url(filter_name, base_url, raw.allow_private_base_url)?;
+    }
     Ok(ValidatedConfig {
         provider: raw.provider,
         api_key: SecretString::from(api_key),
         default_context_size: validate_context_size(filter_name, raw.default_context_size.as_deref())?,
-        timeout_ms: validate_timeout_ms(filter_name, raw.timeout_ms)?,
+        timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
-        failure_mode: raw.provider_failure_mode.unwrap_or(FailureMode::Closed),
-        status_on_error: validate_status_on_error(filter_name, raw.status_on_error)?,
         base_url: raw.base_url.clone(),
+        allow_private_base_url: raw.allow_private_base_url,
     })
-}
-
-/// Validate timeout, applying the default and rejecting zero.
-fn validate_timeout_ms(filter_name: &'static str, raw: Option<u64>) -> Result<u64, FilterError> {
-    let value = raw.unwrap_or(DEFAULT_TIMEOUT_MS);
-    if value == 0 {
-        return Err(FilterError::from(format!(
-            "{filter_name}: timeout_ms must be greater than 0"
-        )));
-    }
-    Ok(value)
-}
-
-/// Validate HTTP status code, applying the default and rejecting out-of-range.
-fn validate_status_on_error(filter_name: &'static str, raw: Option<u16>) -> Result<u16, FilterError> {
-    let value = raw.unwrap_or(DEFAULT_STATUS_ON_ERROR);
-    if !(100..=599).contains(&value) {
-        return Err(FilterError::from(format!(
-            "{filter_name}: status_on_error must be between 100 and 599, got {value}"
-        )));
-    }
-    Ok(value)
 }
 
 /// Validate `default_context_size`, defaulting to `Medium` when
@@ -306,9 +331,8 @@ mod tests {
             default_context_size: None,
             timeout_ms: None,
             max_body_bytes: None,
-            provider_failure_mode: None,
-            status_on_error: None,
             base_url: None,
+            allow_private_base_url: false,
         }
     }
 
@@ -320,8 +344,6 @@ mod tests {
         assert_eq!(cfg.default_context_size, SearchContextSize::Medium);
         assert_eq!(cfg.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert_eq!(cfg.max_body_bytes, MAX_JSON_BODY_BYTES);
-        assert_eq!(cfg.failure_mode, FailureMode::Closed);
-        assert_eq!(cfg.status_on_error, DEFAULT_STATUS_ON_ERROR);
     }
 
     #[test]
@@ -346,16 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_preserves_provider_failure_mode() {
-        let yaml = serde_yaml::from_str("\nprovider: brave\napi_key: test-key\nprovider_failure_mode: open\n").unwrap();
-
-        let raw: WebSearchFilterConfig = parse_filter_config("openai_web_search", &yaml).unwrap();
-        let validated = build_config("openai_web_search", &raw).unwrap();
-
-        assert_eq!(validated.failure_mode, FailureMode::Open);
-    }
-
-    #[test]
     fn build_config_rejects_zero_timeout() {
         let mut cfg = base_config();
         cfg.timeout_ms = Some(0);
@@ -373,30 +385,20 @@ mod tests {
     }
 
     #[test]
-    fn build_config_rejects_invalid_status() {
-        let mut cfg = base_config();
-        cfg.status_on_error = Some(999);
-        assert!(build_config("openai_web_search", &cfg).is_err());
-    }
-
-    #[test]
     fn build_config_custom_values() {
         let mut cfg = base_config();
         cfg.default_context_size = Some("high".into());
         cfg.timeout_ms = Some(15_000);
-        cfg.provider_failure_mode = Some(FailureMode::Open);
-        cfg.status_on_error = Some(503);
         let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.default_context_size, SearchContextSize::High);
         assert_eq!(validated.timeout_ms, 15_000);
-        assert_eq!(validated.failure_mode, FailureMode::Open);
-        assert_eq!(validated.status_on_error, 503);
     }
 
     #[test]
     fn build_config_base_url_threaded_through() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://localhost:9999".into());
+        cfg.allow_private_base_url = true;
         let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://localhost:9999"));
     }
@@ -405,6 +407,85 @@ mod tests {
     fn build_config_base_url_none_by_default() {
         let validated = build_config("openai_web_search", &base_config()).unwrap();
         assert!(validated.base_url.is_none());
+    }
+
+    #[test]
+    fn build_config_rejects_loopback_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://127.0.0.1:9999".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "loopback base_url must be rejected without allow_private_base_url (SSRF/credential disclosure)"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_localhost_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://localhost:9999".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "localhost base_url must be rejected without allow_private_base_url"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_cloud_metadata_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://169.254.169.254".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "link-local cloud-metadata base_url must be rejected without allow_private_base_url"
+        );
+    }
+
+    #[test]
+    fn build_config_accepts_dns_base_url_for_connect_time_validation() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://internal.search.example:8080".into());
+        assert!(build_config("openai_web_search", &cfg).is_ok());
+    }
+
+    #[test]
+    fn build_config_rejects_non_http_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("file:///etc/passwd".into());
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "non-http(s) base_url scheme must be rejected"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_base_url_with_embedded_credentials() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://user:pass@8.8.8.8".into());
+        cfg.allow_private_base_url = true;
+        assert!(
+            build_config("openai_web_search", &cfg).is_err(),
+            "base_url with embedded credentials must be rejected even with allow_private_base_url"
+        );
+    }
+
+    #[test]
+    fn build_config_allows_public_ip_base_url() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("https://8.8.8.8".into());
+        let validated = build_config("openai_web_search", &cfg).unwrap();
+        assert_eq!(
+            validated.base_url.as_deref(),
+            Some("https://8.8.8.8"),
+            "public IP literal base_url should be accepted without the opt-in"
+        );
+    }
+
+    #[test]
+    fn build_config_allows_private_base_url_with_opt_in() {
+        let mut cfg = base_config();
+        cfg.base_url = Some("http://127.0.0.1:9999".into());
+        cfg.allow_private_base_url = true;
+        let validated = build_config("openai_web_search", &cfg).unwrap();
+        assert_eq!(validated.base_url.as_deref(), Some("http://127.0.0.1:9999"));
     }
 
     #[test]

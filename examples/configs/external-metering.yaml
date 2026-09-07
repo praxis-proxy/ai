@@ -42,6 +42,9 @@ filter_chains:
 
       - filter: external_metering
         metering_url: "http://127.0.0.1:9090"
+        # The metering service in this example listens on loopback, a
+        # non-public address, so callouts must be explicitly opted in.
+        allow_private_endpoint: true
         timeout_seconds: 5
         feature_key: "inference-tokens"
         source: "ai-gateway"

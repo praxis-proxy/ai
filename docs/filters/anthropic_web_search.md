@@ -14,9 +14,8 @@ Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
-| `provider_failure_mode` | `closed` \| `open` | no | Failure mode for search provider callouts. |
-| `status_on_error` | integer | no | HTTP status code to return when rejecting on error. |
 | `base_url` | string | no | Override the provider's default API base URL. |
+| `allow_private_base_url` | bool | no | Allow a `base_url` that targets local-sensitive addresses. DNS names are resolved once per request and every result is checked immediately before the transport connects. By default, any private, loopback, link-local, or otherwise non-public result rejects the callout. Enable this only for a trusted private provider endpoint. |
 
 ## Examples
 
@@ -36,8 +35,6 @@ provider: you
 api_key: ${WEB_SEARCH_API_KEY}
 default_context_size: medium
 timeout_ms: 10000
-provider_failure_mode: closed
-status_on_error: 502
 max_body_bytes: 67108864
 ```
 

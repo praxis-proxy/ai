@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use http::Method;
@@ -16,6 +16,7 @@ use super::{
 };
 use crate::{
     openai::responses::state::ResponsesState,
+    store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
     test_utils::{make_filter_context, make_request, make_response},
 };
 
@@ -2255,11 +2256,8 @@ async fn create_items_with_non_object_item_returns_400() {
     assert_eq!(rejection.status, 400, "non-object item should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("must be a JSON object"),
-        "should mention object requirement"
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "non-object errors should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2388,10 +2386,8 @@ async fn create_items_with_non_string_role_returns_400() {
     assert_eq!(rejection.status, 400, "non-string role should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("role must be a string")
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "invalid roles should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2416,8 +2412,8 @@ async fn create_items_with_missing_role_returns_400() {
     assert_eq!(rejection.status, 400, "missing role should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"].as_str().unwrap().contains("role is required"),
-        "missing role error should mention required role: {resp}"
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "missing roles should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2442,10 +2438,8 @@ async fn create_items_with_missing_content_returns_400() {
     assert_eq!(rejection.status, 400, "missing content should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("content is required")
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "missing content should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2470,10 +2464,8 @@ async fn create_items_with_non_string_non_array_content_returns_400() {
     assert_eq!(rejection.status, 400, "numeric content should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("must be a string or array")
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "invalid content should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2514,7 +2506,7 @@ async fn non_message_item_type_skips_normalization() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
-        "items": [{"type": "function_call", "name": "test", "arguments": "{}"}]
+        "items": [{"type": "function_call", "call_id": "call_1", "name": "test", "arguments": "{}"}]
     });
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2525,6 +2517,48 @@ async fn non_message_item_type_skips_normalization() {
     assert_eq!(rejection.status, 200, "non-message type should be accepted");
     let resp = rejection_body(&rejection);
     assert_eq!(resp["data"][0]["type"], "function_call");
+}
+
+#[tokio::test]
+async fn conformance_conversations_item_requests_reject_unknown_and_malformed_contracts() {
+    let filter = build_test_filter();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"items":[{"type":"future_item"}]}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for invalid initial item, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400, "invalid initial items should be rejected");
+
+    let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
+
+    for (label, item) in [
+        ("unknown", serde_json::json!({"type": "future_item"})),
+        ("malformed", serde_json::json!({"type": "function_call"})),
+    ] {
+        let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
+        let mut ctx = make_filter_context(&req);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let mut body = Some(Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"items": [item]})).unwrap(),
+        ));
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected Reject for {label} item, got {action:?}");
+        };
+        assert_eq!(rejection.status, 400, "{label} item should be rejected");
+        assert_eq!(
+            rejection_body(&rejection)["error"]["type"],
+            "invalid_request_error",
+            "{label} item should use the OpenAI invalid-request shape"
+        );
+    }
+    println!("PRAXIS_CONFORMANCE_OK conversations request_item_contract");
 }
 
 // -----------------------------------------------------------------------------
@@ -3425,6 +3459,81 @@ async fn on_response_body_appends_completed_response() {
     assert_eq!(items.len(), 2, "append-back should persist both input and output items");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_surfaces_item_insert_failure() {
+    let filter = build_failing_filter(FailingItemStore {
+        fail_create_items: true,
+        fail_message_sync: false,
+    });
+
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
+        ..ResponsesState::default()
+    });
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    // A completed response whose items cannot be persisted must not be swallowed:
+    // the filter propagates the append-back failure as an error (#837). The
+    // client-visible outcome is then the pipeline's failure-mode decision — a
+    // withheld body under the default `failure_mode: closed`, or a logged release
+    // under `open`.
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "hi from model"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let result = filter.on_response_body(&mut ctx, &mut body, true);
+
+    assert!(
+        result.is_err(),
+        "item-insert failure during append-back must propagate as an error, not a silent success"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_surfaces_transaction_failure() {
+    let filter = build_failing_filter(FailingItemStore {
+        fail_create_items: false,
+        fail_message_sync: true,
+    });
+
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
+        ..ResponsesState::default()
+    });
+
+    let mut resp = make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    // Item insertion and message-cache rebuild are one transaction. A failure in
+    // either part must be surfaced so the fail-closed pipeline can withhold the
+    // response body rather than report a success whose conversation state was not
+    // durably persisted.
+    let response_json = serde_json::json!({
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "hi from model"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    let result = filter.on_response_body(&mut ctx, &mut body, true);
+    assert!(result.is_err(), "transactional item/cache failure must propagate");
+}
+
 #[test]
 fn conformance_conversations_routes_match_runtime_registry() {
     let spec = generated_openapi_spec();
@@ -3528,6 +3637,156 @@ async fn create_test_conversation(filter: &dyn HttpFilter, metadata: Value) -> S
     };
     let resp = rejection_body(&rejection);
     resp["id"].as_str().unwrap().to_owned()
+}
+
+/// Build a conversations filter backed by a fault-injecting store.
+fn build_failing_filter(store: FailingItemStore) -> OpenaiConversationsFilter {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: test_conversations
+        items_table: test_items
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    OpenaiConversationsFilter::with_store_for_test(cfg, Arc::new(store))
+}
+
+/// A [`ConversationItemStore`] that fails selected operations on demand.
+///
+/// Benign methods return empty/default results; the two boolean knobs force the
+/// item-insert and message-cache-sync paths to error so append-back failure
+/// handling can be tested without a real database.
+struct FailingItemStore {
+    /// Force `create_conversation_items` to return a database error.
+    fail_create_items: bool,
+    /// Force the transactional item/cache operation to error.
+    fail_message_sync: bool,
+}
+
+#[async_trait::async_trait]
+impl ConversationItemStore for FailingItemStore {
+    async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        if self.fail_message_sync {
+            return Err(StoreError::Database("mock message sync failure".to_owned()));
+        }
+        Ok(true)
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _expected_messages: &Value,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        Ok(true)
+    }
+
+    async fn get_conversation(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        Ok(None)
+    }
+
+    async fn delete_conversation(&self, _tenant_id: &str, _conversation_id: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        if self.fail_create_items {
+            return Err(StoreError::Database("mock item insert failure".to_owned()));
+        }
+        Ok(())
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        if self.fail_create_items {
+            return Err(StoreError::Database("mock item insert failure".to_owned()));
+        }
+        if self.fail_message_sync {
+            return Err(StoreError::Database("mock message sync failure".to_owned()));
+        }
+        Ok(())
+    }
+
+    async fn list_conversation_items(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _after_item_id: Option<&str>,
+        _limit: u32,
+        _ascending: bool,
+    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_ids: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<ConversationItemRecord>, StoreError> {
+        Ok(None)
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    async fn conversation_item_position(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(None)
+    }
+
+    async fn max_item_position(&self, _tenant_id: &str, _conversation_id: &str) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

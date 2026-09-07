@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! YAML-facing configuration for the `openai_stream_events` filter.
@@ -17,6 +17,12 @@ use crate::openai::sse::SseParserConfig;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StreamEventsConfig {
+    /// Treat successive IRR inference streams as one logical Responses
+    /// stream. Per-iteration lifecycle events are normalized and only the
+    /// final terminal event is exposed downstream.
+    #[serde(default)]
+    pub logical_stream: bool,
+
     /// Maximum bytes buffered for incomplete SSE lines/data across
     /// chunk boundaries. Default: 10 MiB.
     #[serde(default)]
@@ -32,8 +38,9 @@ pub(crate) struct StreamEventsConfig {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 
-    /// Maximum bytes accumulated per function-call argument string
-    /// from `function_call_arguments.delta` events. Default: 1 MiB.
+    /// Maximum bytes accepted per function-call argument string from
+    /// `function_call_arguments.delta` or `function_call_arguments.done` events.
+    /// Default: 1 MiB.
     #[serde(default)]
     pub max_tool_call_argument_bytes: Option<usize>,
 }

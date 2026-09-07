@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Agentic loop controller for the Responses API pipeline.
@@ -19,16 +19,21 @@
 //!   - `openai_agentic_loop.action = "loop"` — tool calls present, loop back
 //!   - `openai_agentic_loop.action = "done"` — exit to client
 //!
-//! # Non-streaming tool call extraction
+//! # Tool call extraction
 //!
-//! For non-streaming responses (the only mode supported by IRR),
+//! For non-streaming responses,
 //! this filter parses the response body JSON and extracts
 //! `function_call` items from the `output` array into
 //! `state.tool_calls` and `web_search_call` items into
-//! `state.web_search_calls`. It also appends these items to
-//! `state.messages` so the model sees its own calls on re-entry.
+//! `state.web_search_calls`. Client `function_call` and `reasoning`
+//! items are appended to `state.messages` so the model sees its own
+//! calls on re-entry. Hosted `web_search_call` items are **not** valid
+//! `OpenResponses` input (issue #808), so they never enter
+//! `state.messages`; they remain in `state.web_search_calls` for
+//! `openai_web_search` to dispatch and bridge into backend history, and
+//! reach the client only through `state.accumulated_output`.
 //!
-//! For streaming responses (future), `stream_events` populates
+//! For streaming responses, `stream_events` populates
 //! `state.tool_calls` via SSE event parsing. When the body is
 //! `None` at end-of-stream (consumed by streaming filters), this
 //! filter skips body parsing and checks `state.tool_calls` as-is.
@@ -81,12 +86,6 @@
 //!         done: true
 //! ```
 //!
-//! # Streaming limitation
-//!
-//! Streaming requests (`stream: true`) are rejected with a 400
-//! error. `iterative_request_router` fully buffers all responses
-//! within the loop and cannot forward incremental SSE events.
-//!
 //! # State dependency
 //!
 //! Requires [`ResponsesState`] in request extensions. Without it
@@ -114,7 +113,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
@@ -160,7 +160,6 @@ const META_STATUS: &str = "responses.status";
 /// ```yaml
 /// filter: openai_agentic_loop
 /// max_infer_iters: 10
-/// max_body_bytes: 10485760
 /// ```
 ///
 /// # Example
@@ -206,8 +205,10 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap for each direction.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -216,12 +217,42 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
-        }
+        BodyMode::Stream
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Fail closed on an unsafe terminal-streaming configuration *before* any
+        // upstream dispatch. Within each IRR round this filter's `on_request`
+        // runs after `openai_responses_proxy` has selected the typed transport
+        // and after `openai_stream_events` has published whether a logical-stream
+        // finalizer is armed, so both facts are observable here.
+        //
+        // When the sub-request will commit a typed stream (`terminal_streaming`
+        // with `"stream": true`) but no `openai_stream_events` logical-stream
+        // finalizer is present, a loop-terminal error detected later in
+        // `on_response_body` cannot reach the client: typed streaming has already
+        // committed `response.completed`, so the error would be silently dropped
+        // after a truncated success is on the wire. This is a server
+        // misconfiguration, so reject with a 500 rather than forward that
+        // truncated success. Buffered rounds retain full error handling and are
+        // unaffected.
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+            // Consume the per-round marker so a `"true"` published by another IRR
+            // step cannot satisfy a later step's check. `openai_stream_events`
+            // re-publishes it every armed round before this filter reads it.
+            let logical_stream = ctx.get_metadata("responses.logical_stream") == Some("true");
+            ctx.set_metadata("responses.logical_stream", "false");
+            if !logical_stream {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    500,
+                    "server_error",
+                    "openai_agentic_loop with openai_responses_proxy terminal_streaming requires \
+                     openai_stream_events with logical_stream: true so loop-terminal errors can \
+                     reach the client",
+                    true,
+                )));
+            }
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -238,16 +269,6 @@ impl HttpFilter for AgenticLoopFilter {
         let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-
-        if state.request_body.get("stream") == Some(&Value::Bool(true)) {
-            ctx.extensions.insert(state);
-            return Ok(FilterAction::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "streaming is not supported with openai_agentic_loop",
-                false,
-            )));
-        }
 
         prepare_iteration(ctx, &mut state);
         trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
@@ -269,22 +290,74 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         };
 
-        if let Some(bytes) = body.as_ref()
-            && let Err(msg) = extract_tool_calls_from_body(bytes, &mut state)
-        {
+        if let Some(bytes) = body.as_ref() {
+            if let Err(msg) = extract_tool_calls_from_body(bytes, &mut state) {
+                return Ok(reject_invalid_function_cardinality(ctx, state, msg));
+            }
+        } else if !prepare_streamed_round(ctx, &mut state)? {
             ctx.extensions.insert(state);
-            return Ok(FilterAction::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                msg,
-                false,
-            )));
+            return Ok(FilterAction::Continue);
         }
 
         let result = evaluate_loop_decision(ctx, &mut state, body, &self.config)?;
         ctx.extensions.insert(state);
         Ok(result)
     }
+}
+
+/// Preserve state while rejecting a buffered round with invalid cardinality.
+fn reject_invalid_function_cardinality(
+    ctx: &mut HttpFilterContext<'_>,
+    state: ResponsesState,
+    message: &'static str,
+) -> FilterAction {
+    ctx.extensions.insert(state);
+    FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message, false))
+}
+
+/// Only a successfully terminated stream may authorize external side effects.
+fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &ResponsesState) -> bool {
+    state.request_body.get("stream").and_then(Value::as_bool) != Some(true)
+        || (ctx.get_metadata("responses.stream_completion") == Some("terminal")
+            && state.response_object.get("status").and_then(Value::as_str) == Some("completed")
+            && ctx.get_metadata("responses.stream_parse_error") != Some("true"))
+}
+
+/// Collect an authoritative successful stream or terminate without dispatch.
+fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<bool, FilterError> {
+    if !streamed_round_is_dispatchable(ctx, state) {
+        collect_streaming_output_items(state);
+        state.tool_calls.clear();
+        state.web_search_calls.clear();
+        set_action(ctx, ACTION_DONE)?;
+        return Ok(false);
+    }
+    collect_streaming_output_items(state);
+    if state.tool_calls.len() > 1 {
+        end_stream_with_error(
+            ctx,
+            state,
+            "invalid_request_error",
+            "openai_agentic_loop supports exactly one function call per round",
+        )?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// End an already-committed stream with a local SSE error and no side effects.
+fn end_stream_with_error(
+    ctx: &mut HttpFilterContext<'_>,
+    state: &mut ResponsesState,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), FilterError> {
+    state.tool_calls.clear();
+    state.web_search_calls.clear();
+    ctx.set_metadata("responses.stream_error_code", code);
+    ctx.set_metadata("responses.stream_error_message", message);
+    ctx.set_metadata("responses.skip_persist", "true");
+    set_action(ctx, ACTION_DONE)
 }
 
 // -----------------------------------------------------------------------------
@@ -302,7 +375,8 @@ fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState
     set_request_body_field(state, "parallel_tool_calls", Value::Bool(false));
 
     if state.iteration > 0 {
-        state.tool_choice = json!("auto");
+        let original = std::mem::replace(&mut state.tool_choice, json!("auto"));
+        state.original_tool_choice.get_or_insert(original);
         set_request_body_field(state, "tool_choice", json!("auto"));
         ctx.request_headers_to_set
             .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));
@@ -334,31 +408,43 @@ fn evaluate_loop_decision(
 ) -> Result<FilterAction, FilterError> {
     if state.tool_calls.is_empty() && state.web_search_calls.is_empty() {
         trace!("no tool calls, signaling done");
-        finalize_response_body(state, body);
+        state.finalize_response_body(body);
         return set_done(ctx);
     }
     match check_exit_conditions(state, config) {
         Some(ExitReason::FinishReasonLength) => {
             ctx.set_metadata(META_STATUS, "incomplete");
-            finalize_response_body(state, body);
+            state.finalize_response_body(body);
             set_action(ctx, ACTION_DONE)?;
             Ok(FilterAction::Continue)
         },
-        Some(ExitReason::IterationLimit) => Ok(FilterAction::Reject(responses_error_rejection(
-            508,
-            "server_error",
-            "agentic loop iteration limit exceeded",
-            false,
-        ))),
+        Some(ExitReason::IterationLimit) => end_at_iteration_limit(ctx, state),
         None => {
             state.iteration += 1;
             let (tc, wsc) = (state.tool_calls.len(), state.web_search_calls.len());
             debug!(iteration = state.iteration, tc, wsc, "pending calls, signaling loop");
-            finalize_response_body(state, body);
+            state.finalize_response_body(body);
             set_action(ctx, ACTION_LOOP)?;
             Ok(FilterAction::Continue)
         },
     }
+}
+
+/// Terminate at the iteration cap using the transport that is still writable.
+fn end_at_iteration_limit(
+    ctx: &mut HttpFilterContext<'_>,
+    state: &mut ResponsesState,
+) -> Result<FilterAction, FilterError> {
+    if state.request_body.get("stream").and_then(Value::as_bool) == Some(true) {
+        end_stream_with_error(ctx, state, "server_error", "agentic loop iteration limit exceeded")?;
+        return Ok(FilterAction::Continue);
+    }
+    Ok(FilterAction::Reject(responses_error_rejection(
+        508,
+        "server_error",
+        "agentic loop iteration limit exceeded",
+        false,
+    )))
 }
 
 // -----------------------------------------------------------------------------
@@ -409,11 +495,46 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
                 state.persisted_messages.push(item.clone());
             },
             Some("web_search_call") => {
+                // A hosted web_search_call is not a valid OpenResponses input
+                // item (issue #808), so it must not enter `messages`. The
+                // openai_web_search dispatch consumes `web_search_calls` and
+                // appends a backend-valid function_call/function_call_output
+                // bridge for the next inference step.
                 state.web_search_calls.push(item.clone());
-                state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
             _ => {},
+        }
+    }
+}
+
+/// Retain the current streamed round after `openai_stream_events` has built
+/// its authoritative response object and tool-call list incrementally.
+fn collect_streaming_output_items(state: &mut ResponsesState) {
+    let output = state.output_items().to_vec();
+    for item in output {
+        // `output` is owned (`to_vec`), so route the owned value into its last
+        // consumer by move; only the earlier consumers of a shared item clone.
+        // Non-matching items go solely to `accumulated_output` and are moved.
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "reasoning") => {
+                state.messages.push(item.clone());
+                state.accumulated_output.push(item.clone());
+                state.persisted_messages.push(item);
+            },
+            Some("web_search_call") => {
+                // Mirror `collect_output_items`: a hosted web_search_call is not
+                // a valid OpenResponses input item (issue #808), so it must not
+                // enter `messages`. The openai_web_search dispatch consumes
+                // `web_search_calls` and appends a backend-valid
+                // function_call/function_call_output bridge for the next round.
+                state.web_search_calls.push(item.clone());
+                state.accumulated_output.push(item.clone());
+                state.persisted_messages.push(item);
+            },
+            _ => {
+                state.accumulated_output.push(item);
+            },
         }
     }
 }
@@ -479,29 +600,6 @@ fn is_finish_reason_length(state: &ResponsesState) -> bool {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
-
-/// Build the final response body from accumulated state.
-///
-/// Replaces `response_object["output"]` with the full
-/// `accumulated_output` (all rounds), stamps accumulated usage,
-/// and serializes back to body bytes.
-fn finalize_response_body(state: &ResponsesState, body: &mut Option<Bytes>) {
-    if !state.response_object.is_object() {
-        return;
-    }
-    let mut response = state.response_object.clone();
-    if let Some(obj) = response.as_object_mut() {
-        if !state.accumulated_output.is_empty() {
-            obj.insert("output".to_owned(), Value::Array(state.accumulated_output.clone()));
-        }
-        if !state.usage.is_null() {
-            obj.insert("usage".to_owned(), state.usage.clone());
-        }
-    }
-    if let Ok(serialized) = serde_json::to_vec(&response) {
-        *body = Some(Bytes::from(serialized));
-    }
-}
 
 /// Shorthand: set `action = "done"` and return `Continue`.
 fn set_done(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {

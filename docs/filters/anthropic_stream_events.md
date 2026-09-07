@@ -7,13 +7,14 @@ Transforms streaming SSE responses between `OpenAI` and Anthropic formats, proce
 
 ## Configuration Notes
 
-Arms automatically when an upstream classifier or transform filter sets `anthropic_messages_format.stream` or `anthropic_to_openai.streaming` metadata to `"true"` and the backend response has `Content-Type: text/event-stream` (with or without parameters such as `charset=utf-8`). No `response_conditions` configuration is needed.
+Arms automatically when an upstream classifier or transform filter sets `anthropic_messages_format.stream` or `anthropic_to_openai.streaming` metadata to `"true"` and the backend response has `Content-Type: text/event-stream` (with or without parameters such as `charset=utf-8`) and does not carry a `Content-Encoding` header. No `response_conditions` configuration is needed.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `max_partial_event_bytes` | integer | no | Maximum incomplete SSE event bytes retained between chunks. |
+| `max_tool_blocks` | integer | no | Maximum number of distinct streaming tool-call content blocks retained per response. Each tool-call index an upstream streams pins per-block state for the response's lifetime, so an upstream that emits unbounded unique indices would grow memory without limit. Exceeding this cap fails the stream closed. Default: 10,000. |
 
 ## Examples
 
@@ -28,4 +29,5 @@ filter: anthropic_stream_events
 ```yaml
 filter: anthropic_stream_events
 max_partial_event_bytes: 10485760
+max_tool_blocks: 10000
 ```

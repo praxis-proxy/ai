@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Shared JSON request-body mutation.
+//! Shared JSON request-body mutation and measurement.
 //!
 //! Several filters buffer the request body (`BodyMode::StreamBuffer`), mutate a parsed JSON value, and then
 //! re-serialize it back into the body, each re-implementing the same serialize / replace dance. This module
@@ -15,6 +15,7 @@
 //!
 //! [`serialize_json_body`] and [`SerializedJson::commit`] split the two halves for callers that must inspect the
 //! serialized length before committing (for example, rejecting a rewritten body that exceeds a configured cap).
+//! Callers that only need the length and never the bytes use [`serialized_len`], which counts without buffering.
 //!
 //! Every commit emits one consistent `tracing` event carrying the filter name, the field changed, and the size
 //! delta, and returns a [`BodyMutation`] report with the same data for callers that need it programmatically.
@@ -22,7 +23,10 @@
 //! Request-side only: core repairs upstream `Content-Length` framing for mutated request bodies via
 //! `mutated_request_body_len`, so filters must not set `Content-Length` themselves.
 
+use std::io::{self, Write};
+
 use bytes::Bytes;
+use serde::Serialize;
 use serde_json::Value;
 use tracing::debug;
 
@@ -38,6 +42,43 @@ pub fn serialize_json_body(value: &Value) -> Result<SerializedJson, serde_json::
     Ok(SerializedJson {
         bytes: Bytes::from(serde_json::to_vec(value)?),
     })
+}
+
+/// Byte length of a JSON-serialized `value`, without allocating the serialized form.
+///
+/// The bytes are counted as the serializer produces them and then discarded, so the
+/// value content is never duplicated on the heap just to read a length.
+///
+/// ```
+/// use praxis_ai_apis::json_body::serialized_len;
+/// use serde_json::json;
+///
+/// let value = json!({"model": "a"});
+/// assert_eq!(serialized_len(&value)?, r#"{"model":"a"}"#.len());
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`serde_json::Error`] if `value` fails to serialize.
+pub fn serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<usize, serde_json::Error> {
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+/// Sink that records how many bytes were written to it and discards them.
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Serialize `value`, replace the buffered request `body`, and emit the mutation event.
@@ -181,12 +222,70 @@ impl BodyMutation {
     reason = "tests"
 )]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use super::*;
 
-    fn serialized_len(value: &Value) -> usize {
+    fn to_vec_len(value: &Value) -> usize {
         serde_json::to_vec(value).unwrap().len()
+    }
+
+    #[test]
+    fn serialized_len_matches_allocating_serialization() {
+        for value in [
+            json!(null),
+            json!(42),
+            json!(1.5),
+            json!(""),
+            json!({}),
+            json!([]),
+            json!({"model": "qwen-2.5-72b-instruct", "stream": true}),
+            json!({"input": [{"type": "input_text", "text": "hello"}, {"nested": {"deep": [1, 2, 3]}}]}),
+        ] {
+            assert_eq!(
+                serialized_len(&value).unwrap(),
+                to_vec_len(&value),
+                "counted length should equal the allocated length for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn serialized_len_counts_escapes_and_multibyte_in_bytes() {
+        let value = json!({"text": "caf\u{00e9} \u{2615}\n\"quoted\"\ttabbed \u{65e5}\u{672c}\u{8a9e}"});
+
+        assert_eq!(serialized_len(&value).unwrap(), to_vec_len(&value));
+    }
+
+    #[test]
+    fn serialized_len_accepts_a_slice_of_values() {
+        let items = vec![json!({"role": "user", "content": "hi"}), json!({"role": "assistant"})];
+
+        assert_eq!(
+            serialized_len(items.as_slice()).unwrap(),
+            serde_json::to_vec(&items).unwrap().len(),
+            "a slice should measure the same as the array it serializes to"
+        );
+    }
+
+    #[test]
+    fn serialized_len_of_empty_slice_is_the_empty_array() {
+        let items: Vec<Value> = Vec::new();
+
+        assert_eq!(serialized_len(items.as_slice()).unwrap(), "[]".len());
+    }
+
+    #[test]
+    fn serialized_len_reports_serialization_failure() {
+        // JSON object keys must be strings; a tuple key fails mid-serialization.
+        let unserializable: BTreeMap<(u8, u8), u8> = BTreeMap::from([((1, 2), 3)]);
+
+        assert!(
+            serialized_len(&unserializable).is_err(),
+            "a serialization failure must surface as an error rather than a length"
+        );
     }
 
     #[test]
@@ -199,8 +298,8 @@ mod tests {
 
         assert_eq!(mutation.filter(), "model_rewrite");
         assert_eq!(mutation.field(), "model");
-        assert_eq!(mutation.original_len(), serialized_len(&original));
-        assert_eq!(mutation.new_len(), serialized_len(&mutated));
+        assert_eq!(mutation.original_len(), to_vec_len(&original));
+        assert_eq!(mutation.new_len(), to_vec_len(&mutated));
         assert!(mutation.size_delta() > 0, "growth should report a positive delta");
         assert_eq!(
             body.as_ref().unwrap(),
@@ -219,11 +318,11 @@ mod tests {
 
         assert!(mutation.size_delta() < 0, "shrinkage should report a negative delta");
         assert_eq!(mutation.size_delta(), {
-            let new = i64::try_from(serialized_len(&mutated)).unwrap();
-            let old = i64::try_from(serialized_len(&original)).unwrap();
+            let new = i64::try_from(to_vec_len(&mutated)).unwrap();
+            let old = i64::try_from(to_vec_len(&original)).unwrap();
             new - old
         });
-        assert_eq!(body.as_ref().unwrap().len(), serialized_len(&mutated));
+        assert_eq!(body.as_ref().unwrap().len(), to_vec_len(&mutated));
     }
 
     #[test]
@@ -234,7 +333,7 @@ mod tests {
         let mutation = replace_json_body(&mut body, &mutated, "model_rewrite", "model").unwrap();
 
         assert_eq!(mutation.original_len(), 0);
-        assert_eq!(mutation.new_len(), serialized_len(&mutated));
+        assert_eq!(mutation.new_len(), to_vec_len(&mutated));
         assert!(body.is_some(), "body should be populated after commit");
     }
 
@@ -245,7 +344,7 @@ mod tests {
 
         let mutation = replace_json_body(&mut body, &mutated, "prompt_enrich", "input").unwrap();
 
-        assert_eq!(mutation.new_len(), serialized_len(&mutated));
+        assert_eq!(mutation.new_len(), to_vec_len(&mutated));
         assert!(
             mutation.new_len() > "caf\u{00e9} \u{2615} \u{65e5}\u{672c}\u{8a9e}".len(),
             "JSON serialization of multibyte content should produce more bytes than the rust str len"
@@ -259,11 +358,11 @@ mod tests {
         let mutated = json!({"input": [{"type": "input_text", "text": "resolved"}]});
 
         let serialized = serialize_json_body(&mutated).unwrap();
-        assert_eq!(serialized.len(), serialized_len(&mutated));
+        assert_eq!(serialized.len(), to_vec_len(&mutated));
         assert!(!serialized.is_empty());
         assert_eq!(
             body.as_ref().unwrap().len(),
-            serialized_len(&original),
+            to_vec_len(&original),
             "body must be untouched before commit"
         );
 
@@ -272,8 +371,8 @@ mod tests {
 
         let mutation = serialized.commit(&mut body, "openai_file_resolve", "input");
         assert_eq!(mutation.field(), "input");
-        assert_eq!(mutation.original_len(), serialized_len(&original));
-        assert_eq!(body.as_ref().unwrap().len(), serialized_len(&mutated));
+        assert_eq!(mutation.original_len(), to_vec_len(&original));
+        assert_eq!(body.as_ref().unwrap().len(), to_vec_len(&mutated));
     }
 
     #[test]

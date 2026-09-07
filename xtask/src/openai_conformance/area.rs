@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 use super::model::{ContractException, CoverageMode, OperationScope, RuntimeVerificationCheck, SupportedOperation};
@@ -29,9 +29,21 @@ const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
         evidence: "openai::conversations::tests::conformance_conversations_generated_schema_check_rejects_wrong_discriminator",
         success_sentinel: "PRAXIS_CONFORMANCE_OK conversations schema_check_sensitivity",
     },
+    RuntimeVerificationCheck {
+        kind: "request_item_contract",
+        evidence: "openai::conversations::tests::conformance_conversations_item_requests_reject_unknown_and_malformed_contracts",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations request_item_contract",
+    },
 ];
 
-/// Response metadata discrepancies caused by the incomplete upstream property.
+/// Evidence-backed discrepancies where the pinned upstream schema is incomplete
+/// and the implementation follows the verified live OpenAI behavior instead.
+///
+/// The response-metadata entries record the string-map response Praxis returns
+/// for an upstream property that carries no schema. The request entries on
+/// `POST /conversations/{conversation_id}` record the update body Praxis
+/// requires and its non-null object metadata, both of which the pinned upstream
+/// omits or leaves nullable but the live endpoint enforces.
 const CONVERSATIONS_CONTRACT_EXCEPTIONS: &[ContractException] = &[
     metadata_response_exception(
         "POST",
@@ -93,6 +105,19 @@ const CONVERSATIONS_CONTRACT_EXCEPTIONS: &[ContractException] = &[
         "/conversations/{conversation_id}/items/{item_id}",
         "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
     ),
+    update_body_required_exception("requestBody.required.from"),
+    update_body_required_exception("requestBody.required.to"),
+    update_metadata_request_exception("requestBody.content.application/json.schema.properties.metadata.anyOf.deleted"),
+    update_metadata_request_exception("requestBody.content.application/json.schema.properties.metadata.type.added"),
+    update_metadata_request_exception(
+        "requestBody.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
+    ),
+    update_metadata_request_exception(
+        "requestBody.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
+    ),
+    update_metadata_request_exception(
+        "requestBody.content.application/json.schema.properties.metadata.listOfTypes.deleted",
+    ),
 ];
 
 /// One conformance area checked by `cargo xtask openai-conformance`.
@@ -135,6 +160,37 @@ const fn metadata_response_exception(
         detail,
         rationale: "OpenAI returns metadata as a string map, while the upstream response property has no schema",
         evidence: "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map",
+    }
+}
+
+/// Declare one live-verified `updateConversation` required-body exception.
+///
+/// The pinned upstream omits `requestBody.required`, but the live endpoint
+/// rejects an absent update body, so the implementation marks the body required.
+const fn update_body_required_exception(detail: &'static str) -> ContractException {
+    ContractException {
+        kind: super::model::ContractDriftKind::Request,
+        method: Some("POST"),
+        path: Some("/conversations/{conversation_id}"),
+        detail,
+        rationale: "OpenAI's live update endpoint requires the request body, while the pinned upstream omits requestBody.required",
+        evidence: "api.openai.com probe on 2026-07-27: update with no body or {} returned 400 missing_required_parameter for metadata",
+    }
+}
+
+/// Declare one live-verified `updateConversation` metadata request exception.
+///
+/// The pinned upstream `Metadata` schema is nullable, but the live update
+/// endpoint rejects null metadata, so the implementation emits a non-null
+/// string-map object that matches the verified runtime contract.
+const fn update_metadata_request_exception(detail: &'static str) -> ContractException {
+    ContractException {
+        kind: super::model::ContractDriftKind::Request,
+        method: Some("POST"),
+        path: Some("/conversations/{conversation_id}"),
+        detail,
+        rationale: "OpenAI's live update endpoint rejects null metadata, while the pinned upstream Metadata schema is nullable",
+        evidence: "api.openai.com probe on 2026-07-27: update with null metadata returned 400 invalid_type, update with object metadata returned 200",
     }
 }
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Anthropic SSE event transformation filter.
@@ -52,11 +52,25 @@ const TOOL_BLOCK_INDEX_SUFFIX: &str = ".index";
 /// Metadata key suffix tracking whether a tool call's content block is open.
 const TOOL_BLOCK_OPEN_SUFFIX: &str = ".open";
 
+/// Metadata key counting distinct tool-call content blocks opened so far.
+///
+/// Each opened block pins per-block state (index and open/closed flag)
+/// for the response's lifetime; this count bounds that growth against
+/// `max_tool_blocks`. The trailing token is `tool_block_count`, not
+/// `tool_block.<key>`, so it never matches [`TOOL_BLOCK_KEY_PREFIX`].
+const TOOL_BLOCK_COUNT_KEY: &str = "anthropic_stream.tool_block_count";
+
 /// Metadata key for the finish reason from the upstream provider.
 const FINISH_REASON_KEY: &str = "anthropic_stream.finish_reason";
 
 /// Metadata key for accumulated output token count.
 const OUTPUT_TOKENS_KEY: &str = "anthropic_stream.output_tokens";
+
+/// Metadata key for accumulated input (prompt) token count.
+const INPUT_TOKENS_KEY: &str = "anthropic_stream.input_tokens";
+
+/// Metadata key for cached input token count.
+const CACHE_READ_TOKENS_KEY: &str = "anthropic_stream.cache_read_tokens";
 
 /// Metadata key for the current content block index.
 const BLOCK_INDEX_KEY: &str = "anthropic_stream.block_index";
@@ -78,7 +92,8 @@ const ARMED_KEY: &str = "anthropic_stream.armed";
 /// filter sets `anthropic_messages_format.stream` or
 /// `anthropic_to_openai.streaming` metadata to `"true"` and
 /// the backend response has `Content-Type: text/event-stream`
-/// (with or without parameters such as `charset=utf-8`).
+/// (with or without parameters such as `charset=utf-8`) and does
+/// not carry a `Content-Encoding` header.
 /// No `response_conditions` configuration is needed.
 ///
 /// # YAML
@@ -92,6 +107,7 @@ const ARMED_KEY: &str = "anthropic_stream.armed";
 /// ```yaml
 /// filter: anthropic_stream_events
 /// max_partial_event_bytes: 10485760
+/// max_tool_blocks: 10000
 /// ```
 pub struct AnthropicStreamEventsFilter {
     /// Parsed and validated configuration.
@@ -108,6 +124,28 @@ impl AnthropicStreamEventsFilter {
         let cfg: AnthropicStreamEventsConfig = parse_filter_config("anthropic_stream_events", config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
+    }
+
+    /// Decode and transform one response body chunk under the filter's
+    /// configured partial-event and tool-block limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if a partial SSE event or the retained
+    /// tool-call block count exceeds its configured limit.
+    fn process_response_chunk(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        bytes: &Bytes,
+        end_of_stream: bool,
+    ) -> Result<Option<Bytes>, FilterError> {
+        decode_and_process_chunk(
+            ctx,
+            bytes,
+            end_of_stream,
+            self.config.max_partial_event_bytes,
+            self.config.max_tool_blocks,
+        )
     }
 }
 
@@ -133,7 +171,8 @@ impl HttpFilter for AnthropicStreamEventsFilter {
         BodyMode::Stream
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         Ok(FilterAction::Continue)
     }
 
@@ -167,8 +206,8 @@ impl HttpFilter for AnthropicStreamEventsFilter {
 
         let Some(bytes) = body.as_ref() else {
             if end_of_stream {
-                let empty = Bytes::new();
-                let output = decode_and_process_chunk(ctx, &empty, true, self.config.max_partial_event_bytes)?
+                let output = self
+                    .process_response_chunk(ctx, &Bytes::new(), true)?
                     .unwrap_or_default();
                 if !output.is_empty() {
                     *body = Some(output);
@@ -177,8 +216,7 @@ impl HttpFilter for AnthropicStreamEventsFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let Some(output) = decode_and_process_chunk(ctx, bytes, end_of_stream, self.config.max_partial_event_bytes)?
-        else {
+        let Some(output) = self.process_response_chunk(ctx, bytes, end_of_stream)? else {
             *body = Some(Bytes::new());
             return Ok(FilterAction::Continue);
         };
@@ -200,10 +238,15 @@ fn decode_and_process_chunk(
     bytes: &Bytes,
     end_of_stream: bool,
     max_partial_event_bytes: usize,
+    max_tool_blocks: usize,
 ) -> Result<Option<Bytes>, FilterError> {
     let combined = combine_pending_utf8(ctx, bytes);
     let Some(valid_up_to) = valid_utf8_prefix_len(ctx, combined.as_slice(), end_of_stream) else {
-        return Ok(Some(passthrough_with_line_buffer(ctx, combined)));
+        // Never mix raw upstream bytes into an Anthropic event stream.
+        ctx.filter_metadata.remove(LINE_BUFFER_KEY);
+        return Err(FilterError::from(
+            "anthropic_stream_events: upstream SSE contains malformed UTF-8",
+        ));
     };
     let Some(valid_bytes) = combined.as_slice().get(..valid_up_to) else {
         return Ok(None);
@@ -216,7 +259,7 @@ fn decode_and_process_chunk(
         return Ok(None);
     }
 
-    process_sse_chunk(ctx, chunk_str, end_of_stream, max_partial_event_bytes).map(Some)
+    process_sse_chunk(ctx, chunk_str, end_of_stream, max_partial_event_bytes, max_tool_blocks).map(Some)
 }
 
 /// Prefix any incomplete UTF-8 bytes retained from the previous chunk.
@@ -252,17 +295,6 @@ fn valid_utf8_prefix_len(ctx: &mut HttpFilterContext<'_>, combined: &[u8], end_o
     }
 }
 
-/// Preserve buffered bytes when a malformed chunk cannot be parsed as UTF-8.
-fn passthrough_with_line_buffer(ctx: &mut HttpFilterContext<'_>, bytes: CombinedUtf8Chunk<'_>) -> Bytes {
-    let Some(buffer) = ctx.filter_metadata.remove(LINE_BUFFER_KEY) else {
-        return bytes.into_bytes();
-    };
-
-    let mut output = buffer.into_bytes();
-    output.extend_from_slice(bytes.as_slice());
-    Bytes::from(output)
-}
-
 /// Combined UTF-8 chunk data, borrowed unless a pending suffix had to be prefixed.
 enum CombinedUtf8Chunk<'a> {
     /// Current chunk borrowed directly from Pingora.
@@ -280,14 +312,6 @@ impl CombinedUtf8Chunk<'_> {
             Self::Owned(bytes) => bytes.as_slice(),
         }
     }
-
-    /// Convert into output bytes without copying borrowed `Bytes`.
-    fn into_bytes(self) -> Bytes {
-        match self {
-            Self::Borrowed(bytes) => bytes.clone(),
-            Self::Owned(bytes) => Bytes::from(bytes),
-        }
-    }
 }
 
 /// Parse SSE event boundaries from the combined buffer, transform
@@ -302,6 +326,7 @@ fn process_sse_chunk(
     chunk_str: &str,
     end_of_stream: bool,
     max_partial_event_bytes: usize,
+    max_tool_blocks: usize,
 ) -> Result<Bytes, FilterError> {
     let leftover = ctx.filter_metadata.get(LINE_BUFFER_KEY).cloned().unwrap_or_default();
     let combined = format!("{leftover}{chunk_str}");
@@ -322,7 +347,7 @@ fn process_sse_chunk(
 
     while let Some((event_block, rest)) = remaining.split_once("\n\n") {
         remaining = rest;
-        process_event_block(ctx, event_block, &mut output);
+        process_event_block(ctx, event_block, &mut output, max_tool_blocks)?;
     }
 
     let to_buffer = if pending_cr {
@@ -384,6 +409,15 @@ fn should_arm(ctx: &HttpFilterContext<'_>) -> bool {
         return false;
     }
 
+    let is_encoded = ctx
+        .response_header
+        .as_ref()
+        .is_some_and(|response| response.headers.contains_key(http::header::CONTENT_ENCODING));
+    if is_encoded {
+        debug!("streaming SSE response is encoded; skipping stream transformation");
+        return false;
+    }
+
     let is_success = ctx.response_header.as_ref().is_none_or(|r| r.status.is_success());
     if !is_success {
         debug!("streaming SSE response with non-2xx status; passing through error body");
@@ -410,7 +444,12 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
 /// Collects all `data` fields into one newline-delimited payload before
 /// processing it. Accepts bare `data`, `data: value`, and `data:value`
 /// per the SSE specification.
-fn process_event_block(ctx: &mut HttpFilterContext<'_>, block: &str, output: &mut Vec<u8>) {
+fn process_event_block(
+    ctx: &mut HttpFilterContext<'_>,
+    block: &str,
+    output: &mut Vec<u8>,
+    max_tool_blocks: usize,
+) -> Result<(), FilterError> {
     let mut event_data = None::<Cow<'_, str>>;
 
     for line in block.lines() {
@@ -436,9 +475,11 @@ fn process_event_block(ctx: &mut HttpFilterContext<'_>, block: &str, output: &mu
         if data == OPENAI_DONE_SENTINEL {
             emit_done(ctx, output);
         } else if let Ok(chunk) = serde_json::from_str::<Value>(&data) {
-            transform_chunk(ctx, &chunk, output);
+            transform_chunk(ctx, &chunk, output, max_tool_blocks)?;
         }
     }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -446,7 +487,12 @@ fn process_event_block(ctx: &mut HttpFilterContext<'_>, block: &str, output: &mu
 // -----------------------------------------------------------------------------
 
 /// Transform a single `OpenAI` SSE chunk into Anthropic events.
-fn transform_chunk(ctx: &mut HttpFilterContext<'_>, chunk: &Value, output: &mut Vec<u8>) {
+fn transform_chunk(
+    ctx: &mut HttpFilterContext<'_>,
+    chunk: &Value,
+    output: &mut Vec<u8>,
+    max_tool_blocks: usize,
+) -> Result<(), FilterError> {
     let started = ctx
         .filter_metadata
         .get(STREAM_STATE_KEY)
@@ -458,19 +504,33 @@ fn transform_chunk(ctx: &mut HttpFilterContext<'_>, chunk: &Value, output: &mut 
 
     if let Some(choice) = extract_first_choice(chunk) {
         if let Some(delta) = choice.get("delta") {
-            transform_delta(ctx, delta, output);
+            transform_delta(ctx, delta, output, max_tool_blocks)?;
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             ctx.set_metadata(FINISH_REASON_KEY, reason.to_owned());
         }
     }
 
-    if let Some(ot) = chunk
-        .get("usage")
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(Value::as_u64)
-    {
-        ctx.set_metadata(OUTPUT_TOKENS_KEY, ot.to_string());
+    extract_usage_tokens(ctx, chunk);
+    Ok(())
+}
+
+/// Extract token usage from a chunk and store in filter metadata.
+fn extract_usage_tokens(ctx: &mut HttpFilterContext<'_>, chunk: &Value) {
+    if let Some(usage) = chunk.get("usage") {
+        if let Some(ot) = usage.get("completion_tokens").and_then(Value::as_u64) {
+            ctx.set_metadata(OUTPUT_TOKENS_KEY, ot.to_string());
+        }
+        if let Some(pt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+            ctx.set_metadata(INPUT_TOKENS_KEY, pt.to_string());
+        }
+        if let Some(ct) = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+        {
+            ctx.set_metadata(CACHE_READ_TOKENS_KEY, ct.to_string());
+        }
     }
 }
 
@@ -522,7 +582,12 @@ fn generate_timestamp_id() -> u128 {
 // -----------------------------------------------------------------------------
 
 /// Transform a delta object from a streaming chunk.
-fn transform_delta(ctx: &mut HttpFilterContext<'_>, delta: &Value, output: &mut Vec<u8>) {
+fn transform_delta(
+    ctx: &mut HttpFilterContext<'_>,
+    delta: &Value,
+    output: &mut Vec<u8>,
+    max_tool_blocks: usize,
+) -> Result<(), FilterError> {
     if let Some(content) = delta.get("content").and_then(Value::as_str) {
         emit_text_delta(ctx, content, output);
     }
@@ -530,9 +595,11 @@ fn transform_delta(ctx: &mut HttpFilterContext<'_>, delta: &Value, output: &mut 
     if let Some(Value::Array(tool_calls)) = delta.get("tool_calls") {
         close_text_block_if_open(ctx, output);
         for tc in tool_calls {
-            transform_tool_delta(ctx, tc, output);
+            transform_tool_delta(ctx, tc, output, max_tool_blocks)?;
         }
     }
+
+    Ok(())
 }
 
 /// Emit a text content delta, opening a new block if needed.
@@ -569,16 +636,21 @@ fn emit_text_delta(ctx: &mut HttpFilterContext<'_>, content: &str, output: &mut 
 // -----------------------------------------------------------------------------
 
 /// Transform a tool call delta into Anthropic content block events.
-fn transform_tool_delta(ctx: &mut HttpFilterContext<'_>, tc: &Value, output: &mut Vec<u8>) {
+fn transform_tool_delta(
+    ctx: &mut HttpFilterContext<'_>,
+    tc: &Value,
+    output: &mut Vec<u8>,
+    max_tool_blocks: usize,
+) -> Result<(), FilterError> {
     let tool_call_key = tool_call_key(tc);
 
-    if let Some(id) = tc.get("id").and_then(Value::as_str)
-        && !is_tool_block_open(ctx, &tool_call_key)
-    {
-        emit_tool_block_start(ctx, &tool_call_key, tc, id, output);
+    if tc.get("id").and_then(Value::as_str).is_some() && !is_tool_block_open(ctx, &tool_call_key) {
+        emit_tool_block_start(ctx, &tool_call_key, tc, output, max_tool_blocks)?;
     }
 
     emit_tool_arguments_delta(ctx, &tool_call_key, tc, output);
+
+    Ok(())
 }
 
 /// Close any open text content block and advance the block index.
@@ -605,14 +677,29 @@ fn tool_call_key(tc: &Value) -> String {
 }
 
 /// Emit a `content_block_start` for a tool-use block.
+///
+/// # Errors
+///
+/// Fails closed with a [`FilterError`] before opening the
+/// `max_tool_blocks + 1`th block, bounding the per-response tool-call
+/// state that would otherwise grow with every unique upstream index.
 fn emit_tool_block_start(
     ctx: &mut HttpFilterContext<'_>,
     tool_call_key: &str,
     tc: &Value,
-    id: &str,
     output: &mut Vec<u8>,
-) {
+    max_tool_blocks: usize,
+) -> Result<(), FilterError> {
+    let opened = get_tool_block_count(ctx);
+    if opened >= max_tool_blocks {
+        return Err(format!(
+            "anthropic_stream_events: streaming tool-call content blocks exceed max_tool_blocks ({max_tool_blocks})"
+        )
+        .into());
+    }
+
     let idx = get_block_index(ctx);
+    let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
     let name = tc
         .get("function")
         .and_then(|f| f.get("name"))
@@ -632,6 +719,9 @@ fn emit_tool_block_start(
     set_tool_block_index(ctx, tool_call_key, idx);
     set_tool_block_open(ctx, tool_call_key, true);
     increment_block_index(ctx);
+    ctx.set_metadata(TOOL_BLOCK_COUNT_KEY, (opened + 1).to_string());
+
+    Ok(())
 }
 
 /// Emit an `input_json_delta` if the tool call has non-empty arguments.
@@ -707,11 +797,7 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
         .get(FINISH_REASON_KEY)
         .map_or("end_turn", |v| map_stop_reason(v));
 
-    let output_tokens: u64 = ctx
-        .filter_metadata
-        .get(OUTPUT_TOKENS_KEY)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let usage = collect_delta_usage(ctx);
 
     emit_event(
         output,
@@ -724,19 +810,37 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
                 "stop_reason": stop_reason,
                 "stop_sequence": null
             },
-            "usage": message_delta_usage(output_tokens)
+            "usage": usage
         }),
     );
+}
+
+/// Collect token counts from metadata and build the terminal delta usage.
+fn collect_delta_usage(ctx: &HttpFilterContext<'_>) -> MessageDeltaUsage {
+    let output_tokens: u64 = ctx
+        .filter_metadata
+        .get(OUTPUT_TOKENS_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let prompt_tokens: Option<u64> = ctx.filter_metadata.get(INPUT_TOKENS_KEY).and_then(|v| v.parse().ok());
+
+    let cache_read: Option<u64> = ctx
+        .filter_metadata
+        .get(CACHE_READ_TOKENS_KEY)
+        .and_then(|v| v.parse().ok());
+
+    let input_tokens = prompt_tokens.map(|pt| match cache_read {
+        Some(cached) => pt.saturating_sub(cached),
+        None => pt,
+    });
+
+    MessageDeltaUsage::new(output_tokens, input_tokens, cache_read)
 }
 
 /// Build a schema-complete Anthropic `Message.usage` value.
 fn message_start_usage() -> MessageUsage {
     MessageUsage::new(0, 0, None)
-}
-
-/// Build a schema-complete Anthropic `message_delta.usage` value.
-fn message_delta_usage(output_tokens: u64) -> MessageDeltaUsage {
-    MessageDeltaUsage::new(output_tokens)
 }
 
 /// Map `OpenAI` finish reasons to Anthropic stop reasons.
@@ -771,6 +875,14 @@ fn get_block_index(ctx: &HttpFilterContext<'_>) -> u32 {
 fn increment_block_index(ctx: &mut HttpFilterContext<'_>) {
     let current = get_block_index(ctx);
     ctx.set_metadata(BLOCK_INDEX_KEY, (current + 1).to_string());
+}
+
+/// Return how many tool-call content blocks have opened this response.
+fn get_tool_block_count(ctx: &HttpFilterContext<'_>) -> usize {
+    ctx.filter_metadata
+        .get(TOOL_BLOCK_COUNT_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Build the metadata key for a tool call's Anthropic block index.
@@ -880,6 +992,20 @@ mod tests {
         assert_eq!(filter.name(), "anthropic_stream_events", "filter name should match");
     }
 
+    #[tokio::test]
+    async fn on_request_prevents_upstream_response_encoding() {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
+            "stream transformation requires an unencoded upstream representation"
+        );
+    }
+
     #[test]
     fn incremental_text_chunks_transformed_immediately() {
         let (filter, mut ctx) = make_filter_and_context();
@@ -987,7 +1113,7 @@ mod tests {
     fn message_delta_usage_matches_anthropic_schema() {
         let (filter, mut ctx) = make_filter_and_context();
 
-        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":7}}\n\n";
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":7}}\n\n";
         let mut body1 = Some(Bytes::from(chunk1));
         drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
 
@@ -1011,13 +1137,63 @@ mod tests {
             &[
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
-                "input_tokens",
                 "server_tool_use",
             ],
             "message_delta usage",
         );
         assert_absent_fields(usage, &["output_tokens_details"], "message_delta usage");
         assert_u64_field(usage, "output_tokens", 7, "message_delta usage");
+        assert_u64_field(usage, "input_tokens", 15, "message_delta usage");
+    }
+
+    #[test]
+    fn message_delta_usage_with_cached_tokens() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let done = "data: [DONE]\n\n";
+        let mut body2 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let usage = event.get("usage").unwrap();
+
+        assert_u64_field(usage, "output_tokens", 5, "message_delta usage");
+        assert_u64_field(
+            usage,
+            "input_tokens",
+            20,
+            "input_tokens should exclude cached (100 - 80)",
+        );
+        assert_u64_field(usage, "cache_read_input_tokens", 80, "message_delta usage");
+    }
+
+    #[test]
+    fn message_delta_usage_without_usage_chunk() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let done = "data: [DONE]\n\n";
+        let mut body2 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let usage = event.get("usage").unwrap();
+
+        assert_u64_field(usage, "output_tokens", 0, "no usage chunk means zero output_tokens");
+        assert_null_fields(
+            usage,
+            &["input_tokens", "cache_read_input_tokens"],
+            "no usage chunk means null input fields",
+        );
     }
 
     #[test]
@@ -1160,6 +1336,36 @@ mod tests {
             "non-SSE response should preserve original content type"
         );
         assert!(!is_armed(&ctx), "filter should not arm for non-SSE response");
+    }
+
+    #[tokio::test]
+    async fn encoded_sse_response_passes_through_unchanged() {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut resp = crate::test_utils::make_response();
+        resp.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        resp.headers
+            .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+        ctx.response_header = Some(&mut resp);
+        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+
+        drop(filter.on_response(&mut ctx).await.unwrap());
+
+        assert!(!is_armed(&ctx), "filter should not arm for an encoded SSE response");
+        assert!(
+            !ctx.response_headers_modified,
+            "encoded SSE response headers should remain unchanged"
+        );
+
+        let encoded = Bytes::from_static(b"\x1f\x8bencoded-sse");
+        let mut body = Some(encoded.clone());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+        assert_eq!(body, Some(encoded), "encoded SSE bytes should pass through unchanged");
     }
 
     #[tokio::test]
@@ -1362,44 +1568,51 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_passes_through_without_poisoning_next_chunk() {
+    fn invalid_utf8_rejected() {
         let (filter, mut ctx) = make_filter_and_context();
 
         let mut body1 = Some(Bytes::from(vec![0xFF]));
-        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
-        assert_eq!(
-            body1.unwrap().as_ref(),
-            &[0xFF],
-            "malformed UTF-8 should pass through unchanged"
+        let error = filter.on_response_body(&mut ctx, &mut body1, false).unwrap_err();
+        assert!(
+            error.to_string().contains("upstream SSE contains malformed UTF-8"),
+            "malformed UTF-8 should fail the transformed stream"
         );
         assert!(
             !ctx.filter_metadata.contains_key(UTF8_BUFFER_KEY),
             "malformed UTF-8 should not be buffered as incomplete"
         );
+    }
 
-        let chunk2 =
+    #[test]
+    fn invalid_utf8_after_stream_start_rejected() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk =
             "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0}]}\n\n";
-        let mut body2 = Some(Bytes::from(chunk2));
-        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
-
-        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        let mut body1 = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
         assert!(
-            out.contains("text_delta"),
-            "valid chunk after malformed UTF-8 should still transform"
+            body1.unwrap().starts_with(b"event: message_start"),
+            "setup chunk should start an Anthropic event stream"
+        );
+
+        let mut body2 = Some(Bytes::from(vec![0xFF]));
+        let error = filter.on_response_body(&mut ctx, &mut body2, false).unwrap_err();
+        assert!(
+            error.to_string().contains("upstream SSE contains malformed UTF-8"),
+            "malformed UTF-8 should fail after transformed events were emitted"
         );
     }
 
     #[test]
-    fn truncated_utf8_at_end_of_stream_passes_through() {
+    fn truncated_utf8_at_end_of_stream_rejected() {
         let (filter, mut ctx) = make_filter_and_context();
 
         let mut body = Some(Bytes::from(vec![0xE2, 0x82]));
-        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
-
-        assert_eq!(
-            body.unwrap().as_ref(),
-            &[0xE2, 0x82],
-            "truncated final UTF-8 should pass through rather than being buffered"
+        let error = filter.on_response_body(&mut ctx, &mut body, true).unwrap_err();
+        assert!(
+            error.to_string().contains("upstream SSE contains malformed UTF-8"),
+            "truncated final UTF-8 should fail the transformed stream"
         );
         assert!(
             !ctx.filter_metadata.contains_key(UTF8_BUFFER_KEY),
@@ -1408,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_utf8_flushed_by_none_end_of_stream_body() {
+    fn pending_utf8_rejected_by_none_end_of_stream_body() {
         let (filter, mut ctx) = make_filter_and_context();
 
         let mut body1 = Some(Bytes::from(vec![0xE2]));
@@ -1419,21 +1632,19 @@ mod tests {
         );
 
         let mut body2 = None;
-        drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
-
-        assert_eq!(
-            body2.unwrap().as_ref(),
-            &[0xE2],
-            "missing final body should flush pending incomplete UTF-8"
+        let error = filter.on_response_body(&mut ctx, &mut body2, true).unwrap_err();
+        assert!(
+            error.to_string().contains("upstream SSE contains malformed UTF-8"),
+            "missing final body should reject pending incomplete UTF-8"
         );
         assert!(
             !ctx.filter_metadata.contains_key(UTF8_BUFFER_KEY),
-            "flushed pending UTF-8 should clear the buffer"
+            "rejected pending UTF-8 should clear the buffer"
         );
     }
 
     #[test]
-    fn malformed_utf8_flushes_partial_sse_buffer() {
+    fn malformed_utf8_discards_partial_sse_buffer() {
         let (filter, mut ctx) = make_filter_and_context();
 
         let mut chunk1 = Vec::new();
@@ -1445,16 +1656,14 @@ mod tests {
         assert_stream_buffers_present(&ctx, true);
 
         let mut body2 = Some(Bytes::from(vec![0xFF]));
-        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
-
-        let output = body2.unwrap();
+        let error = filter.on_response_body(&mut ctx, &mut body2, false).unwrap_err();
         assert!(
-            output.starts_with(b"data: {\"id\":\"c1\""),
-            "malformed UTF-8 should flush previously buffered SSE data"
+            error.to_string().contains("upstream SSE contains malformed UTF-8"),
+            "malformed UTF-8 should fail the transformed stream"
         );
         assert!(
-            output.ends_with(&[0xE2, 0xFF]),
-            "malformed UTF-8 output should include buffered and current malformed bytes"
+            !ctx.filter_metadata.contains_key(LINE_BUFFER_KEY),
+            "malformed UTF-8 should discard buffered SSE data"
         );
         assert_stream_buffers_present(&ctx, false);
     }
@@ -1694,6 +1903,51 @@ mod tests {
         assert!(
             result.is_err(),
             "streaming filter should reject a limit above MAX_JSON_BODY_BYTES"
+        );
+    }
+
+    #[test]
+    fn custom_max_tool_blocks_parses() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_blocks: 5").unwrap();
+        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+
+        assert!(
+            result.is_ok(),
+            "streaming filter should accept a custom max_tool_blocks"
+        );
+    }
+
+    #[test]
+    fn zero_max_tool_blocks_rejected() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_blocks: 0").unwrap();
+        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+
+        assert!(result.is_err(), "streaming filter should reject a zero max_tool_blocks");
+    }
+
+    #[test]
+    fn exceeding_max_tool_blocks_fails_closed() {
+        let (filter, mut ctx) = make_filter_and_context_from_yaml("max_tool_blocks: 2");
+
+        let block = |index: u64| {
+            format!(
+                "data: {{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":{index},\"id\":\"call_{index}\",\"function\":{{\"name\":\"f{index}\",\"arguments\":\"{{}}\"}}}}]}},\"index\":0}}]}}\n\n"
+            )
+        };
+
+        let mut body0 = Some(Bytes::from(block(0)));
+        drop(filter.on_response_body(&mut ctx, &mut body0, false).unwrap());
+
+        let mut body1 = Some(Bytes::from(block(1)));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let mut body2 = Some(Bytes::from(block(2)));
+        let result = filter.on_response_body(&mut ctx, &mut body2, false);
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("max_tool_blocks"),
+            "exceeding the tool-block cap should fail closed and mention max_tool_blocks, got: {err}"
         );
     }
 

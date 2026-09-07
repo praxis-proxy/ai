@@ -1,0 +1,44 @@
+version: 1
+id: messages/typed-server-tools
+description: Typed Anthropic server tools are omitted when translating client tools to Chat Completions.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.request.client_tool_ownership
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          messages:
+            - role: user
+              content: What is the weather in Paris?
+          tools:
+            - type: code_execution_20250522
+              name: code_execution
+            - name: get_weather
+              description: Get the current weather for a city.
+              input_schema:
+                type: object
+                properties:
+                  city:
+                    type: string
+                required:
+                  - city
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

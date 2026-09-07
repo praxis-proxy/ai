@@ -27,6 +27,7 @@ bytes = { workspace = true }
 dashmap = { workspace = true, optional = true }
 futures = { workspace = true }
 http = { workspace = true }
+jsonschema = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-core = { workspace = true }
@@ -40,7 +41,7 @@ serde_yaml = { workspace = true }
 sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tiktoken-rs = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true }

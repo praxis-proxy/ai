@@ -10,7 +10,7 @@ Converts `input_file` content parts to `input_text` for backends that do not sup
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `allow_pre_security_callout` | bool | no | Acknowledge that `StreamBuffer` body processing runs before header-phase security filters.  Must be `true`. |
-| `max_body_bytes` | integer | no | Maximum request body bytes for `StreamBuffer` (default 64 MiB). |
+| `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after converting `input_file` parts to `input_text` (default 64 MiB). Raw request body size is governed by the pipeline's `body_limits`, not this field. |
 | `max_content_bytes` | integer | no | Maximum decoded content bytes per file (default 10 MiB). |
 | `max_file_references` | integer | no | Maximum `input_file` parts processed per request (default 32). |
 | `max_total_text_bytes` | integer | no | Maximum total extracted text bytes across all files in one request (default 64 MiB). |
@@ -31,7 +31,7 @@ allow_pre_security_callout: true
 filter: openai_doc_extract
 allow_pre_security_callout: true
 on_unsupported: continue
-max_body_bytes: 67108864
+max_rewritten_body_bytes: 67108864
 max_content_bytes: 10485760
 max_file_references: 32
 max_total_text_bytes: 67108864

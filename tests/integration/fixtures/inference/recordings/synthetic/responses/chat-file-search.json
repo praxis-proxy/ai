@@ -1,0 +1,225 @@
+{
+  "version": 1,
+  "scenario_id": "responses/chat-file-search",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-chat-file-search",
+    "source_id": "controlled-chat-file-search-translation"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_resp_5a7ec9b6f1282b58e466000000000000": "msg_recorded_0002",
+      "resp_5a7ec9b6f1282b58e466000000000000": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Find the Q4 revenue.",
+              "model": "synthetic-chat-file-search",
+              "store": false,
+              "stream": false,
+              "tool_choice": {
+                "type": "file_search"
+              },
+              "tools": [
+                {
+                  "max_num_results": 5,
+                  "type": "file_search",
+                  "vector_store_ids": [
+                    "vs_q4"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": "1970-01-01T00:00:00Z",
+              "error": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "Find the Q4 revenue.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "max_tool_calls": null,
+              "metadata": {},
+              "model": "synthetic-chat-file-search",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "Q4 revenue was 42 million.",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt_cache_key": null,
+              "reasoning": null,
+              "safety_identifier": null,
+              "service_tier": "default",
+              "status": "completed",
+              "store": false,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": {
+                "type": "file_search"
+              },
+              "tools": [
+                {
+                  "max_num_results": 5,
+                  "type": "file_search",
+                  "vector_store_ids": [
+                    "vs_q4"
+                  ]
+                }
+              ],
+              "top_logprobs": 0,
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 6,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 18
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "Find the Q4 revenue.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-chat-file-search",
+              "stream": false,
+              "tool_choice": {
+                "function": {
+                  "name": "file_search"
+                },
+                "type": "function"
+              },
+              "tools": [
+                {
+                  "function": {
+                    "description": "Search the configured vector stores for relevant files.",
+                    "name": "file_search",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "query": {
+                          "maxLength": 65536,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "query"
+                      ],
+                      "type": "object"
+                    },
+                    "strict": true
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "Q4 revenue was 42 million.",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl_final",
+              "model": "synthetic-chat-file-search",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 6,
+                "prompt_tokens": 12,
+                "total_tokens": 18
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

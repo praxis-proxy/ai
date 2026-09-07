@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 use std::{
@@ -43,7 +43,7 @@ fn minimal_config_uses_safe_defaults() {
     assert_eq!(config.max_response_bytes, 10_485_760);
     assert_eq!(config.max_total_response_bytes, 67_108_864);
     assert_eq!(config.max_state_bytes, 52_428_800);
-    assert_eq!(config.failure_mode, FailureMode::Closed);
+    assert_eq!(config.on_failure, OnFailure::Closed);
 }
 
 #[test]
@@ -79,10 +79,9 @@ fn config_rejects_ambiguous_or_invalid_urls() {
 }
 
 #[test]
-fn config_rejects_dns_and_sensitive_ip_targets_by_default() {
+fn config_rejects_sensitive_ip_targets_by_default() {
     for url in [
         "http://localhost:8001",
-        "http://vector-store.internal:8001",
         "http://127.0.0.1:8001",
         "http://10.0.0.1:8001",
         "http://169.254.169.254:8001",
@@ -93,6 +92,11 @@ fn config_rejects_dns_and_sensitive_ip_targets_by_default() {
     ] {
         assert!(parse_config(&format!("vector_store_url: '{url}'\n")).is_err(), "{url}");
     }
+
+    assert!(
+        parse_config("vector_store_url: 'http://vector-store.example:8001'\n").is_ok(),
+        "DNS targets are validated and pinned at connect time"
+    );
 }
 
 #[test]
@@ -458,6 +462,7 @@ fn continuation_header_replay_excludes_stale_request_metadata() {
         http::header::CONTENT_ENCODING,
         http::header::ACCEPT_ENCODING,
         http::header::HeaderName::from_static("idempotency-key"),
+        http::header::HeaderName::from_static("proxy-connection"),
         http::header::HeaderName::from_static("x-praxis-internal-test"),
     ] {
         assert!(!should_replay_original_header(&name), "{name} should not be replayed");
@@ -765,6 +770,7 @@ async fn forced_tool_choice_resets_after_search_execution() {
     ));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.tool_choice, "auto");
+    assert_eq!(state.original_tool_choice, Some(json!({"type":"file_search"})));
     assert!(state.request_body.get("tool_choice").is_none());
 }
 
@@ -1219,7 +1225,7 @@ async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_vector_store()
 }
 
 #[tokio::test]
-async fn open_and_closed_failure_modes_are_distinct() {
+async fn open_and_closed_on_failures_are_distinct() {
     for (status, body) in [
         (401, json!({"error":"unauthorized"}).to_string()),
         (403, "not-json".to_owned()),
@@ -1233,7 +1239,7 @@ async fn open_and_closed_failure_modes_are_distinct() {
             body_delay: Duration::ZERO,
             status,
         });
-        let closed = make_filter(closed_server.port, "callout_failure_mode: closed\n");
+        let closed = make_filter(closed_server.port, "on_failure: closed\n");
         let mut closed_ctx = make_context(Some(one_pending_state(&["vs-a"])));
         assert!(matches!(
             closed.on_request(&mut closed_ctx).await.unwrap(),
@@ -1250,7 +1256,7 @@ async fn open_and_closed_failure_modes_are_distinct() {
             body_delay: Duration::ZERO,
             status,
         });
-        let open = make_filter(open_server.port, "callout_failure_mode: open\n");
+        let open = make_filter(open_server.port, "on_failure: open\n");
         let mut open_ctx = make_context(Some(one_pending_state(&["vs-a"])));
         assert!(matches!(
             open.on_request(&mut open_ctx).await.unwrap(),
@@ -1271,7 +1277,7 @@ async fn aggregate_budget_stops_later_searches_and_marks_call_incomplete() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, "small"));
     let filter = make_filter(
         server.port,
-        "callout_failure_mode: open\nmax_response_bytes: 512\nmax_total_response_bytes: 512\n",
+        "on_failure: open\nmax_response_bytes: 512\nmax_total_response_bytes: 512\n",
     );
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b"])));
 
@@ -1300,7 +1306,7 @@ async fn malformed_success_bodies_are_charged_to_the_aggregate_budget() {
     });
     let filter = make_filter(
         server.port,
-        "callout_failure_mode: open\nmax_response_bytes: 1\nmax_total_response_bytes: 4\n",
+        "on_failure: open\nmax_response_bytes: 1\nmax_total_response_bytes: 4\n",
     );
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b", "vs-c", "vs-d", "vs-e"])));
 
@@ -1382,7 +1388,7 @@ async fn one_execution_deadline_covers_later_concurrency_chunks() {
 #[tokio::test]
 async fn fail_closed_stops_scheduling_after_the_current_chunk() {
     let server = MockServer::json(500, &json!({"error": "failed"}));
-    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
+    let filter = make_filter(server.port, "on_failure: closed\n");
     let store_ids: Vec<String> = (0..=MAX_CONCURRENT_SEARCHES)
         .map(|index| format!("vs-{index}"))
         .collect();
@@ -1435,7 +1441,7 @@ async fn aggregate_results_are_score_sorted_and_limited_to_top_k() {
             Duration::ZERO,
         ),
     ]);
-    let filter = make_filter(server.port, "callout_failure_mode: open\n");
+    let filter = make_filter(server.port, "on_failure: open\n");
     let mut state = one_pending_state(&["vs-a", "vs-b"]);
     state.tools[0]["max_num_results"] = json!(3);
     state.include.push("file_search_call.results".to_owned());
@@ -1465,7 +1471,7 @@ async fn fail_open_retains_successful_results_from_a_partial_fan_out() {
         ),
         ("vs-b", 500, json!({"error": "failed"}), Duration::ZERO),
     ]);
-    let filter = make_filter(server.port, "callout_failure_mode: open\n");
+    let filter = make_filter(server.port, "on_failure: open\n");
     let mut state = one_pending_state(&["vs-a", "vs-b"]);
     state.include.push("file_search_call.results".to_owned());
     let mut ctx = make_context(Some(state));
@@ -1484,7 +1490,7 @@ async fn fail_open_retains_successful_results_from_a_partial_fan_out() {
 #[tokio::test]
 async fn outbound_query_store_id_and_request_body_are_bounded() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "callout_failure_mode: open\n");
+    let filter = make_filter(server.port, "on_failure: open\n");
 
     let oversized_store = "s".repeat(MAX_VECTOR_STORE_ID_BYTES + 1);
     let mut store_ctx = make_context(Some(one_pending_state(&[&oversized_store])));
@@ -1518,7 +1524,7 @@ async fn outbound_query_store_id_and_request_body_are_bounded() {
 #[tokio::test]
 async fn malformed_execution_fields_fail_without_silent_normalization() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
+    let filter = make_filter(server.port, "on_failure: closed\n");
 
     let mut invalid_stores = one_pending_state(&["vs-a"]);
     invalid_stores.tools[0]["vector_store_ids"] = json!(["vs-a", 7]);
@@ -1550,7 +1556,7 @@ async fn malformed_execution_fields_fail_without_silent_normalization() {
 #[tokio::test]
 async fn missing_file_search_tool_fields_fail_closed() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "callout_failure_mode: closed\n");
+    let filter = make_filter(server.port, "on_failure: closed\n");
 
     let mut missing_ids = one_pending_state(&["vs-a"]);
     missing_ids.tools[0].as_object_mut().unwrap().remove("vector_store_ids");
@@ -1574,7 +1580,7 @@ async fn missing_file_search_tool_fields_fail_closed() {
 #[tokio::test]
 async fn fail_open_isolates_a_malformed_pending_call() {
     let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "callout_failure_mode: open\n");
+    let filter = make_filter(server.port, "on_failure: open\n");
     let malformed = json!({
         "type":"file_search_call","id":"fs-bad","status":"searching","queries":["valid", 7]
     });
@@ -1925,7 +1931,7 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
     let validated = build_config(&raw).unwrap();
     let client = FileSearchClient::new(FileSearchClientConfig {
         api_client: validated.api_client,
-        failure_mode: validated.failure_mode,
+        on_failure: validated.on_failure,
         max_response_bytes: validated.max_response_bytes,
         max_total_response_bytes: validated.max_total_response_bytes,
         timeout: validated.timeout,
@@ -1933,7 +1939,7 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
     FileSearchCalloutFilter {
         client,
         max_state_bytes: validated.max_state_bytes,
-        failure_mode: validated.failure_mode,
+        on_failure: validated.on_failure,
     }
 }
 

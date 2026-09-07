@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Anthropic Messages to Chat Completions-compatible request transformation.
@@ -36,9 +36,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
         chat.insert("max_completion_tokens".to_owned(), max_tokens.clone());
     }
 
-    if let Some(stream) = obj.get("stream") {
-        chat.insert("stream".to_owned(), stream.clone());
-    }
+    convert_stream(&mut chat, obj);
 
     map_parameters(&mut chat, obj);
     convert_tools(&mut chat, obj);
@@ -201,8 +199,10 @@ fn append_text_content(text: &str, text_parts: &mut Vec<String>, content_parts: 
 fn convert_tool_use_block(block: &Value, tool_calls: &mut Vec<Value>) {
     let id = block.get("id").and_then(Value::as_str).unwrap_or("");
     let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-    let input = block.get("input").cloned().unwrap_or_else(|| Value::Object(Map::new()));
-    let args = serde_json::to_string(&input).unwrap_or_default();
+
+    let empty = Value::Object(Map::new());
+    let input = block.get("input").unwrap_or(&empty);
+    let args = serde_json::to_string(input).unwrap_or_default();
 
     tool_calls.push(json!({
         "id": id,
@@ -498,6 +498,24 @@ fn non_empty_lines(lines: &[String]) -> Option<String> {
 // Parameter Mapping
 // -----------------------------------------------------------------------------
 
+/// Copy `stream` and request streaming usage when enabled.
+fn convert_stream(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
+    let Some(stream) = obj.get("stream") else {
+        return;
+    };
+    chat.insert("stream".to_owned(), stream.clone());
+
+    if stream.as_bool() == Some(true) {
+        let mut opts = obj
+            .get("stream_options")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        opts.insert("include_usage".to_owned(), Value::Bool(true));
+        chat.insert("stream_options".to_owned(), Value::Object(opts));
+    }
+}
+
 /// Map Anthropic parameters to Chat Completions-compatible equivalents.
 ///
 /// `top_k` has no standard Chat Completions equivalent but is preserved
@@ -544,12 +562,44 @@ fn convert_tools(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
     }
 }
 
+/// Return a stable JSON type name for diagnostics, never the value itself.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Classify an Anthropic tool: keep only untyped or explicit `custom` client
+/// tools, dropping (and logging) every typed server tool so unknown server
+/// tools fail closed instead of leaking to the backend as client functions.
+fn is_translatable_client_tool(tool: &Value) -> bool {
+    match tool.get("type") {
+        None => true,
+        Some(Value::String(tool_type)) if tool_type == "custom" => true,
+        Some(Value::String(tool_type)) => {
+            warn!(tool_type, "dropping typed Anthropic tool");
+            false
+        },
+        Some(other) => {
+            // Log only the JSON value kind, never the value itself: `type` is
+            // attacker-controlled and could carry a large or sensitive payload.
+            warn!(
+                type_kind = json_type_name(other),
+                "dropping Anthropic tool with non-string type"
+            );
+            false
+        },
+    }
+}
+
 /// Convert one Anthropic client tool definition to a Chat Completions tool.
 fn convert_tool_definition(tool: &Value) -> Option<Value> {
-    let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("custom");
-
-    if tool_type.starts_with("web_search") || tool_type.starts_with("bash") || tool_type.starts_with("text_editor") {
-        warn!(tool_type, "dropping server-side Anthropic tool");
+    if !is_translatable_client_tool(tool) {
         return None;
     }
 
@@ -1228,13 +1278,52 @@ mod tests {
     }
 
     #[test]
-    fn bash_and_text_editor_tools_filtered() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"bash_20241022","name":"bash"},{"type":"text_editor_20241022","name":"text_editor"},{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
+    fn only_client_tools_converted() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"bash_20241022","name":"bash"},{"type":"text_editor_20241022","name":"text_editor"},{"type":"code_execution_20250522","name":"code_execution"},{"type":"computer_20250124","name":"computer","display_width_px":1024,"display_height_px":768},{"type":"future_server_tool_20270101","name":"future_server_tool"},{"type":42,"name":"invalid_type","input_schema":{"type":"object"}},{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}},{"type":"custom","name":"get_time","description":"Get time","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
         let result = transform_request(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         let tools = parsed["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1, "only non-filtered tools should remain");
+        assert_eq!(tools.len(), 2, "only untyped and custom client tools should remain");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
+        assert_eq!(tools[1]["function"]["name"], "get_time");
+    }
+
+    #[test]
+    fn streaming_request_includes_usage_option() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["stream"], true, "stream should be true");
+        assert_eq!(
+            parsed["stream_options"]["include_usage"], true,
+            "stream_options.include_usage should be set"
+        );
+    }
+
+    #[test]
+    fn non_streaming_request_omits_stream_options() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "stream_options should not be present without stream:true"
+        );
+    }
+
+    #[test]
+    fn stream_false_omits_stream_options() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["stream"], false, "stream should be false");
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "stream_options should not be present when stream is false"
+        );
     }
 }

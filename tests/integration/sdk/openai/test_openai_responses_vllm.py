@@ -45,6 +45,12 @@ PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
+IRR_STREAMING_CONFIG_PATH = (
+    "examples/configs/openai/responses/irr-terminal-streaming.yaml"
+)
+CHAT_STREAMING_CONFIG_PATH = (
+    "examples/configs/openai/responses/responses-to-chat-completions.yaml"
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -118,15 +124,66 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     return path
 
 
-def _wait_for_proxy(port: int, timeout: float = 30.0) -> None:
+def _read_log_tail(log_path: str, max_lines: int = 50) -> str:
+    """Best-effort read of a Praxis log file's tail for error diagnostics."""
+    try:
+        with open(log_path) as f:
+            lines = f.readlines()
+    except OSError as exc:
+        return f"(could not read {log_path}: {exc})"
+    if not lines:
+        return "(no output captured)"
+    return "".join(lines[-max_lines:])
+
+
+def _write_irr_streaming_config(praxis_port: int) -> str:
+    with open(IRR_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+def _write_chat_streaming_config(praxis_port: int, db_path: str) -> str:
+    """Patch the shipped Responses-to-Chat example for live vLLM."""
+    with open(CHAT_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+def _wait_for_proxy(port: int, proc: subprocess.Popen, log_path: str, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        # A fatal config/startup error makes Praxis exit before it ever binds
+        # the port. Surface its logs immediately instead of waiting out the
+        # full timeout with a context-free error.
+        exit_code = proc.poll()
+        if exit_code is not None:
+            raise RuntimeError(
+                f"Praxis exited with code {exit_code} before binding port {port}:\n"
+                f"{_read_log_tail(log_path)}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return
         except OSError:
             time.sleep(0.2)
-    raise TimeoutError(f"Praxis did not start within {timeout}s")
+    raise TimeoutError(
+        f"Praxis did not start within {timeout}s on port {port}:\n{_read_log_tail(log_path)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +327,8 @@ def _write_agentic_config(
         "- filter: openai_web_search\n"
         "                provider: brave\n"
         "                api_key: test-key\n"
-        f"                base_url: http://127.0.0.1:{search_port}",
+        f"                base_url: http://127.0.0.1:{search_port}\n"
+        "                allow_private_base_url: true",
     )
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -303,7 +361,7 @@ def praxis_proxy(tmp_path_factory, request):
         stderr=subprocess.STDOUT,
     )
     try:
-        _wait_for_proxy(port)
+        _wait_for_proxy(port, proc, log_path)
         started = True
         yield port
     finally:
@@ -324,10 +382,109 @@ def praxis_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
+def irr_streaming_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy with terminal Responses streaming through IRR."""
+    port = _free_port()
+    config_path = _write_irr_streaming_config(port)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("irr-terminal-streaming")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== IRR streaming Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def chat_streaming_proxy(tmp_path_factory, request):
+    """Start the Responses-to-Chat streaming example against live vLLM."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-chat-streaming")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_chat_streaming_config(port, db_path)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Chat streaming Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
 def openai_client(praxis_proxy):
     """Return an OpenAI client pointed at the local Praxis proxy."""
     return OpenAI(
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def irr_streaming_client(irr_streaming_proxy):
+    """Return an OpenAI client using the terminal-streaming IRR proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{irr_streaming_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def chat_streaming_client(chat_streaming_proxy):
+    """Return an SDK client using Responses-to-Chat stream translation."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{chat_streaming_proxy}/v1",
         api_key="test",
         max_retries=0,
         timeout=300,
@@ -396,7 +553,7 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert "VIOLET-7319" in second.output_text
 
-    def test_doc_extract_inline_file_to_input_text(self, openai_client):
+    def test_doc_extract_inline_file_to(self, openai_client):
         """Issue #397: inline file_data is extracted to input_text and
         consumed by vLLM inference.
 
@@ -448,7 +605,7 @@ class TestOpenAIResponsesVLLM:
             f"marker '{marker}'; got: {response.output_text}"
         )
 
-    def test_file_id_resolution_through_ogx(self, openai_client):
+    def test_file_id_resolution(self, openai_client):
         """End-to-end: upload to OGX via Praxis, reference by file_id,
         verify vLLM output contains the file content.
 
@@ -502,7 +659,7 @@ class TestOpenAIResponsesVLLM:
             except Exception:
                 pass
 
-    def test_client_function_call_returns_to_client(self, openai_client):
+    def test_client_function_call_returns(self, openai_client):
         """Client-side function tools are returned without auto-execution.
 
         The full-flow pipeline has no agentic loop, so function_call
@@ -546,8 +703,9 @@ class TestOpenAIResponsesVLLM:
         args = json.loads(fc.arguments)
         assert "city" in args, f"function arguments should contain city: {args}"
 
-    def test_streaming(self, openai_client):
-        stream = openai_client.responses.create(
+    def test_streaming_through_irr(self, irr_streaming_client):
+        """Stream a Responses request through a terminal IRR step."""
+        stream = irr_streaming_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: STREAM-OK /no_think",
             store=False,
@@ -566,10 +724,58 @@ class TestOpenAIResponsesVLLM:
             if event.type == "response.completed":
                 final_status = event.response.status
 
-        assert event_types[0] == "response.created"
-        assert event_types[-1] == "response.completed"
-        assert final_status == "completed"
-        assert "STREAM-OK" in "".join(text_parts)
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_status == "completed", final_status
+        assert "STREAM-OK" in "".join(text_parts), text_parts
+
+
+class TestResponsesToChatCompletionsVLLM:
+    """Live SDK coverage for Chat Completions SSE translation."""
+
+    def test_streaming_response_round_trip(self, chat_streaming_client):
+        stream = chat_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: CHAT-STREAM-OK /no_think",
+            store=True,
+            stream=True,
+            max_output_tokens=128,
+        )
+
+        event_types = []
+        text_parts = []
+        response_id = None
+        final_status = None
+
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.created":
+                response_id = event.response.id
+            elif event.type == "response.output_text.delta":
+                text_parts.append(event.delta)
+            elif event.type == "response.completed":
+                final_status = event.response.status
+
+        assert event_types[0] == "response.created", event_types
+        assert "response.in_progress" in event_types, event_types
+        assert "response.output_text.delta" in event_types, event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_status == "completed", final_status
+        assert "CHAT-STREAM-OK" in "".join(text_parts), text_parts
+        assert response_id, "response.created should carry a response ID"
+
+        retrieved = chat_streaming_client.responses.retrieve(response_id)
+        assert retrieved.id == response_id, (
+            f"retrieved response ID {retrieved.id!r} should match "
+            f"streamed ID {response_id!r}"
+        )
+        assert retrieved.status == "completed", (
+            f"retrieved response should be completed; got {retrieved.status!r}"
+        )
+        assert "CHAT-STREAM-OK" in retrieved.output_text, (
+            "retrieved response should contain the streamed marker; "
+            f"got {retrieved.output_text!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +824,7 @@ def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
         stderr=subprocess.STDOUT,
     )
     try:
-        _wait_for_proxy(port)
+        _wait_for_proxy(port, proc, log_path)
         started = True
         yield port, mcp_server, search_server
     finally:
@@ -658,7 +864,7 @@ def agentic_client(agentic_proxy):
 class TestAgenticLoopVLLM:
     """Integration tests for the agentic loop against a vLLM backend."""
 
-    def test_mcp_tool_auto_executes_and_returns_final_answer(
+    def test_mcp_tool_auto_executes_and_returns(
         self, agentic_client, agentic_proxy,
     ):
         """MCP tools are auto-executed by the proxy within the IRR loop.
@@ -713,7 +919,101 @@ class TestAgenticLoopVLLM:
             f"rounds; got: {output_types}"
         )
 
-    def test_client_function_exits_openai_agentic_loop(self, agentic_client):
+    def test_mcp_tool_streams_terminal_round_as_one_logical_response(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Streaming sibling of test_mcp_tool_auto_executes_and_returns.
+
+        With stream=True the proxy auto-executes the intermediate MCP
+        tool round internally and buffers it, then streams only the
+        terminal round to the client as ONE logical SSE response
+        (response.created -> ... -> response.completed). The
+        logical-stream finalizer replaces that terminal event's output
+        with the cross-round accumulated trace, so the single
+        response.completed carries the same execution trace the buffered
+        test observes: function_call, mcp_call, and the final message.
+        """
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        stream = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types = []
+        text_parts = []
+        final_response = None
+
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.output_text.delta":
+                text_parts.append(event.delta)
+            if event.type == "response.completed":
+                final_response = event.response
+
+        # One coherent lifecycle framing, exactly as the single-round
+        # test_streaming_through_irr asserts: created first, completed last.
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_response is not None, (
+            "stream must terminate with a response.completed event; "
+            f"got: {event_types}"
+        )
+        assert final_response.status in ("completed", "incomplete"), (
+            f"expected completed or incomplete (token limit); got: {final_response.status}"
+        )
+
+        # The terminal event's output is the cross-round accumulated trace,
+        # so it mirrors the buffered test: the auto-executed function_call
+        # and the MCP result (mcp_call) both surface in the one stream.
+        output_types = [item.type for item in final_response.output]
+        assert "function_call" in output_types, (
+            "streamed terminal output should contain the auto-executed "
+            f"function_call; got: {output_types}"
+        )
+        assert "mcp_call" in output_types, (
+            "streamed terminal output should contain the MCP tool result "
+            f"(mcp_call); got: {output_types}"
+        )
+        rounds = sum(
+            1 for t in output_types
+            if t in ("function_call", "message", "reasoning")
+        )
+        assert rounds >= 2, (
+            "streamed terminal output should span at least two inference "
+            f"rounds; got: {output_types}"
+        )
+
+        # MCPHandler returns f"72F and sunny in {city}"; the city argument
+        # is model-chosen, so assert only the stable, non-templated prefix.
+        # The mcp_call output item carries this tool result verbatim, so it
+        # is present whether or not the model echoes it in the streamed text.
+        haystack = (
+            json.dumps(final_response.model_dump(), default=str)
+            + "".join(text_parts)
+        )
+        assert "72F and sunny in" in haystack, (
+            "the MCP get_weather result should be reflected in the "
+            f"accumulated output or streamed text; got: {haystack}"
+        )
+
+    def test_client_function_exits_openai(self, agentic_client):
         """Client-side function tools exit the agentic loop without
         auto-execution, even when the IRR is active.
 
@@ -774,8 +1074,11 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 8
-        timeout_ms: 120000
-        step_timeout_ms: 60000
+        # Generous deadlines: file-search inference runs on CPU-only vLLM under
+        # heavy CI load (postgres + vLLM + OGX co-located), which can exceed a
+        # 60s step budget. Matches the agentic config's IRR timeouts.
+        timeout_ms: 300000
+        step_timeout_ms: 300000
         max_response_bytes: 67108864
         max_state_bytes: 136314880
         steps:
@@ -789,7 +1092,7 @@ filter_chains:
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
                 max_state_bytes: 136314880
-                callout_failure_mode: closed
+                on_failure: closed
                 forward_headers:
                   - authorization
               - filter: openai_responses_proxy
@@ -805,6 +1108,7 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference"
+                    read_timeout_ms: 300000
                     endpoints:
                       - "{vllm_endpoint}"
             on_result:
@@ -814,6 +1118,9 @@ filter_chains:
                 next: inference
               - default: true
                 done: true
+
+insecure_options:
+  allow_private_endpoints: true
 """
 
 
@@ -928,7 +1235,7 @@ def file_search_proxy(tmp_path_factory, request):
         stderr=subprocess.STDOUT,
     )
     try:
-        _wait_for_proxy(port)
+        _wait_for_proxy(port, proc, log_path)
         started = True
         yield port
     finally:
@@ -962,7 +1269,7 @@ def file_search_client(file_search_proxy):
 class TestFileSearchVLLM:
     """File search integration tests: vLLM -> Praxis -> OGX -> vLLM."""
 
-    def test_file_search_with_vllm_translation(
+    def test_file_search_with(
         self, file_search_client, vector_store
     ):
         """vLLM emits function_call(name=file_search) which the proxy
@@ -1010,5 +1317,177 @@ class TestFileSearchVLLM:
             )
 
 
+# ---------------------------------------------------------------------------
+# File search via Chat Completions translation (issue #296)
+# ---------------------------------------------------------------------------
+
+FILE_SEARCH_CHAT_CONFIG_PATH = (
+    "examples/configs/openai/responses/file-search-chat-completions.yaml"
+)
+
+
+def _write_file_search_chat_config(praxis_port: int) -> str:
+    """Patch the shipped file-search-chat-completions example for testing.
+
+    Exercises the real example config (per repo test requirements) while
+    retargeting the vector-store callout at OGX and the model backend at
+    vLLM's /v1/chat/completions endpoint.
+
+    IRR / callout / backend read deadlines are widened to match
+    FILE_SEARCH_CONFIG_TEMPLATE: CPU-only vLLM plus OGX is slower when
+    the postgres store job co-locates those containers, and a 60s step
+    budget can expire before vLLM returns.
+    """
+    with open(FILE_SEARCH_CHAT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:8001", _ogx_endpoint())
+    vllm = _vllm_endpoint()
+    config = config.replace(
+        '                  - name: "chat-completions-backend"\n'
+        "                    endpoints:\n"
+        '                      - "127.0.0.1:3001"',
+        f'                  - name: "chat-completions-backend"\n'
+        f"                    read_timeout_ms: 300000\n"
+        f"                    endpoints:\n"
+        f'                      - "{vllm}"',
+    )
+    config = config.replace("timeout_ms: 120000", "timeout_ms: 300000")
+    config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
+    config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
+    if f'- "{vllm}"' not in config:
+        raise RuntimeError(
+            "file-search-chat-completions.yaml cluster block did not match; "
+            "vLLM endpoint was not patched"
+        )
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+@pytest.fixture(scope="session")
+def file_search_chat_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy with the file-search Chat Completions pipeline."""
+    port = _free_port()
+    config_path = _write_file_search_chat_config(port)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("file-search-chat")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== File search (chat) proxy logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def file_search_chat_client(file_search_chat_proxy):
+    """Return an OpenAI client pointed at the file-search chat proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{file_search_chat_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+class TestFileSearchChatCompletionsVLLM:
+    """Issue #296: hosted file_search against a Chat Completions backend.
+
+    Unlike TestFileSearchVLLM (which proxies vLLM's native /v1/responses),
+    this drives responses_to_chat_completions: the native file_search tool
+    is synthesized into a private chat `function`, vLLM's
+    /v1/chat/completions emits the call, the proxy runs the OGX vector-store
+    search, and drives one more finite inference round -- without ever
+    exposing the private function to the client.
+    """
+
+    def test_file_search_translated_to_chat_function_round_trip(
+        self, file_search_chat_client, vector_store
+    ):
+        store_id, marker = vector_store
+        response = file_search_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST use the file_search tool to find the Praxis marker "
+                "in the indexed report. Do not answer from memory. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "file_search",
+                    "vector_store_ids": [store_id],
+                }
+            ],
+            include=["file_search_call.results"],
+            store=False,
+            max_output_tokens=512,
+        )
+
+        assert response.status in ("completed", "incomplete"), (
+            f"response should reach a terminal status; got {response.status}"
+        )
+
+        output_types = [item.type for item in response.output]
+
+        # The synthesized private function must never leak to the client; it
+        # is normalized back to a hosted file_search_call.
+        assert all(t != "function_call" for t in output_types), (
+            "the private file_search function must not surface as a client "
+            f"function_call; got output types: {output_types}"
+        )
+
+        file_search_items = [
+            item for item in response.output if item.type == "file_search_call"
+        ]
+        assert file_search_items, (
+            "the synthesized file_search function call should be normalized "
+            f"back to a file_search_call; got output types: {output_types}"
+        )
+        for item in file_search_items:
+            assert item.status in ("completed", "incomplete"), (
+                f"file_search_call status should be terminal; got: {item.status}"
+            )
+
+        # Results come from OGX deterministically (not the model), so the
+        # indexed marker must round-trip through the model->search->model flow.
+        # If a future OGX result shape omits content text, relax this to
+        # asserting file_search results are simply non-empty.
+        payload = json.dumps(response.model_dump(), default=str)
+        assert marker in payload, (
+            "OGX search results (via include=file_search_call.results) should "
+            f"contain the indexed marker {marker!r}; got: {payload}"
+        )
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
+    sys.exit(
+        pytest.main(
+            [__file__, "-v", "--tb=short", "-ra", "--durations=20"] + sys.argv[1:]
+        )
+    )

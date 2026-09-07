@@ -93,12 +93,21 @@ FROM alpine:3.24
 
 LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/ai" \
     org.opencontainers.image.description="Praxis AI proxy server" \
-    org.opencontainers.image.licenses="MIT"
+    org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S praxis \
     && adduser -S -G praxis -h /nonexistent -s /sbin/nologin praxis \
     && mkdir -p /etc/praxis
+
+# Apache-2.0 (section 4) requires object-form recipients to receive the License
+# and the applicable NOTICE attributions. Ship them with the image. The root
+# NOTICE references integrations/llmd/ext-proc/NOTICE relative to this
+# directory, so preserve that subpath to keep the pointer resolvable.
+COPY --chown=root:root --chmod=0444 LICENSE /usr/share/licenses/praxis-ai/LICENSE
+COPY --chown=root:root --chmod=0444 NOTICE /usr/share/licenses/praxis-ai/NOTICE
+COPY --chown=root:root --chmod=0444 integrations/llmd/ext-proc/NOTICE \
+    /usr/share/licenses/praxis-ai/integrations/llmd/ext-proc/NOTICE
 
 COPY --from=builder --chown=root:root --chmod=0555 \
     /usr/local/bin/praxis-ai /usr/local/bin/praxis-ai

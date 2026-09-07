@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Proto compilation build script for the ext-proc crate.
 
 /// Compile vendored Envoy `.proto` files into Rust types with tonic gRPC stubs.

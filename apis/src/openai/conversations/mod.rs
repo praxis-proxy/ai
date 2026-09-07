@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Conversations filter: local `/v1/conversations` endpoints.
@@ -11,6 +11,7 @@ mod config;
 mod contracts;
 mod filter;
 mod handlers;
+mod item_schema;
 pub mod openapi;
 mod routes;
 mod validate;

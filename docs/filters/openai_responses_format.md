@@ -22,7 +22,6 @@ Use with branch chains to route stateful and stateless requests to different clu
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Behavior when the body cannot be classified. |
-| `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 | `headers` | ResponsesFormatHeaders | no | Header names for promoted classification facts. |
 | `headers.format` | string | no | Header name for the detected format (e.g. `openai_responses`, `openai_chat_completions`). |
 | `headers.model` | string | no | Header name for the extracted model value. |
@@ -42,7 +41,6 @@ filter: openai_responses_format
 ```yaml
 filter: openai_responses_format
 on_invalid: continue
-max_body_bytes: 67108864
 headers:
   format: x-praxis-ai-format
   model: x-praxis-ai-model

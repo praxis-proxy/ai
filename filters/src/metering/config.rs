@@ -27,6 +27,7 @@ const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 /// ```yaml
 /// filter: external_metering
 /// metering_url: "http://metering-service:8080"
+/// allow_private_endpoint: false
 /// timeout_seconds: 5
 /// feature_key: "inference-tokens"
 /// source: "ai-gateway"
@@ -41,6 +42,12 @@ const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 pub(super) struct ExternalMeteringConfig {
     /// Base URL of the external metering service (required).
     pub metering_url: String,
+
+    /// Allow the metering endpoint to resolve to non-public addresses
+    /// (loopback, private, link-local). Defaults to `false`, so callouts
+    /// are rejected before connecting unless the operator opts in.
+    #[serde(default)]
+    pub allow_private_endpoint: bool,
 
     /// HTTP timeout in seconds for all metering calls.
     #[serde(default = "default_timeout_seconds")]

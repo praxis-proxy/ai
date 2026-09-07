@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Runtime JSON contracts for locally handled Conversations operations.
@@ -8,12 +8,19 @@
     reason = "utoipa macro-generated schema builders allocate large temporary values"
 )]
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use utoipa::{
     PartialSchema, ToSchema,
-    openapi::schema::{AnyOfBuilder, ArrayBuilder, Object, ObjectBuilder, Schema, Type},
+    openapi::{
+        RefOr,
+        schema::{AnyOfBuilder, ArrayBuilder, Object, ObjectBuilder, Ref, Schema, SchemaType, Type},
+    },
 };
+
+use super::item_schema::validate_input_item;
 
 /// Maximum number of items accepted by create operations.
 pub(super) const MAX_ITEMS_PER_REQUEST: usize = 20;
@@ -27,9 +34,10 @@ pub(super) struct CreateConversationRequest {
     #[schema(schema_with = nullable_metadata_schema)]
     pub(super) metadata: Option<Metadata>,
 
-    /// Optional nullable initial items to add to the conversation.
+    /// Optional initial items to add to the conversation.
+    #[serde(default, deserialize_with = "nullable_vec")]
     #[schema(schema_with = nullable_initial_items_schema)]
-    pub(super) items: Option<Vec<ConversationItem>>,
+    pub(super) items: Vec<InputItem>,
 }
 
 /// Request body accepted by `POST /conversations/{conversation_id}`.
@@ -41,12 +49,60 @@ pub(super) struct UpdateConversationRequest {
 }
 
 /// Request body accepted by `POST /conversations/{conversation_id}/items`.
-#[derive(Debug, Deserialize, ToSchema)]
+///
+/// The `OpenAPI` schema is hand-built by the [`PartialSchema`] impl below so the
+/// emitted component omits the top-level `type: object`, matching OpenAI's inline
+/// `createConversationItems` request body (`properties.items` + `required:
+/// [items]` only).
+#[derive(Debug, Deserialize)]
 pub(super) struct CreateConversationItemsRequest {
     /// Items to create.
     #[serde(default)]
-    #[schema(value_type = Vec<ConversationItem>, required = true, max_items = 20)]
-    pub(super) items: Option<Vec<ConversationItem>>,
+    pub(super) items: Option<Vec<InputItem>>,
+}
+
+impl PartialSchema for CreateConversationItemsRequest {
+    /// Emit the append-items body schema without a top-level `type: object`.
+    ///
+    /// utoipa's `ObjectBuilder` defaults `schema_type` to [`Type::Object`], so a
+    /// derived schema would add `type: object` at the top level. The pinned
+    /// OpenAI `createConversationItems` body has no top-level type — only
+    /// `properties.items` and `required: [items]` — so the type is cleared with
+    /// [`SchemaType::AnyValue`], which utoipa omits from the serialized schema.
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(Schema::Object(
+            ObjectBuilder::new()
+                .schema_type(SchemaType::AnyValue)
+                .description(Some(
+                    "Request body accepted by `POST /conversations/{conversation_id}/items`.",
+                ))
+                .property(
+                    "items",
+                    ArrayBuilder::new()
+                        .items(Ref::from_schema_name("InputItem"))
+                        .description(Some("Items to create."))
+                        .max_items(Some(MAX_ITEMS_PER_REQUEST)),
+                )
+                .required("items")
+                .build(),
+        ))
+    }
+}
+
+impl ToSchema for CreateConversationItemsRequest {
+    /// Preserve the derived component name referenced by the request body.
+    fn name() -> Cow<'static, str> {
+        Cow::Borrowed("CreateConversationItemsRequest")
+    }
+
+    /// Forward the referenced `InputItem` union exactly as the derive did.
+    fn schemas(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+        schemas.push((
+            <InputItem as ToSchema>::name().into_owned(),
+            <InputItem as PartialSchema>::schema(),
+        ));
+        <InputItem as ToSchema>::schemas(schemas);
+    }
 }
 
 /// Metadata supplied with a conversation.
@@ -94,18 +150,31 @@ fn nullable_metadata_schema() -> Schema {
     )
 }
 
-/// Generate the official nullable, bounded initial-items composition.
+/// Emit the nullable initial-items schema mandated by the official reference:
+/// `anyOf: [{type: array, items: $ref InputItem, maxItems: 20}, {type: null}]`.
+///
+/// The runtime keeps a plain `Vec<InputItem>` and coerces a `null` payload to an
+/// empty vec via [`nullable_vec`]; only the emitted contract carries the null
+/// branch so the generated document matches OpenAI's `CreateConversationBody`.
 fn nullable_initial_items_schema() -> Schema {
     Schema::AnyOf(
         AnyOfBuilder::new()
             .item(
                 ArrayBuilder::new()
-                    .items(<ConversationItem as PartialSchema>::schema())
+                    .items(Ref::from_schema_name("InputItem"))
                     .max_items(Some(MAX_ITEMS_PER_REQUEST)),
             )
             .item(Schema::Object(ObjectBuilder::new().schema_type(Type::Null).build()))
             .build(),
     )
+}
+
+/// Deserialize a vec field that may be `null`, treating null as an empty vec.
+fn nullable_vec<'de, D>(deserializer: D) -> Result<Vec<InputItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Vec<InputItem>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Deserialize update metadata only from a JSON object.
@@ -120,22 +189,36 @@ where
     Ok(Metadata(value))
 }
 
-/// Polymorphic conversation item stored and returned as an opaque JSON object.
-///
-/// Message-specific normalization happens in the handler. Other item kinds are
-/// deliberately preserved so new provider variants do not require proxy code
-/// changes.
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+/// Official item union accepted by Conversation create operations.
+#[derive(Debug, ToSchema)]
+#[schema(value_type = Object)]
+pub(super) struct InputItem(Value);
+
+impl InputItem {
+    /// Move an input item into runtime normalization.
+    pub(super) fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for InputItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        validate_input_item(&value).map_err(serde::de::Error::custom)?;
+        Ok(Self(value))
+    }
+}
+
+/// Official item union returned by Conversation item operations.
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(transparent)]
 #[schema(value_type = Object)]
 pub(super) struct ConversationItem(Value);
 
 impl ConversationItem {
-    /// Move an input item into runtime normalization.
-    pub(super) fn into_value(self) -> Value {
-        self.0
-    }
-
     /// Wrap a stored item for response serialization.
     pub(super) const fn from_value(value: Value) -> Self {
         Self(value)
@@ -300,10 +383,10 @@ mod tests {
     #[test]
     fn create_request_distinguishes_missing_and_null_items() {
         let missing: CreateConversationRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(missing.items.is_none(), "missing items should use the default");
+        assert!(missing.items.is_empty(), "missing items should use the default");
 
         let null: CreateConversationRequest = serde_json::from_value(json!({"items": null})).unwrap();
-        assert!(null.items.is_none(), "null items should use the default");
+        assert!(null.items.is_empty(), "null items should use the default");
     }
 
     #[test]
@@ -323,9 +406,15 @@ mod tests {
     }
 
     #[test]
-    fn conversation_item_preserves_unknown_object_variants() {
-        let value = json!({"type": "future_provider_item", "provider_data": {"enabled": true}});
-        let item: ConversationItem = serde_json::from_value(value.clone()).unwrap();
+    fn input_item_rejects_unknown_discriminators() {
+        let result = serde_json::from_value::<InputItem>(json!({"type": "future_provider_item"}));
+        assert!(result.is_err(), "unknown input item types must be rejected");
+    }
+
+    #[test]
+    fn conversation_item_preserves_valid_output() {
+        let value = json!({"type": "reasoning", "id": "rs_1", "summary": []});
+        let item = ConversationItem::from_value(value.clone());
         assert_eq!(serde_json::to_value(item).unwrap(), value);
     }
 }

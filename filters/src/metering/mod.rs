@@ -34,7 +34,10 @@ use bytes::Bytes;
 use http::header::HeaderName;
 use metrics::counter;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use praxis_ai_apis::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
+use praxis_ai_apis::{
+    callout_target::AddressPolicy,
+    subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
+};
 use praxis_core::subrequest::SubRequestConnector;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
@@ -149,6 +152,10 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// default_model: "unknown"
 /// ```
 pub struct ExternalMeteringFilter {
+    /// Connect-time policy for the metering endpoint. Rejects non-public
+    /// addresses unless the operator sets `allow_private_endpoint`.
+    address_policy: AddressPolicy,
+
     /// Model name reported when neither the identity header nor the request
     /// body reveals one.
     default_model: Option<String>,
@@ -222,6 +229,7 @@ impl ExternalMeteringFilter {
         validate_config(&cfg)?;
 
         Ok(Self {
+            address_policy: AddressPolicy::from_allow_private(cfg.allow_private_endpoint),
             default_model: cfg.default_model,
             default_username: cfg.default_username,
             fail_open: cfg.fail_open,
@@ -257,6 +265,7 @@ impl ExternalMeteringFilter {
             request,
             MAX_CALLOUT_RESPONSE_BYTES,
             self.timeout,
+            self.address_policy,
         )
         .await;
 
@@ -315,7 +324,13 @@ impl ExternalMeteringFilter {
             build_usage_event(&event_ctx, &TokenCounts::read(ctx))
         };
 
-        spawn_usage_report(self.subrequest_client.clone(), &self.metering_url, self.timeout, &event);
+        spawn_usage_report(
+            self.subrequest_client.clone(),
+            &self.metering_url,
+            self.timeout,
+            self.address_policy,
+            &event,
+        );
     }
 }
 
@@ -739,7 +754,17 @@ fn reject_unavailable() -> FilterAction {
 ///
 /// Metering is an observer: a slow or failing metering service must never add
 /// latency to, or fail, a request the upstream already answered.
-fn spawn_usage_report(client: SubRequestClient, metering_url: &str, timeout: Duration, event: &serde_json::Value) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential request setup plus the explicit address-policy transport input"
+)]
+fn spawn_usage_report(
+    client: SubRequestClient,
+    metering_url: &str,
+    timeout: Duration,
+    address_policy: AddressPolicy,
+    event: &serde_json::Value,
+) {
     let url = format!("{}/api/v1/events", metering_url.trim_end_matches('/'));
 
     let body = match serde_json::to_vec(event) {
@@ -763,7 +788,17 @@ fn spawn_usage_report(client: SubRequestClient, metering_url: &str, timeout: Dur
             body: Bytes::from(body),
         };
 
-        report_delivery(subrequest::execute_url(&client, &url, request, MAX_CALLOUT_RESPONSE_BYTES, timeout).await);
+        report_delivery(
+            subrequest::execute_url(
+                &client,
+                &url,
+                request,
+                MAX_CALLOUT_RESPONSE_BYTES,
+                timeout,
+                address_policy,
+            )
+            .await,
+        );
     });
 }
 

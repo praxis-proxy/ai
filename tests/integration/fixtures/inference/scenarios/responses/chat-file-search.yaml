@@ -1,0 +1,37 @@
+version: 1
+id: responses/chat-file-search
+description: Hosted Responses file search is synthesized as a bounded Chat Completions function tool.
+protocol: openai_responses
+example_config: openai/responses/file-search-chat-completions-fixture.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.file_search
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Find the Q4 revenue.
+          store: false
+          stream: false
+          tools:
+            - type: file_search
+              vector_store_ids:
+                - vs_q4
+              max_num_results: 5
+          tool_choice:
+            type: file_search
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

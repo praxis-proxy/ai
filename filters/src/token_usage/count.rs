@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Token usage extraction filter for AI inference responses.
@@ -39,7 +39,7 @@ use tracing::{debug, trace};
 use super::{
     StreamingTokens, TokenUsage,
     providers::{parse_anthropic, parse_bedrock, parse_google, parse_openai},
-    set_cache_token_usage, set_token_status_overflow, set_token_usage, streaming,
+    set_cache_token_usage, set_reasoning_token_usage, set_token_status_overflow, set_token_usage, streaming,
 };
 use crate::agentic::a2a::sse;
 
@@ -65,11 +65,20 @@ const META_INPUT: &str = "token_count.input";
 /// Metadata key for accumulated output tokens (streaming).
 const META_OUTPUT: &str = "token_count.output";
 
+/// Metadata key for the provider-supplied or parser-computed total (streaming).
+///
+/// Complete-usage SSE events persist this so Google thoughts, which are not
+/// part of `token.output`, are not dropped when the total is published.
+const META_TOTAL: &str = "token_count.total";
+
 /// Metadata key for accumulated prompt cache reads (streaming).
 const META_CACHE_READ: &str = "token_count.cache_read";
 
 /// Metadata key for accumulated prompt cache writes (streaming).
 const META_CACHE_WRITE: &str = "token_count.cache_write";
+
+/// Metadata key for accumulated reasoning / thinking tokens (streaming).
+const META_REASONING: &str = "token_count.reasoning";
 
 /// Metadata key for hex-encoded JSON body buffer (non-streaming).
 const META_BUF_HEX: &str = "token_count.buf_hex";
@@ -335,7 +344,8 @@ impl HttpFilter for TokenCountFilter {
 /// either header is absent or unparseable. Unlike every other provider, no
 /// body access is required for this path.
 ///
-/// The response headers carry no prompt cache breakdown, so none is recorded.
+/// The response headers carry no prompt cache or reasoning breakdown, so
+/// neither is recorded.
 fn extract_bedrock_headers(ctx: &mut HttpFilterContext<'_>) {
     let input = ctx
         .response_header
@@ -399,14 +409,28 @@ fn handle_json_body(
     }
 }
 
-/// Parses buffered JSON usage and records the normalized counts and prompt
-/// cache breakdown. Called once at end-of-stream with the fully buffered body;
-/// a body carrying no recognizable usage records nothing.
+/// Parses buffered JSON usage and records the normalized counts, prompt cache
+/// breakdown, and reasoning tokens. Called once at end-of-stream with the fully
+/// buffered body; a body carrying no recognizable usage records nothing.
 fn record_json_usage(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, data: &[u8]) {
     let Some(usage) = provider.extract_token_usage(data) else {
         return;
     };
 
+    publish_token_usage(ctx, usage);
+    debug!(
+        input = usage.input_tokens(),
+        output = usage.output_tokens(),
+        total = usage.total_tokens(),
+        cache_read = ?usage.cache_read_tokens(),
+        cache_write = ?usage.cache_write_tokens(),
+        reasoning = ?usage.reasoning_tokens(),
+        "extracted token usage from JSON response"
+    );
+}
+
+/// Writes normalized totals plus any reported cache and reasoning breakdowns.
+fn publish_token_usage(ctx: &mut HttpFilterContext<'_>, usage: TokenUsage) {
     set_token_usage(
         ctx,
         usage.input_tokens(),
@@ -414,14 +438,7 @@ fn record_json_usage(ctx: &mut HttpFilterContext<'_>, provider: ProviderKind, da
         Some(usage.total_tokens()),
     );
     set_cache_token_usage(ctx, usage.cache_read_tokens(), usage.cache_write_tokens());
-    debug!(
-        input = usage.input_tokens(),
-        output = usage.output_tokens(),
-        total = usage.total_tokens(),
-        cache_read = ?usage.cache_read_tokens(),
-        cache_write = ?usage.cache_write_tokens(),
-        "extracted token usage from JSON response"
-    );
+    set_reasoning_token_usage(ctx, usage.reasoning_tokens());
 }
 
 // -----------------------------------------------------------------------------
@@ -495,27 +512,32 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
         .insert(META_INPUT.to_owned(), usage.input_tokens().to_string());
     ctx.filter_metadata
         .insert(META_OUTPUT.to_owned(), usage.output_tokens().to_string());
+    ctx.filter_metadata
+        .insert(META_TOTAL.to_owned(), usage.total_tokens().to_string());
 
     // Only accumulate counts the event actually reported, so an unreported
     // count stays absent instead of being pinned to zero at finalization.
-    if let Some(cache_read) = usage.cache_read_tokens() {
-        ctx.filter_metadata
-            .insert(META_CACHE_READ.to_owned(), cache_read.to_string());
-    }
-
-    if let Some(cache_write) = usage.cache_write_tokens() {
-        ctx.filter_metadata
-            .insert(META_CACHE_WRITE.to_owned(), cache_write.to_string());
-    }
+    store_optional_count(ctx, META_CACHE_READ, usage.cache_read_tokens());
+    store_optional_count(ctx, META_CACHE_WRITE, usage.cache_write_tokens());
+    store_optional_count(ctx, META_REASONING, usage.reasoning_tokens());
 
     trace!(
         input = usage.input_tokens(),
         output = usage.output_tokens(),
+        total = usage.total_tokens(),
         cache_read = ?usage.cache_read_tokens(),
         cache_write = ?usage.cache_write_tokens(),
+        reasoning = ?usage.reasoning_tokens(),
         "complete token usage found in SSE event"
     );
     true
+}
+
+/// Stores one optional streaming accumulator; skips omitted counts.
+fn store_optional_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        ctx.filter_metadata.insert(key.to_owned(), value.to_string());
+    }
 }
 
 /// Try partial extraction (Anthropic, Bedrock streaming).
@@ -526,6 +548,7 @@ fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: 
     merge_reported_count(ctx, META_OUTPUT, tokens.output);
     merge_reported_count(ctx, META_CACHE_READ, tokens.cache_read);
     merge_reported_count(ctx, META_CACHE_WRITE, tokens.cache_write);
+    merge_reported_count(ctx, META_REASONING, tokens.reasoning);
 }
 
 /// Merge one count into its accumulator, skipping counts the event omitted.
@@ -572,22 +595,34 @@ fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>, dropped_tail: bool
         );
     }
 
-    if !has_accumulated {
-        return;
+    if has_accumulated {
+        publish_accumulated_streaming_usage(ctx);
     }
+}
 
+/// Publishes streaming accumulators to the well-known `token.*` metadata keys.
+fn publish_accumulated_streaming_usage(ctx: &mut HttpFilterContext<'_>) {
     let input = read_accumulated(ctx, META_INPUT).unwrap_or(0);
     let output = read_accumulated(ctx, META_OUTPUT).unwrap_or(0);
-    let cache_read = read_accumulated(ctx, META_CACHE_READ);
-    let cache_write = read_accumulated(ctx, META_CACHE_WRITE);
+    // Prefer the parser-computed total from a complete-usage event. Partial
+    // streams (Anthropic / Bedrock) omit META_TOTAL, so TokenUsage::new
+    // falls back to input + output, which is correct when reasoning is a
+    // subset of output.
+    let usage = TokenUsage::new(input, output, read_accumulated(ctx, META_TOTAL))
+        .with_cache(
+            read_accumulated(ctx, META_CACHE_READ),
+            read_accumulated(ctx, META_CACHE_WRITE),
+        )
+        .with_reasoning(read_accumulated(ctx, META_REASONING));
 
-    set_token_usage(ctx, input, output, None);
-    set_cache_token_usage(ctx, cache_read, cache_write);
+    publish_token_usage(ctx, usage);
     debug!(
         input,
         output,
-        ?cache_read,
-        ?cache_write,
+        total = usage.total_tokens(),
+        cache_read = ?usage.cache_read_tokens(),
+        cache_write = ?usage.cache_write_tokens(),
+        reasoning = ?usage.reasoning_tokens(),
         "finalized streaming token counts"
     );
 }

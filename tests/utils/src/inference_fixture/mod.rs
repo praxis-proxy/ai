@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Versioned wire fixtures and inference scenarios for integration tests.
 
 mod bounds;

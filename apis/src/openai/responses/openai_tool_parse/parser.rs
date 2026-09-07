@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Pure request body parser for tool definitions in the Responses API.
@@ -376,10 +376,7 @@ fn classify_tool_type(obj: &serde_json::Map<String, serde_json::Value>) -> ToolT
 
     match type_str {
         "function" => ToolType::Function,
-        "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" | "web_search_2025_08_26" => {
-            ToolType::WebSearch
-        },
-
+        _ if crate::web_search::is_web_search_tool_type(type_str) => ToolType::WebSearch,
         "file_search" => ToolType::FileSearch,
         "code_interpreter" => ToolType::CodeInterpreter,
         "computer" | "computer_use" | "computer_use_preview" => ToolType::ComputerUse,

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 description = "llm-d ext_proc compatibility layer for Praxis AI"
-license = "MIT AND Apache-2.0 AND BSD-3-Clause"
+license = "Apache-2.0 AND BSD-3-Clause"
 repository.workspace = true
 publish = false
 

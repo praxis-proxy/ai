@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT AND Apache-2.0 AND BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 // Copyright (c) 2026 Praxis Contributors
 
 //! AI-owned `llm-d` `ext_proc` compatibility layer for Praxis AI.

@@ -72,6 +72,39 @@ metering_url: "http://metering:8080"
     assert!(filter.default_model.is_none());
 }
 
+#[test]
+fn config_defaults_to_public_only_endpoint_policy() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(
+        !filter.address_policy.allows_private(),
+        "metering callouts must reject non-public addresses unless opted in"
+    );
+}
+
+#[test]
+fn config_allow_private_endpoint_opts_into_private_addresses() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://127.0.0.1:9090"
+allow_private_endpoint: true
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(
+        filter.address_policy.allows_private(),
+        "allow_private_endpoint must permit callouts to non-public addresses"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Fallback Runtime Behavior
 // -----------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Deserialized YAML configuration types for the AI guardrails filter.
@@ -61,10 +61,6 @@ pub(super) struct PhaseConfig {
     pub request: bool,
 
     /// Evaluate upstream responses before forwarding to the client.
-    ///
-    /// Response-side evaluation is not implemented yet (#580); setting this
-    /// to `true` is rejected at filter construction time rather than
-    /// silently ignored.
     #[serde(default)]
     pub response: bool,
 }

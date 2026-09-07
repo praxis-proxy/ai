@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Serde configuration types for the HTTP callout filter.
 
 use std::{net::IpAddr, time::Duration};
 
+use praxis_ai_apis::callout_policy::OnFailure;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 use tracing::warn;
@@ -37,9 +38,9 @@ pub(crate) struct HttpCalloutConfig {
     /// structural key before this config is parsed, so it cannot be
     /// used as an alias here.
     #[serde(default)]
-    pub on_failure: FailureModeConfig,
+    pub on_failure: OnFailure,
 
-    /// HTTP status code returned when rejecting on failure.
+    /// HTTP error status code (`400..=599`) to return when rejecting on error.
     pub status_on_error: Option<u16>,
 
     /// Circuit breaker configuration.
@@ -63,14 +64,13 @@ pub(crate) struct TargetConfig {
     /// Allow the target to resolve to a private, loopback, or
     /// link-local address.
     ///
-    /// Defaults to `true`, which preserves the permissive behavior of
-    /// pointing a callout at a loopback/sidecar guard service (only a
-    /// warning is emitted). Set to `false` to harden against SSRF and
-    /// DNS-rebinding: the callout is then rejected at request time if the
+    /// Defaults to `false`. Set to `true` explicitly when a trusted
+    /// loopback/sidecar or private service is the intended destination.
+    /// When disabled, the callout is rejected at request time if any
     /// resolved peer address is private/loopback/link-local — including a
     /// hostname that resolves to such an address (e.g. cloud metadata at
     /// `169.254.169.254`).
-    #[serde(default = "default_allow_private_addresses")]
+    #[serde(default)]
     pub allow_private_addresses: bool,
 
     /// Request timeout (e.g. `"2s"`, `"500ms"`).
@@ -185,22 +185,6 @@ pub(crate) enum Phase {
 }
 
 // -----------------------------------------------------------------------------
-// Failure Mode
-// -----------------------------------------------------------------------------
-
-/// Behavior when a callout fails.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FailureModeConfig {
-    /// Reject the original request (fail-closed).
-    #[default]
-    Closed,
-
-    /// Allow the original request to proceed (fail-open).
-    Open,
-}
-
-// -----------------------------------------------------------------------------
 // Circuit Breaker
 // -----------------------------------------------------------------------------
 
@@ -228,11 +212,6 @@ fn default_timeout() -> Duration {
 /// Default max body bytes: 1 MiB.
 fn default_max_body_bytes() -> usize {
     1_048_576 // 1 MiB
-}
-
-/// Default: allow private/loopback targets (permissive, warning only).
-fn default_allow_private_addresses() -> bool {
-    true
 }
 
 // -----------------------------------------------------------------------------

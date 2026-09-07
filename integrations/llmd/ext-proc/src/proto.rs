@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT AND Apache-2.0 AND BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 // Copyright (c) 2024 Praxis Contributors
 // Vendored Envoy protos: Apache-2.0 (see NOTICE)
 // Vendored Google protos: BSD-3-Clause (see NOTICE)

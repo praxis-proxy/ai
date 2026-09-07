@@ -31,6 +31,11 @@ filter_chains:
       # skips filter dispatch entirely for non-SSE responses.
       - filter: anthropic_stream_events
         max_partial_event_bytes: 10485760
+        # Cap on distinct streaming tool-call content blocks retained per
+        # response. Bounds per-response memory when an upstream streams
+        # many unique tool-call indices; exceeding it fails the stream
+        # closed.
+        max_tool_blocks: 10000
         response_conditions:
           - when:
               headers:

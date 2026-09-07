@@ -49,9 +49,11 @@ against `api.openai.com` on 2026-07-27.
 | Update with object `metadata` | `200` |
 
 The pinned and current upstream OpenAPI documents omit `requestBody.required`
-for update even though the live endpoint requires the body. The implementation
-document follows the verified runtime contract, so that upstream discrepancy
-remains visible instead of declaring behavior Praxis does not implement.
+for update and mark `metadata` nullable even though the live endpoint requires
+the body and rejects null metadata. The implementation document follows the
+verified runtime contract, and both discrepancies are recorded as explicit
+`upstream_spec_exceptions` on `POST /conversations/{conversation_id}` rather
+than declaring behavior Praxis does not implement.
 
 ## Code Map
 
@@ -132,6 +134,18 @@ This command also runs the focused runtime contract tests recorded in the
 report. A failing or missing declared test makes the command fail after the
 JSON result has been written.
 
+Conversation input and output item unions are derived from the same pinned
+document into the runtime artifact:
+
+```console
+cargo xtask openai-conversation-item-contracts
+cargo xtask openai-conversation-item-contracts --check
+```
+
+Normal conformance generation performs the check before comparing schemas, so
+the runtime validator and generated implementation document cannot silently
+drift from the pinned item union.
+
 ## Reference Refresh
 
 Normal conformance runs do not fetch upstream. They read the complete vendored
@@ -194,6 +208,14 @@ OpenAI Conversations responses were checked against `api.openai.com` on
 populated string map round-tripped unchanged. Praxis therefore retains its
 string-map response schema and records the 12 missing upstream metadata
 constraints as explicit exceptions.
+
+The same probe covered the update request body. An absent body returned `400
+missing_required_parameter` and null metadata returned `400 invalid_type`, so
+the pinned upstream is incomplete: it omits `requestBody.required` and marks
+`metadata` nullable. Praxis follows the verified runtime contract — a required
+body with non-null string-map metadata — and records the seven resulting
+`POST /conversations/{conversation_id}` request drift fingerprints as explicit
+exceptions.
 
 ## CI Enforcement
 

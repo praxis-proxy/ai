@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
 //! Deterministic normalization and redaction for recorded wire fixtures.
 
 use std::collections::BTreeMap;

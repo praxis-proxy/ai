@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Integration tests for conversation-based rehydration in the
@@ -164,7 +164,7 @@ async fn append_back_persists_items_after_response() {
                 "id": "msg_out1",
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "backend reply"}]
+                "content": [{"type": "output_text", "text": "backend reply", "annotations": [], "logprobs": []}]
             }
         ]
     });

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Shared request-context and metadata contracts for routing filters.
@@ -33,6 +33,9 @@ pub(crate) const PROVIDER_OVERLAY_REVISION_HEADER: &str = "x-ai-provider-routing
 /// Demo-only response attribution header.
 pub(crate) const PROVIDER_ATTRIBUTION_RESPONSE_HEADER: &str = "x-ai-demo-provider-gateway";
 
+/// Provider-local inference backend selected by `provider_route`.
+pub(crate) const PROVIDER_INFERENCE_RESPONSE_HEADER: &str = "x-ai-inference-provider";
+
 /// Admission state of the selected route candidate.
 pub(crate) const ROUTE_ADMISSION_STATE: &str = "intelligent_route.admission_state";
 /// Backend cluster selected by `intelligent_route`.
@@ -45,6 +48,10 @@ pub(crate) const ROUTE_LOCAL_SITE: &str = "intelligent_route.local_site";
 pub(crate) const ROUTE_NAME: &str = "intelligent_route.name";
 /// Selection rank within the candidate tier.
 pub(crate) const ROUTE_RANK: &str = "intelligent_route.rank";
+/// Producer-defined group used for this selection.
+pub(crate) const ROUTE_SELECTION_GROUP: &str = "intelligent_route.selection_group";
+/// Request-time selection mode applied within the selected group.
+pub(crate) const ROUTE_SELECTION_MODE: &str = "intelligent_route.selection_mode";
 /// Selection tier (primary, fallback, etc.).
 pub(crate) const ROUTE_SELECTION_TIER: &str = "intelligent_route.selection_tier";
 /// Remote site name of the selected candidate.

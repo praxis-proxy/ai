@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Shared sub-request client construction from runtime configuration.
@@ -187,7 +187,7 @@ runtime:
             "
 vector_store_url: http://127.0.0.1:9
 allow_private_url: true
-callout_failure_mode: closed
+on_failure: closed
 ",
         )
         .unwrap();
