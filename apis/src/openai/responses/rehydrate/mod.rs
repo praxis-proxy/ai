@@ -28,7 +28,10 @@ use super::{
     canonical_openresponses_replay_item, error::responses_error_rejection, extract_conversation_id,
     state::ResponsesState,
 };
-use crate::store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry};
+use crate::{
+    json_body::serialized_len,
+    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -290,7 +293,7 @@ fn check_history_limits(
         }
     }
 
-    let byte_size = serde_json::to_string(items).map_or(usize::MAX, |s| s.len());
+    let byte_size = serialized_len(items).unwrap_or(usize::MAX);
     if byte_size > max_bytes {
         return Err(reject_too_large(
             &format!(
