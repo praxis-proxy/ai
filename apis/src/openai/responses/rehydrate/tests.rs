@@ -2311,16 +2311,19 @@ async fn restores_for_uppercase_json_content_type() {
 }
 
 #[tokio::test]
-async fn strips_stale_body_validators_when_restoring() {
+async fn declines_and_preserves_response_body_validators() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut response = json_ok_response();
     // Validators and integrity digests describe the exact upstream bytes; they
-    // are invalidated the moment the body is re-serialized with the caller's
-    // previous_response_id, so the rewrite must drop them.
+    // would be invalidated the moment the body is re-serialized with the caller's
+    // previous_response_id. The proxy cannot recompute them from the body phase
+    // (headers are already committed) so it declines the response entirely at
+    // eligibility rather than stripping them and shipping a mismatched body — the
+    // response passes through byte-identical with every validator intact.
     response
         .headers
-        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("74"));
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("65"));
     response
         .headers
         .insert(http::header::ETAG, http::HeaderValue::from_static("\"abc123\""));
@@ -2344,8 +2347,7 @@ async fn strips_stale_body_validators_when_restoring() {
         "repr-digest",
         http::HeaderValue::from_static("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
     );
-    // Unrelated metadata that must survive the rewrite: the response should reach
-    // the client almost unchanged apart from the restored ID.
+    // Unrelated metadata that must also survive the untouched passthrough.
     response
         .headers
         .insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
@@ -2361,8 +2363,8 @@ async fn strips_stale_body_validators_when_restoring() {
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "on_response should continue");
     assert!(
-        ctx.response_headers_modified,
-        "clearing stale validators must be signalled"
+        !ctx.response_headers_modified,
+        "a validator-bearing response must be an untouched passthrough"
     );
 
     let headers = &ctx
@@ -2370,7 +2372,7 @@ async fn strips_stale_body_validators_when_restoring() {
         .as_ref()
         .expect("response header should still be present")
         .headers;
-    for stale in [
+    for preserved in [
         http::header::CONTENT_LENGTH.as_str(),
         http::header::ETAG.as_str(),
         http::header::LAST_MODIFIED.as_str(),
@@ -2380,14 +2382,14 @@ async fn strips_stale_body_validators_when_restoring() {
         "repr-digest",
     ] {
         assert!(
-            !headers.contains_key(stale),
-            "stale body validator {stale} must be dropped once the body is rewritten"
+            headers.contains_key(preserved),
+            "declined response must keep its body validator {preserved} intact"
         );
     }
     assert_eq!(
         headers.get(http::header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
         Some("no-store"),
-        "caching-policy headers are unrelated to the byte content and must be preserved"
+        "caching-policy headers must be preserved"
     );
     assert_eq!(
         headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
@@ -2400,18 +2402,75 @@ async fn strips_stale_body_validators_when_restoring() {
         "routing/tracing headers must be preserved"
     );
 
-    let mut body = Some(Bytes::from(
-        r#"{"id":"resp_new","object":"response","previous_response_id":null}"#,
-    ));
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
         "on_response_body should continue"
     );
-    let patched: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(
-        patched["previous_response_id"], "resp_prev",
-        "caller previous_response_id should be restored after the validators are cleared"
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a validator-bearing response passes through byte-identical (id not restored)"
+    );
+}
+
+/// Each body validator / integrity digest must decline the restore on its own.
+/// The aggregate test above stays green as long as *any* validator is still
+/// checked, so this per-header sweep guards against a refactor that silently
+/// drops a single entry from `describes_exact_upstream_bytes` (which would let a
+/// response bearing only that header be rewritten and ship a stale validator —
+/// the exact issue #932 regression).
+#[tokio::test]
+async fn each_body_validator_alone_declines_restore() {
+    for (name, value) in [
+        ("etag", "\"abc123\""),
+        ("last-modified", "Wed, 21 Oct 2026 07:28:00 GMT"),
+        ("content-md5", "Q2hlY2sgSW50ZWdyaXR5IQ=="),
+        ("digest", "sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE="),
+        (
+            "content-digest",
+            "sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:",
+        ),
+        ("repr-digest", "sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
+    ] {
+        assert_single_validator_declines(name, value).await;
+    }
+}
+
+/// Drive `on_response` + `on_response_body` for a `200 OK` JSON response carrying
+/// exactly one validator header and assert it is declined: not modified, the
+/// validator preserved, and the body passed through byte-identical.
+async fn assert_single_validator_declines(name: &'static str, value: &'static str) {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    response.headers.insert(name, http::HeaderValue::from_static(value));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let _action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        !ctx.response_headers_modified,
+        "a response carrying only {name} must be declined (untouched passthrough)"
+    );
+    assert!(
+        ctx.response_header
+            .as_ref()
+            .is_some_and(|resp| resp.headers.contains_key(name)),
+        "the sole validator {name} must be preserved on the declined response"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let _action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a response carrying only {name} passes through byte-identical (id not restored)"
     );
 }
 

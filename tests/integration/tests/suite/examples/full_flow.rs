@@ -449,22 +449,25 @@ async fn full_flow_encoded_response_passes_through_untouched() {
     drop(proxy2);
 }
 
-/// A rehydrated turn whose body is rewritten to restore `previous_response_id`
-/// must not keep the upstream body validators: an `ETag` (and digest headers)
-/// describe the exact upstream bytes, so retaining them would claim the
-/// rewritten response is byte-identical to a different representation and break
-/// cache revalidation. Unrelated metadata (caching policy) must survive so the
-/// response reaches the client almost unchanged (regression test for issue
-/// #932 stale-validator finding).
+/// A rehydrated turn whose backend response carries a body validator (`ETag`,
+/// digest, `Last-Modified`, ...) must pass through unrewritten: those headers
+/// describe the exact upstream bytes and cannot survive a re-serialization, but
+/// the proxy commits response headers before it sees the body, so it declines the
+/// response at eligibility instead of stripping validators and shipping a body
+/// they no longer match. The result is a byte-identical passthrough with the
+/// validators intact — the cosmetic `previous_response_id` echo is forgone rather
+/// than trading it for a mismatched validator (regression test for the issue #932
+/// stale-validator finding and its follow-up: never drop a validator from an
+/// unrewritten body).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_flow_stale_body_validators_stripped_on_restore() {
+async fn full_flow_response_with_validators_passes_through_unrewritten() {
     // Turn 1: store a first response so turn 2 rehydrates history.
     let backend_guard = Backend::fixed(FIRST_RESPONSE_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
     let proxy_port = free_port();
 
-    let db = TempSqlite::new("full_flow_stale_validators");
+    let db = TempSqlite::new("full_flow_validators_passthrough");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
@@ -485,7 +488,8 @@ async fn full_flow_stale_body_validators_stripped_on_restore() {
     drop(backend_guard);
 
     // Turn 2: the backend echoes `previous_response_id: null` and carries an
-    // `ETag` validator plus an unrelated `Cache-Control` policy header.
+    // `ETag` validator plus an unrelated `Cache-Control` policy header. The ETag
+    // makes the response ineligible, so it is passed through untouched.
     let backend_guard2 = Backend::fixed(SECOND_RESPONSE_JSON)
         .header("content-type", "application/json")
         .header("etag", "\"upstream-v1\"")
@@ -512,13 +516,14 @@ async fn full_flow_stale_body_validators_stripped_on_restore() {
 
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw2)).expect("client response should be JSON");
     assert_eq!(
-        response["previous_response_id"], "resp_first",
-        "the body must be rewritten to restore the caller's previous_response_id"
+        response["previous_response_id"],
+        serde_json::Value::Null,
+        "a validator-bearing response is declined, so the backend's null id passes through unrewritten"
     );
     assert_eq!(
-        parse_header(&raw2, "etag"),
-        None,
-        "the upstream ETag must be dropped once the body is rewritten (it no longer describes these bytes)"
+        parse_header(&raw2, "etag").as_deref(),
+        Some("\"upstream-v1\""),
+        "the upstream ETag must be preserved: the validator-bearing response is passed through untouched"
     );
     assert_eq!(
         parse_header(&raw2, "cache-control").as_deref(),

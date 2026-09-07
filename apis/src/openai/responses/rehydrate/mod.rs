@@ -276,38 +276,34 @@ impl HttpFilter for RehydrateFilter {
         };
 
         // Buffer the finite JSON response so `on_response_body` can restore the
-        // caller's `previous_response_id`. Re-serializing the body invalidates
-        // every header that describes the exact upstream bytes, so drop them all
-        // here: `Content-Length` (core recomputes it from the buffered body) and
-        // the body validators / integrity digests (`ETag`, `Last-Modified`,
-        // `Content-MD5`, `Digest`, `Content-Digest`, `Repr-Digest`). Leaving a
-        // validator behind would assert the rewritten payload is byte-identical
-        // to the upstream representation and break cache revalidation or integrity
-        // verification — rewriting `previous_response_id` changes both bytes and
-        // API-visible semantics, so those validators no longer describe this
-        // response. (`Last-Modified` is a weak, mtime-granularity validator, but
-        // it still names the origin representation and is dropped for symmetry.)
+        // caller's `previous_response_id`. Re-serializing the body changes its
+        // length, so `Content-Length` must go — core recomputes it from the
+        // buffered body (byte-identical when the body ends up unchanged). Nothing
+        // else is touched here: `eligible_previous_response_id` already declined
+        // any response carrying a `Content-Encoding`, `Content-Range`, or a body
+        // validator / integrity digest (`ETag`, `Last-Modified`, `Content-MD5`,
+        // `Digest`, `Content-Digest`, `Repr-Digest`), so an eligible response has
+        // no header describing the exact upstream bytes that a rewrite could
+        // invalidate.
         //
-        // `Content-Encoding` and `Content-Range` are deliberately left alone:
-        // `eligible_previous_response_id` already declined encoded and ranged
-        // responses, so an eligible body is a complete, identity-coded
-        // representation. Caching-policy (`Cache-Control`, `Age`, ...), routing,
-        // tracing, and `Content-Type` headers are unrelated to the byte content
-        // and are preserved so the response reaches the client almost unchanged.
+        // Declining validator-bearing responses up front — rather than stripping
+        // the validators here — is what keeps this sound. Praxis commits the
+        // response headers before `on_response_body` runs, so the header phase
+        // cannot yet know whether the body will actually be rewritten (that
+        // depends on it parsing as a Responses resource). Stripping validators
+        // unconditionally would therefore also drop them from a body we then
+        // leave unchanged (an unexpected non-Responses JSON shape), handing the
+        // client an unchanged body with missing validators. Declining avoids that
+        // entirely and passes such responses through byte-identical.
+        //
+        // Caching-policy (`Cache-Control`, `Age`, ...), routing, tracing, and
+        // `Content-Type` headers are unrelated to the byte content and are
+        // preserved so the response reaches the client almost unchanged.
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
         });
         if let Some(response) = &mut ctx.response_header {
-            let headers = &mut response.headers;
-            headers.remove(http::header::CONTENT_LENGTH);
-            headers.remove(http::header::ETAG);
-            headers.remove(http::header::LAST_MODIFIED);
-            // `Content-MD5` (RFC 1864, obsolete) and the RFC 9530 digest fields
-            // have no typed constants in `http`; remove them by lowercase name.
-            headers.remove("content-md5");
-            headers.remove("digest");
-            headers.remove("content-digest");
-            headers.remove("repr-digest");
+            response.headers.remove(http::header::CONTENT_LENGTH);
         }
         ctx.response_headers_modified = true;
         ctx.insert_filter_state(RestorePreviousResponseId {
@@ -357,8 +353,11 @@ struct RestorePreviousResponseId {
 /// backend never sees the ID), so the backend echoes `null`. The Responses API
 /// contract always echoes the caller's `previous_response_id`, so it is restored
 /// on the way out. Only a finite, identity-coded, complete `200 OK` JSON response
-/// is eligible; streaming SSE, content-encoded, ranged/partial, and non-`200`
-/// responses are left untouched.
+/// is eligible; streaming SSE, content-encoded, ranged/partial, non-`200`, and
+/// responses carrying a body validator or integrity digest (`ETag`,
+/// `Last-Modified`, `Content-MD5`, `Digest`, `Content-Digest`, `Repr-Digest`) are
+/// left untouched, so re-serializing the body can never invalidate a header that
+/// described the exact upstream bytes.
 fn eligible_previous_response_id(ctx: &HttpFilterContext<'_>) -> Option<String> {
     // Clone the ID at the ownership boundary so it outlives the borrow on
     // `extensions` and can be carried into the body phase.
@@ -378,18 +377,10 @@ fn eligible_previous_response_id(ctx: &HttpFilterContext<'_>) -> Option<String> 
         return None;
     }
 
-    // Decline any response carrying a `Content-Encoding` or `Content-Range`.
-    // Restoring the ID means parsing the buffered body as JSON and re-serializing
-    // it: a compressed body is opaque bytes that would fail to parse, and a
-    // ranged (partial) body is a fragment of a larger representation that cannot
-    // be soundly rewritten. Dropping the framing headers while leaving the body
-    // encoded or partial would ship those bytes mislabeled as a full, identity
-    // JSON representation. Leaving such a response ineligible passes it through
-    // verbatim. (Mirrors the encoded-SSE decline in `openai_responses`
-    // stream_events; see issue #668 for the same defense on the streaming path.)
-    if resp.headers.contains_key(http::header::CONTENT_ENCODING)
-        || resp.headers.contains_key(http::header::CONTENT_RANGE)
-    {
+    // Decline any response whose headers describe or constrain the exact upstream
+    // bytes; restoring the ID re-serializes the body and would invalidate them.
+    // See [`describes_exact_upstream_bytes`] for the full set and rationale.
+    if describes_exact_upstream_bytes(&resp.headers) {
         return None;
     }
 
@@ -406,6 +397,35 @@ fn eligible_previous_response_id(ctx: &HttpFilterContext<'_>) -> Option<String> 
         .eq_ignore_ascii_case("application/json");
 
     is_json.then_some(prev_id)
+}
+
+/// Whether any response header describes or constrains the exact upstream bytes,
+/// making the body unsafe to re-serialize when restoring `previous_response_id`:
+///
+/// - `Content-Encoding` — an opaque (e.g. compressed) body that would fail to parse as JSON; stripping the label would
+///   ship encoded bytes mislabeled as identity JSON. (Mirrors the encoded-SSE decline in `openai_responses`
+///   `stream_events`; see issue #668 for the same defense on the streaming path.)
+/// - `Content-Range` — a fragment of a larger representation that cannot be soundly rewritten.
+/// - `ETag` / `Last-Modified` / `Content-MD5` (RFC 1864) / `Digest` / `Content-Digest` / `Repr-Digest` (RFC 9530) —
+///   body validators and integrity digests that name the exact upstream representation. Re-serializing the body
+///   invalidates them, but Praxis commits response headers before `on_response_body` runs, so the proxy can neither
+///   recompute them from the rewritten body nor tell in the header phase whether a rewrite will actually happen.
+///   Stripping them there would drop them from a body we then leave unchanged (an unexpected non-Responses JSON shape).
+///   Declining up front passes the response through byte-identical with its validators intact — a validator-bearing
+///   `POST /v1/responses` body does not occur in practice (OpenAI and vLLM never send these here), so this only forgoes
+///   the cosmetic ID echo in an anomalous case and never corrupts a response.
+///
+/// (`Content-MD5` and the RFC 9530 digests have no typed constant in `http`;
+/// matched by lowercase name — `HeaderMap::contains_key` is case-insensitive.)
+fn describes_exact_upstream_bytes(headers: &http::HeaderMap) -> bool {
+    headers.contains_key(http::header::CONTENT_ENCODING)
+        || headers.contains_key(http::header::CONTENT_RANGE)
+        || headers.contains_key(http::header::ETAG)
+        || headers.contains_key(http::header::LAST_MODIFIED)
+        || headers.contains_key("content-md5")
+        || headers.contains_key("digest")
+        || headers.contains_key("content-digest")
+        || headers.contains_key("repr-digest")
 }
 
 /// Restore the caller's `previous_response_id` into the buffered Responses
