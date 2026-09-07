@@ -34,7 +34,7 @@
 )]
 mod tests;
 
-use std::mem;
+use std::{collections::HashSet, mem};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -396,29 +396,67 @@ struct SearchCallIds<'a> {
 /// type, so the allowance is the declared maximum minus all built-in calls
 /// already consumed — web searches dispatched across prior iterations
 /// ([`ResponsesState::web_search_calls_executed`]) *plus* completed non-web
-/// built-in calls (e.g. file search) accumulated this response. Without the
-/// second term a mixed pipeline could dispatch a full web-search allowance on
-/// top of already-executed file searches and overshoot the client's cap. Web
-/// searches are counted through the dedicated counter rather than by scanning
-/// [`ResponsesState::accumulated_output`] to avoid the echoed-call/result
-/// double count documented on that field; non-web built-in calls have no such
+/// built-in calls (e.g. file search) recorded on the state. Without the second
+/// term a mixed pipeline could dispatch a full web-search allowance on top of
+/// already-executed file searches and overshoot the client's cap. Web searches
+/// are counted through the dedicated counter rather than by scanning the output
+/// collections to avoid the echoed-call/result double count documented on
+/// [`ResponsesState::accumulated_output`]; non-web built-in calls have no such
 /// counter and are counted directly, mirroring
 /// [`remaining_file_search_call_budget`](super::file_search_callout).
 fn remaining_web_search_budget(state: &ResponsesState) -> usize {
     let web_executed = usize::try_from(state.web_search_calls_executed).unwrap_or(usize::MAX);
-    let other_builtin_calls = state
-        .accumulated_output
-        .iter()
-        .filter(|item| {
-            super::file_search_callout::is_builtin_tool_call(item)
-                && item.get("type").and_then(Value::as_str) != Some("web_search_call")
-        })
-        .count();
+    let other_builtin_calls = count_non_web_builtin_calls(state);
     let used = web_executed.saturating_add(other_builtin_calls);
     let client_remaining = state.max_tool_calls.map_or(usize::MAX, |max| {
         usize::try_from(max).unwrap_or(usize::MAX).saturating_sub(used)
     });
     client_remaining.min(MAX_WEB_SEARCH_CALLS_PER_CONTINUATION)
+}
+
+/// Count distinct non-web built-in tool calls already spent against the shared
+/// `max_tool_calls` budget.
+///
+/// A completed file-search call is moved out of the response object into
+/// [`ResponsesState::file_search_output_items`] before the next iterative round,
+/// so scanning only [`ResponsesState::accumulated_output`] would miss it and let
+/// a mixed file-search/web-search pipeline dispatch a full web-search allowance
+/// on top of an already-executed file search, overshooting the client's cap.
+/// Every collection that can retain a built-in call is scanned —
+/// `accumulated_output`, the moved-out `file_search_output_items`, and the live
+/// [`ResponsesState::output_items`] — and results are deduplicated by item `id`,
+/// because a single call can be echoed into more than one collection (e.g.
+/// accumulated during the response phase *and* retained after the move).
+/// Web-search calls are excluded here; they are tracked through
+/// [`ResponsesState::web_search_calls_executed`].
+fn count_non_web_builtin_calls(state: &ResponsesState) -> usize {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut count = 0_usize;
+    let candidates = state
+        .accumulated_output
+        .iter()
+        .chain(&state.file_search_output_items)
+        .chain(state.output_items());
+    for item in candidates {
+        let is_non_web_builtin = super::file_search_callout::is_builtin_tool_call(item)
+            && item.get("type").and_then(Value::as_str) != Some("web_search_call");
+        if !is_non_web_builtin {
+            continue;
+        }
+        match item.get("id").and_then(Value::as_str) {
+            // Distinct calls always carry an id; dedup avoids counting a call
+            // echoed into several collections more than once.
+            Some(id) => {
+                if seen.insert(id) {
+                    count = count.saturating_add(1);
+                }
+            },
+            // An id-less built-in call cannot be deduplicated; count it so the
+            // budget errs toward the client's cap rather than overshooting it.
+            None => count = count.saturating_add(1),
+        }
+    }
+    count
 }
 
 /// Surface an over-budget web search call as incomplete without dispatching.

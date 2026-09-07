@@ -1234,6 +1234,44 @@ fn remaining_budget_counts_web_and_non_web_builtin_together() {
     );
 }
 
+#[test]
+fn remaining_budget_counts_moved_out_file_search_calls() {
+    // A completed file search is moved out of the response object into
+    // `file_search_output_items` before the next iterative round, so it no
+    // longer appears in `accumulated_output`. It must still exhaust the shared
+    // `max_tool_calls` budget, or a later web search would overshoot the cap.
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 1}));
+    state.file_search_output_items = vec![serde_json::json!({
+        "type": "file_search_call",
+        "id": "fs_moved",
+        "status": "completed",
+    })];
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        0,
+        "a moved-out completed file search must exhaust the shared max_tool_calls budget"
+    );
+}
+
+#[test]
+fn remaining_budget_dedups_file_search_call_across_collections() {
+    // The same completed file-search call can be echoed into more than one
+    // collection (accumulated during the response phase and retained after the
+    // move). It must be counted once, not twice, or the budget would decline a
+    // web search that is actually still within the client's cap.
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 2}));
+    let call = serde_json::json!({"type": "file_search_call", "id": "fs_dup", "status": "completed"});
+    state.accumulated_output = vec![call.clone()];
+    state.file_search_output_items = vec![call];
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        1,
+        "2 - 1 distinct file search = 1; the call echoed into two collections is counted once"
+    );
+}
+
 #[tokio::test]
 async fn on_request_body_honors_client_max_tool_calls() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
