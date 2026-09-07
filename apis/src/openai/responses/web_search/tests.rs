@@ -504,6 +504,25 @@ async fn on_request_body_missing_query_produces_incomplete_status() {
         output["status"], "incomplete",
         "missing query should produce incomplete status"
     );
+
+    let bridge_call = &state.messages[state.messages.len() - 2];
+    assert_eq!(bridge_call["type"], "function_call");
+    assert_eq!(bridge_call["arguments"], r#"{}"#);
+    assert_eq!(
+        bridge_call["status"], "completed",
+        "the synthetic function call was fully generated; its output carries the incomplete execution result"
+    );
+    let bridge_output = state.messages.last().unwrap();
+    assert_eq!(bridge_output["type"], "function_call_output");
+    assert_eq!(
+        bridge_output["output"],
+        "Web search could not run because the query was missing."
+    );
+    assert_eq!(
+        state.persisted_messages.last(),
+        Some(bridge_output),
+        "persisted history must contain the truthful model continuation"
+    );
 }
 
 #[tokio::test]

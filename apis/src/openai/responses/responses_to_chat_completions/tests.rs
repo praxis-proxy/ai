@@ -158,6 +158,48 @@ async fn classified_responses_create_without_state_fails_closed() {
 }
 
 #[tokio::test]
+async fn canonical_state_translates_across_iterative_metadata_boundary() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "stream": false
+    }));
+    state.response_id = Some("resp_iterative".to_owned());
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1-mini","input":"hello","stream":false}"#,
+    ));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(translated["messages"][0]["content"], "hello");
+    assert_eq!(translated["stream"], false);
+    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
+}
+
+#[tokio::test]
+async fn unvalidated_state_does_not_bypass_missing_classifier_metadata() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello"
+    })));
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert_server_error(action);
+    assert!(context.get_metadata(ARMED_KEY).is_none());
+}
+
+#[tokio::test]
 async fn unresolved_previous_response_id_fails_closed() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -324,6 +366,65 @@ async fn canonical_state_is_translated_and_arms_response() {
     );
     assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
     assert_eq!(context.get_metadata(CREATED_AT_KEY), Some("1700000000"));
+    assert_eq!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .and_then(|state| state.response_created_at),
+        Some(1_700_000_000)
+    );
+}
+
+#[tokio::test]
+async fn malformed_responses_input_is_rejected_before_request_translation() {
+    let cases = [
+        (
+            "scalar input",
+            json!({"model": "m", "input": 42}),
+            "unsupported Responses input type for Chat Completions translation: number",
+        ),
+        (
+            "non-object input item",
+            json!({"model": "m", "input": [42]}),
+            "Responses input item must be a JSON object",
+        ),
+        (
+            "function call without call_id",
+            json!({"model": "m", "input": [{"type": "function_call", "name": "lookup", "arguments": "{}"}]}),
+            "Responses function_call input item is missing required field `call_id`",
+        ),
+    ];
+
+    for (case, request_body, expected_message) in cases {
+        let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut context = crate::test_utils::make_filter_context(&request);
+        context.set_metadata("openai_responses_format.format", "openai_responses");
+        context
+            .extensions
+            .insert(ResponsesState::from_request_body(request_body.clone()));
+        let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
+        let mut body = Some(original.clone());
+
+        let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("{case} should be rejected");
+        };
+        assert_eq!(rejection.status, 400, "{case} should produce a client error");
+        let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["error"]["code"], "invalid_request_error", "{case}");
+        assert_eq!(parsed["error"]["message"], expected_message, "{case}");
+        assert_eq!(
+            body.as_deref(),
+            Some(original.as_ref()),
+            "{case} should not rewrite the body"
+        );
+        assert!(
+            context.get_metadata(ARMED_KEY).is_none(),
+            "{case} must not arm response processing"
+        );
+    }
 }
 
 #[tokio::test]
@@ -409,36 +510,41 @@ async fn translated_request_over_configured_limit_is_rejected() {
 }
 
 #[tokio::test]
-async fn unsupported_responses_tool_is_rejected_at_filter_boundary() {
+async fn web_search_translation_preserves_canonical_hosted_tool_state() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.set_metadata("openai_responses_format.format", "openai_responses");
-    context.extensions.insert(ResponsesState::from_request_body(json!({
+    let request_body = json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
-        "tools": [{"type": "web_search"}]
-    })));
+        "tools": [{
+            "type": "web_search",
+            "search_context_size": "high",
+            "user_location": {"type": "approximate", "country": "FR"}
+        }],
+        "tool_choice": {"type": "web_search"}
+    });
+    context
+        .extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
     let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1-mini","input":"hello","tools":[{"type":"web_search"}]}"#,
+        br#"{"model":"gpt-4.1-mini","input":"hello","tools":[{"type":"web_search","search_context_size":"high","user_location":{"type":"approximate","country":"FR"}}],"tool_choice":{"type":"web_search"}}"#,
     ));
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
-        panic!("expected rejection");
-    };
-    assert_eq!(rejection.status, 400);
-    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
-    assert_eq!(parsed["error"]["code"], "invalid_request_error");
-    assert!(
-        context.get_metadata(ARMED_KEY).is_none(),
-        "unsupported tool rejection must not arm response processing"
+    assert!(matches!(action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(translated["tools"][0]["function"]["name"], "web_search");
+    assert_eq!(
+        translated["tool_choice"],
+        json!({"type": "function", "function": {"name": "web_search"}})
     );
-    assert!(
-        context.get_metadata(CREATED_AT_KEY).is_none(),
-        "unsupported tool rejection must not set created_at"
-    );
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.tools.as_slice(), request_body["tools"].as_array().unwrap());
+    assert_eq!(state.tool_choice, request_body["tool_choice"]);
+    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
 }
 
 #[tokio::test]
@@ -452,10 +558,10 @@ async fn streaming_translation_error_uses_responses_sse_error_event() {
         "model": "gpt-4.1-mini",
         "input": "hello",
         "stream": true,
-        "tools": [{"type": "web_search"}]
+        "tools": [{"type": "code_interpreter"}]
     })));
     let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1-mini","input":"hello","stream":true,"tools":[{"type":"web_search"}]}"#,
+        br#"{"model":"gpt-4.1-mini","input":"hello","stream":true,"tools":[{"type":"code_interpreter"}]}"#,
     ));
 
     let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
@@ -491,7 +597,7 @@ fn assert_responses_sse_translation_error(rejection: &praxis_filter::Rejection) 
     assert_eq!(parsed["error"]["code"], "invalid_request_error");
     assert_eq!(
         parsed["error"]["message"],
-        "unsupported Responses tool type for Chat Completions translation: web_search"
+        "unsupported Responses tool type for Chat Completions translation: code_interpreter"
     );
     assert!(parsed["error"]["param"].is_null());
 }
@@ -774,6 +880,57 @@ async fn non_streaming_chat_response_becomes_response_resource() {
 }
 
 #[tokio::test]
+async fn chat_file_search_function_call_becomes_responses_function_call() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.time_source = &fixed_time;
+    let request_value = json!({
+        "model": "chat-only-model",
+        "input": "find revenue",
+        "stream": false,
+        "store": false,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}],
+        "tool_choice": {"type": "file_search"}
+    });
+    let mut state = ResponsesState::from_request_body(request_value);
+    state.response_id = Some("resp_file_search".to_owned());
+    context.extensions.insert(state);
+    let mut request_body = Some(Bytes::from_static(
+        br#"{"model":"chat-only-model","input":"find revenue"}"#,
+    ));
+    let request_action = filter
+        .on_request_body(&mut context, &mut request_body, true)
+        .await
+        .unwrap();
+    assert!(matches!(request_action, FilterAction::Continue));
+
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    let response_action = filter.on_response(&mut context).await.unwrap();
+    assert!(matches!(response_action, FilterAction::Continue));
+    context.response_header = None;
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_search","object":"chat.completion","model":"chat-only-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_search","type":"function","function":{"name":"file_search","arguments":"{\"query\":\"Q4 revenue\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(translated["id"], "resp_file_search");
+    assert_eq!(translated["tools"][0]["type"], "file_search");
+    assert_eq!(translated["output"][0]["type"], "function_call");
+    assert_eq!(translated["output"][0]["name"], "file_search");
+    assert_eq!(translated["output"][0]["arguments"], "{\"query\":\"Q4 revenue\"}");
+}
+
+#[tokio::test]
 async fn malformed_success_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
@@ -803,6 +960,39 @@ async fn malformed_success_aborts_after_headers_are_sent() {
 
     assert!(error.to_string().contains("invalid Chat Completions response"));
     assert_eq!(body.as_deref(), Some(b"not-json".as_slice()));
+}
+
+#[tokio::test]
+async fn malformed_success_shape_aborts_after_headers_are_sent() {
+    let yaml = serde_yaml::from_str("{}").unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_test_123");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello"
+    })));
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let original = Bytes::from_static(b"{}");
+    let mut body = Some(original.clone());
+
+    let error = filter.on_response_body(&mut context, &mut body, true).unwrap_err();
+
+    assert!(error.to_string().contains("choices must be an array"));
+    assert_eq!(body.as_deref(), Some(original.as_ref()));
 }
 
 #[tokio::test]

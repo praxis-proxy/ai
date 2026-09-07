@@ -21,7 +21,10 @@ use super::{
     ValidatedConfig,
     config::{SearchContextSize, SearchProvider},
 };
-use crate::subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse};
+use crate::{
+    callout_target::AddressPolicy,
+    subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
+};
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
@@ -77,6 +80,8 @@ pub(crate) struct SearchClient {
     default_context_size: SearchContextSize,
     /// Override the provider's default API base URL.
     base_url: Option<String>,
+    /// Connect-time private-address policy for the provider target.
+    address_policy: AddressPolicy,
 }
 
 impl std::fmt::Debug for SearchClient {
@@ -88,6 +93,7 @@ impl std::fmt::Debug for SearchClient {
             .field("api_key", &"[REDACTED]")
             .field("default_context_size", &self.default_context_size)
             .field("base_url", &self.base_url)
+            .field("address_policy", &self.address_policy)
             .finish()
     }
 }
@@ -113,6 +119,7 @@ impl SearchClient {
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
             base_url: config.base_url.clone(),
+            address_policy: AddressPolicy::from_allow_private(config.allow_private_base_url),
         })
     }
 
@@ -137,7 +144,15 @@ impl SearchClient {
     /// Execute a search request and map the result to a
     /// [`SearchOutcome`].
     async fn execute_search(&self, url: &str, request: SubRequest) -> SearchOutcome {
-        let result = subrequest::execute_url(&self.client, url, request, MAX_SEARCH_RESPONSE_BYTES, self.timeout).await;
+        let result = subrequest::execute_url(
+            &self.client,
+            url,
+            request,
+            MAX_SEARCH_RESPONSE_BYTES,
+            self.timeout,
+            self.address_policy,
+        )
+        .await;
         self.map_search_result(result)
     }
 
@@ -404,13 +419,19 @@ mod tests {
     #[test]
     fn parse_brave_results_empty() {
         let json = json!({"web": {"results": []}});
-        assert!(parse_brave_results(&json).is_empty());
+        assert!(
+            parse_brave_results(&json).is_empty(),
+            "empty Brave results should parse as empty"
+        );
     }
 
     #[test]
     fn parse_brave_results_missing_web() {
         let json = json!({"query": "test"});
-        assert!(parse_brave_results(&json).is_empty());
+        assert!(
+            parse_brave_results(&json).is_empty(),
+            "missing Brave web results should parse as empty"
+        );
     }
 
     #[test]
@@ -445,13 +466,19 @@ mod tests {
     #[test]
     fn parse_tavily_results_empty() {
         let json = json!({"results": []});
-        assert!(parse_tavily_results(&json).is_empty());
+        assert!(
+            parse_tavily_results(&json).is_empty(),
+            "empty Tavily results should parse as empty"
+        );
     }
 
     #[test]
     fn parse_tavily_results_missing_results() {
         let json = json!({"answer": "some answer"});
-        assert!(parse_tavily_results(&json).is_empty());
+        assert!(
+            parse_tavily_results(&json).is_empty(),
+            "missing Tavily results should parse as empty"
+        );
     }
 
     #[test]
@@ -475,6 +502,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            allow_private_base_url: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
 
@@ -516,7 +544,10 @@ mod tests {
 
     #[test]
     fn parse_you_results_handles_missing_sections() {
-        assert!(parse_you_results(&json!({"results": {}})).is_empty());
+        assert!(
+            parse_you_results(&json!({"results": {}})).is_empty(),
+            "missing You.com result sections should parse as empty"
+        );
     }
 
     #[test]
@@ -528,9 +559,10 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            allow_private_base_url: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client());
-        assert!(client.is_ok());
+        assert!(client.is_ok(), "a valid search configuration should build a client");
     }
 
     #[test]
@@ -542,6 +574,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            allow_private_base_url: false,
         };
 
         let error = SearchClient::from_config("anthropic_web_search", &config, test_subrequest_client()).unwrap_err();
@@ -563,6 +596,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
+            allow_private_base_url: true,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_brave_request("test query", 5);
@@ -581,6 +615,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
+            allow_private_base_url: true,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_tavily_request("test query", SearchContextSize::Medium);
@@ -599,6 +634,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
+            allow_private_base_url: true,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let (url, _) = client.build_you_request("test query", 5);
@@ -617,6 +653,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            allow_private_base_url: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(b"not json");
@@ -635,6 +672,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            allow_private_base_url: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let outcome = client.parse_response(br#"{"web":{"results":[]}}"#);
@@ -652,6 +690,7 @@ mod tests {
             timeout_ms: 1000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            allow_private_base_url: true,
         };
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
     }

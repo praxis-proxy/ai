@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod callout_policy;
+pub mod callout_target;
 pub mod classifier;
 pub mod json_body;
 pub(crate) mod mcp_client;

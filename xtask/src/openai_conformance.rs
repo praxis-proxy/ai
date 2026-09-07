@@ -11,6 +11,8 @@ use clap::Parser;
 mod area;
 /// Operation coverage calculation.
 mod coverage;
+/// Source-derived Conversation item schema artifact.
+mod item_contracts;
 /// Machine-readable JSON report rendering.
 mod json_report;
 /// Shared report and operation model types.
@@ -35,6 +37,8 @@ mod tests;
 
 use area::{ApiArea, CONFORMANCE_AREAS, OPENAI_REFERENCE_MANIFEST, OPENAI_REFERENCE_SPEC};
 use coverage::calculate_coverage;
+pub(crate) use item_contracts::{Args as ItemContractsArgs, run as run_item_contracts};
+use item_contracts::{ITEM_CONTRACTS_ARTIFACT, generate_item_contracts, verify_item_contracts};
 use json_report::write_json_report;
 use model::{
     CoverageReport, ReferenceSourceReport, RuntimeVerificationArea, RuntimeVerificationCheck, RuntimeVerificationStatus,
@@ -194,6 +198,12 @@ fn run_inner(args: &Args) -> Result<CoverageReport, String> {
     let reference_spec = reference_override.unwrap_or(OPENAI_REFERENCE_SPEC);
     let manifest = reference_override.is_none().then_some(OPENAI_REFERENCE_MANIFEST);
     let reference = load_reference_source(reference_spec, manifest)?;
+    if reference_override.is_none() && areas.iter().any(|area| area.scope.id == "conversations") {
+        let source =
+            std::fs::read(reference_spec).map_err(|error| format!("failed to read {reference_spec}: {error}"))?;
+        let generated = generate_item_contracts(&source)?;
+        verify_item_contracts(std::path::Path::new(ITEM_CONTRACTS_ARTIFACT), &generated)?;
+    }
 
     for area in &areas {
         let mut projected = project_reference(&reference, area.scope)?;

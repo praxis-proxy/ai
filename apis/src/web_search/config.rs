@@ -119,13 +119,10 @@ pub(crate) struct WebSearchFilterConfig {
 
     /// Allow a `base_url` that targets local-sensitive addresses.
     ///
-    /// DNS targets are unsupported in protected mode (the default):
-    /// validation cannot pin the address the HTTP client will eventually
-    /// dial, so a `base_url` host must be a public IP literal. Enabling
-    /// `allow_private_base_url` also permits DNS results resolving to
-    /// local-sensitive addresses, so a hostile or rebound resolution can
-    /// send the provider credential to a loopback, private, or
-    /// cloud-metadata endpoint.
+    /// DNS names are resolved once per request and every result is checked
+    /// immediately before the transport connects. By default, any private,
+    /// loopback, link-local, or otherwise non-public result rejects the
+    /// callout. Enable this only for a trusted private provider endpoint.
     #[serde(default)]
     pub(crate) allow_private_base_url: bool,
 }
@@ -166,13 +163,10 @@ pub(crate) struct OpenAiWebSearchConfig {
 
     /// Allow a `base_url` that targets local-sensitive addresses.
     ///
-    /// DNS targets are unsupported in protected mode (the default):
-    /// validation cannot pin the address the HTTP client will eventually
-    /// dial, so a `base_url` host must be a public IP literal. Enabling
-    /// `allow_private_base_url` also permits DNS results resolving to
-    /// local-sensitive addresses, so a hostile or rebound resolution can
-    /// send the provider credential to a loopback, private, or
-    /// cloud-metadata endpoint.
+    /// DNS names are resolved once per request and every result is checked
+    /// immediately before the transport connects. By default, any private,
+    /// loopback, link-local, or otherwise non-public result rejects the
+    /// callout. Enable this only for a trusted private provider endpoint.
     #[serde(default)]
     allow_private_base_url: bool,
 }
@@ -220,6 +214,9 @@ pub(crate) struct ValidatedConfig {
 
     /// Override the provider's default API base URL.
     pub base_url: Option<String>,
+
+    /// Connect-time private-address policy for the provider target.
+    pub allow_private_base_url: bool,
 }
 
 impl std::fmt::Debug for ValidatedConfig {
@@ -231,6 +228,7 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("base_url", &self.base_url)
+            .field("allow_private_base_url", &self.allow_private_base_url)
             .finish()
     }
 }
@@ -268,6 +266,7 @@ fn build_validated_config(
         timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
         base_url: raw.base_url.clone(),
+        allow_private_base_url: raw.allow_private_base_url,
     })
 }
 
@@ -441,13 +440,10 @@ mod tests {
     }
 
     #[test]
-    fn build_config_rejects_dns_base_url_without_opt_in() {
+    fn build_config_accepts_dns_base_url_for_connect_time_validation() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://internal.search.example:8080".into());
-        assert!(
-            build_config("openai_web_search", &cfg).is_err(),
-            "DNS base_url must be rejected without allow_private_base_url because the dialed address cannot be pinned"
-        );
+        assert!(build_config("openai_web_search", &cfg).is_ok());
     }
 
     #[test]

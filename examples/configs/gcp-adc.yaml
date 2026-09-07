@@ -43,6 +43,8 @@ filter_chains:
       - filter: gcp_adc
         # source: adc   # default: GOOGLE_APPLICATION_CREDENTIALS, else GKE metadata
         # scope: https://www.googleapis.com/auth/cloud-platform
+        # Metadata authentication uses only the fixed metadata endpoint;
+        # redirects and ambient HTTP proxies are disabled.
 
 insecure_options:
   allow_private_endpoints: true # example proxies to a local backend

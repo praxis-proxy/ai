@@ -40,6 +40,7 @@ filter_chains:
         scope: https://cognitiveservices.azure.com/.default
         client_secret_env_var: AZURE_CLIENT_SECRET
         # authority_host: login.microsoftonline.com  # optional, for sovereign clouds
+        # allow_private_authority: false  # opt in only for a trusted private authority
 
 insecure_options:
   allow_private_endpoints: true # example proxies to a local backend

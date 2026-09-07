@@ -6,7 +6,10 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::callout_policy::{self, CalloutSettings, OnFailure};
+use crate::{
+    callout_policy::{self, CalloutSettings, OnFailure},
+    callout_target::{AddressPolicy, validate_configured_http_target},
+};
 
 /// Default callout timeout (30 seconds — summarization can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -34,6 +37,10 @@ pub(super) struct CompactFilterConfig {
     /// URL of the inference backend for summarization calls.
     /// E.g., `"http://localhost:11434/v1/chat/completions"`
     pub inference_url: String,
+
+    /// Allow the inference target to resolve to non-public addresses.
+    #[serde(default)]
+    pub allow_private_inference_url: bool,
 
     /// Default model for summarization when not overridden
     /// in the request's `context_management`.
@@ -78,6 +85,9 @@ pub(super) struct ValidatedConfig {
     /// URL of the inference backend for summarization calls.
     pub inference_url: String,
 
+    /// Connect-time policy for the inference target.
+    pub address_policy: AddressPolicy,
+
     /// Default model for summarization.
     pub default_model: String,
 
@@ -99,11 +109,17 @@ const SUPPORTED_ENCODINGS: &[&str] = &["cl100k_base", "o200k_base"];
 /// `true`, `inference_url` is empty, `tiktoken_encoding` is not a
 /// supported encoding name, `timeout_ms` is zero, or
 /// `status_on_error` is out of range.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the validation flow keeps all compact callout invariants together"
+)]
 pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig, FilterError> {
     validate_pre_security_callout(raw)?;
     if raw.inference_url.is_empty() {
         return Err(FilterError::from("openai_responses_compact: inference_url is empty"));
     }
+    let address_policy = AddressPolicy::from_allow_private(raw.allow_private_inference_url);
+    validate_configured_http_target("openai_responses_compact", &raw.inference_url, address_policy)?;
 
     if !SUPPORTED_ENCODINGS.contains(&raw.tiktoken_encoding.as_str()) {
         return Err(FilterError::from(format!(
@@ -124,6 +140,7 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
 
     Ok(ValidatedConfig {
         inference_url: raw.inference_url.clone(),
+        address_policy,
         default_model: raw.default_model.clone(),
         tiktoken_encoding: raw.tiktoken_encoding.clone(),
         callout: CalloutSettings {

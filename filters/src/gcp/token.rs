@@ -65,6 +65,7 @@ struct MetadataTokenResponse {
 /// Returns [`FilterError`] if the metadata request fails, returns a
 /// non-success status, or its body cannot be parsed; or, for
 /// [`TokenSource::ServiceAccountKey`], always (not implemented).
+#[cfg(test)]
 pub(super) async fn fetch(
     client: &reqwest::Client,
     source: &TokenSource,
@@ -82,17 +83,58 @@ pub(super) async fn fetch(
     }
 }
 
+/// Acquire a token through a proxy-free, redirect-free client pinned to
+/// every validated metadata-server address returned by one DNS lookup.
+///
+/// The metadata protocol intentionally targets a private endpoint. The
+/// configured host is separately restricted to Google's metadata hostname
+/// or a literal loopback test host.
+pub(super) async fn fetch_pinned(
+    source: &TokenSource,
+    metadata_host: &str,
+    scope: &str,
+    timeout: Duration,
+) -> Result<(HeaderValue, Duration), FilterError> {
+    let TokenSource::Metadata { service_account } = source else {
+        return Err(FilterError::from(
+            "gcp_adc: token fetch for source key_file is not implemented yet (requires JWT signing); \
+             use source: adc or source: metadata on a GCE/GKE instance instead",
+        ));
+    };
+
+    let url = metadata_token_url(metadata_host, service_account, scope);
+    let client = praxis_ai_apis::callout_target::build_pinned_reqwest_client(
+        "gcp_adc",
+        &url,
+        praxis_ai_apis::callout_target::AddressPolicy::AllowPrivate,
+        timeout,
+    )
+    .await?;
+    fetch_metadata_token_url(&client, &url).await
+}
+
 /// Acquire a token from the GCE/GKE metadata server.
+#[cfg(test)]
 async fn fetch_metadata_token(
     client: &reqwest::Client,
     metadata_host: &str,
     service_account: &str,
     scope: &str,
 ) -> Result<(HeaderValue, Duration), FilterError> {
+    let url = metadata_token_url(metadata_host, service_account, scope);
+    fetch_metadata_token_url(client, &url).await
+}
+
+/// Build the metadata token URL from already validated components.
+fn metadata_token_url(metadata_host: &str, service_account: &str, scope: &str) -> String {
     let mut url =
         format!("http://{metadata_host}/computeMetadata/v1/instance/service-accounts/{service_account}/token?scopes=");
     url::form_urlencoded::byte_serialize(scope.as_bytes()).for_each(|piece| url.push_str(piece));
+    url
+}
 
+/// Send one metadata token request with a caller-configured client.
+async fn fetch_metadata_token_url(client: &reqwest::Client, url: &str) -> Result<(HeaderValue, Duration), FilterError> {
     let response = client
         .get(url)
         .header("Metadata-Flavor", "Google")

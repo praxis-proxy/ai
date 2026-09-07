@@ -525,6 +525,11 @@ async fn get_v1_responses_with_id_classifies_as_responses() {
         Some("openai_responses"),
         "GET /v1/responses/{{id}} should classify as responses"
     );
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+        "openai error response formatter should be installed for responses path"
+    );
 }
 
 #[tokio::test]
@@ -864,6 +869,11 @@ async fn get_responses_without_websocket_headers_classifies_body_normally() {
         Some("non_json"),
         "an ordinary GET list request must not be promoted as a WebSocket handshake"
     );
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_none(),
+        "openai error response formatter should not be installed for non-json"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -967,6 +977,11 @@ async fn mode_not_set_for_chat_completions() {
     assert!(
         !headers.contains_key("x-praxis-responses-mode"),
         "mode header absent for chat_completions"
+    );
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+        "openai error response formatter should be installed for chat completions"
     );
 }
 

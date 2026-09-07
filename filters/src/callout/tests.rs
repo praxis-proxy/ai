@@ -18,13 +18,35 @@
 mod filter_tests {
     use std::time::Duration;
 
-    use praxis_filter::{BodyAccess, BodyMode, FilterAction};
+    use praxis_filter::{BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
 
     use crate::{callout::HttpCalloutFilter, test_utils::make_filter_context};
+
+    /// Build a test filter, explicitly opting local mock endpoints into the
+    /// private-address policy while leaving public-target fixtures unchanged.
+    fn test_filter(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let mut config = config.clone();
+        let needs_private_opt_in = config
+            .get("target")
+            .and_then(|target| target.get("url"))
+            .and_then(serde_yaml::Value::as_str)
+            .is_some_and(|url| {
+                praxis_ai_apis::callout_target::validate_configured_http_target(
+                    "http_callout test",
+                    url,
+                    praxis_ai_apis::callout_target::AddressPolicy::PublicOnly,
+                )
+                .is_err()
+            });
+        if needs_private_opt_in {
+            config["target"]["allow_private_addresses"] = serde_yaml::Value::Bool(true);
+        }
+        HttpCalloutFilter::from_config(&config)
+    }
 
     // -------------------------------------------------------------------------
     // Config Parsing
@@ -40,7 +62,7 @@ mod filter_tests {
         )
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
         assert_eq!(filter.name(), "http_callout");
     }
 
@@ -277,15 +299,14 @@ mod filter_tests {
                 .err()
                 .unwrap_or_else(|| panic!("URL with userinfo should be rejected: {bad}"));
             assert!(
-                err.to_string().contains("userinfo"),
-                "error should mention userinfo for {bad}: {err}"
+                err.to_string().contains("embedded credentials"),
+                "error should mention embedded credentials for {bad}: {err}"
             );
         }
     }
 
     #[test]
-    fn config_warns_on_private_ip_url() {
-        // Private/loopback URLs should succeed (warning only).
+    fn config_rejects_private_ip_url_without_opt_in() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
             target:
@@ -295,7 +316,7 @@ mod filter_tests {
         .unwrap();
 
         let filter = HttpCalloutFilter::from_config(&yaml);
-        assert!(filter.is_ok(), "private/loopback URL should succeed with a warning");
+        assert!(filter.is_err(), "private/loopback URL should require explicit opt-in");
     }
 
     #[test]
@@ -326,43 +347,28 @@ mod filter_tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn target_parse_https_enables_tls_sni_and_default_port() {
-        // An https URL without an explicit port must enable TLS, set the
-        // SNI to the host, default the port to 443, and omit the port from
-        // the Host authority (since 443 is the default for the scheme).
-        let target = crate::callout::CalloutTarget::parse("https://example.com/api").unwrap();
+    fn target_parse_https_preserves_target_components() {
+        let target =
+            praxis_ai_apis::callout_target::validate_http_target("http_callout", "https://example.com:8443/api")
+                .unwrap();
 
-        assert!(target.tls, "https should enable TLS");
-        assert_eq!(target.port, 443, "https should default to port 443");
-        assert_eq!(target.sni, "example.com", "SNI should be the host");
-        assert_eq!(target.host, "example.com");
-        assert_eq!(target.authority, "example.com", "default port omitted from authority");
-        assert_eq!(target.request_uri, "/api");
+        assert_eq!(target.scheme(), "https");
+        assert_eq!(target.host_str(), Some("example.com"));
+        assert_eq!(target.port(), Some(8443));
+        assert_eq!(target.path(), "/api");
     }
 
     #[test]
-    fn target_parse_https_explicit_nondefault_port_in_authority() {
-        // A non-default https port must appear in the Host authority.
-        let target = crate::callout::CalloutTarget::parse("https://example.com:8443/api").unwrap();
-
-        assert!(target.tls);
-        assert_eq!(target.port, 8443);
-        assert_eq!(target.sni, "example.com", "SNI is the host, not host:port");
-        assert_eq!(
-            target.authority, "example.com:8443",
-            "non-default port kept in authority"
+    fn target_parse_rejects_userinfo() {
+        assert!(
+            praxis_ai_apis::callout_target::validate_http_target("http_callout", "https://user:pass@example.com/api",)
+                .is_err()
         );
     }
 
     #[test]
-    fn target_parse_http_disables_tls_and_leaves_sni_empty() {
-        // An http URL defaults to port 80, disables TLS, and has no SNI.
-        let target = crate::callout::CalloutTarget::parse("http://example.com/api").unwrap();
-
-        assert!(!target.tls, "http should disable TLS");
-        assert_eq!(target.port, 80, "http should default to port 80");
-        assert!(target.sni.is_empty(), "no SNI without TLS");
-        assert_eq!(target.authority, "example.com", "default port omitted from authority");
+    fn target_parse_rejects_non_http_scheme() {
+        assert!(praxis_ai_apis::callout_target::validate_http_target("http_callout", "file:///tmp/secret").is_err());
     }
 
     // -------------------------------------------------------------------------
@@ -381,7 +387,7 @@ mod filter_tests {
         )
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
         assert_eq!(filter.request_body_access(), BodyAccess::None);
         assert_eq!(filter.request_body_mode(), BodyMode::Stream);
     }
@@ -398,7 +404,7 @@ mod filter_tests {
         )
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
         assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
         assert!(
             matches!(
@@ -422,7 +428,7 @@ mod filter_tests {
         )
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
         assert_eq!(filter.name(), crate::callout::FILTER_NAME);
         assert_eq!(filter.name(), "http_callout");
     }
@@ -437,7 +443,7 @@ mod filter_tests {
         )
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
         assert!(filter.needs_request_context());
     }
 
@@ -475,7 +481,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -522,7 +528,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -568,7 +574,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -613,7 +619,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -647,7 +653,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -693,7 +699,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -714,7 +720,7 @@ mod filter_tests {
     // -------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn private_target_blocked_when_addresses_disallowed() {
+    async fn private_target_requires_explicit_opt_in() {
         // A live server on loopback that would answer 200 if reached. With
         // allow_private_addresses: false, resolve_peer must reject the
         // loopback peer *before* any request, so the callout fails and
@@ -740,27 +746,14 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
-
-        let req = praxis_filter::Request {
-            method: http::Method::POST,
-            uri: "/test".parse().unwrap(),
-            headers: http::HeaderMap::new(),
-        };
-        let mut ctx = make_filter_context(&req);
-
-        let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(
-            matches!(action, FilterAction::Reject(r) if r.status == 502),
-            "a resolved private/loopback peer must be blocked when disallowed"
+            HttpCalloutFilter::from_config(&yaml).is_err(),
+            "a literal private target must fail configuration without the opt-in"
         );
     }
 
     #[tokio::test]
-    async fn private_target_allowed_by_default() {
-        // The default (allow_private_addresses omitted -> true) preserves the
-        // permissive loopback-guard use case: a callout to a loopback server
-        // succeeds and continues the request.
+    async fn private_target_allowed_with_explicit_opt_in() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/guard"))
@@ -772,6 +765,7 @@ mod filter_tests {
             r#"
             target:
               url: "{}/guard"
+              allow_private_addresses: true
             request:
               phase: request_headers
             on_failure: closed
@@ -780,7 +774,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -792,7 +786,7 @@ mod filter_tests {
         let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(
             matches!(action, FilterAction::Continue),
-            "a loopback target must be reachable under the permissive default"
+            "a loopback target must be reachable after explicit opt-in"
         );
     }
 
@@ -824,7 +818,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -868,7 +862,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let mut headers = http::HeaderMap::new();
         headers.insert("x-praxis-iterative-depth", "1".parse().unwrap());
@@ -915,7 +909,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let mut headers = http::HeaderMap::new();
         headers.insert("x-custom", "my-value".parse().unwrap());
@@ -929,6 +923,44 @@ mod filter_tests {
 
         let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "forward_headers should work");
+    }
+
+    #[tokio::test]
+    async fn static_host_is_overwritten_with_target_authority_on_wire() {
+        let mock_server = MockServer::start().await;
+        let authority = mock_server.address().to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .and(wiremock::matchers::header("host", authority))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              headers:
+                - name: "Host"
+                  value: "attacker.example"
+            request:
+              phase: request_headers
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+
+        let filter = test_filter(&yaml).unwrap();
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+        };
+        let mut ctx = make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
     }
 
     // -------------------------------------------------------------------------
@@ -963,7 +995,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -1009,7 +1041,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -1044,7 +1076,7 @@ mod filter_tests {
         )
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -1085,7 +1117,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -1114,7 +1146,7 @@ mod filter_tests {
         )
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -1166,7 +1198,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -1213,7 +1245,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         // Fire enough requests to trip the breaker via connect failures.
         for _ in 0..3 {
@@ -1270,7 +1302,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -1309,7 +1341,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,
@@ -1354,7 +1386,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         // Downstream request omits the configured forward header.
         let req = praxis_filter::Request {
@@ -1402,7 +1434,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         // The client supplies BOTH headers downstream.
         let mut headers = http::HeaderMap::new();
@@ -1466,7 +1498,7 @@ mod filter_tests {
         ))
         .unwrap();
 
-        let filter = HttpCalloutFilter::from_config(&yaml).unwrap();
+        let filter = test_filter(&yaml).unwrap();
 
         let req = praxis_filter::Request {
             method: http::Method::POST,

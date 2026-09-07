@@ -12,14 +12,17 @@ use serde::{
     de::{DeserializeOwned, MapAccess, Visitor, value::MapAccessDeserializer},
 };
 use serde_json::{Map, Value};
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(test)]
+use tracing::warn;
 
 use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
-        CreateConversationRequest, DeletedConversationResource, ItemOrder, MAX_ITEMS_PER_REQUEST, Metadata,
+        CreateConversationRequest, DeletedConversationResource, InputItem, ItemOrder, MAX_ITEMS_PER_REQUEST, Metadata,
         UpdateConversationRequest,
     },
+    item_schema::validate_output_item,
     validate::{MetadataError, validate_metadata},
 };
 use crate::{
@@ -41,6 +44,7 @@ use crate::{
 /// up on refreshing the cache. Each failed swap means another writer refreshed
 /// the cache first from the same authoritative rows, so a small bound absorbs
 /// realistic append contention.
+#[cfg(test)]
 const MAX_SYNC_ATTEMPTS: usize = 8;
 
 // -----------------------------------------------------------------------------
@@ -104,12 +108,11 @@ pub(super) async fn handle_create_conversation(
     let raw_id = ctx.id_generator.generate(ctx.time_source);
     let conversation_id = format!("conv_{raw_id}");
     let created_at = current_timestamp(ctx);
-    let items = input.items.unwrap_or_default();
-    if let Err(msg) = validate_item_count(items.len()) {
+    if let Err(msg) = validate_item_count(input.items.len()) {
         return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
-    let item_values = items.into_iter().map(ConversationItem::into_value);
-    let item_records = match build_item_records(ctx, tenant_id, &conversation_id, created_at, 1, item_values) {
+    let item_values = input.items.into_iter().map(InputItem::into_value);
+    let item_records = match build_item_records(ctx, tenant_id, &conversation_id, created_at, 0, item_values) {
         Ok(records) => records,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
@@ -118,21 +121,22 @@ pub(super) async fn handle_create_conversation(
             &duplicate_item_id_message(item_id),
         )?));
     }
-    let messages = Value::Array(item_records.iter().map(|item| item.item_data.clone()).collect());
 
     let record = ConversationRecord {
         conversation_id: conversation_id.clone(),
         tenant_id: tenant_id.to_owned(),
         created_at,
         metadata,
-        messages,
+        messages: Value::Array(Vec::new()),
     };
 
     if let Err(e) = store.upsert_conversation(&record).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     if !item_records.is_empty()
-        && let Err(e) = store.create_conversation_items(&item_records).await
+        && let Err(e) = store
+            .create_items_and_sync_messages(tenant_id, &conversation_id, &item_records)
+            .await
     {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
@@ -296,15 +300,15 @@ pub(super) async fn handle_create_items(
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    let existing = match store.get_conversation(tenant_id, conversation_id).await {
-        Ok(record) => record,
+    match store.get_conversation(tenant_id, conversation_id).await {
+        Ok(Some(_)) => {},
+        Ok(None) => {
+            debug!(conversation_id, "conversation not found for item create");
+            return Ok(FilterAction::Reject(not_found_response(
+                &conversation_not_found_message(conversation_id),
+            )?));
+        },
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
-    };
-    let Some(existing) = existing else {
-        debug!(conversation_id, "conversation not found for item create");
-        return Ok(FilterAction::Reject(not_found_response(
-            &conversation_not_found_message(conversation_id),
-        )?));
     };
 
     let Some(items) = input.items else {
@@ -313,17 +317,12 @@ pub(super) async fn handle_create_items(
     if let Err(msg) = validate_item_count(items.len()) {
         return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
     }
-    let item_values = items.into_iter().map(ConversationItem::into_value);
-    let start_position = match store.max_item_position(tenant_id, conversation_id).await {
-        Ok(pos) => pos.saturating_add(1),
-        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
-    };
+    let item_values = items.into_iter().map(InputItem::into_value);
     let created_at = current_timestamp(ctx);
-    let item_records =
-        match build_item_records(ctx, tenant_id, conversation_id, created_at, start_position, item_values) {
-            Ok(records) => records,
-            Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
-        };
+    let item_records = match build_item_records(ctx, tenant_id, conversation_id, created_at, 0, item_values) {
+        Ok(records) => records,
+        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+    };
     if let Some(item_id) = duplicate_item_id(&item_records) {
         return Ok(FilterAction::Reject(invalid_input_response(
             &duplicate_item_id_message(item_id),
@@ -343,10 +342,10 @@ pub(super) async fn handle_create_items(
         )?));
     }
 
-    if let Err(e) = store.create_conversation_items(&item_records).await {
-        return Ok(FilterAction::Reject(store_error_response(&e)?));
-    }
-    if let Err(e) = sync_conversation_messages(store, tenant_id, conversation_id, Some(existing.messages)).await {
+    if let Err(e) = store
+        .create_items_and_sync_messages(tenant_id, conversation_id, &item_records)
+        .await
+    {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     debug!(
@@ -474,8 +473,8 @@ pub(super) async fn handle_delete_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    let existing = match store.get_conversation(tenant_id, conversation_id).await {
-        Ok(Some(record)) => record,
+    match store.get_conversation(tenant_id, conversation_id).await {
+        Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation not found for item delete");
             return Ok(FilterAction::Reject(not_found_response(
@@ -486,14 +485,10 @@ pub(super) async fn handle_delete_item(
     };
 
     match store
-        .delete_conversation_item(tenant_id, conversation_id, item_id)
+        .delete_item_and_sync_messages(tenant_id, conversation_id, item_id)
         .await
     {
         Ok(true) => {
-            if let Err(e) = sync_conversation_messages(store, tenant_id, conversation_id, Some(existing.messages)).await
-            {
-                return Ok(FilterAction::Reject(store_error_response(&e)?));
-            }
             debug!(conversation_id, item_id, tenant_id, "conversation item deleted");
             match store.get_conversation(tenant_id, conversation_id).await {
                 Ok(Some(record)) => {
@@ -605,7 +600,11 @@ pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result
     };
     map.insert("id".to_owned(), Value::String(item_id.clone()));
     normalize_message_item(&mut map)?;
-    Ok((item_id, Value::Object(map)))
+    map.entry("status".to_owned())
+        .or_insert_with(|| Value::String("completed".to_owned()));
+    let item = Value::Object(map);
+    validate_output_item(&item)?;
+    Ok((item_id, item))
 }
 
 /// Normalize easy SDK message inputs into conversation message response objects.
@@ -640,6 +639,7 @@ fn normalize_message_content(role: &str, content: Value) -> Result<Value, String
                     "type": "output_text",
                     "text": text,
                     "annotations": [],
+                    "logprobs": [],
                 })
             } else {
                 serde_json::json!({
@@ -956,6 +956,7 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
 /// assumed to be small: the OpenAI contract has no cumulative item or byte
 /// ceiling. Replace this full-history rebuild with incremental processing; do
 /// not add a non-spec conversation limit as a workaround. Tracked in #532.
+#[cfg(test)]
 pub(super) async fn sync_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &str,
@@ -999,6 +1000,7 @@ pub(super) async fn sync_conversation_messages(
 /// Returns `Ok(true)` when the cache is up to date — either already current or
 /// swapped in this call — and `Ok(false)` when a concurrent writer won the swap
 /// and the caller should retry with a freshly read snapshot.
+#[cfg(test)]
 async fn try_sync_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &str,
@@ -1033,6 +1035,7 @@ async fn try_sync_conversation_messages(
 }
 
 /// Collect all item JSON values for a conversation in ascending order.
+#[cfg(test)]
 async fn collect_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &str,
@@ -1733,6 +1736,17 @@ mod tests {
             self.inner.create_conversation_items(items).await
         }
 
+        async fn create_items_and_sync_messages(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            items: &[ConversationItemRecord],
+        ) -> Result<(), StoreError> {
+            self.inner
+                .create_items_and_sync_messages(tenant_id, conversation_id, items)
+                .await
+        }
+
         async fn list_conversation_items(
             &self,
             tenant_id: &str,
@@ -1799,6 +1813,17 @@ mod tests {
 
         async fn max_item_position(&self, tenant_id: &str, conversation_id: &str) -> Result<i64, StoreError> {
             self.inner.max_item_position(tenant_id, conversation_id).await
+        }
+
+        async fn delete_item_and_sync_messages(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            item_id: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner
+                .delete_item_and_sync_messages(tenant_id, conversation_id, item_id)
+                .await
         }
     }
 }

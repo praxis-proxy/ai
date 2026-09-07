@@ -744,30 +744,19 @@ async fn conversation_items_paginate_ascending_and_descending() {
 }
 
 #[tokio::test]
-async fn conversation_items_paginate_duplicate_positions() {
+async fn duplicate_position_rejected_by_unique_constraint() {
     let store = make_store_with_items().await;
-    let items = [
-        make_conversation_item("item_a", "tenant_a", "conv_1", 1),
-        make_conversation_item("item_b", "tenant_a", "conv_1", 1),
-        make_conversation_item("item_c", "tenant_a", "conv_1", 1),
-        make_conversation_item("item_d", "tenant_a", "conv_1", 2),
-    ];
+    let first = [make_conversation_item("item_a", "tenant_a", "conv_1", 1)];
     store
-        .create_conversation_items(&items)
+        .create_conversation_items(&first)
         .await
-        .expect("item insert should succeed");
+        .expect("first insert should succeed");
 
-    let page1 = store
-        .list_conversation_items("tenant_a", "conv_1", None, 2, true)
+    let duplicate = [make_conversation_item("item_b", "tenant_a", "conv_1", 1)];
+    store
+        .create_conversation_items(&duplicate)
         .await
-        .expect("page 1 should succeed");
-    assert_item_ids(&page1, &["item_a", "item_b"]);
-
-    let page2 = store
-        .list_conversation_items("tenant_a", "conv_1", Some("item_b"), 2, true)
-        .await
-        .expect("page 2 should succeed");
-    assert_item_ids(&page2, &["item_c", "item_d"]);
+        .expect_err("duplicate position should fail");
 }
 
 #[tokio::test]
@@ -1339,6 +1328,247 @@ async fn conversation_item_methods_fail_without_items_table() {
         matches!(err, StoreError::Unavailable(_)),
         "max_position should return Unavailable"
     );
+
+    let sync_item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
+    let err = store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &[sync_item])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Unavailable(_)),
+        "create_items_and_sync_messages should return Unavailable"
+    );
+
+    let err = store
+        .delete_item_and_sync_messages("tenant_a", "conv_1", "item_1")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Unavailable(_)),
+        "delete_item_and_sync_messages should return Unavailable"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// create_items_and_sync_messages (SQLite)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_items_and_sync_messages_assigns_positions() {
+    let store = make_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let items = [
+        make_conversation_item("item_a", "tenant_a", "conv_1", 0),
+        make_conversation_item("item_b", "tenant_a", "conv_1", 0),
+    ];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+        .await
+        .expect("create_items_and_sync should succeed");
+
+    let fetched = store
+        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&fetched, &["item_a", "item_b"]);
+    assert_eq!(fetched[0].position, 1, "first item should get position 1");
+    assert_eq!(fetched[1].position, 2, "second item should get position 2");
+
+    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    let messages = conv_record.messages.as_array().expect("messages should be an array");
+    assert_eq!(messages.len(), 2, "messages cache should have 2 items");
+}
+
+#[tokio::test]
+async fn create_items_and_sync_messages_continues_from_max_position() {
+    let store = make_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let first_batch = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &first_batch)
+        .await
+        .expect("first batch should succeed");
+
+    let second_batch = [
+        make_conversation_item("item_b", "tenant_a", "conv_1", 0),
+        make_conversation_item("item_c", "tenant_a", "conv_1", 0),
+    ];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &second_batch)
+        .await
+        .expect("second batch should succeed");
+
+    let fetched = store
+        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&fetched, &["item_a", "item_b", "item_c"]);
+    assert_eq!(fetched[0].position, 1);
+    assert_eq!(fetched[1].position, 2);
+    assert_eq!(fetched[2].position, 3);
+
+    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    let messages = conv_record.messages.as_array().expect("messages should be an array");
+    assert_eq!(messages.len(), 3, "messages cache should include all 3 items");
+}
+
+#[tokio::test]
+async fn create_items_and_sync_messages_empty_batch_is_noop() {
+    let store = make_store_with_items().await;
+    let empty: [ConversationItemRecord; 0] = [];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &empty)
+        .await
+        .expect("empty batch should succeed");
+}
+
+#[tokio::test]
+async fn create_items_and_sync_messages_missing_conversation_errors() {
+    let store = make_store_with_items().await;
+    // No conversation row exists for "conv_gone" — mirrors a conversation
+    // deleted between the handler's existence check and this transaction.
+    let items = [make_conversation_item("item_a", "tenant_a", "conv_gone", 0)];
+    let err = store
+        .create_items_and_sync_messages("tenant_a", "conv_gone", &items)
+        .await
+        .expect_err("create against a missing conversation should error");
+    assert!(
+        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
+        "unexpected error: {err:?}"
+    );
+
+    // The transaction must roll back — no orphaned items may persist.
+    let fetched = store
+        .list_conversation_items("tenant_a", "conv_gone", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert!(fetched.is_empty(), "items must not persist when the message sync fails");
+}
+
+// -----------------------------------------------------------------------------
+// delete_item_and_sync_messages (SQLite)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_item_and_sync_messages_updates_cache() {
+    let store = make_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let items = [
+        make_conversation_item("item_a", "tenant_a", "conv_1", 0),
+        make_conversation_item("item_b", "tenant_a", "conv_1", 0),
+    ];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+        .await
+        .expect("create should succeed");
+
+    let deleted = store
+        .delete_item_and_sync_messages("tenant_a", "conv_1", "item_a")
+        .await
+        .expect("delete should succeed");
+    assert!(deleted, "item_a should have been deleted");
+
+    let remaining = store
+        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&remaining, &["item_b"]);
+
+    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    let messages = conv_record.messages.as_array().expect("messages should be an array");
+    assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
+}
+
+#[tokio::test]
+async fn delete_item_and_sync_messages_nonexistent_returns_false() {
+    let store = make_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let deleted = store
+        .delete_item_and_sync_messages("tenant_a", "conv_1", "nonexistent")
+        .await
+        .expect("delete should succeed");
+    assert!(!deleted, "nonexistent item should return false");
+}
+
+#[tokio::test]
+async fn delete_item_and_sync_messages_missing_conversation_errors() {
+    let store = make_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let items = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+        .await
+        .expect("create should succeed");
+
+    // Delete the conversation row; items intentionally survive (no FK).
+    ConversationItemStore::delete_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("delete conversation should succeed");
+
+    let err = store
+        .delete_item_and_sync_messages("tenant_a", "conv_1", "item_a")
+        .await
+        .expect_err("delete-item sync against a missing conversation should error");
+    assert!(
+        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
+        "unexpected error: {err:?}"
+    );
+
+    // The transaction must roll back — the item deletion must not persist.
+    let remaining = store
+        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&remaining, &["item_a"]);
 }
 
 // -----------------------------------------------------------------------------
@@ -1593,7 +1823,7 @@ async fn sqlite_accepts_matching_schema_version() {
 #[tokio::test]
 async fn concurrent_upserts_do_not_lose_data() {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let store = Arc::new(make_file_store(&dir).await);
+    let store = Arc::new(make_file_store(&dir, None).await);
     let mut handles = Vec::new();
 
     for i in 0..20 {
@@ -1622,7 +1852,7 @@ async fn concurrent_upserts_do_not_lose_data() {
 #[tokio::test]
 async fn concurrent_reads_and_writes() {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let store = Arc::new(make_file_store(&dir).await);
+    let store = Arc::new(make_file_store(&dir, None).await);
 
     let record = make_response_record("resp_rw", "tenant_a", 1000);
     store
@@ -1658,6 +1888,64 @@ async fn concurrent_reads_and_writes() {
     for handle in handles {
         handle.await.expect("task should not panic");
     }
+}
+
+#[tokio::test]
+async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let store = Arc::new(make_file_store(&dir, Some("test_conversation_items")).await);
+
+    let conv = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let store_a = Arc::clone(&store);
+    let store_b = Arc::clone(&store);
+
+    let handle_a = tokio::spawn(async move {
+        let items = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
+        store_a
+            .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+            .await
+            .expect("task A should succeed");
+    });
+
+    let handle_b = tokio::spawn(async move {
+        let items = [make_conversation_item("item_b", "tenant_a", "conv_1", 0)];
+        store_b
+            .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+            .await
+            .expect("task B should succeed");
+    });
+
+    handle_a.await.expect("task A should not panic");
+    handle_b.await.expect("task B should not panic");
+
+    let items = store
+        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .await
+        .expect("list should succeed");
+
+    assert_eq!(items.len(), 2, "both items should be present");
+
+    let positions: Vec<i64> = items.iter().map(|i| i.position).collect();
+    assert_ne!(positions[0], positions[1], "positions must be distinct");
+    assert!(
+        positions.contains(&1) && positions.contains(&2),
+        "positions should be 1 and 2, got {positions:?}",
+    );
+
+    let conv_record = ConversationItemStore::get_conversation(&*store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    let messages = conv_record.messages.as_array().expect("messages should be an array");
+    assert_eq!(messages.len(), 2, "messages cache should include both items");
 }
 
 // -----------------------------------------------------------------------------
@@ -2338,30 +2626,19 @@ async fn pg_conversation_items_paginate_ascending_and_descending() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_conversation_items_paginate_duplicate_positions() {
+async fn pg_duplicate_position_rejected_by_unique_constraint() {
     let store = make_pg_store_with_items().await;
-    let items = [
-        make_conversation_item("item_a", "tenant_a", "conv_1", 1),
-        make_conversation_item("item_b", "tenant_a", "conv_1", 1),
-        make_conversation_item("item_c", "tenant_a", "conv_1", 1),
-        make_conversation_item("item_d", "tenant_a", "conv_1", 2),
-    ];
+    let first = [make_conversation_item("item_a", "tenant_a", "conv_1", 1)];
     store
-        .create_conversation_items(&items)
+        .create_conversation_items(&first)
         .await
-        .expect("item insert should succeed");
+        .expect("first insert should succeed");
 
-    let page1 = store
-        .list_conversation_items("tenant_a", "conv_1", None, 2, true)
+    let duplicate = [make_conversation_item("item_b", "tenant_a", "conv_1", 1)];
+    store
+        .create_conversation_items(&duplicate)
         .await
-        .expect("page 1 should succeed");
-    assert_item_ids(&page1, &["item_a", "item_b"]);
-
-    let page2 = store
-        .list_conversation_items("tenant_a", "conv_1", Some("item_b"), 2, true)
-        .await
-        .expect("page 2 should succeed");
-    assert_item_ids(&page2, &["item_c", "item_d"]);
+        .expect_err("duplicate position should fail");
 }
 
 #[tokio::test]
@@ -2635,6 +2912,159 @@ async fn pg_delete_conversation_preserves_items() {
 }
 
 // -----------------------------------------------------------------------------
+// create_items_and_sync_messages (PostgreSQL)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn pg_create_items_and_sync_messages_assigns_positions() {
+    let store = make_pg_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_sync".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let items = [
+        make_conversation_item("item_a", "tenant_a", "conv_sync", 0),
+        make_conversation_item("item_b", "tenant_a", "conv_sync", 0),
+    ];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_sync", &items)
+        .await
+        .expect("create_items_and_sync should succeed");
+
+    let fetched = store
+        .list_conversation_items("tenant_a", "conv_sync", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&fetched, &["item_a", "item_b"]);
+    assert_eq!(fetched[0].position, 1, "first item should get position 1");
+    assert_eq!(fetched[1].position, 2, "second item should get position 2");
+
+    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_sync")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    let messages = conv_record.messages.as_array().expect("messages should be an array");
+    assert_eq!(messages.len(), 2, "messages cache should have 2 items");
+}
+
+// -----------------------------------------------------------------------------
+// delete_item_and_sync_messages (PostgreSQL)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn pg_delete_item_and_sync_messages_updates_cache() {
+    let store = make_pg_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_del_sync".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let items = [
+        make_conversation_item("item_a", "tenant_a", "conv_del_sync", 0),
+        make_conversation_item("item_b", "tenant_a", "conv_del_sync", 0),
+    ];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_del_sync", &items)
+        .await
+        .expect("create should succeed");
+
+    let deleted = store
+        .delete_item_and_sync_messages("tenant_a", "conv_del_sync", "item_a")
+        .await
+        .expect("delete should succeed");
+    assert!(deleted, "item_a should have been deleted");
+
+    let remaining = store
+        .list_conversation_items("tenant_a", "conv_del_sync", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&remaining, &["item_b"]);
+
+    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_del_sync")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    let messages = conv_record.messages.as_array().expect("messages should be an array");
+    assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
+    let store = make_pg_store_with_items().await;
+    // No conversation row exists — mirrors a conversation deleted between the
+    // handler's existence check and this transaction.
+    let items = [make_conversation_item("item_a", "tenant_a", "conv_missing", 0)];
+    let err = store
+        .create_items_and_sync_messages("tenant_a", "conv_missing", &items)
+        .await
+        .expect_err("create against a missing conversation should error");
+    assert!(
+        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
+        "unexpected error: {err:?}"
+    );
+
+    // The transaction must roll back — no orphaned items may persist.
+    let fetched = store
+        .list_conversation_items("tenant_a", "conv_missing", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert!(fetched.is_empty(), "items must not persist when the message sync fails");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
+    let store = make_pg_store_with_items().await;
+    let conv = ConversationRecord {
+        conversation_id: "conv_del_missing".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let items = [make_conversation_item("item_a", "tenant_a", "conv_del_missing", 0)];
+    store
+        .create_items_and_sync_messages("tenant_a", "conv_del_missing", &items)
+        .await
+        .expect("create should succeed");
+
+    // Delete the conversation row; items intentionally survive (no FK).
+    ConversationItemStore::delete_conversation(&store, "tenant_a", "conv_del_missing")
+        .await
+        .expect("delete conversation should succeed");
+
+    let err = store
+        .delete_item_and_sync_messages("tenant_a", "conv_del_missing", "item_a")
+        .await
+        .expect_err("delete-item sync against a missing conversation should error");
+    assert!(
+        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
+        "unexpected error: {err:?}"
+    );
+
+    // The transaction must roll back — the item deletion must not persist.
+    let remaining = store
+        .list_conversation_items("tenant_a", "conv_del_missing", None, 100, true)
+        .await
+        .expect("list should succeed");
+    assert_item_ids(&remaining, &["item_a"]);
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -2650,10 +3080,10 @@ async fn make_store() -> SqliteResponseStore {
     .expect("store creation should succeed")
 }
 
-async fn make_file_store(dir: &tempfile::TempDir) -> SqliteResponseStore {
+async fn make_file_store(dir: &tempfile::TempDir, items_table: Option<&str>) -> SqliteResponseStore {
     let db_path = dir.path().join("concurrent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None, None)
+    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", items_table, None)
         .await
         .expect("file-backed store creation should succeed")
 }

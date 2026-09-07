@@ -7,11 +7,11 @@ Translates canonical Responses create requests for a Chat Completions backend.
 
 ## Configuration Notes
 
-The filter consumes the classification metadata and `ResponsesState` produced by `openai_responses_format` and `openai_responses_validate`. It converts the enriched request to Chat Completions wire format, converts finite successful Chat responses back to Responses resources, and normalizes finite provider errors while preserving their HTTP status. Chat Completions SSE is left byte-for-byte unchanged for the separate incremental stream converter.
+The filter consumes the classification metadata and `ResponsesState` produced by `openai_responses_format` and `openai_responses_validate`. It converts the enriched request to Chat Completions wire format, converts finite successful Chat responses back to Responses resources, and normalizes finite provider errors while preserving their HTTP status. Supported hosted web-search tools are exposed to the Chat backend as a private, bounded `web_search` function. Returned calls are restored to canonical `web_search_call` output before downstream agentic filters run. Chat Completions SSE is left byte-for-byte unchanged for the separate incremental stream converter.
 
 Configure `path_rewrite` after this filter when the upstream endpoint must change from `/v1/responses` to `/v1/chat/completions`.
 
-Requests using `previous_response_id` require `openai_response_store` and `openai_responses_rehydrate` earlier in the request pipeline. The filter fails closed if stored history has not been resolved, preventing a continuation from silently losing prior turns. Chat Completions SSE response conversion is tracked separately in [issue #36](https://github.com/praxis-proxy/ai/issues/36).
+Requests using `previous_response_id` require `openai_response_store` and `openai_responses_rehydrate` earlier in the request pipeline. The filter fails closed if stored history has not been resolved, preventing a continuation from silently losing prior turns. Chat Completions SSE response conversion is tracked separately in [issue #36](https://github.com/praxis-proxy/ai/issues/36). For finite web-search loops, place `openai_web_search` and `openai_agentic_loop` before this filter in an iterative-router step. The reverse response order then restores the hosted call before those filters inspect it.
 
 ## Examples
 

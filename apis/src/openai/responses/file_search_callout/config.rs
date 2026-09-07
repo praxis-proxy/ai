@@ -51,8 +51,8 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) struct FileSearchFilterConfig {
     /// Allow URLs that target local-sensitive addresses.
     ///
-    /// DNS names are rejected unless this is enabled because validation
-    /// cannot pin the address that the HTTP client will eventually dial.
+    /// DNS names are allowed by default when every connect-time result is
+    /// public. Enable this only for a trusted private vector-store service.
     #[serde(default)]
     pub allow_private_url: bool,
 
@@ -125,6 +125,7 @@ pub(crate) fn build_config_with_client(
         &forward_headers,
         max_response_bytes,
         timeout_ms,
+        cfg.allow_private_url,
     );
 
     Ok(ValidatedConfig {
@@ -162,12 +163,17 @@ fn validated_state_limit(configured: Option<usize>) -> Result<usize, FilterError
 }
 
 /// Build the shared API client from the validated URL and sub-request client.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the helper assembles independently validated transport settings"
+)]
 fn build_api_client(
     vector_store_url: &Url,
     client: SubRequestClient,
     forward_headers: &[String],
     max_response_bytes: usize,
     timeout_ms: u64,
+    allow_private: bool,
 ) -> ApiClient {
     ApiClient::new(ApiClientConfig {
         api_base_url: vector_store_url.as_str().to_owned(),
@@ -178,6 +184,7 @@ fn build_api_client(
             .iter()
             .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
             .collect(),
+        address_policy: crate::callout_target::AddressPolicy::from_allow_private(allow_private),
     })
 }
 

@@ -19,6 +19,8 @@ This filter only injects `Authorization`. Pointing the request at the correct Ve
 
 Whenever no valid token can be produced — none cached and the inline fetch fails — the request is rejected with `503` rather than forwarded unauthenticated.
 
+Metadata requests use a proxy-free, redirect-free client pinned to the complete validated DNS result set. Metadata mode intentionally permits the protocol-owned private endpoint; arbitrary private hosts remain invalid configuration.
+
 ## Configuration
 
 | Field | Type | Required | Description |

@@ -27,6 +27,7 @@ bytes = { workspace = true }
 dashmap = { workspace = true, optional = true }
 futures = { workspace = true }
 http = { workspace = true }
+jsonschema = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-core = { workspace = true }

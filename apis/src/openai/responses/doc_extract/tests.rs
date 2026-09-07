@@ -757,6 +757,101 @@ async fn persisted_history_does_not_double_count_references() {
     );
 }
 
+#[test]
+fn sync_state_uses_independent_history_offsets() {
+    use super::super::state::ResponsesState;
+
+    let req = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(req);
+
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "notes.txt", "file_data": text_file_data("state content")}
+        ]}
+    ]));
+
+    // The two vectors carry different history lengths, so a shared
+    // offset would write the rewritten tail into the wrong slot.
+    let mut state = ResponsesState::from_request_body(body_json);
+    state.messages.insert(
+        0,
+        serde_json::json!({"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "prior response"}
+        ]}),
+    );
+    state.persisted_messages.splice(
+        0..0,
+        [
+            serde_json::json!({"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "prior response"}
+            ]}),
+            serde_json::json!({"type": "mcp_list_tools", "tools": []}),
+        ],
+    );
+    ctx.extensions.insert(state);
+
+    // `sync_state` syncs an already-extracted body; it does not extract.
+    let extracted = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "extracted state content"}
+        ]}
+    ]));
+    sync_state(&mut ctx, extracted, &make_filter().config).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.messages[1]["content"][0]["type"], "input_text",
+        "messages tail should use its own history length"
+    );
+    assert_eq!(
+        state.persisted_messages[1]["type"], "mcp_list_tools",
+        "the persisted-only history item should survive the rewrite"
+    );
+    assert_eq!(
+        state.persisted_messages[2]["content"][0]["type"], "input_text",
+        "persisted input tail should use its own history length"
+    );
+}
+
+#[test]
+fn sync_state_leaves_original_input_untouched() {
+    use super::super::state::ResponsesState;
+
+    let req = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(req);
+
+    let body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "notes.txt", "file_data": text_file_data("state content")}
+        ]}
+    ]));
+    ctx.extensions.insert(ResponsesState::from_request_body(body_json));
+
+    // `sync_state` syncs an already-extracted body; it does not extract.
+    let extracted = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "extracted state content"}
+        ]}
+    ]));
+    sync_state(&mut ctx, extracted, &make_filter().config).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let part = &state.input[0]["content"][0];
+    assert_eq!(
+        part["type"], "input_file",
+        "state.input should keep the original input_file part"
+    );
+    assert_eq!(
+        part["file_data"],
+        text_file_data("state content"),
+        "state.input should keep the original client file_data"
+    );
+    assert_eq!(
+        state.messages[0]["content"][0]["type"], "input_text",
+        "the extracted tail should still reach messages"
+    );
+}
+
 // -- Size limit tests ---------------------------------------------------------
 
 #[tokio::test]

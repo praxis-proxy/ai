@@ -76,8 +76,8 @@ use std::{borrow::Cow, io};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
+    BodyAccess, BodyMode, ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    body::MAX_JSON_BODY_BYTES, builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
 };
 use tracing::{debug, trace};
 
@@ -280,6 +280,8 @@ impl HttpFilter for ResponsesFormatFilter {
             compute_mode(&classified)
         };
 
+        install_error_formatter(ctx, classified.format);
+
         write_metadata(ctx, &classified, mode);
         promote_headers(ctx, &classified, &self.config, mode);
         promote_filter_results(ctx, &classified, mode)?;
@@ -291,6 +293,26 @@ impl HttpFilter for ResponsesFormatFilter {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Install the OpenAI error response formatter for positively classified
+/// OpenAI requests (Responses and Chat Completions).
+///
+/// When installed, Praxis invokes the formatter from `fail_to_proxy`
+/// instead of emitting RFC 9457 Problem Details. Non-OpenAI formats
+/// (Anthropic, unknown, invalid, non-JSON) are left untouched.
+fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, format: AiRequestFormat) {
+    match format {
+        AiRequestFormat::Responses | AiRequestFormat::ChatCompletions => {
+            ctx.extensions.insert(ErrorResponseFormatterHandle::new(
+                crate::openai::error_response_formatter::OpenAiErrorFormatter,
+            ));
+        },
+        AiRequestFormat::AnthropicMessages
+        | AiRequestFormat::UnknownJson
+        | AiRequestFormat::InvalidJson
+        | AiRequestFormat::NonJson => {},
+    }
+}
 
 /// Classify a request from a recognized path/handshake or its body.
 fn classify_request(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> (ClassifiedRequest, bool) {

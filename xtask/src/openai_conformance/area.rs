@@ -29,6 +29,11 @@ const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
         evidence: "openai::conversations::tests::conformance_conversations_generated_schema_check_rejects_wrong_discriminator",
         success_sentinel: "PRAXIS_CONFORMANCE_OK conversations schema_check_sensitivity",
     },
+    RuntimeVerificationCheck {
+        kind: "request_item_contract",
+        evidence: "openai::conversations::tests::conformance_conversations_item_requests_reject_unknown_and_malformed_contracts",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations request_item_contract",
+    },
 ];
 
 /// Response metadata discrepancies caused by the incomplete upstream property.

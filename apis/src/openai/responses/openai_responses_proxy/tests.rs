@@ -6,7 +6,7 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter};
+use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::json;
 
 use super::super::state::ResponsesState;
@@ -70,6 +70,128 @@ fn body_mode_is_stream_buffer() {
     }
 }
 
+#[test]
+fn terminal_streaming_capability_is_opt_in() {
+    assert!(
+        !make_filter().may_select_streaming_subrequest_response(),
+        "default configuration must preserve existing buffered IRR pipelines"
+    );
+    assert!(
+        make_terminal_streaming_filter().may_select_streaming_subrequest_response(),
+        "terminal_streaming must declare the Praxis streaming capability"
+    );
+}
+
+#[tokio::test]
+async fn terminal_streaming_selects_streaming_from_effective_passthrough_body() {
+    let filter = make_terminal_streaming_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "terminal streaming passthrough should continue"
+    );
+    assert_eq!(
+        ctx.subrequest_response_mode(),
+        SubRequestResponseMode::Streaming,
+        "effective provider body, not descriptive classifier metadata, must select transport"
+    );
+}
+
+#[tokio::test]
+async fn terminal_streaming_preserves_buffered_mode_when_stream_is_false_or_absent() {
+    let filter = make_terminal_streaming_filter();
+    for original in [
+        br#"{"model":"gpt-4.1","input":"hello","stream":false}"#.as_slice(),
+        br#"{"model":"gpt-4.1","input":"hello"}"#.as_slice(),
+    ] {
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+        let mut body = Some(Bytes::copy_from_slice(original));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "non-streaming terminal request should continue"
+        );
+        assert_eq!(
+            ctx.subrequest_response_mode(),
+            SubRequestResponseMode::Buffered,
+            "non-streaming effective body must keep the buffered transport"
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_streaming_uses_rebuilt_state_body_not_client_intent_metadata() {
+    let filter = make_terminal_streaming_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "stream": false
+    }));
+    state
+        .messages
+        .push(json!({"type":"function_call_output","call_id":"call_1","output":"done"}));
+    ctx.extensions.insert(state);
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "rebuilt buffered request should continue"
+    );
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["stream"], false);
+    assert_eq!(ctx.subrequest_response_mode(), SubRequestResponseMode::Buffered);
+}
+
+#[tokio::test]
+async fn terminal_streaming_selects_streaming_for_rebuilt_effective_body() {
+    let filter = make_terminal_streaming_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "stream": true
+    }));
+    state
+        .messages
+        .push(json!({"type":"function_call_output","call_id":"call_1","output":"done"}));
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"hello","stream":false}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "rebuilt streaming request should continue"
+    );
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(outbound["stream"], true);
+    assert_eq!(ctx.subrequest_response_mode(), SubRequestResponseMode::Streaming);
+}
+
 #[tokio::test]
 async fn on_request_returns_continue() {
     let filter = make_filter();
@@ -117,7 +239,10 @@ async fn initialized_state_preserves_scalar_input_on_first_pass() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "initialized scalar request should continue"
+    );
     assert_eq!(body.as_deref(), Some(original.as_slice()));
     assert!(
         ctx.request_headers_to_set.is_empty(),
@@ -141,9 +266,15 @@ async fn provider_previous_response_id_is_byte_exact_without_rehydrate() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "provider previous_response_id passthrough should continue"
+    );
     assert_eq!(body.as_deref(), Some(original.as_slice()));
-    assert!(ctx.request_headers_to_set.is_empty());
+    assert!(
+        ctx.request_headers_to_set.is_empty(),
+        "byte-exact previous_response_id passthrough must not synthesize headers"
+    );
 }
 
 #[tokio::test]
@@ -169,7 +300,10 @@ async fn rebuild_preserves_provider_previous_response_id_without_rehydrate() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "rebuilt previous_response_id request should continue"
+    );
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(outbound["previous_response_id"], "resp_provider");
     assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
@@ -190,7 +324,10 @@ async fn rebuild_serializes_from_state_request_body() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "state-backed rebuild should continue"
+    );
     let outbound: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(outbound["model"], "client-model", "serializes from state.request_body");
     assert_eq!(outbound["input"].as_array().unwrap().len(), 2);
@@ -367,7 +504,10 @@ async fn strips_conversation_from_outbound_body() {
         r#"{"model":"gpt-4o","input":"hello","conversation":{"id":"conv_abc123"}}"#,
     ));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "conversation stripping should continue"
+    );
 
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert!(
@@ -400,7 +540,10 @@ async fn strips_both_previous_response_id_and_conversation() {
         r#"{"model":"gpt-4o","input":"hello","previous_response_id":"resp_abc123","conversation":"conv_xyz789"}"#,
     ));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "identifier stripping should continue"
+    );
 
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert!(
@@ -418,7 +561,10 @@ async fn passthrough_strips_conversation_from_body() {
     let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"hello","conversation":42}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "passthrough conversation stripping should continue"
+    );
 
     let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert!(
@@ -549,10 +695,16 @@ fn messages_for_backend_translates_compaction_item() {
     let encoded = base64::engine::general_purpose::STANDARD.encode("summary text");
     let msgs = vec![json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded})];
     let result = super::messages_for_backend(&msgs);
-    assert!(matches!(result, std::borrow::Cow::Owned(_)));
+    assert!(
+        matches!(result, std::borrow::Cow::Owned(_)),
+        "summary insertion must return an owned input array"
+    );
     assert_eq!(result.len(), 1);
     assert_eq!(result[0]["role"], "assistant");
-    assert!(result[0]["content"].as_str().unwrap().contains("summary text"));
+    assert!(
+        result[0]["content"].as_str().unwrap().contains("summary text"),
+        "inserted summary message must contain the supplied summary"
+    );
 }
 
 #[test]
@@ -574,7 +726,10 @@ fn compaction_to_assistant_message_decodes_encrypted_content() {
     let item = json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded});
     let msg = super::compaction_to_assistant_message(&item);
     assert_eq!(msg["role"], "assistant");
-    assert!(msg["content"].as_str().unwrap().contains("decoded summary"));
+    assert!(
+        msg["content"].as_str().unwrap().contains("decoded summary"),
+        "inserted summary message must contain the decoded summary"
+    );
 }
 
 #[test]
@@ -603,4 +758,9 @@ fn compaction_to_assistant_message_handles_invalid_base64() {
 
 fn make_filter() -> Box<dyn HttpFilter> {
     super::ResponsesProxyFilter::from_config(&serde_yaml::Value::Null).unwrap()
+}
+
+fn make_terminal_streaming_filter() -> Box<dyn HttpFilter> {
+    let yaml = serde_yaml::from_str("terminal_streaming: true").unwrap();
+    super::ResponsesProxyFilter::from_config(&yaml).unwrap()
 }

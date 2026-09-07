@@ -68,6 +68,11 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// fetch fails — the request is rejected with `503` rather than
 /// forwarded unauthenticated.
 ///
+/// Metadata requests use a proxy-free, redirect-free client pinned to the
+/// complete validated DNS result set. Metadata mode intentionally permits
+/// the protocol-owned private endpoint; arbitrary private hosts remain
+/// invalid configuration.
+///
 /// # YAML configuration
 ///
 /// ```yaml
@@ -79,10 +84,6 @@ pub struct GcpAdcFilter {
     /// Cache-through token cache; see the struct docs and
     /// [`praxis_ai_apis::token_cache`].
     cache: TokenCache<HeaderValue>,
-
-    /// HTTP client used for metadata-server requests, built once with
-    /// [`TOKEN_REQUEST_TIMEOUT`].
-    client: reqwest::Client,
 
     /// Resolved credential source.
     source: TokenSource,
@@ -106,18 +107,12 @@ impl GcpAdcFilter {
     ///
     /// Returns [`FilterError`] if `service_account` or `metadata_host`
     /// are structurally unsafe, a field is set that its `source` does
-    /// not use, ADC file resolution fails, or the HTTP client fails to
-    /// build.
+    /// not use, or ADC file resolution fails.
     fn new(config: &GcpAdcConfig, application_credentials: Option<&std::path::Path>) -> Result<Self, FilterError> {
         validate_config(config)?;
         let source = resolve_token_source(config, application_credentials)?;
-        let client = reqwest::Client::builder()
-            .timeout(TOKEN_REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| FilterError::from(format!("gcp_adc: failed to build HTTP client: {e}")))?;
         Ok(Self {
             cache: TokenCache::new(EXPIRY_SKEW),
-            client,
             source,
             scope: config.scope.clone(),
             metadata_host: config.metadata_host.clone(),
@@ -162,7 +157,9 @@ impl praxis_filter::HttpFilter for GcpAdcFilter {
     ) -> Result<praxis_filter::FilterAction, FilterError> {
         let fetched = self
             .cache
-            .get_or_refresh(|| token::fetch(&self.client, &self.source, &self.metadata_host, &self.scope))
+            .get_or_refresh(|| {
+                token::fetch_pinned(&self.source, &self.metadata_host, &self.scope, TOKEN_REQUEST_TIMEOUT)
+            })
             .await;
         match fetched {
             Ok(authorization) => {

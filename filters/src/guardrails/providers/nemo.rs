@@ -28,6 +28,10 @@ struct NemoConfig {
     /// `NeMo` endpoint URL.
     endpoint: String,
 
+    /// Allow the endpoint to resolve to non-public addresses.
+    #[serde(default)]
+    allow_private_endpoint: bool,
+
     /// Model name sent in each request. Defaults to `""` when omitted.
     #[serde(default)]
     model: String,
@@ -80,6 +84,9 @@ pub(in crate::guardrails) struct NemoProvider {
 
     /// Per-request deadline covering admission, connect, and I/O.
     timeout: Duration,
+
+    /// Connect-time policy for the configured endpoint.
+    address_policy: praxis_ai_apis::callout_target::AddressPolicy,
 }
 
 impl NemoProvider {
@@ -99,6 +106,13 @@ impl NemoProvider {
         if cfg.endpoint.is_empty() {
             return Err("ai_guardrails (nemo): 'endpoint' must not be empty".into());
         }
+        let address_policy =
+            praxis_ai_apis::callout_target::AddressPolicy::from_allow_private(cfg.allow_private_endpoint);
+        praxis_ai_apis::callout_target::validate_configured_http_target(
+            "ai_guardrails (nemo)",
+            &cfg.endpoint,
+            address_policy,
+        )?;
         if cfg.timeout_ms == 0 {
             return Err("ai_guardrails (nemo): 'timeout_ms' must be greater than zero".into());
         }
@@ -108,6 +122,7 @@ impl NemoProvider {
             endpoint: cfg.endpoint,
             model: cfg.model,
             timeout: Duration::from_millis(cfg.timeout_ms),
+            address_policy,
         })
     }
 }
@@ -116,9 +131,16 @@ impl NemoProvider {
 impl GuardProvider for NemoProvider {
     async fn evaluate(&self, messages: Vec<serde_json::Value>, _phase: GuardPhase) -> Result<GuardResult, FilterError> {
         let request = build_request(&self.model, messages)?;
-        let response = subrequest::execute_url(&self.client, &self.endpoint, request, MAX_RESPONSE_SIZE, self.timeout)
-            .await
-            .map_err(|error| map_subrequest_error(&error))?;
+        let response = subrequest::execute_url(
+            &self.client,
+            &self.endpoint,
+            request,
+            MAX_RESPONSE_SIZE,
+            self.timeout,
+            self.address_policy,
+        )
+        .await
+        .map_err(|error| map_subrequest_error(&error))?;
         ensure_success_status(&response)?;
         let nemo_response: NemoResponse = serde_json::from_slice(&response.body)
             .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): failed to parse response: {e}").into() })?;

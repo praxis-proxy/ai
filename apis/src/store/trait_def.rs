@@ -258,4 +258,48 @@ pub trait ConversationItemStore: Send + Sync {
     /// Returns [`StoreError`] if the items table is not configured
     /// or a database operation fails.
     async fn max_item_position(&self, tenant_id: &str, conversation_id: &str) -> Result<i64, StoreError>;
+
+    /// Atomically insert items and rebuild the conversation message cache.
+    ///
+    /// Within a single database transaction this method:
+    /// 1. Reads the current maximum item position.
+    /// 2. Assigns sequential positions starting from `max + 1`.
+    /// 3. Inserts the items.
+    /// 4. Rebuilds the `messages` cache from **all** items.
+    /// 5. Updates the conversation row.
+    ///
+    /// The `position` field in each input record is **ignored**; positions
+    /// are assigned within the transaction to prevent collisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the items table is not configured
+    /// or a database operation fails.
+    async fn create_items_and_sync_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError>;
+
+    /// Atomically delete an item and rebuild the conversation message cache.
+    ///
+    /// Within a single database transaction this method:
+    /// 1. Deletes the item row.
+    /// 2. Rebuilds the `messages` cache from all remaining items.
+    /// 3. Updates the conversation row.
+    ///
+    /// Returns `true` if the item was deleted, `false` if it did not
+    /// exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the items table is not configured
+    /// or a database operation fails.
+    async fn delete_item_and_sync_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError>;
 }

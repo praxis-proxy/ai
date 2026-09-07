@@ -42,10 +42,10 @@ pub(crate) enum FileUrlMode {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileResolveConfig {
-    /// Allow `files_api_url` to target private, loopback, link-local,
-    /// or DNS-name hosts.  Default `false` rejects SSRF-sensitive
-    /// targets; set to `true` in development or when the Files API is
-    /// an internal service on a private network.
+    /// Allow `files_api_url` to resolve to private, loopback, link-local,
+    /// or otherwise non-public addresses. Default `false` permits DNS
+    /// names only when every connect-time result is public. Set to `true`
+    /// only when the Files API is a trusted private service.
     #[serde(default)]
     pub allow_private_files_api_url: bool,
 

@@ -113,6 +113,7 @@ struct CompactionParams {
 /// filter: openai_responses_compact
 /// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
+/// allow_private_inference_url: true
 /// default_model: llama3.2:1b
 /// ```
 ///
@@ -122,6 +123,7 @@ struct CompactionParams {
 /// filter: openai_responses_compact
 /// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
+/// allow_private_inference_url: true
 /// default_model: gpt-4o-mini
 /// tiktoken_encoding: cl100k_base
 /// timeout_ms: 30000
@@ -191,6 +193,7 @@ impl CompactFilter {
             request,
             MAX_SUMMARIZATION_RESPONSE_BYTES,
             timeout,
+            self.config.address_policy,
         )
         .await;
         self.handle_subrequest_result(result, streaming)

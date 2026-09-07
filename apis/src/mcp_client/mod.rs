@@ -70,7 +70,6 @@ impl McpDisplayUrl {
         let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) else {
             return Self::invalid();
         };
-
         let mut out = String::with_capacity(scheme.len() + host.len() + 16);
         out.push_str(scheme);
         out.push_str("://");
@@ -200,6 +199,13 @@ pub(crate) enum McpClientError {
     InvalidAuthorization,
 }
 
+/// Parse a server URL into a safe display URL, or return invalid fallback.
+fn parse_display_url(server_url: &str) -> McpDisplayUrl {
+    server_url
+        .parse::<http::Uri>()
+        .map_or_else(|_| McpDisplayUrl::invalid(), |uri| McpDisplayUrl::from_uri(&uri))
+}
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -224,23 +230,30 @@ pub(crate) async fn list_tools(
     max_tools: usize,
     allow_loopback: bool,
 ) -> Result<Vec<serde_json::Value>, McpClientError> {
-    let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
-    let transport = StreamableHttpClientTransport::with_client(
-        build_pinned_client(&resolved)?,
-        build_transport_config(server_url, headers, authorization)?,
-    );
-    let display_url = resolved.display_url;
-    let client = tokio::time::timeout(timeout, Box::pin(().serve(transport)))
+    let display_url = parse_display_url(server_url);
+
+    let work = async {
+        let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
+        let transport = StreamableHttpClientTransport::with_client(
+            build_pinned_client(&resolved)?,
+            build_transport_config(server_url, headers, authorization)?,
+        );
+        let display_url = resolved.display_url;
+        let client = Box::pin(().serve(transport))
+            .await
+            .map_err(|_source| McpClientError::Connection {
+                url: display_url.clone(),
+            })?;
+        let tools = Box::pin(paginate_tools(&client, max_tools, &display_url)).await?;
+        tools_to_json(tools)
+    };
+
+    tokio::time::timeout(timeout, Box::pin(work))
         .await
         .map_err(|_elapsed| McpClientError::Timeout {
-            url: display_url.clone(),
+            url: display_url,
             timeout,
         })?
-        .map_err(|_source| McpClientError::Connection {
-            url: display_url.clone(),
-        })?;
-    let tools = paginate_tools(&client, timeout, max_tools, &display_url).await?;
-    tools_to_json(tools)
 }
 
 /// Call `tools/call` on an MCP server and return the result.
@@ -265,43 +278,46 @@ pub(crate) async fn call_tool(
     timeout: Duration,
     allow_loopback: bool,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
-    let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
-    let transport = StreamableHttpClientTransport::with_client(
-        build_pinned_client(&resolved)?,
-        build_transport_config(server_url, headers, authorization)?,
-    );
-    let display_url = resolved.display_url;
+    let display_url = parse_display_url(server_url);
 
-    let client = tokio::time::timeout(timeout, Box::pin(().serve(transport)))
-        .await
-        .map_err(|_elapsed| McpClientError::Timeout {
-            url: display_url.clone(),
-            timeout,
-        })?
-        .map_err(|_source| McpClientError::Connection {
-            url: display_url.clone(),
-        })?;
+    let work = async {
+        let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
+        let transport = StreamableHttpClientTransport::with_client(
+            build_pinned_client(&resolved)?,
+            build_transport_config(server_url, headers, authorization)?,
+        );
+        let display_url = resolved.display_url;
 
-    let parsed_args = match &arguments {
-        serde_json::Value::Object(obj) => Some(obj.clone()),
-        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s).ok(),
-        _ => None,
+        let client = Box::pin(().serve(transport))
+            .await
+            .map_err(|_source| McpClientError::Connection {
+                url: display_url.clone(),
+            })?;
+
+        let parsed_args = match &arguments {
+            serde_json::Value::Object(obj) => Some(obj.clone()),
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s).ok(),
+            _ => None,
+        };
+        let mut params = CallToolRequestParams::new(tool_name.to_owned());
+        if let Some(args_obj) = parsed_args {
+            params = params.with_arguments(args_obj);
+        }
+
+        Box::pin(client.call_tool(params))
+            .await
+            .map_err(|_source| McpClientError::CallTool {
+                url: display_url.clone(),
+                tool_name: tool_name.to_owned(),
+            })
     };
-    let mut params = CallToolRequestParams::new(tool_name.to_owned());
-    if let Some(args_obj) = parsed_args {
-        params = params.with_arguments(args_obj);
-    }
 
-    tokio::time::timeout(timeout, Box::pin(client.call_tool(params)))
+    tokio::time::timeout(timeout, Box::pin(work))
         .await
         .map_err(|_elapsed| McpClientError::Timeout {
-            url: display_url.clone(),
+            url: display_url,
             timeout,
         })?
-        .map_err(|_source| McpClientError::CallTool {
-            url: display_url.clone(),
-            tool_name: tool_name.to_owned(),
-        })
 }
 
 /// Cap on pagination rounds to prevent infinite loops from
@@ -310,10 +326,8 @@ const MAX_PAGES: usize = 100;
 
 /// Paginate `tools/list`, bounded by both `max_tools` and
 /// [`MAX_PAGES`].
-#[expect(clippy::too_many_lines, reason = "pagination loop with error branches")]
 async fn paginate_tools(
     client: &Peer<RoleClient>,
-    timeout: Duration,
     max_tools: usize,
     url: &McpDisplayUrl,
 ) -> Result<Vec<rmcp::model::Tool>, McpClientError> {
@@ -321,12 +335,8 @@ async fn paginate_tools(
     let mut cursor = None;
     for _ in 0..MAX_PAGES {
         let params = PaginatedRequestParams::default().with_cursor(cursor);
-        let page = tokio::time::timeout(timeout, Box::pin(client.list_tools(Some(params))))
+        let page = Box::pin(client.list_tools(Some(params)))
             .await
-            .map_err(|_elapsed| McpClientError::Timeout {
-                url: url.clone(),
-                timeout,
-            })?
             .map_err(|_source| McpClientError::ListTools { url: url.clone() })?;
         all_tools.extend(page.tools);
         if all_tools.len() > max_tools {
@@ -595,7 +605,6 @@ fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
         },
     }
 }
-
 /// Convert `rmcp::model::Tool` values to opaque JSON.
 fn tools_to_json(tools: Vec<rmcp::model::Tool>) -> Result<Vec<serde_json::Value>, McpClientError> {
     tools

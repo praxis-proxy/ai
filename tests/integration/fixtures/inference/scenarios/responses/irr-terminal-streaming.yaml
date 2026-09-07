@@ -1,0 +1,32 @@
+version: 1
+id: responses/irr-terminal-streaming
+description: A native Responses SSE exchange remains streaming through a terminal iterative request router step.
+protocol: openai_responses
+example_config: openai/responses/irr-terminal-streaming.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.agentic.irr_terminal_streaming
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Reply with exactly `STREAM-OK` and nothing else.
+          store: false
+          stream: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      # Controlled imports use data-only SSE frames; replay still compares the
+      # complete normalized upstream and client exchanges byte-for-byte.
+      client_sse_events: []
+      upstream_sse_events: []

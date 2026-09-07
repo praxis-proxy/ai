@@ -719,6 +719,7 @@ fn continuation_state_fits(
     for value in [
         state.context_management.as_ref(),
         state.conversation.as_ref(),
+        state.original_tool_choice.as_ref(),
         state.previous_usage.as_ref(),
     ]
     .into_iter()
@@ -735,6 +736,7 @@ fn continuation_state_fits(
         .map(|(key, value)| key.len().saturating_add(value.len()))
         .chain(state.include.iter().map(String::len))
         .chain(state.previous_response_id.iter().map(String::len))
+        .chain(state.response_id.iter().map(String::len))
         .chain(
             state
                 .mcp_tool_map
@@ -825,7 +827,8 @@ fn mixed_tool_response_rejection() -> FilterAction {
 
 /// Allow the model to answer after satisfying the first forced search call.
 fn reset_tool_choice(state: &mut ResponsesState) {
-    state.tool_choice = Value::String("auto".to_owned());
+    let original = std::mem::replace(&mut state.tool_choice, Value::String("auto".to_owned()));
+    state.original_tool_choice.get_or_insert(original);
     if let Some(request) = state.request_body.as_object_mut() {
         request.remove("tool_choice");
     }
