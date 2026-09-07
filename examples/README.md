@@ -37,7 +37,8 @@ before sending requests.
 | [mcp-classifier-routing.yaml](configs/mcp-classifier-routing.yaml) | Routes MCP requests by body-derived method and tool name |
 | [mcp-stateless-broker.yaml](configs/mcp-stateless-broker.yaml) | Configurable stateless MCP broker using the final MCP 2026-07-28 stateless profile |
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
-| [nemo-guardrails.yaml](configs/nemo-guardrails.yaml) | Evaluates all incoming requests against a NeMo Guardrails service before forwarding to the upstream provider |
+| [nemo-guardrails-response.yaml](configs/nemo-guardrails-response.yaml) | Evaluates upstream responses against a NeMo Guardrails service |
+| [nemo-guardrails.yaml](configs/nemo-guardrails.yaml) | Evaluates incoming requests against a NeMo Guardrails service |
 | [prompt-enrichment.yaml](configs/prompt-enrichment.yaml) | Injects system messages into OpenAI-compatible chat completion requests before forwarding to the upstream provider |
 | [provider-route.yaml](configs/provider-route.yaml) | This listener requires downstream mTLS. `peer_identity_trust` authenticates and authorizes the edge gateway before AI-owned x-ai-routing-* fields can influence provider-local routing |
 | [time-to-first-token.yaml](configs/time-to-first-token.yaml) | Measures the elapsed time from request receipt to the first non-empty SSE body chunk and records a praxis_ai_ttft_seconds Prometheus histogram labeled by model |
