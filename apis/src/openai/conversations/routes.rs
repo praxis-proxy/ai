@@ -5,7 +5,14 @@
 
 use std::ops::Deref;
 
-use utoipa::PartialSchema;
+use serde_json::Value;
+use utoipa::{
+    PartialSchema,
+    openapi::{
+        RefOr,
+        schema::{ObjectBuilder, Schema, Type},
+    },
+};
 
 use super::contracts::{
     ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
@@ -18,6 +25,7 @@ use crate::openai::{
         OpenAiTransport, OperationEntry, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec,
         ResponseSpec, RouteParams, match_operation, schema_binding,
     },
+    responses::store::DEFAULT_PAGE_LIMIT,
 };
 
 /// JSON media type used by all Conversations bodies.
@@ -140,6 +148,10 @@ macro_rules! path_parameter {
 }
 
 /// Declare an optional typed query parameter.
+///
+/// The `$schema:ty` form derives the schema from a type's [`PartialSchema`]
+/// impl. The `schema_fn = $path` form takes an explicit schema constructor for
+/// parameters whose emitted contract must match the official reference exactly.
 macro_rules! query_parameter {
     ($name:literal, $schema:ty, $description:literal) => {
         ParameterSpec::new(
@@ -150,6 +162,25 @@ macro_rules! query_parameter {
             <$schema as PartialSchema>::schema,
         )
     };
+    ($name:literal,schema_fn = $schema_fn:path, $description:literal) => {
+        ParameterSpec::new($name, ParameterLocation::Query, false, $description, $schema_fn)
+    };
+}
+
+/// Emit the `listConversationItems` `limit` query schema mandated by the
+/// official reference: `{type: integer, default: 20}`.
+///
+/// The derived `<u32 as PartialSchema>::schema` would add `format: int32` and
+/// `minimum: 0` and omit the default, so the schema is hand-built to match the
+/// pinned OpenAI contract exactly. The default mirrors the runtime page size in
+/// [`DEFAULT_PAGE_LIMIT`], keeping the contract and handler in lockstep.
+fn list_items_limit_schema() -> RefOr<Schema> {
+    RefOr::T(Schema::Object(
+        ObjectBuilder::new()
+            .schema_type(Type::Integer)
+            .default(Some(Value::from(DEFAULT_PAGE_LIMIT)))
+            .build(),
+    ))
 }
 
 /// Declare each operation once and derive both runtime and `OpenAPI` metadata.
@@ -282,7 +313,7 @@ conversation_operations! {
                     "conversation_id",
                     "The ID of the conversation to list items for."
                 ),
-                query_parameter!("limit", u32, "Maximum number of items to return."),
+                query_parameter!("limit", schema_fn = list_items_limit_schema, "Maximum number of items to return."),
                 query_parameter!("order", ItemOrder, "Sort order for returned items."),
                 query_parameter!("after", String, "Item ID to list after."),
                 query_parameter!(

@@ -1230,6 +1230,7 @@ mod tests {
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
@@ -1257,6 +1258,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
@@ -1275,7 +1277,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 20);
+        assert_eq!(report.features_total, 21);
         assert_eq!(report.scenarios_total, 18);
         assert_eq!(report.recordings_total, 23);
         assert_eq!(
@@ -1301,7 +1303,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 20);
+        assert_eq!(manifest.features.len(), 21);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1329,16 +1331,20 @@ mod tests {
                     ]
                 ),
                 (
+                    &"messages.response.malformed_tool_arguments".to_owned(),
+                    &vec!["messages/malformed-tool-arguments".to_owned()]
+                ),
+                (
+                    &"messages.streaming.usage".to_owned(),
+                    &vec!["messages/basic-stream".to_owned()]
+                ),
+                (
                     &"messages.error.upstream".to_owned(),
                     &vec!["messages/upstream-error".to_owned()]
                 ),
                 (
                     &"messages.error.malformed_success".to_owned(),
                     &vec!["messages/malformed-success".to_owned()]
-                ),
-                (
-                    &"messages.response.malformed_tool_arguments".to_owned(),
-                    &vec!["messages/malformed-tool-arguments".to_owned()]
                 ),
                 (
                     &"messages.native.request".to_owned(),
@@ -1442,7 +1448,7 @@ mod tests {
                 ("vllm", CoverageStatus::LiveCovered),
             ]
         );
-        for feature in &manifest.features[3..6] {
+        for feature in &manifest.features[3..4] {
             assert_eq!(
                 feature
                     .providers
@@ -1452,7 +1458,28 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[6..9] {
+        assert_eq!(
+            manifest.features[4]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("openai", CoverageStatus::LiveCovered),
+                ("vllm", CoverageStatus::LiveCovered),
+            ]
+        );
+        for feature in &manifest.features[5..7] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            );
+        }
+        for feature in &manifest.features[7..10] {
             assert_eq!(
                 feature
                     .providers
@@ -1462,7 +1489,7 @@ mod tests {
                 vec![("anthropic", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[9..12] {
+        for feature in &manifest.features[10..13] {
             assert_eq!(
                 feature
                     .providers
@@ -1475,7 +1502,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[12..] {
+        for feature in &manifest.features[13..] {
             assert_eq!(
                 feature
                     .providers
@@ -1506,7 +1533,11 @@ mod tests {
             &stream,
             "messages/basic-stream",
             "Minimal streaming Anthropic Messages request translated to Chat Completions.",
-            &["messages.request.minimal", "messages.response.text"],
+            &[
+                "messages.request.minimal",
+                "messages.response.text",
+                "messages.streaming.usage",
+            ],
             "Say hello in one sentence.",
             true,
             BodyKind::Sse,
