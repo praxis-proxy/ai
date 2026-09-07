@@ -42,6 +42,7 @@ use self::{
 };
 use crate::{
     callout_policy::OnFailure,
+    http_hop::{connection_nominates_header, is_hop_by_hop},
     openai::responses::{
         bounded_json_size,
         error::responses_error_rejection,
@@ -542,24 +543,13 @@ fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
     ctx.request_headers_to_set.extend(headers);
 }
 
-/// Whether `Connection` marks a request header as specific to one hop.
-fn connection_nominates_header(headers: &HeaderMap, name: &http::header::HeaderName) -> bool {
-    headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .any(|token| token.eq_ignore_ascii_case(name.as_str()))
-}
-
 /// Whether a header remains valid after the continuation body is rewritten.
 fn should_replay_original_header(name: &http::header::HeaderName) -> bool {
     !praxis_core::reserved_headers::is_reserved(name.as_str())
+        && !is_hop_by_hop(name.as_str())
         && !matches!(
             name.as_str(),
             "accept-encoding"
-                | "connection"
                 | "content-encoding"
                 | "content-length"
                 | "content-md5"
@@ -567,15 +557,8 @@ fn should_replay_original_header(name: &http::header::HeaderName) -> bool {
                 | "expect"
                 | "host"
                 | "idempotency-key"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
                 | "signature"
                 | "signature-input"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
         )
 }
 

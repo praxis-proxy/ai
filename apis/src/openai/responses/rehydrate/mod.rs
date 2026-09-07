@@ -28,7 +28,10 @@ use super::{
     canonical_openresponses_replay_item, error::responses_error_rejection, extract_conversation_id,
     state::ResponsesState,
 };
-use crate::store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry};
+use crate::{
+    json_body::serialized_len,
+    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -290,7 +293,7 @@ fn check_history_limits(
         }
     }
 
-    let byte_size = serde_json::to_string(items).map_or(usize::MAX, |s| s.len());
+    let byte_size = serialized_len(items).unwrap_or(usize::MAX);
     if byte_size > max_bytes {
         return Err(reject_too_large(
             &format!(
@@ -548,12 +551,11 @@ fn collect_mcp_tool_listings_from_items(
 
         let label = item.get("server_label").and_then(Value::as_str)?;
         let tools = item.get("tools").and_then(Value::as_array)?;
-        let names = mcp_tool_names(tools);
-        let mut dedupe_names = names.clone();
-        dedupe_names.sort();
-        dedupe_names.dedup();
+        let mut names = mcp_tool_names(tools);
+        names.sort();
+        names.dedup();
 
-        if !seen.insert((label.to_owned(), dedupe_names)) {
+        if !seen.insert((label.to_owned(), names)) {
             return None;
         }
 

@@ -240,7 +240,10 @@ fn classify_format(obj: &serde_json::Map<String, serde_json::Value>) -> AiReques
 /// - Any message in `messages` has typed content blocks (array of objects with a `type` key, e.g. `[{"type": "text",
 ///   ...}]`)
 fn has_anthropic_signals(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
-    if obj.contains_key("system") {
+    if matches!(
+        obj.get("system"),
+        Some(serde_json::Value::String(_) | serde_json::Value::Array(_))
+    ) {
         return true;
     }
 
@@ -484,6 +487,18 @@ mod tests {
             result.format,
             AiRequestFormat::ChatCompletions,
             "max_tokens + string content + no system should be chat_completions — header override disambiguates in the filter layer"
+        );
+    }
+
+    #[test]
+    fn chat_completions_with_null_system_not_misclassified() {
+        let body = br#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"max_tokens":100,"system":null}"#;
+        let result = classify_request_body(body);
+
+        assert_eq!(
+            result.format,
+            AiRequestFormat::ChatCompletions,
+            "system: null should not be treated as an Anthropic signal"
         );
     }
 

@@ -34,6 +34,8 @@
 )]
 mod tests;
 
+use std::mem;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -260,15 +262,17 @@ impl HttpFilter for WebSearchFilter {
             .or_else(|| web_search_context_size_from_state(state))
             .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
 
-        let calls: Vec<Value> = state.web_search_calls.clone();
+        // Move the web search calls out instead of cloning and then removing them from state.
+        let calls: Vec<Value> = ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .map(|state| mem::take(&mut state.web_search_calls))
+            .unwrap_or_default();
+
         debug!(count = calls.len(), "executing pending web search calls");
 
         for (index, call) in calls.iter().enumerate() {
             self.execute_single_search(ctx, call, index, context_size).await;
-        }
-
-        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-            state.web_search_calls.clear();
         }
 
         Ok(FilterAction::Continue)
