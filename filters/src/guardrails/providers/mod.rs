@@ -20,20 +20,23 @@ use praxis_filter::FilterError;
 pub enum GuardPhase {
     /// Inspecting the client request before it reaches the upstream.
     Request,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used once response-side evaluation is implemented (#580)")
-    )]
     /// Inspecting the upstream response before it reaches the client.
     Response,
 }
 
+impl GuardPhase {
+    /// Returns a static label for logging and diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+}
+
 impl fmt::Display for GuardPhase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Request => f.write_str("request"),
-            Self::Response => f.write_str("response"),
-        }
+        f.write_str(self.label())
     }
 }
 
