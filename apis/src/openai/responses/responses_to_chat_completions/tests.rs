@@ -10,7 +10,8 @@ use praxis_filter::{BodyAccess, BodyMode, FilterAction};
 use serde_json::json;
 
 use super::{
-    ARMED_KEY, CREATED_AT_KEY, RESPONSE_STATUS_KEY, ResponsesToChatCompletionsFilter, error::normalize_provider_error,
+    ARMED_KEY, CREATED_AT_KEY, RESPONSE_STATUS_KEY, RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM,
+    ResponsesToChatCompletionsFilter, error::normalize_provider_error,
 };
 use crate::openai::responses::state::ResponsesState;
 
@@ -270,6 +271,46 @@ async fn canonical_state_translates_across_iterative_metadata_boundary() {
     assert_eq!(translated["messages"][0]["content"], "hello");
     assert_eq!(translated["stream"], false);
     assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
+}
+
+#[tokio::test]
+async fn canonical_state_installs_stream_converter_across_iterative_metadata_boundary() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "stream": true
+    }));
+    state.response_id = Some("resp_iterative".to_owned());
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1-mini","input":"hello","stream":true}"#,
+    ));
+
+    let request_action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    assert!(
+        matches!(request_action, FilterAction::Continue),
+        "canonical streaming request should translate successfully"
+    );
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    context.response_header = Some(response);
+
+    let response_action = filter.on_response(&mut context).await.unwrap();
+
+    assert!(
+        matches!(response_action, FilterAction::Continue),
+        "preserved canonical state must seed streaming translation across the metadata boundary"
+    );
+    assert_eq!(
+        context.get_metadata(RESPONSE_TRANSFORM_KEY),
+        Some(RESPONSE_TRANSFORM_STREAM)
+    );
 }
 
 #[tokio::test]

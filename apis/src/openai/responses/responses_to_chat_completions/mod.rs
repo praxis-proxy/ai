@@ -609,8 +609,15 @@ fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
 
 /// Read the response id and creation timestamp needed to seed the converter.
 fn stream_identity(ctx: &HttpFilterContext<'_>) -> Option<(String, u64)> {
-    let response_id = ctx.get_metadata("responses.response_id")?.to_owned();
-    let created_at = ctx.get_metadata(CREATED_AT_KEY)?.parse::<u64>().ok()?;
+    let state = ctx.extensions.get::<ResponsesState>();
+    let response_id = ctx
+        .get_metadata("responses.response_id")
+        .map(str::to_owned)
+        .or_else(|| state.and_then(|state| state.response_id.clone()))?;
+    let created_at = ctx
+        .get_metadata(CREATED_AT_KEY)
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| state.and_then(|state| state.response_created_at))?;
     Some((response_id, created_at))
 }
 
