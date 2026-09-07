@@ -84,6 +84,9 @@ pub(super) struct ChatToolCallFragment<'a> {
     /// defaulting to `0` and merging distinct calls.
     #[serde(default)]
     pub index: Option<u64>,
+    /// Tool discriminator, required to be `function` across the assembled call.
+    #[serde(default, borrow, rename = "type")]
+    pub tool_type: Option<Cow<'a, str>>,
     /// Tool-call id fragment, typically present on the first fragment.
     #[serde(default, borrow)]
     pub id: Option<Cow<'a, str>>,
@@ -149,10 +152,11 @@ mod tests {
 
     #[test]
     fn parses_tool_call_fragment() {
-        let raw = br#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather"}}]}}]}"#;
+        let raw = br#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather"}}]}}]}"#;
         let chunk: ChatChunk<'_> = serde_json::from_slice(raw).unwrap();
         let call = &chunk.choices[0].delta.as_ref().unwrap().tool_calls[0];
         assert_eq!(call.index, Some(0));
+        assert_eq!(call.tool_type.as_deref(), Some("function"));
         assert_eq!(call.id.as_deref(), Some("call_1"));
         assert_eq!(call.function.as_ref().unwrap().name.as_deref(), Some("get_weather"));
     }

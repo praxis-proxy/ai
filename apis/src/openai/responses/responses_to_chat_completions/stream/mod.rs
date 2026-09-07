@@ -141,6 +141,9 @@ enum ConvertError {
     IdAfterArguments,
     /// Tool-call arguments arrived before its id and name were known.
     ToolCallMissingIdentity,
+    /// A tool call omitted the required `function` discriminator or used an
+    /// unsupported type.
+    UnsupportedToolCallType,
     /// The SSE buffer limit was exceeded.
     BufferOverflow,
     /// The emitted-event limit was exceeded.
@@ -260,6 +263,8 @@ impl MessageState {
 struct ToolCallState {
     /// Chat Completions tool-call index (stable across fragments).
     chat_index: u64,
+    /// Whether any fragment supplied the required `function` discriminator.
+    function_type_seen: bool,
     /// Responses output index, assigned when the item's `output_item.added`
     /// event is emitted (at the first argument fragment, or the close late-add),
     /// so it stays dense with no holes.
@@ -288,6 +293,7 @@ impl ToolCallState {
     fn new(chat_index: u64) -> Self {
         Self {
             chat_index,
+            function_type_seen: false,
             output_index: None,
             item_id: None,
             call_id: String::new(),
@@ -905,6 +911,12 @@ impl StreamConverter {
     ) -> Result<(), ConvertError> {
         let chat_index = fragment.index.ok_or(ConvertError::ToolCallMissingIndex)?;
         let position = self.tool_call_position(chat_index)?;
+        if let Some(tool_type) = fragment.tool_type.as_deref() {
+            if tool_type != "function" {
+                return Err(ConvertError::UnsupportedToolCallType);
+            }
+            self.tool_calls[position].function_type_seen = true;
+        }
         if let Some(id) = fragment.id.as_deref()
             && !id.is_empty()
         {
@@ -1098,7 +1110,7 @@ impl StreamConverter {
         needed
     }
 
-    /// Ensure every started tool call carries both an id and a name.
+    /// Ensure every started tool call carries a function type, id, and name.
     ///
     /// A call the provider began but never fully identified is incomplete;
     /// dropping it would silently turn an intended call into an empty success, so
@@ -1106,6 +1118,9 @@ impl StreamConverter {
     fn validate_tool_call_identities(&self) -> Result<(), ConvertError> {
         if self.tool_calls.iter().any(|call| !call.has_identity()) {
             return Err(ConvertError::ToolCallMissingIdentity);
+        }
+        if self.tool_calls.iter().any(|call| !call.function_type_seen) {
+            return Err(ConvertError::UnsupportedToolCallType);
         }
         Ok(())
     }
@@ -1848,6 +1863,10 @@ fn is_recognized_finish_reason(reason: &str) -> bool {
 
 /// Map a conversion error to a client-safe failure message that never leaks
 /// upstream bytes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "explicitly mapping every conversion error keeps client-facing failures exhaustive and non-reflective"
+)]
 fn failure_message(error: &ConvertError) -> &'static str {
     match error {
         ConvertError::MalformedJson => "upstream returned a malformed streaming chunk",
@@ -1864,7 +1883,8 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::NameAfterArguments
         | ConvertError::IdAfterArguments
         | ConvertError::ToolCallMissingIdentity
-        | ConvertError::ToolCallMissingIndex => "upstream sent an invalid tool-call stream",
+        | ConvertError::ToolCallMissingIndex
+        | ConvertError::UnsupportedToolCallType => "upstream sent an invalid tool-call stream",
         ConvertError::LegacyFunctionCall => "upstream used unsupported legacy function calling",
         ConvertError::BufferOverflow => "upstream stream exceeded the SSE buffer limit",
         ConvertError::EventLimit => "upstream stream exceeded the event limit",

@@ -293,7 +293,7 @@ fn single_tool_call_emits_function_events() {
     let events = run_stream(
         &[
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"role":"assistant"}}]}"#,
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
@@ -377,6 +377,32 @@ fn missing_choice_index_fails_closed() {
 }
 
 #[test]
+fn missing_or_unsupported_tool_call_type_fails_closed() {
+    for tool_type in [None, Some("custom")] {
+        let type_field = tool_type.map_or(String::new(), |value| format!(r#",\"type\":\"{value}\""#));
+        let tool_chunk = format!(
+            r#"{{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"call_1"{type_field},"function":{{"name":"get_weather","arguments":"{{}}"}}}}]}}}}]}}"#,
+        );
+        let events = run_stream(
+            &[
+                tool_chunk.as_str(),
+                r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ],
+            wide_limits(),
+        );
+
+        assert_eq!(
+            events
+                .last()
+                .expect("invalid tool-call type should terminate the stream")
+                .0,
+            "response.failed",
+            "a missing or unsupported tool-call type must fail closed: {tool_type:?}",
+        );
+    }
+}
+
+#[test]
 fn hosted_web_search_stream_emits_only_canonical_items() {
     let body = json!({
         "model": "gpt-4.1-mini",
@@ -386,7 +412,7 @@ fn hosted_web_search_stream_emits_only_canonical_items() {
     });
     let events = run_stream_with_body(
         &[
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search_1","function":{"name":"web_search"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search_1","type":"function","function":{"name":"web_search"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Praxis Proxy\"}"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
@@ -438,7 +464,7 @@ fn incomplete_hosted_web_search_uses_a_valid_item_status() {
     });
     let events = run_stream_with_body(
         &[
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search_1","function":{"name":"web_search","arguments":"{\"query\":\"Praxis Proxy\"}"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search_1","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"Praxis Proxy\"}"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
         ],
         &body,
@@ -463,8 +489,8 @@ fn incomplete_hosted_web_search_uses_a_valid_item_status() {
 fn multiple_tool_calls_preserve_output_order() {
     let events = run_stream(
         &[
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"first","arguments":"{}"}}]}}]}"#,
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"second","arguments":"{}"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"first","arguments":"{}"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"second","arguments":"{}"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
         ],
         wide_limits(),
@@ -498,8 +524,8 @@ fn staggered_tool_calls_use_emit_order() {
     // actually added, so allocating at emit keeps the streamed indices dense.
     let events = run_stream(
         &[
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"first"}}]}}]}"#,
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"second","arguments":"{}"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"first"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"second","arguments":"{}"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
         ],
@@ -551,8 +577,8 @@ fn split_identity_tool_calls_use_emit_order() {
     // send id and name together, so emit order equals appearance order for them.
     let events = run_stream(
         &[
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a"}]}}]}"#,
-            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"second","arguments":"{}"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function"}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"second","arguments":"{}"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"first","arguments":"{}"}}]}}]}"#,
             r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
         ],
@@ -1775,7 +1801,7 @@ fn closeout_budget_is_atomic_across_items() {
     // *before* emitting any closeout event.
     let chunks = [
         r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
-        r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
+        r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
         r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
     ];
 
