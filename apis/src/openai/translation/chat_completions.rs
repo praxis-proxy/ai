@@ -1677,7 +1677,7 @@ fn append_tool_call_outputs(
 }
 
 /// Return whether the original request declared hosted web search.
-fn context_has_web_search(context: &ResponseContext<'_>) -> bool {
+pub(crate) fn context_has_web_search(context: &ResponseContext<'_>) -> bool {
     context.tools.iter().any(|tool| {
         tool.get("type")
             .and_then(Value::as_str)
@@ -1703,6 +1703,18 @@ fn web_search_call_output_item(tool_call: &Value, status: &str) -> Result<Value,
         .ok_or(TranslationError::InvalidWebSearchCall(
             "arguments must be a JSON object encoded as a string",
         ))?;
+    web_search_call_output_item_from_parts(call_id, arguments, status)
+}
+
+/// Build one canonical hosted web-search output item from normalized parts.
+pub(crate) fn web_search_call_output_item_from_parts(
+    call_id: &str,
+    arguments: &str,
+    status: &str,
+) -> Result<Value, TranslationError> {
+    if call_id.is_empty() {
+        return Err(TranslationError::InvalidWebSearchCall("missing call id"));
+    }
     let query = web_search_query(arguments)?;
 
     Ok(json!({

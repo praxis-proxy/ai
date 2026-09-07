@@ -40,8 +40,9 @@ use self::{
     framing::{Framing, FramingError},
 };
 use crate::openai::translation::chat_completions::{
-    ResponseContext, chat_response_to_response_resource, function_call_output_item_from_parts,
+    ResponseContext, chat_response_to_response_resource, context_has_web_search, function_call_output_item_from_parts,
     in_progress_response_resource, message_output_item, output_text_item, refusal_item,
+    web_search_call_output_item_from_parts,
 };
 
 /// Resource limits governing one streaming translation.
@@ -269,6 +270,9 @@ struct ToolCallState {
     arguments: String,
     /// Whether argument fragments have begun.
     args_started: bool,
+    /// Whether this is the private compatibility function for a hosted
+    /// web-search tool declared by the original Responses request.
+    is_web_search: bool,
     /// Whether `response.output_item.added` was emitted.
     item_added: bool,
     /// Whether the item's `done` events were emitted.
@@ -286,6 +290,7 @@ impl ToolCallState {
             name: String::new(),
             arguments: String::new(),
             args_started: false,
+            is_web_search: false,
             item_added: false,
             closed: false,
         }
@@ -883,7 +888,7 @@ impl StreamConverter {
     )]
     #[expect(
         clippy::expect_used,
-        reason = "begin_tool_arguments set item_id and output_index for this position before the delta is emitted; their absence is an unreachable invariant"
+        reason = "non-web-search calls run begin_tool_arguments before emitting a delta, which sets item_id and output_index; their absence is an unreachable invariant"
     )]
     fn process_tool_call_fragment(
         &mut self,
@@ -920,9 +925,23 @@ impl StreamConverter {
         if let Some(arguments) = function.arguments.as_deref()
             && !arguments.is_empty()
         {
-            self.begin_tool_arguments(position, inputs, out)?;
+            let context = self.response_context(inputs, None);
+            let is_web_search = self.tool_calls[position].name == "web_search" && context_has_web_search(&context);
+            self.tool_calls[position].is_web_search = is_web_search;
+            if is_web_search {
+                // The private Chat function's arguments are not a public
+                // Responses function call. Accumulate them until the query is
+                // complete, then announce one canonical web_search_call during
+                // atomic terminal closeout.
+                self.tool_calls[position].args_started = true;
+            } else {
+                self.begin_tool_arguments(position, out)?;
+            }
             self.charge_tool_arguments(position, arguments.len())?;
             self.tool_calls[position].arguments.push_str(arguments);
+            if is_web_search {
+                return Ok(());
+            }
             let call = &self.tool_calls[position];
             let item_id = call.item_id.clone().expect("item id set");
             let output_index = call.output_index.expect("output index set");
@@ -969,12 +988,7 @@ impl StreamConverter {
         clippy::indexing_slicing,
         reason = "position comes from tool_call_position(), which returns an existing index or pushes and returns len()-1, so it is always in bounds"
     )]
-    fn begin_tool_arguments(
-        &mut self,
-        position: usize,
-        inputs: &SnapshotInputs<'_>,
-        out: &mut Vec<u8>,
-    ) -> Result<(), ConvertError> {
+    fn begin_tool_arguments(&mut self, position: usize, out: &mut Vec<u8>) -> Result<(), ConvertError> {
         if self.tool_calls[position].args_started {
             return Ok(());
         }
@@ -983,7 +997,6 @@ impl StreamConverter {
         }
         // Text and refusal are ordered before tool calls; opening a message
         // that later received tool calls keeps output indexes stable.
-        let _ = inputs;
         self.tool_calls[position].args_started = true;
         // Claim the dense output index here, at the emit point, not when the call
         // first appeared: an id-only call that is never named never reaches this
@@ -1071,7 +1084,9 @@ impl StreamConverter {
             if !call.item_added {
                 needed += 1;
             }
-            needed += 2;
+            // Hosted web search has no public function-arguments event: only
+            // the canonical output item is completed during closeout.
+            needed += if call.is_web_search { 1 } else { 2 };
         }
         needed
     }
@@ -1086,6 +1101,25 @@ impl StreamConverter {
             return Err(ConvertError::ToolCallMissingIdentity);
         }
         Ok(())
+    }
+
+    /// Assign ids and dense output indices to calls that will be announced
+    /// during terminal closeout.
+    fn prepare_closeout_tool_items(&mut self) {
+        let mut next_output_index = self.next_output_index;
+        for call in &mut self.tool_calls {
+            if call.closed || call.output_index.is_some() {
+                continue;
+            }
+            call.output_index = Some(next_output_index);
+            next_output_index += 1;
+            call.item_id = Some(if call.is_web_search {
+                call.call_id.clone()
+            } else {
+                format!("fc_{}", call.call_id)
+            });
+        }
+        self.next_output_index = next_output_index;
     }
 
     /// Close the assistant message item.
@@ -1203,22 +1237,26 @@ impl StreamConverter {
             }
             if !self.tool_calls[position].item_added {
                 // An identified call whose arguments never began was never
-                // announced during streaming; claim its dense output index here,
-                // at this emit point, so it lands after every item already added.
-                let output_index = self.alloc_output_index();
-                self.tool_calls[position].output_index = Some(output_index);
+                // announced during streaming. Its dense output index and item id
+                // were prepared before terminal ordering.
+                let output_index = self.tool_calls[position].output_index.expect("output index prepared");
                 let call_id = self.tool_calls[position].call_id.clone();
-                self.tool_calls[position].item_id = Some(format!("fc_{call_id}"));
                 self.tool_calls[position].item_added = true;
                 let name = self.tool_calls[position].name.clone();
+                let arguments = self.tool_calls[position].arguments.clone();
+                let item = if self.tool_calls[position].is_web_search {
+                    web_search_call_output_item_from_parts(&call_id, &arguments, "in_progress").map_err(|error| {
+                        tracing::trace!(%error, "web-search call could not form a canonical output item");
+                        ConvertError::InvalidTerminalResource
+                    })?
+                } else {
+                    function_call_output_item_from_parts(&call_id, &name, "", "in_progress")
+                };
                 emit_event(
                     &mut self.emit,
                     &self.limits,
                     true,
-                    events::output_item_added(
-                        output_index,
-                        &function_call_output_item_from_parts(&call_id, &name, "", "in_progress"),
-                    ),
+                    events::output_item_added(output_index, &item),
                     out,
                 )?;
             }
@@ -1228,21 +1266,28 @@ impl StreamConverter {
             let call_id = call.call_id.clone();
             let name = call.name.clone();
             let arguments = call.arguments.clone();
+            if !call.is_web_search {
+                emit_event(
+                    &mut self.emit,
+                    &self.limits,
+                    true,
+                    events::function_call_arguments_done(&item_id, output_index, &name, &arguments),
+                    out,
+                )?;
+            }
+            let item = if call.is_web_search {
+                web_search_call_output_item_from_parts(&call_id, &arguments, status).map_err(|error| {
+                    tracing::trace!(%error, "web-search call could not form a canonical output item");
+                    ConvertError::InvalidTerminalResource
+                })?
+            } else {
+                function_call_output_item_from_parts(&call_id, &name, &arguments, status)
+            };
             emit_event(
                 &mut self.emit,
                 &self.limits,
                 true,
-                events::function_call_arguments_done(&item_id, output_index, &name, &arguments),
-                out,
-            )?;
-            emit_event(
-                &mut self.emit,
-                &self.limits,
-                true,
-                events::output_item_done(
-                    output_index,
-                    &function_call_output_item_from_parts(&call_id, &name, &arguments, status),
-                ),
+                events::output_item_done(output_index, &item),
                 out,
             )?;
             self.tool_calls[position].closed = true;
@@ -1259,6 +1304,7 @@ impl StreamConverter {
             tracing::trace!(%error, "accumulated stream state could not form a valid terminal response");
             ConvertError::InvalidTerminalResource
         })?;
+        self.prepare_closeout_tool_items();
         self.order_output_by_stream_index(&mut resource);
         self.order_message_content_by_stream_index(&mut resource);
         // The finite path rejects a serialized response exceeding `max_body_bytes`

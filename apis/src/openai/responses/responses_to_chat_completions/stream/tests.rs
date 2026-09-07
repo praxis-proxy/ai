@@ -338,6 +338,58 @@ fn single_tool_call_emits_function_events() {
 }
 
 #[test]
+fn hosted_web_search_stream_emits_only_canonical_items() {
+    let body = json!({
+        "model": "gpt-4.1-mini",
+        "input": "search for Praxis Proxy",
+        "stream": true,
+        "tools": [{"type": "web_search", "search_context_size": "high"}]
+    });
+    let events = run_stream_with_body(
+        &[
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search_1","function":{"name":"web_search"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Praxis Proxy\"}"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ],
+        &body,
+        wide_limits(),
+    );
+
+    assert_eq!(
+        types(&events),
+        vec![
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        ],
+        "the private compatibility function must not leak function-call argument events",
+    );
+    let added = &events[2].1;
+    assert_eq!(added["output_index"], 0);
+    assert_eq!(added["item"]["id"], "call_search_1");
+    assert_eq!(added["item"]["type"], "web_search_call");
+    assert_eq!(added["item"]["status"], "in_progress");
+    assert_eq!(
+        added["item"]["action"],
+        json!({"type": "search", "query": "Praxis Proxy"})
+    );
+
+    let done = &events[3].1;
+    assert_eq!(done["output_index"], 0);
+    assert_eq!(done["item"]["id"], "call_search_1");
+    assert_eq!(done["item"]["type"], "web_search_call");
+    assert_eq!(done["item"]["status"], "completed");
+    assert_eq!(
+        events.last().unwrap().1["response"]["output"][0],
+        done["item"],
+        "the terminal item must match the canonical item announced incrementally",
+    );
+}
+
+#[test]
 fn multiple_tool_calls_preserve_output_order() {
     let events = run_stream(
         &[
