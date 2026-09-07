@@ -650,9 +650,9 @@ filter_chains:
     filters:
       - filter: anthropic_messages_format
         on_invalid: continue
-      - filter: anthropic_to_openai
+      - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
-      - filter: anthropic_stream_events
+      - filter: anthropic_messages_to_chat_completions_stream
         max_tool_blocks: {max_tool_blocks}
       - filter: router
         routes:

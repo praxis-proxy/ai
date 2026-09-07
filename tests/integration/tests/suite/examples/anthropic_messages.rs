@@ -105,7 +105,7 @@ fn anthropic_messages_protocol_injects_default_version() {
 }
 
 #[test]
-fn anthropic_to_openai_transforms_response_body() {
+fn anthropic_messages_to_chat_completions_transforms_response_body() {
     let recording = Recording::load("anthropic/messages/to_openai_non_streaming.json");
     let response_body = recording.response_body();
     let request_body = recording.request_body();
@@ -167,7 +167,7 @@ fn anthropic_to_openai_transforms_response_body() {
 }
 
 #[test]
-fn anthropic_to_openai_returns_api_error_for_malformed_tool_arguments() {
+fn anthropic_messages_to_chat_completions_returns_api_error_for_malformed_tool_arguments() {
     let response = serde_json::json!({
         "id": "chatcmpl-malformed-tool",
         "object": "chat.completion",
@@ -231,7 +231,7 @@ fn anthropic_to_openai_returns_api_error_for_malformed_tool_arguments() {
 }
 
 #[test]
-fn anthropic_to_openai_replaces_malformed_success_body() {
+fn anthropic_messages_to_chat_completions_replaces_malformed_success_body() {
     let backend = Backend::fixed("not json")
         .header("content-type", "application/json")
         .header("x-request-id", "req_malformed")
@@ -258,7 +258,11 @@ fn anthropic_to_openai_replaces_malformed_success_body() {
     assert_eq!(parsed["request_id"], "req_malformed");
 }
 
-fn run_anthropic_to_openai_error(status: u16, response_body: &str, stream: bool) -> (u16, serde_json::Value) {
+fn run_anthropic_messages_to_chat_completions_error(
+    status: u16,
+    response_body: &str,
+    stream: bool,
+) -> (u16, serde_json::Value) {
     let backend = Backend::status(status, response_body)
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -282,8 +286,8 @@ fn run_anthropic_to_openai_error(status: u16, response_body: &str, stream: bool)
 }
 
 #[test]
-fn anthropic_to_openai_normalizes_upstream_error() {
-    let (status, parsed) = run_anthropic_to_openai_error(
+fn anthropic_messages_to_chat_completions_normalizes_upstream_error() {
+    let (status, parsed) = run_anthropic_messages_to_chat_completions_error(
         429,
         r#"{"error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req_01"}"#,
         false,
@@ -297,8 +301,8 @@ fn anthropic_to_openai_normalizes_upstream_error() {
 }
 
 #[test]
-fn anthropic_to_openai_normalizes_pre_stream_error_for_streaming_request() {
-    let (status, parsed) = run_anthropic_to_openai_error(
+fn anthropic_messages_to_chat_completions_normalizes_pre_stream_error_for_streaming_request() {
+    let (status, parsed) = run_anthropic_messages_to_chat_completions_error(
         503,
         r#"{"error":{"type":"server_error","message":"unavailable"}}"#,
         true,
@@ -312,7 +316,7 @@ fn anthropic_to_openai_normalizes_pre_stream_error_for_streaming_request() {
 }
 
 #[test]
-fn anthropic_to_openai_transforms_tool_cycle_request_body() {
+fn anthropic_messages_to_chat_completions_transforms_tool_cycle_request_body() {
     let recording = Recording::load("anthropic/messages/tool_result.json");
     let request_body = recording.request_body();
     let chat_response = serde_json::json!({
@@ -375,7 +379,7 @@ fn anthropic_to_openai_transforms_tool_cycle_request_body() {
 }
 
 #[test]
-fn anthropic_to_openai_transforms_streaming_response_body() {
+fn anthropic_messages_to_chat_completions_transforms_streaming_response_body() {
     let recording = Recording::load("anthropic/messages/to_openai_streaming.json");
     let response_body = recording.response_body();
     let request_body = recording.request_body();

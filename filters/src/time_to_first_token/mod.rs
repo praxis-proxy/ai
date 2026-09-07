@@ -54,7 +54,7 @@ const META_ACTIVE: &str = "time_to_first_token.active";
 ///
 /// The histogram's `model` label is read from metadata set by an upstream format
 /// filter (`openai_responses_format`, `anthropic_messages_format`, or
-/// `anthropic_to_openai`). If no format filter runs before this filter,
+/// `anthropic_messages_to_chat_completions`). If no format filter runs before this filter,
 /// all TTFT samples are labeled `unknown`.
 ///
 /// # YAML
@@ -144,7 +144,7 @@ impl HttpFilter for TimeToFirstTokenFilter {
 fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
     ctx.get_metadata("openai_responses_format.model")
         .or_else(|| ctx.get_metadata("anthropic_messages_format.model"))
-        .or_else(|| ctx.get_metadata("anthropic_to_openai.model"))
+        .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
         .filter(|v| is_promotable_value(v))
         .unwrap_or("unknown")
         .to_owned()

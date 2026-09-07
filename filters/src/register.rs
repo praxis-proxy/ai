@@ -180,11 +180,11 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "anthropic_stream_events" => praxis_ai_apis::anthropic::AnthropicStreamEventsFilter::from_config
+        http "anthropic_messages_to_chat_completions" => praxis_ai_apis::anthropic::AnthropicMessagesToChatCompletionsFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "anthropic_to_openai" => praxis_ai_apis::anthropic::AnthropicToOpenaiFilter::from_config
+        http "anthropic_messages_to_chat_completions_stream" => praxis_ai_apis::anthropic::AnthropicMessagesToChatCompletionsStreamFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,

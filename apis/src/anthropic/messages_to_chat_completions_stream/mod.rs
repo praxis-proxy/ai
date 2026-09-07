@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Anthropic SSE event transformation filter.
+//! Anthropic Messages streaming SSE transformation filter.
 //!
-//! Transforms `OpenAI` Chat Completions SSE events into Anthropic
-//! Messages SSE events per-chunk while buffering partial events.
+//! Transforms Chat Completions SSE events into Anthropic Messages SSE
+//! events per-chunk while buffering partial events. Any Chat
+//! Completions-compatible backend is a valid source, not only OpenAI.
 
 mod config;
 
@@ -18,7 +19,7 @@ use praxis_filter::{
 use serde_json::Value;
 use tracing::debug;
 
-use self::config::{AnthropicStreamEventsConfig, build_config};
+use self::config::{AnthropicMessagesToChatCompletionsStreamConfig, build_config};
 use crate::{
     anthropic::wire::{ContentBlock, MessageDeltaUsage, MessageUsage},
     is_event_stream_content_type,
@@ -76,15 +77,15 @@ const UTF8_BUFFER_KEY: &str = "anthropic_stream.utf8_buffer";
 const ARMED_KEY: &str = "anthropic_stream.armed";
 
 // -----------------------------------------------------------------------------
-// AnthropicStreamEventsFilter
+// AnthropicMessagesToChatCompletionsStreamFilter
 // -----------------------------------------------------------------------------
 
-/// Transforms streaming SSE responses between `OpenAI` and
-/// Anthropic formats, processing each chunk as it arrives.
+/// Transforms streaming SSE responses between the Chat Completions and
+/// Anthropic Messages formats, processing each chunk as it arrives.
 ///
 /// Arms automatically when an upstream classifier or transform
 /// filter sets `anthropic_messages_format.stream` or
-/// `anthropic_to_openai.streaming` metadata to `"true"` and
+/// `anthropic_messages_to_chat_completions.streaming` metadata to `"true"` and
 /// the backend response has `Content-Type: text/event-stream`
 /// (with or without parameters such as `charset=utf-8`) and does
 /// not carry a `Content-Encoding` header.
@@ -93,29 +94,30 @@ const ARMED_KEY: &str = "anthropic_stream.armed";
 /// # YAML
 ///
 /// ```yaml
-/// filter: anthropic_stream_events
+/// filter: anthropic_messages_to_chat_completions_stream
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: anthropic_stream_events
+/// filter: anthropic_messages_to_chat_completions_stream
 /// max_partial_event_bytes: 10485760
 /// max_tool_blocks: 10000
 /// ```
-pub struct AnthropicStreamEventsFilter {
+pub struct AnthropicMessagesToChatCompletionsStreamFilter {
     /// Parsed and validated configuration.
-    config: AnthropicStreamEventsConfig,
+    config: AnthropicMessagesToChatCompletionsStreamConfig,
 }
 
-impl AnthropicStreamEventsFilter {
+impl AnthropicMessagesToChatCompletionsStreamFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: AnthropicStreamEventsConfig = parse_filter_config("anthropic_stream_events", config)?;
+        let cfg: AnthropicMessagesToChatCompletionsStreamConfig =
+            parse_filter_config("anthropic_messages_to_chat_completions_stream", config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
@@ -144,9 +146,9 @@ impl AnthropicStreamEventsFilter {
 }
 
 #[async_trait]
-impl HttpFilter for AnthropicStreamEventsFilter {
+impl HttpFilter for AnthropicMessagesToChatCompletionsStreamFilter {
     fn name(&self) -> &'static str {
-        "anthropic_stream_events"
+        "anthropic_messages_to_chat_completions_stream"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -239,7 +241,7 @@ fn decode_and_process_chunk(
         // Never mix raw upstream bytes into an Anthropic event stream.
         ctx.filter_metadata.remove(LINE_BUFFER_KEY);
         return Err(FilterError::from(
-            "anthropic_stream_events: upstream SSE contains malformed UTF-8",
+            "anthropic_messages_to_chat_completions_stream: upstream SSE contains malformed UTF-8",
         ));
     };
     let Some(valid_bytes) = combined.as_slice().get(..valid_up_to) else {
@@ -372,7 +374,9 @@ fn store_line_buffer(
 
     if buffer.len() > max_partial_event_bytes {
         ctx.filter_metadata.remove(LINE_BUFFER_KEY);
-        let msg = format!("anthropic_stream_events: incomplete SSE event exceeds {max_partial_event_bytes} bytes");
+        let msg = format!(
+            "anthropic_messages_to_chat_completions_stream: incomplete SSE event exceeds {max_partial_event_bytes} bytes"
+        );
         return Err(msg.into());
     }
 
@@ -428,7 +432,7 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
         .is_some_and(|v| v == "true")
         || ctx
             .filter_metadata
-            .get("anthropic_to_openai.streaming")
+            .get("anthropic_messages_to_chat_completions.streaming")
             .is_some_and(|v| v == "true")
 }
 
@@ -675,7 +679,7 @@ fn emit_tool_block_start(
     let opened = get_tool_block_count(ctx);
     if opened >= max_tool_blocks {
         return Err(format!(
-            "anthropic_stream_events: streaming tool-call content blocks exceed max_tool_blocks ({max_tool_blocks})"
+            "anthropic_messages_to_chat_completions_stream: streaming tool-call content blocks exceed max_tool_blocks ({max_tool_blocks})"
         )
         .into());
     }
@@ -955,9 +959,13 @@ mod tests {
     #[test]
     fn default_config_parses() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        let filter = AnthropicStreamEventsFilter::from_config(&yaml).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml).unwrap();
 
-        assert_eq!(filter.name(), "anthropic_stream_events", "filter name should match");
+        assert_eq!(
+            filter.name(),
+            "anthropic_messages_to_chat_completions_stream",
+            "filter name should match"
+        );
     }
 
     #[tokio::test]
@@ -1175,7 +1183,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream; charset=utf-8"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1196,7 +1204,7 @@ mod tests {
             http::HeaderValue::from_static("Text/Event-Stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1238,7 +1246,7 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1269,7 +1277,7 @@ mod tests {
         resp.headers
             .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1433,7 +1441,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1454,7 +1462,7 @@ mod tests {
     #[test]
     fn unknown_config_field_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(
             result.is_err(),
@@ -1805,7 +1813,7 @@ mod tests {
     #[test]
     fn zero_partial_event_limit_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_partial_event_bytes: 0").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(
             result.is_err(),
@@ -1816,7 +1824,7 @@ mod tests {
     #[test]
     fn exceeds_max_partial_event_limit_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_partial_event_bytes: 67108865").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(
             result.is_err(),
@@ -1827,7 +1835,7 @@ mod tests {
     #[test]
     fn custom_max_tool_blocks_parses() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_blocks: 5").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(
             result.is_ok(),
@@ -1838,7 +1846,7 @@ mod tests {
     #[test]
     fn zero_max_tool_blocks_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_blocks: 0").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(result.is_err(), "streaming filter should reject a zero max_tool_blocks");
     }
@@ -1927,12 +1935,12 @@ mod tests {
 
     fn make_filter() -> Box<dyn HttpFilter> {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        AnthropicStreamEventsFilter::from_config(&yaml).unwrap()
+        AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml).unwrap()
     }
 
     fn make_filter_from_yaml(yaml: &str) -> Box<dyn HttpFilter> {
         let yaml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        AnthropicStreamEventsFilter::from_config(&yaml).unwrap()
+        AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml).unwrap()
     }
 
     fn make_error_context(status: http::StatusCode) -> (HttpFilterContext<'static>, praxis_filter::Response) {

@@ -10,15 +10,15 @@ use praxis_filter::{
 use serde::Deserialize;
 
 // -----------------------------------------------------------------------------
-// AnthropicStreamEventsConfig
+// AnthropicMessagesToChatCompletionsStreamConfig
 // -----------------------------------------------------------------------------
 
-/// YAML configuration for the [`AnthropicStreamEventsFilter`].
+/// YAML configuration for the [`AnthropicMessagesToChatCompletionsStreamFilter`].
 ///
-/// [`AnthropicStreamEventsFilter`]: super::AnthropicStreamEventsFilter
+/// [`AnthropicMessagesToChatCompletionsStreamFilter`]: super::AnthropicMessagesToChatCompletionsStreamFilter
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AnthropicStreamEventsConfig {
+pub(crate) struct AnthropicMessagesToChatCompletionsStreamConfig {
     /// Maximum incomplete SSE event bytes retained between chunks.
     #[serde(default = "default_max_partial_event_bytes")]
     pub max_partial_event_bytes: usize,
@@ -51,7 +51,9 @@ const DEFAULT_MAX_TOOL_BLOCKS: usize = 10_000;
 // -----------------------------------------------------------------------------
 
 /// Validate the parsed configuration.
-pub(crate) fn build_config(cfg: AnthropicStreamEventsConfig) -> Result<AnthropicStreamEventsConfig, FilterError> {
+pub(crate) fn build_config(
+    cfg: AnthropicMessagesToChatCompletionsStreamConfig,
+) -> Result<AnthropicMessagesToChatCompletionsStreamConfig, FilterError> {
     validate_max_partial_event_bytes(cfg.max_partial_event_bytes)?;
     validate_max_tool_blocks(cfg.max_tool_blocks)?;
     Ok(cfg)
@@ -60,7 +62,7 @@ pub(crate) fn build_config(cfg: AnthropicStreamEventsConfig) -> Result<Anthropic
 /// Validate the maximum retained tool-call content block count.
 fn validate_max_tool_blocks(value: usize) -> Result<(), FilterError> {
     if value == 0 {
-        return Err("anthropic_stream_events: 'max_tool_blocks' must be greater than 0".into());
+        return Err("anthropic_messages_to_chat_completions_stream: 'max_tool_blocks' must be greater than 0".into());
     }
 
     Ok(())
@@ -69,12 +71,14 @@ fn validate_max_tool_blocks(value: usize) -> Result<(), FilterError> {
 /// Validate the maximum partial SSE event byte limit.
 fn validate_max_partial_event_bytes(value: usize) -> Result<(), FilterError> {
     if value == 0 {
-        return Err("anthropic_stream_events: 'max_partial_event_bytes' must be greater than 0".into());
+        return Err(
+            "anthropic_messages_to_chat_completions_stream: 'max_partial_event_bytes' must be greater than 0".into(),
+        );
     }
 
     if value > MAX_JSON_BODY_BYTES {
         return Err(format!(
-            "anthropic_stream_events: max_partial_event_bytes ({value}) exceeds maximum ({MAX_JSON_BODY_BYTES})"
+            "anthropic_messages_to_chat_completions_stream: max_partial_event_bytes ({value}) exceeds maximum ({MAX_JSON_BODY_BYTES})"
         )
         .into());
     }
