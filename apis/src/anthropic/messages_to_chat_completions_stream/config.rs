@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration for the Anthropic stream events filter.
+//! Configuration for the Anthropic-to-Chat-Completions streaming transformation filter.
 
 use praxis_filter::{
     FilterError,
