@@ -502,7 +502,12 @@ impl<'a> Sanitizer<'a> {
             if key == "created" {
                 nested_value = Value::from(0);
             } else if key == "created_at" {
-                nested_value = Value::from("1970-01-01T00:00:00Z");
+                // `created_at` is a Unix-timestamp integer in the OpenAI
+                // Responses/Chat APIs, exactly like `created`. Normalize to a
+                // fixed integer (not an ISO-8601 string) so a native passthrough
+                // response still parses through the response store, which reads
+                // `created_at` as an `i64`.
+                nested_value = Value::from(0);
             } else if key == "completed_at" && !nested_value.is_null() {
                 nested_value = Value::from(0);
             } else {
@@ -1706,7 +1711,7 @@ mod tests {
             panic!("fixture response must be JSON")
         };
         assert_eq!(client_response["created"], 0);
-        assert_eq!(client_response["created_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(client_response["created_at"], json!(0));
         assert!(client_response.get("system_fingerprint").is_none());
         let upstream_response = &fixture.turns[0].upstream.response.body;
         let RecordedBody::Json {
@@ -1717,6 +1722,40 @@ mod tests {
         };
         assert_eq!(upstream_response["previous_response_id"], "resp_recorded_0008");
         assert_eq!(fixture.normalization.linked_ids["resp_literal"], "resp_recorded_0008");
+    }
+
+    #[test]
+    fn sanitize_preserves_integer_created_at_type_normalized_to_zero() {
+        // Arrange: a native Responses `created_at` is a Unix-timestamp integer.
+        let mut fixture = fixture();
+        set_created_at(&mut fixture.turns[0].client.response.body, json!(1_699_999_999_i64));
+        set_created_at(&mut fixture.turns[0].upstream.response.body, json!(1_699_999_999_i64));
+
+        // Act
+        sanitize_fixture(&mut fixture, &RedactionRules::default()).unwrap();
+
+        // Assert: the value is canonicalized to 0 but stays an integer, so a
+        // native passthrough response persists through the response store.
+        assert_integer_created_at_zero(&fixture.turns[0].client.response.body);
+        assert_integer_created_at_zero(&fixture.turns[0].upstream.response.body);
+    }
+
+    fn set_created_at(body: &mut RecordedBody, value: Value) {
+        let RecordedBody::Json { value: json } = body else {
+            panic!("fixture response must be JSON")
+        };
+        json["created_at"] = value;
+    }
+
+    fn assert_integer_created_at_zero(body: &RecordedBody) {
+        let RecordedBody::Json { value } = body else {
+            panic!("fixture response must be JSON")
+        };
+        assert_eq!(value["created_at"], json!(0));
+        assert!(
+            value["created_at"].is_i64(),
+            "integer created_at must stay an integer after normalization"
+        );
     }
 
     #[test]

@@ -221,6 +221,19 @@ impl HttpFilter for RehydrateFilter {
         }
     }
 
+    /// `ReadWrite` so the response phase can restore the caller's
+    /// `previous_response_id` into the response body.
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    /// Streaming by default. A finite JSON response that requires the
+    /// `previous_response_id` restore selects a bounded `StreamBuffer`
+    /// dynamically in [`Self::on_response`].
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
@@ -252,6 +265,175 @@ impl HttpFilter for RehydrateFilter {
             .is_some_and(|v| v == "true");
 
         self.rehydrate(ctx, body, streaming).await
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The response header is only available in this header phase, so the
+        // eligibility decision (status + content-type + rehydration state) is
+        // made here and carried into `on_response_body` via filter state.
+        let Some(prev_id) = eligible_previous_response_id(ctx) else {
+            return Ok(FilterAction::Continue);
+        };
+
+        // Buffer the finite JSON response so `on_response_body` can restore the
+        // caller's `previous_response_id`. Re-serializing the body invalidates
+        // every header that describes the exact upstream bytes, so drop them all
+        // here: `Content-Length` (core recomputes it from the buffered body) and
+        // the body validators / integrity digests (`ETag`, `Last-Modified`,
+        // `Content-MD5`, `Digest`, `Content-Digest`, `Repr-Digest`). Leaving a
+        // validator behind would assert the rewritten payload is byte-identical
+        // to the upstream representation and break cache revalidation or integrity
+        // verification — rewriting `previous_response_id` changes both bytes and
+        // API-visible semantics, so those validators no longer describe this
+        // response. (`Last-Modified` is a weak, mtime-granularity validator, but
+        // it still names the origin representation and is dropped for symmetry.)
+        //
+        // `Content-Encoding` and `Content-Range` are deliberately left alone:
+        // `eligible_previous_response_id` already declined encoded and ranged
+        // responses, so an eligible body is a complete, identity-coded
+        // representation. Caching-policy (`Cache-Control`, `Age`, ...), routing,
+        // tracing, and `Content-Type` headers are unrelated to the byte content
+        // and are preserved so the response reaches the client almost unchanged.
+        ctx.set_response_body_mode(BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        });
+        if let Some(response) = &mut ctx.response_header {
+            let headers = &mut response.headers;
+            headers.remove(http::header::CONTENT_LENGTH);
+            headers.remove(http::header::ETAG);
+            headers.remove(http::header::LAST_MODIFIED);
+            // `Content-MD5` (RFC 1864, obsolete) and the RFC 9530 digest fields
+            // have no typed constants in `http`; remove them by lowercase name.
+            headers.remove("content-md5");
+            headers.remove("digest");
+            headers.remove("content-digest");
+            headers.remove("repr-digest");
+        }
+        ctx.response_headers_modified = true;
+        ctx.insert_filter_state(RestorePreviousResponseId {
+            previous_response_id: prev_id,
+        });
+
+        Ok(FilterAction::Continue)
+    }
+
+    fn on_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
+        // `response_header` is gone by the body phase; the armed decision from
+        // `on_response` is the sole signal that a restore is required.
+        let Some(armed) = ctx.remove_filter_state::<RestorePreviousResponseId>() else {
+            return Ok(FilterAction::Continue);
+        };
+
+        restore_previous_response_id(armed.previous_response_id, body);
+        Ok(FilterAction::Continue)
+    }
+}
+
+/// Marker carrying the caller's `previous_response_id` from the response header
+/// phase to the response body phase.
+///
+/// The eligibility decision requires `ctx.response_header`, which is only
+/// present during [`RehydrateFilter::on_response`]; this state hands the ID to
+/// [`RehydrateFilter::on_response_body`], where the header is no longer available.
+struct RestorePreviousResponseId {
+    /// The `previous_response_id` the caller supplied, to echo back.
+    previous_response_id: String,
+}
+
+/// Return the caller's `previous_response_id` when it must be restored into the
+/// response body, or `None` when the response is ineligible.
+///
+/// When history was rehydrated, the proxy strips `previous_response_id` from the
+/// upstream request (prior turns are replayed via the `input` array and the
+/// backend never sees the ID), so the backend echoes `null`. The Responses API
+/// contract always echoes the caller's `previous_response_id`, so it is restored
+/// on the way out. Only a finite, identity-coded, complete `200 OK` JSON response
+/// is eligible; streaming SSE, content-encoded, ranged/partial, and non-`200`
+/// responses are left untouched.
+fn eligible_previous_response_id(ctx: &HttpFilterContext<'_>) -> Option<String> {
+    // Clone the ID at the ownership boundary so it outlives the borrow on
+    // `extensions` and can be carried into the body phase.
+    let prev_id = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .filter(|state| state.history_rehydrated)
+        .and_then(|state| state.previous_response_id.clone())?;
+
+    let resp = ctx.response_header.as_ref()?;
+    // Require an ordinary `200 OK`. Restoring the ID re-serializes the full body,
+    // so any other success shape is not a complete, self-contained Responses
+    // resource to rewrite: `206 Partial Content` is a byte fragment, `204 No
+    // Content` has no body, and `202 Accepted` background handoffs are echoed
+    // verbatim. All are passed through untouched.
+    if resp.status != http::StatusCode::OK {
+        return None;
+    }
+
+    // Decline any response carrying a `Content-Encoding` or `Content-Range`.
+    // Restoring the ID means parsing the buffered body as JSON and re-serializing
+    // it: a compressed body is opaque bytes that would fail to parse, and a
+    // ranged (partial) body is a fragment of a larger representation that cannot
+    // be soundly rewritten. Dropping the framing headers while leaving the body
+    // encoded or partial would ship those bytes mislabeled as a full, identity
+    // JSON representation. Leaving such a response ineligible passes it through
+    // verbatim. (Mirrors the encoded-SSE decline in `openai_responses`
+    // stream_events; see issue #668 for the same defense on the streaming path.)
+    if resp.headers.contains_key(http::header::CONTENT_ENCODING)
+        || resp.headers.contains_key(http::header::CONTENT_RANGE)
+    {
+        return None;
+    }
+
+    let content_type = resp
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let is_json = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/json");
+
+    is_json.then_some(prev_id)
+}
+
+/// Restore the caller's `previous_response_id` into the buffered Responses
+/// resource, replacing the `null` the backend echoed after the proxy stripped
+/// the ID from the upstream request.
+fn restore_previous_response_id(prev_id: String, body: &mut Option<Bytes>) {
+    let Some(bytes) = body.as_ref() else {
+        return;
+    };
+    let Ok(mut parsed) = serde_json::from_slice::<Value>(bytes) else {
+        debug!("rehydrate: response body is not JSON, skipping previous_response_id restore");
+        return;
+    };
+    let Some(object) = parsed.as_object_mut() else {
+        return;
+    };
+    // Only rewrite a Responses resource, never an unexpected success shape.
+    if object.get("object").and_then(Value::as_str) != Some("response") {
+        return;
+    }
+
+    object.insert("previous_response_id".to_owned(), Value::String(prev_id));
+    match serde_json::to_vec(&parsed) {
+        Ok(serialized) => {
+            *body = Some(Bytes::from(serialized));
+            trace!("restored caller previous_response_id into response body");
+        },
+        Err(error) => warn!(error = %error, "rehydrate: failed to re-serialize response body"),
     }
 }
 

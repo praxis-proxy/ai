@@ -40,7 +40,7 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 | `openai_responses_format` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — |
 | `openai_responses_proxy` | — | ReadWrite / StreamBuffer | — | — |
-| `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | — | — |
+| `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ✓ | ReadWrite / Stream |
 | `openai_responses_validate` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_stream_events` | ✓ | — | ✓ | ReadWrite / Stream |
 | `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | — | — |

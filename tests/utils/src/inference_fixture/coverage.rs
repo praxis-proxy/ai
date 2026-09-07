@@ -1236,6 +1236,7 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
+                vec!["responses_native_passthrough"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1271,11 +1272,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 19);
-        assert_eq!(report.scenarios_total, 17);
-        assert_eq!(report.recordings_total, 22);
+        assert_eq!(report.features_total, 20);
+        assert_eq!(report.scenarios_total, 18);
+        assert_eq!(report.recordings_total, 23);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1295,10 +1297,11 @@ mod tests {
                 "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
+                "responses/native-continuation",
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 19);
+        assert_eq!(manifest.features.len(), 20);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1374,6 +1377,10 @@ mod tests {
                 (
                     &"responses.native.tool_call".to_owned(),
                     &vec!["responses/native-tool-call".to_owned()]
+                ),
+                (
+                    &"responses.native.continuation".to_owned(),
+                    &vec!["responses/native-continuation".to_owned()]
                 ),
                 (
                     &"responses.chat.request".to_owned(),
@@ -1773,6 +1780,64 @@ mod tests {
             continuation.expect.upstream_sse_events.is_empty(),
             "non-streaming continuation turn must have no upstream SSE events"
         );
+
+        let native_continuation =
+            InferenceScenario::load(&root.join("scenarios/responses/native-continuation.yaml")).unwrap();
+        assert_eq!(native_continuation.version, 1);
+        assert_eq!(native_continuation.id, "responses/native-continuation");
+        assert_eq!(
+            native_continuation.description,
+            "Native OpenAI Responses continuation. The stored first turn is rehydrated into the outbound history and previous_response_id is stripped from the upstream request, while the caller's previous_response_id is restored into the client response (issue #932)."
+        );
+        assert_eq!(native_continuation.protocol, InferenceProtocol::OpenaiResponses);
+        assert_eq!(
+            native_continuation.example_config,
+            "openai/responses/rehydrate-fixture.yaml"
+        );
+        assert_eq!(native_continuation.upstream_authority, "127.0.0.1:3001");
+        assert_eq!(native_continuation.features, ["responses.native.continuation"]);
+        assert_eq!(native_continuation.turns.len(), 2);
+
+        let initial = &native_continuation.turns[0];
+        assert_eq!(initial.name, "initial");
+        assert_eq!(initial.request.method, "POST");
+        assert_eq!(initial.request.path, "/v1/responses");
+        assert_eq!(initial.expect.client_status, 200);
+        assert_eq!(initial.expect.client_body_kind, BodyKind::Json);
+        assert_eq!(initial.expect.upstream_path, "/v1/responses");
+        assert_eq!(initial.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &initial.request.body else {
+            panic!("native continuation initial request body must be JSON");
+        };
+        assert_eq!(value["model"], "${MODEL}");
+        assert_eq!(value["input"], "What is 2+2? Reply with just the number.");
+        assert_eq!(value["store"], true);
+        assert_eq!(value["stream"], false);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
+        assert!(initial.expect.client_sse_events.is_empty());
+        assert!(initial.expect.upstream_sse_events.is_empty());
+
+        let native_turn = &native_continuation.turns[1];
+        assert_eq!(native_turn.name, "continuation");
+        assert_eq!(native_turn.request.path, "/v1/responses");
+        assert_eq!(native_turn.expect.client_status, 200);
+        assert_eq!(native_turn.expect.client_body_kind, BodyKind::Json);
+        assert_eq!(native_turn.expect.upstream_path, "/v1/responses");
+        assert_eq!(native_turn.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &native_turn.request.body else {
+            panic!("native continuation request body must be JSON");
+        };
+        assert_eq!(value["model"], "${MODEL}");
+        assert_eq!(
+            value["input"],
+            "What was the previous answer? Reply with just the number."
+        );
+        assert_eq!(value["previous_response_id"], "${PREVIOUS_RESPONSE_ID}");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], false);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
+        assert!(native_turn.expect.client_sse_events.is_empty());
+        assert!(native_turn.expect.upstream_sse_events.is_empty());
     }
 
     #[cfg(unix)]

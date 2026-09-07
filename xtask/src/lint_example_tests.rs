@@ -33,6 +33,7 @@ const SKIP: &[&str] = &[
     "openai/responses/format-routing.yaml",
     "openai/responses/full-flow.yaml",
     "openai/responses/model-rewrite.yaml",
+    "openai/responses/rehydrate-fixture.yaml",
     "openai/responses/rehydrate.yaml",
     "openai/responses/request-validate.yaml",
     "openai/responses/response-store.yaml",
