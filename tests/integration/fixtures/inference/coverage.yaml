@@ -39,6 +39,15 @@ features:
         status: covered
       vllm:
         status: live_covered
+  - id: messages.response.malformed_tool_arguments
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/malformed-tool-arguments
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.streaming.usage
     scopes:
       - messages_to_chat_completions
@@ -65,15 +74,6 @@ features:
     status: synthetic_only
     scenarios:
       - messages/malformed-success
-    providers:
-      synthetic:
-        status: synthetic_only
-  - id: messages.response.malformed_tool_arguments
-    scopes:
-      - messages_to_chat_completions
-    status: synthetic_only
-    scenarios:
-      - messages/malformed-tool-arguments
     providers:
       synthetic:
         status: synthetic_only
