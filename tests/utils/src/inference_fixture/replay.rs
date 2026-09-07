@@ -382,27 +382,33 @@ fn validate_replay_filters(config: &Config) -> Result<(), FixtureError> {
     Ok(())
 }
 
+/// Whether a filter type is known to be fully contained within replay.
+fn is_replay_contained_filter(filter_type: &str) -> bool {
+    matches!(
+        filter_type,
+        "openai_agentic_loop"
+            | "anthropic_messages_format"
+            | "anthropic_messages_protocol"
+            | "anthropic_to_openai"
+            | "anthropic_stream_events"
+            | "iterative_request_router"
+            | "openai_responses_proxy"
+            | "path_rewrite"
+            | "openai_responses_format"
+            | "openai_responses_validate"
+            | "openai_response_store"
+            | "openai_responses_rehydrate"
+            | "openai_stream_events"
+            | "responses_to_chat_completions"
+            | "router"
+            | "load_balancer"
+    )
+}
+
 /// Traverses top-level and inline branch filters without scanning inert config data.
 fn validate_replay_filter_entries(filters: &[FilterEntry]) -> Result<(), FixtureError> {
     for filter in filters {
-        if !matches!(
-            filter.filter_type.as_str(),
-            "openai_agentic_loop"
-                | "anthropic_messages_format"
-                | "anthropic_messages_protocol"
-                | "anthropic_to_openai"
-                | "anthropic_stream_events"
-                | "iterative_request_router"
-                | "openai_responses_proxy"
-                | "path_rewrite"
-                | "openai_responses_format"
-                | "openai_responses_validate"
-                | "openai_response_store"
-                | "openai_responses_rehydrate"
-                | "responses_to_chat_completions"
-                | "router"
-                | "load_balancer"
-        ) {
+        if !is_replay_contained_filter(filter.filter_type.as_str()) {
             return Err(runtime_error("scenario filter is not replay-contained"));
         }
         for branch in filter.branch_chains.iter().flatten() {
@@ -2488,7 +2494,7 @@ mod tests {
             .expect("test filter config should parse")
         };
         let safe_config: Config = parse_config(
-            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
+            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
         );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
 

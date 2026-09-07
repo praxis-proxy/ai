@@ -1278,8 +1278,8 @@ mod tests {
             ]
         );
         assert_eq!(report.features_total, 21);
-        assert_eq!(report.scenarios_total, 18);
-        assert_eq!(report.recordings_total, 23);
+        assert_eq!(report.scenarios_total, 19);
+        assert_eq!(report.recordings_total, 24);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1294,6 +1294,7 @@ mod tests {
                 "messages/upstream-error",
                 "responses/agentic-parallel-tool-calls",
                 "responses/chat-basic-nonstream",
+                "responses/chat-basic-stream",
                 "responses/chat-file-search",
                 "responses/chat-web-search",
                 "responses/irr-terminal-streaming",
@@ -1390,11 +1391,17 @@ mod tests {
                 ),
                 (
                     &"responses.chat.request".to_owned(),
-                    &vec!["responses/chat-basic-nonstream".to_owned()]
+                    &vec![
+                        "responses/chat-basic-nonstream".to_owned(),
+                        "responses/chat-basic-stream".to_owned(),
+                    ]
                 ),
                 (
                     &"responses.chat.response.text".to_owned(),
-                    &vec!["responses/chat-basic-nonstream".to_owned()]
+                    &vec![
+                        "responses/chat-basic-nonstream".to_owned(),
+                        "responses/chat-basic-stream".to_owned(),
+                    ]
                 ),
                 (
                     &"responses.chat.web_search".to_owned(),
@@ -1869,6 +1876,61 @@ mod tests {
         assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
         assert!(native_turn.expect.client_sse_events.is_empty());
         assert!(native_turn.expect.upstream_sse_events.is_empty());
+
+        let responses_chat_stream =
+            InferenceScenario::load(&root.join("scenarios/responses/chat-basic-stream.yaml")).unwrap();
+        assert_eq!(responses_chat_stream.version, 1);
+        assert_eq!(responses_chat_stream.id, "responses/chat-basic-stream");
+        assert_eq!(
+            responses_chat_stream.description,
+            "Streaming OpenAI Responses request translated to Chat Completions SSE."
+        );
+        assert_eq!(responses_chat_stream.protocol, InferenceProtocol::OpenaiResponses);
+        assert_eq!(
+            responses_chat_stream.example_config,
+            "openai/responses/responses-to-chat-completions.yaml"
+        );
+        assert_eq!(responses_chat_stream.upstream_authority, "127.0.0.1:3001");
+        assert_eq!(
+            responses_chat_stream.features,
+            ["responses.chat.request", "responses.chat.response.text"]
+        );
+        assert_eq!(responses_chat_stream.turns.len(), 1);
+        let turn = &responses_chat_stream.turns[0];
+        assert_eq!(turn.name, "initial");
+        assert_eq!(turn.request.method, "POST");
+        assert_eq!(turn.request.path, "/v1/responses");
+        assert_eq!(turn.expect.client_status, 200);
+        assert_eq!(turn.expect.client_body_kind, BodyKind::Sse);
+        assert_eq!(turn.expect.upstream_path, "/v1/chat/completions");
+        assert_eq!(turn.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &turn.request.body else {
+            panic!("translated streaming Responses request body must be JSON");
+        };
+        assert_eq!(value["model"], "${MODEL}");
+        assert_eq!(value["input"], "Say hello in one sentence.");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], true);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
+        assert_eq!(
+            turn.expect.client_sse_events,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(turn.expect.client_sse_repeatable_events, ["response.output_text.delta"]);
+        assert!(
+            turn.expect.upstream_sse_events.is_empty(),
+            "Chat Completions upstream chunks are data-only frames"
+        );
     }
 
     #[cfg(unix)]
