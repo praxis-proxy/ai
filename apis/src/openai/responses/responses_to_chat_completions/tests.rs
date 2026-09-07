@@ -1480,11 +1480,14 @@ async fn successful_sse_chunks_translate_to_responses_events() {
     context.set_metadata("openai_responses_format.format", "openai_responses");
     context.set_metadata("openai_responses_format.stream", "true");
     context.set_metadata("responses.response_id", "resp_stream");
-    context.extensions.insert(ResponsesState::from_request_body(json!({
+    let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1-mini",
         "input": "hello",
-        "stream": true
-    })));
+        "stream": true,
+        "tool_choice": "auto"
+    }));
+    state.original_tool_choice = Some(json!({"type": "web_search"}));
+    context.extensions.insert(state);
     let mut request_body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":true}"#,
     ));
@@ -1574,6 +1577,11 @@ async fn successful_sse_chunks_translate_to_responses_events() {
     let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
     assert_eq!(parsed["response"]["status"], "completed");
     assert_eq!(parsed["response"]["output"][0]["content"][0]["text"], "Hello");
+    assert_eq!(
+        parsed["response"]["tool_choice"],
+        json!({"type": "web_search"}),
+        "streaming snapshots must preserve the client's original tool choice across internal rounds",
+    );
 }
 
 #[test]

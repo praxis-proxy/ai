@@ -41,7 +41,7 @@ pub(super) struct ChatChunk<'a> {
 pub(super) struct ChatChoice<'a> {
     /// Choice index; the translation only accepts `0`.
     #[serde(default)]
-    pub index: u64,
+    pub index: Option<u64>,
     /// Incremental delta for this choice.
     #[serde(default, borrow)]
     pub delta: Option<ChatDelta<'a>>,
@@ -56,6 +56,9 @@ pub(super) struct ChatChoice<'a> {
 /// The incremental delta payload of a Chat Completions choice.
 #[derive(Debug, Deserialize)]
 pub(super) struct ChatDelta<'a> {
+    /// Message role, when the provider repeats it in a delta.
+    #[serde(default, borrow)]
+    pub role: Option<Cow<'a, str>>,
     /// Incremental assistant text.
     #[serde(default, borrow)]
     pub content: Option<Cow<'a, str>>,
@@ -129,7 +132,7 @@ mod tests {
         assert_eq!(chunk.id.as_deref(), Some("chatcmpl_1"));
         assert_eq!(chunk.object.as_deref(), Some("chat.completion.chunk"));
         assert_eq!(chunk.choices.len(), 1);
-        assert_eq!(chunk.choices[0].index, 0);
+        assert_eq!(chunk.choices[0].index, Some(0));
         assert_eq!(chunk.choices[0].delta.as_ref().unwrap().content.as_deref(), Some("Hel"));
     }
 

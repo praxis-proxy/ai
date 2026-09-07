@@ -43,6 +43,7 @@ fn converter(limits: StreamLimits) -> StreamConverter {
 fn push(conv: &mut StreamConverter, body: &Value, chunk: &[u8], raw: &mut Vec<u8>) {
     let inputs = SnapshotInputs {
         request_body: body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv.push(chunk, &inputs).unwrap() {
@@ -54,6 +55,7 @@ fn push(conv: &mut StreamConverter, body: &Value, chunk: &[u8], raw: &mut Vec<u8
 fn finish(conv: &mut StreamConverter, body: &Value, raw: &mut Vec<u8>) {
     let inputs = SnapshotInputs {
         request_body: body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv.finish(&inputs).unwrap() {
@@ -335,6 +337,43 @@ fn single_tool_call_emits_function_events() {
         }]
     });
     assert_eq!(events.last().unwrap().1["response"], finite_resource(&full));
+}
+
+#[test]
+fn non_assistant_role_fails_closed() {
+    let events = run_stream(
+        &[
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"role":"user","content":"not assistant output"}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ],
+        wide_limits(),
+    );
+
+    assert_eq!(
+        events.last().expect("stream should terminate after an invalid role").0,
+        "response.failed",
+        "a non-assistant provider delta must fail closed",
+    );
+}
+
+#[test]
+fn missing_choice_index_fails_closed() {
+    let events = run_stream(
+        &[
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"delta":{"content":"missing index"}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ],
+        wide_limits(),
+    );
+
+    assert_eq!(
+        events
+            .last()
+            .expect("stream should terminate after a missing choice index")
+            .0,
+        "response.failed",
+        "a provider choice without its required index must fail closed",
+    );
 }
 
 #[test]
@@ -631,6 +670,7 @@ fn partial_frame_after_terminal_fails_at_eof() {
     );
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     // A partial trailing frame (no blank line) buffers but yields no complete
@@ -1063,6 +1103,7 @@ fn trailing_frame_after_terminal_in_later_callback_fails() {
     );
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     let result = conv.push(
@@ -1083,6 +1124,7 @@ fn trailing_frame_after_terminal_in_same_callback_fails() {
     let mut conv = converter(wide_limits());
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     let mut chunk = provider_stream(&[
@@ -1115,6 +1157,7 @@ fn empty_callback_after_terminal_is_tolerated() {
     );
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     let result = conv
@@ -1257,6 +1300,7 @@ fn timeout_emits_failed() {
     // First push establishes the start time.
     let first = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: 100,
     };
     if let Some(bytes) = conv
@@ -1271,6 +1315,7 @@ fn timeout_emits_failed() {
     // A later push beyond the timeout window fails.
     let late = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: 200,
     };
     if let Some(bytes) = conv
@@ -1390,6 +1435,7 @@ fn failed_terminal_does_not_echo_unbounded_request_fields() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     // Tiny output passes the incremental charge, but echoing the large request
@@ -1445,6 +1491,7 @@ fn failed_terminal_fallback_is_schema_complete() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv
@@ -1514,6 +1561,7 @@ fn failed_terminal_fallback_is_bounded_by_request_fields() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv
@@ -1569,6 +1617,7 @@ fn bounded_failure_has_null_completed_at() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv
@@ -1615,6 +1664,7 @@ fn finish_after_timeout_emits_failed() {
     // terminal (no `[DONE]`), so the terminal is deferred to `finish`.
     let started = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: 100,
     };
     if let Some(bytes) = conv
@@ -1629,6 +1679,7 @@ fn finish_after_timeout_emits_failed() {
     // The EOF callback arrives well past the timeout window.
     let elapsed = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: 200,
     };
     if let Some(bytes) = conv.finish(&elapsed).unwrap() {
@@ -1804,6 +1855,7 @@ fn large_lifecycle_frame_needs_accumulator_headroom() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv
@@ -1909,6 +1961,7 @@ fn lifecycle_frame_overflow_rolls_back_the_pair() {
     });
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     let mut probe = converter(wide_limits());
@@ -2055,6 +2108,7 @@ fn terminal_over_byte_limit_fails_without_committed_items() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv
@@ -2114,6 +2168,7 @@ fn oversized_lifecycle_frame_fails_closed_with_minimal_snapshot() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv
@@ -2201,6 +2256,7 @@ fn minimal_failed_frame_persists_under_default_accumulator() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv
@@ -2373,6 +2429,7 @@ fn minimal_terminal_fits_at_floor_ceiling() {
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
         request_body: &body,
+        original_tool_choice: None,
         now: NOW,
     };
     if let Some(bytes) = conv

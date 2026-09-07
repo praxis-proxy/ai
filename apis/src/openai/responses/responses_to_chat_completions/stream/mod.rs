@@ -75,6 +75,8 @@ pub(super) struct StreamLimits {
 pub(super) struct SnapshotInputs<'a> {
     /// Original canonical Responses request body.
     pub(super) request_body: &'a Value,
+    /// Client-visible tool choice preserved across internal agentic rounds.
+    pub(super) original_tool_choice: Option<&'a Value>,
     /// Current wall-clock time in seconds.
     pub(super) now: u64,
 }
@@ -119,6 +121,8 @@ enum ConvertError {
     MultipleChoices,
     /// The single choice used an index other than zero.
     InvalidChoiceIndex,
+    /// A streamed delta declared a role other than `assistant`.
+    UnexpectedRole,
     /// Chunk `id` or `model` changed mid-stream.
     InconsistentMetadata,
     /// The first Chat chunk was missing a required identity field (`id`,
@@ -534,7 +538,7 @@ impl StreamConverter {
                 if matches!(self.phase, Phase::ProviderDone) {
                     return Err(ConvertError::DataAfterFinish);
                 }
-                if choice.index != 0 {
+                if choice.index != Some(0) {
                     return Err(ConvertError::InvalidChoiceIndex);
                 }
                 self.process_choice(choice, inputs, out)
@@ -623,6 +627,9 @@ impl StreamConverter {
         out: &mut Vec<u8>,
     ) -> Result<(), ConvertError> {
         if let Some(delta) = &choice.delta {
+            if delta.role.as_deref().is_some_and(|role| role != "assistant") {
+                return Err(ConvertError::UnexpectedRole);
+            }
             if delta.function_call.is_some() {
                 // Legacy singular function calling is not translated; failing
                 // closed avoids silently completing the stream with empty output.
@@ -1614,8 +1621,11 @@ impl StreamConverter {
 
     /// Build a response context borrowing the request body.
     fn response_context<'a>(&self, inputs: &SnapshotInputs<'a>, completed_at: Option<u64>) -> ResponseContext<'a> {
-        let context =
+        let mut context =
             ResponseContext::from_responses_request(inputs.request_body, self.response_id.clone(), self.created_at);
+        if let Some(original_tool_choice) = inputs.original_tool_choice {
+            context.tool_choice = Some(original_tool_choice);
+        }
         match completed_at {
             Some(timestamp) => context.with_completed_at(timestamp),
             None => context,
@@ -1844,6 +1854,7 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::MultipleChoices | ConvertError::InvalidChoiceIndex => {
             "upstream returned an unsupported multi-choice stream"
         },
+        ConvertError::UnexpectedRole => "upstream stream used an unexpected message role",
         ConvertError::InconsistentMetadata => "upstream stream metadata changed mid-response",
         ConvertError::MissingChunkMetadata => "upstream stream omitted required chunk metadata",
         ConvertError::UnexpectedObject => "upstream returned an unexpected stream object",

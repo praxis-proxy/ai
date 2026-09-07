@@ -285,15 +285,19 @@ impl ResponsesToChatCompletionsFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Err("responses_to_chat_completions: missing Responses state for streaming translation".into());
         };
-        let request_body = &state.request_body;
+        let inputs = SnapshotInputs {
+            request_body: &state.request_body,
+            original_tool_choice: state.original_tool_choice.as_ref(),
+            now,
+        };
 
         let mut out = Vec::new();
         if let Some(chunk) = body.take()
-            && let Some(events) = converter.push(&chunk, &SnapshotInputs { request_body, now })?
+            && let Some(events) = converter.push(&chunk, &inputs)?
         {
             out.extend_from_slice(&events);
         }
-        if end_of_stream && let Some(events) = converter.finish(&SnapshotInputs { request_body, now })? {
+        if end_of_stream && let Some(events) = converter.finish(&inputs)? {
             out.extend_from_slice(&events);
         }
 
