@@ -1122,6 +1122,15 @@ def _write_file_search_chat_config(praxis_port: int) -> str:
     Exercises the real example config (per repo test requirements) while
     retargeting the vector-store callout at OGX and the model backend at
     vLLM's /v1/chat/completions endpoint.
+
+    The shipped example carries production-facing iterative_request_router
+    deadlines (120s overall / 60s per step) sized for a real GPU backend.
+    This test drives a CPU-only vLLM under heavy co-located CI load (postgres
+    + vLLM + OGX on one runner), where a single inference round -- especially
+    the second, whose prompt now carries the file_search results -- can exceed
+    the 60s step budget and get aborted by the IRR with a 504 (a load-driven
+    flake, seen only in the postgres variant). Raise the CI-only budgets to
+    match TestFileSearchVLLM without changing the shipped example's defaults.
     """
     with open(FILE_SEARCH_CHAT_CONFIG_PATH) as f:
         config = f.read()
@@ -1129,6 +1138,24 @@ def _write_file_search_chat_config(praxis_port: int) -> str:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = config.replace("127.0.0.1:8001", _ogx_endpoint())
+
+    # Generous CI deadlines for CPU-only vLLM (mirror TestFileSearchVLLM).
+    # Both the overall and per-step IRR budgets must rise together: bumping
+    # only the step budget would leave the 120s overall deadline to fire
+    # first on a slow multi-round flow.
+    config = config.replace("timeout_ms: 120000", "timeout_ms: 300000")
+    config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
+    # Give the vector-store search callout the same headroom the sibling uses
+    # so a slow OGX search under load is not the next flake source.
+    config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
+    # Once the step budget is 300s, keep the upstream read timeout from
+    # becoming the new binding limit (it defaults to None; set >= step budget).
+    config = config.replace(
+        '- name: "chat-completions-backend"\n                    endpoints:',
+        '- name: "chat-completions-backend"\n'
+        "                    read_timeout_ms: 300000\n"
+        "                    endpoints:",
+    )
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
