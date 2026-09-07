@@ -390,6 +390,37 @@ fn hosted_web_search_stream_emits_only_canonical_items() {
 }
 
 #[test]
+fn incomplete_hosted_web_search_uses_a_valid_item_status() {
+    let body = json!({
+        "model": "gpt-4.1-mini",
+        "input": "search for Praxis Proxy",
+        "stream": true,
+        "tools": [{"type": "web_search"}]
+    });
+    let events = run_stream_with_body(
+        &[
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search_1","function":{"name":"web_search","arguments":"{\"query\":\"Praxis Proxy\"}"}}]}}]}"#,
+            r#"{"id":"c1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        ],
+        &body,
+        wide_limits(),
+    );
+
+    let item_done = events
+        .iter()
+        .find(|(name, _)| name == "response.output_item.done")
+        .expect("hosted search should emit a completed output-item event");
+    assert_eq!(
+        item_done.1["item"]["status"], "failed",
+        "an interrupted hosted search must use a status allowed by WebSearchToolCall",
+    );
+    let terminal = events.last().expect("stream should emit a terminal event");
+    assert_eq!(terminal.0, "response.incomplete");
+    assert_eq!(terminal.1["response"]["status"], "incomplete");
+    assert_eq!(terminal.1["response"]["output"][0]["status"], "failed");
+}
+
+#[test]
 fn multiple_tool_calls_preserve_output_order() {
     let events = run_stream(
         &[

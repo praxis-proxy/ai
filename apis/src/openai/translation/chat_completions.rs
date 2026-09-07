@@ -1716,6 +1716,11 @@ pub(crate) fn web_search_call_output_item_from_parts(
         return Err(TranslationError::InvalidWebSearchCall("missing call id"));
     }
     let query = web_search_query(arguments)?;
+    // The response can be incomplete because generation hit a token or content
+    // filter limit, but WebSearchToolCall has no `incomplete` item status.
+    // Preserve the response-level status and represent the interrupted hosted
+    // call with the schema's fail-closed `failed` status.
+    let status = if status == "incomplete" { "failed" } else { status };
 
     Ok(json!({
         "id": call_id,
