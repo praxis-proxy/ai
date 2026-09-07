@@ -1272,6 +1272,26 @@ fn remaining_budget_dedups_file_search_call_across_collections() {
     );
 }
 
+#[test]
+fn remaining_budget_ignores_pending_file_search_calls() {
+    // A file-search call that is still `searching`/`in_progress` has not yet
+    // consumed a provider call, so it must not draw down the shared budget.
+    // `remaining_file_search_call_budget` already excludes these placeholders;
+    // counting them here would let a mixed pending file-search/web-search
+    // response decline the web search before either call runs.
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 1}));
+    state.accumulated_output = vec![
+        serde_json::json!({"type": "file_search_call", "id": "fs_pending", "status": "searching"}),
+        serde_json::json!({"type": "web_search_call", "id": "ws_pending", "status": "in_progress"}),
+    ];
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        1,
+        "a pending file search must not exhaust the shared max_tool_calls budget"
+    );
+}
+
 #[tokio::test]
 async fn on_request_body_honors_client_max_tool_calls() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

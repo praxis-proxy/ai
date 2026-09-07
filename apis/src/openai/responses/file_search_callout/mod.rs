@@ -1312,7 +1312,11 @@ fn unsupported_streaming_rejection(ctx: &HttpFilterContext<'_>) -> Option<Filter
 }
 
 /// Return whether one output item still requires local file-search execution.
-fn is_pending_file_search_call(item: &Value) -> bool {
+///
+/// Shared with `openai_web_search`, which must exclude these pending
+/// placeholders when counting non-web built-in calls against the shared
+/// `max_tool_calls` budget, mirroring [`remaining_file_search_call_budget`].
+pub(crate) fn is_pending_file_search_call(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("file_search_call")
         && matches!(
             item.get("status").and_then(Value::as_str),

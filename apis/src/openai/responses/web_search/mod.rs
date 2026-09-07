@@ -428,7 +428,12 @@ fn remaining_web_search_budget(state: &ResponsesState) -> usize {
 /// because a single call can be echoed into more than one collection (e.g.
 /// accumulated during the response phase *and* retained after the move).
 /// Web-search calls are excluded here; they are tracked through
-/// [`ResponsesState::web_search_calls_executed`].
+/// [`ResponsesState::web_search_calls_executed`]. Pending file-search
+/// placeholders (`searching`/`in_progress`) are also excluded, mirroring
+/// [`remaining_file_search_call_budget`](super::file_search_callout): they have
+/// not yet consumed a provider call, so counting them would let a mixed pending
+/// file-search/web-search response decline the web search before either call
+/// runs.
 fn count_non_web_builtin_calls(state: &ResponsesState) -> usize {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut count = 0_usize;
@@ -439,7 +444,8 @@ fn count_non_web_builtin_calls(state: &ResponsesState) -> usize {
         .chain(state.output_items());
     for item in candidates {
         let is_non_web_builtin = super::file_search_callout::is_builtin_tool_call(item)
-            && item.get("type").and_then(Value::as_str) != Some("web_search_call");
+            && item.get("type").and_then(Value::as_str) != Some("web_search_call")
+            && !super::file_search_callout::is_pending_file_search_call(item);
         if !is_non_web_builtin {
             continue;
         }
