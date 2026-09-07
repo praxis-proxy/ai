@@ -48,6 +48,9 @@ AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 IRR_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/irr-terminal-streaming.yaml"
 )
+CHAT_STREAMING_CONFIG_PATH = (
+    "examples/configs/openai/responses/responses-to-chat-completions.yaml"
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -139,6 +142,21 @@ def _write_irr_streaming_config(praxis_port: int) -> str:
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+def _write_chat_streaming_config(praxis_port: int, db_path: str) -> str:
+    """Patch the shipped Responses-to-Chat example for live vLLM."""
+    with open(CHAT_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+    config = _patch_store_backend(config, db_path)
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
@@ -402,6 +420,45 @@ def irr_streaming_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
+def chat_streaming_proxy(tmp_path_factory, request):
+    """Start the Responses-to-Chat streaming example against live vLLM."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-chat-streaming")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_chat_streaming_config(port, db_path)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Chat streaming Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
 def openai_client(praxis_proxy):
     """Return an OpenAI client pointed at the local Praxis proxy."""
     return OpenAI(
@@ -417,6 +474,17 @@ def irr_streaming_client(irr_streaming_proxy):
     """Return an OpenAI client using the terminal-streaming IRR proxy."""
     return OpenAI(
         base_url=f"http://127.0.0.1:{irr_streaming_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def chat_streaming_client(chat_streaming_proxy):
+    """Return an SDK client using Responses-to-Chat stream translation."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{chat_streaming_proxy}/v1",
         api_key="test",
         max_retries=0,
         timeout=300,
@@ -660,6 +728,54 @@ class TestOpenAIResponsesVLLM:
         assert event_types[-1] == "response.completed", event_types
         assert final_status == "completed", final_status
         assert "STREAM-OK" in "".join(text_parts), text_parts
+
+
+class TestResponsesToChatCompletionsVLLM:
+    """Live SDK coverage for Chat Completions SSE translation."""
+
+    def test_streaming_response_round_trip(self, chat_streaming_client):
+        stream = chat_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: CHAT-STREAM-OK /no_think",
+            store=True,
+            stream=True,
+            max_output_tokens=128,
+        )
+
+        event_types = []
+        text_parts = []
+        response_id = None
+        final_status = None
+
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.created":
+                response_id = event.response.id
+            elif event.type == "response.output_text.delta":
+                text_parts.append(event.delta)
+            elif event.type == "response.completed":
+                final_status = event.response.status
+
+        assert event_types[0] == "response.created", event_types
+        assert "response.in_progress" in event_types, event_types
+        assert "response.output_text.delta" in event_types, event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_status == "completed", final_status
+        assert "CHAT-STREAM-OK" in "".join(text_parts), text_parts
+        assert response_id, "response.created should carry a response ID"
+
+        retrieved = chat_streaming_client.responses.retrieve(response_id)
+        assert retrieved.id == response_id, (
+            f"retrieved response ID {retrieved.id!r} should match "
+            f"streamed ID {response_id!r}"
+        )
+        assert retrieved.status == "completed", (
+            f"retrieved response should be completed; got {retrieved.status!r}"
+        )
+        assert "CHAT-STREAM-OK" in retrieved.output_text, (
+            "retrieved response should contain the streamed marker; "
+            f"got {retrieved.output_text!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
