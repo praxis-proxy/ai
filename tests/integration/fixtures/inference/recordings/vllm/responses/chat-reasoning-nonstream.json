@@ -1,0 +1,210 @@
+{
+  "version": 1,
+  "scenario_id": "responses/chat-reasoning-nonstream",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "live",
+    "provider": "vllm",
+    "model": "google/gemma-4-12B-it",
+    "source_id": null
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-bbbd6b6b557feaaf": "chatcmpl-recorded-0004",
+      "msg_resp_5a89eadc8326eef31576000000000000": "msg_recorded_0003",
+      "resp_5a89eadc8326eef31576000000000000": "resp_recorded_0001",
+      "rs_resp_5a89eadc8326eef31576000000000000": "rs_recorded_0002"
+    }
+  },
+  "turns": [
+    {
+      "name": "reasoning",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is 2+2? Reply with just the number.",
+              "model": "google/gemma-4-12B-it",
+              "reasoning": {
+                "effort": "medium"
+              },
+              "store": true,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": "1970-01-01T00:00:00Z",
+              "error": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "What is 2+2? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "max_tool_calls": null,
+              "metadata": {},
+              "model": "google/gemma-4-12B-it",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "text": "The user is asking for the result of 2+2.\nThe user specifies to reply with \"just the number\".\n\nCalculation: 2 + 2 = 4.\nConstraint: Only the number.",
+                      "type": "reasoning_text"
+                    }
+                  ],
+                  "id": "rs_recorded_0002",
+                  "status": "completed",
+                  "summary": [],
+                  "type": "reasoning"
+                },
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0003",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt_cache_key": null,
+              "reasoning": {
+                "effort": "medium",
+                "summary": null
+              },
+              "safety_identifier": null,
+              "service_tier": null,
+              "status": "completed",
+              "store": true,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_logprobs": 0,
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 29,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 50,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 79
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "google/gemma-4-12B-it",
+              "reasoning_effort": "medium",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "logprobs": null,
+                  "message": {
+                    "annotations": null,
+                    "audio": null,
+                    "content": "4",
+                    "function_call": null,
+                    "reasoning": "The user is asking for the result of 2+2.\nThe user specifies to reply with \"just the number\".\n\nCalculation: 2 + 2 = 4.\nConstraint: Only the number.",
+                    "refusal": null,
+                    "role": "assistant",
+                    "tool_calls": []
+                  },
+                  "routed_experts": null,
+                  "stop_reason": 106,
+                  "token_ids": null
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0004",
+              "kv_transfer_params": null,
+              "model": "google/gemma-4-12B-it",
+              "object": "chat.completion",
+              "prompt_logprobs": null,
+              "prompt_text": null,
+              "prompt_token_ids": null,
+              "service_tier": null,
+              "usage": {
+                "completion_tokens": 50,
+                "prompt_tokens": 29,
+                "prompt_tokens_details": null,
+                "total_tokens": 79
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

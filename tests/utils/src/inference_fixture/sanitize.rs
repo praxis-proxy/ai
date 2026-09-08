@@ -738,6 +738,7 @@ fn is_identifier_key(key: &str) -> bool {
 fn identifier_prefix(identifier: &str) -> Option<&'static str> {
     [
         ("resp_", "resp_recorded_"),
+        ("rs_", "rs_recorded_"),
         ("msg_", "msg_recorded_"),
         ("chatcmpl-", "chatcmpl-recorded-"),
         ("call_", "call_recorded_"),
