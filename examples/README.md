@@ -86,6 +86,7 @@ before sending requests.
 | [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists non-streaming Responses API responses to a database and serves stored data via GET endpoints and handles DELETE /v1/responses/{id} locally |
 | [responses-proxy.yaml](configs/openai/responses/responses-proxy.yaml) | Proxies OpenAI Responses API requests to a native /v1/responses backend |
 | [responses-routing.yaml](configs/openai/responses/responses-routing.yaml) | Routes Responses API traffic by detected mode |
+| [responses-to-chat-completions-reasoning.yaml](configs/openai/responses/responses-to-chat-completions-reasoning.yaml) | Same pipeline as responses-to-chat-completions.yaml, but targets a vLLM backend that returns reasoning in choices[].message.reasoning |
 | [responses-to-chat-completions.yaml](configs/openai/responses/responses-to-chat-completions.yaml) | Accepts OpenAI Responses create requests, including finite stored continuations, while targeting a backend that only implements /v1/chat/completions |
 | [stream-events.yaml](configs/openai/responses/stream-events.yaml) | Demonstrates the `openai_stream_events` filter, which observes SSE chunks from the backend without modification, accumulates state (response object, output items, tool calls, usage), and writes it to ResponsesState metadata |
 | [tool-routing.yaml](configs/openai/responses/tool-routing.yaml) | Demonstrates using `openai_tool_parse` to route Responses API requests by their tool composition |

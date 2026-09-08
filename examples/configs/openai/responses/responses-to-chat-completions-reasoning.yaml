@@ -1,0 +1,74 @@
+# Responses API to Chat Completions with reasoning translation
+#
+# Same pipeline as responses-to-chat-completions.yaml, but targets a vLLM
+# backend that returns raw reasoning in choices[].message.reasoning. The reasoning
+# dialect promotes that raw reasoning into a Responses reasoning output item.
+#
+# Reasoning dialect contract (see the responses_to_chat_completions filter):
+#   - dialect: vllm reads message.reasoning (the current vLLM field) and
+#     falls back to the deprecated message.reasoning_content alias
+#     for older backends, emitting it as a reasoning item whose content is
+#     reasoning_text. Raw reasoning is never placed in the item summary, which
+#     is reserved for safe summaries.
+#   - vLLM has no safe-summary capability, so a client that requests
+#     reasoning.summary (or the deprecated reasoning.generate_summary) is
+#     rejected with a 400 before the request is forwarded.
+#   - max_reasoning_bytes bounds the raw reasoning preserved per
+#     response; oversized reasoning fails closed rather than truncating.
+#
+# Streaming reasoning translation is out of scope for this base filter and is
+# tracked in https://github.com/praxis-proxy/ai/issues/36.
+
+listeners:
+  - name: responses-chat-reasoning-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-chat-reasoning-translation]
+
+filter_chains:
+  - name: responses-chat-reasoning-translation
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: responses_to_chat_completions
+        max_body_bytes: 67108864
+        reasoning:
+          dialect: vllm
+          max_reasoning_bytes: 65536
+
+      - filter: path_rewrite
+        replace:
+          pattern: "^/v1/responses/?$"
+          replacement: "/v1/chat/completions"
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+              methods: [POST]
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "chat-completions-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "chat-completions-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
