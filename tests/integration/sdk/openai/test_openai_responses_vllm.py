@@ -994,13 +994,20 @@ class TestOpenAIResponsesVLLM:
                 input="Remember the color ultramarine. /no_think",
                 conversation={"id": conversation.id},
                 store=True,
+                temperature=0,
                 max_output_tokens=128,
             )
+            # Ask the model to echo the earlier color rather than recall it in
+            # free form: the small CI model reliably repeats an exact token from
+            # loaded context but may paraphrase a "which color" question. This
+            # still proves the first turn's context was appended back and
+            # reloaded for the second turn.
             second = openai_client.responses.create(
                 model=VLLM_MODEL,
-                input="Which color did I name? /no_think",
+                input="Repeat the exact color name I told you to remember. /no_think",
                 conversation=conversation.id,
                 store=True,
+                temperature=0,
                 max_output_tokens=128,
             )
 
@@ -1219,7 +1226,16 @@ class TestOpenAIResponsesVLLM:
                     "type": "function_call_output",
                     "call_id": function_calls[0].call_id,
                     "output": "The weather is 72F and sunny.",
-                }
+                },
+                # Give the model an explicit instruction to report the tool
+                # result. Without a directive the small CI model may resume with
+                # an empty assistant message; this keeps the test focused on the
+                # proxy resuming inference from a client-provided function output.
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "Tell me the weather using the tool result. /no_think",
+                },
             ],
             tools=[
                 {
@@ -1237,6 +1253,7 @@ class TestOpenAIResponsesVLLM:
             ],
             tool_choice="none",
             store=True,
+            temperature=0,
             max_output_tokens=256,
         )
 
