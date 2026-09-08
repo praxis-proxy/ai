@@ -1513,58 +1513,6 @@ async fn rehydrates_from_conversation_object_form() {
 }
 
 #[tokio::test]
-async fn previous_response_id_takes_precedence_over_conversation() {
-    let response_messages = json!([
-        {"role": "user", "content": "from response"},
-        {"role": "assistant", "content": "response reply"}
-    ]);
-    let mut store = MockStore::with_completed_response("resp_win", json!("from response"), response_messages);
-    store.conversations.insert(
-        "conv_lose".to_owned(),
-        ConversationRecord {
-            conversation_id: "conv_lose".to_owned(),
-            tenant_id: "default".to_owned(),
-            created_at: 1000,
-            metadata: json!({}),
-            messages: json!([
-                {"role": "user", "content": "from conversation"},
-                {"role": "assistant", "content": "conversation reply"}
-            ]),
-        },
-    );
-    let registry = setup_registry(store);
-
-    let filter = default_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"model":"gpt-4.1","input":"next","previous_response_id":"resp_win","conversation":"conv_lose"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Release),
-        "should release after rehydration"
-    );
-
-    let state = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .expect("ResponsesState should be populated");
-    assert_eq!(
-        state.messages[0]["content"], "from response",
-        "previous_response_id should take precedence over conversation"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.previous_response_id"),
-        Some("resp_win"),
-        "previous_response_id metadata should be set"
-    );
-}
-
-#[tokio::test]
 async fn rejects_when_conversation_not_found() {
     let store = MockStore::empty();
     let registry = setup_registry(store);

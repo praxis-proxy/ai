@@ -17,11 +17,16 @@ use praxis_filter::Rejection;
 ///
 /// Produces `{"error":{"message":"<msg>","type":"<code>","param":null,"code":"<code>"}}`.
 pub(crate) fn responses_error_body(code: &str, message: &str) -> Bytes {
+    responses_error_body_with_code(code, code, message)
+}
+
+/// Build a non-streaming OpenAI API error JSON body with distinct type and code.
+fn responses_error_body_with_code(error_type: &str, code: &str, message: &str) -> Bytes {
     Bytes::from(
         serde_json::json!({
             "error": {
                 "message": message,
-                "type": code,
+                "type": error_type,
                 "param": null,
                 "code": code,
             },
@@ -77,9 +82,19 @@ fn responses_error_sse_payload_at_sequence(code: &str, message: &str, sequence_n
 /// emitted by the `stream_events` filter, not here. Every rejection therefore
 /// uses `application/json`.
 pub(crate) fn responses_error_rejection(status: u16, code: &str, message: &str) -> Rejection {
+    responses_error_rejection_with_code(status, code, code, message)
+}
+
+/// Build a [`Rejection`] with distinct OpenAI error type and code values.
+pub(crate) fn responses_error_rejection_with_code(
+    status: u16,
+    error_type: &str,
+    code: &str,
+    message: &str,
+) -> Rejection {
     Rejection::status(status)
         .with_header("content-type", "application/json")
-        .with_body(responses_error_body(code, message))
+        .with_body(responses_error_body_with_code(error_type, code, message))
 }
 
 // -----------------------------------------------------------------------------
@@ -113,6 +128,27 @@ mod tests {
         );
         assert_eq!(parsed["error"]["message"], "bad input", "message field should match");
         assert!(parsed["error"]["param"].is_null(), "param should be null");
+    }
+
+    #[test]
+    fn rejection_supports_distinct_error_type_and_code() {
+        let rejection = responses_error_rejection_with_code(
+            400,
+            "invalid_request_error",
+            "mutually_exclusive_parameters",
+            "bad input",
+        );
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "error type should match"
+        );
+        assert_eq!(
+            body["error"]["code"], "mutually_exclusive_parameters",
+            "error code should match"
+        );
+        assert!(body["error"]["param"].is_null(), "param should be null");
     }
 
     #[test]

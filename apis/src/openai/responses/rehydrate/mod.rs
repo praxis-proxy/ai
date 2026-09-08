@@ -120,8 +120,8 @@ impl RehydrateFilter {
     /// `conversation`), and populate [`ResponsesState`] with the full
     /// conversation history.
     ///
-    /// `previous_response_id` takes precedence when both fields are
-    /// present.
+    /// The upstream `openai_responses_validate` filter rejects requests that
+    /// supply both selectors; the resolution order here is a silent fallback.
     async fn rehydrate(
         &self,
         ctx: &mut HttpFilterContext<'_>,

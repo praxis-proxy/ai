@@ -1355,6 +1355,29 @@ class TestOpenAIResponsesVLLM:
             f"previous_response_id; got: {lifecycle_previous_ids}"
         )
 
+    @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+    def test_conflicting_history_selectors_error_shape(self, openai_client, stream):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="next",
+                previous_response_id="resp_previous",
+                conversation="conv_existing",
+                stream=stream,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.body == {
+            "code": "mutually_exclusive_parameters",
+            "message": (
+                "Mutually exclusive parameters. Ensure you are only providing "
+                "one of: 'previous_response_id' or 'conversation'."
+            ),
+            "param": None,
+            "type": "invalid_request_error",
+        }
+
     def test_doc_extract_inline_file_to(self, openai_client):
         """Issue #397: inline file_data is extracted to input_text and
         consumed by vLLM inference.

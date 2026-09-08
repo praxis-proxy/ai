@@ -19,8 +19,9 @@
 //! request body.
 //!
 //! The `openai_responses_validate` filter runs after the classifier
-//! to validate JSON syntax and extract additional fields without
-//! rejecting provider-owned parameter combinations.
+//! to validate JSON syntax, reject conflicting history selectors, and
+//! extract additional fields without rejecting provider-owned parameter
+//! combinations.
 
 pub(crate) mod agentic_loop;
 mod body_limits;

@@ -10,9 +10,9 @@
 //! `openai_responses_format.*` metadata.
 //!
 //! This filter validates that the body is JSON, then does targeted field
-//! extraction for `conversation.id`. It does **not** deserialize the full
-//! body into a typed struct or validate provider-owned parameter
-//! combinations.
+//! extraction for `conversation.id` and mutually exclusive history
+//! selectors. It does **not** deserialize the full body into a typed
+//! struct or validate provider-owned parameter combinations.
 //!
 //! # YAML
 //!
@@ -29,7 +29,11 @@ use praxis_filter::{
 };
 use tracing::{debug, trace};
 
-use super::{error::responses_error_rejection, extract_conversation_id, state::ResponsesState};
+use super::{
+    error::{responses_error_rejection, responses_error_rejection_with_code},
+    extract_conversation_id,
+    state::ResponsesState,
+};
 
 // -----------------------------------------------------------------------------
 // OpenaiResponsesValidateFilter
@@ -104,11 +108,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         }
 
         if is_bodyless_responses_request(&ctx.request.method, ctx.request.uri.path()) {
-            trace!(
-                method = %ctx.request.method,
-                path = ctx.request.uri.path(),
-                "skipping validation for bodyless endpoint"
-            );
+            trace!(method = %ctx.request.method, path = ctx.request.uri.path(), "skipping validation for bodyless endpoint");
             return Ok(FilterAction::Release);
         }
 
@@ -116,6 +116,9 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
             Ok(v) => v,
             Err(action) => return Ok(action),
         };
+        if let Some(action) = reject_conflicting_history_selectors(&parsed) {
+            return Ok(action);
+        }
 
         let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
         let conversation_id = resolve_conversation_id(ctx, &parsed);
@@ -158,6 +161,20 @@ fn parse_request_body(body: &Option<Bytes>) -> Result<serde_json::Value, FilterA
             Err(reject_invalid(&format!("invalid request body: {e}")))
         },
     }
+}
+
+/// Reject requests that select both supported sources of conversation history.
+fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<FilterAction> {
+    let conflicts = body.get("previous_response_id").is_some_and(|value| !value.is_null())
+        && body.get("conversation").is_some_and(|value| !value.is_null());
+    conflicts.then(|| {
+        FilterAction::Reject(responses_error_rejection_with_code(
+            400,
+            "invalid_request_error",
+            "mutually_exclusive_parameters",
+            "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        ))
+    })
 }
 
 /// Check whether a Responses endpoint has no JSON request body to validate.
@@ -376,6 +393,46 @@ mod tests {
             Some("conv_existing_123"),
             "bare-string conversation ID should be extracted from request body"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_conflicting_history_selectors() {
+        let action = run_filter_raw(
+            r#"{"input":"next","previous_response_id":"resp_win","conversation":"conv_lose"}"#,
+            &[],
+        )
+        .await;
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected rejection");
+        };
+        assert_eq!(rejection.status, 400);
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "mutually_exclusive_parameters");
+        assert_eq!(
+            body["error"]["message"],
+            "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'."
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_selector_conflict_uses_json_validation_error() {
+        let action = run_filter_raw(
+            r#"{"input":"next","previous_response_id":"resp_win","conversation":"conv_lose","stream":true}"#,
+            &[("openai_responses_format.stream", "true")],
+        )
+        .await;
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected rejection");
+        };
+        assert_eq!(rejection.status, 400);
+        assert_eq!(
+            rejection.headers.iter().find(|(name, _)| name == "content-type"),
+            Some(&("content-type".to_owned(), "application/json".to_owned()))
+        );
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "mutually_exclusive_parameters");
     }
 
     #[tokio::test]
