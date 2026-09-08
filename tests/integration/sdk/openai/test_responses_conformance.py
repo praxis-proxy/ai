@@ -6,7 +6,7 @@
 
 Boots a Praxis listener that translates POST /v1/responses -> POST
 /v1/chat/completions, fronts a vLLM CPU backend with a translation-witness
-shim, and runs the pinned OpenResponses Bun suite against the applicable
+shim, and runs the pinned OpenResponses Bun suite against the supported
 templates. Never exercises native Responses passthrough.
 """
 
@@ -61,10 +61,11 @@ def _load_manifest() -> dict:
     return yaml.safe_load(MANIFEST_PATH.read_text())
 
 
-def _manifest_ids(manifest: dict) -> tuple[set[str], set[str]]:
-    applicable = {entry["id"] for entry in manifest["applicable"]}
-    skipped = {entry["id"] for entry in manifest["skip"]}
-    return applicable, skipped
+def _manifest_ids(manifest: dict) -> tuple[set[str], set[str], set[str]]:
+    supported = {entry["id"] for entry in manifest["supported"]}
+    unsupported = {entry["id"] for entry in manifest["unsupported"]}
+    inapplicable = {entry["id"] for entry in manifest["inapplicable"]}
+    return supported, unsupported, inapplicable
 
 
 def _ensure_suite() -> Path:
@@ -92,6 +93,18 @@ def _enumerate_template_ids(suite_dir: Path) -> set[str]:
 
     text = (suite_dir / "src/lib/compliance-tests.ts").read_text()
     return set(re.findall(r'^    id: "(.+?)",?$', text, re.MULTILINE))
+
+
+def _run_compliance(suite_dir: Path, listener_port: int, ids: set[str]) -> subprocess.CompletedProcess:
+    cmd = [
+        "bun", "run", "bin/compliance-test.ts",
+        "--base-url", f"http://127.0.0.1:{listener_port}/v1",
+        "--api-key", "test",
+        "--model", VLLM_MODEL,
+        "--filter", ",".join(sorted(ids)),
+        "--json",
+    ]
+    return subprocess.run(cmd, cwd=suite_dir, capture_output=True, text=True)
 
 
 class _WitnessHandler(BaseHTTPRequestHandler):
@@ -184,16 +197,16 @@ def praxis_proxy(tmp_path):
 
 def test_suite_template_ids_are_fully_triaged():
     suite_dir = _ensure_suite()
-    applicable, skipped = _manifest_ids(_load_manifest())
+    supported, unsupported, inapplicable = _manifest_ids(_load_manifest())
     enumerated = _enumerate_template_ids(suite_dir)
-    triaged = applicable | skipped
+    triaged = supported | unsupported | inapplicable
     assert enumerated == triaged, (
         f"untriaged templates: {sorted(enumerated - triaged)}; "
         f"stale manifest ids: {sorted(triaged - enumerated)}"
     )
 
 
-def test_openresponses_conformance_applicable_all_pass(praxis_proxy):
+def test_openresponses_conformance_supported_all_pass(praxis_proxy):
     # In CI the composite action's readiness step guarantees vLLM is up before
     # this runs, so this skip only fires for local runs without a backend.
     try:
@@ -202,21 +215,38 @@ def test_openresponses_conformance_applicable_all_pass(praxis_proxy):
         pytest.skip(f"vLLM not reachable at {VLLM_BASE_URL}")
     listener_port, seen = praxis_proxy
     suite_dir = _ensure_suite()
-    applicable, _ = _manifest_ids(_load_manifest())
-    cmd = [
-        "bun", "run", "bin/compliance-test.ts",
-        "--base-url", f"http://127.0.0.1:{listener_port}/v1",
-        "--api-key", "test",
-        "--model", VLLM_MODEL,
-        "--filter", ",".join(sorted(applicable)),
-        "--json",
-    ]
-    result = subprocess.run(cmd, cwd=suite_dir, capture_output=True, text=True)
+    supported, _, _ = _manifest_ids(_load_manifest())
+    result = _run_compliance(suite_dir, listener_port, supported)
     assert result.returncode == 0, f"suite failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     paths = {(method, path) for method, path in seen}
     assert ("POST", "/v1/chat/completions") in paths, f"backend never saw chat completions; saw {paths}"
     assert not any(path.startswith("/v1/responses") for _method, path in seen), (
         f"criterion (f) violated: backend saw native Responses traffic: {seen}"
+    )
+
+
+def test_openresponses_conformance_unsupported_stays_failing(praxis_proxy):
+    # Promotion nudge: `unsupported` templates are in-scope translation gaps we
+    # do not pass yet. If a translator fix makes one pass, this test turns red
+    # and tells you to promote it — so the coverage bump can never go unnoticed.
+    # Runs each id on its own so the nudge names the exact template to promote.
+    try:
+        httpx.get(f"{VLLM_BASE_URL}/v1/models", timeout=2.0)
+    except Exception:
+        pytest.skip(f"vLLM not reachable at {VLLM_BASE_URL}")
+    listener_port, _seen = praxis_proxy
+    suite_dir = _ensure_suite()
+    _, unsupported, _ = _manifest_ids(_load_manifest())
+    now_passing = [
+        template_id
+        for template_id in sorted(unsupported)
+        if _run_compliance(suite_dir, listener_port, {template_id}).returncode == 0
+    ]
+    assert not now_passing, (
+        "these `unsupported` templates now PASS — the translator gained a capability. "
+        "Promote them to `supported` in tests/conformance/openresponses/manifest.yaml "
+        "and regenerate the report (`cargo xtask openresponses-coverage --fix`); "
+        f"coverage will bump: {now_passing}"
     )
 
 
