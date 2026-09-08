@@ -37,8 +37,9 @@ use super::{
 };
 use crate::{
     classifier::is_responses_create,
-    openai::translation::chat_completions::{
-        ResponseContext, chat_response_to_response_resource, responses_state_to_chat_request,
+    openai::translation::{
+        chat_completions::{ResponseContext, chat_response_to_response_resource, responses_state_to_chat_request},
+        reasoning::{ReasoningOptions, validate_requested_reasoning},
     },
 };
 
@@ -121,7 +122,7 @@ impl ResponsesToChatCompletionsFilter {
         ctx: &HttpFilterContext<'_>,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let streaming = request_is_streaming(ctx);
-        let translated = match translate_canonical_state(ctx, streaming) {
+        let translated = match translate_canonical_state(ctx, streaming, &self.config.reasoning) {
             Ok(value) => value,
             Err(action) => return Ok(Err(action)),
         };
@@ -165,7 +166,7 @@ impl ResponsesToChatCompletionsFilter {
         ctx: &HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<(), FilterError> {
-        match translate_success_response(ctx, body.as_deref().unwrap_or_default()) {
+        match translate_success_response(ctx, body.as_deref().unwrap_or_default(), self.config.reasoning) {
             Ok(translated) if translated.len() <= self.config.max_body_bytes => {
                 *body = Some(translated);
                 Ok(())
@@ -304,7 +305,11 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
 }
 
 /// Convert the validator-owned canonical state to a Chat request value.
-fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Result<serde_json::Value, FilterAction> {
+fn translate_canonical_state(
+    ctx: &HttpFilterContext<'_>,
+    streaming: bool,
+    reasoning: &ReasoningOptions,
+) -> Result<serde_json::Value, FilterAction> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         warn!(
             prerequisite = "openai_responses_validate",
@@ -313,6 +318,7 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Re
         return Err(missing_pipeline_state(streaming));
     };
     ensure_previous_response_rehydrated(state, streaming)?;
+    reject_incompatible_reasoning(&state.request_body, reasoning, streaming)?;
     responses_state_to_chat_request(&state.request_body, &state.messages, &state.tools, &state.tool_choice).map_err(
         |error| {
             debug!(error = %error, "Responses request cannot be represented by Chat Completions");
@@ -324,6 +330,26 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Re
             ))
         },
     )
+}
+
+/// Reject a request whose reasoning controls are incompatible with the dialect.
+fn reject_incompatible_reasoning(
+    request_body: &serde_json::Value,
+    reasoning: &ReasoningOptions,
+    streaming: bool,
+) -> Result<(), FilterAction> {
+    let Some(request) = request_body.as_object() else {
+        return Ok(());
+    };
+    validate_requested_reasoning(request, reasoning).map_err(|error| {
+        debug!(error = %error, "reasoning request rejected before forwarding");
+        FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            &error.to_string(),
+            streaming,
+        ))
+    })
 }
 
 /// Require stored history before translating a continuation request.
@@ -437,7 +463,11 @@ fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
 }
 
 /// Convert a finite successful Chat response into a Responses resource.
-fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Result<Bytes, FilterError> {
+fn translate_success_response(
+    ctx: &HttpFilterContext<'_>,
+    body: &[u8],
+    reasoning: ReasoningOptions,
+) -> Result<Bytes, FilterError> {
     let response_id = ctx
         .get_metadata("responses.response_id")
         .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing response id".into() })?;
@@ -451,7 +481,8 @@ fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Resul
         .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing Responses state".into() })?;
     let response_context =
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
-            .with_completed_at(ctx.time_source.now().as_secs());
+            .with_completed_at(ctx.time_source.now().as_secs())
+            .with_reasoning_options(reasoning);
     let provider_response: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
     let translated = chat_response_to_response_resource(&provider_response, &response_context)

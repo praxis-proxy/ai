@@ -7,6 +7,8 @@ use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
 use tracing::warn;
 
+use super::reasoning::{ReasoningOptions, extract_reasoning_item, reasoning_item_id, requested_summary};
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -82,6 +84,10 @@ pub(crate) struct ResponseContext<'a> {
     pub(crate) safety_identifier: Option<&'a Value>,
     /// Request prompt cache key to echo on the `Responses` resource.
     pub(crate) prompt_cache_key: Option<&'a Value>,
+    /// Original `Responses` reasoning controls to echo on the `Responses` resource.
+    pub(crate) reasoning: Option<&'a Value>,
+    /// Reasoning dialect behavior applied while translating the response.
+    pub(crate) reasoning_options: ReasoningOptions,
 }
 
 impl<'a> ResponseContext<'a> {
@@ -112,6 +118,8 @@ impl<'a> ResponseContext<'a> {
             service_tier: request.value("service_tier"),
             safety_identifier: request.value("safety_identifier"),
             prompt_cache_key: request.value("prompt_cache_key"),
+            reasoning: request.value("reasoning"),
+            reasoning_options: ReasoningOptions::default(),
         }
     }
 
@@ -119,6 +127,13 @@ impl<'a> ResponseContext<'a> {
     #[must_use]
     pub(crate) fn with_completed_at(mut self, completed_at: u64) -> Self {
         self.completed_at = Some(completed_at);
+        self
+    }
+
+    /// Return a response context configured with a reasoning dialect.
+    #[must_use]
+    pub(crate) fn with_reasoning_options(mut self, reasoning_options: ReasoningOptions) -> Self {
+        self.reasoning_options = reasoning_options;
         self
     }
 }
@@ -188,6 +203,23 @@ pub(crate) enum TranslationError {
     /// A Responses tool choice has no Chat Completions-compatible representation.
     #[error("unsupported Responses tool_choice type for Chat Completions translation: {0}")]
     UnsupportedToolChoiceType(String),
+    /// A reasoning summary was requested for a dialect without a safe-summary contract.
+    #[error("reasoning.summary is not supported by the configured reasoning dialect")]
+    UnsupportedReasoningSummary,
+    /// The request specified conflicting reasoning summary controls.
+    #[error("reasoning.summary and reasoning.generate_summary conflict")]
+    ConflictingReasoningSummary,
+    /// The provider returned more raw reasoning than the configured limit allows.
+    #[error("raw reasoning content ({bytes} bytes) exceeds the configured maximum of {max_bytes} bytes")]
+    ReasoningTooLarge {
+        /// Observed raw reasoning size in bytes.
+        bytes: usize,
+        /// Configured maximum raw reasoning size in bytes.
+        max_bytes: usize,
+    },
+    /// The provider returned raw reasoning in an unexpected shape.
+    #[error("provider returned malformed raw reasoning content: expected string, found {0}")]
+    MalformedReasoning(String),
 }
 
 /// Borrowed canonical request fields that supersede their original request values.
@@ -730,7 +762,7 @@ fn build_chat_tool_choice(choice: Option<&Value>) -> Result<Option<Value>, Trans
 }
 
 /// Return a stable JSON type name for diagnostics.
-fn json_type_name(value: &Value) -> &'static str {
+pub(crate) fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -759,7 +791,7 @@ pub(crate) fn chat_response_to_response_resource(
         .and_then(Value::as_str);
     let status = response_status(finish_reason);
     let incomplete_details = incomplete_details(finish_reason);
-    let output = build_output_items(obj, context, status);
+    let output = build_output_items(obj, context, status)?;
     let usage = build_usage(obj);
     let service_tier = service_tier_value_with_context(obj, context);
     let parts = ResponseResourceParts {
@@ -805,7 +837,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "output": Value::Array(parts.output),
         "parallel_tool_calls": context.parallel_tool_calls,
         "previous_response_id": previous_response_id_value(context),
-        "reasoning": Value::Null,
+        "reasoning": reasoning_value(context),
         "store": context.store,
         "temperature": number_or_default(context.temperature, 1.0),
         "text": text_value(context),
@@ -929,6 +961,21 @@ fn previous_response_id_value(context: &ResponseContext<'_>) -> Value {
         .map_or(Value::Null, |response_id| Value::String(response_id.to_owned()))
 }
 
+/// Build the `reasoning` response field.
+fn reasoning_value(context: &ResponseContext<'_>) -> Value {
+    let Some(reasoning) = context.reasoning.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+    let summary = requested_summary(reasoning)
+        .ok()
+        .flatten()
+        .map_or(Value::Null, |mode| Value::String(mode.to_owned()));
+    json!({
+        "effort": reasoning.get("effort").cloned().unwrap_or(Value::Null),
+        "summary": summary,
+    })
+}
+
 /// Build the `tool_choice` response field.
 fn tool_choice_value(context: &ResponseContext<'_>) -> Value {
     context
@@ -973,18 +1020,30 @@ fn number_value(value: f64) -> Value {
 }
 
 /// Build all `Responses` output items from the first Chat choice.
-fn build_output_items(obj: &Map<String, Value>, context: &ResponseContext<'_>, status: &str) -> Vec<Value> {
+fn build_output_items(
+    obj: &Map<String, Value>,
+    context: &ResponseContext<'_>,
+    status: &str,
+) -> Result<Vec<Value>, TranslationError> {
     let mut output = Vec::new();
     let Some(choice) = first_choice(obj) else {
-        return output;
+        return Ok(output);
     };
 
     let message = choice.get("message");
+    if let Some(reasoning_item) = extract_reasoning_item(
+        message,
+        reasoning_item_id(&context.response_id),
+        status,
+        &context.reasoning_options,
+    )? {
+        output.push(reasoning_item);
+    }
     let logprobs = chat_logprobs_content(choice);
     append_message_output(&mut output, message, context, status, logprobs);
     append_tool_call_outputs(&mut output, message, status);
 
-    output
+    Ok(output)
 }
 
 /// Append a message output item when the Chat response includes assistant text.
