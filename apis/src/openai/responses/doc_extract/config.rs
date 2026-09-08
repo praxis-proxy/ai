@@ -6,6 +6,8 @@
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
+use crate::openai::responses::body_limits::validate_size_limit;
+
 /// Default maximum number of `input_file` parts extracted per request.
 const DEFAULT_MAX_FILE_REFERENCES: usize = 32;
 
@@ -45,9 +47,14 @@ pub(crate) struct DocExtractConfig {
     #[serde(default)]
     pub allow_pre_security_callout: bool,
 
-    /// Maximum request body bytes for `StreamBuffer` (default 64 MiB).
-    #[serde(default = "default_max_body_bytes")]
-    pub max_body_bytes: usize,
+    /// Maximum size in bytes of the request body this filter *produces*
+    /// after converting `input_file` parts to `input_text` (default 64
+    /// MiB).
+    ///
+    /// Raw request body size is governed by the pipeline's `body_limits`,
+    /// not this field.
+    #[serde(default = "default_max_rewritten_body_bytes")]
+    pub max_rewritten_body_bytes: usize,
 
     /// Maximum decoded content bytes per file (default 10 MiB).
     #[serde(default = "default_max_content_bytes")]
@@ -67,8 +74,8 @@ pub(crate) struct DocExtractConfig {
     pub on_unsupported: OnUnsupported,
 }
 
-/// Default max body bytes.
-fn default_max_body_bytes() -> usize {
+/// Default max rewritten body bytes (64 MiB).
+fn default_max_rewritten_body_bytes() -> usize {
     MAX_JSON_BODY_BYTES
 }
 
@@ -107,16 +114,11 @@ fn validate_pre_security_callout(cfg: &DocExtractConfig) -> Result<(), FilterErr
 
 /// Validate numeric limits applied while buffering and extracting.
 fn validate_limits(cfg: &DocExtractConfig) -> Result<(), FilterError> {
-    if cfg.max_body_bytes == 0 {
-        return Err("openai_doc_extract: 'max_body_bytes' must be greater than 0".into());
-    }
-    if cfg.max_body_bytes > MAX_JSON_BODY_BYTES {
-        return Err(format!(
-            "openai_doc_extract: 'max_body_bytes' ({}) exceeds maximum ({MAX_JSON_BODY_BYTES})",
-            cfg.max_body_bytes
-        )
-        .into());
-    }
+    validate_size_limit(
+        "openai_doc_extract",
+        "max_rewritten_body_bytes",
+        cfg.max_rewritten_body_bytes,
+    )?;
 
     if cfg.max_content_bytes == 0 {
         return Err("openai_doc_extract: 'max_content_bytes' must be greater than 0".into());
@@ -145,16 +147,7 @@ fn validate_extraction_limits(cfg: &DocExtractConfig) -> Result<(), FilterError>
         .into());
     }
 
-    if cfg.max_total_text_bytes == 0 {
-        return Err("openai_doc_extract: 'max_total_text_bytes' must be greater than 0".into());
-    }
-    if cfg.max_total_text_bytes > MAX_JSON_BODY_BYTES {
-        return Err(format!(
-            "openai_doc_extract: 'max_total_text_bytes' ({}) exceeds maximum ({MAX_JSON_BODY_BYTES})",
-            cfg.max_total_text_bytes
-        )
-        .into());
-    }
+    validate_size_limit("openai_doc_extract", "max_total_text_bytes", cfg.max_total_text_bytes)?;
 
     Ok(())
 }

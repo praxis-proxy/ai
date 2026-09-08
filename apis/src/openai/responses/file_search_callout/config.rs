@@ -11,10 +11,8 @@ use serde::Deserialize;
 
 use super::client::MAX_CONCURRENT_SEARCHES;
 use crate::{
-    openai::{
-        api_client::{self, ApiClient, ApiClientConfig},
-        responses::config_validation::FailureMode,
-    },
+    callout_policy::OnFailure,
+    openai::api_client::{self, ApiClient, ApiClientConfig},
     subrequest::SubRequestClient,
 };
 
@@ -53,13 +51,13 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) struct FileSearchFilterConfig {
     /// Allow URLs that target local-sensitive addresses.
     ///
-    /// DNS names are rejected unless this is enabled because validation
-    /// cannot pin the address that the HTTP client will eventually dial.
+    /// DNS names are allowed by default when every connect-time result is
+    /// public. Enable this only for a trusted private vector-store service.
     #[serde(default)]
     pub allow_private_url: bool,
 
     /// Behaviour when a vector-store callout fails.
-    pub callout_failure_mode: Option<FailureMode>,
+    pub on_failure: Option<OnFailure>,
 
     /// Headers to forward from the original request to the
     /// vector store API for authentication and tenant isolation.
@@ -91,7 +89,7 @@ pub(crate) struct ValidatedConfig {
     pub api_client: ApiClient,
 
     /// Search failure handling policy.
-    pub failure_mode: FailureMode,
+    pub on_failure: OnFailure,
 
     /// Maximum response body size per callout.
     pub max_response_bytes: usize,
@@ -113,7 +111,7 @@ pub(crate) fn build_config_with_client(
     client: SubRequestClient,
 ) -> Result<ValidatedConfig, FilterError> {
     let vector_store_url = parse_vector_store_url(&cfg.vector_store_url, cfg.allow_private_url)?;
-    let failure_mode = cfg.callout_failure_mode.unwrap_or(FailureMode::Closed);
+    let on_failure = cfg.on_failure.unwrap_or(OnFailure::Closed);
     let (max_response_bytes, max_total_response_bytes) =
         response_limits(cfg.max_response_bytes, cfg.max_total_response_bytes)?;
     let max_state_bytes = validated_state_limit(cfg.max_state_bytes)?;
@@ -127,11 +125,12 @@ pub(crate) fn build_config_with_client(
         &forward_headers,
         max_response_bytes,
         timeout_ms,
+        cfg.allow_private_url,
     );
 
     Ok(ValidatedConfig {
         api_client,
-        failure_mode,
+        on_failure,
         max_response_bytes,
         max_total_response_bytes,
         max_state_bytes,
@@ -164,12 +163,17 @@ fn validated_state_limit(configured: Option<usize>) -> Result<usize, FilterError
 }
 
 /// Build the shared API client from the validated URL and sub-request client.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the helper assembles independently validated transport settings"
+)]
 fn build_api_client(
     vector_store_url: &Url,
     client: SubRequestClient,
     forward_headers: &[String],
     max_response_bytes: usize,
     timeout_ms: u64,
+    allow_private: bool,
 ) -> ApiClient {
     ApiClient::new(ApiClientConfig {
         api_base_url: vector_store_url.as_str().to_owned(),
@@ -180,6 +184,7 @@ fn build_api_client(
             .iter()
             .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
             .collect(),
+        address_policy: crate::callout_target::AddressPolicy::from_allow_private(allow_private),
     })
 }
 

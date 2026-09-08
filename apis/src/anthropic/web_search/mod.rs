@@ -16,7 +16,7 @@ use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
 use crate::web_search::{
-    SearchClient, SearchContextSize, SearchOutcome, SearchResult, WebSearchFilterConfig, build_config,
+    SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig, build_config,
     format_search_results,
 };
 
@@ -159,8 +159,6 @@ struct ResponseEnvelope<'a> {
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// default_context_size: medium
 /// timeout_ms: 10000
-/// provider_failure_mode: closed
-/// status_on_error: 502
 /// max_body_bytes: 67108864
 /// ```
 ///
@@ -222,21 +220,14 @@ impl AnthropicWebSearchFilter {
         }))
     }
 
-    /// Execute one pending call and map provider failure policy to Messages semantics.
-    async fn execute_pending_search(&self, pending: &PendingSearch) -> Result<Vec<SearchResult>, Rejection> {
-        let outcome = self
-            .search_client
+    /// Execute one pending call, returning the provider outcome.
+    ///
+    /// A provider failure never rejects the Messages response: the caller
+    /// appends a truthful `is_error` tool result so the loop can continue.
+    async fn execute_pending_search(&self, pending: &PendingSearch) -> SearchOutcome {
+        self.search_client
             .search(&pending.query, Some(self.default_context_size))
-            .await;
-        match outcome {
-            SearchOutcome::Results(results) => Ok(results),
-            SearchOutcome::Skipped => Ok(Vec::new()),
-            SearchOutcome::Rejected { status } => Err(anthropic_rejection(
-                status,
-                "api_error",
-                "web search provider unavailable",
-            )),
-        }
+            .await
     }
 
     /// Execute a retained search and replace the IRR request body.
@@ -281,13 +272,8 @@ impl AnthropicWebSearchFilter {
                 "messages must be an array for web search re-entry",
             )));
         }
-        let results = match self.execute_pending_search(&pending).await {
-            Ok(results) => results,
-            Err(rejection) => {
-                return Ok(FilterAction::Reject(rejection));
-            },
-        };
-        if let Err(rejection) = append_search_turns(&mut request, assistant_content, pending, &results) {
+        let outcome = self.execute_pending_search(&pending).await;
+        if let Err(rejection) = append_search_turns(&mut request, assistant_content, pending, &outcome) {
             return Ok(FilterAction::Reject(rejection));
         }
         let rebuilt = serde_json::to_vec(&request)
@@ -524,7 +510,7 @@ fn append_search_turns(
     request: &mut Value,
     assistant_content: Vec<Value>,
     pending: PendingSearch,
-    results: &[SearchResult],
+    outcome: &SearchOutcome,
 ) -> Result<(), Rejection> {
     let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
         return Err(anthropic_rejection(
@@ -533,25 +519,41 @@ fn append_search_turns(
             "messages must be an array for web search re-entry",
         ));
     };
-    let content = if results.is_empty() {
-        "No search results found.".to_owned()
-    } else {
-        format_search_results(results)
-    };
     let PendingSearch { id, query: _ } = pending;
     let mut assistant_turn = serde_json::Map::new();
     assistant_turn.insert("role".to_owned(), Value::String("assistant".to_owned()));
     assistant_turn.insert("content".to_owned(), Value::Array(assistant_content));
     messages.push(Value::Object(assistant_turn));
-    messages.push(json!({"role":"user","content":[{
-        "type":"tool_result","tool_use_id":id,"content":content
-    }]}));
+    messages.push(build_tool_result_turn(&id, outcome));
     if request.get("tool_choice").is_some()
         && let Some(object) = request.as_object_mut()
     {
         object.insert("tool_choice".to_owned(), json!({"type":"auto"}));
     }
     Ok(())
+}
+
+/// Build the user turn carrying the search tool result.
+///
+/// A provider failure yields a truthful `is_error` result carrying the bounded
+/// [`SEARCH_UNAVAILABLE`] message so the loop continues; a successful empty
+/// search reports `No search results found.` without `is_error`.
+fn build_tool_result_turn(tool_use_id: &str, outcome: &SearchOutcome) -> Value {
+    match outcome {
+        SearchOutcome::Results(results) => {
+            let content = if results.is_empty() {
+                "No search results found.".to_owned()
+            } else {
+                format_search_results(results)
+            };
+            json!({"role":"user","content":[{
+                "type":"tool_result","tool_use_id":tool_use_id,"content":content
+            }]})
+        },
+        SearchOutcome::Failed => json!({"role":"user","content":[{
+            "type":"tool_result","tool_use_id":tool_use_id,"content":SEARCH_UNAVAILABLE,"is_error":true
+        }]}),
+    }
 }
 
 /// Publish the loop decision for the IRR transition table.

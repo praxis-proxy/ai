@@ -32,7 +32,6 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-        max_body_bytes: 67108864
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model

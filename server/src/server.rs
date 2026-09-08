@@ -227,7 +227,6 @@ fn register_admin_endpoints(
                 health_registry: Some(health_registry),
                 kv_registry: Some(kv_stores.clone()),
                 pipelines: None,
-                #[cfg(feature = "praxis-main")]
                 log_level: None,
                 verbose: config.admin.verbose,
             },
@@ -307,13 +306,13 @@ fn insecure_warn(active: bool, msg: &str) {
 ///
 /// ```
 /// let msg = praxis_ai::check_root_privilege(false, 0);
-/// assert!(msg.is_some());
+/// assert!(msg.is_some(), "root without override should be rejected");
 ///
 /// let msg = praxis_ai::check_root_privilege(true, 0);
-/// assert!(msg.is_none());
+/// assert!(msg.is_none(), "root override should be accepted");
 ///
 /// let msg = praxis_ai::check_root_privilege(false, 1000);
-/// assert!(msg.is_none());
+/// assert!(msg.is_none(), "non-root user should be accepted");
 /// ```
 pub fn check_root_privilege(allow_root: bool, euid: u32) -> Option<String> {
     if euid != 0 {

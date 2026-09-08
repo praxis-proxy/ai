@@ -187,7 +187,7 @@ runtime:
             "
 vector_store_url: http://127.0.0.1:9
 allow_private_url: true
-callout_failure_mode: closed
+on_failure: closed
 ",
         )
         .unwrap();

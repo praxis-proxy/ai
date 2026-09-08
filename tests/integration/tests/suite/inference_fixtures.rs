@@ -14,6 +14,10 @@ const STREAM_SCENARIO: &str = "messages/basic-stream";
 const STREAM_PROVIDER: &str = "openai";
 const ERROR_SCENARIO: &str = "messages/upstream-error";
 const ERROR_PROVIDER: &str = "synthetic";
+const MALFORMED_TOOL_ARGUMENTS_SCENARIO: &str = "messages/malformed-tool-arguments";
+const MALFORMED_TOOL_ARGUMENTS_PROVIDER: &str = "synthetic";
+const MALFORMED_COMPACTION_SCENARIO: &str = "responses/chat-malformed-compaction";
+const MALFORMED_COMPACTION_PROVIDER: &str = "synthetic";
 const NATIVE_ANTHROPIC_PROVIDER: &str = "anthropic";
 const NATIVE_ANTHROPIC_SCENARIOS: [&str; 3] = [
     "messages/native-basic-nonstream",
@@ -50,6 +54,8 @@ async fn all_inference_fixtures_replay() {
     let mut native_responses_recordings = BTreeSet::new();
     let mut saw_stream_representative = false;
     let mut saw_error_representative = false;
+    let mut saw_malformed_tool_arguments = false;
+    let mut saw_malformed_compaction = false;
     let mut saw_agentic_parallel_tool_calls = false;
 
     for recording in recordings {
@@ -87,6 +93,14 @@ async fn all_inference_fixtures_replay() {
         if scenario_id == ERROR_SCENARIO && provider == ERROR_PROVIDER {
             assert_synthetic_rate_limit(&report.actual, scenario_id, provider);
             saw_error_representative = true;
+        }
+        if scenario_id == MALFORMED_TOOL_ARGUMENTS_SCENARIO && provider == MALFORMED_TOOL_ARGUMENTS_PROVIDER {
+            assert_malformed_tool_arguments_error(&report.actual, scenario_id, provider);
+            saw_malformed_tool_arguments = true;
+        }
+        if scenario_id == MALFORMED_COMPACTION_SCENARIO && provider == MALFORMED_COMPACTION_PROVIDER {
+            assert_malformed_compaction_error(&report.actual, scenario_id, provider);
+            saw_malformed_compaction = true;
         }
         if provider == NATIVE_ANTHROPIC_PROVIDER && NATIVE_ANTHROPIC_SCENARIOS.contains(&scenario_id) {
             native_anthropic_scenarios.insert(scenario_id.to_owned());
@@ -128,6 +142,14 @@ async fn all_inference_fixtures_replay() {
     assert!(
         saw_error_representative,
         "missing representative recording for scenario `{ERROR_SCENARIO}` and provider `{ERROR_PROVIDER}`"
+    );
+    assert!(
+        saw_malformed_tool_arguments,
+        "missing representative recording for scenario `{MALFORMED_TOOL_ARGUMENTS_SCENARIO}` and provider `{MALFORMED_TOOL_ARGUMENTS_PROVIDER}`"
+    );
+    assert!(
+        saw_malformed_compaction,
+        "missing representative recording for scenario `{MALFORMED_COMPACTION_SCENARIO}` and provider `{MALFORMED_COMPACTION_PROVIDER}`"
     );
     assert!(
         saw_agentic_parallel_tool_calls,
@@ -222,6 +244,61 @@ fn assert_synthetic_rate_limit(actual: &WireFixture, scenario_id: &str, provider
     assert_eq!(
         client, &client_expected,
         "client 429 body changed for scenario `{scenario_id}` and provider `{provider}`"
+    );
+}
+
+fn assert_malformed_tool_arguments_error(actual: &WireFixture, scenario_id: &str, provider: &str) {
+    let turn = actual.turns.first().unwrap_or_else(|| {
+        panic!("scenario `{scenario_id}` and provider `{provider}` replayed without a turn");
+    });
+    let client_expected = json!({
+        "type": "error",
+        "error": {"message": "upstream response could not be transformed", "type": "api_error"},
+        "request_id": null
+    });
+    assert_eq!(
+        turn.client.response.status, 200,
+        "client status changed for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let RecordedBody::Json { value: client } = &turn.client.response.body else {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay a client JSON error envelope");
+    };
+    assert_eq!(
+        client, &client_expected,
+        "malformed tool arguments must convert to an Anthropic api_error envelope for scenario `{scenario_id}` and provider `{provider}`"
+    );
+}
+
+fn assert_malformed_compaction_error(actual: &WireFixture, scenario_id: &str, provider: &str) {
+    let turn = actual.turns.first().unwrap_or_else(|| {
+        panic!("scenario `{scenario_id}` and provider `{provider}` replayed without a turn");
+    });
+    let client_expected = json!({
+        "error": {
+            "message": "Responses compaction input item field `encrypted_content` must be valid base64",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "invalid_request_error"
+        }
+    });
+    assert_eq!(
+        turn.client.response.status, 400,
+        "client status changed for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let RecordedBody::Json { value: client } = &turn.client.response.body else {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay a client JSON error");
+    };
+    assert_eq!(
+        client, &client_expected,
+        "malformed compaction must fail closed with an invalid_request_error for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    assert_eq!(
+        turn.upstream.request.path, "",
+        "malformed compaction must not contact upstream for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    assert_eq!(
+        turn.upstream.response.status, 0,
+        "malformed compaction must record an empty upstream response for scenario `{scenario_id}` and provider `{provider}`"
     );
 }
 

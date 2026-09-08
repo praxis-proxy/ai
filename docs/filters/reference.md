@@ -17,8 +17,8 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`anthropic_messages_format`](anthropic_messages_format.md) | Classifies Anthropic Messages API requests and promotes routing facts to headers, metadata, and filter results. |
 | [`anthropic_messages_protocol`](anthropic_messages_protocol.md) | Normalizes Anthropic Messages protocol headers for native backends. |
-| [`anthropic_stream_events`](anthropic_stream_events.md) | Transforms streaming SSE responses between `OpenAI` and Anthropic formats, processing each chunk as it arrives. |
-| [`anthropic_to_openai`](anthropic_to_openai.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The filter name refers to the OpenAI Chat Completions wire shape, not the Responses API; non-OpenAI compatible backends are valid targets. |
+| [`anthropic_messages_to_chat_completions`](anthropic_messages_to_chat_completions.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The name refers to the Chat Completions wire shape, not the OpenAI Responses API; any Chat Completions-compatible backend is a valid target, not only OpenAI. |
+| [`anthropic_messages_to_chat_completions_stream`](anthropic_messages_to_chat_completions_stream.md) | Transforms streaming SSE responses between the Chat Completions and Anthropic Messages formats, processing each chunk as it arrives. |
 | [`anthropic_validate`](anthropic_validate.md) | Validates Anthropic Messages request bodies for proxy-owned JSON envelope requirements. |
 | [`anthropic_web_search`](anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
 
@@ -82,13 +82,19 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
-| [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request (and eventually response) bodies. The provider determines whether content should be passed, blocked, or redacted. |
+| [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request and response bodies. The provider determines whether content should be passed, blocked, or redacted. |
 
 ### Inference
 
 | Filter | Description |
 |--------|-------------|
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
+
+### Metering
+
+| Filter | Description |
+|--------|-------------|
+| [`external_metering`](external_metering.md) | Integrates with an external metering service for pre-request balance checks and post-response token usage reporting. |
 
 ### Prompt Enrich
 

@@ -14,7 +14,6 @@ Manages iteration bookkeeping in `on_request_body`, extracts tool calls from non
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. |
-| `max_body_bytes` | integer | no | Maximum response body size in bytes for `StreamBuffer` mode. |
 
 ## Examples
 
@@ -29,5 +28,4 @@ filter: openai_agentic_loop
 ```yaml
 filter: openai_agentic_loop
 max_infer_iters: 10
-max_body_bytes: 10485760
 ```

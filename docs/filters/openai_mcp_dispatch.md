@@ -10,7 +10,6 @@ Executes MCP tool calls against upstream MCP servers within the Responses API ag
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `allow_loopback` | bool | no | Allow connections to loopback addresses (default: false). |
-| `max_body_bytes` | integer | no | Maximum response body bytes for `StreamBuffer`. |
 | `timeout_ms` | integer | no | Per-call timeout in milliseconds for `tools/call` calls. |
 
 ## Examples
@@ -26,5 +25,4 @@ filter: openai_mcp_dispatch
 ```yaml
 filter: openai_mcp_dispatch
 timeout_ms: 30000
-max_body_bytes: 67108864
 ```

@@ -1,0 +1,42 @@
+version: 1
+id: responses/chat-basic-stream
+description: Streaming OpenAI Responses request translated to Chat Completions SSE.
+protocol: openai_responses
+example_config: openai/responses/responses-to-chat-completions.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.request
+  - responses.chat.response.text
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Say hello in one sentence.
+          store: false
+          stream: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events:
+        - response.created
+        - response.in_progress
+        - response.output_item.added
+        - response.content_part.added
+        - response.output_text.delta
+        - response.output_text.done
+        - response.content_part.done
+        - response.output_item.done
+        - response.completed
+      client_sse_repeatable_events:
+        - response.output_text.delta
+      upstream_sse_events: []

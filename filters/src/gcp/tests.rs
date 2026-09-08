@@ -3,20 +3,16 @@
 
 //! Unit tests for the GCP ADC upstream-auth filter.
 
-use std::{
-    io::Write as _,
-    time::{Duration, Instant},
-};
+use std::io::{Read as _, Write as _};
 
 use http::{HeaderValue, Method, header};
-use praxis_filter::{FilterAction, HttpFilter as _};
+use praxis_filter::FilterAction;
 use tempfile::NamedTempFile;
 
 use super::{
     GcpAdcFilter,
     config::{parse_gcp_adc_config, validate_service_account},
-    filter::CachedToken,
-    token::{TokenSource, resolve_token_source},
+    token::{self, TokenSource, resolve_token_source},
 };
 use crate::test_utils::{make_filter_context, make_request};
 
@@ -35,8 +31,23 @@ fn write_json(body: &str) -> NamedTempFile {
     file
 }
 
-fn valid_token(access_token: &str) -> CachedToken {
-    CachedToken::new(access_token, Instant::now() + Duration::from_secs(300)).expect("valid test token")
+/// Spawn a one-shot HTTP/1.1 server on loopback that replies with `body`
+/// to any request, and returns its bound `host:port`.
+fn mock_metadata_endpoint(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (addr.to_string(), handle)
 }
 
 // -----------------------------------------------------------------------------
@@ -51,9 +62,9 @@ fn parses_minimal_valid_config() {
     assert_eq!(config.scope, "https://www.googleapis.com/auth/cloud-platform");
     assert!(config.service_account.is_none(), "service_account should be unset");
     assert!(config.credentials_file.is_none(), "credentials_file should be unset");
-    assert!(
-        (config.refresh_ratio - 0.75).abs() < f64::EPSILON,
-        "default refresh_ratio should be 0.75"
+    assert_eq!(
+        config.metadata_host, "metadata.google.internal",
+        "metadata_host should default"
     );
 }
 
@@ -64,7 +75,6 @@ fn parses_explicit_metadata_and_key_file() {
 source: metadata
 service_account: foo@project.iam.gserviceaccount.com
 scope: https://www.googleapis.com/auth/cloud-platform
-refresh_ratio: 0.5
 ",
     ))
     .expect("metadata config should parse");
@@ -136,16 +146,51 @@ fn rejects_unknown_field() {
 }
 
 #[test]
-fn from_config_rejects_out_of_range_refresh_ratio() {
-    for ratio in ["0", "1", "-0.1", "1.5"] {
-        let err = GcpAdcFilter::from_config(&yaml(&format!("refresh_ratio: {ratio}")))
-            .err()
-            .expect("refresh_ratio must be exclusive (0, 1)");
-        assert!(
-            err.to_string().contains("refresh_ratio"),
-            "error should name refresh_ratio for {ratio}: {err}"
-        );
-    }
+fn rejects_structural_characters_in_metadata_host() {
+    let err = GcpAdcFilter::from_config(&yaml("metadata_host: evil.com/../x"))
+        .err()
+        .expect("path-injecting metadata_host must be rejected");
+    assert!(
+        err.to_string().contains("metadata_host"),
+        "error should name metadata_host: {err}"
+    );
+}
+
+#[test]
+fn rejects_non_loopback_non_default_metadata_host() {
+    // Structurally valid hostname, but not the real metadata server or a
+    // loopback test address -- must still be rejected, or a misconfigured
+    // metadata_host would send the access token over a real network in
+    // cleartext.
+    let err = GcpAdcFilter::from_config(&yaml("metadata_host: evil.example.com"))
+        .err()
+        .expect("non-loopback, non-default metadata_host must be rejected");
+    assert!(
+        err.to_string().contains("metadata_host"),
+        "error should name metadata_host: {err}"
+    );
+}
+
+#[test]
+fn accepts_loopback_and_default_metadata_host() {
+    GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: metadata.google.internal"))
+        .expect("the real metadata server must be accepted");
+    GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: 127.0.0.1:9000"))
+        .expect("a loopback IP address must be accepted for tests");
+}
+
+#[test]
+fn rejects_localhost_metadata_host() {
+    // Unlike a literal loopback IP, `localhost` is a hostname resolved
+    // via DNS/`/etc/hosts` and could be remapped to point anywhere --
+    // accepting it would defeat the loopback restriction entirely.
+    let err = GcpAdcFilter::from_config(&yaml("metadata_host: localhost:9000"))
+        .err()
+        .expect("localhost must be rejected, it is not a fixed address");
+    assert!(
+        err.to_string().contains("metadata_host"),
+        "error should name metadata_host: {err}"
+    );
 }
 
 #[test]
@@ -248,76 +293,113 @@ fn explicit_metadata_ignores_credentials_path() {
 }
 
 // -----------------------------------------------------------------------------
-// CachedToken
+// token::fetch against a mock metadata endpoint
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn cached_token_formats_bearer_and_marks_sensitive() {
-    let request = make_request(Method::GET, "/");
-    let filter = GcpAdcFilter::for_test(Some(valid_token("secret-token")));
-    let mut ctx = make_filter_context(&request);
+async fn fetch_parses_bearer_and_ttl_for_metadata_source() {
+    let (host, server) = mock_metadata_endpoint(r#"{"access_token":"abc123","expires_in":3600}"#);
+    let client = reqwest::Client::new();
+    let source = TokenSource::Metadata {
+        service_account: "default".to_owned(),
+    };
 
-    // The constructor — not the test — must produce a sensitive,
-    // Bearer-formatted header value.
-    let action = filter.on_request(&mut ctx).await.expect("must not error");
-    assert!(matches!(action, FilterAction::Continue));
-    let injected = ctx
-        .request_headers_to_set
-        .iter()
-        .find(|(name, _)| *name == header::AUTHORIZATION)
-        .map(|(_, value)| value);
-    let injected = injected.expect("Authorization must be injected");
-    assert_eq!(injected.to_str().expect("ascii"), "Bearer secret-token");
-    assert!(injected.is_sensitive(), "constructor must mark the value sensitive");
+    let (authorization, ttl) = token::fetch(&client, &source, &host, "scope")
+        .await
+        .expect("mock metadata fetch must succeed");
+
+    assert_eq!(authorization.to_str().unwrap(), "Bearer abc123");
+    assert!(authorization.is_sensitive(), "bearer header must be marked sensitive");
+    assert_eq!(ttl, std::time::Duration::from_secs(3600));
+    server.join().unwrap();
 }
 
-#[test]
-fn cached_token_rejects_invalid_header_value() {
-    CachedToken::new("bad\ntoken", Instant::now()).expect_err("control characters must be rejected");
-}
-
-#[test]
-fn cached_token_expiry() {
-    let now = Instant::now();
-    let token = CachedToken::new("t", now + Duration::from_secs(60)).expect("valid token");
-    assert!(token.is_valid(now), "token in the future must be valid");
+#[tokio::test]
+async fn fetch_errors_for_service_account_key_source() {
+    let client = reqwest::Client::new();
+    let err = token::fetch(&client, &TokenSource::ServiceAccountKey, "unused", "scope")
+        .await
+        .expect_err("key_file fetch is not implemented and must error, not hang or silently fail closed forever");
     assert!(
-        !token.is_valid(now + Duration::from_secs(61)),
-        "token past expiry must be invalid"
+        err.to_string().contains("not implemented"),
+        "error must explain why, got: {err}"
     );
 }
 
 // -----------------------------------------------------------------------------
-// on_request
+// on_request: cache-through end to end
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn on_request_injects_bearer_when_token_valid() {
-    let filter = GcpAdcFilter::for_test(Some(valid_token("test-token")));
+async fn on_request_injects_bearer_on_first_fetch() {
+    let (host, server) = mock_metadata_endpoint(r#"{"access_token":"fresh","expires_in":3600}"#);
+    let filter =
+        GcpAdcFilter::from_config(&yaml(&format!("source: metadata\nmetadata_host: {host}"))).expect("must construct");
     let request = make_request(Method::POST, "/v1/models");
     let mut ctx = make_filter_context(&request);
 
     let action = filter.on_request(&mut ctx).await.expect("must not error");
-    assert!(matches!(action, FilterAction::Continue), "valid token must continue");
+    assert!(matches!(action, FilterAction::Continue));
 
     let auth = ctx
         .request_headers_to_set
         .iter()
         .find(|(name, _)| *name == header::AUTHORIZATION)
         .map(|(_, value)| value.to_str().expect("ascii"));
-    assert_eq!(auth, Some("Bearer test-token"), "must inject the cached bearer token");
+    assert_eq!(
+        auth,
+        Some("Bearer fresh"),
+        "must inject the freshly fetched bearer token"
+    );
+    server.join().unwrap();
 }
 
 #[tokio::test]
-async fn on_request_fails_closed_when_no_token() {
-    let filter = GcpAdcFilter::for_test(None);
+async fn on_request_reuses_cached_token_without_a_second_fetch() {
+    // The mock endpoint accepts exactly one connection; a second
+    // on_request call must not attempt a second fetch, or it would fail
+    // to connect and 503 instead of continuing.
+    let (host, server) = mock_metadata_endpoint(r#"{"access_token":"once","expires_in":3600}"#);
+    let filter =
+        GcpAdcFilter::from_config(&yaml(&format!("source: metadata\nmetadata_host: {host}"))).expect("must construct");
+    let request = make_request(Method::POST, "/v1/models");
+
+    let mut first_ctx = make_filter_context(&request);
+    let first = filter
+        .on_request(&mut first_ctx)
+        .await
+        .expect("first call must not error");
+    assert!(matches!(first, FilterAction::Continue));
+
+    let mut second_ctx = make_filter_context(&request);
+    let second = filter
+        .on_request(&mut second_ctx)
+        .await
+        .expect("second call must not error");
+    assert!(
+        matches!(second, FilterAction::Continue),
+        "a still-valid cache must serve the second request without a new connection"
+    );
+    let auth = second_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| *name == header::AUTHORIZATION)
+        .map(|(_, value)| value.to_str().expect("ascii"));
+    assert_eq!(auth, Some("Bearer once"));
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn on_request_fails_closed_when_metadata_unreachable() {
+    let filter =
+        GcpAdcFilter::from_config(&yaml("source: metadata\nmetadata_host: 127.0.0.1:1")).expect("must construct");
     let request = make_request(Method::POST, "/v1/models");
     let mut ctx = make_filter_context(&request);
 
     let action = filter.on_request(&mut ctx).await.expect("must reject, not error");
     assert!(
-        matches!(action, FilterAction::Reject(rejection) if rejection.status == 503),
-        "no cached token must fail closed with 503"
+        matches!(action, FilterAction::Reject(r) if r.status == 503),
+        "a failed fetch must fail closed with 503"
     );
     assert!(
         ctx.request_headers_to_set.is_empty(),
@@ -326,23 +408,28 @@ async fn on_request_fails_closed_when_no_token() {
 }
 
 #[tokio::test]
-async fn on_request_fails_closed_when_token_expired() {
-    let filter = GcpAdcFilter::for_test(Some(
-        CachedToken::new("stale", Instant::now() - Duration::from_secs(1)).expect("valid header value"),
-    ));
+async fn on_request_fails_closed_for_key_file_source() {
+    let file = write_json(r#"{"type":"service_account","client_email":"sa@example.com"}"#);
+    let filter = GcpAdcFilter::from_config(&yaml(&format!(
+        "source: key_file\ncredentials_file: {}",
+        file.path().display()
+    )))
+    .expect("must construct");
     let request = make_request(Method::POST, "/v1/models");
     let mut ctx = make_filter_context(&request);
 
     let action = filter.on_request(&mut ctx).await.expect("must reject, not error");
     assert!(
-        matches!(action, FilterAction::Reject(rejection) if rejection.status == 503),
-        "expired token must fail closed with 503"
+        matches!(action, FilterAction::Reject(r) if r.status == 503),
+        "key_file token fetch is not implemented yet and must fail closed with 503"
     );
 }
 
 #[tokio::test]
 async fn on_request_overwrites_client_authorization() {
-    let filter = GcpAdcFilter::for_test(Some(valid_token("gcp-token")));
+    let (host, server) = mock_metadata_endpoint(r#"{"access_token":"gcp-token","expires_in":3600}"#);
+    let filter =
+        GcpAdcFilter::from_config(&yaml(&format!("source: metadata\nmetadata_host: {host}"))).expect("must construct");
     let mut request = make_request(Method::POST, "/v1/models");
     request
         .headers
@@ -358,4 +445,5 @@ async fn on_request_overwrites_client_authorization() {
         .find(|(name, _)| *name == header::AUTHORIZATION)
         .map(|(_, value)| value.to_str().expect("ascii"));
     assert_eq!(auth, Some("Bearer gcp-token"));
+    server.join().unwrap();
 }

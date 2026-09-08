@@ -27,11 +27,22 @@ impl SearchStub {
     }
 
     fn start_many(responses: &[Value]) -> Self {
+        Self::start_many_with_status(responses, "200 OK")
+    }
+
+    /// Serve a single failing HTTP response so the loop maps the provider
+    /// callout to [`SearchOutcome::Failed`] and continues with an error result.
+    fn start_failing() -> Self {
+        Self::start_many_with_status(&[json!({"error": "service unavailable"})], "503 Service Unavailable")
+    }
+
+    fn start_many_with_status(responses: &[Value], status_line: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind You.com stub");
         let port = listener.local_addr().expect("stub address").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
         let bodies = responses.iter().map(Value::to_string).collect::<Vec<_>>();
+        let status_line = status_line.to_owned();
         std::thread::spawn(move || {
             for body in bodies {
                 let (mut stream, _) = listener.accept().expect("accept search request");
@@ -40,7 +51,7 @@ impl SearchStub {
                     .expect("capture search request")
                     .push(read_http_request(&mut stream));
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).expect("write search response");
@@ -208,6 +219,60 @@ fn messages_web_search_round_trip_re_enters_the_model() {
             .last_request()
             .to_ascii_lowercase()
             .contains("x-api-key: test-key")
+    );
+}
+
+#[test]
+fn provider_failure_appends_is_error_tool_result_and_re_enters_model() {
+    let fixture = fixture();
+    let model = StatefulCapturingBackend::new(vec![
+        (200, fixture["first_model_response"].to_string()),
+        (200, fixture["final_model_response"].to_string()),
+    ])
+    .start_with_shutdown();
+    let search = SearchStub::start_failing();
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_config(proxy_port, model.port(), search.port()));
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a provider failure must not reject the request"
+    );
+    let client_response: Value = serde_json::from_str(&parse_body(&raw)).expect("client response JSON");
+    assert_eq!(
+        client_response, fixture["final_model_response"],
+        "the loop must return the model's post-failure answer"
+    );
+
+    let requests = model.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the loop must re-enter the model after the search fails"
+    );
+    let second: Value = serde_json::from_str(&requests[1].body).expect("second model request JSON");
+    let messages = second["messages"].as_array().expect("Messages history");
+    let tool_result = &messages[messages.len() - 1]["content"][0];
+    assert_eq!(tool_result["type"], "tool_result");
+    assert_eq!(tool_result["tool_use_id"], "toolu_web_search_01");
+    assert_eq!(
+        tool_result["is_error"], true,
+        "a provider failure must produce a truthful is_error result"
+    );
+    assert_eq!(
+        tool_result["content"], "Web search unavailable.",
+        "the model must receive the bounded failure notice"
+    );
+    assert_eq!(
+        search.request_count(),
+        1,
+        "the failed search still counts as one callout"
     );
 }
 

@@ -638,6 +638,212 @@ impl ConversationItemStore for SqliteResponseStore {
 
         row.try_get("max_pos").map_err(|e| StoreError::Database(e.to_string()))
     }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let items_table = self
+            .tables
+            .items
+            .as_deref()
+            .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
+        let conv_table = &self.tables.conversations;
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlite_create_items_and_sync(&mut tx, items_table, conv_table, tenant_id, conversation_id, items).await?;
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        let items_table = self
+            .tables
+            .items
+            .as_deref()
+            .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
+        let conv_table = &self.tables.conversations;
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        let deleted =
+            sqlite_delete_item_and_sync(&mut tx, items_table, conv_table, tenant_id, conversation_id, item_id).await?;
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(deleted)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Transactional Helpers
+// -----------------------------------------------------------------------------
+
+/// Body of [`SqliteResponseStore::create_items_and_sync_messages`].
+///
+/// Runs inside a `BEGIN IMMEDIATE` transaction managed by the caller.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "transactional helper that threads table names and scope identifiers"
+)]
+async fn sqlite_create_items_and_sync(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    items_table: &str,
+    conv_table: &str,
+    tenant_id: &str,
+    conversation_id: &str,
+    items: &[ConversationItemRecord],
+) -> Result<(), StoreError> {
+    let max_sql = format!(
+        "SELECT COALESCE(MAX(position), 0) AS max_pos \
+         FROM {items_table} \
+         WHERE tenant_id = ? AND conversation_id = ?"
+    );
+    let max_row = sqlx::query(AssertSqlSafe(max_sql.as_str()))
+        .bind(tenant_id)
+        .bind(conversation_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let max_pos: i64 = max_row
+        .try_get("max_pos")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    let insert_sql = format!(
+        "INSERT INTO {items_table} \
+         (item_id, tenant_id, conversation_id, item_data, created_at, position) \
+         VALUES (?, ?, ?, ?, ?, ?)"
+    );
+    for (i, item) in items.iter().enumerate() {
+        let offset = i64::try_from(i).unwrap_or(i64::MAX);
+        let position = max_pos.saturating_add(1).saturating_add(offset);
+        let item_data = serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+        sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+            .bind(&item.item_id)
+            .bind(tenant_id)
+            .bind(conversation_id)
+            .bind(&item_data)
+            .bind(item.created_at)
+            .bind(position)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+    }
+
+    sqlite_rebuild_messages(tx, items_table, conv_table, tenant_id, conversation_id).await
+}
+
+/// Body of [`SqliteResponseStore::delete_item_and_sync_messages`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "transactional helper that threads table names and scope identifiers"
+)]
+async fn sqlite_delete_item_and_sync(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    items_table: &str,
+    conv_table: &str,
+    tenant_id: &str,
+    conversation_id: &str,
+    item_id: &str,
+) -> Result<bool, StoreError> {
+    let delete_sql = format!("DELETE FROM {items_table} WHERE item_id = ? AND tenant_id = ? AND conversation_id = ?");
+    let result = sqlx::query(AssertSqlSafe(delete_sql.as_str()))
+        .bind(item_id)
+        .bind(tenant_id)
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+
+    sqlite_rebuild_messages(tx, items_table, conv_table, tenant_id, conversation_id).await?;
+    Ok(true)
+}
+
+/// Read all item JSON values and overwrite the conversation message cache.
+///
+/// Returns [`StoreError::Database`] if the conversation row is gone by
+/// the time the cache is written — i.e. it was deleted concurrently
+/// between the caller's existence check and this transaction. Callers
+/// run this inside a transaction, so the propagated error rolls back
+/// any item mutations made in the same transaction.
+#[expect(clippy::too_many_lines, reason = "sequential query pipeline within a transaction")]
+async fn sqlite_rebuild_messages(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    items_table: &str,
+    conv_table: &str,
+    tenant_id: &str,
+    conversation_id: &str,
+) -> Result<(), StoreError> {
+    let select_sql = format!(
+        "SELECT item_data FROM {items_table} \
+         WHERE tenant_id = ? AND conversation_id = ? \
+         ORDER BY position ASC, item_id ASC"
+    );
+    let rows = sqlx::query(AssertSqlSafe(select_sql.as_str()))
+        .bind(tenant_id)
+        .bind(conversation_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    let mut messages = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let json: String = row
+            .try_get("item_data")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        messages.push(value);
+    }
+
+    let messages_json = serde_json::to_string(&serde_json::Value::Array(messages))
+        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+    let update_sql = format!(
+        "UPDATE {conv_table} SET messages = ? \
+         WHERE conversation_id = ? AND tenant_id = ?"
+    );
+    let updated = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+        .bind(&messages_json)
+        .bind(conversation_id)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::Database(format!(
+            "conversation disappeared during message sync: {conversation_id}"
+        )));
+    }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------

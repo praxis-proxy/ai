@@ -33,6 +33,21 @@ fn config_rejects_unknown_fields() {
 }
 
 #[test]
+fn body_mode_is_stream_buffer() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    match filter.request_body_mode() {
+        BodyMode::StreamBuffer { max_bytes } => {
+            assert_eq!(
+                max_bytes,
+                Some(67_108_864),
+                "StreamBuffer should default to the 64 MiB ceiling; the raw cap is governed by body_limits"
+            );
+        },
+        other => panic!("expected StreamBuffer, got {other:?}"),
+    }
+}
+
+#[test]
 fn config_rejects_zero_timeout() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 0").unwrap();
     assert!(
@@ -483,6 +498,72 @@ async fn cache_hit_populates_mcp_tool_map_on_existing_state() {
         "tool should be in map"
     );
     assert!(!state.request_body.is_null(), "request_body must not be null");
+}
+
+/// The rewritten body (after `mcp`→`function` expansion) is bounded
+/// by `max_rewritten_body_bytes`: a tiny limit rejects with 413.
+///
+/// Uses the cache-hit path so resolution needs no live MCP server.
+#[tokio::test]
+async fn rewritten_body_over_limit_rejected_with_413() {
+    let filter =
+        McpToolResolveFilter::from_config(&serde_yaml::from_str("max_rewritten_body_bytes: 10").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": server_url,
+        "tools": [{"name": "get_weather", "description": "Get weather"}]
+    })];
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(r) if r.status == 413),
+        "rewritten body over max_rewritten_body_bytes should be rejected with 413"
+    );
+}
+
+/// The same cache-hit resolution under a generous limit is committed,
+/// rewriting the `mcp` entry into a `function` tool.
+#[tokio::test]
+async fn rewritten_body_under_limit_committed() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": server_url,
+        "tools": [{"name": "get_weather", "description": "Get weather"}]
+    })];
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "rewritten body under the limit should continue"
+    );
+
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    let tools = rewritten["tools"].as_array().expect("tools array present");
+    assert!(
+        tools
+            .iter()
+            .any(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("function")),
+        "mcp tool should be rewritten to a function tool"
+    );
 }
 
 /// A cache hit must still reject a blocked `server_url` — a
@@ -2444,9 +2525,9 @@ async fn duplicate_label_entries_rejected_at_filter_level() {
 // Body Size Limit After MCP Tool Expansion
 // =========================================================================
 
-/// Build a filter with a specific `max_body_bytes` limit.
-fn filter_with_max_body_bytes(limit: usize) -> Box<dyn HttpFilter> {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_body_bytes: {limit}")).unwrap();
+/// Build a filter with a specific `max_rewritten_body_bytes` limit.
+fn filter_with_max_rewritten_body_bytes(limit: usize) -> Box<dyn HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_rewritten_body_bytes: {limit}")).unwrap();
     McpToolResolveFilter::from_config(&yaml).unwrap()
 }
 
@@ -2460,11 +2541,11 @@ fn large_cached_tools(desc_len: usize) -> Vec<serde_json::Value> {
     })]
 }
 
-/// Expansion past `max_body_bytes` produces a 413 rejection with
+/// Expansion past `max_rewritten_body_bytes` produces a 413 rejection with
 /// `invalid_request_error`. Body and `ResponsesState` are unchanged.
 #[tokio::test]
 async fn expanded_body_exceeding_limit_returns_413() {
-    let filter = filter_with_max_body_bytes(256);
+    let filter = filter_with_max_rewritten_body_bytes(256);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
@@ -2497,11 +2578,11 @@ async fn expanded_body_exceeding_limit_returns_413() {
     );
 }
 
-/// Expansion within `max_body_bytes` continues and commits the
+/// Expansion within `max_rewritten_body_bytes` continues and commits the
 /// rewritten body to `ResponsesState`.
 #[tokio::test]
 async fn expanded_body_within_limit_continues() {
-    let filter = filter_with_max_body_bytes(1_048_576);
+    let filter = filter_with_max_rewritten_body_bytes(1_048_576);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
@@ -2528,7 +2609,7 @@ async fn expanded_body_within_limit_continues() {
 /// Run MCP tool expansion through the filter and return the
 /// expanded body length.
 async fn measure_expanded_body_len(server_url: &str, cached: &[serde_json::Value]) -> usize {
-    let filter = filter_with_max_body_bytes(1_048_576);
+    let filter = filter_with_max_rewritten_body_bytes(1_048_576);
     let body_json = mcp_body(server_url);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2543,7 +2624,7 @@ async fn measure_expanded_body_len(server_url: &str, cached: &[serde_json::Value
     body.as_ref().unwrap().len()
 }
 
-/// Expanded body whose length equals `max_body_bytes` exactly is
+/// Expanded body whose length equals `max_rewritten_body_bytes` exactly is
 /// accepted (the guard rejects strictly *over* the limit).
 #[tokio::test]
 async fn expanded_body_at_exact_limit_continues() {
@@ -2554,7 +2635,7 @@ async fn expanded_body_at_exact_limit_continues() {
     })];
     let expanded_len = measure_expanded_body_len(server_url, &cached).await;
 
-    let filter_exact = filter_with_max_body_bytes(expanded_len);
+    let filter_exact = filter_with_max_rewritten_body_bytes(expanded_len);
     let body_json = mcp_body(server_url);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);

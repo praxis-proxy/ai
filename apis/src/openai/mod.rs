@@ -10,6 +10,7 @@
 )]
 pub(crate) mod api_client;
 pub(crate) mod conversations;
+pub(crate) mod error_response_formatter;
 pub(crate) mod include;
 mod operation;
 pub(crate) mod responses;
@@ -30,6 +31,12 @@ pub use operation::{OpenAiHandlingMode, OpenAiOperationSpec, OpenAiRequestBody};
 pub use responses::{
     AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, FileSearchCalloutFilter, McpDispatchFilter,
     McpToolResolveFilter, ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter,
-    ResponsesFormatFilter, ToolParseFilter, WebSearchFilter, openai_responses_proxy::ResponsesProxyFilter,
-    responses_to_chat_completions::ResponsesToChatCompletionsFilter, stream_events::OpenaiStreamEventsFilter,
+    ResponsesFormatFilter, ToolParseFilter, WebSearchFilter,
+    openai_responses_proxy::ResponsesProxyFilter,
+    responses_to_chat_completions::ResponsesToChatCompletionsFilter,
+    routes::{
+        PROTOCOL_EXTENSION_OPERATION_IDS as RESPONSES_PROTOCOL_EXTENSION_OPERATION_IDS, ResponsesOperation,
+        ResponsesOperationSpec, operation_specs as responses_operation_specs,
+    },
+    stream_events::OpenaiStreamEventsFilter,
 };

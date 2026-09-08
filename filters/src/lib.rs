@@ -18,6 +18,7 @@ pub mod callout;
 pub mod gcp;
 pub mod guardrails;
 pub mod inference;
+pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
 pub mod prompt_enrich;
@@ -38,6 +39,7 @@ pub use callout::HttpCalloutFilter;
 pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
+pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
@@ -100,7 +102,6 @@ pub(crate) mod test_utils {
             health_registry: None,
             id_generator: &TEST_ID_GENERATOR,
             kv_stores: None,
-            #[cfg(feature = "praxis-main")]
             session_stores: None,
             metrics_route: None,
             peer_identity: None,
@@ -114,19 +115,12 @@ pub(crate) mod test_utils {
             response_headers_modified: false,
             subrequest_client: None,
             subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
-            #[cfg(feature = "praxis-main")]
             attempted_endpoints: Vec::new(),
-            #[cfg(feature = "praxis-main")]
             retry_policy: None,
-            #[cfg(feature = "praxis-main")]
             route_retry_policy: None,
-            #[cfg(feature = "praxis-main")]
             cluster_retry_state: None,
-            #[cfg(feature = "praxis-main")]
             cluster_retry_state_released: false,
-            #[cfg(feature = "praxis-main")]
             endpoint_reselector: None,
-            #[cfg(feature = "praxis-main")]
             pinned_endpoint_address: None,
             rewritten_path: None,
             selected_endpoint_index: None,

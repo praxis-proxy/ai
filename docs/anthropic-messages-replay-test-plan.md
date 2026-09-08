@@ -213,7 +213,7 @@ include usage fields and at least one content block with `type: "tool_use"`.
 ### Streaming
 
 Streaming replay is deferred until the replay schema can represent SSE
-responses. Unit and integration tests for `anthropic_stream_events` should still
+responses. Unit and integration tests for `anthropic_messages_to_chat_completions_stream` should still
 cover:
 
 - Text `content_block_delta` events.

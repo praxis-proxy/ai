@@ -5,12 +5,11 @@
 
 use std::collections::HashSet;
 
-use praxis_filter::{
-    FilterError, body::DEFAULT_JSON_BODY_MAX_BYTES,
-    builtins::http::payload_processing::config_validation::validate_max_body_bytes,
-};
+use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 use url::Url;
+
+use crate::openai::responses::body_limits::validate_size_limit;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -54,9 +53,14 @@ pub(crate) struct ConnectorConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpToolResolveConfig {
-    /// Maximum request body bytes for `StreamBuffer`.
-    #[serde(default = "default_max_body_bytes")]
-    pub max_body_bytes: usize,
+    /// Maximum size in bytes of the request body this filter *produces*
+    /// after expanding `mcp` tool entries into `function` entries.
+    ///
+    /// Raw request body size is governed by the pipeline's `body_limits`,
+    /// not this field. This bounds only the post-expansion body, which can
+    /// grow larger than the raw input.
+    #[serde(default = "default_max_rewritten_body_bytes")]
+    pub max_rewritten_body_bytes: usize,
 
     /// Per-server timeout in milliseconds for `tools/list` calls.
     #[serde(default = "default_timeout_ms")]
@@ -82,9 +86,9 @@ pub(crate) struct McpToolResolveConfig {
     pub connectors: Vec<ConnectorConfig>,
 }
 
-/// Default max body bytes.
-fn default_max_body_bytes() -> usize {
-    DEFAULT_JSON_BODY_MAX_BYTES
+/// Default max rewritten body bytes (64 MiB): a post-expansion backstop.
+fn default_max_rewritten_body_bytes() -> usize {
+    MAX_JSON_BODY_BYTES
 }
 
 /// Default timeout in milliseconds.
@@ -104,7 +108,11 @@ fn default_max_tools() -> usize {
 
 /// Validate the parsed configuration.
 pub(crate) fn build_config(cfg: McpToolResolveConfig) -> Result<McpToolResolveConfig, FilterError> {
-    validate_max_body_bytes("openai_mcp_tool_resolve", cfg.max_body_bytes)?;
+    validate_size_limit(
+        "openai_mcp_tool_resolve",
+        "max_rewritten_body_bytes",
+        cfg.max_rewritten_body_bytes,
+    )?;
     if cfg.timeout_ms == 0 {
         return Err("openai_mcp_tool_resolve: timeout_ms must be greater than 0".into());
     }

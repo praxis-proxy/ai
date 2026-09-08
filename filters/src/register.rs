@@ -15,16 +15,16 @@ use crate::HttpCalloutFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 use crate::TokenRateLimitFilter;
 use crate::{
-    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, IntelligentRouteFilter, McpFilter, ModelToHeaderFilter,
-    PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter,
-    TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IntelligentRouteFilter, McpFilter,
+    ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter,
+    TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
 ///
 /// When `subrequest_client` is provided, filters that make HTTP
-/// callouts (`openai_file_resolve`, `openai_web_search`,
-/// `anthropic_web_search`) capture the
+/// callouts (`ai_guardrails`, `openai_file_resolve`, `openai_web_search`,
+/// `anthropic_web_search`, `external_metering`) capture the
 /// shared client instead of creating isolated per-filter connectors.
 ///
 /// Does not call [`FilterRegistry::with_builtins`].
@@ -45,6 +45,8 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     #[cfg(feature = "gcp-adc-filter")]
     register_gcp_filters(registry);
     register_general_ai_filters(registry);
+    register_ai_guardrails(registry, subrequest_client);
+    register_external_metering(registry, subrequest_client);
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
     register_routing_filters(registry);
@@ -100,10 +102,6 @@ fn register_gcp_filters(registry: &mut FilterRegistry) {
 
 /// Register general-purpose AI filters.
 fn register_general_ai_filters(registry: &mut FilterRegistry) {
-    praxis_filter::register_filters!(
-        @register registry,
-        http "ai_guardrails" => AiGuardrailsFilter::from_config
-    );
     #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -139,6 +137,28 @@ fn register_token_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "token_rate_limit" => TokenRateLimitFilter::from_config
     );
+}
+
+/// Register the external metering filter, capturing the shared
+/// sub-request client when one is available.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_external_metering(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "external_metering",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    ExternalMeteringFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'external_metering'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "external_metering" => ExternalMeteringFilter::from_config
+        );
+    }
 }
 
 /// Register intelligent routing filters.
@@ -183,11 +203,11 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "anthropic_stream_events" => praxis_ai_apis::anthropic::AnthropicStreamEventsFilter::from_config
+        http "anthropic_messages_to_chat_completions" => praxis_ai_apis::anthropic::AnthropicMessagesToChatCompletionsFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
-        http "anthropic_to_openai" => praxis_ai_apis::anthropic::AnthropicToOpenaiFilter::from_config
+        http "anthropic_messages_to_chat_completions_stream" => praxis_ai_apis::anthropic::AnthropicMessagesToChatCompletionsStreamFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -278,6 +298,28 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 // -----------------------------------------------------------------------------
 // Sub-request-aware registration
 // -----------------------------------------------------------------------------
+
+/// Register `ai_guardrails` with the shared client when
+/// available, otherwise fall back to an isolated per-filter connector.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "ai_guardrails",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    AiGuardrailsFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'ai_guardrails'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "ai_guardrails" => AiGuardrailsFilter::from_config
+        );
+    }
+}
 
 /// Register `anthropic_web_search` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.

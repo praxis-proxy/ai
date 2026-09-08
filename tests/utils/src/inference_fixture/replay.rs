@@ -17,9 +17,9 @@ use praxis_core::config::{ChainRef, Config, FilterEntry, ProtocolKind};
 use serde_json::Value;
 
 use super::{
-    FixtureError, FixtureProvenance, ImportedUpstream, InferenceScenario, NormalizationMetadata, RecordedBody,
-    RecordedExchange, RecordedRequest, RecordedResponse, RedactionRules, ScenarioExpectation, ScenarioTurn,
-    WIRE_FIXTURE_VERSION, WireFixture, WireTurn,
+    BodyKind, FixtureError, FixtureProvenance, ImportedUpstream, InferenceScenario, NormalizationMetadata,
+    RecordedBody, RecordedExchange, RecordedRequest, RecordedResponse, RedactionRules, ScenarioExpectation,
+    ScenarioTurn, WIRE_FIXTURE_VERSION, WireFixture, WireTurn,
     bounds::{MAX_SCRIPTED_RESPONSE_BODY_BYTES, body_has_rendered_content, parse_response_body, validate_request_body},
     header_policy::{http_fixture_headers, recorded_transport_headers},
     http_server::ScriptedHttpServer,
@@ -119,7 +119,9 @@ impl ScenarioRunner {
             .map_err(|_source| FixtureError::ReplayHttp)?;
         let mut pending = Vec::with_capacity(bound.turns.len());
         let mut previous_response_id = None;
-        for (turn_index, mut turn) in bound.turns.into_iter().enumerate() {
+        let mut contacted = 0_usize;
+        for mut turn in bound.turns {
+            let contacts = turn_contacts_upstream(&turn.expect);
             turn.bind_previous_response_id(previous_response_id.as_deref())?;
             let response = send_recorded_request(&client, proxy.addr(), &turn.request).await?;
             previous_response_id = response.response_id().map(str::to_owned);
@@ -127,10 +129,13 @@ impl ScenarioRunner {
                 scenario: turn,
                 client_response: response,
             });
-            backend.wait_for_exchanges(turn_index + 1, EXCHANGE_TIMEOUT).await?;
+            if contacts {
+                contacted = contacted.saturating_add(1);
+                backend.wait_for_exchanges(contacted, EXCHANGE_TIMEOUT).await?;
+            }
         }
 
-        let captured_requests = finish_backend_after_proxy_shutdown(&mut proxy, backend, pending.len())?;
+        let captured_requests = finish_backend_after_proxy_shutdown(&mut proxy, backend, contacted)?;
 
         let upstream_responses = response_owners
             .into_iter()
@@ -142,17 +147,27 @@ impl ScenarioRunner {
 
         compare_imported_requests(&bound.id, &provenance, &captured_requests, expected_requests, rules)?;
 
+        let mut captured_requests = captured_requests.into_iter();
+        let mut upstream_responses = upstream_responses.into_iter();
         let mut turns = Vec::with_capacity(pending.len());
-        for (turn_index, ((pending, upstream_request), upstream_response)) in pending
-            .into_iter()
-            .zip(captured_requests)
-            .zip(upstream_responses)
-            .enumerate()
-        {
+        for (turn_index, pending) in pending.into_iter().enumerate() {
             let PendingTurn {
                 scenario,
                 client_response,
             } = pending;
+            let (upstream_request, upstream_response) = if turn_contacts_upstream(&scenario.expect) {
+                (
+                    captured_requests.next().ok_or_else(|| {
+                        runtime_error("scripted backend captured fewer requests than contacting turns")
+                    })?,
+                    upstream_responses
+                        .next()
+                        .ok_or_else(|| runtime_error("imported upstream responses were exhausted"))?,
+                )
+            } else {
+                let empty = uncontacted_upstream();
+                (empty.request, empty.response)
+            };
             let turn = WireTurn {
                 name: scenario.name,
                 client: RecordedExchange {
@@ -237,10 +252,13 @@ impl ScenarioRunner {
 
         // Materialization owns its scripts. Cloning at this API boundary is
         // necessary because replay must retain the caller's expected fixture.
+        // Turns that fail before upstream are omitted from the script list.
         let upstream = expected
             .turns
             .iter()
-            .map(|turn| ImportedUpstream {
+            .zip(&scenario.turns)
+            .filter(|(_turn, scenario_turn)| turn_contacts_upstream(&scenario_turn.expect))
+            .map(|(turn, _scenario_turn)| ImportedUpstream {
                 source_id: expected.provenance.source_id.clone(),
                 provider: Some(expected.provenance.provider.clone()),
                 model: Some(expected.provenance.model.clone()),
@@ -263,6 +281,12 @@ pub(super) fn validate_scenario_requests(scenario: &InferenceScenario) -> Result
         validate_origin_form_path(&turn.request.path)?;
         super::header_policy::validate_recorded_headers(&turn.request.headers)?;
         validate_request_body(&turn.request.body)?;
+        if !turn_contacts_upstream(&turn.expect) && turn.expect.upstream_body_kind != BodyKind::Empty {
+            return Err(mismatch(
+                "expect.upstream_body_kind",
+                "uncontacted turns require an empty upstream body",
+            ));
+        }
     }
     Ok(())
 }
@@ -382,27 +406,33 @@ fn validate_replay_filters(config: &Config) -> Result<(), FixtureError> {
     Ok(())
 }
 
+/// Whether a filter type is known to be fully contained within replay.
+fn is_replay_contained_filter(filter_type: &str) -> bool {
+    matches!(
+        filter_type,
+        "openai_agentic_loop"
+            | "anthropic_messages_format"
+            | "anthropic_messages_protocol"
+            | "anthropic_messages_to_chat_completions"
+            | "anthropic_messages_to_chat_completions_stream"
+            | "iterative_request_router"
+            | "openai_responses_proxy"
+            | "path_rewrite"
+            | "openai_responses_format"
+            | "openai_responses_validate"
+            | "openai_response_store"
+            | "openai_responses_rehydrate"
+            | "openai_stream_events"
+            | "responses_to_chat_completions"
+            | "router"
+            | "load_balancer"
+    )
+}
+
 /// Traverses top-level and inline branch filters without scanning inert config data.
 fn validate_replay_filter_entries(filters: &[FilterEntry]) -> Result<(), FixtureError> {
     for filter in filters {
-        if !matches!(
-            filter.filter_type.as_str(),
-            "openai_agentic_loop"
-                | "anthropic_messages_format"
-                | "anthropic_messages_protocol"
-                | "anthropic_to_openai"
-                | "anthropic_stream_events"
-                | "iterative_request_router"
-                | "openai_responses_proxy"
-                | "path_rewrite"
-                | "openai_responses_format"
-                | "openai_responses_validate"
-                | "openai_response_store"
-                | "openai_responses_rehydrate"
-                | "responses_to_chat_completions"
-                | "router"
-                | "load_balancer"
-        ) {
+        if !is_replay_contained_filter(filter.filter_type.as_str()) {
             return Err(runtime_error("scenario filter is not replay-contained"));
         }
         for branch in filter.branch_chains.iter().flatten() {
@@ -1100,13 +1130,13 @@ fn finish_backend_after_proxy_shutdown(
     backend.finish(expected_exchanges)
 }
 
-/// Validates model/provider coherence and exact turn/script counts.
+/// Validates model/provider coherence and exact contacting-turn/script counts.
 fn validate_upstream_inputs(
     scenario: &InferenceScenario,
     provenance: &FixtureProvenance,
     upstream: &[ImportedUpstream],
 ) -> Result<(), FixtureError> {
-    if scenario.turns.len() != upstream.len() {
+    if contacting_turn_count(scenario) != upstream.len() {
         return Err(mismatch("turns", "imported upstream count mismatch"));
     }
     if provenance.model.is_empty() {
@@ -1136,6 +1166,15 @@ fn validate_upstream_inputs(
         }
     }
     Ok(())
+}
+
+/// Counts scenario turns that must produce a provider exchange.
+fn contacting_turn_count(scenario: &InferenceScenario) -> usize {
+    scenario
+        .turns
+        .iter()
+        .filter(|turn| turn_contacts_upstream(&turn.expect))
+        .count()
 }
 
 /// Sends one exact bound scenario request and captures the final client response.
@@ -1541,6 +1580,28 @@ fn compare_values_inner(actual: &Value, expected: &Value, path: &str, opaque_key
     }
 }
 
+/// Returns whether this turn is expected to produce an upstream exchange.
+fn turn_contacts_upstream(expect: &ScenarioExpectation) -> bool {
+    !expect.upstream_path.is_empty()
+}
+
+/// Records the absence of a provider exchange after a client-side rejection.
+fn uncontacted_upstream() -> RecordedExchange {
+    RecordedExchange {
+        request: RecordedRequest {
+            method: String::new(),
+            path: String::new(),
+            headers: BTreeMap::new(),
+            body: RecordedBody::Empty,
+        },
+        response: RecordedResponse {
+            status: 0,
+            headers: BTreeMap::new(),
+            body: RecordedBody::Empty,
+        },
+    }
+}
+
 /// Creates an empty exchange used only for deterministic request normalization.
 fn empty_exchange() -> RecordedExchange {
     RecordedExchange {
@@ -1675,6 +1736,62 @@ mod tests {
             fixture.turns[0].client.response.body.json_value()["content"][0]["text"],
             "4"
         );
+    }
+
+    #[tokio::test]
+    async fn materialize_records_uncontacted_upstream_when_translation_rejects() {
+        let scenario = malformed_compaction_scenario();
+
+        let fixture = ScenarioRunner::materialize(&scenario, synthetic_compaction_provenance(), Vec::new())
+            .await
+            .expect("client-side translation rejection should complete without an upstream script");
+
+        assert_eq!(fixture.turns.len(), 1);
+        assert_eq!(fixture.turns[0].client.response.status, 400);
+        assert_eq!(
+            fixture.turns[0].client.response.body.json_value()["error"]["type"],
+            "invalid_request_error"
+        );
+        assert_eq!(
+            fixture.turns[0].client.response.body.json_value()["error"]["message"],
+            "Responses compaction input item field `encrypted_content` must be valid base64"
+        );
+        assert_eq!(fixture.turns[0].upstream.request.method, "");
+        assert_eq!(fixture.turns[0].upstream.request.path, "");
+        assert_eq!(fixture.turns[0].upstream.request.body, RecordedBody::Empty);
+        assert_eq!(fixture.turns[0].upstream.response.status, 0);
+        assert_eq!(fixture.turns[0].upstream.response.body, RecordedBody::Empty);
+    }
+
+    #[test]
+    fn uncontacted_turn_rejects_a_nonempty_upstream_body_kind() {
+        let mut scenario = malformed_compaction_scenario();
+        scenario.turns[0].expect.upstream_body_kind = BodyKind::Json;
+
+        let error = validate_scenario_requests(&scenario).expect_err("uncontacted JSON upstream must fail closed");
+        assert!(matches!(
+            error,
+            FixtureError::ReplayMismatch {
+                path,
+                rule: "uncontacted turns require an empty upstream body"
+            } if path == "expect.upstream_body_kind"
+        ));
+    }
+
+    #[test]
+    fn uncontacted_turn_rejects_an_imported_upstream_script() {
+        let scenario = malformed_compaction_scenario();
+        let imported = imported_turn("fixture-model", "unused", chat_response("unused", "chatcmpl-unused"));
+
+        let error = validate_upstream_inputs(&scenario, &synthetic_compaction_provenance(), &[imported])
+            .expect_err("uncontacted turns must not import an upstream script");
+        assert!(matches!(
+            error,
+            FixtureError::ReplayMismatch {
+                path,
+                rule: "imported upstream count mismatch"
+            } if path == "turns"
+        ));
     }
 
     #[tokio::test]
@@ -2488,7 +2605,7 @@ mod tests {
             .expect("test filter config should parse")
         };
         let safe_config: Config = parse_config(
-            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
+            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
         );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
 
@@ -3607,6 +3724,64 @@ mod tests {
         }
     }
 
+    fn synthetic_compaction_provenance() -> FixtureProvenance {
+        FixtureProvenance {
+            kind: ProvenanceKind::Synthetic,
+            provider: "synthetic".to_owned(),
+            model: "synthetic-malformed-compaction-model".to_owned(),
+            source_id: Some("controlled-malformed-compaction-base64".to_owned()),
+        }
+    }
+
+    fn malformed_compaction_scenario() -> InferenceScenario {
+        InferenceScenario {
+            version: 1,
+            id: "responses/chat-malformed-compaction".to_owned(),
+            description:
+                "Malformed Responses compaction encrypted_content fails closed before Chat Completions translation."
+                    .to_owned(),
+            protocol: InferenceProtocol::OpenaiResponses,
+            example_config: "openai/responses/responses-to-chat-completions.yaml".to_owned(),
+            upstream_authority: "127.0.0.1:3001".to_owned(),
+            features: vec!["responses.chat.malformed_compaction".to_owned()],
+            turns: vec![ScenarioTurn {
+                name: "initial".to_owned(),
+                request: RecordedRequest {
+                    method: "POST".to_owned(),
+                    path: "/v1/responses".to_owned(),
+                    headers: BTreeMap::from([("content-type".to_owned(), vec!["application/json".to_owned()])]),
+                    body: RecordedBody::Json {
+                        value: json!({
+                            "model": "${MODEL}",
+                            "input": [
+                                {
+                                    "type": "compaction",
+                                    "id": "compact_1",
+                                    "encrypted_content": "%%%not-base64%%%"
+                                },
+                                {"role": "user", "content": "What did we decide?"}
+                            ],
+                            "store": false,
+                            "stream": false,
+                        }),
+                    },
+                },
+                expect: ScenarioExpectation {
+                    client_status: 400,
+                    client_body_kind: BodyKind::Json,
+                    upstream_path: String::new(),
+                    upstream_body_kind: BodyKind::Empty,
+                    client_sse_events: Vec::new(),
+                    client_sse_repeatable_events: Vec::new(),
+                    client_sse_interleaved_events: Vec::new(),
+                    upstream_sse_events: Vec::new(),
+                    upstream_sse_repeatable_events: Vec::new(),
+                    upstream_sse_interleaved_events: Vec::new(),
+                },
+            }],
+        }
+    }
+
     fn imported_turn(model: &str, prompt: &str, response: RecordedResponse) -> ImportedUpstream {
         ImportedUpstream {
             source_id: Some("imported-test".to_owned()),
@@ -3651,12 +3826,18 @@ mod tests {
             path: "/v1/chat/completions".to_owned(),
             headers: BTreeMap::from([("content-type".to_owned(), vec!["application/json".to_owned()])]),
             body: RecordedBody::Json {
-                value: json!({
-                    "model": model,
-                    "max_completion_tokens": 64,
-                    "stream": stream,
-                    "messages": [{"role": "user", "content": prompt}],
-                }),
+                value: {
+                    let mut obj = json!({
+                        "model": model,
+                        "max_completion_tokens": 64,
+                        "stream": stream,
+                        "messages": [{"role": "user", "content": prompt}],
+                    });
+                    if stream {
+                        obj["stream_options"] = json!({"include_usage": true});
+                    }
+                    obj
+                },
             },
         }
     }

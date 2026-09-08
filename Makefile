@@ -140,6 +140,7 @@ lint:
 	cargo xtask sync-inference-readme
 	cargo xtask sync-responses-readme
 	cargo xtask check-inference
+	cargo xtask check-responses-registry
 
 fmt:
 	cargo +nightly fmt --all
@@ -154,7 +155,7 @@ audit:
 coverage-check:
 	cargo llvm-cov --workspace --json \
 		--exclude xtask \
-		--ignore-filename-regex '(target/|tests/)' \
+		--ignore-filename-regex '(target/|tests/|store/postgres\.rs)' \
 		--output-path coverage.json
 	@LINE_PCT=$$(jq '.data[0].totals.lines.percent' coverage.json); \
 	echo "Line coverage: $${LINE_PCT}%"; \

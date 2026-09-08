@@ -41,9 +41,10 @@ use self::{
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
+    callout_policy::OnFailure,
+    http_hop::{connection_nominates_header, is_hop_by_hop},
     openai::responses::{
         bounded_json_size,
-        config_validation::FailureMode,
         error::responses_error_rejection,
         state::{MAX_CITATION_FILES, ResponsesState},
         usage::merge_usage,
@@ -81,7 +82,7 @@ pub struct FileSearchCalloutFilter {
     max_state_bytes: usize,
 
     /// Whether a failed callout rejects or produces an incomplete result.
-    failure_mode: FailureMode,
+    on_failure: OnFailure,
 }
 
 /// Request-local marker used to reject streaming before the first subrequest.
@@ -125,7 +126,7 @@ impl FileSearchCalloutFilter {
     fn build(validated: ValidatedConfig) -> Box<dyn HttpFilter> {
         let client = FileSearchClient::new(FileSearchClientConfig {
             api_client: validated.api_client,
-            failure_mode: validated.failure_mode,
+            on_failure: validated.on_failure,
             max_response_bytes: validated.max_response_bytes,
             max_total_response_bytes: validated.max_total_response_bytes,
             timeout: validated.timeout,
@@ -134,7 +135,7 @@ impl FileSearchCalloutFilter {
         Box::new(Self {
             client,
             max_state_bytes: validated.max_state_bytes,
-            failure_mode: validated.failure_mode,
+            on_failure: validated.on_failure,
         })
     }
 
@@ -272,7 +273,7 @@ impl FileSearchCalloutFilter {
                 "vector store search failed"
             );
         }
-        let failure = (self.failure_mode == FailureMode::Closed)
+        let failure = (self.on_failure == OnFailure::Closed)
             .then(|| batch.failures.first())
             .flatten()?;
         Some(FilterAction::Reject(responses_error_rejection(
@@ -542,24 +543,13 @@ fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
     ctx.request_headers_to_set.extend(headers);
 }
 
-/// Whether `Connection` marks a request header as specific to one hop.
-fn connection_nominates_header(headers: &HeaderMap, name: &http::header::HeaderName) -> bool {
-    headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .any(|token| token.eq_ignore_ascii_case(name.as_str()))
-}
-
 /// Whether a header remains valid after the continuation body is rewritten.
 fn should_replay_original_header(name: &http::header::HeaderName) -> bool {
     !praxis_core::reserved_headers::is_reserved(name.as_str())
+        && !is_hop_by_hop(name.as_str())
         && !matches!(
             name.as_str(),
             "accept-encoding"
-                | "connection"
                 | "content-encoding"
                 | "content-length"
                 | "content-md5"
@@ -567,15 +557,8 @@ fn should_replay_original_header(name: &http::header::HeaderName) -> bool {
                 | "expect"
                 | "host"
                 | "idempotency-key"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
                 | "signature"
                 | "signature-input"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
         )
 }
 
@@ -719,6 +702,7 @@ fn continuation_state_fits(
     for value in [
         state.context_management.as_ref(),
         state.conversation.as_ref(),
+        state.original_tool_choice.as_ref(),
         state.previous_usage.as_ref(),
     ]
     .into_iter()
@@ -735,6 +719,7 @@ fn continuation_state_fits(
         .map(|(key, value)| key.len().saturating_add(value.len()))
         .chain(state.include.iter().map(String::len))
         .chain(state.previous_response_id.iter().map(String::len))
+        .chain(state.response_id.iter().map(String::len))
         .chain(
             state
                 .mcp_tool_map
@@ -825,7 +810,8 @@ fn mixed_tool_response_rejection() -> FilterAction {
 
 /// Allow the model to answer after satisfying the first forced search call.
 fn reset_tool_choice(state: &mut ResponsesState) {
-    state.tool_choice = Value::String("auto".to_owned());
+    let original = std::mem::replace(&mut state.tool_choice, Value::String("auto".to_owned()));
+    state.original_tool_choice.get_or_insert(original);
     if let Some(request) = state.request_body.as_object_mut() {
         request.remove("tool_choice");
     }
@@ -1150,7 +1136,10 @@ fn combined_output_fits(state: &ResponsesState, incoming_response: &Value, max_b
 }
 
 /// Return whether an output item is a provider-hosted built-in tool call.
-fn is_builtin_tool_call(item: &Value) -> bool {
+///
+/// Shared with `openai_web_search`, which counts non-web built-in calls against
+/// the same client-declared `max_tool_calls` budget.
+pub(crate) fn is_builtin_tool_call(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
         Some(
@@ -1323,7 +1312,11 @@ fn unsupported_streaming_rejection(ctx: &HttpFilterContext<'_>) -> Option<Filter
 }
 
 /// Return whether one output item still requires local file-search execution.
-fn is_pending_file_search_call(item: &Value) -> bool {
+///
+/// Shared with `openai_web_search`, which must exclude these pending
+/// placeholders when counting non-web built-in calls against the shared
+/// `max_tool_calls` budget, mirroring [`remaining_file_search_call_budget`].
+pub(crate) fn is_pending_file_search_call(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("file_search_call")
         && matches!(
             item.get("status").and_then(Value::as_str),

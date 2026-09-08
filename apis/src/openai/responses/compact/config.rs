@@ -6,7 +6,10 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::openai::responses::config_validation::{self, CalloutSettings, FailureMode};
+use crate::{
+    callout_policy::{self, CalloutSettings, OnFailure},
+    callout_target::{AddressPolicy, validate_configured_http_target},
+};
 
 /// Default callout timeout (30 seconds — summarization can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -22,9 +25,22 @@ const DEFAULT_STATUS_ON_ERROR: u16 = 502;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CompactFilterConfig {
+    /// Allow summarization callouts from the `StreamBuffer` pre-read
+    /// phase, before header-phase security filters execute.
+    ///
+    /// This must be explicitly enabled only when an outer trust
+    /// boundary authenticates and authorizes requests before they
+    /// reach this listener.
+    #[serde(default)]
+    pub allow_pre_security_callout: bool,
+
     /// URL of the inference backend for summarization calls.
     /// E.g., `"http://localhost:11434/v1/chat/completions"`
     pub inference_url: String,
+
+    /// Allow the inference target to resolve to non-public addresses.
+    #[serde(default)]
+    pub allow_private_inference_url: bool,
 
     /// Default model for summarization when not overridden
     /// in the request's `context_management`.
@@ -42,9 +58,9 @@ pub(super) struct CompactFilterConfig {
 
     /// Failure mode for the inference callout.
     #[serde(default)]
-    pub callout_failure_mode: Option<FailureMode>,
+    pub on_failure: Option<OnFailure>,
 
-    /// HTTP status code to return when rejecting on error.
+    /// HTTP error status code (`400..=599`) to return when rejecting on error.
     #[serde(default)]
     pub status_on_error: Option<u16>,
 }
@@ -69,6 +85,9 @@ pub(super) struct ValidatedConfig {
     /// URL of the inference backend for summarization calls.
     pub inference_url: String,
 
+    /// Connect-time policy for the inference target.
+    pub address_policy: AddressPolicy,
+
     /// Default model for summarization.
     pub default_model: String,
 
@@ -86,13 +105,21 @@ const SUPPORTED_ENCODINGS: &[&str] = &["cl100k_base", "o200k_base"];
 ///
 /// # Errors
 ///
-/// Returns [`FilterError`] if `inference_url` is empty,
-/// `tiktoken_encoding` is not a supported encoding name,
-/// `timeout_ms` is zero, or `status_on_error` is out of range.
+/// Returns [`FilterError`] if `allow_pre_security_callout` is not
+/// `true`, `inference_url` is empty, `tiktoken_encoding` is not a
+/// supported encoding name, `timeout_ms` is zero, or
+/// `status_on_error` is out of range.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the validation flow keeps all compact callout invariants together"
+)]
 pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig, FilterError> {
+    validate_pre_security_callout(raw)?;
     if raw.inference_url.is_empty() {
         return Err(FilterError::from("openai_responses_compact: inference_url is empty"));
     }
+    let address_policy = AddressPolicy::from_allow_private(raw.allow_private_inference_url);
+    validate_configured_http_target("openai_responses_compact", &raw.inference_url, address_policy)?;
 
     if !SUPPORTED_ENCODINGS.contains(&raw.tiktoken_encoding.as_str()) {
         return Err(FilterError::from(format!(
@@ -103,9 +130,9 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
     }
 
     let timeout_ms =
-        config_validation::validate_timeout_ms("openai_responses_compact", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
+        callout_policy::validate_timeout_ms("openai_responses_compact", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
 
-    let status_on_error = config_validation::validate_status_on_error(
+    let status_on_error = callout_policy::validate_status_on_error(
         "openai_responses_compact",
         raw.status_on_error,
         DEFAULT_STATUS_ON_ERROR,
@@ -113,14 +140,26 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
 
     Ok(ValidatedConfig {
         inference_url: raw.inference_url.clone(),
+        address_policy,
         default_model: raw.default_model.clone(),
         tiktoken_encoding: raw.tiktoken_encoding.clone(),
         callout: CalloutSettings {
             timeout_ms,
-            failure_mode: raw.callout_failure_mode.unwrap_or(FailureMode::Closed),
+            on_failure: raw.on_failure.unwrap_or(OnFailure::Closed),
             status_on_error,
         },
     })
+}
+
+/// Require explicit acknowledgement of the pre-read security boundary.
+fn validate_pre_security_callout(cfg: &CompactFilterConfig) -> Result<(), FilterError> {
+    if !cfg.allow_pre_security_callout {
+        return Err(
+            "openai_responses_compact: 'allow_pre_security_callout' must be true because StreamBuffer body callouts run before header-phase security filters; place authentication and authorization in an outer trust boundary"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -130,25 +169,35 @@ mod yaml_tests {
     use super::*;
 
     #[test]
-    fn callout_failure_mode_open_deserializes_from_yaml() {
+    fn on_failure_open_deserializes_from_yaml() {
         let cfg: CompactFilterConfig =
-            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: open")
+            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions\non_failure: open")
                 .expect("should deserialize");
-        assert_eq!(cfg.callout_failure_mode, Some(FailureMode::Open));
+        assert_eq!(cfg.on_failure, Some(OnFailure::Open));
     }
 
     #[test]
-    fn callout_failure_mode_closed_deserializes_from_yaml() {
+    fn on_failure_closed_deserializes_from_yaml() {
         let cfg: CompactFilterConfig =
-            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions\ncallout_failure_mode: closed")
+            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions\non_failure: closed")
                 .expect("should deserialize");
-        assert_eq!(cfg.callout_failure_mode, Some(FailureMode::Closed));
+        assert_eq!(cfg.on_failure, Some(OnFailure::Closed));
     }
 
     #[test]
-    fn callout_failure_mode_absent_defaults_to_none() {
+    fn on_failure_absent_defaults_to_none() {
         let cfg: CompactFilterConfig =
             serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions").expect("should deserialize");
-        assert_eq!(cfg.callout_failure_mode, None);
+        assert_eq!(cfg.on_failure, None);
+    }
+
+    #[test]
+    fn pre_security_callout_defaults_to_false() {
+        let cfg: CompactFilterConfig =
+            serde_yaml::from_str("inference_url: http://localhost/v1/chat/completions").expect("should deserialize");
+        assert!(
+            !cfg.allow_pre_security_callout,
+            "pre-security callouts must be disabled until explicitly acknowledged"
+        );
     }
 }

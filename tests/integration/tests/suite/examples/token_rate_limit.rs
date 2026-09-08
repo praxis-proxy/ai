@@ -299,7 +299,9 @@ fn mixed_algorithm_rules_config(proxy_port: u16, backend_port: u16, valkey_url: 
          \x20       clusters:\n\
          \x20         - name: backend\n\
          \x20           endpoints:\n\
-         \x20             - \"127.0.0.1:3000\"\n"
+         \x20             - \"127.0.0.1:3000\"\n\
+         insecure_options:\n\
+         \x20 allow_private_endpoints: true\n"
     );
     patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]))
 }

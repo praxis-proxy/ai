@@ -3,6 +3,13 @@
 This directory tracks Praxis AI conformance against selected OpenAI API
 surfaces. The current scope is Conversations only.
 
+This directory also vendors the upstream Anthropic Messages API OpenAPI
+document at `specs/anthropic-spec.json` as a **review reference only**. It is
+read by the automated PR review prompt (`.github/prompts/automated-review.md`)
+when a change touches Anthropic surfaces. It is not consumed by
+`cargo xtask openai-conformance`, and there is no `oasdiff`, capability, or CI
+gate for Anthropic. See [Anthropic Messages Reference Spec](#anthropic-messages-reference-spec).
+
 ## Contract Sources
 
 Conformance compares two independent truths:
@@ -49,9 +56,11 @@ against `api.openai.com` on 2026-07-27.
 | Update with object `metadata` | `200` |
 
 The pinned and current upstream OpenAPI documents omit `requestBody.required`
-for update even though the live endpoint requires the body. The implementation
-document follows the verified runtime contract, so that upstream discrepancy
-remains visible instead of declaring behavior Praxis does not implement.
+for update and mark `metadata` nullable even though the live endpoint requires
+the body and rejects null metadata. The implementation document follows the
+verified runtime contract, and both discrepancies are recorded as explicit
+`upstream_spec_exceptions` on `POST /conversations/{conversation_id}` rather
+than declaring behavior Praxis does not implement.
 
 ## Code Map
 
@@ -132,6 +141,18 @@ This command also runs the focused runtime contract tests recorded in the
 report. A failing or missing declared test makes the command fail after the
 JSON result has been written.
 
+Conversation input and output item unions are derived from the same pinned
+document into the runtime artifact:
+
+```console
+cargo xtask openai-conversation-item-contracts
+cargo xtask openai-conversation-item-contracts --check
+```
+
+Normal conformance generation performs the check before comparing schemas, so
+the runtime validator and generated implementation document cannot silently
+drift from the pinned item union.
+
 ## Reference Refresh
 
 Normal conformance runs do not fetch upstream. They read the complete vendored
@@ -195,6 +216,14 @@ populated string map round-tripped unchanged. Praxis therefore retains its
 string-map response schema and records the 12 missing upstream metadata
 constraints as explicit exceptions.
 
+The same probe covered the update request body. An absent body returned `400
+missing_required_parameter` and null metadata returned `400 invalid_type`, so
+the pinned upstream is incomplete: it omits `requestBody.required` and marks
+`metadata` nullable. Praxis follows the verified runtime contract — a required
+body with non-null string-map metadata — and records the seven resulting
+`POST /conversations/{conversation_id}` request drift fingerprints as explicit
+exceptions.
+
 ## CI Enforcement
 
 CI always runs strict capability and owned-contract conformance after the
@@ -238,3 +267,56 @@ adapter, generated owned-contract document, and focused runtime suite. They
 reuse the global OpenAI pin, semantic projector, shared operation metadata,
 and report pipeline rather than adding another reference artifact, scanning
 Rust source, or maintaining a handwritten implementation specification.
+
+## Anthropic Messages Reference Spec
+
+`specs/anthropic-spec.json` is the vendored Anthropic API OpenAPI document,
+used as the authoritative contract when reviewing changes to the Anthropic
+Messages surfaces under `apis/src/anthropic/`. Unlike the OpenAI spec, it is a
+**review reference only**: no `oasdiff` comparison, capability projection,
+runtime suite, or CI gate is wired to it. It exists so the automated PR review
+prompt can cross-reference request and response schemas, field names, types,
+enums, and optionality without a network fetch.
+
+### Source and provenance
+
+`specs/anthropic-spec-source.json` pins the exact upstream origin:
+
+- Repository `anthropics/anthropic-sdk-python`, at an immutable 40-character
+  commit `revision`.
+- Path `scripts/mock-spec.json.gz` — the mock-server OpenAPI document bundled
+  in that repository. `encoding` is `gzip` and `source_sha256` is the digest of
+  that upstream gzip.
+- `anthropic-spec.json` is the verbatim gunzip of that pinned gzip, and
+  `vendored_sha256` is the digest of the decompressed JSON checked in here.
+
+Verify the vendored file against the manifest:
+
+```console
+shasum -a 256 docs/conformance/specs/anthropic-spec.json
+# must equal vendored_sha256 in anthropic-spec-source.json
+```
+
+### Scope
+
+The spec is the complete upstream Anthropic API document. Today the only
+Anthropic path Praxis handles is `/v1/messages` and its subpaths
+(`/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches`), so that
+is where conformance review applies. The other stable surfaces in the spec
+(`/v1/complete`, `/v1/models`, `/v1/files`) are in scope only if a change adds
+Anthropic handling for them. Paths carrying a `?beta=true` query and the
+platform or console surfaces (agents, deployments, environments, memory stores,
+organizations, sessions, tunnels, vaults, skills, user profiles) are always out
+of scope — Praxis does not implement them, so their absence in Praxis is never
+a finding.
+
+### Refresh
+
+```console
+curl -fsSL \
+  https://raw.githubusercontent.com/anthropics/anthropic-sdk-python/<revision>/scripts/mock-spec.json.gz \
+  | gunzip > docs/conformance/specs/anthropic-spec.json
+```
+
+Then update `revision`, `source_sha256`, and `vendored_sha256` in
+`specs/anthropic-spec-source.json`.

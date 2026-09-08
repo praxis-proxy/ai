@@ -215,7 +215,7 @@ fn reject_file_url_failed_returns_502() {
 
 #[test]
 fn reject_rewritten_body_too_large_returns_413() {
-    let action = reject_rewritten_body_too_large(2048, 1024);
+    let action = reject_rewritten_body_too_large(2048, 1024, false);
     match action {
         FilterAction::Reject(r) => {
             assert_eq!(r.status, 413, "oversized rewritten body should produce 413");
@@ -227,31 +227,6 @@ fn reject_rewritten_body_too_large_returns_413() {
 // -----------------------------------------------------------------------------
 // on_request_body
 // -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn rejects_oversized_raw_body_before_resolution() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "files_api_url: \"http://127.0.0.1:9\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\non_missing: reject\nmax_body_bytes: 64",
-    )
-    .unwrap();
-    let filter = FileResolveFilter::from_config(&yaml).unwrap();
-    let req = Box::leak(Box::new(crate::test_utils::make_request(
-        http::Method::POST,
-        "/v1/responses",
-    )));
-    let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_file","file_id":"file-never-fetched"}]}]}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    assert!(
-        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
-        "the resolver's own body limit must be enforced before parsing or callouts"
-    );
-}
 
 #[tokio::test]
 async fn skips_non_responses_request() {
@@ -435,7 +410,8 @@ async fn sync_state_updates_responses_state() {
     });
 
     let client = make_client();
-    sync_state(&mut ctx, &resolved_body, &client, OnMissing::Continue)
+    // Clone so the assertion below can compare against the pre-move value.
+    sync_state(&mut ctx, resolved_body.clone(), &client, OnMissing::Continue)
         .await
         .unwrap();
 
@@ -571,7 +547,7 @@ async fn sync_state_uses_independent_history_offsets() {
             "content": [{"type": "input_file", "file_data": "SGVsbG8="}]
         }]
     });
-    sync_state(&mut ctx, &resolved_body, &make_client(), OnMissing::Continue)
+    sync_state(&mut ctx, resolved_body, &make_client(), OnMissing::Continue)
         .await
         .unwrap();
 
@@ -687,7 +663,7 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
     let unresolved_len = serialized_outbound_body_len(&state).unwrap();
 
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\nmax_body_bytes: {unresolved_len}"
+        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\nmax_rewritten_body_bytes: {unresolved_len}"
     ))
     .unwrap();
     let filter = FileResolveFilter::from_config(&yaml).unwrap();
@@ -705,6 +681,86 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
     assert!(
         matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
         "resolved rehydrated history should respect the resolver's final body limit"
+    );
+}
+
+#[tokio::test]
+async fn max_resolved_bytes_bounds_individual_content_independent_of_rewritten_limit() {
+    let files_api_url = start_files_api_stub();
+    // The stub serves 7 bytes of content for file-history. A tiny
+    // max_resolved_bytes must reject it even though the rewritten-body
+    // limit is left at the 64 MiB ceiling: the two limits are decoupled.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\non_missing: reject\nmax_resolved_bytes: 1\nmax_rewritten_body_bytes: 67108864"
+    ))
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+    let request_body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
+        "a small max_resolved_bytes must reject oversized inline content regardless of max_rewritten_body_bytes"
+    );
+}
+
+#[tokio::test]
+async fn max_resolved_bytes_default_allows_resolution() {
+    let files_api_url = start_files_api_stub();
+    // Same request as the decoupling reject test, but with a large
+    // max_resolved_bytes: the content now fits and resolution succeeds,
+    // proving the previous rejection was attributable to max_resolved_bytes.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\nmax_resolved_bytes: 67108864\nmax_rewritten_body_bytes: 67108864"
+    ))
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+
+    let request_body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a large max_resolved_bytes should allow the same content to resolve"
+    );
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    let part = &rewritten["input"][0]["content"][0];
+    assert!(
+        part.get("file_id").is_none(),
+        "file_id should be removed after resolution"
+    );
+    assert_eq!(
+        part["file_data"], "aGlzdG9yeQ==",
+        "resolved content should be inlined as base64"
     );
 }
 
@@ -743,6 +799,59 @@ async fn rejects_unresolvable_history_when_configured_to_reject() {
 }
 
 #[tokio::test]
+async fn sync_state_leaves_original_input_untouched() {
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-abc"}]
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state
+        .messages
+        .insert(0, json!({"role": "user", "content": "replay history"}));
+    state
+        .persisted_messages
+        .insert(0, json!({"role": "user", "content": "replay history"}));
+    ctx.extensions.insert(state);
+
+    let resolved_body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_data": "SGVsbG8="}]
+        }]
+    });
+    sync_state(&mut ctx, resolved_body, &make_client(), OnMissing::Continue)
+        .await
+        .unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let part = &state.input[0]["content"][0];
+    assert_eq!(
+        part["file_id"], "file-abc",
+        "state.input should keep the original client file_id"
+    );
+    assert!(
+        part.get("file_data").is_none(),
+        "state.input should not receive resolved file_data"
+    );
+    assert_eq!(
+        state.messages[1]["content"][0]["file_data"], "SGVsbG8=",
+        "the rewritten tail should still reach messages"
+    );
+}
+
+#[tokio::test]
 async fn sync_state_skipped_without_responses_state() {
     let req = Box::leak(Box::new(crate::test_utils::make_request(
         http::Method::POST,
@@ -753,7 +862,7 @@ async fn sync_state_skipped_without_responses_state() {
     let resolved_body = json!({"model": "gpt-4o", "input": []});
     let client = make_client();
 
-    sync_state(&mut ctx, &resolved_body, &client, OnMissing::Continue)
+    sync_state(&mut ctx, resolved_body, &client, OnMissing::Continue)
         .await
         .unwrap();
 
@@ -790,6 +899,7 @@ fn make_client_for_url_with_max(files_api_url: &str, max_resolved_bytes: usize) 
         timeout: Duration::from_secs(5),
         max_response_bytes: 1_048_576,
         forward_header_names: vec![],
+        address_policy: crate::callout_target::AddressPolicy::AllowPrivate,
     });
     FilesApiClient::new(
         api,
@@ -845,10 +955,12 @@ fn serve_file_request(mut stream: std::net::TcpStream) {
 
 #[tokio::test]
 async fn file_url_resolved_to_data_uri() {
-    use crate::openai::responses::file_resolve::{
-        config::OnMissing,
-        resolve::resolve_input,
-        resolve_url::{FileUrlResolver, NormalizedOrigin},
+    use crate::{
+        callout_policy::OnMissing,
+        openai::responses::file_resolve::{
+            resolve::resolve_input,
+            resolve_url::{FileUrlResolver, NormalizedOrigin},
+        },
     };
 
     // Start TCP stub serving file content
@@ -1007,7 +1119,7 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
 
 #[tokio::test]
 async fn file_url_passthrough_when_no_resolver() {
-    use crate::openai::responses::file_resolve::{config::OnMissing, resolve::resolve_input};
+    use crate::{callout_policy::OnMissing, openai::responses::file_resolve::resolve::resolve_input};
 
     // Build body with file_url
     let mut body = json!({
@@ -1036,10 +1148,12 @@ async fn file_url_passthrough_when_no_resolver() {
 
 #[tokio::test]
 async fn file_url_in_shorthand_message_resolved() {
-    use crate::openai::responses::file_resolve::{
-        config::OnMissing,
-        resolve::resolve_input,
-        resolve_url::{FileUrlResolver, NormalizedOrigin},
+    use crate::{
+        callout_policy::OnMissing,
+        openai::responses::file_resolve::{
+            resolve::resolve_input,
+            resolve_url::{FileUrlResolver, NormalizedOrigin},
+        },
     };
 
     // Start TCP stub
@@ -1101,10 +1215,12 @@ async fn file_url_in_shorthand_message_resolved() {
 
 #[tokio::test]
 async fn file_url_in_function_call_output_resolved() {
-    use crate::openai::responses::file_resolve::{
-        config::OnMissing,
-        resolve::resolve_input,
-        resolve_url::{FileUrlResolver, NormalizedOrigin},
+    use crate::{
+        callout_policy::OnMissing,
+        openai::responses::file_resolve::{
+            resolve::resolve_input,
+            resolve_url::{FileUrlResolver, NormalizedOrigin},
+        },
     };
 
     // Start TCP stub
@@ -1167,8 +1283,9 @@ async fn file_url_in_function_call_output_resolved() {
 
 #[tokio::test]
 async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
-    use crate::openai::responses::file_resolve::{
-        config::OnMissing, resolve::resolve_input, resolve_url::FileUrlResolver,
+    use crate::{
+        callout_policy::OnMissing,
+        openai::responses::file_resolve::{resolve::resolve_input, resolve_url::FileUrlResolver},
     };
 
     let mut body = json!({
@@ -1205,8 +1322,9 @@ async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
 
 #[tokio::test]
 async fn file_url_failed_is_not_swallowed_by_on_missing_continue() {
-    use crate::openai::responses::file_resolve::{
-        config::OnMissing, resolve::resolve_input, resolve_url::FileUrlResolver,
+    use crate::{
+        callout_policy::OnMissing,
+        openai::responses::file_resolve::{resolve::resolve_input, resolve_url::FileUrlResolver},
     };
 
     // Regression test for #542: simulate an attacker-controlled origin
@@ -1268,8 +1386,9 @@ async fn file_url_failed_is_not_swallowed_by_on_missing_continue() {
 
 #[tokio::test]
 async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
-    use crate::openai::responses::file_resolve::{
-        config::OnMissing, resolve::resolve_input, resolve_url::FileUrlResolver,
+    use crate::{
+        callout_policy::OnMissing,
+        openai::responses::file_resolve::{resolve::resolve_input, resolve_url::FileUrlResolver},
     };
 
     // Regression test for #542: an oversized file_url response must

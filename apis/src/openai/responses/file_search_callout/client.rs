@@ -14,7 +14,7 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize, de::Visitor};
 use serde_json::Value;
 
-use crate::openai::{api_client::ApiClient, responses::config_validation::FailureMode};
+use crate::{callout_policy::OnFailure, openai::api_client::ApiClient};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -337,7 +337,7 @@ pub(crate) struct FileSearchClientConfig {
     pub api_client: ApiClient,
 
     /// Whether one failed chunk stops scheduling later callouts.
-    pub failure_mode: FailureMode,
+    pub on_failure: OnFailure,
 
     /// Maximum response body size enforced by the core client.
     pub max_response_bytes: usize,
@@ -355,7 +355,7 @@ pub(crate) struct FileSearchClient {
     api_client: ApiClient,
 
     /// Whether one failed chunk stops scheduling later callouts.
-    failure_mode: FailureMode,
+    on_failure: OnFailure,
 
     /// Maximum response body size enforced by the core client.
     max_response_bytes: usize,
@@ -372,7 +372,7 @@ impl FileSearchClient {
     pub fn new(config: FileSearchClientConfig) -> Self {
         Self {
             api_client: config.api_client,
-            failure_mode: config.failure_mode,
+            on_failure: config.on_failure,
             max_response_bytes: config.max_response_bytes,
             max_total_response_bytes: config.max_total_response_bytes,
             timeout: config.timeout,
@@ -440,7 +440,7 @@ impl FileSearchClient {
                 deadline_recorded = true;
                 break;
             }
-            if chunk_failed && self.failure_mode == FailureMode::Closed {
+            if chunk_failed && self.on_failure == OnFailure::Closed {
                 if let Some(remaining_specs) = specs.get(next_spec..) {
                     append_fail_closed_failures(&mut batch.failures, remaining_specs);
                 }

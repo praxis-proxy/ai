@@ -53,7 +53,8 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -62,8 +63,8 @@ use self::{
     extract::{ExtractError, ExtractionBudget, extract_input_file},
 };
 use super::{
-    file_resolve::resolve::content_parts_mut, openai_responses_proxy::serialized_outbound_body_len,
-    state::ResponsesState,
+    body_limits::reject_rewritten_body_too_large, file_resolve::resolve::content_parts_mut,
+    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};
 
@@ -83,7 +84,7 @@ use crate::{classifier::is_responses_create, json_body::serialize_json_body};
 /// filter: openai_doc_extract
 /// allow_pre_security_callout: true
 /// on_unsupported: continue
-/// max_body_bytes: 67108864
+/// max_rewritten_body_bytes: 67108864
 /// max_content_bytes: 10485760
 /// max_file_references: 32
 /// max_total_text_bytes: 67108864
@@ -118,8 +119,11 @@ impl HttpFilter for DocExtractFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
+        // Accept up to the absolute ceiling; the pipeline's body_limits
+        // decides the real raw cap. max_rewritten_body_bytes bounds only
+        // the body produced after input_file → input_text conversion.
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
         }
     }
 
@@ -151,11 +155,8 @@ impl HttpFilter for DocExtractFilter {
             trace!("no body, releasing");
             return Ok(FilterAction::Release);
         };
-        if raw.len() > self.config.max_body_bytes {
-            return Ok(reject_raw_body_too_large(raw.len(), self.config.max_body_bytes));
-        }
 
-        let mut parsed: serde_json::Value = match serde_json::from_slice(raw) {
+        let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
             Err(e) => {
                 debug!(error = %e, "body is not valid JSON, releasing");
@@ -163,21 +164,28 @@ impl HttpFilter for DocExtractFilter {
             },
         };
 
-        extract_and_rewrite(self, ctx, body, &mut parsed)
+        extract_and_rewrite(self, ctx, body, parsed)
     }
 }
 
 /// Run extraction on the current input and history, then rewrite
 /// the body and sync state.
+///
+/// Takes ownership of the parsed body so the extracted value can be
+/// moved into [`ResponsesState`] instead of deep-cloned.
 fn extract_and_rewrite(
     filter: &DocExtractFilter,
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
-    parsed: &mut serde_json::Value,
+    mut parsed: serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
+    let streaming = ctx
+        .get_metadata("openai_responses_format.stream")
+        .is_some_and(|v| v == "true");
+    let max_bytes = filter.config.max_rewritten_body_bytes;
     let mut budget = ExtractionBudget::new(&filter.config);
 
-    let count = match extract_current_input(parsed, &mut budget) {
+    let count = match extract_current_input(&mut parsed, &mut budget) {
         Ok(count) => count,
         Err(e) => return Ok(reject_extract_error(&e)),
     };
@@ -187,20 +195,20 @@ fn extract_and_rewrite(
         if let Err(e) = extract_state_history(ctx, &mut budget) {
             return Ok(reject_extract_error(&e));
         }
-        if let Some(rejection) = reject_oversized_state_body(ctx, filter.config.max_body_bytes)? {
+        if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes, streaming)? {
             return Ok(rejection);
         }
         return Ok(FilterAction::Continue);
     }
 
     debug!(count, "extracted input_file parts");
-    if let Some(rejection) = rewrite_body(body, parsed, filter.config.max_body_bytes, filter.name())? {
+    if let Some(rejection) = rewrite_body(body, &parsed, max_bytes, streaming, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = sync_state_after_rewrite(ctx, parsed, &mut budget) {
         return Ok(reject_extract_error(&e));
     }
-    if let Some(rejection) = reject_oversized_state_body(ctx, filter.config.max_body_bytes)? {
+    if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes, streaming)? {
         return Ok(rejection);
     }
 
@@ -246,13 +254,23 @@ fn extract_item_parts(item: &mut serde_json::Value, budget: &mut ExtractionBudge
 fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
-    max_body_bytes: usize,
+    max_rewritten_body_bytes: usize,
+    streaming: bool,
     filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
     let rewritten = serialize_json_body(parsed)
         .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
-    if rewritten.len() > max_body_bytes {
-        return Ok(Some(reject_rewritten_body_too_large(rewritten.len(), max_body_bytes)));
+    if rewritten.len() > max_rewritten_body_bytes {
+        warn!(
+            actual = rewritten.len(),
+            limit = max_rewritten_body_bytes,
+            "rewritten request body exceeds configured limit"
+        );
+        return Ok(Some(reject_rewritten_body_too_large(
+            rewritten.len(),
+            max_rewritten_body_bytes,
+            streaming,
+        )));
     }
     rewritten.commit(body, filter_name, "input");
     Ok(None)
@@ -260,25 +278,45 @@ fn rewrite_body(
 
 /// Sync converted content back into [`ResponsesState`] after a body
 /// rewrite.
+///
+/// Takes `resolved_body` by value and moves it into `request_body`
+/// rather than deep-cloning a tree that may carry inlined file data.
 fn sync_state_after_rewrite(
     ctx: &mut HttpFilterContext<'_>,
-    resolved_body: &serde_json::Value,
+    resolved_body: serde_json::Value,
     budget: &mut ExtractionBudget,
 ) -> Result<(), ExtractError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         return Ok(());
     };
 
-    state.request_body = resolved_body.clone();
+    state.request_body = resolved_body;
 
-    let Some(resolved_input) = resolved_body.get("input").and_then(serde_json::Value::as_array) else {
+    let input_len = state.input.len();
+    let ResponsesState {
+        request_body,
+        messages,
+        persisted_messages,
+        ..
+    } = state;
+
+    let Some(resolved_input) = request_body.get("input").and_then(serde_json::Value::as_array) else {
         return Ok(());
     };
 
-    let input_len = state.input.len();
+    sync_message_history(messages, input_len, Some(resolved_input), budget)?;
+    sync_persisted_history(persisted_messages, input_len, Some(resolved_input), budget)
+}
 
-    sync_message_history(&mut state.messages, input_len, Some(resolved_input), budget)?;
-    sync_persisted_history(&mut state.persisted_messages, input_len, Some(resolved_input), budget)
+/// Test helper that creates an isolated request extraction budget.
+#[cfg(test)]
+fn sync_state(
+    ctx: &mut HttpFilterContext<'_>,
+    resolved_body: serde_json::Value,
+    config: &DocExtractConfig,
+) -> Result<(), ExtractError> {
+    let mut budget = ExtractionBudget::new(config);
+    sync_state_after_rewrite(ctx, resolved_body, &mut budget)
 }
 
 /// Extract `input_file` parts in rehydrated history when the
@@ -355,7 +393,8 @@ fn extract_history(
 /// `openai_responses_proxy` will later serialize from state.
 fn reject_oversized_state_body(
     ctx: &HttpFilterContext<'_>,
-    max_body_bytes: usize,
+    max_rewritten_body_bytes: usize,
+    streaming: bool,
 ) -> Result<Option<FilterAction>, FilterError> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return Ok(None);
@@ -363,7 +402,14 @@ fn reject_oversized_state_body(
     let len = serialized_outbound_body_len(state).map_err(|e| -> FilterError {
         format!("openai_doc_extract: failed to measure rebuilt request body: {e}").into()
     })?;
-    Ok((len > max_body_bytes).then(|| reject_rewritten_body_too_large(len, max_body_bytes)))
+    Ok((len > max_rewritten_body_bytes).then(|| {
+        warn!(
+            actual = len,
+            limit = max_rewritten_body_bytes,
+            "rebuilt state body exceeds configured limit"
+        );
+        reject_rewritten_body_too_large(len, max_rewritten_body_bytes, streaming)
+    }))
 }
 
 // -- Error responses ------------------------------------------------
@@ -397,40 +443,4 @@ fn extract_error_response(err: &ExtractError) -> (u16, String) {
     };
     warn!(%err, "extraction error");
     (status, message)
-}
-
-/// Build a 413 rejection for an oversized raw request body.
-fn reject_raw_body_too_large(actual: usize, limit: usize) -> FilterAction {
-    warn!(actual, limit, "buffered request body exceeds configured limit");
-    let body = serde_json::json!({
-        "error": {
-            "message": format!("request body exceeds {limit} bytes"),
-            "type": "doc_extract_error"
-        }
-    })
-    .to_string();
-
-    FilterAction::Reject(
-        Rejection::status(413)
-            .with_header("content-type", "application/json")
-            .with_body(Bytes::from(body)),
-    )
-}
-
-/// Build a 413 rejection for an oversized rewritten body.
-fn reject_rewritten_body_too_large(actual: usize, limit: usize) -> FilterAction {
-    warn!(actual, limit, "rewritten request body exceeds configured limit");
-    let body = serde_json::json!({
-        "error": {
-            "message": format!("rewritten request body exceeds {limit} bytes"),
-            "type": "doc_extract_error"
-        }
-    })
-    .to_string();
-
-    FilterAction::Reject(
-        Rejection::status(413)
-            .with_header("content-type", "application/json")
-            .with_body(Bytes::from(body)),
-    )
 }

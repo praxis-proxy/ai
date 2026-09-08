@@ -5,23 +5,8 @@
 
 Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body.
 
-## Configuration
-
-| Field | Type | Required | Description |
-|-------|------|---------|-------------|
-| `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
-
-## Examples
-
-### Example 1
+## Example
 
 ```yaml
 filter: openai_tool_parse
-```
-
-### Example 2
-
-```yaml
-filter: openai_tool_parse
-max_body_bytes: 67108864
 ```

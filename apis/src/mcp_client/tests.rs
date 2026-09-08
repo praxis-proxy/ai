@@ -81,10 +81,13 @@ fn hop_by_hop_headers_stripped_from_mcp_headers() {
         "content-length": "999",
         "transfer-encoding": "chunked",
         "connection": "keep-alive",
+        "keep-alive": "timeout=5",
+        "proxy-connection": "keep-alive",
         "te": "trailers",
         "trailer": "Foo",
         "upgrade": "websocket",
         "proxy-authorization": "Basic creds",
+        "proxy-authenticate": "Basic realm=\"mcp\"",
         "x-custom": "safe"
     });
     let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
@@ -95,6 +98,92 @@ fn hop_by_hop_headers_stripped_from_mcp_headers() {
             .custom_headers
             .contains_key(&http::HeaderName::from_static("x-custom")),
         "x-custom should pass through"
+    );
+}
+
+#[test]
+fn keep_alive_and_proxy_connection_headers_stripped_from_mcp_headers() {
+    let headers = serde_json::json!({
+        "keep-alive": "timeout=5",
+        "proxy-connection": "keep-alive",
+        "connection": "keep-alive",
+        "x-custom": "safe"
+    });
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
+
+    assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
+    assert!(
+        config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-custom")),
+        "x-custom should pass through"
+    );
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("keep-alive")),
+        "keep-alive must not reach outbound MCP transport"
+    );
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("proxy-connection")),
+        "proxy-connection must not reach outbound MCP transport"
+    );
+    assert!(
+        !config.custom_headers.contains_key(&http::header::CONNECTION),
+        "connection must stay blocked"
+    );
+}
+
+#[test]
+fn connection_nominated_headers_stripped_from_mcp_headers() {
+    let headers = serde_json::json!({
+        "connection": "x-smuggle, Keep-Alive",
+        "x-smuggle": "secret",
+        "x-custom": "safe"
+    });
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
+
+    assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
+    assert!(
+        config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-custom")),
+        "x-custom is not listed in Connection and should pass through"
+    );
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-smuggle")),
+        "fields named by Connection must not reach outbound MCP transport"
+    );
+    assert!(
+        !config.custom_headers.contains_key(&http::header::CONNECTION),
+        "connection itself must stay blocked"
+    );
+}
+
+#[test]
+fn proxy_authenticate_stripped_from_mcp_headers() {
+    let headers = serde_json::json!({
+        "proxy-authenticate": "Basic realm=\"mcp\"",
+        "x-custom": "safe"
+    });
+    let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
+
+    assert_eq!(config.custom_headers.len(), 1, "only safe header should remain");
+    assert!(
+        config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-custom")),
+        "x-custom should pass through"
+    );
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("proxy-authenticate")),
+        "proxy-authenticate is hop-by-hop and must not reach outbound MCP transport"
     );
 }
 
@@ -969,6 +1058,81 @@ async fn call_tool_timeout() {
     ct.cancel();
 
     let err = result.expect_err("should time out");
+    let msg = err.to_string();
+    assert!(msg.contains("timed out"), "error should mention timeout: {msg}");
+}
+
+#[derive(Debug, Clone)]
+struct SlowListToolsMcpServer {
+    delay_per_page: Duration,
+}
+
+impl ServerHandler for SlowListToolsMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        tokio::time::sleep(self.delay_per_page).await;
+        let cursor = request.and_then(|p| p.cursor);
+        let next_cursor = match cursor.as_deref() {
+            None => Some("page2".to_owned()),
+            Some("page2") => Some("page3".to_owned()),
+            _ => None,
+        };
+        let tool = rmcp::model::Tool::new(
+            "dummy".to_owned(),
+            "dummy tool".to_owned(),
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        let mut res = rmcp::model::ListToolsResult::with_all_items(vec![tool]);
+        res.next_cursor = next_cursor;
+        Ok(res)
+    }
+}
+
+async fn start_slow_list_mcp_server(delay_per_page: Duration) -> (String, tokio_util::sync::CancellationToken) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+
+    let service: StreamableHttpService<SlowListToolsMcpServer, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(SlowListToolsMcpServer { delay_per_page }),
+        std::sync::Arc::default(),
+        config,
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/mcp"), ct)
+}
+
+#[tokio::test]
+async fn list_tools_cumulative_pagination_timeout() {
+    let (url, ct) = start_slow_list_mcp_server(Duration::from_millis(150)).await;
+    let short_timeout = Duration::from_millis(200);
+    let result = list_tools(&url, None, None, short_timeout, 128, true).await;
+    ct.cancel();
+
+    let err = result.expect_err("cumulative pagination time exceeding timeout should time out");
     let msg = err.to_string();
     assert!(msg.contains("timed out"), "error should mention timeout: {msg}");
 }

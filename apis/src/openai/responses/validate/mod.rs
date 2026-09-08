@@ -121,7 +121,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         let conversation_id = resolve_conversation_id(ctx, &parsed);
 
         enrich_context(ctx, &response_id, &conversation_id);
-        ctx.extensions.insert(ResponsesState::from_request_body(parsed));
+        insert_responses_state(ctx, parsed, &response_id);
 
         debug!(
             response_id = %response_id,
@@ -136,6 +136,13 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Initialize canonical request state, including metadata that must survive IRR steps.
+fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
+    let mut state = ResponsesState::from_request_body(parsed);
+    state.response_id = Some(response_id.to_owned());
+    ctx.extensions.insert(state);
+}
 
 /// Parse the request body as JSON.
 fn parse_request_body(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> Result<serde_json::Value, FilterAction> {
@@ -317,6 +324,11 @@ mod tests {
         assert_eq!(state.tools.len(), 1, "tools should be populated");
         assert_eq!(state.iteration, 0, "iteration should start at 0");
         assert!(state.tool_calls.is_empty(), "tool_calls should start empty");
+        assert_eq!(
+            state.response_id.as_deref(),
+            ctx.filter_metadata.get("responses.response_id").map(String::as_str),
+            "canonical state should retain the response id across IRR steps"
+        );
     }
 
     #[tokio::test]

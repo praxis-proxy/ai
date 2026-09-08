@@ -39,7 +39,6 @@ pub(super) enum GcpAdcSource {
 /// filter: gcp_adc
 /// source: adc
 /// scope: https://www.googleapis.com/auth/cloud-platform
-/// refresh_ratio: 0.75
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,10 +65,14 @@ pub(super) struct GcpAdcConfig {
     #[serde(default)]
     pub credentials_file: Option<String>,
 
-    /// Fraction of a token's TTL at which to refresh it. Must be in the
-    /// open interval `(0, 1)`.
-    #[serde(default = "default_refresh_ratio")]
-    pub refresh_ratio: f64,
+    /// GCE/GKE metadata server host. Defaults to the real metadata
+    /// server; the only other accepted value is a `127.0.0.1` loopback
+    /// address, to point tests at a local mock. The metadata endpoint is
+    /// only safe to reach over plain HTTP because it never leaves the
+    /// VM/host, so nothing else is accepted (not even `localhost`, which
+    /// is a resolvable hostname rather than a fixed address).
+    #[serde(default = "default_metadata_host")]
+    pub metadata_host: String,
 }
 
 /// Default `OAuth2` scope for Vertex AI and other GCP APIs.
@@ -77,9 +80,9 @@ fn default_scope() -> String {
     "https://www.googleapis.com/auth/cloud-platform".to_owned()
 }
 
-/// Default value for [`GcpAdcConfig::refresh_ratio`].
-fn default_refresh_ratio() -> f64 {
-    0.75
+/// Default value for [`GcpAdcConfig::metadata_host`].
+fn default_metadata_host() -> String {
+    "metadata.google.internal".to_owned()
 }
 
 /// Parse and validate the `gcp_adc` filter's YAML config.
@@ -98,20 +101,61 @@ pub(super) fn parse_gcp_adc_config(config: &serde_yaml::Value) -> Result<GcpAdcC
 ///
 /// [`GcpAdcFilter::new`]: super::filter::GcpAdcFilter
 pub(super) fn validate_config(config: &GcpAdcConfig) -> Result<(), FilterError> {
-    if !(config.refresh_ratio > 0.0 && config.refresh_ratio < 1.0) {
-        return Err(format!(
-            "gcp_adc: refresh_ratio must be between 0 and 1 (exclusive), got {}",
-            config.refresh_ratio
-        )
-        .into());
-    }
     if config.scope.is_empty() {
         return Err("gcp_adc: scope must not be empty".into());
     }
+    validate_url_component("metadata_host", &config.metadata_host)?;
+    validate_metadata_host(&config.metadata_host)?;
     match config.source {
         GcpAdcSource::KeyFile => validate_key_file_fields(config),
         GcpAdcSource::Metadata | GcpAdcSource::Adc => validate_metadata_fields(config),
     }
+}
+
+/// Reject a config value that could break out of its URL component —
+/// `metadata_host` is interpolated as the URL authority of the metadata
+/// request. This does not attempt full hostname validation — it only
+/// forbids the characters that change URL structure.
+pub(super) fn validate_url_component(field: &str, value: &str) -> Result<(), FilterError> {
+    if value.is_empty() {
+        return Err(format!("gcp_adc: {field} must not be empty").into());
+    }
+    let forbidden = |c: char| matches!(c, '/' | '\\' | '?' | '#' | '@') || c.is_whitespace() || c.is_control();
+    if value.contains(forbidden) {
+        return Err(format!(
+            "gcp_adc: {field} '{value}' is invalid: it must be a bare value with no scheme, \
+             path, query, '@', or whitespace"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Reject a `metadata_host` that isn't the real GCE/GKE metadata server or
+/// the `127.0.0.1` loopback address (used only to point tests at a local
+/// mock).
+///
+/// `localhost` is deliberately not accepted: unlike a literal loopback
+/// IP, it is a hostname resolved via DNS/`/etc/hosts` and could be
+/// remapped to point anywhere, which would defeat this check entirely.
+///
+/// The metadata endpoint is safe to reach over plain HTTP specifically
+/// because it is link-local and never routable off the VM/host. Any other
+/// host configured here would send the same plaintext request -- and
+/// receive the access token in the response -- over a real network path.
+fn validate_metadata_host(value: &str) -> Result<(), FilterError> {
+    let host = value.split(':').next().unwrap_or(value);
+    let is_safe = value == "metadata.google.internal" || host == "127.0.0.1";
+    if !is_safe {
+        return Err(format!(
+            "gcp_adc: metadata_host '{value}' must be 'metadata.google.internal' or a loopback \
+             IP address (127.0.0.1, for tests) -- the metadata endpoint is only safe over \
+             plain HTTP because it never leaves the VM; anything else would send the access \
+             token over a real network in cleartext"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// `key_file` requires `credentials_file` and does not use

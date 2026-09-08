@@ -25,13 +25,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use config::{FailureModeConfig, HttpCalloutConfig, Phase, expand_env_vars, validate_callout_url};
+use config::{HttpCalloutConfig, Phase, expand_env_vars, validate_callout_url};
 use extract::{BodyShaper, CompiledExtraction};
 use http::HeaderMap;
-use pingora_core::upstreams::peer::HttpPeer;
+use praxis_ai_apis::{
+    callout_policy::{OnFailure, validate_status_on_error},
+    callout_target::{AddressPolicy, validate_configured_http_target},
+    http_hop::{connection_nominates_header, is_hop_by_hop},
+    subrequest,
+};
 use praxis_core::{
     circuit::CircuitBreakerConfig as CoreCircuitBreakerConfig,
-    connectivity::is_private_ip,
     subrequest::{
         DEPTH_HEADER, FrameworkHeaders, SubRequest, SubRequestClient, SubRequestConnector, SubRequestConnectorOptions,
         SubResponse,
@@ -52,18 +56,8 @@ const FILTER_NAME: &str = "http_callout";
 /// Maximum allowed value for `max_body_bytes` (100 MiB).
 const MAX_BODY_BYTES: usize = 104_857_600; // 100 MiB
 
-/// Hop-by-hop and sensitive headers that must never be blindly
-/// forwarded from the client onto the callout request.
-const DISALLOWED_FORWARD_HEADERS: &[http::HeaderName] = &[
-    http::header::HOST,
-    http::header::CONTENT_LENGTH,
-    http::header::TRANSFER_ENCODING,
-    http::header::CONNECTION,
-    http::header::UPGRADE,
-    http::header::PROXY_AUTHORIZATION,
-    http::header::TRAILER,
-];
-
+/// Default HTTP status when the callout fails.
+const DEFAULT_STATUS_ON_ERROR: u16 = 403;
 // -----------------------------------------------------------------------------
 // HttpCalloutFilter
 // -----------------------------------------------------------------------------
@@ -97,13 +91,16 @@ pub struct HttpCalloutFilter {
     extractions: Vec<CompiledExtraction>,
 
     /// Behavior on callout failure.
-    failure_mode: FailureModeConfig,
+    on_failure: OnFailure,
 
     /// Downstream headers to copy into the callout request.
     forward_headers: Vec<http::HeaderName>,
 
     /// Static headers to send with every callout.
     headers: Vec<(http::HeaderName, http::HeaderValue)>,
+
+    /// Authority from the configured URL, used as the callout `Host`.
+    target_authority: http::HeaderValue,
 
     /// Callout response headers to inject into the upstream
     /// request on success.
@@ -121,9 +118,6 @@ pub struct HttpCalloutFilter {
     /// HTTP status code returned when rejecting on failure.
     status_on_error: u16,
 
-    /// Parsed target (host, port, TLS, SNI, authority, request URI).
-    target: CalloutTarget,
-
     /// Request timeout covering DNS, connect, and I/O.
     timeout: Duration,
 
@@ -139,21 +133,30 @@ impl HttpCalloutFilter {
     /// Returns [`FilterError`] if config parsing, SSRF validation,
     /// env-var expansion, `JSONPath` compilation, or client
     /// construction fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "construction validates the complete callout security policy in one place"
+    )]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: HttpCalloutConfig = parse_filter_config(FILTER_NAME, config)?;
 
         validate_callout_url(&cfg.target.url)?;
         validate_max_body_bytes(cfg.request.max_body_bytes)?;
-        validate_status_on_error(cfg.status_on_error)?;
+        let status_on_error = validate_status_on_error(FILTER_NAME, cfg.status_on_error, DEFAULT_STATUS_ON_ERROR)?;
 
         let body_shaper = BodyShaper::compile(&cfg.target.body)?;
         let headers = parse_static_headers(&cfg)?;
+        let target_authority = parse_target_authority(&cfg.target.url)?;
         let forward_headers = parse_header_names(&cfg.target.forward_headers, "forward_header")?;
         warn_on_disallowed_forward_headers(&forward_headers);
         let extractions = compile_extractions(&cfg)?;
         let inject_headers = parse_header_names(&cfg.response.inject_headers, "inject_header")?;
 
-        let target = CalloutTarget::parse(&cfg.target.url)?;
+        validate_configured_http_target(
+            FILTER_NAME,
+            &cfg.target.url,
+            AddressPolicy::from_allow_private(cfg.target.allow_private_addresses),
+        )?;
         let client = build_subrequest_client(&cfg);
 
         Ok(Box::new(Self {
@@ -161,15 +164,15 @@ impl HttpCalloutFilter {
             body_shaper,
             client,
             extractions,
-            failure_mode: cfg.on_failure,
+            on_failure: cfg.on_failure,
             forward_headers,
             headers,
             inject_headers,
             max_body_bytes: cfg.request.max_body_bytes,
             max_depth: cfg.max_depth.unwrap_or(1),
             phase: cfg.request.phase,
-            status_on_error: cfg.status_on_error.unwrap_or(403),
-            target,
+            status_on_error,
+            target_authority,
             timeout: cfg.target.timeout,
             url: cfg.target.url,
         }))
@@ -192,7 +195,7 @@ impl HttpCalloutFilter {
 
         let request = SubRequest {
             method: http::Method::POST,
-            uri: self.target.request_uri.clone(),
+            uri: http::Uri::default(),
             headers,
             body: body.map_or(Bytes::new(), Bytes::from),
         };
@@ -201,7 +204,7 @@ impl HttpCalloutFilter {
     }
 
     /// Assemble the callout request headers: static configured headers,
-    /// safely-forwarded client headers, and the enforced `Host`.
+    /// safely-forwarded client headers, and the target-bound `Host`.
     fn build_callout_headers(&self, ctx: &HttpFilterContext<'_>) -> HeaderMap {
         let mut headers = HeaderMap::new();
 
@@ -212,7 +215,7 @@ impl HttpCalloutFilter {
 
         // Forward allowed client headers, skipping hop-by-hop/sensitive ones.
         for name in &self.forward_headers {
-            if DISALLOWED_FORWARD_HEADERS.contains(name) {
+            if is_disallowed_forward_header(name) || connection_nominates_header(&ctx.request.headers, name) {
                 continue;
             }
             if let Some(value) = ctx.request.headers.get(name) {
@@ -220,11 +223,9 @@ impl HttpCalloutFilter {
             }
         }
 
-        // Enforce the configured target authority on the Host header.
-        if let Ok(value) = self.target.authority.parse() {
-            headers.insert(http::header::HOST, value);
-        }
-
+        // Host is security-sensitive: the shared executor preserves an
+        // explicitly supplied value, so bind it here to the target URL.
+        headers.insert(http::header::HOST, self.target_authority.clone());
         headers
     }
 
@@ -279,45 +280,12 @@ impl HttpCalloutFilter {
         }
     }
 
-    /// Resolve DNS for the target and construct an [`HttpPeer`].
-    ///
-    /// When `allow_private_addresses` is `false`, the resolved peer address
-    /// is validated *after* resolution against the shared classifier
-    /// [`praxis_core::connectivity::is_private_ip`], so a hostname that
-    /// resolves to a private/loopback/link-local address (or rebinds to one
-    /// after config time) is rejected rather than connected to. Deferring to
-    /// core's predicate keeps this check consistent with the rest of the
-    /// proxy instead of adding another hand-rolled range list (see
-    /// praxis-proxy/ai#771).
-    async fn resolve_peer(&self) -> Result<HttpPeer, String> {
-        let addr = tokio::net::lookup_host((self.target.host.as_str(), self.target.port))
-            .await
-            .map_err(|e| format!("DNS resolution failed for {}: {e}", self.target.host))?
-            .next()
-            .ok_or_else(|| format!("no addresses resolved for {}", self.target.host))?;
-
-        if !self.allow_private_addresses && is_private_ip(&addr.ip()) {
-            return Err(format!(
-                "{} resolved to a blocked private/loopback address {} \
-                 (allow_private_addresses is false)",
-                self.target.host,
-                addr.ip()
-            ));
-        }
-
-        Ok(HttpPeer::new(
-            addr.to_string(),
-            self.target.tls,
-            self.target.sni.clone(),
-        ))
-    }
-
     /// The action to take when the callout itself fails (DNS, connect,
     /// I/O), per the configured failure mode.
     fn failure_action(&self) -> FilterAction {
-        match self.failure_mode {
-            FailureModeConfig::Open => FilterAction::Continue,
-            FailureModeConfig::Closed => Self::build_rejection(self.status_on_error),
+        match self.on_failure {
+            OnFailure::Open => FilterAction::Continue,
+            OnFailure::Closed => Self::build_rejection(self.status_on_error),
         }
     }
 
@@ -337,18 +305,15 @@ impl HttpCalloutFilter {
     /// Returns the response on success, or `None` when the callout
     /// itself failed (DNS/connect/I/O) and the caller should apply
     /// [`Self::failure_action`].
-    async fn perform_callout(&self, request: &SubRequest, fw: &FrameworkHeaders) -> Option<SubResponse> {
-        let peer = match self.resolve_peer().await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(url = %self.url, error = e, "callout failed");
-                return None;
-            },
-        };
-
-        match Box::pin(
-            self.client
-                .execute(&peer, request, self.max_body_bytes, self.timeout, Some(fw)),
+    async fn perform_callout(&self, request: SubRequest, fw: &FrameworkHeaders) -> Option<SubResponse> {
+        match subrequest::execute_url_with_framework(
+            &self.client,
+            &self.url,
+            request,
+            self.max_body_bytes,
+            self.timeout,
+            AddressPolicy::from_allow_private(self.allow_private_addresses),
+            Some(fw),
         )
         .await
         {
@@ -379,7 +344,7 @@ impl HttpCalloutFilter {
 
         let (request, fw) = self.build_request(ctx, callout_body, depth);
 
-        let action = match Box::pin(self.perform_callout(&request, &fw)).await {
+        let action = match Box::pin(self.perform_callout(request, &fw)).await {
             Some(response) => self.handle_response(&response, ctx),
             None => self.failure_action(),
         };
@@ -413,31 +378,6 @@ fn validate_max_body_bytes(n: usize) -> Result<(), FilterError> {
     Ok(())
 }
 
-/// Reject a `status_on_error` value outside the valid HTTP status range.
-///
-/// `None` (unset) is accepted; the filter then defaults to `403`. A
-/// configured value must be a legal HTTP status code (100–599) so the
-/// rejection path never emits a nonsensical status like `0` or `65535`.
-///
-/// The `100..=599` range check is the established convention across the
-/// codebase (`openai_responses_compact`, `web_search`, core builtins),
-/// currently duplicated per filter. See the follow-up to promote a shared
-/// `validate_status_on_error` helper into `praxis-ai-apis`.
-///
-/// # Errors
-///
-/// Returns [`FilterError`] if a configured status is outside 100–599.
-fn validate_status_on_error(status: Option<u16>) -> Result<(), FilterError> {
-    if let Some(code) = status
-        && !(100..=599).contains(&code)
-    {
-        return Err(
-            format!("http_callout: status_on_error ({code}) must be a valid HTTP status code (100-599)").into(),
-        );
-    }
-    Ok(())
-}
-
 /// Parse static header entries with env-var expansion.
 fn parse_static_headers(cfg: &HttpCalloutConfig) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, FilterError> {
     cfg.target
@@ -456,6 +396,18 @@ fn parse_static_headers(cfg: &HttpCalloutConfig) -> Result<Vec<(http::HeaderName
         .collect()
 }
 
+/// Extract the authority that must be used for the outbound `Host` header.
+fn parse_target_authority(url: &str) -> Result<http::HeaderValue, FilterError> {
+    let uri: http::Uri = url
+        .parse()
+        .map_err(|e| -> FilterError { format!("http_callout: invalid target URL '{url}': {e}").into() })?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| FilterError::from(format!("http_callout: target URL has no authority: {url}")))?;
+    http::HeaderValue::from_str(authority.as_str())
+        .map_err(|e| format!("http_callout: invalid target authority '{}': {e}", authority.as_str()).into())
+}
+
 /// Parse a list of header name strings.
 fn parse_header_names(names: &[String], context: &str) -> Result<Vec<http::HeaderName>, FilterError> {
     names
@@ -469,13 +421,13 @@ fn parse_header_names(names: &[String], context: &str) -> Result<Vec<http::Heade
 
 /// Warn about configured forward headers that will never be forwarded.
 ///
-/// Hop-by-hop and sensitive headers in [`DISALLOWED_FORWARD_HEADERS`] are
-/// silently skipped at request time. Surfacing them at config time tells
-/// the operator their entry is a no-op instead of leaving them to wonder
-/// why the header never reaches the callout target.
+/// Hop-by-hop and sensitive headers are silently skipped at request time.
+/// Surfacing them at config time tells the operator their entry is a no-op
+/// instead of leaving them to wonder why the header never reaches the
+/// callout target.
 fn warn_on_disallowed_forward_headers(forward_headers: &[http::HeaderName]) {
     for name in forward_headers {
-        if DISALLOWED_FORWARD_HEADERS.contains(name) {
+        if is_disallowed_forward_header(name) {
             warn!(
                 header = %name,
                 "http_callout: forward_header '{name}' is a hop-by-hop or sensitive header \
@@ -485,6 +437,12 @@ fn warn_on_disallowed_forward_headers(forward_headers: &[http::HeaderName]) {
     }
 }
 
+/// Hop-by-hop names plus `Host` and `Content-Length`, which must not be
+/// copied from the client onto a newly constructed callout request.
+fn is_disallowed_forward_header(name: &http::HeaderName) -> bool {
+    *name == http::header::HOST || *name == http::header::CONTENT_LENGTH || is_hop_by_hop(name.as_str())
+}
+
 /// Compile `JSONPath` extraction rules from config.
 fn compile_extractions(cfg: &HttpCalloutConfig) -> Result<Vec<CompiledExtraction>, FilterError> {
     cfg.response
@@ -492,107 +450,6 @@ fn compile_extractions(cfg: &HttpCalloutConfig) -> Result<Vec<CompiledExtraction
         .iter()
         .map(|e| CompiledExtraction::compile(&e.json_path, e.result_key.clone()))
         .collect()
-}
-
-/// Parsed callout target, derived from the configured URL once and
-/// reused for every callout.
-#[derive(Debug)]
-struct CalloutTarget {
-    /// URL authority for the HTTP `Host` header (host, plus `:port`
-    /// when non-default).
-    authority: String,
-
-    /// Hostname for DNS resolution.
-    host: String,
-
-    /// TCP port.
-    port: u16,
-
-    /// Path-only URI for the sub-request.
-    request_uri: http::Uri,
-
-    /// TLS SNI hostname (empty when TLS is disabled).
-    sni: String,
-
-    /// Whether TLS is enabled for the target.
-    tls: bool,
-}
-
-impl CalloutTarget {
-    /// Parse the target URL into the components needed for peer
-    /// construction at execution time.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the URL is malformed, uses a scheme
-    /// other than http/https, is missing a host, or embeds userinfo.
-    fn parse(url: &str) -> Result<Self, FilterError> {
-        let parsed: http::Uri = url
-            .parse()
-            .map_err(|e| -> FilterError { format!("http_callout: invalid URL '{url}': {e}").into() })?;
-
-        let tls = parse_scheme_tls(&parsed, url)?;
-        let host = parse_host(&parsed, url)?;
-
-        let default_port = if tls { 443 } else { 80 };
-        let port = parsed
-            .authority()
-            .and_then(http::uri::Authority::port_u16)
-            .unwrap_or(default_port);
-        let sni = if tls { host.clone() } else { String::new() };
-        let authority = if port == default_port {
-            host.clone()
-        } else {
-            format!("{host}:{port}")
-        };
-
-        let path_and_query = parsed.path_and_query().map_or("/", |pq| pq.as_str());
-        let request_uri: http::Uri = path_and_query
-            .parse()
-            .map_err(|e| -> FilterError { format!("http_callout: bad path in URL: {e}").into() })?;
-
-        Ok(Self {
-            authority,
-            host,
-            port,
-            request_uri,
-            sni,
-            tls,
-        })
-    }
-}
-
-/// Determine whether the target scheme enables TLS (https) or not (http).
-fn parse_scheme_tls(parsed: &http::Uri, url: &str) -> Result<bool, FilterError> {
-    match parsed.scheme_str() {
-        Some("https") => Ok(true),
-        Some("http") => Ok(false),
-        _ => Err(format!("http_callout: scheme must be http or https in '{url}'").into()),
-    }
-}
-
-/// Extract and validate the host from a parsed target URL.
-fn parse_host(parsed: &http::Uri, url: &str) -> Result<String, FilterError> {
-    let authority = parsed
-        .authority()
-        .ok_or_else(|| -> FilterError { format!("http_callout: URL missing host: {url}").into() })?;
-
-    // Reject userinfo (e.g. user:pass@host) to prevent credential leakage.
-    if url.contains('@') {
-        return Err(format!("http_callout: userinfo in URL is not allowed: {url}").into());
-    }
-
-    let host = authority
-        .host()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_owned();
-
-    if host.is_empty() {
-        return Err(format!("http_callout: empty host in URL: {url}").into());
-    }
-
-    Ok(host)
 }
 
 /// Build a [`SubRequestClient`] from parsed config.

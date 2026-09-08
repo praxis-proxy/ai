@@ -18,6 +18,15 @@ features:
         status: covered
       vllm:
         status: live_covered
+  - id: messages.request.client_tool_ownership
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/typed-server-tools
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.response.text
     scopes:
       - messages_to_chat_completions
@@ -30,12 +39,41 @@ features:
         status: covered
       vllm:
         status: live_covered
+  - id: messages.response.malformed_tool_arguments
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/malformed-tool-arguments
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.streaming.usage
+    scopes:
+      - messages_to_chat_completions
+    status: live_covered
+    scenarios:
+      - messages/basic-stream
+    providers:
+      openai:
+        status: live_covered
+      vllm:
+        status: live_covered
   - id: messages.error.upstream
     scopes:
       - messages_to_chat_completions
     status: synthetic_only
     scenarios:
       - messages/upstream-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.error.malformed_success
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/malformed-success
     providers:
       synthetic:
         status: synthetic_only
@@ -105,12 +143,22 @@ features:
         status: live_covered
       vllm:
         status: live_covered
+  - id: responses.native.continuation
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/native-continuation
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.request
     scopes:
       - responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
+      - responses/chat-basic-stream
     providers:
       synthetic:
         status: synthetic_only
@@ -120,6 +168,25 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
+      - responses/chat-basic-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.web_search
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-web-search
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.file_search
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-file-search
     providers:
       synthetic:
         status: synthetic_only
@@ -129,6 +196,15 @@ features:
     status: synthetic_only
     scenarios:
       - responses/agentic-parallel-tool-calls
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.agentic.irr_terminal_streaming
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/irr-terminal-streaming
     providers:
       synthetic:
         status: synthetic_only
@@ -159,3 +235,12 @@ features:
     providers:
       vllm:
         status: live_covered
+  - id: responses.chat.malformed_compaction
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-malformed-compaction
+    providers:
+      synthetic:
+        status: synthetic_only

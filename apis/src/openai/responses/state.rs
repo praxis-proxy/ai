@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
+
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 
@@ -54,6 +56,13 @@ pub(crate) struct ResponsesState {
     /// construct the response object check this to decide which
     /// optional sections to populate.
     pub include: Vec<String>,
+
+    /// Stable response ID used while several streamed inference rounds are
+    /// exposed as one logical Responses stream.
+    pub logical_stream_response_id: Option<String>,
+
+    /// Next downstream sequence number for a logical Responses stream.
+    pub logical_stream_sequence: u64,
 
     /// Whether stored history was successfully resolved into this state.
     ///
@@ -119,6 +128,19 @@ pub(crate) struct ResponsesState {
     /// Token usage reported by the previous response.
     pub previous_usage: Option<serde_json::Value>,
 
+    /// Client-visible tool choice retained when an internal continuation
+    /// resets [`Self::tool_choice`] to `"auto"` for later model rounds.
+    pub original_tool_choice: Option<serde_json::Value>,
+
+    /// Stable creation timestamp for the public response across iterations.
+    pub response_created_at: Option<u64>,
+
+    /// Stable public response ID assigned by request validation.
+    ///
+    /// Iterative router steps preserve extensions while resetting per-step
+    /// metadata, so translated responses must also be able to read the ID here.
+    pub response_id: Option<String>,
+
     /// Parsed request body as received from the client.
     pub request_body: serde_json::Value,
 
@@ -144,6 +166,18 @@ pub(crate) struct ResponsesState {
     /// `name`/`arguments`) and must not trigger the
     /// one-function-call-per-round limit.
     pub web_search_calls: Vec<serde_json::Value>,
+
+    /// Cumulative web searches dispatched to the provider across all
+    /// agentic-loop iterations.
+    ///
+    /// `openai_web_search` increments this each time it issues a
+    /// provider request so the client-declared `max_tool_calls` budget
+    /// is honored across IRR continuations, not just within one round.
+    /// A dedicated counter is used instead of counting `web_search_call`
+    /// items in [`Self::accumulated_output`] because that field retains
+    /// both the model's echoed call and the executed result, which would
+    /// double-count each search.
+    pub web_search_calls_executed: u32,
 
     /// Tool choice setting. Reset to `"auto"` by `openai_agentic_loop`
     /// after the first iteration; the original value from the
@@ -179,6 +213,7 @@ pub(crate) enum RequestBodyRebuild {
 }
 
 impl Default for ResponsesState {
+    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
         Self {
             citation_files: HashMap::new(),
@@ -186,6 +221,8 @@ impl Default for ResponsesState {
             conversation: None,
             file_search_output_items: Vec::new(),
             include: Vec::new(),
+            logical_stream_response_id: None,
+            logical_stream_sequence: 0,
             history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
@@ -197,11 +234,15 @@ impl Default for ResponsesState {
             previous_response_id: None,
             previous_tools: Vec::new(),
             previous_usage: None,
+            original_tool_choice: None,
+            response_created_at: None,
+            response_id: None,
             request_body: serde_json::Value::Null,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
             tool_calls: Vec::new(),
             web_search_calls: Vec::new(),
+            web_search_calls_executed: 0,
             tool_choice: serde_json::Value::String("auto".to_owned()),
             tools: Vec::new(),
             usage: serde_json::Value::Null,
@@ -276,6 +317,31 @@ impl ResponsesState {
     /// Return whether provider-visible request state requires serialization.
     pub(crate) fn request_body_requires_rebuild(&self) -> bool {
         self.request_body_rebuild == RequestBodyRebuild::Required
+    }
+
+    /// Build the final response body from accumulated state.
+    ///
+    /// Replaces `response_object["output"]` with the full `accumulated_output`
+    /// (all rounds), stamps accumulated usage, and serializes back to body bytes.
+    pub(crate) fn finalize_response_body(&self, body: &mut Option<Bytes>) {
+        if !self.response_object.is_object() {
+            return;
+        }
+        let mut response = self.response_object.clone();
+        if let Some(obj) = response.as_object_mut() {
+            if !self.accumulated_output.is_empty() {
+                obj.insert(
+                    "output".to_owned(),
+                    serde_json::Value::Array(self.accumulated_output.clone()),
+                );
+            }
+            if !self.usage.is_null() {
+                obj.insert("usage".to_owned(), self.usage.clone());
+            }
+        }
+        if let Ok(serialized) = serde_json::to_vec(&response) {
+            *body = Some(Bytes::from(serialized));
+        }
     }
 }
 
@@ -596,6 +662,7 @@ mod tests {
         assert!(state.response_object.is_null());
         assert!(state.tool_calls.is_empty());
         assert!(state.web_search_calls.is_empty());
+        assert_eq!(state.web_search_calls_executed, 0);
         assert_eq!(state.tool_choice, json!("auto"));
         assert!(state.tools.is_empty());
         assert!(state.usage.is_null());

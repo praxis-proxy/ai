@@ -22,11 +22,11 @@ use std::collections::HashMap;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tracing::{debug, warn};
 
-use super::{
-    config::OnMissing,
-    resolve_url::{FileUrlResolver, redact_url},
+use super::resolve_url::{FileUrlResolver, redact_url};
+use crate::{
+    callout_policy::OnMissing,
+    openai::api_client::{ApiClient, ApiClientError},
 };
-use crate::openai::api_client::{ApiClient, ApiClientError};
 
 /// Files API path prefix used in resource URL construction.
 const FILES_PATH_PREFIX: &str = "v1/files";
@@ -999,6 +999,7 @@ mod tests {
             timeout: std::time::Duration::from_millis(timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
+            address_policy: crate::callout_target::AddressPolicy::AllowPrivate,
         })
     }
 

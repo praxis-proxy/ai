@@ -188,6 +188,10 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
         "CREATE INDEX IF NOT EXISTS idx_{i}_conversation \
          ON {i}(conversation_id, tenant_id, position, item_id)"
     ));
+    stmts.push(format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_{i}_position \
+         ON {i}(tenant_id, conversation_id, position)"
+    ));
 }
 
 /// Validate the configured table names and return them as borrowed identifiers.
@@ -683,8 +687,8 @@ mod tests {
         let ddl = generate_ddl(&tables).expect("valid names with items should produce DDL");
         assert_eq!(
             ddl.len(),
-            6,
-            "should produce 6 DDL statements (responses, conversations, tenant_id index, items, items index, version)"
+            7,
+            "should produce 7 DDL statements (responses, conversations, tenant_id index, items, items indexes, version)"
         );
         assert!(
             ddl[3].contains("test_items"),

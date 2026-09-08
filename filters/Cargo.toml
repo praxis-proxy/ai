@@ -52,11 +52,10 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
-futures = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 notify = { workspace = true }
-pingora-core.workspace = true
+percent-encoding = { workspace = true }
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }

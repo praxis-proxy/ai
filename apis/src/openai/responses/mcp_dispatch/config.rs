@@ -3,10 +3,7 @@
 
 //! Configuration for the `openai_mcp_dispatch` filter.
 
-use praxis_filter::{
-    FilterError, body::DEFAULT_JSON_BODY_MAX_BYTES,
-    builtins::http::payload_processing::config_validation::validate_max_body_bytes,
-};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
 /// Default timeout for MCP `tools/call` calls (30 seconds).
@@ -20,18 +17,9 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default)]
     pub allow_loopback: bool,
 
-    /// Maximum response body bytes for `StreamBuffer`.
-    #[serde(default = "default_max_body_bytes")]
-    pub max_body_bytes: usize,
-
     /// Per-call timeout in milliseconds for `tools/call` calls.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-}
-
-/// Default value for `max_body_bytes`.
-fn default_max_body_bytes() -> usize {
-    DEFAULT_JSON_BODY_MAX_BYTES
 }
 
 /// Default value for `timeout_ms`.
@@ -41,7 +29,6 @@ fn default_timeout_ms() -> u64 {
 
 /// Validate the parsed configuration.
 pub(crate) fn build_config(cfg: McpDispatchConfig) -> Result<McpDispatchConfig, FilterError> {
-    validate_max_body_bytes("openai_mcp_dispatch", cfg.max_body_bytes)?;
     if cfg.timeout_ms == 0 {
         return Err("openai_mcp_dispatch: timeout_ms must be greater than 0".into());
     }

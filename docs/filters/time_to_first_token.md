@@ -9,7 +9,7 @@ Measures time-to-first-token for streaming AI responses.
 
 Activates only for successful `text/event-stream` responses. On the first non-empty body chunk, records `ctx.request_start.elapsed()` as a Prometheus histogram and deactivates for the remainder of the response.
 
-The histogram's `model` label is read from metadata set by an upstream format filter (`openai_responses_format`, `anthropic_messages_format`, or `anthropic_to_openai`). If no format filter runs before this filter, all TTFT samples are labeled `unknown`.
+The histogram's `model` label is read from metadata set by an upstream format filter (`openai_responses_format`, `anthropic_messages_format`, or `anthropic_messages_to_chat_completions`). If no format filter runs before this filter, all TTFT samples are labeled `unknown`.
 
 ## Example
 

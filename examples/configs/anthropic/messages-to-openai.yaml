@@ -3,14 +3,14 @@
 # Transforms Anthropic Messages API requests and responses for
 # Chat Completions-compatible inference backends.
 #
-# The `anthropic_to_openai` filter name follows the proposal and
-# existing config surface. It targets the OpenAI Chat Completions
-# wire shape, so non-OpenAI compatible backends can use it too.
+# The `anthropic_messages_to_chat_completions` filter name reflects the
+# wire formats it bridges. It targets the Chat Completions wire shape,
+# so any Chat Completions-compatible backend can use it, not only OpenAI.
 #
 # Request: system hoisting, content block flattening, tool mapping.
 # Response: content blocks, stop_reason, usage mapping back to
 # Anthropic format. Streaming responses are converted by
-# `anthropic_stream_events`.
+# `anthropic_messages_to_chat_completions_stream`.
 
 listeners:
   - name: anthropic-gateway
@@ -23,14 +23,19 @@ filter_chains:
       - filter: anthropic_messages_format
         on_invalid: continue
 
-      - filter: anthropic_to_openai
+      - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
 
       # response_conditions is optional: the filter self-arms via
       # metadata and Content-Type checks internally. Adding it
       # skips filter dispatch entirely for non-SSE responses.
-      - filter: anthropic_stream_events
+      - filter: anthropic_messages_to_chat_completions_stream
         max_partial_event_bytes: 10485760
+        # Cap on distinct streaming tool-call content blocks retained per
+        # response. Bounds per-response memory when an upstream streams
+        # many unique tool-call indices; exceeding it fails the stream
+        # closed.
+        max_tool_blocks: 10000
         response_conditions:
           - when:
               headers:

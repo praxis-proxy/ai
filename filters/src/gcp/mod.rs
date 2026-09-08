@@ -7,8 +7,9 @@
 //! is off by default and activates the `experimental` marker. The
 //! configuration surface may change between releases.
 //!
-//! Token acquisition is not implemented yet — see [`GcpAdcFilter`] for
-//! the current fail-closed behavior and the upstream tracking issues.
+//! Token acquisition for the metadata-server sources (`adc`, `metadata`)
+//! is implemented; `key_file` is not yet (needs `JWT` signing) — see
+//! [`GcpAdcFilter`] for the current behavior.
 //!
 //! Classic GKE Workload Identity is the metadata server (ADC), not
 //! STS/WIF. Vertex AI needs an `OAuth2` access token with a **scope**,
