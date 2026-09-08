@@ -18,10 +18,6 @@ use crate::openai::responses::body_limits::validate_size_limit;
 /// filter: openai_responses_proxy
 /// max_rewritten_body_bytes: 10485760
 /// ```
-///
-/// Streaming transport is selected automatically from the effective outbound
-/// `stream` field; there is no operator opt-in. The removed `terminal_streaming`
-/// flag is rejected via `deny_unknown_fields` so stale configs fail to build.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResponsesProxyConfig {

@@ -65,12 +65,13 @@ use crate::json_body::{SerializedJson, serialize_json_body};
 /// This filter always advertises the Praxis streaming capability. When the
 /// effective outbound body contains `"stream": true` it selects Praxis's
 /// streaming transport; otherwise it selects the buffered transport. There is
-/// no operator opt-in. Classifier metadata remains descriptive client intent;
-/// this final serializer owns the transport decision. IRR can resume one
-/// downstream stream across response-dependent transitions, but every
-/// response-body filter in a step composed with this filter must use
-/// `BodyMode::Stream` (or explicitly reject streaming requests) rather than
-/// silently buffering them.
+/// no operator opt-in — the removed `terminal_streaming` flag is rejected via
+/// `deny_unknown_fields` so stale configs fail to build. Classifier metadata
+/// remains descriptive client intent; this final serializer owns the transport
+/// decision. IRR can resume one downstream stream across response-dependent
+/// transitions, but every response-body filter in a step composed with this
+/// filter must use `BodyMode::Stream` (or explicitly reject streaming requests)
+/// rather than silently buffering them.
 ///
 /// # YAML
 ///
