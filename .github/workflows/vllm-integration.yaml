@@ -129,22 +129,11 @@ jobs:
             .github/workflows/vllm-integration.yaml
             tests/integration/sdk/openai/test_openai_responses_vllm.py
 
-      - name: Pull vLLM CPU image
-        run: docker pull "$VLLM_IMAGE"
-
       - name: Start vLLM
-        run: |
-          docker run -d --name vllm \
-            -p 8000:8000 \
-            --privileged=true \
-            "$VLLM_IMAGE" \
-            --model /root/.cache/Qwen/Qwen3-0.6B \
-            --max-model-len 4096 \
-            --served-model-name "$VLLM_MODEL" \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.5
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.VLLM_MODEL }}
 
       - name: Pre-install OGX dependencies
         run: |
@@ -170,20 +159,6 @@ jobs:
       - name: Run Conversations SDK integration tests
         run: |
           uv run tests/integration/sdk/openai/test_openai_conversations.py -s
-
-      - name: Wait for vLLM readiness
-        run: |
-          echo "Waiting for vLLM health and model endpoints..."
-          timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-            if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
-              echo "::error::vLLM container exited unexpectedly"
-              docker logs vllm 2>&1
-              exit 1
-            fi
-            sleep 5
-          done'
-          echo "vLLM is ready"
 
       - name: Wait for OGX readiness
         run: |
@@ -287,22 +262,11 @@ jobs:
             .github/workflows/vllm-integration.yaml
             tests/integration/sdk/openai/test_openai_responses_vllm.py
 
-      - name: Pull vLLM CPU image
-        run: docker pull "$VLLM_IMAGE"
-
       - name: Start vLLM
-        run: |
-          docker run -d --name vllm \
-            -p 8000:8000 \
-            --privileged=true \
-            "$VLLM_IMAGE" \
-            --model /root/.cache/Qwen/Qwen3-0.6B \
-            --max-model-len 4096 \
-            --served-model-name "$VLLM_MODEL" \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.5
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.VLLM_MODEL }}
 
       - name: Pre-install OGX dependencies
         run: |
@@ -324,20 +288,6 @@ jobs:
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
-
-      - name: Wait for vLLM readiness
-        run: |
-          echo "Waiting for vLLM health and model endpoints..."
-          timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-            if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
-              echo "::error::vLLM container exited unexpectedly"
-              docker logs vllm 2>&1
-              exit 1
-            fi
-            sleep 5
-          done'
-          echo "vLLM is ready"
 
       - name: Wait for OGX readiness
         run: |
