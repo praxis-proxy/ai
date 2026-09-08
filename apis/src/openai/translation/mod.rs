@@ -1303,7 +1303,7 @@ mod tests {
         super::reasoning::validate_requested_reasoning(request.as_object().unwrap(), reasoning)
             .map_err(|error| error.to_string())
     }
-    
+
     #[test]
     fn reasoning_without_effort_does_not_set_reasoning_effort() {
         let mapped = map(&json!({
