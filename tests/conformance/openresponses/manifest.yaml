@@ -55,12 +55,15 @@ inapplicable:
       text-only, so no translator change can make it pass in this harness.
   - id: compact-response
     reason: >-
-      Targets the /responses/compact endpoint, which compacts a stored response
-      chain — a store-layer concern outside the stateless translation surface.
+      Separate /responses/compact operation outside the Responses-create
+      translation surface. Belongs to a whole-Responses-API metric, not this
+      responses_to_chat_completions (POST /v1/responses) coverage.
   - id: compact-missing-model
     reason: >-
-      Targets the /responses/compact endpoint (negative case); outside the
-      stateless translation surface.
+      Separate /responses/compact operation (negative case) outside the
+      Responses-create translation surface. Belongs to a whole-Responses-API
+      metric, not this responses_to_chat_completions (POST /v1/responses)
+      coverage.
   - id: websocket-response
     reason: >-
       WebSocket transport is not part of the HTTP translation surface.
