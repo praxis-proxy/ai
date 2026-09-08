@@ -479,7 +479,6 @@ def _write_agentic_config(
     if translate_to_chat:
         config = config.replace(
             "              - filter: openai_responses_proxy\n"
-            "                terminal_streaming: true\n"
             "              - filter: router",
             "              - filter: responses_to_chat_completions\n"
             "              - filter: path_rewrite\n"
