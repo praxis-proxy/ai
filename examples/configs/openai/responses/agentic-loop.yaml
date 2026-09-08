@@ -113,8 +113,9 @@ filter_chains:
               # response identity across rounds, and withholds per-round
               # terminal events until the IRR transition is known.
               #
-              # REQUIRED with `openai_responses_proxy: terminal_streaming`
-              # below. Typed streaming commits `response.completed` to the
+              # REQUIRED because `openai_responses_proxy` below selects typed
+              # streaming automatically for an effective `"stream": true`
+              # request. Typed streaming commits `response.completed` to the
               # client as it arrives, so a loop-terminal error detected by
               # `openai_agentic_loop` (e.g. an SSE parse failure or a tool-call
               # cardinality violation) can only reach the client through this
@@ -140,8 +141,9 @@ filter_chains:
               - filter: openai_mcp_dispatch
               - filter: openai_agentic_loop
                 max_infer_iters: 10
+              # Selects typed streaming automatically when the effective
+              # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy
-                terminal_streaming: true
               - filter: router
                 routes:
                   - path_prefix: "/"

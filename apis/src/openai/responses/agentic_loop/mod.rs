@@ -227,8 +227,9 @@ impl HttpFilter for AgenticLoopFilter {
         // and after `openai_stream_events` has published whether a logical-stream
         // finalizer is armed, so both facts are observable here.
         //
-        // When the sub-request will commit a typed stream (`terminal_streaming`
-        // with `"stream": true`) but no `openai_stream_events` logical-stream
+        // When the sub-request will commit a typed stream (an effective
+        // `"stream": true` request, for which `openai_responses_proxy` selects
+        // streaming automatically) but no `openai_stream_events` logical-stream
         // finalizer is present, a loop-terminal error detected later in
         // `on_response_body` cannot reach the client: typed streaming has already
         // committed `response.completed`, so the error would be silently dropped
@@ -246,7 +247,7 @@ impl HttpFilter for AgenticLoopFilter {
                 return Ok(FilterAction::Reject(responses_error_rejection(
                     500,
                     "server_error",
-                    "openai_agentic_loop with openai_responses_proxy terminal_streaming requires \
+                    "openai_agentic_loop with a streaming openai_responses_proxy sub-request requires \
                      openai_stream_events with logical_stream: true so loop-terminal errors can \
                      reach the client",
                     true,

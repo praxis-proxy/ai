@@ -16,8 +16,12 @@ use crate::openai::responses::body_limits::validate_size_limit;
 ///
 /// ```yaml
 /// filter: openai_responses_proxy
-/// terminal_streaming: false
+/// max_rewritten_body_bytes: 10485760
 /// ```
+///
+/// Streaming transport is selected automatically from the effective outbound
+/// `stream` field; there is no operator opt-in. The removed `terminal_streaming`
+/// flag is rejected via `deny_unknown_fields` so stale configs fail to build.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResponsesProxyConfig {
@@ -29,19 +33,12 @@ pub(super) struct ResponsesProxyConfig {
     /// larger than the raw input when conversation history is rehydrated.
     #[serde(default = "default_max_rewritten_body_bytes")]
     pub max_rewritten_body_bytes: usize,
-
-    /// Select Praxis streaming transport for effective `stream: true`
-    /// requests. IRR may resume the same downstream stream after a step
-    /// transition when its response filters use streaming body mode.
-    #[serde(default)]
-    pub terminal_streaming: bool,
 }
 
 impl Default for ResponsesProxyConfig {
     fn default() -> Self {
         Self {
             max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
-            terminal_streaming: false,
         }
     }
 }

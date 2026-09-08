@@ -457,15 +457,26 @@ impl HttpFilter for FileSearchCalloutFilter {
         BodyAccess::ReadWrite
     }
 
+    /// Streaming by default so this filter composes inside a streaming-capable
+    /// `openai_responses_proxy` IRR step without tripping the pipeline's
+    /// `StreamBuffer` build validation. The non-streaming requests this filter
+    /// actually serves select a bounded `StreamBuffer` dynamically in
+    /// [`Self::on_request`]; streaming requests are rejected outright by
+    /// [`unsupported_streaming_rejection`], so they never reach the buffering
+    /// path.
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        }
+        BodyMode::Stream
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let action = self.execute_pending(ctx).await?;
         if matches!(action, FilterAction::Continue) {
+            // Reaching Continue means the request is non-streaming (streaming is
+            // rejected in execute_pending). Buffer its response so
+            // capture_response can parse the whole model response object.
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_JSON_BODY_BYTES),
+            });
             preserve_original_request_headers(ctx);
             ctx.request_headers_to_set.push((
                 http::header::ACCEPT_ENCODING,

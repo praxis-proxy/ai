@@ -158,7 +158,8 @@ async fn arm_publishes_logical_stream_marker_when_enabled() {
     filter.on_request(&mut ctx).await.unwrap();
 
     // openai_agentic_loop reads and consumes this marker to fail closed on the
-    // unsafe terminal_streaming + agentic_loop without-logical_stream combo.
+    // unsafe automatic-terminal-streaming + agentic_loop without-logical_stream
+    // combo.
     assert_eq!(
         ctx.get_metadata("responses.logical_stream"),
         Some("true"),
