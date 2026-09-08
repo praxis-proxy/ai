@@ -1541,7 +1541,7 @@ fn normalize_response_tools(tools: &[Value]) -> Vec<Value> {
                 normalized.entry("parameters").or_insert(Value::Null);
                 normalized.entry("strict").or_insert(Value::Bool(false));
                 Value::Object(normalized)
-            }
+            },
             _ => tool.clone(),
         })
         .collect()

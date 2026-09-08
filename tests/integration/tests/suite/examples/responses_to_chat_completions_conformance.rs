@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    StatefulCapturingBackend, example_config_path, free_port, http_send, json_post, parse_body,
-    parse_status, patch_yaml, start_capturing_backend, start_proxy,
+    StatefulCapturingBackend, example_config_path, free_port, http_send, json_post, parse_body, parse_status,
+    patch_yaml, start_capturing_backend, start_proxy,
 };
 
 const EXAMPLE: &str = "openai/responses/responses-to-chat-completions-conformance.yaml";
