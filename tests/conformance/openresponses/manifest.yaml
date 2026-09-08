@@ -44,16 +44,37 @@ skip:
       Targets the /responses/compact endpoint (negative case); out of scope
       for the translation filter.
   - id: websocket-response
-    reason: WebSocket transport is not part of the HTTP translation surface.
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
   - id: websocket-sequential-responses
-    reason: WebSocket transport is not part of the HTTP translation surface.
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
   - id: websocket-continuation
-    reason: WebSocket transport is not part of the HTTP translation surface.
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
   - id: websocket-reconnect-store-false-recovery
-    reason: WebSocket transport is not part of the HTTP translation surface.
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
   - id: websocket-previous-response-not-found
-    reason: WebSocket transport is not part of the HTTP translation surface.
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
   - id: websocket-failed-continuation-evicts-cache
-    reason: WebSocket transport is not part of the HTTP translation surface.
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
   - id: websocket-compact-new-chain
-    reason: WebSocket transport is not part of the HTTP translation surface.
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
