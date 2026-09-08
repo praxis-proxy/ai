@@ -107,6 +107,17 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// from the accumulator, not a buffered body, whereas any other response-body
 /// rewriter needing the complete buffered body would instead receive fragments.
 ///
+/// The optional `reasoning` block selects a dialect that promotes raw
+/// chain-of-thought returned by the backend into a Responses `reasoning`
+/// output item. The default dialect `none` performs no extraction and
+/// preserves only portable Chat Completions fields. The `vllm` dialect
+/// reads the current `message.reasoning` field (falling back to the deprecated
+/// `message.reasoning_content` alias) and emits it as a reasoning item whose
+/// `content` is `reasoning_text`. Raw reasoning is never placed in the item
+/// summary, which is reserved for safe summaries. No current dialect can
+/// generate a safe summary, so a client that requests `reasoning.summary` (or
+/// the deprecated `reasoning.generate_summary`) is rejected.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -118,6 +129,9 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// ```yaml
 /// filter: responses_to_chat_completions
 /// max_rewritten_body_bytes: 67108864
+/// reasoning:
+///   dialect: vllm
+///   max_reasoning_bytes: 65536
 /// ```
 pub struct ResponsesToChatCompletionsFilter {
     /// Parsed and validated body limits.

@@ -15,6 +15,8 @@ Requests using `previous_response_id` require `openai_response_store` and `opena
 
 To emit translated SSE events incrementally, this filter forces the reconciled response body mode to `Stream` for the entire filter chain. The protocol layer reconciles a single chain-wide response body mode with no per-filter provenance, so this downgrade cannot be scoped to one neighbor: it overrides every response filter's `StreamBuffer` requirement, not only `openai_response_store`'s. Only compose response-body filters after this one that tolerate incremental fragments; `openai_stream_events` and `openai_response_store` are compatible because they persist streamed turns from the accumulator, not a buffered body, whereas any other response-body rewriter needing the complete buffered body would instead receive fragments.
 
+The optional `reasoning` block selects a dialect that promotes raw chain-of-thought returned by the backend into a Responses `reasoning` output item. The default dialect `none` performs no extraction and preserves only portable Chat Completions fields. The `vllm` dialect reads the current `message.reasoning` field (falling back to the deprecated `message.reasoning_content` alias) and emits it as a reasoning item whose `content` is `reasoning_text`. Raw reasoning is never placed in the item summary, which is reserved for safe summaries. No current dialect can generate a safe summary, so a client that requests `reasoning.summary` (or the deprecated `reasoning.generate_summary`) is rejected.
+
 ## Examples
 
 ### Example 1
@@ -28,4 +30,7 @@ filter: responses_to_chat_completions
 ```yaml
 filter: responses_to_chat_completions
 max_rewritten_body_bytes: 67108864
+reasoning:
+  dialect: vllm
+  max_reasoning_bytes: 65536
 ```

@@ -416,7 +416,7 @@ mod tests {
     fn reasoning_bytes_over_body_limit_rejected() {
         let err = validate_max_reasoning_bytes(2048, 1024).unwrap_err();
         assert!(
-            err.to_string().contains("must not exceed max_body_bytes"),
+            err.to_string().contains("must not exceed max_rewritten_body_bytes"),
             "value above the body limit should be rejected, got: {err}"
         );
     }
