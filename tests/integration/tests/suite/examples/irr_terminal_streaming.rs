@@ -149,10 +149,21 @@ fn downstream_cancellation_closes_terminal_upstream_stream() {
             .recv_timeout(Duration::from_secs(2))
             .expect("client should drop the downstream stream");
         thread::sleep(Duration::from_millis(50));
-        let payload = "x".repeat(64 * 1024);
+        // The client has dropped. Keep producing *valid* SSE events: the
+        // compose filter forwards each normalized event downstream, and it is
+        // that downstream write that surfaces the client disconnect. Raw
+        // non-SSE bytes would be buffered by the SSE parser as an incomplete
+        // frame and never reach a downstream write, so the drop would go
+        // unnoticed. Each event carries a 64 KiB payload to fill socket
+        // buffers and force the write error promptly.
+        let filler = "x".repeat(64 * 1024);
+        let event = format!(
+            "event: response.output_text.delta\n\
+             data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{filler}\"}}\n\n"
+        );
         let mut upstream_closed = false;
         for _ in 0..256 {
-            if write!(stream, "{:x}\r\n{payload}\r\n", payload.len())
+            if write!(stream, "{:x}\r\n{event}\r\n", event.len())
                 .and_then(|()| stream.flush())
                 .is_err()
             {

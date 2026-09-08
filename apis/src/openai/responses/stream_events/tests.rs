@@ -8,12 +8,13 @@
     clippy::string_slice,
     clippy::too_many_lines,
     clippy::unwrap_used,
+    clippy::unused_async,
     unused_must_use,
     reason = "tests"
 )]
 
 use bytes::Bytes;
-use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
+use praxis_filter::{FilterAction, HttpFilter as _, SubRequestResponseMode};
 use serde_json::json;
 
 use super::{
@@ -27,24 +28,28 @@ use crate::{
     test_utils::{make_filter_context, make_request},
 };
 
-fn make_filter() -> Box<dyn HttpFilter> {
+fn make_filter() -> OpenaiStreamEventsFilter {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-    OpenaiStreamEventsFilter::from_config(&yaml).unwrap()
+    OpenaiStreamEventsFilter::build(&yaml).unwrap()
 }
 
-fn make_armed_context() -> (Box<dyn HttpFilter>, praxis_filter::HttpFilterContext<'static>) {
+/// Build a context and arm the filter as the IRR runner plus `on_request`
+/// would inside a step.
+///
+/// `on_request` fails closed unless an `IterationState` is present, and unit
+/// tests cannot construct one (its fields are private to praxis-filter). So
+/// tests arm directly through `arm`, which mirrors what `on_request` does once
+/// the IRR-placement guard has passed. The guard itself and the successful
+/// in-IRR arming path are covered by the functional integration tests.
+fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
     ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
+    filter.arm(&mut ctx);
     (filter, ctx)
-}
-
-fn make_logical_filter() -> Box<dyn HttpFilter> {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("logical_stream: true").unwrap();
-    OpenaiStreamEventsFilter::from_config(&yaml).unwrap()
 }
 
 #[test]
@@ -122,12 +127,12 @@ fn local_completion_preserves_deferred_done_sentinel() {
 }
 
 #[test]
-fn logical_stream_requires_response_write_access() {
-    let filter = make_logical_filter();
+fn response_body_access_is_always_read_write() {
+    let filter = make_filter();
     assert_eq!(
         filter.response_body_access(),
         praxis_filter::BodyAccess::ReadWrite,
-        "logical lifecycle normalization rewrites emitted SSE frames"
+        "logical lifecycle normalization always rewrites emitted SSE frames"
     );
 }
 
@@ -184,21 +189,33 @@ fn oversized_max_tool_call_argument_bytes_rejected() {
 }
 
 #[tokio::test]
-async fn arms_for_streaming_responses_request() {
-    let (filter, mut ctx) = make_armed_context();
+async fn on_request_rejects_streaming_responses_outside_irr() {
+    // Without an `IterationState` in extensions the filter is placed outside an
+    // `iterative_request_router` step. It cannot compose a logical stream there,
+    // so it must fail closed rather than arm.
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+
     let action = filter.on_request(&mut ctx).await.unwrap();
+
     assert!(
-        matches!(action, FilterAction::Continue),
-        "metadata-selected streaming request should continue"
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 500),
+        "out-of-IRR placement must fail closed with a 500"
     );
     assert!(
-        ctx.get_filter_state::<StreamEventsState>().is_some(),
-        "filter should be armed"
+        ctx.get_filter_state::<StreamEventsState>().is_none(),
+        "a rejected request must not arm the SSE parser"
     );
 }
 
 #[tokio::test]
-async fn arms_for_typed_streaming_selection_without_classifier_metadata() {
+async fn on_request_rejects_typed_streaming_outside_irr() {
+    // The typed terminal-streaming selection path must also fail closed when the
+    // filter is not inside an `iterative_request_router` step.
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
@@ -208,41 +225,26 @@ async fn arms_for_typed_streaming_selection_without_classifier_metadata() {
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
-        "typed terminal streaming selection should continue"
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 500),
+        "out-of-IRR typed streaming must fail closed with a 500"
     );
     assert!(
-        ctx.get_filter_state::<StreamEventsState>().is_some(),
-        "typed terminal streaming selection should arm the SSE parser"
+        ctx.get_filter_state::<StreamEventsState>().is_none(),
+        "a rejected typed-streaming request must not arm the SSE parser"
     );
 }
 
-#[tokio::test]
-async fn arm_publishes_logical_stream_marker_when_enabled() {
-    let (_default, mut ctx) = make_armed_context();
-    let filter = make_logical_filter();
-
-    filter.on_request(&mut ctx).await.unwrap();
-
+#[test]
+fn arm_publishes_logical_stream_marker() {
     // openai_agentic_loop reads and consumes this marker to fail closed on the
-    // unsafe automatic-terminal-streaming + agentic_loop without-logical_stream
-    // combo.
+    // unsafe terminal_streaming + agentic_loop combination when stream_events is
+    // absent. Arming always publishes it because the filter is always logical.
+    let (_filter, ctx) = make_armed_context();
+
     assert_eq!(
         ctx.get_metadata("responses.logical_stream"),
         Some("true"),
-        "logical_stream must publish the per-round marker openai_agentic_loop consumes"
-    );
-}
-
-#[tokio::test]
-async fn arm_omits_logical_stream_marker_when_disabled() {
-    let (filter, mut ctx) = make_armed_context();
-
-    filter.on_request(&mut ctx).await.unwrap();
-
-    assert!(
-        ctx.get_metadata("responses.logical_stream").is_none(),
-        "a non-logical stream_events filter must not publish the logical_stream marker"
+        "arming must publish the per-round marker openai_agentic_loop consumes"
     );
 }
 
@@ -332,7 +334,7 @@ fn make_sse_chunk(event_type: &str, data: &serde_json::Value) -> Bytes {
 
 #[tokio::test]
 async fn logical_stream_suppresses_intermediate_terminal_and_normalizes_resumed_turn() {
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -343,7 +345,7 @@ async fn logical_stream_suppresses_intermediate_terminal_and_normalizes_resumed_
         "stream": true
     })));
 
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -392,7 +394,7 @@ async fn logical_stream_suppresses_intermediate_terminal_and_normalizes_resumed_
     state.accumulated_output = vec![function_call, json!({"type": "mcp_call", "id": "mcp_1"})];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_mcp_dispatch");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut resumed_created = Some(make_sse_chunk(
         "response.created",
@@ -688,7 +690,7 @@ async fn logical_stream_synthesizes_missing_progress_for_local_and_model_declare
 
 #[tokio::test]
 async fn logical_stream_suppresses_malformed_chunk_and_emits_terminal_error() {
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -698,7 +700,7 @@ async fn logical_stream_suppresses_malformed_chunk_and_emits_terminal_error() {
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -2160,7 +2162,6 @@ fn make_done_chunk() -> Bytes {
 #[tokio::test]
 async fn terminal_event_writes_response_object() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let response_payload = json!({
         "id": "resp_123",
@@ -2185,9 +2186,65 @@ async fn terminal_event_writes_response_object() {
 }
 
 #[tokio::test]
+async fn logical_terminal_only_output_survives_canonicalization() {
+    // A plain one-round logical stream: the model's output arrives solely in the
+    // terminal `response.completed` event, with no incremental `output_item.*`
+    // events and no dispatch/loop filter to fill `accumulated_output`. The
+    // finalized logical terminal — and the response-store source it mirrors —
+    // must preserve that output rather than replace it with an empty accumulator.
+    let (filter, mut ctx) = make_armed_context();
+
+    let message = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Hello from stream"}]
+    });
+    let completed = json!({
+        "response": {
+            "id": "resp_terminal_only",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-4o",
+            "created_at": 1_700_000_000,
+            "output": [message.clone()]
+        },
+        "sequence_number": 0
+    });
+
+    let mut terminal = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(terminal.is_none(), "the terminal event must be deferred until finalize");
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    // `unwrap` (not `expect`) matches this module's test conventions; a `None`
+    // here means finalize failed to emit the deferred terminal.
+    let emitted = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains("Hello from stream"),
+        "the finalized terminal must carry the terminal event's own output: {emitted}"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.accumulated_output.is_empty(),
+        "no dispatch/loop filter ran, so the cross-round accumulator stays empty"
+    );
+    assert_eq!(
+        state.output_items().len(),
+        1,
+        "the store source must retain the terminal output"
+    );
+    assert_eq!(
+        state.output_items()[0],
+        message,
+        "the store source output must equal the terminal event output"
+    );
+}
+
+#[tokio::test]
 async fn terminal_event_authoritatively_populates_completed_function_calls() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
     ctx.extensions.insert(ResponsesState::default());
     ctx.extensions
         .get_mut::<ResponsesState>()
@@ -2283,7 +2340,6 @@ fn response_accumulation_sums_usage_across_iterations() {
 #[tokio::test]
 async fn output_item_added_accumulates_incrementally() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let item = json!({"type": "message", "role": "assistant", "id": "item_1"});
     let payload = json!({"item": item});
@@ -2299,7 +2355,6 @@ async fn output_item_added_accumulates_incrementally() {
 #[tokio::test]
 async fn terminal_event_overwrites_incremental_output() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let item = json!({"item": {"type": "message", "id": "item_1"}});
     let mut body1 = Some(make_sse_chunk("response.output_item.added", &item));
@@ -2332,7 +2387,6 @@ async fn terminal_event_overwrites_incremental_output() {
 #[tokio::test]
 async fn function_call_accumulation() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let item = json!({
         "item": {
@@ -2377,7 +2431,6 @@ async fn function_call_accumulation() {
 #[tokio::test]
 async fn missing_state_does_not_panic() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let completed = json!({
         "id": "resp_123",
@@ -2399,7 +2452,6 @@ async fn missing_state_does_not_panic() {
 #[tokio::test]
 async fn eos_validates_stream_completeness() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let completed =
         json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
@@ -2424,7 +2476,6 @@ async fn eos_validates_stream_completeness() {
 #[tokio::test]
 async fn eos_without_terminal_sets_incomplete() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let delta = json!({"text": "hi"});
     let mut b1 = Some(make_sse_chunk("response.output_text.delta", &delta));
@@ -2441,7 +2492,7 @@ async fn eos_without_terminal_sets_incomplete() {
 
 #[tokio::test]
 async fn logical_eos_without_terminal_emits_error() {
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -2451,7 +2502,7 @@ async fn logical_eos_without_terminal_emits_error() {
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut delta = Some(make_sse_chunk(
         "response.output_text.delta",
@@ -2503,6 +2554,29 @@ async fn logical_eos_without_terminal_emits_error() {
         ctx.get_metadata("responses.skip_persist"),
         Some("true"),
         "a stream missing its terminal event must not be persisted"
+    );
+}
+
+#[test]
+fn armed_first_round_emits_created_lifecycle() {
+    // A single inference round is a one-round logical stream: the first round's
+    // created lifecycle is emitted (normalized) rather than suppressed.
+    let (filter, mut ctx) = make_armed_context();
+
+    let mut body = Some(make_sse_chunk(
+        "response.created",
+        &json!({"response": {"id": "r1", "status": "in_progress", "output": []}}),
+    ));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let emitted = String::from_utf8(body.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains("event: response.created"),
+        "the first round's created lifecycle should be emitted: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""id":"r1""#),
+        "the first round keeps its own response identity: {emitted}"
     );
 }
 
@@ -2672,40 +2746,6 @@ fn deferred_terminal_stores_moved_payload_without_deep_clone() {
 }
 
 #[test]
-fn body_passes_through_unchanged() {
-    let (filter, mut ctx) = make_armed_context();
-    ctx.insert_filter_state(StreamEventsState {
-        frame_parser: SseFrameParser::new(10_485_760),
-        event_count: 0,
-        max_events: 100_000,
-        timeout: std::time::Duration::from_secs(300),
-        started_at: None,
-        completed_at: None,
-        completion_state: CompletionState::Open,
-        tool_call_args: std::collections::HashMap::new(),
-        rejected_tool_call_args: std::collections::HashSet::new(),
-        max_tool_call_argument_bytes: 1024 * 1024,
-        logical_stream: false,
-        iteration: 0,
-        output_index_offset: 0,
-        deferred_terminal: None,
-        deferred_done: false,
-        local_items_flushed: false,
-        local_tool_items: std::collections::HashMap::new(),
-    });
-
-    let original = Bytes::from("event: response.created\ndata: {\"type\":\"response.created\",\"id\":\"r1\"}\n\n");
-    let mut body = Some(original.clone());
-    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-
-    assert_eq!(
-        body.as_ref().unwrap().as_ref(),
-        original.as_ref(),
-        "body should pass through unchanged in ReadOnly mode"
-    );
-}
-
-#[test]
 fn parse_error_sets_metadata() {
     let (filter, mut ctx) = make_armed_context();
     ctx.insert_filter_state(StreamEventsState {
@@ -2719,7 +2759,6 @@ fn parse_error_sets_metadata() {
         tool_call_args: std::collections::HashMap::new(),
         rejected_tool_call_args: std::collections::HashSet::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
-        logical_stream: false,
         iteration: 0,
         output_index_offset: 0,
         deferred_terminal: None,
@@ -2743,7 +2782,6 @@ fn parse_error_sets_metadata() {
 #[tokio::test]
 async fn output_item_done_replaces_by_index() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let added = json!({"item": {"type": "message", "id": "item_1", "content": []}});
     let mut b1 = Some(make_sse_chunk("response.output_item.added", &added));
@@ -2767,7 +2805,6 @@ async fn output_item_done_replaces_by_index() {
 #[tokio::test]
 async fn terminal_incomplete_sets_status() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let payload = json!({
         "id": "resp_inc",
@@ -2790,7 +2827,6 @@ async fn terminal_incomplete_sets_status() {
 #[tokio::test]
 async fn terminal_failed_sets_status() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let payload = json!({
         "id": "resp_fail",
@@ -2813,7 +2849,6 @@ async fn terminal_failed_sets_status() {
 #[tokio::test]
 async fn output_item_done_replaces_by_id() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let added = json!({"item": {"type": "message", "id": "item_A", "content": []}});
     let mut b1 = Some(make_sse_chunk("response.output_item.added", &added));
@@ -2833,7 +2868,6 @@ async fn output_item_done_replaces_by_id() {
 #[tokio::test]
 async fn upsert_tool_call_dedup() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let item = json!({
         "item": {
@@ -2867,7 +2901,6 @@ async fn upsert_tool_call_dedup() {
 #[tokio::test]
 async fn function_call_done_without_prior_deltas() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let item = json!({
         "item": {
@@ -2902,7 +2935,6 @@ async fn function_call_done_without_prior_deltas() {
 #[tokio::test]
 async fn done_payload_wins_over_accumulated_deltas() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let item = json!({
         "item": {
@@ -2940,7 +2972,6 @@ async fn done_payload_wins_over_accumulated_deltas() {
 #[tokio::test]
 async fn unknown_event_type_ignored() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let payload = json!({"some_field": "some_value"});
     let mut body = Some(make_sse_chunk("response.future_event_type", &payload));
@@ -2953,7 +2984,6 @@ async fn unknown_event_type_ignored() {
 #[tokio::test]
 async fn error_event_does_not_mutate_state() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let payload = json!({"code": "server_error", "message": "something broke"});
     let mut body = Some(make_sse_chunk("error", &payload));
@@ -2969,7 +2999,6 @@ async fn error_event_does_not_mutate_state() {
 #[tokio::test]
 async fn error_after_terminal_lifecycle_is_accepted() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let completed =
         json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
@@ -2993,7 +3022,6 @@ async fn error_after_terminal_lifecycle_is_accepted() {
 #[tokio::test]
 async fn second_error_after_terminal_is_rejected() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let completed =
         json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
@@ -3021,7 +3049,7 @@ async fn resumed_round_error_does_not_persist_prior_round_success() {
     // `error` must not persist the previous round's completed response as the
     // logical result. Re-arming invalidates the prior `response_object`, and the
     // error round never repopulates it, so `build_record` skips persistence.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -3033,7 +3061,7 @@ async fn resumed_round_error_does_not_persist_prior_round_success() {
     })));
 
     // Round 1: a completed response carrying a tool call, transitioning the loop.
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
     let function_call = json!({
         "type": "function_call",
         "id": "fc_1",
@@ -3074,7 +3102,7 @@ async fn resumed_round_error_does_not_persist_prior_round_success() {
     state.accumulated_output = vec![function_call, json!({"type": "mcp_call", "id": "mcp_1"})];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_mcp_dispatch");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     assert!(
         ctx.extensions
@@ -3113,14 +3141,14 @@ async fn resumed_round_error_does_not_persist_prior_round_success() {
 #[tokio::test]
 async fn tool_call_argument_bytes_cap_enforced() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
-    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
     ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let item = json!({
         "item": {
@@ -3158,13 +3186,13 @@ async fn tool_call_argument_bytes_cap_enforced() {
 #[tokio::test]
 async fn tool_call_argument_bytes_cap_rejects_restart_after_overflow() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
-    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
     ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let item = json!({
         "item": {
@@ -3204,13 +3232,13 @@ async fn tool_call_argument_bytes_cap_rejects_restart_after_overflow() {
 #[tokio::test]
 async fn tool_call_argument_bytes_cap_rejects_oversized_done_payload() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 20").unwrap();
-    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
     ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let item = json!({
         "item": {
@@ -3254,14 +3282,14 @@ async fn tool_call_argument_bytes_cap_rejects_oversized_done_payload() {
 #[tokio::test]
 async fn tool_call_argument_bytes_within_limit() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_call_argument_bytes: 50").unwrap();
-    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
     ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let item = json!({
         "item": {
@@ -3292,7 +3320,6 @@ async fn tool_call_argument_bytes_within_limit() {
 #[tokio::test]
 async fn on_response_disarms_for_non_2xx_status() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
     assert!(
         ctx.get_filter_state::<StreamEventsState>().is_some(),
         "test setup should arm the SSE parser"
@@ -3317,7 +3344,6 @@ async fn on_response_disarms_for_non_2xx_status() {
 #[tokio::test]
 async fn on_response_disarms_for_non_sse_content_type() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let resp = Box::leak(Box::new(crate::test_utils::make_response()));
     resp.headers.insert(
@@ -3337,7 +3363,6 @@ async fn on_response_disarms_for_non_sse_content_type() {
 #[tokio::test]
 async fn on_response_stays_armed_for_sse_with_charset() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let resp = Box::leak(Box::new(crate::test_utils::make_response()));
     resp.headers.insert(
@@ -3355,22 +3380,6 @@ async fn on_response_stays_armed_for_sse_with_charset() {
 }
 
 #[tokio::test]
-async fn on_request_strips_accept_encoding_when_arming() {
-    let (filter, mut ctx) = make_armed_context();
-
-    filter.on_request(&mut ctx).await.unwrap();
-
-    assert!(
-        ctx.get_filter_state::<StreamEventsState>().is_some(),
-        "test setup should arm the SSE parser"
-    );
-    assert!(
-        ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
-        "arming logical parsing must strip Accept-Encoding so the backend returns plaintext SSE"
-    );
-}
-
-#[tokio::test]
 async fn on_request_keeps_accept_encoding_when_not_arming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
@@ -3379,8 +3388,11 @@ async fn on_request_keeps_accept_encoding_when_not_arming() {
     ctx.set_metadata("openai_responses_format.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
-    filter.on_request(&mut ctx).await.unwrap();
-
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "non-streaming request should continue without arming"
+    );
     assert!(
         ctx.get_filter_state::<StreamEventsState>().is_none(),
         "non-streaming request must not arm"
@@ -3394,7 +3406,6 @@ async fn on_request_keeps_accept_encoding_when_not_arming() {
 #[tokio::test]
 async fn on_response_disarms_for_content_encoded_sse() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     // A non-compliant backend returns a gzip-encoded event stream despite the
     // stripped Accept-Encoding. The raw SSE parser cannot decode it, so the
@@ -3419,7 +3430,6 @@ async fn on_response_disarms_for_content_encoded_sse() {
 #[tokio::test]
 async fn disarmed_filter_passes_error_body_through() {
     let (filter, mut ctx) = make_armed_context();
-    filter.on_request(&mut ctx).await.unwrap();
 
     let resp = Box::leak(Box::new(crate::test_utils::make_response()));
     resp.status = http::StatusCode::BAD_REQUEST;

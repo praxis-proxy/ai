@@ -7,9 +7,9 @@ use std::{collections::HashMap, time::Duration};
 
 use futures::{SinkExt as _, StreamExt as _};
 use praxis_test_utils::{
-    Backend, CapturedWsMessage, TempSqlite, WsBackendEvent, WsServerAction, example_config_path, free_port, http_send,
-    json_post, load_example_config, parse_body, parse_header, parse_status, patch_yaml, start_backend_with_shutdown,
-    start_echo_backend, start_proxy, start_scripted_websocket_backend,
+    Backend, CapturedWsMessage, TempSqlite, WsBackendEvent, WsServerAction, example_config_path, free_port, http_get,
+    http_send, json_post, load_example_config, parse_body, parse_header, parse_status, patch_yaml,
+    start_backend_with_shutdown, start_echo_backend, start_proxy, start_scripted_websocket_backend,
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
@@ -51,6 +51,28 @@ const SECOND_RESPONSE_SSE: &str = concat!(
 
 /// Maximum time allowed for a test client to complete a WebSocket handshake.
 const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Load the full-flow config with the sqlite store redirected to an isolated
+/// temp database. Store-enabled requests now reach the backend and persist, so
+/// they must not share the on-disk `responses.db` across parallel tests.
+fn load_full_flow_config_with_db(
+    proxy_port: u16,
+    db: &TempSqlite,
+    port_map: &HashMap<&str, u16>,
+) -> praxis_core::config::Config {
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+        .expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        port_map,
+    );
+    praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse")
+}
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -146,13 +168,19 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
 
 #[test]
 fn full_flow_stateful_valid_request_reaches_backend() {
-    let backend_guard = start_backend_with_shutdown("inference-backend");
+    // A classified Responses create request now flows through the IRR
+    // (openai_responses_proxy + openai_stream_events), so the backend must
+    // return a native Responses resource rather than an opaque marker string.
+    let backend_guard = start_backend_with_shutdown(
+        r#"{"id":"resp_stateful","created_at":1000,"model":"gpt-4.1","object":"response","status":"completed","output":[]}"#,
+    );
     let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_stateful");
 
-    let config = load_example_config(
-        "openai/responses/full-flow.yaml",
+    let config = load_full_flow_config_with_db(
         proxy_port,
-        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
     let proxy = start_proxy(&config);
 
@@ -166,22 +194,30 @@ fn full_flow_stateful_valid_request_reaches_backend() {
         200,
         "stateful request should pass validation and reach the backend"
     );
+    let response: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("backend response should be valid JSON");
     assert_eq!(
-        parse_body(&raw),
-        "inference-backend",
+        response["id"], "resp_stateful",
         "stateful request should route to the shared inference backend"
+    );
+    assert_eq!(
+        response["object"], "response",
+        "backend response should be a Responses resource"
     );
 }
 
 #[test]
 fn full_flow_stateless_valid_request_reaches_same_backend() {
-    let backend_guard = start_backend_with_shutdown("inference-backend");
+    let backend_guard = start_backend_with_shutdown(
+        r#"{"id":"resp_stateless","created_at":1000,"model":"gpt-4.1","object":"response","status":"completed","output":[]}"#,
+    );
     let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_stateless");
 
-    let config = load_example_config(
-        "openai/responses/full-flow.yaml",
+    let config = load_full_flow_config_with_db(
         proxy_port,
-        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
     let proxy = start_proxy(&config);
 
@@ -195,10 +231,15 @@ fn full_flow_stateless_valid_request_reaches_same_backend() {
         200,
         "stateless request should pass validation and reach the backend"
     );
+    let response: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("backend response should be valid JSON");
     assert_eq!(
-        parse_body(&raw),
-        "inference-backend",
+        response["id"], "resp_stateless",
         "stateless request should route to the shared inference backend"
+    );
+    assert_eq!(
+        response["object"], "response",
+        "backend response should be a Responses resource"
     );
 }
 
@@ -227,6 +268,100 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
         404,
         "non-Responses body should not match the format-constrained route"
     );
+}
+
+/// Streaming persistence and retrieval, end to end. A `stream: true` create
+/// request routes through the IRR, where openai_stream_events accumulates the
+/// native Responses SSE lifecycle into `ResponsesState.response_object`. The
+/// pre-IRR openai_response_store then persists that accumulated object on the
+/// response path, so the streamed resource is retrievable via
+/// `GET /v1/responses/{id}`. Without the in-IRR accumulator the object stays
+/// null and persistence is silently skipped (the store logs "response_object is
+/// null" and returns), which is exactly the regression this test guards.
+#[test]
+fn full_flow_streaming_response_is_persisted_and_retrievable() {
+    // A native Responses SSE lifecycle. The terminal event carries the full
+    // response object (id, created_at, model are all required for streaming
+    // persistence) so the accumulated resource is durable.
+    let chunks = vec![
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream\",",
+            "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+            "\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        )
+        .to_owned(),
+        concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Stored\"}\n\n",
+        )
+        .to_owned(),
+        concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",",
+            "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",\"status\":\"completed\",",
+            "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",",
+            "\"content\":[{\"type\":\"output_text\",\"text\":\"Stored\"}]}]}}\n\n",
+        )
+        .to_owned(),
+    ];
+    let backend_guard = Backend::chunked(chunks)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_streaming_persist");
+
+    let config = load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    // `stream: true` with the default store (true) — the streamed resource must persist.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello","stream":true}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "streaming create should succeed: {raw}");
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("response.completed"),
+        "terminal lifecycle event should reach the client: {body}"
+    );
+
+    // Recover the streamed resource id from the terminal lifecycle event.
+    let completed = body
+        .split("\n\n")
+        .find(|frame| frame.starts_with("event: response.completed\n"))
+        .expect("stream should contain a terminal response.completed event");
+    let data = completed
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("data: "))
+        .expect("terminal event should carry a data line");
+    let parsed: serde_json::Value = serde_json::from_str(data).expect("terminal event data should be JSON");
+    let response_id = parsed["response"]["id"]
+        .as_str()
+        .expect("terminal event should carry a response id")
+        .to_owned();
+    assert_eq!(response_id, "resp_stream");
+
+    // The accumulated streaming resource must be persisted and retrievable.
+    let (status, stored_body) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    assert_eq!(
+        status, 200,
+        "a stream:true store-default response must be persisted and retrievable: {stored_body}"
+    );
+    let stored: serde_json::Value = serde_json::from_str(&stored_body).expect("stored response should be JSON");
+    assert_eq!(stored["id"], response_id, "stored id should match the streamed id");
+    assert_eq!(stored["status"], "completed", "stored resource should be completed");
+    assert_eq!(
+        stored["output"][0]["content"][0]["text"], "Stored",
+        "accumulated streaming output text should be persisted"
+    );
+
+    drop(proxy);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -986,9 +1121,12 @@ async fn next_backend_event(backend: &mut praxis_test_utils::WsBackendGuard) -> 
 }
 
 /// Load the full-flow example with a per-test temp database.
-/// The full-flow config routes streaming and WebSocket requests
-/// through the outer pipeline (no IRR), so this works for all
-/// request types without modification.
+/// A WebSocket handshake (`GET /v1/responses` with an `Upgrade`
+/// header) takes the bypass branch of the B-shaped gateway — the
+/// carrier's `unless` condition skips it (method is not POST), so it
+/// never enters the IRR — while classified `POST /v1/responses`
+/// create requests fall through to the IRR. This helper works for
+/// both without modification.
 fn ws_full_flow_config(
     test_name: &str,
     proxy_port: u16,

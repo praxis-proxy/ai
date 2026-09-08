@@ -243,18 +243,19 @@ impl HttpFilter for AgenticLoopFilter {
         // truncated success. Buffered rounds retain full error handling and are
         // unaffected.
         if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
-            // Consume the per-round marker so a `"true"` published by another IRR
-            // step cannot satisfy a later step's check. `openai_stream_events`
-            // re-publishes it every armed round before this filter reads it.
-            let logical_stream = ctx.get_metadata("responses.logical_stream") == Some("true");
+            // `openai_stream_events` publishes this marker on every armed round
+            // (it always composes its stream into one logical Responses
+            // lifecycle). Consume it so a `"true"` published by another IRR step
+            // cannot satisfy a later step's check; the filter re-publishes it
+            // every armed round before this filter reads it.
+            let stream_events_armed = ctx.get_metadata("responses.logical_stream") == Some("true");
             ctx.set_metadata("responses.logical_stream", "false");
-            if !logical_stream {
+            if !stream_events_armed {
                 return Ok(FilterAction::Reject(responses_error_rejection(
                     500,
                     "server_error",
                     "openai_agentic_loop with a streaming openai_responses_proxy sub-request requires \
-                     openai_stream_events with logical_stream: true so loop-terminal errors can \
-                     reach the client",
+                     openai_stream_events in the same step so loop-terminal errors can reach the client",
                 )));
             }
         }

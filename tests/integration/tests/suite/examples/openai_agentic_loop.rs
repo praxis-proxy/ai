@@ -3606,14 +3606,14 @@ fn streaming_web_search_failure_synthesizes_partial_progress_in_one_logical_resp
 // -----------------------------------------------------------------------------
 
 #[test]
-fn terminal_streaming_without_logical_stream_fails_closed_before_dispatch() {
+fn terminal_streaming_without_stream_events_fails_closed_before_dispatch() {
     // openai_responses_proxy selects typed streaming automatically for the
-    // effective stream: true request, but openai_stream_events is reconfigured
-    // with logical_stream: false. Typed streaming commits response.completed to
-    // the client as it arrives, so a loop-terminal error detected later by
-    // openai_agentic_loop could not reach the client. The loop must therefore
-    // reject before any backend request rather than forward a truncatable
-    // success.
+    // effective stream: true request, but openai_stream_events is removed from
+    // the inference step, so no logical-stream finalizer is armed. Typed
+    // streaming commits response.completed to the client as it arrives, so a
+    // loop-terminal error detected later by openai_agentic_loop could not reach
+    // the client. The loop must therefore reject before any backend request
+    // rather than forward a truncatable success.
     let (model_port, model_requests, _model_thread) = start_streaming_model(vec![vec![sse_event(
         "response.completed",
         serde_json::json!({
@@ -3622,7 +3622,7 @@ fn terminal_streaming_without_logical_stream_fails_closed_before_dispatch() {
         }),
     )]]);
     let proxy_port = free_port();
-    let config = load_agentic_config_without_logical_stream(proxy_port, model_port);
+    let config = load_agentic_config_without_stream_events(proxy_port, model_port);
     let proxy = start_proxy(&config);
     let request = serde_json::json!({
         "model": "gpt-4.1",
@@ -3639,7 +3639,7 @@ fn terminal_streaming_without_logical_stream_fails_closed_before_dispatch() {
     assert_eq!(
         parse_status(&raw),
         500,
-        "unsafe terminal streaming without logical_stream must fail closed with 500: {raw}"
+        "unsafe terminal streaming without a stream_events finalizer must fail closed with 500: {raw}"
     );
     let body = parse_body(&raw);
     assert!(
@@ -5694,23 +5694,25 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
     praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
 }
 
-fn load_agentic_config_without_logical_stream(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    // Disable logical_stream on the real openai_stream_events filter (the two-line
-    // `- filter:`/`logical_stream:` pair). The doc comment above it also contains
-    // the literal `logical_stream: true`, so match the filter line too to avoid
-    // rewriting the comment instead of the config.
-    let enabled = "- filter: openai_stream_events\n                logical_stream: true";
-    let disabled = "- filter: openai_stream_events\n                logical_stream: false";
-    let patched = yaml.replacen(enabled, disabled, 1);
+    // Remove the openai_stream_events filter from the inference step so no
+    // logical-stream finalizer is armed. openai_responses_proxy still selects
+    // typed streaming automatically for the effective stream: true request, so
+    // openai_agentic_loop must fail closed: a loop-terminal error could not
+    // otherwise reach the client through a committed stream. The `- filter:`
+    // prefix keeps this from matching the filter name in the surrounding doc
+    // comment.
+    let finalizer_line = "              - filter: openai_stream_events\n";
+    let patched = yaml.replacen(finalizer_line, "", 1);
     assert_ne!(
         patched, yaml,
-        "expected to disable logical_stream in agentic-loop.yaml; its openai_stream_events block may have changed"
+        "expected to remove openai_stream_events from agentic-loop.yaml; its inference step may have changed"
     );
-    praxis_core::config::Config::from_yaml(&patched).expect("parse agentic-loop config without logical_stream")
+    praxis_core::config::Config::from_yaml(&patched).expect("parse agentic-loop config without openai_stream_events")
 }
 
 fn load_agentic_rejection_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {

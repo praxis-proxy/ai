@@ -187,11 +187,26 @@ fn responses_to_chat_completions_rejects_malformed_finite_success() {
     let request = r#"{"model":"gpt-4.1-mini","input":"Hello","stream":false,"store":false}"#;
 
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
-    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("error response should be JSON");
+    let body = parse_body(&raw);
 
+    // A malformed finite success can only be detected after the body is
+    // buffered, by which point the upstream `200 OK` headers may already be
+    // committed. The converter therefore fails closed by aborting the transform
+    // with a `FilterError` rather than a `Reject` (the unit tests
+    // `malformed_success_aborts_after_headers_are_sent` and
+    // `malformed_success_shape_aborts_after_headers_are_sent` pin this contract).
+    // Inside the `iterative_request_router` step that abort surfaces as a
+    // bodyless `500` gateway error end-to-end, so assert the fail-closed status
+    // and that no upstream Chat Completions framing leaks to the client.
     assert_eq!(parse_status(&raw), 500);
-    assert_eq!(response["error"]["type"], "server_error");
-    assert_eq!(response["error"]["code"], "internal_proxy_error");
+    assert!(
+        !body.contains("chat.completion"),
+        "raw Chat framing must not leak on a finite abort: {body}"
+    );
+    assert!(
+        !body.contains("event: response."),
+        "no translated event stream may leak on a finite abort: {body}"
+    );
 }
 
 #[test]

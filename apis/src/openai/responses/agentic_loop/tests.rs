@@ -154,8 +154,9 @@ fn passthrough_without_state_on_response_body() {
 async fn on_request_rejects_typed_streaming_without_logical_stream() {
     // openai_responses_proxy already selected the typed streaming transport for
     // this round, but openai_stream_events published no logical-stream marker
-    // (logical_stream: false or the filter is absent). A loop-terminal error
-    // could not reach the client, so this must fail closed before dispatch.
+    // (the filter is absent from this step, so nothing armed a finalizer). A
+    // loop-terminal error could not reach the client, so this must fail closed
+    // before dispatch.
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);

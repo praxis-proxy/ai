@@ -18,7 +18,7 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_responses_proxy`** — Rebuilds the request body from `ResponsesState` when present.
 - **`openai_responses_rehydrate`** — Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input).
 - **`openai_responses_validate`** — Validates and enriches Responses API requests.
-- **`openai_stream_events`** — Accumulates state from native Responses API SSE event streams.
+- **`openai_stream_events`** — Composes the current IRR execution into one logical Responses stream.
 - **`openai_tool_parse`** — Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body.
 - **`openai_web_search`** — Web search filter for model-driven `web_search_call` dispatch.
 - **`responses_to_chat_completions`** — Translates canonical Responses create requests for a Chat Completions backend.

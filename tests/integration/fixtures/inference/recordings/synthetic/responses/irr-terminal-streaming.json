@@ -11,8 +11,8 @@
   "normalization": {
     "version": 1,
     "linked_ids": {
-      "msg_synthetic_1": "msg_recorded_0002",
-      "resp_synthetic_1": "resp_recorded_0001"
+      "msg_recorded_0002": "msg_recorded_0002",
+      "resp_recorded_0001": "resp_recorded_0001"
     }
   },
   "turns": [
@@ -48,19 +48,19 @@
             "kind": "sse",
             "frames": [
               {
-                "event": null,
+                "event": "response.created",
                 "data": "{\"response\":{\"id\":\"resp_recorded_0001\",\"model\":\"synthetic-responses-model\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}",
                 "id": null,
                 "retry": null
               },
               {
-                "event": null,
+                "event": "response.output_text.delta",
                 "data": "{\"content_index\":0,\"delta\":\"STREAM-OK\",\"output_index\":0,\"response_id\":\"resp_recorded_0001\",\"sequence_number\":1,\"type\":\"response.output_text.delta\"}",
                 "id": null,
                 "retry": null
               },
               {
-                "event": null,
+                "event": "response.completed",
                 "data": "{\"response\":{\"id\":\"resp_recorded_0001\",\"model\":\"synthetic-responses-model\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"STREAM-OK\",\"type\":\"output_text\"}],\"id\":\"msg_recorded_0002\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}},\"sequence_number\":2,\"type\":\"response.completed\"}",
                 "id": null,
                 "retry": null

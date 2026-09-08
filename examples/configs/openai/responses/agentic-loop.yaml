@@ -147,9 +147,12 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              # Parses every inference SSE stream, preserves one logical
-              # response identity across rounds, and withholds per-round
-              # terminal events until the IRR transition is known.
+              # Composes every inference SSE stream into one logical Responses
+              # lifecycle: preserves one response identity across rounds and
+              # withholds per-round terminal events until the IRR transition is
+              # known. A single inference round is just a one-round logical
+              # stream, so this filter always composes and must run inside this
+              # IRR step.
               #
               # REQUIRED because `openai_responses_proxy` below selects typed
               # streaming automatically for an effective `"stream": true`
@@ -158,14 +161,13 @@ filter_chains:
               # `openai_agentic_loop` (e.g. an SSE parse failure or mixed
               # client/server function-call ownership) can only reach the client through this
               # filter's logical-stream finalizer, which defers each round's
-              # terminal event and can replace it with an error frame. Without
-              # `logical_stream: true` that error is silently dropped after the
-              # success is already on the wire, so `openai_agentic_loop` fails
-              # closed with a 500 before any backend request when the two are
-              # misconfigured together. (Startup validation of this pairing is
-              # left to a future Praxis-core improvement.)
+              # terminal event and can replace it with an error frame. When this
+              # filter is absent from the step, that error would be silently
+              # dropped after the success is already on the wire, so
+              # `openai_agentic_loop` fails closed with a 500 before any backend
+              # request. (Startup validation of this pairing is left to a future
+              # Praxis-core improvement.)
               - filter: openai_stream_events
-                logical_stream: true
 
               # Runs first on request re-entry to execute pending web
               # searches, and last on the model response to detect

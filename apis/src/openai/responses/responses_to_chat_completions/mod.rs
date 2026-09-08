@@ -118,9 +118,9 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// `openai_agentic_loop` as one buffered blob — a blob is not a Responses
 /// resource, so the loop could not detect a returned `web_search_call` and would
 /// terminate before any search dispatches. With streaming, `openai_web_search`
-/// dispatches the search, inference resumes, and `openai_stream_events` (with
-/// `logical_stream: true`, placed first in the step) composes one client-facing
-/// Responses SSE lifecycle across the model, search, and resumed model output.
+/// dispatches the search, inference resumes, and `openai_stream_events` (placed
+/// first in the step) composes one client-facing Responses SSE lifecycle across
+/// the model, search, and resumed model output.
 /// Every response filter co-located in a step with this one must therefore use
 /// `BodyMode::Stream`; a static `StreamBuffer` filter in the same step must
 /// instead buffer dynamically (see `openai_file_search_callout`).

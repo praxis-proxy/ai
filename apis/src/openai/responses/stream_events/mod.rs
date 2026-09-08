@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Accumulates state from native Responses API SSE event streams.
+//! Composes the current iterative-request-router (IRR) execution into
+//! one logical Responses API SSE stream.
 //!
-//! Parses backend SSE chunks using [`SseFrameParser`], dispatches
-//! typed events to update [`ResponsesState`] in request extensions.
-//! With `logical_stream: true`, successive IRR inference streams are
-//! normalized into one downstream Responses lifecycle.
+//! Parses backend SSE chunks using [`SseFrameParser`], dispatches typed
+//! events to update [`ResponsesState`] in request extensions, and
+//! normalizes successive IRR inference streams into one downstream
+//! Responses lifecycle. A single inference round is just a one-round
+//! logical stream, so the filter always normalizes. It must run inside
+//! an `iterative_request_router` step; running it anywhere else is a
+//! misconfiguration and fails closed at request time.
 //!
 //! [`SseFrameParser`]: crate::openai::sse::SseFrameParser
 //! [`ResponsesState`]: super::state::ResponsesState
@@ -24,8 +28,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
+    SubRequestResponseMode, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, trace, warn};
@@ -38,7 +42,7 @@ use crate::{
     is_event_stream_content_type,
     openai::{
         responses::{
-            error::responses_error_sse_payload,
+            error::{responses_error_rejection, responses_error_sse_payload},
             state::{EmittedItem, ResponsesState},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
@@ -87,8 +91,6 @@ pub(super) struct StreamEventsState {
     rejected_tool_call_args: std::collections::HashSet<String>,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
-    /// Whether this parser normalizes an IRR multi-round logical stream.
-    logical_stream: bool,
     /// Inference iteration number for lifecycle suppression and index offsets.
     iteration: u32,
     /// Output index offset contributed by preceding inference/tool rounds.
@@ -109,14 +111,16 @@ pub(super) struct StreamEventsState {
     local_tool_items: std::collections::HashMap<String, local_tools::LocalToolMode>,
 }
 
-/// Accumulates state from native Responses API SSE event streams.
+/// Composes the current IRR execution into one logical Responses stream.
+///
+/// Must run inside an `iterative_request_router` step. Running it
+/// elsewhere is a misconfiguration and fails closed at request time.
 ///
 /// # YAML
 ///
 /// ```yaml
 /// filter: openai_stream_events
 /// # All fields optional:
-/// # logical_stream: false
 /// # max_buffer_bytes: 10485760
 /// # max_events: 100000
 /// # timeout_secs: 300
@@ -127,8 +131,6 @@ pub struct OpenaiStreamEventsFilter {
     parser_config: SseParserConfig,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
-    /// Normalize successive IRR turns into one logical Responses stream.
-    logical_stream: bool,
 }
 
 impl OpenaiStreamEventsFilter {
@@ -138,13 +140,21 @@ impl OpenaiStreamEventsFilter {
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Ok(Box::new(Self::build(config)?))
+    }
+
+    /// Build the concrete filter from parsed YAML config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid.
+    fn build(config: &serde_yaml::Value) -> Result<Self, FilterError> {
         let cfg: StreamEventsConfig = parse_filter_config("openai_stream_events", config)?;
         cfg.validate()?;
-        Ok(Box::new(Self {
+        Ok(Self {
             parser_config: cfg.to_parser_config(),
             max_tool_call_argument_bytes: cfg.max_tool_call_argument_bytes(),
-            logical_stream: cfg.logical_stream,
-        }))
+        })
     }
 
     /// Whether per-request parser state has been installed.
@@ -175,7 +185,6 @@ impl OpenaiStreamEventsFilter {
             tool_call_args: std::collections::HashMap::new(),
             rejected_tool_call_args: std::collections::HashSet::new(),
             max_tool_call_argument_bytes: self.max_tool_call_argument_bytes,
-            logical_stream: self.logical_stream,
             iteration,
             output_index_offset,
             deferred_terminal: None,
@@ -186,14 +195,13 @@ impl OpenaiStreamEventsFilter {
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
         // consumes) to confirm this typed-streaming round can surface
-        // loop-terminal errors through `finalize_logical_stream`. Only meaningful
-        // when `logical_stream` is enabled; refreshed every round because the
-        // agentic loop overwrites it after each check.
-        if self.logical_stream {
-            ctx.set_metadata("responses.logical_stream", "true");
-            // Per-consumer capability marker (§7.1). file_search is the only consumer today.
-            ctx.set_metadata("responses.logical_stream.file_search", "true");
-        }
+        // loop-terminal errors through `finalize_logical_stream`. Refreshed
+        // every armed round because the agentic loop overwrites it after each
+        // check.
+        ctx.set_metadata("responses.logical_stream", "true");
+        // Per-consumer capability marker (§7.1). file_search is the only
+        // consumer today.
+        ctx.set_metadata("responses.logical_stream.file_search", "true");
     }
 }
 
@@ -212,11 +220,9 @@ impl HttpFilter for OpenaiStreamEventsFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        if self.logical_stream {
-            BodyAccess::ReadWrite
-        } else {
-            BodyAccess::ReadOnly
-        }
+        // Always ReadWrite: the filter normalizes every armed stream into one
+        // logical Responses lifecycle, rewriting per-round SSE bytes.
+        BodyAccess::ReadWrite
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -225,11 +231,43 @@ impl HttpFilter for OpenaiStreamEventsFilter {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let typed_streaming = ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming;
+        // The `iterative_request_router` runner moves request extensions into
+        // each step but builds a fresh `filter_metadata` map, so metadata set by
+        // pre-IRR filters (e.g. `openai_responses_format`) is not visible here.
+        // `ResponsesState` is created pre-IRR and travels through extensions, so
+        // fall back to it for format and stream detection — mirroring how
+        // `responses_to_chat_completions` resolves `request_is_streaming`.
+        let responses_state = ctx.extensions.get::<ResponsesState>();
+        let has_responses_state = responses_state.is_some();
+        let body_stream = responses_state
+            .and_then(|state| state.request_body.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
-            && (typed_streaming || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses"));
-        let is_streaming = typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true");
+            && (typed_streaming
+                || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+                || has_responses_state);
+        let is_streaming =
+            typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
 
         if is_responses && is_streaming {
+            // The filter always composes the current IRR execution into one
+            // logical Responses stream, so it must run inside an
+            // `iterative_request_router` step. `IterationState` is inserted by
+            // the IRR runner before the request phase of every iteration
+            // (including iteration 0), so its absence here means the filter is
+            // placed outside IRR — a server misconfiguration. Fail closed
+            // before any upstream dispatch rather than emit an unnormalized
+            // stream that later loop-terminal errors could not correct.
+            if ctx.extensions.get::<IterationState>().is_none() {
+                warn!("openai_stream_events is not inside an iterative_request_router step");
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    500,
+                    "server_error",
+                    "openai_stream_events must run inside an iterative_request_router step",
+                    true,
+                )));
+            }
             trace!("arming stream_events for streaming Responses API request");
             self.arm(ctx);
             // The SSE frame parser consumes raw bytes, so a compressed upstream
@@ -318,7 +356,7 @@ fn handle_parse_result(
     let parsed = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
-            handle_parse_error(ctx, body, state, &error);
+            handle_parse_error(ctx, body, &error);
             return;
         },
     };
@@ -328,29 +366,20 @@ fn handle_parse_result(
         CompletionState::Error => "error",
     };
     ctx.set_metadata("responses.stream_completion", completion);
-    if state.logical_stream {
-        *body = parsed;
-    }
+    *body = parsed;
 }
 
 /// Record a parse failure and suppress unnormalized logical-stream bytes.
-fn handle_parse_error(
-    ctx: &mut HttpFilterContext<'_>,
-    body: &mut Option<Bytes>,
-    state: &StreamEventsState,
-    error: &SseParseError,
-) {
+fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, error: &SseParseError) {
     warn!(%error, "SSE parse error in stream_events");
     ctx.set_metadata("responses.stream_parse_error", "true".to_owned());
-    if state.logical_stream {
-        ctx.set_metadata("responses.stream_error_code", "server_error");
-        ctx.set_metadata(
-            "responses.stream_error_message",
-            "upstream Responses stream could not be parsed",
-        );
-        ctx.set_metadata("responses.skip_persist", "true");
-        *body = None;
-    }
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata(
+        "responses.stream_error_message",
+        "upstream Responses stream could not be parsed",
+    );
+    ctx.set_metadata("responses.skip_persist", "true");
+    *body = None;
 }
 
 /// Parse frames from raw bytes and accumulate events.
@@ -377,10 +406,7 @@ fn parse_and_accumulate(
     let events = parse_chunk_events(state, &frames, now)?;
     let logical_output = commit_chunk_events(state, ctx, events);
 
-    Ok(state
-        .logical_stream
-        .then(|| Bytes::from(logical_output))
-        .filter(|bytes| !bytes.is_empty()))
+    Ok((!logical_output.is_empty()).then(|| Bytes::from(logical_output)))
 }
 
 /// Phase 1: parse and validate every frame in a chunk before any mutation.
@@ -396,9 +422,7 @@ fn parse_chunk_events(
     let mut events = Vec::with_capacity(frames.len());
     for frame in frames {
         if frame.data == b"[DONE]" {
-            if state.logical_stream {
-                state.deferred_done = true;
-            }
+            state.deferred_done = true;
             continue;
         }
 
@@ -423,9 +447,7 @@ fn commit_chunk_events(
     let mut logical_output = Vec::new();
     for event in events {
         accumulate_event(ctx, state, &event);
-        if state.logical_stream {
-            append_logical_event(state, ctx, event, &mut logical_output);
-        }
+        append_logical_event(state, ctx, event, &mut logical_output);
     }
 
     // Mirror the parser's deferred-`[DONE]` decision into shared response state,
@@ -1255,15 +1277,18 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
     };
-    if !parser_state.logical_stream {
-        ctx.insert_filter_state(parser_state);
-        return;
-    }
 
-    let mut output = Vec::new();
-    // #313 §4.2: drain file_search synthesis first, under the precedence policy. A
-    // validation failure here calls fs_end_stream_with_error_ctx (site (b), §7.3) so
-    // the error branch below is selected and the router does not re-fire.
+    // Preserve any non-terminal logical events `process_chunk` already emitted
+    // for this final chunk, then append synthesized local-tool events and the
+    // deferred terminal. A transport that reassembles the whole stream before
+    // releasing it (e.g. `responses_to_chat_completions`) delivers the
+    // created/delta events and deferred terminal together in the end-of-stream
+    // chunk; starting from an empty buffer here would drop those earlier events.
+    let mut output = body.take().map_or_else(Vec::new, |bytes| bytes.to_vec());
+    // #313 §4.2: drain file_search synthesis before terminal/error finalization,
+    // under the precedence policy. A validation failure here calls
+    // fs_end_stream_with_error_ctx (site (b), §7.3) so the error branch below is
+    // selected and the router does not re-fire.
     local_tools::drain_local_tool_synthesis(ctx, parser_state.output_index_offset, &mut output);
     // #313 P1 (DoS bound): file_search's EOS reconcile (a prior response-phase filter) has
     // already read this round's provider-streamed observation set; clear it unconditionally
@@ -1351,18 +1376,26 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 /// Make the response-store source agree with the logical SSE terminal.
 fn canonicalize_logical_response(state: &mut ResponsesState) -> (Vec<Value>, Value) {
     let logical_id = state.logical_stream_response_id.clone();
-    let accumulated_output = state.accumulated_output.clone();
     let usage = state.usage.clone();
+    // Prefer the cross-round accumulator populated by dispatch/loop filters
+    // (agentic pipelines). When no such filter ran — a plain one-round logical
+    // stream — it stays empty, so fall back to the terminal event's own output
+    // rather than clobber it with nothing. Mirrors `finalize_response_body`.
+    let output = if state.accumulated_output.is_empty() {
+        state.output_items().to_vec()
+    } else {
+        state.accumulated_output.clone()
+    };
     if let Some(response) = state.response_object.as_object_mut() {
         if let Some(logical_id) = logical_id {
             response.insert("id".to_owned(), Value::String(logical_id));
         }
-        response.insert("output".to_owned(), Value::Array(accumulated_output.clone()));
+        response.insert("output".to_owned(), Value::Array(output.clone()));
         if !usage.is_null() {
             response.insert("usage".to_owned(), usage.clone());
         }
     }
-    (accumulated_output, usage)
+    (output, usage)
 }
 
 /// Check whether the stream has exceeded its wall-clock timeout.
@@ -1414,21 +1447,21 @@ fn mark_complete(state: &mut StreamEventsState, new_state: CompletionState, now:
 
 /// Check that the SSE stream terminated with a terminal event.
 fn validate_stream_end(ctx: &mut HttpFilterContext<'_>) {
-    let incomplete_logical_stream = ctx.get_filter_state::<StreamEventsState>().and_then(|state| {
+    let incomplete = ctx.get_filter_state::<StreamEventsState>().is_some_and(|state| {
         let checked_at = state.completed_at.unwrap_or_else(Instant::now);
         if let Err(e) = check_timeout(state, checked_at) {
             warn!(error = %e, "stream did not terminate cleanly");
-            Some(state.logical_stream)
+            true
         } else if state.completion_state == CompletionState::Open {
             warn!("stream did not terminate cleanly: missing terminal event");
-            Some(state.logical_stream)
+            true
         } else {
-            None
+            false
         }
     });
-    if let Some(logical_stream) = incomplete_logical_stream {
+    if incomplete {
         ctx.set_metadata("responses.stream_incomplete", "true".to_owned());
-        if logical_stream && ctx.get_metadata("responses.stream_error_code").is_none() {
+        if ctx.get_metadata("responses.stream_error_code").is_none() {
             ctx.set_metadata("responses.stream_error_code", "server_error");
             ctx.set_metadata(
                 "responses.stream_error_message",
