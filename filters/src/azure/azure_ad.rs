@@ -30,11 +30,18 @@
 //!
 //! # Scope
 //!
-//! This filter currently supports the **client-secret** credential only.
-//! Managed identity (AKS/IMDS), client certificates (`private_key_jwt`
-//! assertions), and OIDC/workload-identity federation are planned
-//! follow-ups; they slot into the same cache-through machinery this
-//! filter already uses, with no change to request handling.
+//! This filter supports both **client-secret** credentials and **OIDC/workload-identity**
+//! federation (RFC 7523 client assertions). Managed identity (IMDS) and client
+//! certificates (`private_key_jwt`) slot into the same cache-through machinery
+//! this filter uses, with no change to request handling.
+//!
+//! # Workload Identity / OIDC Federation
+//!
+//! For passwordless / zero-secret deployments (e.g. OpenShift / AKS Workload Identity
+//! or GitHub Actions OIDC), configure `federated_token_file` (pointing to the mounted
+//! service account token file) or `federated_token_env_var`. On every token refresh,
+//! the filter acquires an Entra ID access token via RFC 7523 client assertion
+//! token exchange (`grant_type=client_credentials`, `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`).
 //!
 //! # Routing vs. authentication
 //!
@@ -94,6 +101,42 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 // Token endpoint
 // -----------------------------------------------------------------------------
 
+/// Credential source for acquiring an Entra ID bearer token.
+#[derive(Debug, Clone)]
+pub(crate) enum CredentialSource {
+    /// Client-credentials grant using a static secret from an environment variable.
+    ClientSecret { secret: String },
+
+    /// OIDC Workload Identity Federation (RFC 7523 client assertion)
+    /// using a federated JWT token from a file or environment variable.
+    FederatedToken { source: FederatedTokenSource },
+}
+
+/// Source location for an OIDC federated JWT token.
+#[derive(Debug, Clone)]
+pub(crate) enum FederatedTokenSource {
+    /// Token read from a file path (e.g. Kubernetes projected service account token).
+    File(std::path::PathBuf),
+    /// Token read from an environment variable.
+    EnvVar(String),
+}
+
+impl FederatedTokenSource {
+    fn resolve(&self) -> Result<String, FilterError> {
+        match self {
+            Self::File(path) => std::fs::read_to_string(path).map(|s| s.trim().to_owned()).map_err(|e| {
+                FilterError::from(format!(
+                    "azure_ad: failed to read federated token file '{}': {e}",
+                    path.display()
+                ))
+            }),
+            Self::EnvVar(var) => std::env::var(var)
+                .map(|s| s.trim().to_owned())
+                .map_err(|e| FilterError::from(format!("azure_ad: federated token env var '{var}' is not set: {e}"))),
+        }
+    }
+}
+
 /// Successful response body from the Entra ID token endpoint. Extra
 /// fields (`token_type`, `ext_expires_in`, …) are ignored.
 #[derive(Debug, Deserialize)]
@@ -106,7 +149,7 @@ struct TokenResponse {
 }
 
 /// Acquire a token from the Entra ID token endpoint via the
-/// client-credentials grant.
+/// client-credentials grant or OIDC Workload Identity Federation client assertion.
 ///
 /// Returns the ready-to-inject `Authorization` header value and the
 /// token's lifetime. Kept free of caching concerns so it can be
@@ -122,15 +165,33 @@ async fn fetch_token(
     client: &reqwest::Client,
     token_url: &str,
     client_id: &str,
-    client_secret: &str,
+    credential: &CredentialSource,
     scope: &str,
 ) -> Result<(HeaderValue, Duration), FilterError> {
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("grant_type", "client_credentials")
-        .append_pair("client_id", client_id)
-        .append_pair("client_secret", client_secret)
-        .append_pair("scope", scope)
-        .finish();
+    let body = {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer
+            .append_pair("grant_type", "client_credentials")
+            .append_pair("client_id", client_id);
+
+        match credential {
+            CredentialSource::ClientSecret { secret } => {
+                serializer.append_pair("client_secret", secret);
+            },
+            CredentialSource::FederatedToken { source } => {
+                let assertion = source.resolve()?;
+                serializer
+                    .append_pair(
+                        "client_assertion_type",
+                        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                    )
+                    .append_pair("client_assertion", &assertion);
+            },
+        }
+
+        serializer.append_pair("scope", scope);
+        serializer.finish()
+    };
 
     let response = client
         .post(token_url)
@@ -188,8 +249,8 @@ pub struct AzureAdFilter {
     /// Application (client) ID.
     client_id: String,
 
-    /// Client secret, resolved from the configured environment variable.
-    client_secret: String,
+    /// Credential source (client secret or OIDC federated token).
+    credential: CredentialSource,
 
     /// `OAuth2` scope (e.g. `https://cognitiveservices.azure.com/.default`).
     scope: String,
@@ -201,23 +262,17 @@ pub struct AzureAdFilter {
 }
 
 impl AzureAdFilter {
-    /// Build a filter from parsed config, resolving the client secret
-    /// from its environment variable.
+    /// Build a filter from parsed config, resolving the credential source
+    /// (client secret or OIDC federated token).
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if `authority_host` or `tenant_id` contain
-    /// URL-structural characters, the configured secret environment
-    /// variable is unset or not UTF-8, or the HTTP client fails to build.
+    /// URL-structural characters, credentials cannot be resolved, or the HTTP client fails to build.
     fn new(config: AzureAdConfig) -> Result<Self, FilterError> {
         validate_config(&config)?;
 
-        let client_secret = std::env::var(&config.client_secret_env_var).map_err(|e| {
-            FilterError::from(format!(
-                "azure_ad: client_secret_env_var '{}' is not set: {e}",
-                config.client_secret_env_var
-            ))
-        })?;
+        let credential = resolve_credential_source(&config)?;
 
         let token_url = format!(
             "https://{}/{}/oauth2/v2.0/token",
@@ -231,7 +286,7 @@ impl AzureAdFilter {
             token_url,
             address_policy,
             client_id: config.client_id,
-            client_secret,
+            credential,
             scope: config.scope,
             failing: AtomicBool::new(false),
         })
@@ -281,14 +336,7 @@ impl praxis_filter::HttpFilter for AzureAdFilter {
                     TOKEN_REQUEST_TIMEOUT,
                 )
                 .await?;
-                fetch_token(
-                    &client,
-                    &self.token_url,
-                    &self.client_id,
-                    &self.client_secret,
-                    &self.scope,
-                )
-                .await
+                fetch_token(&client, &self.token_url, &self.client_id, &self.credential, &self.scope).await
             })
             .await;
         match fetched {
@@ -333,8 +381,14 @@ pub(crate) struct AzureAdConfig {
     /// `https://cognitiveservices.azure.com/.default`).
     pub(crate) scope: String,
 
-    /// Environment variable holding the client secret.
-    pub(crate) client_secret_env_var: String,
+    /// Environment variable holding the client secret (for static secret auth).
+    pub(crate) client_secret_env_var: Option<String>,
+
+    /// Path to a file containing an OIDC federated JWT token (for Workload Identity / OIDC federation).
+    pub(crate) federated_token_file: Option<std::path::PathBuf>,
+
+    /// Environment variable holding an OIDC federated JWT token or token path.
+    pub(crate) federated_token_env_var: Option<String>,
 
     /// Entra ID authority host. Override for sovereign clouds (e.g.
     /// `login.microsoftonline.us`).
@@ -344,6 +398,61 @@ pub(crate) struct AzureAdConfig {
     /// Allow a private authority host for a trusted internal identity service.
     #[serde(default)]
     pub(crate) allow_private_authority: bool,
+}
+
+/// Resolve credential source from explicit config or ambient environment.
+fn resolve_credential_source(config: &AzureAdConfig) -> Result<CredentialSource, FilterError> {
+    let secret_var = config.client_secret_env_var.as_deref();
+    let fed_file = config.federated_token_file.as_deref();
+    let fed_var = config.federated_token_env_var.as_deref();
+
+    let count = usize::from(secret_var.is_some()) + usize::from(fed_file.is_some()) + usize::from(fed_var.is_some());
+
+    if count > 1 {
+        return Err(FilterError::from(
+            "azure_ad: 'client_secret_env_var', 'federated_token_file', and 'federated_token_env_var' are mutually exclusive",
+        ));
+    }
+
+    if let Some(secret_var) = secret_var {
+        let secret = std::env::var(secret_var).map_err(|e| {
+            FilterError::from(format!(
+                "azure_ad: client_secret_env_var '{secret_var}' is not set: {e}"
+            ))
+        })?;
+        return Ok(CredentialSource::ClientSecret { secret });
+    }
+
+    if let Some(path) = fed_file {
+        return Ok(CredentialSource::FederatedToken {
+            source: FederatedTokenSource::File(path.to_path_buf()),
+        });
+    }
+
+    if let Some(var) = fed_var {
+        return Ok(CredentialSource::FederatedToken {
+            source: FederatedTokenSource::EnvVar(var.to_string()),
+        });
+    }
+
+    // Ambient environment fallbacks (e.g. AKS / OpenShift Workload Identity)
+    if let Ok(var) = std::env::var("AZURE_FEDERATED_TOKEN_FILE") {
+        if !var.trim().is_empty() {
+            return Ok(CredentialSource::FederatedToken {
+                source: FederatedTokenSource::File(std::path::PathBuf::from(var.trim())),
+            });
+        }
+    }
+
+    if let Ok(var) = std::env::var("AZURE_CLIENT_SECRET") {
+        if !var.trim().is_empty() {
+            return Ok(CredentialSource::ClientSecret { secret: var });
+        }
+    }
+
+    Err(FilterError::from(
+        "azure_ad: must configure either 'client_secret_env_var', 'federated_token_file', or 'federated_token_env_var' (or set AZURE_FEDERATED_TOKEN_FILE or AZURE_CLIENT_SECRET in environment)",
+    ))
 }
 
 /// Validate the config fields [`AzureAdFilter::new`] relies on before it
@@ -432,10 +541,45 @@ mod tests {
 
         assert_eq!(config.tenant_id, "tid");
         assert_eq!(config.client_id, "cid");
-        assert_eq!(config.client_secret_env_var, "AZURE_CLIENT_SECRET");
+        assert_eq!(config.client_secret_env_var, Some("AZURE_CLIENT_SECRET".to_string()));
         assert_eq!(
             config.authority_host, "login.microsoftonline.com",
             "authority_host should default"
+        );
+    }
+
+    #[test]
+    fn parses_oidc_federated_token_config() {
+        let config = parse_azure_ad_config(&yaml(
+            "tenant_id: tid\n\
+             client_id: cid\n\
+             scope: https://cognitiveservices.azure.com/.default\n\
+             federated_token_file: /var/run/secrets/azure/tokens/azure-identity-token\n",
+        ))
+        .expect("OIDC federated token config should parse");
+
+        assert_eq!(config.tenant_id, "tid");
+        assert_eq!(config.client_id, "cid");
+        assert_eq!(
+            config.federated_token_file,
+            Some(std::path::PathBuf::from(
+                "/var/run/secrets/azure/tokens/azure-identity-token"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_mutually_exclusive_credential_configs() {
+        let err = AzureAdFilter::from_config(&yaml(
+            "tenant_id: tid\n\
+             client_id: cid\n\
+             scope: s\n\
+             client_secret_env_var: CARGO_PKG_NAME\n\
+             federated_token_file: /path/to/token\n",
+        ));
+        assert!(
+            err.is_err(),
+            "client_secret_env_var and federated_token_file must be mutually exclusive"
         );
     }
 
@@ -522,7 +666,9 @@ mod tests {
             tenant_id: "tid".to_owned(),
             client_id: "cid".to_owned(),
             scope: "s".to_owned(),
-            client_secret_env_var: "AZURE_TEST_UNSET_SECRET".to_owned(),
+            client_secret_env_var: Some("AZURE_TEST_UNSET_SECRET".to_owned()),
+            federated_token_file: None,
+            federated_token_env_var: None,
             authority_host: "login.microsoftonline.com@evil.com".to_owned(),
             allow_private_authority: false,
         };
@@ -561,14 +707,34 @@ mod tests {
     async fn fetch_token_parses_bearer_and_ttl() {
         let (url, server) = mock_token_endpoint(r#"{"access_token":"abc123","expires_in":3600}"#);
         let client = reqwest::Client::new();
+        let cred = super::CredentialSource::ClientSecret {
+            secret: "secret".to_owned(),
+        };
 
-        let (authorization, ttl) = fetch_token(&client, &url, "cid", "secret", "scope")
+        let (authorization, ttl) = fetch_token(&client, &url, "cid", &cred, "scope")
             .await
             .expect("mock token fetch must succeed");
 
         assert_eq!(authorization.to_str().unwrap(), "Bearer abc123");
         assert!(authorization.is_sensitive(), "bearer header must be marked sensitive");
         assert_eq!(ttl, std::time::Duration::from_secs(3600));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_token_supports_oidc_federated_assertion() {
+        let (url, server) = mock_token_endpoint(r#"{"access_token":"oidc_access_token_123","expires_in":1800}"#);
+        let client = reqwest::Client::new();
+        let cred = super::CredentialSource::FederatedToken {
+            source: super::FederatedTokenSource::EnvVar("CARGO_PKG_NAME".to_string()),
+        };
+
+        let (authorization, ttl) = fetch_token(&client, &url, "cid", &cred, "scope")
+            .await
+            .expect("federated token fetch must succeed");
+
+        assert_eq!(authorization.to_str().unwrap(), "Bearer oidc_access_token_123");
+        assert_eq!(ttl, std::time::Duration::from_secs(1800));
         server.join().unwrap();
     }
 
@@ -587,7 +753,10 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let err = fetch_token(&client, &url, "cid", "secret", "scope")
+        let cred = super::CredentialSource::ClientSecret {
+            secret: "secret".to_owned(),
+        };
+        let err = fetch_token(&client, &url, "cid", &cred, "scope")
             .await
             .expect_err("401 must produce an error");
         assert!(format!("{err}").contains("401"), "error must carry the status: {err}");

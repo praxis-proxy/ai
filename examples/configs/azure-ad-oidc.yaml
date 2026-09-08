@@ -1,0 +1,41 @@
+# Azure AD (Entra ID) Workload Identity / OIDC Federation upstream authentication
+#
+# Acquires an Entra ID bearer token via RFC 7523 client-assertion token exchange
+# using an OIDC federated JWT token (e.g. OpenShift / Kubernetes Projected Service
+# Account Token, GitHub Actions OIDC token) and injects "Authorization: Bearer <token>"
+# on every proxied request to Azure OpenAI.
+#
+# Passwordless & secretless: eliminates static client secrets.
+#
+# Token File Path:
+#   /var/run/secrets/azure/tokens/azure-identity-token (standard Azure Workload Identity mount path)
+#
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - azure-openai
+
+filter_chains:
+  - name: azure-openai
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/openai/"
+            cluster: azure-openai
+      - filter: load_balancer
+        clusters:
+          - name: azure-openai
+            endpoints:
+              - "127.0.0.1:3000"
+      - filter: azure_ad
+        tenant_id: 00000000-0000-0000-0000-000000000000
+        client_id: 11111111-1111-1111-1111-111111111111
+        scope: https://cognitiveservices.azure.com/.default
+        federated_token_file: /var/run/secrets/azure/tokens/azure-identity-token
+        # authority_host: login.microsoftonline.com  # optional, for sovereign clouds
+        # allow_private_authority: false  # opt in only for a trusted private authority
+
+insecure_options:
+  allow_private_endpoints: true
