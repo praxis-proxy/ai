@@ -2175,6 +2175,367 @@ class TestAgenticLoopVLLM:
             f"accumulated output or streamed text; got: {haystack}"
         )
 
+    def test_mcp_tool_streams_local_call_as_incremental_output_items(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #276: locally executed MCP activity is streamed incrementally.
+
+        test_mcp_tool_streams_terminal_round_as_one_logical_response asserts the
+        #756 lifecycle framing: the mcp_call the proxy executes locally ends up
+        in the terminal response.completed snapshot. That snapshot carries the
+        mcp_call with or without #276, so it does not prove the client ever saw
+        the tool activity live.
+
+        This sibling asserts the behavior #276 adds: the locally executed
+        mcp_call -- which never appears in the model backend's SSE stream -- is
+        synthesized as an incremental response.output_item.added /
+        response.output_item.done pair, exactly once (no re-emission across IRR
+        rounds), before the resumed model output, with an id and output index
+        that agree with the terminal snapshot.
+        """
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        stream = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        # Record incremental output-item events in arrival order, plus the
+        # arrival position of the first resumed model text delta so ordering can
+        # be asserted without depending on model prose.
+        added = []  # (output_index, item_type, item_id, sequence_number)
+        done = []   # (output_index, item_type, item_id, sequence_number)
+        # #276 tool-specific progress/outcome events: (type, item_id, seq).
+        mcp_progress = []
+        mcp_added_at = None
+        first_text_delta_at = None
+        final_response = None
+
+        for position, event in enumerate(stream):
+            etype = event.type
+            if etype == "response.output_item.added":
+                item = event.item.model_dump()
+                added.append(
+                    (event.output_index, item.get("type"), item.get("id"),
+                     event.sequence_number)
+                )
+                if item.get("type") == "mcp_call" and mcp_added_at is None:
+                    mcp_added_at = position
+            elif etype == "response.output_item.done":
+                item = event.item.model_dump()
+                done.append(
+                    (event.output_index, item.get("type"), item.get("id"),
+                     event.sequence_number)
+                )
+            elif etype in (
+                "response.mcp_call.in_progress",
+                "response.mcp_call.completed",
+                "response.mcp_call.failed",
+            ):
+                mcp_progress.append(
+                    (etype, event.item_id, event.sequence_number)
+                )
+            elif (
+                etype == "response.output_text.delta"
+                and first_text_delta_at is None
+            ):
+                first_text_delta_at = position
+            elif etype == "response.completed":
+                final_response = event.response
+
+        assert final_response is not None, (
+            "stream must terminate with a response.completed event"
+        )
+
+        # #276 core: the locally executed mcp_call must be streamed as exactly
+        # one incremental output_item.added. Without the synthesis it appears
+        # only in the terminal snapshot (asserted by the sibling test) and never
+        # here -- so this is the assertion that fails when #276 is absent.
+        mcp_added = [a for a in added if a[1] == "mcp_call"]
+        assert len(mcp_added) == 1, (
+            "the locally executed mcp_call should surface as exactly one "
+            f"response.output_item.added; got incremental added items: {added}"
+        )
+        mcp_index, _, mcp_id, mcp_added_seq = mcp_added[0]
+        assert mcp_id, f"synthesized mcp_call must carry an id; got: {mcp_added}"
+
+        # Exactly one matching output_item.done for the same id: proves the
+        # item is not re-emitted across IRR rounds and that the pair is closed.
+        mcp_done = [d for d in done if d[1] == "mcp_call" and d[2] == mcp_id]
+        assert len(mcp_done) == 1, (
+            "the mcp_call should be closed by exactly one output_item.done for "
+            f"id {mcp_id!r}; got incremental done items: {done}"
+        )
+        assert mcp_done[0][0] == mcp_index, (
+            "output_item.done must reuse the added item's output_index; "
+            f"added index={mcp_index}, done index={mcp_done[0][0]}"
+        )
+        assert mcp_added_seq < mcp_done[0][3], (
+            "output_item.added must carry a lower sequence_number than its "
+            f"output_item.done; added={mcp_added_seq}, done={mcp_done[0][3]}"
+        )
+
+        # #276 tool-specific events: between the generic output-item pair the
+        # synthesized mcp_call must emit in_progress then completed (the tool
+        # succeeds, so never failed). This is what turns an opaque output-item
+        # pair into MCP call/result progress the client can render live.
+        mcp_prog = [p for p in mcp_progress if p[1] == mcp_id]
+        prog_types = [p[0] for p in mcp_prog]
+        assert prog_types.count("response.mcp_call.in_progress") == 1, (
+            "the synthesized mcp_call must emit exactly one in_progress event "
+            f"for id {mcp_id!r}; got progress events: {mcp_progress}"
+        )
+        assert prog_types.count("response.mcp_call.completed") == 1, (
+            "a successful mcp_call must emit exactly one completed outcome "
+            f"event for id {mcp_id!r}; got progress events: {mcp_progress}"
+        )
+        assert "response.mcp_call.failed" not in prog_types, (
+            "a successful mcp_call must not emit a failed outcome event; "
+            f"got progress events: {mcp_progress}"
+        )
+        in_progress_seq = next(
+            p[2] for p in mcp_prog if p[0] == "response.mcp_call.in_progress"
+        )
+        completed_seq = next(
+            p[2] for p in mcp_prog if p[0] == "response.mcp_call.completed"
+        )
+        assert (
+            mcp_added_seq < in_progress_seq
+            < completed_seq
+            < mcp_done[0][3]
+        ), (
+            "mcp_call events must be ordered added -> in_progress -> completed "
+            f"-> done by sequence_number; added={mcp_added_seq}, "
+            f"in_progress={in_progress_seq}, completed={completed_seq}, "
+            f"done={mcp_done[0][3]}"
+        )
+
+        # Ordering: synthesized tool activity must precede the resumed model
+        # output. When the model streams any text, the mcp_call added event
+        # comes first.
+        if first_text_delta_at is not None:
+            assert (
+                mcp_added_at is not None
+                and mcp_added_at < first_text_delta_at
+            ), (
+                "synthesized mcp_call output_item.added must precede the "
+                f"resumed model text; mcp_added_at={mcp_added_at}, "
+                f"first_text_delta_at={first_text_delta_at}"
+            )
+
+        # Snapshot agrees with the stream: the terminal response.completed
+        # carries the same mcp_call (same id) at the same output index it was
+        # streamed at -- the incremental events and the final snapshot are one
+        # coherent view, not two divergent ones.
+        snapshot = [
+            (idx, item.type, item.id)
+            for idx, item in enumerate(final_response.output)
+        ]
+        assert any(
+            item_type == "mcp_call" and item_id == mcp_id and idx == mcp_index
+            for idx, item_type, item_id in snapshot
+        ), (
+            "the terminal snapshot must agree with the streamed mcp_call "
+            f"(id={mcp_id!r}, index={mcp_index}); got snapshot: {snapshot}"
+        )
+
+    def test_web_search_streams_local_call_as_incremental_output_items(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #276: locally executed web-search activity is streamed live.
+
+        The web-search sibling of
+        test_mcp_tool_streams_local_call_as_incremental_output_items. On a
+        Chat-Completions-backed model the proxy executes the search locally, so
+        the model backend's SSE stream never carries the web_search_call.*
+        progress events. Without #276 the search surfaces only in the terminal
+        response.completed snapshot; this asserts the behavior #276 adds: the
+        locally executed web_search_call is synthesized as an incremental
+        output_item.added -> web_search_call.in_progress -> searching ->
+        completed -> output_item.done sequence, exactly once (no re-emission
+        across IRR rounds), before the resumed model output, with an id and
+        output index that agree with the terminal snapshot.
+        """
+        stream = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "Search the web for the latest Rust release, then answer. "
+                "You MUST use the web search tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[{"type": "web_search_preview"}],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        # Record incremental output-item events in arrival order, plus the
+        # arrival position of the first resumed model text delta so ordering can
+        # be asserted without depending on model prose.
+        added = []  # (output_index, item_type, item_id, sequence_number)
+        done = []   # (output_index, item_type, item_id, sequence_number)
+        # #276 tool-specific progress/outcome events: (type, item_id, seq).
+        ws_progress = []
+        ws_added_at = None
+        first_text_delta_at = None
+        final_response = None
+
+        for position, event in enumerate(stream):
+            etype = event.type
+            if etype == "response.output_item.added":
+                item = event.item.model_dump()
+                added.append(
+                    (event.output_index, item.get("type"), item.get("id"),
+                     event.sequence_number)
+                )
+                if item.get("type") == "web_search_call" and ws_added_at is None:
+                    ws_added_at = position
+            elif etype == "response.output_item.done":
+                item = event.item.model_dump()
+                done.append(
+                    (event.output_index, item.get("type"), item.get("id"),
+                     event.sequence_number)
+                )
+            elif etype in (
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+                "response.web_search_call.completed",
+            ):
+                ws_progress.append(
+                    (etype, event.item_id, event.sequence_number)
+                )
+            elif (
+                etype == "response.output_text.delta"
+                and first_text_delta_at is None
+            ):
+                first_text_delta_at = position
+            elif etype == "response.completed":
+                final_response = event.response
+
+        assert final_response is not None, (
+            "stream must terminate with a response.completed event"
+        )
+
+        # #276 core: the locally executed web_search_call must be streamed as
+        # exactly one incremental output_item.added. Without the synthesis it
+        # appears only in the terminal snapshot and never here -- so this is the
+        # assertion that fails when #276 is absent.
+        ws_added = [a for a in added if a[1] == "web_search_call"]
+        assert len(ws_added) == 1, (
+            "the locally executed web_search_call should surface as exactly one "
+            f"response.output_item.added; got incremental added items: {added}"
+        )
+        ws_index, _, ws_id, ws_added_seq = ws_added[0]
+        assert ws_id, (
+            f"synthesized web_search_call must carry an id; got: {ws_added}"
+        )
+
+        # Exactly one matching output_item.done for the same id: proves the
+        # item is not re-emitted across IRR rounds and that the pair is closed.
+        ws_done = [d for d in done if d[1] == "web_search_call" and d[2] == ws_id]
+        assert len(ws_done) == 1, (
+            "the web_search_call should be closed by exactly one "
+            f"output_item.done for id {ws_id!r}; got incremental done: {done}"
+        )
+        assert ws_done[0][0] == ws_index, (
+            "output_item.done must reuse the added item's output_index; "
+            f"added index={ws_index}, done index={ws_done[0][0]}"
+        )
+        assert ws_added_seq < ws_done[0][3], (
+            "output_item.added must carry a lower sequence_number than its "
+            f"output_item.done; added={ws_added_seq}, done={ws_done[0][3]}"
+        )
+
+        # #276 tool-specific events: between the generic output-item pair the
+        # synthesized web_search_call must emit in_progress -> searching ->
+        # completed (the search succeeds; web search has no failed event). This
+        # is what turns an opaque output-item pair into search progress the
+        # client can render live.
+        ws_prog = [p for p in ws_progress if p[1] == ws_id]
+        prog_types = [p[0] for p in ws_prog]
+        assert prog_types.count("response.web_search_call.in_progress") == 1, (
+            "the synthesized web_search_call must emit exactly one in_progress "
+            f"event for id {ws_id!r}; got progress events: {ws_progress}"
+        )
+        assert prog_types.count("response.web_search_call.searching") == 1, (
+            "the synthesized web_search_call must emit exactly one searching "
+            f"event for id {ws_id!r}; got progress events: {ws_progress}"
+        )
+        assert prog_types.count("response.web_search_call.completed") == 1, (
+            "a successful web_search_call must emit exactly one completed "
+            f"outcome event for id {ws_id!r}; got progress events: {ws_progress}"
+        )
+        in_progress_seq = next(
+            p[2] for p in ws_prog
+            if p[0] == "response.web_search_call.in_progress"
+        )
+        searching_seq = next(
+            p[2] for p in ws_prog
+            if p[0] == "response.web_search_call.searching"
+        )
+        completed_seq = next(
+            p[2] for p in ws_prog
+            if p[0] == "response.web_search_call.completed"
+        )
+        assert (
+            ws_added_seq < in_progress_seq
+            < searching_seq
+            < completed_seq
+            < ws_done[0][3]
+        ), (
+            "web_search_call events must be ordered added -> in_progress -> "
+            f"searching -> completed -> done by sequence_number; "
+            f"added={ws_added_seq}, in_progress={in_progress_seq}, "
+            f"searching={searching_seq}, completed={completed_seq}, "
+            f"done={ws_done[0][3]}"
+        )
+
+        # Ordering: synthesized tool activity must precede the resumed model
+        # output. When the model streams any text, the web_search_call added
+        # event comes first.
+        if first_text_delta_at is not None:
+            assert (
+                ws_added_at is not None
+                and ws_added_at < first_text_delta_at
+            ), (
+                "synthesized web_search_call output_item.added must precede the "
+                f"resumed model text; ws_added_at={ws_added_at}, "
+                f"first_text_delta_at={first_text_delta_at}"
+            )
+
+        # Snapshot agrees with the stream: the terminal response.completed
+        # carries the same web_search_call (same id) at the same output index it
+        # was streamed at -- the incremental events and final snapshot are one
+        # coherent view, not two divergent ones.
+        snapshot = [
+            (idx, item.type, item.id)
+            for idx, item in enumerate(final_response.output)
+        ]
+        assert any(
+            item_type == "web_search_call" and item_id == ws_id
+            and idx == ws_index
+            for idx, item_type, item_id in snapshot
+        ), (
+            "the terminal snapshot must agree with the streamed web_search_call "
+            f"(id={ws_id!r}, index={ws_index}); got snapshot: {snapshot}"
+        )
+
     def test_client_function_exits_openai(self, agentic_client):
         """Client-side function tools exit the agentic loop without
         auto-execution, even when the IRR is active.

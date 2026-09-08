@@ -135,6 +135,10 @@ impl McpDispatchFilter {
             warn!("ResponsesState missing when handling approval");
             return Ok(FilterAction::Continue);
         };
+        // Record execution provenance so `stream_events` may synthesize this
+        // approval item's lifecycle; a bare `accumulated_output` push is not proof
+        // that this filter produced the item.
+        state.locally_executed_output_items.insert(pending.call_id.clone());
         state.accumulated_output.push(approval_event);
 
         // Re-serialize the response body with the new mcp_approval_request event
@@ -209,6 +213,12 @@ impl HttpFilter for McpDispatchFilter {
         for result in results {
             state.messages.push(result.message.clone());
             state.persisted_messages.push(result.message);
+            // Record execution provenance keyed on the item id `stream_events`
+            // reads, so only this locally executed `mcp_call` gains a synthesized
+            // lifecycle.
+            if let Some(id) = result.output_item.get("id").and_then(serde_json::Value::as_str) {
+                state.locally_executed_output_items.insert(id.to_owned());
+            }
             state.accumulated_output.push(result.output_item);
         }
 

@@ -10,7 +10,7 @@
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 
@@ -199,6 +199,80 @@ pub(crate) struct ResponsesState {
     /// trace. `openai_agentic_loop` writes model items, `mcp_dispatch`
     /// writes `mcp_call` and `mcp_approval_request` items.
     pub accumulated_output: Vec<serde_json::Value>,
+
+    /// Client-visible lifecycle progress of output items, keyed by item id.
+    ///
+    /// Tracked across IRR rounds so `stream_events` can synthesize incremental
+    /// events for locally generated tool items (MCP calls and approvals, or web
+    /// searches absent from the upstream stream): each milestone (`added`, the
+    /// progress/outcome lifecycle, the last delivered content) exactly once,
+    /// without duplicating an `output_item.added` the model already streamed,
+    /// yet still re-emitting the outcome when the same item changes locally
+    /// (e.g. a model `web_search_call` placeholder later completed under the
+    /// same id, or gaining `action.sources` after local execution).
+    pub emitted_output_items: HashMap<String, EmittedItem>,
+
+    /// Item ids of local tool calls a dispatch filter actually executed this
+    /// request (execution provenance), keyed by the output item's `id`.
+    ///
+    /// `stream_events` synthesizes the client-visible progress/outcome lifecycle
+    /// only for items recorded here, never for every tool-typed item that reaches
+    /// [`Self::accumulated_output`]. A non-dispatchable round that aborts on a
+    /// parse error still copies the model's `web_search_call` placeholder into
+    /// `accumulated_output` (via `agentic_loop::collect_streaming_output_items`),
+    /// so keying synthesis on item type alone would fabricate an
+    /// `in_progress`/`searching`/`done` lifecycle for a search that never ran.
+    /// `mcp_dispatch` records both the approval-request and result item ids;
+    /// `web_search` records the id it replaces with executed results.
+    pub locally_executed_output_items: HashSet<String>,
+}
+
+/// Which client-visible lifecycle milestones a locally generated output item has
+/// already reached the client, so `stream_events` synthesizes each exactly once
+/// yet re-emits the outcome when the item's content later changes.
+///
+/// The model backend streams at most `output_item.added`/`output_item.done` for
+/// these items and often never the tool-specific progress events
+/// (`*.in_progress`, `*.searching`, `*.completed`, `*.failed`), so tracking each
+/// milestone separately from content lets the proxy fill in the missing progress
+/// lifecycle even when local execution leaves the item's content byte-identical
+/// to the model's placeholder.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EmittedItem {
+    /// `output_item.added` reached the client (model passthrough or synthesis).
+    pub added: bool,
+    /// The finalizing `output_item.done` envelope reached the client for this item
+    /// (model passthrough that survived the premature-`done` check, or synthesis).
+    ///
+    /// Tracked separately from [`Self::added`] and the phase set: a backend may
+    /// stream every tool-specific phase in-band yet be cut off before the `done`
+    /// envelope, so a resumed round must still finalize the item with exactly one
+    /// `done`. Conversely, once the envelope has been delivered it is re-emitted
+    /// only when the item's content changes, never merely because a phase was
+    /// synthesized.
+    pub done_delivered: bool,
+    /// The individual tool-specific progress and outcome events that have reached
+    /// the client for this item (e.g. `response.web_search_call.in_progress`,
+    /// `response.mcp_call.completed`), keyed by their event type.
+    ///
+    /// Each phase is tracked independently — they are distinct API lifecycle
+    /// events, not one combined milestone. An entry is added only by observing an
+    /// actual progress event (model passthrough) or by synthesizing one; never by
+    /// `output_item.added`/`output_item.done` alone, which announce the item and
+    /// carry its content but are no proof that any progress event was delivered.
+    /// Tracking each phase separately lets the proxy fill in exactly the events a
+    /// partial in-band lifecycle (e.g. `in_progress` then `done`) still owes,
+    /// without duplicating the ones the model already streamed.
+    pub streamed_phases: BTreeSet<String>,
+    /// Fixed-size digest of the item content last delivered to the client,
+    /// compared across rounds to re-emit the `output_item.done` envelope when the
+    /// same item changes locally (e.g. gains `action.sources`).
+    ///
+    /// A digest rather than the full serialized item so retained state stays
+    /// bounded: local tool payloads already live in `accumulated_output`, and an
+    /// IRR response can reach tens of MiB across rounds, so keeping a second full
+    /// copy per item here would be payload-scale memory amplification.
+    pub content_digest: u64,
 }
 
 /// Whether the proxy can preserve the original request bytes.
@@ -247,6 +321,8 @@ impl Default for ResponsesState {
             tools: Vec::new(),
             usage: serde_json::Value::Null,
             accumulated_output: Vec::new(),
+            emitted_output_items: HashMap::new(),
+            locally_executed_output_items: HashSet::new(),
         }
     }
 }
@@ -667,6 +743,8 @@ mod tests {
         assert!(state.tools.is_empty());
         assert!(state.usage.is_null());
         assert!(state.accumulated_output.is_empty());
+        assert!(state.emitted_output_items.is_empty());
+        assert!(state.locally_executed_output_items.is_empty());
     }
 
     #[test]
