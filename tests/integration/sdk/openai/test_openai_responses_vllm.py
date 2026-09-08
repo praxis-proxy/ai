@@ -1012,13 +1012,17 @@ class TestOpenAIResponsesVLLM:
                 conversation.id,
                 order="asc",
             )
-            assert len(items.data) == 4
-            assert [item.role for item in items.data] == [
-                "user",
-                "assistant",
-                "user",
-                "assistant",
+            # Append-back also persists reasoning items, so assert on the
+            # message turns rather than the total item count.
+            message_roles = [
+                item.role for item in items.data if item.type == "message"
             ]
+            assert message_roles == [
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+            ], message_roles
         finally:
             openai_client.conversations.delete(conversation.id)
 
