@@ -1259,7 +1259,10 @@ class TestOpenAIResponsesVLLM:
                 },
             },
             store=False,
-            max_output_tokens=128,
+            # The native Responses path emits a separate reasoning item whose
+            # tokens count against the budget, so allow enough headroom for the
+            # constrained JSON to complete on the small CI model.
+            max_output_tokens=512,
         )
 
         assert response.status == "completed"
