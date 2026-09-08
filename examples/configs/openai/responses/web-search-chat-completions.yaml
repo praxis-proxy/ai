@@ -59,6 +59,12 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 11
+        # Terminal streaming rounds resume real inference after the web-search
+        # dispatch, so allow generous per-request and per-step deadlines for
+        # slower backends (mirrors full-flow-agentic.yaml). The default step
+        # deadline is too tight for a full translated streaming generation.
+        timeout_ms: 120000
+        step_timeout_ms: 60000
         max_stream_response_bytes: 67108864
         steps:
           - name: inference
