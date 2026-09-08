@@ -6,10 +6,10 @@ filter — never against native Responses passthrough.
 
 ## What runs
 
-A Praxis listener loads
-`examples/configs/openai/responses/responses-to-chat-completions-conformance.yaml`,
-which translates `POST /v1/responses` into `POST /v1/chat/completions` and
-forwards to a Chat-Completions-only backend (vLLM CPU, `Qwen/Qwen3-0.6B`).
+A Praxis listener loads the shared
+`examples/configs/openai/responses/responses-to-chat-completions.yaml`
+example, which translates `POST /v1/responses` into `POST /v1/chat/completions`
+and forwards to a Chat-Completions-only backend (vLLM CPU, `Qwen/Qwen3-0.6B`).
 A translation-witness shim sits between Praxis and vLLM and asserts the
 backend only ever receives `POST /v1/chat/completions` (criterion f).
 

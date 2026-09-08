@@ -6,7 +6,7 @@ on:
     paths:
       - "apis/src/openai/translation/**"
       - "apis/src/openai/responses/**"
-      - "examples/configs/openai/responses/responses-to-chat-completions-conformance.yaml"
+      - "examples/configs/openai/responses/responses-to-chat-completions.yaml"
       - "tests/conformance/openresponses/**"
       - "tests/integration/sdk/openai/test_responses_conformance.py"
       - ".github/actions/start-vllm/**"
@@ -20,7 +20,7 @@ on:
     paths:
       - "apis/src/openai/translation/**"
       - "apis/src/openai/responses/**"
-      - "examples/configs/openai/responses/responses-to-chat-completions-conformance.yaml"
+      - "examples/configs/openai/responses/responses-to-chat-completions.yaml"
       - "tests/conformance/openresponses/**"
       - "tests/integration/sdk/openai/test_responses_conformance.py"
       - ".github/actions/start-vllm/**"
@@ -63,7 +63,7 @@ jobs:
                                          "${{ github.event.merge_group.head_sha }}" -- \
             'apis/src/openai/translation/' \
             'apis/src/openai/responses/' \
-            'examples/configs/openai/responses/responses-to-chat-completions-conformance.yaml' \
+            'examples/configs/openai/responses/responses-to-chat-completions.yaml' \
             'tests/conformance/openresponses/' \
             'tests/integration/sdk/openai/test_responses_conformance.py' \
             '.github/actions/start-vllm/' \

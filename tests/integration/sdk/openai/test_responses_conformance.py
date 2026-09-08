@@ -28,7 +28,7 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-CONFIG_PATH = REPO_ROOT / "examples/configs/openai/responses/responses-to-chat-completions-conformance.yaml"
+CONFIG_PATH = REPO_ROOT / "examples/configs/openai/responses/responses-to-chat-completions.yaml"
 MANIFEST_PATH = REPO_ROOT / "tests/conformance/openresponses/manifest.yaml"
 OVERLAY_PATH = REPO_ROOT / "tests/conformance/openresponses/package.json"
 
@@ -135,10 +135,15 @@ def _start_witness() -> tuple[ThreadingHTTPServer, int, list[tuple[str, str]]]:
     return server, port, _WitnessHandler.seen_paths
 
 
-def _patched_config(listener_port: int, backend_port: int) -> str:
+def _patched_config(listener_port: int, backend_port: int, db_path: Path) -> str:
     text = CONFIG_PATH.read_text()
     text = text.replace("127.0.0.1:8080", f"127.0.0.1:{listener_port}")
     text = text.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    # The shared example persists via a store filter; isolate its SQLite file in
+    # the test's tmp dir so the run leaves nothing behind and never contends on a
+    # repo-root responses.db. The conformance suite is stateless, so the store is
+    # a no-op for correctness — this only redirects where it writes.
+    text = text.replace("sqlite://responses.db?mode=rwc", f"sqlite://{db_path}?mode=rwc")
     return text
 
 
@@ -161,7 +166,7 @@ def praxis_proxy(tmp_path):
     witness, witness_port, seen = _start_witness()
     listener_port = _free_port()
     config_file = tmp_path / "conformance.yaml"
-    config_file.write_text(_patched_config(listener_port, witness_port))
+    config_file.write_text(_patched_config(listener_port, witness_port, tmp_path / "responses.db"))
     log_path = tmp_path / "praxis.log"
     with open(log_path, "w") as log_file:
         proc = subprocess.Popen([_find_binary(), "-c", str(config_file)], stdout=log_file, stderr=subprocess.STDOUT)

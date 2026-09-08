@@ -1,27 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Functional tests for the OpenResponses translation conformance example.
+//! Functional tests for the Responses-to-Chat-Completions translation example.
 //!
 //! These run against a mock Chat Completions backend and always execute
 //! (no vLLM required). They pin the invariants the external OpenResponses
 //! suite depends on: the translator forwards to Chat Completions (never
 //! native Responses passthrough), rejects a non-string `service_tier`, and
-//! echoes function tools with the response-side schema.
+//! echoes function tools with the response-side schema. The example carries a
+//! store filter, so each test gets its own `TempSqlite` for isolation.
 
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    StatefulCapturingBackend, example_config_path, free_port, http_send, json_post, parse_body, parse_status,
-    patch_yaml, start_capturing_backend, start_proxy,
+    StatefulCapturingBackend, TempSqlite, example_config_path, free_port, http_send, json_post, parse_body,
+    parse_status, patch_yaml, start_capturing_backend, start_proxy,
 };
 
-const EXAMPLE: &str = "openai/responses/responses-to-chat-completions-conformance.yaml";
+const EXAMPLE: &str = "openai/responses/responses-to-chat-completions.yaml";
 
-fn load_test_config(listener_port: u16, port_map: &HashMap<&str, u16>) -> praxis_core::config::Config {
+fn load_test_config(
+    test_name: &str,
+    listener_port: u16,
+    port_map: &HashMap<&str, u16>,
+) -> (praxis_core::config::Config, TempSqlite) {
+    let db = TempSqlite::new(test_name);
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
-    let patched = patch_yaml(&yaml, listener_port, port_map);
-    praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse")
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        listener_port,
+        port_map,
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    (config, db)
 }
 
 #[test]
@@ -33,7 +44,11 @@ fn conformance_config_routes_to_chat_completions_never_responses() {
     });
     let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_test_config(proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let (config, _db) = load_test_config(
+        "conformance_routes_to_chat_completions",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
     let proxy = start_proxy(&config);
     let request = r#"{"model":"Qwen/Qwen3-0.6B","input":"Hello","stream":false,"store":false}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
@@ -55,7 +70,11 @@ fn conformance_config_normalizes_null_service_tier_to_default() {
     });
     let backend = start_capturing_backend(&chat_response.to_string());
     let proxy_port = free_port();
-    let config = load_test_config(proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let (config, _db) = load_test_config(
+        "conformance_normalizes_null_service_tier",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
     let proxy = start_proxy(&config);
     let request = r#"{"model":"Qwen/Qwen3-0.6B","input":"Hello","stream":false,"store":false}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", request));
@@ -73,7 +92,11 @@ fn conformance_config_echoes_normalized_function_tool() {
     });
     let backend = start_capturing_backend(&chat_response.to_string());
     let proxy_port = free_port();
-    let config = load_test_config(proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let (config, _db) = load_test_config(
+        "conformance_echoes_normalized_function_tool",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
     let proxy = start_proxy(&config);
     let request = serde_json::json!({
         "model": "Qwen/Qwen3-0.6B", "input": "What's the weather in San Francisco?", "stream": false, "store": false,
