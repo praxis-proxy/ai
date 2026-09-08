@@ -2574,6 +2574,50 @@ mod tests {
         assert_eq!(mapped["service_tier"], "default");
     }
 
+    #[test]
+    fn null_service_tier_in_response_falls_back_to_default() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "Hi"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "gpt-4.1-mini",
+            "service_tier": Value::Null,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        assert_eq!(mapped["service_tier"], "default");
+    }
+
+    #[test]
+    fn null_service_tier_in_response_falls_back_to_request_context() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "Hi", "service_tier": "flex"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "gpt-4.1-mini",
+            "service_tier": Value::Null,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        assert_eq!(mapped["service_tier"], "flex");
+    }
+
+    #[test]
+    fn null_service_tier_in_request_context_falls_back_to_default() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "Hi", "service_tier": Value::Null});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        assert_eq!(mapped["service_tier"], "default");
+    }
+
     // -------------------------------------------------------------------------
     // Response translation: tool call output items
     // -------------------------------------------------------------------------

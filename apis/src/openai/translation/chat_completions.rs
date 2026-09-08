@@ -1329,6 +1329,7 @@ fn is_supported_function_call(tool_call: &Value) -> bool {
 pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Value {
     let service_tier = context
         .service_tier
+        .filter(|value| value.is_string())
         .cloned()
         .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()));
     let parts = ResponseResourceParts {
@@ -1527,8 +1528,9 @@ fn text_value(context: &ResponseContext<'_>) -> Value {
 /// Build provider service tier, falling back to the request context when absent.
 fn service_tier_value_with_context(obj: &Map<String, Value>, context: &ResponseContext<'_>) -> Value {
     obj.get("service_tier")
+        .filter(|value| value.is_string())
+        .or_else(|| context.service_tier.filter(|value| value.is_string()))
         .cloned()
-        .or_else(|| context.service_tier.cloned())
         .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()))
 }
 
