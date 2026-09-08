@@ -1426,7 +1426,7 @@ async fn rehydrates_from_conversation_object_form() {
 }
 
 #[tokio::test]
-async fn previous_response_id_takes_precedence_over_conversation() {
+async fn rejects_previous_response_id_with_conversation() {
     let response_messages = json!([
         {"role": "user", "content": "from response"},
         {"role": "assistant", "content": "response reply"}
@@ -1457,24 +1457,55 @@ async fn previous_response_id_takes_precedence_over_conversation() {
     ));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "conflicting selectors should reject with 400");
+            let body_bytes = rejection.body.unwrap();
+            let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(
+                body["error"]["code"], "invalid_request_error",
+                "rejection should use the established Responses error format"
+            );
+            assert_eq!(
+                body["error"]["type"], "invalid_request_error",
+                "rejection should use the OpenAI invalid request type"
+            );
+            assert_eq!(
+                body["error"]["message"],
+                "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+                "rejection should match the OpenAI message"
+            );
+        },
+        other => panic!("expected Reject, got {other:?}"),
+    }
     assert!(
-        matches!(action, FilterAction::Release),
-        "should release after rehydration"
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "conflicting selectors must not be rehydrated"
     );
+}
 
-    let state = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .expect("ResponsesState should be populated");
+#[tokio::test]
+async fn streaming_selector_conflict_uses_json_validation_error() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"next","previous_response_id":"resp_win","conversation":"conv_lose","stream":true}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject");
+    };
+    assert_eq!(rejection.status, 400);
     assert_eq!(
-        state.messages[0]["content"], "from response",
-        "previous_response_id should take precedence over conversation"
+        rejection.headers.iter().find(|(name, _)| name == "content-type"),
+        Some(&("content-type".to_owned(), "application/json".to_owned()))
     );
-    assert_eq!(
-        ctx.get_metadata("responses.previous_response_id"),
-        Some("resp_win"),
-        "previous_response_id metadata should be set"
-    );
+    let body: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request_error");
 }
 
 #[tokio::test]

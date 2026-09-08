@@ -101,8 +101,7 @@ impl RehydrateFilter {
     /// `conversation`), and populate [`ResponsesState`] with the full
     /// conversation history.
     ///
-    /// `previous_response_id` takes precedence when both fields are
-    /// present.
+    /// Requests that provide both selectors are rejected.
     async fn rehydrate(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -465,6 +464,10 @@ fn parse_body_and_extract_id(bytes: &[u8], streaming: bool) -> Result<(Value, Op
         Some(_) => return Err(reject_invalid("previous_response_id must be a string", streaming)),
     };
 
+    if id.is_some() && parsed.get("conversation").is_some_and(|value| !value.is_null()) {
+        return Err(reject_mutually_exclusive_selectors());
+    }
+
     Ok((parsed, id))
 }
 
@@ -613,6 +616,16 @@ fn reject_invalid(message: &str, streaming: bool) -> FilterAction {
         "invalid_request_error",
         message,
         streaming,
+    ))
+}
+
+/// Reject requests that select both mutually exclusive history sources.
+fn reject_mutually_exclusive_selectors() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        400,
+        "invalid_request_error",
+        "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        false,
     ))
 }
 
