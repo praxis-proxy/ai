@@ -52,7 +52,7 @@ before sending requests.
 
 | File | Description |
 | ------ | ------------- |
-| [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | Runs a non-streaming native Messages model -> You.com search -> model loop through Praxis core's iterative_request_router |
+| [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | A single Anthropic Messages gateway that runs the server-owned web-search loop through Praxis core's iterative_request_router (IRR) and serves BOTH streaming and buffered clients from one pipeline. `anthropic_web_search` selects the transport per request from the client's `stream` flag (`terminal_streaming: true`) |
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
