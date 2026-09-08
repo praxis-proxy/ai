@@ -45,6 +45,12 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_web_search`](openai_web_search.md) | Web search filter for model-driven `web_search_call` dispatch. |
 | [`responses_to_chat_completions`](responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
 
+### Vertex
+
+| Filter | Description |
+|--------|-------------|
+| [`openai_chat_completions_to_vertexai_gemini`](openai_chat_completions_to_vertexai_gemini.md) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini `generateContent` format and translates responses back. |
+
 ## Cross-Provider Filters (praxis-ai-filters)
 
 ### Agentic

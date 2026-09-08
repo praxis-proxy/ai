@@ -42,6 +42,8 @@ const SKIP: &[&str] = &[
     "openai/responses/web-search-chat-completions-fixture.yaml",
     "prompt-enrichment.yaml",
     "token-usage-headers.yaml",
+    // TODO(#114): add fixture-backed integration test for Vertex Gemini translation.
+    "vertex/chat-completions-to-gemini.yaml",
 ];
 
 // -----------------------------------------------------------------------------

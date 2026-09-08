@@ -1,0 +1,50 @@
+# Chat Completions to Vertex AI Gemini
+#
+# Transforms OpenAI Chat Completions requests into Vertex AI Gemini
+# generateContent format and translates responses back.
+#
+# Request: messages flattened to Gemini contents, system messages
+# hoisted to systemInstruction, tools mapped to function
+# declarations, generationConfig built from OpenAI parameters.
+#
+# Response: candidates mapped to choices, usageMetadata to usage,
+# finishReason normalized. Streaming SSE frames are translated
+# inline from Gemini streamGenerateContent to Chat Completions
+# chunk format.
+#
+# The filter rewrites the upstream path to the Vertex AI
+# generateContent (or streamGenerateContent) endpoint using the
+# model name from the request body and the configured project and
+# region.
+#
+# Production deployments should pair this filter with `gcp_adc`
+# (requires --features gcp-adc-filter) for automatic OAuth2 token
+# injection and TLS to the regional Vertex AI endpoint
+# (e.g. us-central1-aiplatform.googleapis.com:443).
+
+listeners:
+  - name: vertex-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [vertex-gemini]
+
+filter_chains:
+  - name: vertex-gemini
+    filters:
+      - filter: openai_chat_completions_to_vertexai_gemini
+        project: my-gcp-project
+        region: us-central1
+        # max_body_bytes: 1048576  # default: 1 MiB
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: vertex-backend
+
+      - filter: load_balancer
+        clusters:
+          - name: vertex-backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend
