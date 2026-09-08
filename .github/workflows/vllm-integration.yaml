@@ -99,7 +99,7 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -140,6 +140,10 @@ jobs:
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
+
+      - name: Run Conversations SDK integration tests
+        run: |
+          uv run tests/integration/sdk/openai/test_openai_conversations.py -s
 
       - name: Wait for vLLM readiness
         run: |
@@ -196,7 +200,7 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     permissions:
       contents: read
     services:

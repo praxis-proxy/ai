@@ -649,7 +649,25 @@ fn normalize_message_content(role: &str, content: Value) -> Result<Value, String
             };
             Ok(Value::Array(vec![content_item]))
         },
-        Value::Array(_) => Ok(content),
+        Value::Array(mut parts) => {
+            if role == "assistant" {
+                for part in &mut parts {
+                    let Some(part) = part.as_object_mut() else {
+                        continue;
+                    };
+                    if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                        continue;
+                    }
+                    if part.get("annotations").is_none_or(Value::is_null) {
+                        part.insert("annotations".to_owned(), Value::Array(Vec::new()));
+                    }
+                    if part.get("logprobs").is_none_or(Value::is_null) {
+                        part.insert("logprobs".to_owned(), Value::Array(Vec::new()));
+                    }
+                }
+            }
+            Ok(Value::Array(parts))
+        },
         _ => Err("message content must be a string or array".to_owned()),
     }
 }
@@ -1070,6 +1088,23 @@ mod tests {
 
     use super::*;
     use crate::store::SqliteResponseStore;
+
+    #[test]
+    fn assistant_output_text_normalizes_nullable_provider_fields() {
+        let normalized = normalize_message_content(
+            "assistant",
+            serde_json::json!([{
+                "type": "output_text",
+                "text": "hello",
+                "annotations": [],
+                "logprobs": null
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(normalized[0]["annotations"], serde_json::json!([]));
+        assert_eq!(normalized[0]["logprobs"], serde_json::json!([]));
+    }
 
     // -------------------------------------------------------------------------
     // store_error_response
