@@ -462,7 +462,7 @@ impl HttpFilter for FileSearchCalloutFilter {
     /// `StreamBuffer` build validation. The non-streaming requests this filter
     /// actually serves select a bounded `StreamBuffer` dynamically in
     /// [`Self::on_request`]; streaming requests are rejected outright by
-    /// [`unsupported_streaming_rejection`], so they never reach the buffering
+    /// `unsupported_streaming_rejection`, so they never reach the buffering
     /// path.
     fn response_body_mode(&self) -> BodyMode {
         BodyMode::Stream
