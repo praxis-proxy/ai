@@ -1291,10 +1291,17 @@ class TestOpenAIResponsesVLLM:
                 },
             },
             store=False,
-            # The native Responses path emits a separate reasoning item whose
-            # tokens count against the budget, so allow enough headroom for the
-            # constrained JSON to complete on the small CI model.
-            max_output_tokens=512,
+            # The native Responses passthrough debits the separate reasoning
+            # item's tokens against this shared budget. With temperature=0 the
+            # reasoning length is deterministic, but greedy decoding on the small
+            # CI model produces a preamble that overruns 512 tokens before the
+            # constrained JSON completes (status=="incomplete"). The identical
+            # request on the Chat Completions translation path
+            # (test_structured_output_round_trip) completes in <128 tokens, which
+            # confirms the answer itself is tiny and the budget must simply cover
+            # the reasoning preamble. Give generous headroom (well under the
+            # 4096-token model context) so completion is deterministic.
+            max_output_tokens=2048,
         )
 
         assert response.status == "completed"
