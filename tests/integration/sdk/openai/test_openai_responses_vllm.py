@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "httpx>=0.27",
-#     "openai>=2.0",
-#     "pytest>=8.0",
+#     "httpx>=0.27,<1",
+#     "openai>=2.0,<3",
+#     "pytest>=8.0,<9",
 # ]
 # ///
 """
