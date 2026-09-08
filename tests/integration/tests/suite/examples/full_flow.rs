@@ -8,7 +8,7 @@ use std::{collections::HashMap, time::Duration};
 use futures::{SinkExt as _, StreamExt as _};
 use praxis_test_utils::{
     Backend, CapturedWsMessage, TempSqlite, WsBackendEvent, WsServerAction, example_config_path, free_port, http_send,
-    json_post, load_example_config, parse_body, parse_status, patch_yaml, start_backend_with_shutdown,
+    json_post, load_example_config, parse_body, parse_header, parse_status, patch_yaml, start_backend_with_shutdown,
     start_echo_backend, start_proxy, start_scripted_websocket_backend,
 };
 use tokio_tungstenite::{
@@ -29,6 +29,12 @@ use super::openai_file_resolve::start_files_api_stub;
 
 /// Backend response for the first turn — stored by response_store.
 const FIRST_RESPONSE_JSON: &str = r#"{"id":"resp_first","created_at":1000,"model":"gpt-4.1","object":"response","status":"completed","input":"Hello","output":[{"type":"message","content":[{"type":"output_text","text":"Hi there"}]}]}"#;
+
+/// Backend response for the second turn. The proxy replays prior turns via the
+/// rebuilt `input` array and strips `previous_response_id` from the upstream
+/// request, so a real provider never sees the caller's ID and echoes
+/// `previous_response_id: null` — exactly as modeled here.
+const SECOND_RESPONSE_JSON: &str = r#"{"id":"resp_second","created_at":2000,"model":"gpt-4.1","object":"response","status":"completed","previous_response_id":null,"output":[{"type":"message","content":[{"type":"output_text","text":"Sure"}]}]}"#;
 
 /// Maximum time allowed for a test client to complete a WebSocket handshake.
 const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -281,6 +287,248 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     assert!(
         echoed.get("previous_response_id").is_none(),
         "previous_response_id should be stripped from outbound body"
+    );
+
+    drop(proxy2);
+}
+
+/// The proxy strips `previous_response_id` from the upstream request when
+/// history was rehydrated, so the backend echoes `previous_response_id: null`.
+/// The Responses API contract requires the caller's `previous_response_id` to
+/// be echoed back, so the rehydrate filter must restore it into the
+/// client-facing response (regression test for issue #932).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_flow_previous_response_id_restored_in_client_response() {
+    let backend_guard = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let db = TempSqlite::new("full_flow_prev_restore");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+        .expect("example config should exist");
+    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "first request should succeed");
+
+    drop(backend_guard);
+
+    // Second turn: a fixed backend that echoes `previous_response_id: null`,
+    // modeling a real provider that never saw the stripped ID.
+    let backend_guard2 = Backend::fixed(SECOND_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let patched2 = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend_guard2.port())]),
+    );
+    let config2 = praxis_core::config::Config::from_yaml(&patched2).expect("second patched config should parse");
+    drop(proxy);
+
+    let proxy2 = start_proxy(&config2);
+
+    let raw2 = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_first"}"#,
+        ),
+    );
+    let status2 = parse_status(&raw2);
+    let body2 = parse_body(&raw2);
+    assert_eq!(
+        status2, 200,
+        "second request with previous_response_id should succeed, body: {body2}"
+    );
+
+    let response: serde_json::Value = serde_json::from_str(&body2).expect("client response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_second",
+        "client should receive the backend's response resource"
+    );
+    assert_eq!(
+        response["previous_response_id"], "resp_first",
+        "client-supplied previous_response_id must be restored into the response (issue #932)"
+    );
+
+    drop(proxy2);
+}
+
+/// Opaque body standing in for a compressed payload: labeled `Content-Encoding`
+/// but not valid JSON, so a naive restore attempt cannot parse it. The test
+/// harness sends a UTF-8 string, so a real gzip byte stream cannot be modeled
+/// directly; what matters for the regression is that the body is advertised as
+/// encoded and is unparseable as JSON.
+const ENCODED_RESPONSE_BODY: &str = "not-valid-json-opaque-compressed-payload";
+
+/// A rehydrated turn whose backend returns a content-encoded body must pass
+/// through byte-for-byte with its `Content-Encoding` intact. The rehydrate
+/// filter cannot parse a compressed body to restore `previous_response_id`, so
+/// it must decline the response entirely rather than strip the encoding header
+/// and ship still-compressed bytes mislabeled as identity JSON (regression test
+/// for the issue #932 encoded-response corruption).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_flow_encoded_response_passes_through_untouched() {
+    // Turn 1: store a first response so turn 2 rehydrates history.
+    let backend_guard = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let db = TempSqlite::new("full_flow_encoded_passthrough");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+        .expect("example config should exist");
+    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "first request should succeed");
+
+    drop(backend_guard);
+
+    // Turn 2: the backend advertises `Content-Encoding: gzip` over an opaque
+    // body, modeling a provider that honored the client's `Accept-Encoding`.
+    let backend_guard2 = Backend::fixed(ENCODED_RESPONSE_BODY)
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .start_with_shutdown();
+    let patched2 = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend_guard2.port())]),
+    );
+    let config2 = praxis_core::config::Config::from_yaml(&patched2).expect("second patched config should parse");
+    drop(proxy);
+
+    let proxy2 = start_proxy(&config2);
+
+    let raw2 = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_first"}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw2),
+        200,
+        "encoded second turn should still succeed, raw: {raw2}"
+    );
+    assert_eq!(
+        parse_header(&raw2, "content-encoding").as_deref(),
+        Some("gzip"),
+        "Content-Encoding must be preserved: the filter must not strip the label while leaving the body encoded"
+    );
+    assert_eq!(
+        parse_body(&raw2),
+        ENCODED_RESPONSE_BODY,
+        "an encoded body must pass through byte-for-byte with no rewrite attempt"
+    );
+
+    drop(proxy2);
+}
+
+/// A rehydrated turn whose backend response carries a body validator (`ETag`,
+/// digest, `Last-Modified`, ...) must pass through unrewritten: those headers
+/// describe the exact upstream bytes and cannot survive a re-serialization, but
+/// the proxy commits response headers before it sees the body, so it declines the
+/// response at eligibility instead of stripping validators and shipping a body
+/// they no longer match. The result is a byte-identical passthrough with the
+/// validators intact — the cosmetic `previous_response_id` echo is forgone rather
+/// than trading it for a mismatched validator (regression test for the issue #932
+/// stale-validator finding and its follow-up: never drop a validator from an
+/// unrewritten body).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_flow_response_with_validators_passes_through_unrewritten() {
+    // Turn 1: store a first response so turn 2 rehydrates history.
+    let backend_guard = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let db = TempSqlite::new("full_flow_validators_passthrough");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+        .expect("example config should exist");
+    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "first request should succeed");
+
+    drop(backend_guard);
+
+    // Turn 2: the backend echoes `previous_response_id: null` and carries an
+    // `ETag` validator plus an unrelated `Cache-Control` policy header. The ETag
+    // makes the response ineligible, so it is passed through untouched.
+    let backend_guard2 = Backend::fixed(SECOND_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .header("etag", "\"upstream-v1\"")
+        .header("cache-control", "no-store")
+        .start_with_shutdown();
+    let patched2 = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend_guard2.port())]),
+    );
+    let config2 = praxis_core::config::Config::from_yaml(&patched2).expect("second patched config should parse");
+    drop(proxy);
+
+    let proxy2 = start_proxy(&config2);
+
+    let raw2 = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_first"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw2), 200, "second request should succeed, raw: {raw2}");
+
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw2)).expect("client response should be JSON");
+    assert_eq!(
+        response["previous_response_id"],
+        serde_json::Value::Null,
+        "a validator-bearing response is declined, so the backend's null id passes through unrewritten"
+    );
+    assert_eq!(
+        parse_header(&raw2, "etag").as_deref(),
+        Some("\"upstream-v1\""),
+        "the upstream ETag must be preserved: the validator-bearing response is passed through untouched"
+    );
+    assert_eq!(
+        parse_header(&raw2, "cache-control").as_deref(),
+        Some("no-store"),
+        "unrelated caching-policy headers must be preserved"
     );
 
     drop(proxy2);

@@ -15,6 +15,7 @@ mod aws_sigv4;
 mod azure_ad;
 mod compact;
 mod credential_injection;
+mod external_metering;
 mod file_search_callout;
 mod file_search_chat_completions;
 mod full_flow;

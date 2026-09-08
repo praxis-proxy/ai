@@ -553,6 +553,53 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert "VIOLET-7319" in second.output_text
 
+    def test_rehydrated_response_echoes_previous_response_id(self, openai_client):
+        """Issue #932: the rehydrated response must echo the caller's
+        previous_response_id back to the client.
+
+        On the rehydrated path the proxy replays prior turns via the `input`
+        array and strips previous_response_id from the upstream request, so the
+        vLLM backend never sees it and echoes previous_response_id: null. The
+        rehydrate filter restores the caller's id into the response body so the
+        client always sees the id it sent, per the Responses API contract.
+
+        This assertion is metadata-only and independent of model output, so it
+        is deterministic despite running against a real vLLM backend.
+
+        Manifest linkage: this is the live vLLM regression counterpart of the
+        committed synthetic inference fixture -- coverage feature
+        ``responses.native.continuation``, scenario
+        ``responses/native-continuation`` (see
+        tests/integration/fixtures/inference/). No live recording is committed
+        for that feature -- it stays ``synthetic_only`` because a live recording
+        requires explicit authorization -- so this SDK test provides the
+        real-backend confidence instead.
+        """
+        first = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: ECHO-BASE /no_think",
+            store=True,
+            max_output_tokens=128,
+        )
+
+        assert first.status == "completed"
+        assert first.id
+
+        second = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: ECHO-NEXT /no_think",
+            previous_response_id=first.id,
+            store=True,
+            max_output_tokens=128,
+        )
+
+        assert second.status == "completed"
+        assert second.previous_response_id == first.id, (
+            "the proxy must echo the caller's previous_response_id back to the "
+            "client even though it strips the id from the rehydrated upstream "
+            f"request; got: {second.previous_response_id!r}"
+        )
+
     def test_doc_extract_inline_file_to(self, openai_client):
         """Issue #397: inline file_data is extracted to input_text and
         consumed by vLLM inference.

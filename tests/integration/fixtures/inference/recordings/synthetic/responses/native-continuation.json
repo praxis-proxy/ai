@@ -1,22 +1,20 @@
 {
   "version": 1,
-  "scenario_id": "responses/chat-basic-nonstream",
+  "scenario_id": "responses/native-continuation",
   "protocol": "openai_responses",
   "provenance": {
     "kind": "synthetic",
     "provider": "synthetic",
-    "model": "synthetic-chat-model",
-    "source_id": "controlled-responses-chat-continuation"
+    "model": "synthetic-native-model",
+    "source_id": "controlled-responses-native-continuation"
   },
   "normalization": {
     "version": 1,
     "linked_ids": {
-      "chatcmpl-controlled": "chatcmpl-recorded-0003",
-      "chatcmpl-controlled-continuation": "chatcmpl-recorded-0006",
-      "msg_resp_58e042562f6abc2ae2e9000000000000": "msg_recorded_0002",
-      "msg_resp_58e042563be4bc2ae2e9000000000002": "msg_recorded_0005",
-      "resp_58e042562f6abc2ae2e9000000000000": "resp_recorded_0001",
-      "resp_58e042563be4bc2ae2e9000000000002": "resp_recorded_0004"
+      "msg_native_controlled_initial": "msg_recorded_0002",
+      "msg_native_controlled_continuation": "msg_recorded_0004",
+      "resp_native_controlled_initial": "resp_recorded_0001",
+      "resp_native_controlled_continuation": "resp_recorded_0003"
     }
   },
   "turns": [
@@ -35,7 +33,7 @@
             "kind": "json",
             "value": {
               "input": "What is 2+2? Reply with just the number.",
-              "model": "synthetic-chat-model",
+              "model": "synthetic-native-model",
               "store": true,
               "stream": false
             }
@@ -55,15 +53,13 @@
               "completed_at": 0,
               "created_at": 0,
               "error": null,
-              "frequency_penalty": 0.0,
               "id": "resp_recorded_0001",
               "incomplete_details": null,
               "input": "What is 2+2? Reply with just the number.",
               "instructions": null,
               "max_output_tokens": null,
-              "max_tool_calls": null,
               "metadata": {},
-              "model": "synthetic-chat-model",
+              "model": "synthetic-native-model",
               "object": "response",
               "output": [
                 {
@@ -82,12 +78,8 @@
                 }
               ],
               "parallel_tool_calls": true,
-              "presence_penalty": 0.0,
               "previous_response_id": null,
-              "prompt_cache_key": null,
               "reasoning": null,
-              "safety_identifier": null,
-              "service_tier": "default",
               "status": "completed",
               "store": true,
               "temperature": 1.0,
@@ -98,7 +90,6 @@
               },
               "tool_choice": "auto",
               "tools": [],
-              "top_logprobs": 0,
               "top_p": 1.0,
               "truncation": "disabled",
               "usage": {
@@ -119,7 +110,7 @@
       "upstream": {
         "request": {
           "method": "POST",
-          "path": "/v1/chat/completions",
+          "path": "/v1/responses",
           "headers": {
             "content-type": [
               "application/json"
@@ -128,13 +119,9 @@
           "body": {
             "kind": "json",
             "value": {
-              "messages": [
-                {
-                  "content": "What is 2+2? Reply with just the number.",
-                  "role": "user"
-                }
-              ],
-              "model": "synthetic-chat-model",
+              "input": "What is 2+2? Reply with just the number.",
+              "model": "synthetic-native-model",
+              "store": true,
               "stream": false
             }
           }
@@ -149,23 +136,58 @@
           "body": {
             "kind": "json",
             "value": {
-              "choices": [
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "What is 2+2? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "metadata": {},
+              "model": "synthetic-native-model",
+              "object": "response",
+              "output": [
                 {
-                  "finish_reason": "stop",
-                  "index": 0,
-                  "message": {
-                    "content": "4",
-                    "role": "assistant"
-                  }
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
                 }
               ],
-              "created": 0,
-              "id": "chatcmpl-recorded-0003",
-              "model": "synthetic-chat-model",
-              "object": "chat.completion",
+              "parallel_tool_calls": true,
+              "previous_response_id": null,
+              "reasoning": null,
+              "status": "completed",
+              "store": true,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_p": 1.0,
+              "truncation": "disabled",
               "usage": {
-                "completion_tokens": 1,
-                "prompt_tokens": 12,
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
                 "total_tokens": 13
               }
             }
@@ -188,7 +210,7 @@
             "kind": "json",
             "value": {
               "input": "What was the previous answer? Reply with just the number.",
-              "model": "synthetic-chat-model",
+              "model": "synthetic-native-model",
               "previous_response_id": "resp_recorded_0001",
               "store": false,
               "stream": false
@@ -209,15 +231,13 @@
               "completed_at": 0,
               "created_at": 0,
               "error": null,
-              "frequency_penalty": 0.0,
-              "id": "resp_recorded_0004",
+              "id": "resp_recorded_0003",
               "incomplete_details": null,
               "input": "What was the previous answer? Reply with just the number.",
               "instructions": null,
               "max_output_tokens": null,
-              "max_tool_calls": null,
               "metadata": {},
-              "model": "synthetic-chat-model",
+              "model": "synthetic-native-model",
               "object": "response",
               "output": [
                 {
@@ -229,19 +249,15 @@
                       "type": "output_text"
                     }
                   ],
-                  "id": "msg_recorded_0005",
+                  "id": "msg_recorded_0004",
                   "role": "assistant",
                   "status": "completed",
                   "type": "message"
                 }
               ],
               "parallel_tool_calls": true,
-              "presence_penalty": 0.0,
               "previous_response_id": "resp_recorded_0001",
-              "prompt_cache_key": null,
               "reasoning": null,
-              "safety_identifier": null,
-              "service_tier": "default",
               "status": "completed",
               "store": false,
               "temperature": 1.0,
@@ -252,7 +268,6 @@
               },
               "tool_choice": "auto",
               "tools": [],
-              "top_logprobs": 0,
               "top_p": 1.0,
               "truncation": "disabled",
               "usage": {
@@ -273,7 +288,7 @@
       "upstream": {
         "request": {
           "method": "POST",
-          "path": "/v1/chat/completions",
+          "path": "/v1/responses",
           "headers": {
             "content-type": [
               "application/json"
@@ -282,21 +297,34 @@
           "body": {
             "kind": "json",
             "value": {
-              "messages": [
+              "input": [
                 {
                   "content": "What is 2+2? Reply with just the number.",
-                  "role": "user"
+                  "role": "user",
+                  "type": "message"
                 },
                 {
-                  "content": "4",
-                  "role": "assistant"
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
                 },
                 {
                   "content": "What was the previous answer? Reply with just the number.",
-                  "role": "user"
+                  "role": "user",
+                  "type": "message"
                 }
               ],
-              "model": "synthetic-chat-model",
+              "model": "synthetic-native-model",
+              "store": false,
               "stream": false
             }
           }
@@ -311,23 +339,58 @@
           "body": {
             "kind": "json",
             "value": {
-              "choices": [
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "id": "resp_recorded_0003",
+              "incomplete_details": null,
+              "input": "What was the previous answer? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "metadata": {},
+              "model": "synthetic-native-model",
+              "object": "response",
+              "output": [
                 {
-                  "finish_reason": "stop",
-                  "index": 0,
-                  "message": {
-                    "content": "4",
-                    "role": "assistant"
-                  }
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0004",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
                 }
               ],
-              "created": 0,
-              "id": "chatcmpl-recorded-0006",
-              "model": "synthetic-chat-model",
-              "object": "chat.completion",
+              "parallel_tool_calls": true,
+              "previous_response_id": null,
+              "reasoning": null,
+              "status": "completed",
+              "store": false,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_p": 1.0,
+              "truncation": "disabled",
               "usage": {
-                "completion_tokens": 1,
-                "prompt_tokens": 28,
+                "input_tokens": 28,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
                 "total_tokens": 29
               }
             }
