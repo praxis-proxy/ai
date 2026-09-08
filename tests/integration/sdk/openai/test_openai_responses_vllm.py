@@ -192,7 +192,7 @@ def _wait_for_proxy(port: int, proc: subprocess.Popen, log_path: str, timeout: f
 
 
 class MCPHandler(BaseHTTPRequestHandler):
-    """Streamable HTTP MCP server exposing get_weather and get_time tools."""
+    """Streamable HTTP MCP server with a single get_weather tool."""
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -211,41 +211,27 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.end_headers()
         elif method == "tools/list":
             self._json_rpc(rid, {
-                "tools": [
-                    {
-                        "name": "get_weather",
-                        "description": "Get current weather for a city",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"city": {"type": "string"}},
-                            "required": ["city"],
-                            "additionalProperties": False,
-                        },
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get current weather for a city",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": False,
                     },
-                    {
-                        "name": "get_time",
-                        "description": "Get the current local time for a city",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"city": {"type": "string"}},
-                            "required": ["city"],
-                            "additionalProperties": False,
-                        },
-                    },
-                ]
+                }]
             })
         elif method == "tools/call":
-            params = req.get("params", {})
-            tool = params.get("name", "")
-            city = params.get("arguments", {}).get("city", "unknown")
-            # Distinct, tool-keyed results so a two-round loop can be
-            # distinguished in the accumulated output trace.
-            if tool == "get_time":
-                text = f"3:00 PM local time in {city}"
-            else:
-                text = f"72F and sunny in {city}"
+            city = (
+                req.get("params", {})
+                .get("arguments", {})
+                .get("city", "unknown")
+            )
             self._json_rpc(rid, {
-                "content": [{"type": "text", "text": text}]
+                "content": [
+                    {"type": "text", "text": f"72F and sunny in {city}"}
+                ]
             })
         elif method == "ping":
             self._json_rpc(rid, {})
@@ -1180,25 +1166,27 @@ class TestAgenticLoopVLLM:
         )
         assert function_calls[0].name == "get_weather"
 
-    def test_two_tool_rounds_accumulate_output_and_usage(
+    def test_agentic_loop_accumulates_usage_across_rounds(
         self, agentic_client, agentic_proxy,
     ):
-        """Issue #983: consecutive MCP tool rounds accumulate output and usage.
+        """Issue #983: usage accumulates across consecutive inference rounds.
 
-        Buffered variant. Advertising two distinct MCP tools (get_weather,
-        get_time) lets the proxy drive model -> tool -> model -> tool -> model
-        entirely within the IRR loop, executing each tool and feeding its
-        result into the next inference round. The terminal response exposes the
-        cross-round accumulated trace (function_call + mcp_call items and the
-        final message) and a single usage object summed across every round.
+        Buffered variant. A single auto-executed MCP tool drives a
+        model -> tool -> model loop; the terminal response exposes the
+        cross-round accumulated output trace (function_call + mcp_call + the
+        final message) and one usage object summed across every inference
+        round.
 
-        This is the live-vLLM counterpart of the deterministic Rust test
-        ``two_tool_rounds_accumulate_output_and_usage``
-        (tests/integration/tests/suite/examples/openai_agentic_loop.rs), which
-        asserts the *exact* per-round token sum against a StatefulCapturingBackend.
-        A real model's per-round token counts are not predictable, so here we
-        assert the accumulation machinery end to end: a genuine multi-round
-        trace plus a present, positive, internally consistent summed usage.
+        The deterministic exact-sum contract over *two sequential tool rounds*
+        lives in the Rust test ``two_tool_rounds_accumulate_output_and_usage``
+        (tests/integration/tests/suite/examples/openai_agentic_loop.rs) with a
+        StatefulCapturingBackend. That scenario is not reproducible live: a
+        small model batches multiple tool calls into one round, which
+        openai_agentic_loop rejects (``exactly one function call per round``),
+        so this live counterpart drives one reliable tool round and asserts the
+        accumulation *machinery* end to end -- a genuine multi-round trace plus
+        a present, positive, internally consistent summed usage -- against a
+        real backend.
         """
         _, mcp_port, _ = agentic_proxy
         mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
@@ -1206,16 +1194,15 @@ class TestAgenticLoopVLLM:
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
             input=(
-                "You have two tools. First call get_weather for Paris, then "
-                "call get_time for Paris, then answer using both results. "
-                "You MUST call both tools. Do not answer directly. /no_think"
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
             ),
             tools=[
                 {
                     "type": "mcp",
-                    "server_label": "concierge",
+                    "server_label": "weather",
                     "server_url": mcp_url,
-                    "allowed_tools": ["get_weather", "get_time"],
+                    "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
             ],
@@ -1225,13 +1212,13 @@ class TestAgenticLoopVLLM:
 
         _assert_multi_round_usage_and_trace(response, transport="buffered")
 
-    def test_two_tool_rounds_streaming_matches_buffered(
+    def test_agentic_loop_streaming_accumulates_usage_across_rounds(
         self, agentic_client, agentic_proxy,
     ):
         """Issue #983: streaming sibling of
-        test_two_tool_rounds_accumulate_output_and_usage.
+        test_agentic_loop_accumulates_usage_across_rounds.
 
-        With stream=True the proxy auto-executes the intermediate tool rounds
+        With stream=True the proxy auto-executes the intermediate tool round
         internally and streams only the terminal round to the client as ONE
         logical SSE response (response.created -> ... -> response.completed).
         The logical-stream finalizer stamps that terminal event with the
@@ -1247,16 +1234,15 @@ class TestAgenticLoopVLLM:
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
             input=(
-                "You have two tools. First call get_weather for Paris, then "
-                "call get_time for Paris, then answer using both results. "
-                "You MUST call both tools. Do not answer directly. /no_think"
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
             ),
             tools=[
                 {
                     "type": "mcp",
-                    "server_label": "concierge",
+                    "server_label": "weather",
                     "server_url": mcp_url,
-                    "allowed_tools": ["get_weather", "get_time"],
+                    "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
             ],
