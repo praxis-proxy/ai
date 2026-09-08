@@ -192,7 +192,7 @@ def _wait_for_proxy(port: int, proc: subprocess.Popen, log_path: str, timeout: f
 
 
 class MCPHandler(BaseHTTPRequestHandler):
-    """Streamable HTTP MCP server with a single get_weather tool."""
+    """Streamable HTTP MCP server exposing get_weather and get_time tools."""
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -211,27 +211,41 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.end_headers()
         elif method == "tools/list":
             self._json_rpc(rid, {
-                "tools": [{
-                    "name": "get_weather",
-                    "description": "Get current weather for a city",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                        "required": ["city"],
-                        "additionalProperties": False,
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get current weather for a city",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                            "additionalProperties": False,
+                        },
                     },
-                }]
+                    {
+                        "name": "get_time",
+                        "description": "Get the current local time for a city",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                            "additionalProperties": False,
+                        },
+                    },
+                ]
             })
         elif method == "tools/call":
-            city = (
-                req.get("params", {})
-                .get("arguments", {})
-                .get("city", "unknown")
-            )
+            params = req.get("params", {})
+            tool = params.get("name", "")
+            city = params.get("arguments", {}).get("city", "unknown")
+            # Distinct, tool-keyed results so a two-round loop can be
+            # distinguished in the accumulated output trace.
+            if tool == "get_time":
+                text = f"3:00 PM local time in {city}"
+            else:
+                text = f"72F and sunny in {city}"
             self._json_rpc(rid, {
-                "content": [
-                    {"type": "text", "text": f"72F and sunny in {city}"}
-                ]
+                "content": [{"type": "text", "text": text}]
             })
         elif method == "ping":
             self._json_rpc(rid, {})
@@ -908,6 +922,70 @@ def agentic_client(agentic_proxy):
 # ---------------------------------------------------------------------------
 
 
+def _assert_multi_round_usage_and_trace(response, *, transport):
+    """Assert a terminal agentic response carries a multi-round accumulated
+    output trace and an internally consistent, summed usage object.
+
+    Shared by the buffered and streaming #983 tests so both transports assert
+    exactly the same shape (criterion e: buffered and streaming expose
+    equivalent accumulated terminal output and usage). ``response`` is the
+    buffered ``Response`` or the streamed ``response.completed`` event's
+    ``response`` -- both expose ``.status``, ``.output``, and ``.usage``.
+
+    Deliberately does NOT assert exact per-round token counts: against a real
+    model those are not predictable. The deterministic exact-sum contract is
+    covered by the Rust integration test ``two_tool_rounds_accumulate_*``
+    (tests/integration/tests/suite/examples/openai_agentic_loop.rs) with a
+    StatefulCapturingBackend. Here we assert the accumulation *machinery* end
+    to end over a genuine multi-round loop.
+    """
+    assert response.status in ("completed", "incomplete"), (
+        f"[{transport}] expected completed or incomplete (token limit); "
+        f"got: {response.status}"
+    )
+
+    output_types = [item.type for item in response.output]
+    assert "function_call" in output_types, (
+        f"[{transport}] accumulated output should contain an auto-executed "
+        f"function_call; got: {output_types}"
+    )
+    assert "mcp_call" in output_types, (
+        f"[{transport}] accumulated output should contain an MCP tool result "
+        f"(mcp_call); got: {output_types}"
+    )
+    rounds = sum(
+        1 for t in output_types
+        if t in ("function_call", "message", "reasoning")
+    )
+    assert rounds >= 2, (
+        f"[{transport}] accumulated output should span at least two inference "
+        f"rounds; got: {output_types}"
+    )
+
+    # Usage is summed across every inference round into one terminal object.
+    # We cannot predict the totals, but the summed object must be present,
+    # positive, and internally consistent -- if merge_usage accumulated some
+    # fields but not others, total would drift from input + output.
+    usage = response.usage
+    assert usage is not None, (
+        f"[{transport}] terminal response must carry an accumulated usage "
+        "object"
+    )
+    assert usage.input_tokens > 0, (
+        f"[{transport}] accumulated input_tokens should be positive; "
+        f"got: {usage.input_tokens}"
+    )
+    assert usage.output_tokens > 0, (
+        f"[{transport}] accumulated output_tokens should be positive; "
+        f"got: {usage.output_tokens}"
+    )
+    assert usage.total_tokens == usage.input_tokens + usage.output_tokens, (
+        f"[{transport}] accumulated usage must be internally consistent "
+        f"(total == input + output); got: {usage.input_tokens} + "
+        f"{usage.output_tokens} != {usage.total_tokens}"
+    )
+
+
 class TestAgenticLoopVLLM:
     """Integration tests for the agentic loop against a vLLM backend."""
 
@@ -1101,6 +1179,108 @@ class TestAgenticLoopVLLM:
             f"got output types: {[i.type for i in response.output]}"
         )
         assert function_calls[0].name == "get_weather"
+
+    def test_two_tool_rounds_accumulate_output_and_usage(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #983: consecutive MCP tool rounds accumulate output and usage.
+
+        Buffered variant. Advertising two distinct MCP tools (get_weather,
+        get_time) lets the proxy drive model -> tool -> model -> tool -> model
+        entirely within the IRR loop, executing each tool and feeding its
+        result into the next inference round. The terminal response exposes the
+        cross-round accumulated trace (function_call + mcp_call items and the
+        final message) and a single usage object summed across every round.
+
+        This is the live-vLLM counterpart of the deterministic Rust test
+        ``two_tool_rounds_accumulate_output_and_usage``
+        (tests/integration/tests/suite/examples/openai_agentic_loop.rs), which
+        asserts the *exact* per-round token sum against a StatefulCapturingBackend.
+        A real model's per-round token counts are not predictable, so here we
+        assert the accumulation machinery end to end: a genuine multi-round
+        trace plus a present, positive, internally consistent summed usage.
+        """
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You have two tools. First call get_weather for Paris, then "
+                "call get_time for Paris, then answer using both results. "
+                "You MUST call both tools. Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "concierge",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather", "get_time"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            max_output_tokens=512,
+        )
+
+        _assert_multi_round_usage_and_trace(response, transport="buffered")
+
+    def test_two_tool_rounds_streaming_matches_buffered(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #983: streaming sibling of
+        test_two_tool_rounds_accumulate_output_and_usage.
+
+        With stream=True the proxy auto-executes the intermediate tool rounds
+        internally and streams only the terminal round to the client as ONE
+        logical SSE response (response.created -> ... -> response.completed).
+        The logical-stream finalizer stamps that terminal event with the
+        cross-round accumulated output and the summed usage, so the single
+        response.completed exposes the same multi-round trace and internally
+        consistent usage the buffered variant observes -- criterion e:
+        buffered and streaming expose equivalent accumulated terminal output
+        and usage.
+        """
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        stream = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You have two tools. First call get_weather for Paris, then "
+                "call get_time for Paris, then answer using both results. "
+                "You MUST call both tools. Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "concierge",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather", "get_time"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types = []
+        final_response = None
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.completed":
+                final_response = event.response
+
+        # One coherent SSE lifecycle framing across the whole multi-round loop.
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_response is not None, (
+            "stream must terminate with a response.completed event; "
+            f"got: {event_types}"
+        )
+
+        _assert_multi_round_usage_and_trace(final_response, transport="streaming")
 
 
 # ---------------------------------------------------------------------------

@@ -619,6 +619,462 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
 }
 
 // -----------------------------------------------------------------------------
+// Two consecutive tool rounds: accumulated output and usage (issue #983)
+// -----------------------------------------------------------------------------
+//
+// One client Responses request drives model -> tool -> model -> tool -> model
+// final output. Both MCP tools execute exactly once, each result feeds the next
+// inference round, the terminal response lists every function call, server-tool
+// result, and the final assistant message in stable order, and the reported
+// token usage is the exact sum of all three inference rounds. The buffered and
+// streaming variants assert the SAME accumulated output and usage to prove the
+// two transports are equivalent.
+//
+// This flow cannot be an inference fixture: the replay harness binds exactly one
+// upstream exchange per client turn and rejects MCP callout filters as not
+// replay-contained, so a single request that fans out to three upstream rounds
+// must be a functional integration test.
+
+/// Per-round token usage as `(input, output, total)`. Distinct values make the
+/// accumulated sum unambiguous, and each round's total equals input + output so
+/// the summed `total_tokens` (merged as an independent field) also equals the
+/// summed input plus output.
+const ROUND1_USAGE: (u64, u64, u64) = (11, 4, 15);
+const ROUND2_USAGE: (u64, u64, u64) = (22, 5, 27);
+const ROUND3_USAGE: (u64, u64, u64) = (33, 6, 39);
+
+/// Usage accumulated across all three inference rounds.
+const EXPECTED_INPUT_TOKENS: u64 = ROUND1_USAGE.0 + ROUND2_USAGE.0 + ROUND3_USAGE.0;
+const EXPECTED_OUTPUT_TOKENS: u64 = ROUND1_USAGE.1 + ROUND2_USAGE.1 + ROUND3_USAGE.1;
+const EXPECTED_TOTAL_TOKENS: u64 = ROUND1_USAGE.2 + ROUND2_USAGE.2 + ROUND3_USAGE.2;
+
+/// Output item `type` values a two-tool-round terminal response must expose, in
+/// stable chronological order: each tool round contributes a function call then
+/// its server-tool result, followed by the final assistant message.
+const EXPECTED_OUTPUT_TYPES: [&str; 5] = ["function_call", "mcp_call", "function_call", "mcp_call", "message"];
+
+/// Final assistant text emitted by the terminal inference round.
+const FINAL_TEXT: &str = "SF is 72F and it is 3pm PST.";
+
+#[test]
+fn two_tool_rounds_accumulate_output_and_usage() {
+    // Round 1: the model asks to call the weather tool.
+    let first_response = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_weather",
+            "name": "weather__get_weather",
+            "arguments": r#"{"location":"SF"}"#,
+            "status": "completed"
+        }],
+        "usage": usage_json(ROUND1_USAGE)
+    });
+    // Round 2: after the weather result, the model asks to call the time tool.
+    let second_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_2",
+            "call_id": "call_time",
+            "name": "weather__get_time",
+            "arguments": r#"{"timezone":"PST"}"#,
+            "status": "completed"
+        }],
+        "usage": usage_json(ROUND2_USAGE)
+    });
+    // Round 3: the model emits the final assistant message and the loop exits.
+    let final_response = serde_json::json!({
+        "id": "resp_3",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": FINAL_TEXT}]
+        }],
+        "usage": usage_json(ROUND3_USAGE)
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+        (200, serde_json::to_string(&final_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(object_schema("location")),
+            McpToolFixture::new("get_time")
+                .with_description("Get the current time for a timezone")
+                .with_input_schema(object_schema("timezone")),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather and time in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": mcp_url,
+            "allowed_tools": ["get_weather", "get_time"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "two-round agentic request should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+
+    // Three inference rounds ran: model -> tool -> model -> tool -> model.
+    let model_reqs = model.requests();
+    assert_eq!(
+        model_reqs.len(),
+        3,
+        "model backend should receive exactly three requests"
+    );
+
+    // Both tools executed exactly once.
+    assert_eq!(mcp.method_count("tools/call"), 2, "exactly two MCP tool calls total");
+    assert_eq!(
+        mcp.tool_call_count("get_weather"),
+        1,
+        "get_weather must execute exactly once"
+    );
+    assert_eq!(mcp.tool_call_count("get_time"), 1, "get_time must execute exactly once");
+
+    // The terminal response lists every function call, server-tool result, and
+    // the final message in stable chronological order.
+    let output = response["output"].as_array().expect("final response output array");
+    let output_types: Vec<&str> = output.iter().map(output_item_type).collect();
+    assert_eq!(
+        output_types, EXPECTED_OUTPUT_TYPES,
+        "terminal output must interleave both tool rounds then the final message: {output:#?}"
+    );
+    let mcp_calls: Vec<&serde_json::Value> = output.iter().filter(|item| item["type"] == "mcp_call").collect();
+    assert!(
+        mcp_calls[0]["output"]
+            .as_str()
+            .is_some_and(|out| out.contains("mock result for get_weather")),
+        "first server-tool result must be the weather call: {:#?}",
+        mcp_calls[0]
+    );
+    assert!(
+        mcp_calls[1]["output"]
+            .as_str()
+            .is_some_and(|out| out.contains("mock result for get_time")),
+        "second server-tool result must be the time call: {:#?}",
+        mcp_calls[1]
+    );
+    let message = output
+        .last()
+        .expect("terminal output should end with the assistant message");
+    assert_eq!(
+        message["content"][0]["text"], FINAL_TEXT,
+        "final message text must survive: {message:#?}"
+    );
+
+    // The buffered terminal keeps the last round's backend response id.
+    assert_eq!(response["id"], "resp_3", "buffered terminal keeps the last round id");
+
+    // Reported usage equals the exact sum of all three inference rounds.
+    assert_eq!(
+        response["usage"]["input_tokens"], EXPECTED_INPUT_TOKENS,
+        "input tokens must sum across rounds"
+    );
+    assert_eq!(
+        response["usage"]["output_tokens"], EXPECTED_OUTPUT_TOKENS,
+        "output tokens must sum across rounds"
+    );
+    assert_eq!(
+        response["usage"]["total_tokens"], EXPECTED_TOTAL_TOKENS,
+        "total tokens must sum across rounds"
+    );
+
+    // Each tool result was supplied to the following inference round.
+    let second_input = request_input(&model_reqs[1].body);
+    assert!(
+        second_input.iter().any(is_weather_result),
+        "round 2 input must carry the weather result: {second_input:#?}"
+    );
+    let third_input = request_input(&model_reqs[2].body);
+    assert!(
+        third_input.iter().any(is_time_result),
+        "round 3 input must carry the time result: {third_input:#?}"
+    );
+}
+
+#[test]
+fn two_tool_rounds_streaming_matches_buffered() {
+    // A streamed function-call turn: created -> item added -> arg deltas -> done
+    // -> completed (carrying the round's usage). Mirrors the buffered rounds so
+    // the streaming and buffered variants accumulate identical output and usage.
+    let fc_turn = |resp_id: &str, item_id: &str, call_id: &str, name: &str, args: &str, usage: (u64, u64, u64)| {
+        vec![
+            sse_event(
+                "response.created",
+                serde_json::json!({
+                    "response": {"id": resp_id, "object": "response", "status": "in_progress", "output": []},
+                    "sequence_number": 0
+                }),
+            ),
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "response_id": resp_id,
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": item_id,
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": "",
+                        "status": "in_progress"
+                    },
+                    "sequence_number": 1
+                }),
+            ),
+            sse_event(
+                "response.function_call_arguments.delta",
+                serde_json::json!({
+                    "response_id": resp_id,
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "delta": args,
+                    "sequence_number": 2
+                }),
+            ),
+            sse_event(
+                "response.function_call_arguments.done",
+                serde_json::json!({
+                    "response_id": resp_id,
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "arguments": args,
+                    "sequence_number": 3
+                }),
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({
+                    "response": {
+                        "id": resp_id,
+                        "object": "response",
+                        "status": "completed",
+                        "output": [{
+                            "type": "function_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": args,
+                            "status": "completed"
+                        }],
+                        "usage": usage_json(usage)
+                    },
+                    "sequence_number": 4
+                }),
+            ),
+        ]
+    };
+    let final_turn = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_stream_3", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_stream_3",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_stream_3", "role": "assistant", "status": "in_progress", "content": []},
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.output_text.delta",
+            serde_json::json!({
+                "response_id": "resp_stream_3",
+                "item_id": "msg_stream_3",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": FINAL_TEXT,
+                "sequence_number": 2
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_stream_3",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_stream_3",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": FINAL_TEXT}]
+                    }],
+                    "usage": usage_json(ROUND3_USAGE)
+                },
+                "sequence_number": 3
+            }),
+        ),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![
+        fc_turn(
+            "resp_stream_1",
+            "fc_stream_1",
+            "call_weather",
+            "weather__get_weather",
+            r#"{"location":"SF"}"#,
+            ROUND1_USAGE,
+        ),
+        fc_turn(
+            "resp_stream_2",
+            "fc_stream_2",
+            "call_time",
+            "weather__get_time",
+            r#"{"timezone":"PST"}"#,
+            ROUND2_USAGE,
+        ),
+        final_turn,
+    ]);
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(object_schema("location")),
+            McpToolFixture::new("get_time")
+                .with_description("Get the current time for a timezone")
+                .with_input_schema(object_schema("timezone")),
+        ],
+        ..McpMockConfig::default()
+    });
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model_port);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather and time in SF?",
+        "stream": true,
+        "store": false,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather", "get_time"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed two-round request should return 200: {raw}"
+    );
+    assert_eq!(
+        body.matches("event: response.created").count(),
+        1,
+        "the whole loop must expose one logical response.created: {body}"
+    );
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "intermediate round completions must be suppressed: {body}"
+    );
+    assert!(
+        body.contains(FINAL_TEXT),
+        "the terminal inference text should reach the stream: {body}"
+    );
+    assert!(
+        !body.contains("resp_stream_2") && !body.contains("resp_stream_3"),
+        "resumed rounds must retain the first logical response id: {body}"
+    );
+
+    // Both tools executed exactly once.
+    assert_eq!(mcp.method_count("tools/call"), 2, "exactly two MCP tool calls total");
+    assert_eq!(
+        mcp.tool_call_count("get_weather"),
+        1,
+        "get_weather must execute exactly once"
+    );
+    assert_eq!(mcp.tool_call_count("get_time"), 1, "get_time must execute exactly once");
+
+    // The single terminal response.completed carries the accumulated output and
+    // usage — the same order and sums as the buffered variant.
+    let completed = extract_completed_response(&body);
+    assert_eq!(completed["id"], "resp_stream_1", "streaming keeps the first round id");
+    let output = completed["output"].as_array().expect("terminal streamed output array");
+    let output_types: Vec<&str> = output.iter().map(output_item_type).collect();
+    assert_eq!(
+        output_types, EXPECTED_OUTPUT_TYPES,
+        "streamed terminal output must match the buffered accumulated order: {output:#?}"
+    );
+    assert_eq!(
+        completed["usage"]["input_tokens"], EXPECTED_INPUT_TOKENS,
+        "streamed input tokens must sum across rounds"
+    );
+    assert_eq!(
+        completed["usage"]["output_tokens"], EXPECTED_OUTPUT_TOKENS,
+        "streamed output tokens must sum across rounds"
+    );
+    assert_eq!(
+        completed["usage"]["total_tokens"], EXPECTED_TOTAL_TOKENS,
+        "streamed total tokens must sum across rounds"
+    );
+
+    model_thread.join().expect("streaming model thread should finish");
+    let (second_input, third_input) = {
+        let requests = model_requests
+            .lock()
+            .expect("model request lock should not be poisoned");
+        assert_eq!(requests.len(), 3, "IRR should make three streamed model requests");
+        (request_input(&requests[1]), request_input(&requests[2]))
+    };
+    assert!(
+        second_input.iter().any(is_weather_result),
+        "round 2 input must carry the weather result: {second_input:#?}"
+    );
+    assert!(
+        third_input.iter().any(is_time_result),
+        "round 3 input must carry the time result: {third_input:#?}"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Round-Trip: Web Search via IRR
 // -----------------------------------------------------------------------------
 
@@ -1184,6 +1640,76 @@ fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) ->
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Build an OpenAI Responses `usage` object from `(input, output, total)`.
+fn usage_json((input, output, total): (u64, u64, u64)) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": total
+    })
+}
+
+/// A minimal single-string-property MCP tool input schema.
+fn object_schema(property: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {property: {"type": "string"}},
+        "required": [property],
+        "additionalProperties": false
+    })
+}
+
+/// The `type` of a Responses output item, or `""` when absent.
+fn output_item_type(item: &serde_json::Value) -> &str {
+    item["type"].as_str().unwrap_or_default()
+}
+
+/// Parse a captured model request body and return its `input` array.
+fn request_input(body: &str) -> Vec<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(body).expect("model request body should be valid JSON");
+    value["input"].as_array().cloned().unwrap_or_default()
+}
+
+/// True when `item` is the `function_call_output` bridge carrying the weather
+/// tool result fed back to the model.
+fn is_weather_result(item: &serde_json::Value) -> bool {
+    item["type"] == "function_call_output"
+        && item["output"]
+            .as_str()
+            .is_some_and(|out| out.contains("mock result for get_weather"))
+}
+
+/// True when `item` is the `function_call_output` bridge carrying the time tool
+/// result fed back to the model.
+fn is_time_result(item: &serde_json::Value) -> bool {
+    item["type"] == "function_call_output"
+        && item["output"]
+            .as_str()
+            .is_some_and(|out| out.contains("mock result for get_time"))
+}
+
+/// Extract the `response` object from the single terminal `response.completed`
+/// SSE frame in a client stream.
+fn extract_completed_response(body: &str) -> serde_json::Value {
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "event: response.completed" {
+            continue;
+        }
+        for data_line in lines.by_ref() {
+            if let Some(payload) = data_line.strip_prefix("data: ") {
+                let event: serde_json::Value =
+                    serde_json::from_str(payload.trim()).expect("response.completed data should be valid JSON");
+                return event["response"].clone();
+            }
+            if data_line.trim().is_empty() {
+                break;
+            }
+        }
+    }
+    panic!("no response.completed event found in stream: {body}");
+}
 
 fn patch_web_search_api_key(yaml: &str) -> String {
     yaml.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
