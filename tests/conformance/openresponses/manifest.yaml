@@ -1,0 +1,59 @@
+# OpenResponses conformance triage for the responses_to_chat_completions filter.
+#
+# Source suite: https://github.com/openresponses/openresponses
+# Pinned commit: 92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c
+# Runner: bun 1.3.12, zod 3.25.76
+#
+# The launcher (tests/integration/sdk/openai/test_responses_conformance.py)
+# enumerates the suite's template ids and asserts they exactly equal
+# (applicable ∪ skip) below. A new or removed suite template fails the run
+# until this manifest is updated — no template can silently go untriaged.
+
+suite:
+  repo: https://github.com/openresponses/openresponses
+  commit: 92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c
+  bun: 1.3.12
+  zod: 3.25.76
+
+applicable:
+  - id: basic-response
+  - id: system-prompt
+  - id: multi-turn
+  - id: assistant-phase
+  - id: tool-calling
+  - id: streaming-response
+
+skip:
+  - id: image-input
+    reason: >-
+      Requires a vision-capable backend; the Qwen3-0.6B CPU backend is
+      text-only. Tracked under https://github.com/praxis-proxy/ai/issues/987;
+      a dedicated follow-up issue can be split out later.
+  - id: response-output-phase-schema
+    reason: >-
+      Exercises structured-output response phases with no equivalent
+      capability at this suite SHA / backend. Tracked under
+      https://github.com/praxis-proxy/ai/issues/987; a dedicated follow-up
+      issue can be split out later.
+  - id: compact-response
+    reason: >-
+      Targets the /responses/compact endpoint, which is not part of the
+      Responses-to-Chat-Completions translation surface.
+  - id: compact-missing-model
+    reason: >-
+      Targets the /responses/compact endpoint (negative case); out of scope
+      for the translation filter.
+  - id: websocket-response
+    reason: WebSocket transport is not part of the HTTP translation surface.
+  - id: websocket-sequential-responses
+    reason: WebSocket transport is not part of the HTTP translation surface.
+  - id: websocket-continuation
+    reason: WebSocket transport is not part of the HTTP translation surface.
+  - id: websocket-reconnect-store-false-recovery
+    reason: WebSocket transport is not part of the HTTP translation surface.
+  - id: websocket-previous-response-not-found
+    reason: WebSocket transport is not part of the HTTP translation surface.
+  - id: websocket-failed-continuation-evicts-cache
+    reason: WebSocket transport is not part of the HTTP translation surface.
+  - id: websocket-compact-new-chain
+    reason: WebSocket transport is not part of the HTTP translation surface.
