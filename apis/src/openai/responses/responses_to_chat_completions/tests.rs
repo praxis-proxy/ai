@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::StatusCode;
 use praxis_core::time::FixedTimeSource;
-use praxis_filter::{BodyAccess, BodyMode, FilterAction};
+use praxis_filter::{BodyAccess, BodyMode, FilterAction, SubRequestResponseMode};
 use serde_json::json;
 
 use super::{
@@ -503,6 +503,76 @@ async fn canonical_state_is_translated_and_arms_response() {
             .get::<ResponsesState>()
             .and_then(|state| state.response_created_at),
         Some(1_700_000_000)
+    );
+}
+
+#[test]
+fn always_advertises_streaming_subrequest_capability() {
+    // Running inside the iterative router, the filter always declares the
+    // streaming subrequest capability. The transport is chosen per request from
+    // the effective `stream` bit, never a build-time flag — a flag would make a
+    // `stream: true` request silently buffer, and so never dispatch the search.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    assert!(
+        filter.may_select_streaming_subrequest_response(),
+        "the filter must always advertise the build-time streaming-subrequest contract"
+    );
+}
+
+/// Drive one create request through `on_request_body` with the given config and
+/// return the transport the filter selected for the translated subrequest.
+async fn selected_subrequest_mode(config_yaml: &str, request_body: serde_json::Value) -> SubRequestResponseMode {
+    let config = serde_yaml::from_str(config_yaml).unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&config).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context
+        .extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "translation should continue");
+    assert_eq!(context.get_metadata(ARMED_KEY), Some("true"), "translation should arm");
+    context.subrequest_response_mode()
+}
+
+#[tokio::test]
+async fn selects_streaming_transport_for_streaming_request() {
+    // An effective stream:true request must keep each translated per-round stream
+    // internal to the router so `openai_agentic_loop` can parse it and dispatch.
+    let mode = selected_subrequest_mode("{}", json!({"model": "gpt-4.1-mini", "input": "hello", "stream": true})).await;
+    assert_eq!(
+        mode,
+        SubRequestResponseMode::Streaming,
+        "an effective stream:true request must keep each translated round internal to the router"
+    );
+}
+
+#[tokio::test]
+async fn selects_buffered_transport_for_non_streaming_request() {
+    let mode = selected_subrequest_mode(
+        "{}",
+        json!({"model": "gpt-4.1-mini", "input": "hello", "stream": false}),
+    )
+    .await;
+    assert_eq!(
+        mode,
+        SubRequestResponseMode::Buffered,
+        "a non-streaming request must not select the streaming subrequest transport"
+    );
+}
+
+#[tokio::test]
+async fn selects_buffered_transport_when_stream_is_absent() {
+    // A request that omits `stream` entirely buffers, matching a `stream: false`
+    // request: only an explicit effective stream:true selects the streaming path.
+    let mode = selected_subrequest_mode("{}", json!({"model": "gpt-4.1-mini", "input": "hello"})).await;
+    assert_eq!(
+        mode,
+        SubRequestResponseMode::Buffered,
+        "an absent stream bit must leave the subrequest transport at its buffered default"
     );
 }
 

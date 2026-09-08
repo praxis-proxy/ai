@@ -9,6 +9,8 @@ Resolves MCP tool entries from the Responses API `tools` array into concrete too
 
 Rejects the request with HTTP 400 before any callouts if two or more resolvable MCP entries share the same `server_label` (including entries that differ only by credentials).
 
+For streaming requests, a runtime or response-processing failure from `tools/list` is returned as a successful SSE transport containing `response.mcp_list_tools.failed` and a terminal `response.failed` event. Local policy failures such as SSRF blocking remain HTTP error responses.
+
 ## Configuration
 
 | Field | Type | Required | Description |
