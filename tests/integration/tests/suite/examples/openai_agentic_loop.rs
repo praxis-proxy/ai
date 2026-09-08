@@ -2761,11 +2761,8 @@ fn spawn_failing_search_mock(listener: TcpListener) {
 ///
 /// Returns a shared counter so a test can assert exactly how many provider
 /// requests the web search filter issued across an agentic-loop continuation.
-fn spawn_counting_search_mock(listener: TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {
-    use std::{
-        io::{Read as _, Write as _},
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+fn spawn_counting_search_mock(listener: TcpListener) -> Arc<AtomicUsize> {
+    use std::io::{Read as _, Write as _};
     let counter = Arc::new(AtomicUsize::new(0));
     let thread_counter = Arc::clone(&counter);
     let body = serde_json::json!({
@@ -2860,7 +2857,7 @@ fn web_search_caps_multiple_calls_within_one_round() {
     );
 
     assert_eq!(
-        search_count.load(std::sync::atomic::Ordering::SeqCst),
+        search_count.load(Ordering::SeqCst),
         1,
         "only one provider request may be dispatched under max_tool_calls=1"
     );
@@ -2962,7 +2959,7 @@ fn web_search_budget_persists_across_loop_iterations() {
     assert_eq!(parse_status(&raw), 200, "multi-round web search should return 200");
 
     assert_eq!(
-        search_count.load(std::sync::atomic::Ordering::SeqCst),
+        search_count.load(Ordering::SeqCst),
         1,
         "the executed budget must persist across iterations: only the first-round search dispatches"
     );

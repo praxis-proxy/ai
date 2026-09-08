@@ -718,6 +718,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "exhaustive one-assert-per-field check of every default value"
+    )]
     fn default_produces_expected_values() {
         let state = ResponsesState::default();
         assert!(state.context_management.is_none());
