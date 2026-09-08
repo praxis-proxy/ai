@@ -651,24 +651,31 @@ fn normalize_message_content(role: &str, content: Value) -> Result<Value, String
         },
         Value::Array(mut parts) => {
             if role == "assistant" {
-                for part in &mut parts {
-                    let Some(part) = part.as_object_mut() else {
-                        continue;
-                    };
-                    if part.get("type").and_then(Value::as_str) != Some("output_text") {
-                        continue;
-                    }
-                    if part.get("annotations").is_none_or(Value::is_null) {
-                        part.insert("annotations".to_owned(), Value::Array(Vec::new()));
-                    }
-                    if part.get("logprobs").is_none_or(Value::is_null) {
-                        part.insert("logprobs".to_owned(), Value::Array(Vec::new()));
-                    }
-                }
+                normalize_assistant_content_parts(&mut parts);
             }
             Ok(Value::Array(parts))
         },
         _ => Err("message content must be a string or array".to_owned()),
+    }
+}
+
+/// Fill in the optional `annotations` and `logprobs` fields that some backends
+/// omit or send as `null` on assistant `output_text` parts, so append-back
+/// matches the API contract.
+fn normalize_assistant_content_parts(parts: &mut [Value]) {
+    for part in parts {
+        let Some(part) = part.as_object_mut() else {
+            continue;
+        };
+        if part.get("type").and_then(Value::as_str) != Some("output_text") {
+            continue;
+        }
+        if part.get("annotations").is_none_or(Value::is_null) {
+            part.insert("annotations".to_owned(), Value::Array(Vec::new()));
+        }
+        if part.get("logprobs").is_none_or(Value::is_null) {
+            part.insert("logprobs".to_owned(), Value::Array(Vec::new()));
+        }
     }
 }
 
