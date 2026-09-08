@@ -40,11 +40,13 @@
 mod a2a;
 mod agentic_mocks;
 mod anthropic_messages;
+mod claude_code;
 mod codex_websocket;
 mod conversations_rehydrate;
 mod examples;
 mod failure_mode;
 mod guardrails;
+mod harness;
 mod inference_fixtures;
 mod mcp;
 mod mcp_broker;

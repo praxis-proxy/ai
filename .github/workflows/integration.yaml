@@ -118,6 +118,8 @@ jobs:
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: test-integration-cargo
 
       - name: Schema tests
         run: make test-schema
@@ -125,7 +127,14 @@ jobs:
       - name: Inference fixture tests
         run: make test-inference-fixtures
 
+      - name: Install pinned Claude Code CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code@2.1.267
+          claude --version
+
       - name: Integration tests
+        env:
+          PRAXIS_TEST_CLAUDE_CODE_BIN: claude
         run: make test-integration
 
       - name: Environment tests
