@@ -8,8 +8,8 @@ mod test_utils;
 pub use test_utils::load_example_config;
 
 mod agentic_routing;
+mod anthropic_full_flow_agentic;
 mod anthropic_messages;
-mod anthropic_messages_web_search;
 mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;

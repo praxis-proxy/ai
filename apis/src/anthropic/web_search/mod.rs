@@ -167,7 +167,7 @@ struct ResponseEnvelope<'a> {
 /// ```yaml
 /// # cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
 /// # WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" cargo run -p praxis-ai-proxy -- \
-/// #   -c examples/configs/anthropic/messages-web-search.yaml
+/// #   -c examples/configs/anthropic/full-flow-agentic.yaml
 /// # curl http://127.0.0.1:8080/v1/messages \
 /// #   -H 'content-type: application/json' \
 /// #   -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":"Use web search to look up potato, then summarize in one sentence."}],"tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}'

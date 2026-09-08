@@ -142,7 +142,7 @@ fn load_config_with_limits(
     max_state_bytes: Option<usize>,
     max_body_bytes: Option<usize>,
 ) -> praxis_core::config::Config {
-    let yaml = std::fs::read_to_string(example_config_path("anthropic/messages-web-search.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("anthropic/full-flow-agentic.yaml"))
         .expect("read Messages web-search example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
     let mut yaml = yaml.replace(
