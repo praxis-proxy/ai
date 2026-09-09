@@ -315,17 +315,9 @@ fn reject_invalid_function_cardinality(
     FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message))
 }
 
-/// Only a successfully terminated stream may authorize external side effects.
-fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &ResponsesState) -> bool {
-    state.request_body.get("stream").and_then(Value::as_bool) != Some(true)
-        || (ctx.get_metadata("responses.stream_completion") == Some("terminal")
-            && state.response_object.get("status").and_then(Value::as_str) == Some("completed")
-            && ctx.get_metadata("responses.stream_parse_error") != Some("true"))
-}
-
 /// Collect an authoritative successful stream or terminate without dispatch.
 fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<bool, FilterError> {
-    if !streamed_round_is_dispatchable(ctx, state) {
+    if !super::streamed_round_is_dispatchable(ctx, state) {
         collect_streaming_output_items(state);
         state.tool_calls.clear();
         state.web_search_calls.clear();

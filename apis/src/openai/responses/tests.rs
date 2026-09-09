@@ -1131,3 +1131,49 @@ fn make_filter(yaml_str: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_str).unwrap();
     ResponsesFormatFilter::from_config(&yaml).unwrap()
 }
+
+// -----------------------------------------------------------------------------
+// streamed_round_is_dispatchable Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn dispatchable_requires_terminal_completed_no_parse_error() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = state::ResponsesState::default();
+    state.request_body = serde_json::json!({"stream": true});
+    // Non-terminal stream: not dispatchable.
+    assert!(!streamed_round_is_dispatchable(&ctx, &state));
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    state.response_object = serde_json::json!({"status": "completed"});
+    assert!(streamed_round_is_dispatchable(&ctx, &state));
+    ctx.set_metadata("responses.stream_parse_error", "true");
+    assert!(
+        !streamed_round_is_dispatchable(&ctx, &state),
+        "parse error blocks dispatch"
+    );
+}
+
+#[test]
+fn non_streaming_request_is_always_dispatchable() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let ctx = crate::test_utils::make_filter_context(&req);
+    let state = state::ResponsesState::default(); // no stream flag
+    assert!(streamed_round_is_dispatchable(&ctx, &state));
+}
+
+#[test]
+fn fs_end_stream_writes_five_keys_and_is_idempotent() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    fs_end_stream_with_error_ctx(&mut ctx, "server_error", "boom");
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert_eq!(ctx.get_metadata("responses.stream_error_message"), Some("boom"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let r = ctx.filter_results.get("openai_file_search_callout").unwrap();
+    assert_eq!(r.get("action"), Some("done"));
+    assert_eq!(r.get("pending"), Some("false"));
+    // Idempotent: a second call with a different code does not clobber.
+    fs_end_stream_with_error_ctx(&mut ctx, "other_code", "later");
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+}

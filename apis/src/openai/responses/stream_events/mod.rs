@@ -13,6 +13,7 @@
 
 pub(crate) mod accumulator;
 mod config;
+mod local_tools;
 
 use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
@@ -102,6 +103,10 @@ pub(super) struct StreamEventsState {
     /// most once per round rather than re-serializing every local item ahead of
     /// each resumed event.
     local_items_flushed: bool,
+    /// Locally-executable tool items opened this round, keyed by `item:{id}` and
+    /// `index:{output_index}` → suppression mode (§4.1). Transient per-round: created
+    /// in `arm()`, dropped when the state is removed at `finalize_logical_stream`.
+    local_tool_items: std::collections::HashMap<String, local_tools::LocalToolMode>,
 }
 
 /// Accumulates state from native Responses API SSE event streams.
@@ -176,6 +181,7 @@ impl OpenaiStreamEventsFilter {
             deferred_terminal: None,
             deferred_done: false,
             local_items_flushed: false,
+            local_tool_items: std::collections::HashMap::new(),
         });
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
@@ -185,6 +191,8 @@ impl OpenaiStreamEventsFilter {
         // agentic loop overwrites it after each check.
         if self.logical_stream {
             ctx.set_metadata("responses.logical_stream", "true");
+            // Per-consumer capability marker (§7.1). file_search is the only consumer today.
+            ctx.set_metadata("responses.logical_stream.file_search", "true");
         }
     }
 }
@@ -423,12 +431,89 @@ fn commit_chunk_events(
 }
 
 /// Append one provider event to the logical stream or defer/suppress it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear sequence: file_search suppression + deferred-delta gate + seven event type arms, each with its own payload normalization"
+)]
 fn append_logical_event(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     event: ResponsesEvent,
     output: &mut Vec<u8>,
 ) {
+    // #313 §4/§6: classify locally-executable file_search items at first sight and
+    // suppress their raw wire representation. Only runs on the logical stream with a
+    // hosted file_search tool declared (the load-bearing configured-tool gate, P1 round-11).
+    let file_search_active = state.logical_stream
+        && ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(crate::openai::responses::file_search_callout::has_file_search_tool);
+    if file_search_active && event.event_type() == "response.output_item.added" {
+        let payload = event.payload();
+        if let Some(item) = payload.get("item") {
+            use crate::openai::responses::file_search_callout::{
+                is_file_search_function_call, is_pending_file_search_call,
+            };
+            if is_file_search_function_call(item) {
+                local_tools::register_local_tool(
+                    &mut state.local_tool_items,
+                    payload,
+                    local_tools::LocalToolMode::Suppress,
+                );
+            } else if is_pending_file_search_call(item) {
+                local_tools::register_local_tool(
+                    &mut state.local_tool_items,
+                    payload,
+                    local_tools::LocalToolMode::NativeHybridPending,
+                );
+            }
+        }
+    }
+    // Mode-aware suppression: Suppress drops all events; NativeHybridPending drops only
+    // a still-PENDING output_item.done (EOS synthesizes the completed tail), but passes
+    // through terminal done (completed/failed/incomplete) and removes keys (cancels synthesis).
+    if !state.local_tool_items.is_empty() {
+        let keys: Vec<String> = local_tools::event_local_tool_keys(event.payload()).collect();
+        if let Some(mode) = keys.iter().find_map(|k| state.local_tool_items.get(k).copied()) {
+            match mode {
+                local_tools::LocalToolMode::Suppress => return,
+                local_tools::LocalToolMode::NativeHybridPending => {
+                    if event.event_type() == "response.output_item.done" {
+                        let status = event
+                            .payload()
+                            .get("item")
+                            .and_then(|item| item.get("status"))
+                            .and_then(Value::as_str);
+                        if matches!(status, Some("searching" | "in_progress")) {
+                            return; // still-pending done: EOS synthesizes the completed tail.
+                        }
+                        // Terminal done (completed/failed/incomplete): pass through and
+                        // cancel EOS synthesis — the provider resolved the call. Record the
+                        // item id so the file_search EOS reconcile skips re-queuing this
+                        // call; a synthesized tail would duplicate this live done (#313 P1).
+                        // Recorded for every terminal status, not just `completed`.
+                        if let Some(id) = event
+                            .payload()
+                            .get("item")
+                            .and_then(|item| item.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            ctx.extensions
+                                .get_or_insert_with(ResponsesState::default)
+                                .provider_streamed_terminal_ids
+                                .insert(id.to_owned());
+                        }
+                        for k in &keys {
+                            state.local_tool_items.remove(k);
+                        }
+                    }
+                    // Opening + progress fall through and pass normally.
+                },
+            }
+        }
+    }
+
     if event.is_terminal() {
         let event_type = event.event_type().to_owned();
         state.deferred_terminal = Some(DeferredTerminalEvent {
@@ -1101,6 +1186,10 @@ fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u
 }
 
 /// Emit the held terminal event only when the current IRR step is terminal.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear sequence: drain synthesis → terminal-error arm-stop → continues gate → error/terminal emit"
+)]
 fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
@@ -1110,8 +1199,39 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
         return;
     }
 
-    let continues = logical_stream_continues(ctx);
     let mut output = Vec::new();
+    // #313 §4.2: drain file_search synthesis first, under the precedence policy. A
+    // validation failure here calls fs_end_stream_with_error_ctx (site (b), §7.3) so
+    // the error branch below is selected and the router does not re-fire.
+    local_tools::drain_local_tool_synthesis(ctx, parser_state.output_index_offset, &mut output);
+    // #313 P1 (DoS bound): file_search's EOS reconcile (a prior response-phase filter) has
+    // already read this round's provider-streamed observation set; clear it unconditionally
+    // here — NOT inside drain_local_tool_synthesis, which early-returns on an empty synthesis
+    // queue (exactly the all-natives-streamed-live case) — so it cannot accumulate across IRR
+    // continuation rounds and bypass the max_state_bytes ceiling. The ids are stale after the
+    // round that recorded them, so clearing loses nothing.
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.provider_streamed_terminal_ids.clear();
+    }
+    // #313 P1: a terminal failure recorded after file_search already published its
+    // per-round continuation — our own parse/validation error (`stream_error_code`, e.g.
+    // set by validate_stream_end at EOS, which runs AFTER file_search's reconcile) or a
+    // flat upstream `error` completion (`stream_completion == "error"`, which sets no
+    // error code) — must clear a stale file_search `action="loop"` to the two-key stop,
+    // or the error frame is suppressed and another IRR round fires. Scoped to file_search:
+    // web_search/mcp own their own stop signalling and are left untouched.
+    let file_search_looping = ctx
+        .filter_results
+        .get("openai_file_search_callout")
+        .and_then(|results| results.get("action"))
+        == Some("loop");
+    let terminal_error = ctx.get_metadata("responses.stream_error_code").is_some()
+        || ctx.get_metadata("responses.stream_completion") == Some("error");
+    if file_search_looping && terminal_error {
+        crate::openai::responses::fs_arm_stream_stop(ctx);
+    }
+    let continues = logical_stream_continues(ctx); // re-read AFTER drain + arm-stop: a
+    // (b)-site failure or the arm-stop above flips file_search action=done.
     if !continues && let Some(mut error) = logical_stream_error(ctx) {
         // #276: surface any locally executed tool items that never reached the
         // client before the stream terminates with an error, so already-executed
@@ -1155,7 +1275,7 @@ fn emit_deferred_terminal(
 
 /// Whether a dispatch filter requested another inference step.
 fn logical_stream_continues(ctx: &HttpFilterContext<'_>) -> bool {
-    ["openai_mcp_dispatch", "openai_web_search"]
+    ["openai_mcp_dispatch", "openai_web_search", "openai_file_search_callout"]
         .iter()
         .any(|filter| ctx.filter_results.get(filter).and_then(|results| results.get("action")) == Some("loop"))
 }

@@ -3661,6 +3661,225 @@ class TestFileSearchChatCompletionsVLLM:
         )
 
 
+# ---------------------------------------------------------------------------
+# Streaming hosted file search (issue #313)
+# ---------------------------------------------------------------------------
+
+FILE_SEARCH_STREAMING_CONFIG_PATH = (
+    "examples/configs/openai/responses/file-search-streaming.yaml"
+)
+
+
+def _write_file_search_streaming_config(praxis_port: int) -> str:
+    """Patch the shipped file-search-streaming example for testing.
+
+    Exercises the real #313 streaming example config (per repo test
+    requirements) while retargeting the vector-store callout at OGX and the
+    model backend at vLLM's native /v1/responses endpoint. The shipped
+    example ships tight deadlines suited to a fast provider; CPU-only vLLM
+    under co-located CI load (postgres + vLLM + OGX) needs the wider budgets
+    already used by the agentic and non-streaming file-search fixtures.
+    """
+    with open(FILE_SEARCH_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:8001", _ogx_endpoint())
+    # Retarget the model backend and give it a generous read timeout, matching
+    # _write_agentic_config. This is also the only occurrence of :3001.
+    config = config.replace(
+        '- "127.0.0.1:3001"',
+        f'- "{_vllm_endpoint()}"\n'
+        "                    read_timeout_ms: 300000",
+    )
+    # Widen the IRR and callout deadlines for slow CPU inference/search.
+    config = config.replace("timeout_ms: 120000", "timeout_ms: 300000")
+    config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
+    config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+@pytest.fixture(scope="session")
+def file_search_streaming_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy with the streaming file-search-callout pipeline."""
+    port = _free_port()
+    config_path = _write_file_search_streaming_config(port)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("file-search-streaming")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== File search streaming proxy logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def file_search_streaming_client(file_search_streaming_proxy):
+    """Return an OpenAI client pointed at the streaming file-search proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{file_search_streaming_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+def _drain_response_stream(stream):
+    """Consume a Responses SSE stream.
+
+    Returns the ordered event types, every output item announced via
+    output_item.added/.done, and the terminal response status.
+    """
+    event_types = []
+    output_items = []
+    terminal_status = None
+    for event in stream:
+        event_types.append(event.type)
+        if event.type in (
+            "response.output_item.added",
+            "response.output_item.done",
+        ):
+            output_items.append(event.item)
+        if event.type in ("response.completed", "response.incomplete"):
+            terminal_status = event.response.status
+    return event_types, output_items, terminal_status
+
+
+class TestFileSearchStreamingVLLM:
+    """Issue #313: streaming hosted file_search (stream=True).
+
+    Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
+    example config: openai_stream_events(logical_stream) + file_search_callout
+    + openai_responses_proxy (streaming transport auto-derived from
+    stream=True). vLLM emits a private
+    function_call(name=file_search), which the callout suppresses and replaces
+    with a synthesized file_search_call lifecycle, runs the OGX search, and
+    streams a terminal re-inference round -- all collapsed onto a single
+    client-visible SSE response envelope.
+    """
+
+    _INPUT = (
+        "Use the file_search tool to find information about the Praxis "
+        "marker. Repeat the marker exactly. /no_think"
+    )
+
+    def test_streaming_file_search_lifecycle_events(
+        self, file_search_streaming_client, vector_store
+    ):
+        """The hosted file_search lifecycle is synthesized onto the stream."""
+        store_id, _marker = vector_store
+        stream = file_search_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input=self._INPUT,
+            tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            include=["file_search_call.results"],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types, output_items, terminal_status = _drain_response_stream(
+            stream
+        )
+
+        assert event_types, "stream should yield at least one event"
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] in (
+            "response.completed",
+            "response.incomplete",
+        ), event_types
+        assert terminal_status in ("completed", "incomplete"), terminal_status
+
+        assert "response.file_search_call.completed" in event_types, (
+            "streaming hosted file_search must emit the completed lifecycle "
+            f"event; got: {event_types}"
+        )
+
+        file_search_items = [
+            item for item in output_items if item.type == "file_search_call"
+        ]
+        assert file_search_items, (
+            "a hosted file_search_call item must be announced on the stream; "
+            f"got event types: {event_types}"
+        )
+        for item in file_search_items:
+            assert item.status in ("searching", "completed", "incomplete"), (
+                "file_search_call status should be a known lifecycle state; "
+                f"got: {item.status}"
+            )
+
+    def test_streaming_file_search_single_logical_stream(
+        self, file_search_streaming_client, vector_store
+    ):
+        """The search round and terminal round collapse into one envelope."""
+        store_id, _marker = vector_store
+        stream = file_search_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input=self._INPUT,
+            tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            include=["file_search_call.results"],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types, output_items, _status = _drain_response_stream(stream)
+
+        # The #756/#313 logical stream unifies the search round and the
+        # terminal re-inference round into ONE client-visible envelope.
+        assert event_types.count("response.created") == 1, (
+            "multiple model rounds must collapse to a single response.created; "
+            f"got: {event_types}"
+        )
+        terminal_count = sum(
+            1
+            for t in event_types
+            if t in ("response.completed", "response.incomplete")
+        )
+        assert terminal_count == 1, (
+            "the logical stream must emit exactly one terminal response event; "
+            f"got: {event_types}"
+        )
+
+        # The private function used to drive the search must never surface to
+        # the client as a function_call.
+        leaked = [
+            item for item in output_items if item.type == "function_call"
+        ]
+        assert not leaked, (
+            "the hosted file_search must not leak as a client function_call; "
+            f"leaked: {[getattr(item, 'name', '?') for item in leaked]}"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(
         pytest.main(

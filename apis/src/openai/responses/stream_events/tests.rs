@@ -2,9 +2,12 @@
 // Copyright (c) 2026 Praxis Contributors
 
 #![allow(
-    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
     clippy::indexing_slicing,
+    clippy::string_slice,
     clippy::too_many_lines,
+    clippy::unwrap_used,
     unused_must_use,
     reason = "tests"
 )]
@@ -15,7 +18,10 @@ use serde_json::json;
 
 use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object};
 use crate::{
-    openai::{responses::state::ResponsesState, sse::SseFrameParser},
+    openai::{
+        responses::state::{ResponsesState, SynthesisKind},
+        sse::SseFrameParser,
+    },
     test_utils::{make_filter_context, make_request},
 };
 
@@ -2537,6 +2543,7 @@ fn body_passes_through_unchanged() {
         deferred_terminal: None,
         deferred_done: false,
         local_items_flushed: false,
+        local_tool_items: std::collections::HashMap::new(),
     });
 
     let original = Bytes::from("event: response.created\ndata: {\"type\":\"response.created\",\"id\":\"r1\"}\n\n");
@@ -2570,6 +2577,7 @@ fn parse_error_sets_metadata() {
         deferred_terminal: None,
         deferred_done: false,
         local_items_flushed: false,
+        local_tool_items: std::collections::HashMap::new(),
     });
 
     let large_chunk =
@@ -3307,5 +3315,465 @@ async fn on_response_preserves_content_length_when_not_armed() {
             .get(http::header::CONTENT_LENGTH)
             .is_some(),
         "Content-Length should be preserved when filter is not armed"
+    );
+}
+
+// Test helpers for Task 4 file_search classification/suppression tests
+fn test_ctx_with_hosted_file_search_tool() -> praxis_filter::HttpFilterContext<'static> {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::default();
+    state.tools = vec![json!({"type": "file_search", "vector_store_ids": ["vs_1"]})];
+    ctx.extensions.insert(state);
+    ctx
+}
+
+fn test_ctx_without_file_search_tool() -> praxis_filter::HttpFilterContext<'static> {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    let state = ResponsesState::default();
+    ctx.extensions.insert(state);
+    ctx
+}
+
+fn responses_event(event_type: &str, mut payload: serde_json::Value) -> crate::openai::sse::responses::ResponsesEvent {
+    use crate::openai::sse::{SseFrame, responses::ResponsesEvent};
+    // Ensure the payload has the required "type" field matching the event_type
+    if let serde_json::Value::Object(ref mut obj) = payload {
+        obj.insert("type".to_owned(), serde_json::Value::String(event_type.to_owned()));
+    }
+    let data = serde_json::to_vec(&payload).unwrap();
+    let frame = SseFrame {
+        event_type: Some(event_type.to_owned()),
+        data,
+    };
+    ResponsesEvent::from_frame(&frame).unwrap()
+}
+
+impl OpenaiStreamEventsFilter {
+    fn test_logical_stream() -> Self {
+        Self {
+            parser_config: crate::openai::sse::SseParserConfig {
+                max_buffer_bytes: 10_485_760,
+                max_events: 100_000,
+                timeout: std::time::Duration::from_secs(300),
+            },
+            max_tool_call_argument_bytes: 1024 * 1024,
+            logical_stream: true,
+        }
+    }
+}
+
+#[test]
+fn suppress_mode_drops_private_function_call_lifecycle() {
+    use super::{StreamEventsState, append_logical_event, local_tools::LocalToolMode};
+
+    // A private function_call(name=file_search) opened while a hosted file_search
+    // tool is declared: its added/delta/done all suppressed (nothing emitted).
+    let mut ctx = test_ctx_with_hosted_file_search_tool();
+    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    filter.arm(&mut ctx);
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+
+    let added = responses_event(
+        "response.output_item.added",
+        json!({"output_index": 0, "item": {"id": "fc_1", "type": "function_call", "name": "file_search", "arguments": "{\"query\":\"x\"}"}}),
+    );
+    let delta = responses_event(
+        "response.function_call_arguments.delta",
+        json!({"item_id": "fc_1", "delta": "..."}),
+    );
+    let args_done = responses_event(
+        "response.function_call_arguments.done",
+        json!({"item_id": "fc_1", "arguments": "{\"query\":\"x\"}"}),
+    );
+    let item_done = responses_event(
+        "response.output_item.done",
+        json!({"output_index": 0, "item": {"id": "fc_1", "type": "function_call", "name": "file_search"}}),
+    );
+    let mut out = Vec::new();
+    for event in [added, delta, args_done, item_done] {
+        append_logical_event(&mut state, &mut ctx, event, &mut out);
+    }
+    assert!(
+        out.is_empty(),
+        "every event for a Suppress item (added/delta/arguments.done/output_item.done) must be dropped"
+    );
+    assert_eq!(state.local_tool_items.get("item:fc_1"), Some(&LocalToolMode::Suppress));
+}
+
+#[test]
+fn client_function_call_without_hosted_tool_passes_through() {
+    use super::{StreamEventsState, append_logical_event};
+
+    // has_file_search_tool == false: not suppressed, reaches the wire (P1 round-11).
+    let mut ctx = test_ctx_without_file_search_tool();
+    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    filter.arm(&mut ctx);
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let added = responses_event(
+        "response.output_item.added",
+        json!({"output_index": 0, "item": {"id": "fc_1", "type": "function_call", "name": "file_search"}}),
+    );
+    let mut out = Vec::new();
+    append_logical_event(&mut state, &mut ctx, added, &mut out);
+    assert!(
+        !out.is_empty(),
+        "client function_call must pass through when no hosted tool is declared"
+    );
+    assert!(
+        state.local_tool_items.is_empty(),
+        "nothing classified without a hosted tool"
+    );
+}
+
+#[test]
+fn native_hybrid_drops_pending_done_and_passes_opening() {
+    use super::{StreamEventsState, append_logical_event};
+
+    let mut ctx = test_ctx_with_hosted_file_search_tool();
+    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    filter.arm(&mut ctx);
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let added = responses_event(
+        "response.output_item.added",
+        json!({"output_index": 0, "item": {"id": "fs_1", "type": "file_search_call", "status": "searching"}}),
+    );
+    let pending_done = responses_event(
+        "response.output_item.done",
+        json!({"output_index": 0, "item": {"id": "fs_1", "type": "file_search_call", "status": "searching"}}),
+    );
+    let mut out = Vec::new();
+    append_logical_event(&mut state, &mut ctx, added, &mut out);
+    assert!(!out.is_empty(), "native opening passes through");
+    out.clear();
+    append_logical_event(&mut state, &mut ctx, pending_done, &mut out);
+    assert!(
+        out.is_empty(),
+        "a still-pending output_item.done is dropped (no double-done)"
+    );
+    assert!(
+        state.local_tool_items.contains_key("item:fs_1"),
+        "item stays registered for EOS synthesis"
+    );
+}
+
+#[test]
+fn native_terminal_done_passes_and_cancels_synthesis() {
+    use super::{StreamEventsState, append_logical_event};
+
+    let mut ctx = test_ctx_with_hosted_file_search_tool();
+    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    filter.arm(&mut ctx);
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let added = responses_event(
+        "response.output_item.added",
+        json!({"output_index": 0, "item": {"id": "fs_1", "type": "file_search_call", "status": "searching"}}),
+    );
+    let terminal_done = responses_event(
+        "response.output_item.done",
+        json!({"output_index": 0, "item": {"id": "fs_1", "type": "file_search_call", "status": "completed", "results": []}}),
+    );
+    let mut out = Vec::new();
+    append_logical_event(&mut state, &mut ctx, added, &mut out);
+    out.clear();
+    append_logical_event(&mut state, &mut ctx, terminal_done, &mut out);
+    assert!(!out.is_empty(), "a terminal (completed) done passes through");
+    assert!(
+        !state.local_tool_items.contains_key("item:fs_1"),
+        "keys removed → EOS synthesis cancelled"
+    );
+    assert!(!state.local_tool_items.contains_key("index:0"));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .provider_streamed_terminal_ids
+            .contains("fs_1"),
+        "provider-streamed terminal id recorded so the EOS reconcile skips re-queuing it (P1)"
+    );
+}
+
+#[test]
+fn native_failed_done_records_observation_for_reconcile_skip() {
+    use super::{StreamEventsState, append_logical_event};
+
+    // #313 P1: a provider-streamed FAILED (or incomplete) native done also passes through
+    // and must be recorded — the reconcile skips by observed membership, not status, so a
+    // synthesized tail cannot duplicate this live terminal done.
+    let mut ctx = test_ctx_with_hosted_file_search_tool();
+    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    filter.arm(&mut ctx);
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let added = responses_event(
+        "response.output_item.added",
+        json!({"output_index": 0, "item": {"id": "fs_9", "type": "file_search_call", "status": "searching"}}),
+    );
+    let failed_done = responses_event(
+        "response.output_item.done",
+        json!({"output_index": 0, "item": {"id": "fs_9", "type": "file_search_call", "status": "failed"}}),
+    );
+    let mut out = Vec::new();
+    append_logical_event(&mut state, &mut ctx, added, &mut out);
+    out.clear();
+    append_logical_event(&mut state, &mut ctx, failed_done, &mut out);
+    assert!(!out.is_empty(), "a terminal (failed) done passes through");
+    assert!(
+        !state.local_tool_items.contains_key("item:fs_9"),
+        "keys removed → EOS synthesis cancelled"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .provider_streamed_terminal_ids
+            .contains("fs_9"),
+        "a provider-streamed FAILED native is recorded so reconcile skips it (P1)"
+    );
+}
+
+#[tokio::test]
+async fn logical_stream_finalize_clears_provider_streamed_terminal_ids() {
+    // #313 P1 (DoS bound): file_search's EOS reconcile (a prior response-phase filter) consumes
+    // this round's observation set; finalize must clear it so it cannot accumulate across IRR
+    // continuation rounds and bypass max_state_bytes. Seeding it stands in for a round in which
+    // stream_events observed a provider-streamed native terminal done.
+    let filter = make_logical_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_first", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    let mut terminal = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {"id": "resp_first", "status": "completed", "output": []},
+            "sequence_number": 1
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .provider_streamed_terminal_ids
+        .insert("fs_round_n".to_owned());
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .provider_streamed_terminal_ids
+            .is_empty(),
+        "finalize must clear the per-round observation set so it cannot grow across IRR rounds (P1 DoS bound)"
+    );
+}
+
+#[test]
+fn logical_stream_continues_recognizes_file_search_loop() {
+    use super::logical_stream_continues;
+
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.filter_results
+        .entry("openai_file_search_callout")
+        .or_default()
+        .set("action", "loop")
+        .unwrap();
+    assert!(
+        logical_stream_continues(&ctx),
+        "file_search action=loop must continue the logical stream"
+    );
+}
+
+#[test]
+fn arm_publishes_file_search_marker_on_logical_stream() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    OpenaiStreamEventsFilter::test_logical_stream().arm(&mut ctx);
+    assert_eq!(ctx.get_metadata("responses.logical_stream.file_search"), Some("true"));
+}
+
+#[test]
+fn drain_offset_discipline_emits_round_local_then_offset() {
+    // accumulated len 6; the synthesized call sits at absolute index 5. With
+    // output_index_offset 5, round_local = 5 - 5 = 0, and normalize re-adds the offset
+    // → wire output_index = 0 + 5 = 5 (no double-offset, no underflow).
+    let mut ctx = test_ctx_without_file_search_tool();
+    let mut state = ResponsesState::default();
+    state.accumulated_output = (0..6)
+        .map(|_| json!({"type":"file_search_call","status":"completed","results":[]}))
+        .collect();
+    state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native)];
+    ctx.extensions.insert(state);
+    let mut out = Vec::new();
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, 5, &mut out);
+    let emitted = String::from_utf8(out).unwrap();
+    assert!(
+        emitted.contains("\"output_index\":5"),
+        "absolute 5 with offset 5 → round_local 0 → wire output_index 5; got: {emitted}"
+    );
+}
+
+#[test]
+fn drain_pre_existing_error_suppresses_synthesis() {
+    let mut ctx = test_ctx_without_file_search_tool();
+    ctx.set_metadata("responses.stream_error_code", "server_error"); // set before drain
+    let mut state = ResponsesState::default();
+    state.accumulated_output = vec![json!({"type":"file_search_call","status":"completed","results":[]})];
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Native)]; // a VALID queued item
+    ctx.extensions.insert(state);
+    let mut out = Vec::new();
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, 0, &mut out);
+    assert!(
+        out.is_empty(),
+        "a valid queued item is discarded when an error is already committed"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .pending_local_tool_synthesis
+            .is_empty(),
+        "queue drained once regardless of the error short-circuit"
+    );
+}
+
+#[test]
+fn drain_invalid_index_sets_error_and_no_gap() {
+    let mut ctx = test_ctx_without_file_search_tool();
+    let mut state = ResponsesState::default();
+    state.accumulated_output = vec![json!({"type":"file_search_call","status":"completed","results":[]})];
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Native)]; // offset 3 > absolute 0 → None
+    ctx.extensions.insert(state);
+    let mut out = Vec::new();
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, 3, &mut out);
+    assert!(out.is_empty(), "no guessed frame on invariant failure");
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_some(),
+        "five-write set"
+    );
+}
+
+// §10 P0: native-progress-precedes-closed-error ordering (no gap, no rewind).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_progress_precedes_closed_error_ordering() {
+    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    }));
+    state.tools = vec![json!({"type": "file_search", "vector_store_ids": ["vs_1"]})];
+    ctx.extensions.insert(state);
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    // Drive one native file_search progress frame through to get a sequence_number
+    let mut progress = Some(make_sse_chunk(
+        "response.file_search_call.in_progress",
+        &json!({
+            "response_id": "resp_fail",
+            "output_index": 0,
+            "item": {"type": "file_search_call", "id": "fs_1", "status": "searching"},
+            "sequence_number": 1
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut progress, false).unwrap();
+    let progress_out = String::from_utf8(progress.unwrap().to_vec()).unwrap();
+    // Extract the normalized sequence_number from the emitted frame
+    let last_live_sequence: u64 = progress_out
+        .lines()
+        .find(|line| line.starts_with("data:"))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(&line[5..]).ok())
+        .and_then(|v| v.get("sequence_number").and_then(serde_json::Value::as_u64))
+        .expect("native progress frame must have sequence_number");
+
+    // Set up closed-failure state: file_search publishes action=done + logical_stream_error
+    ctx.filter_results
+        .entry("openai_file_search_callout")
+        .or_default()
+        .set("action", "done")
+        .unwrap();
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", "file_search failed");
+
+    // Call finalizer → should emit error frame
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let eos = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+
+    // Assert (a) error frame's sequence_number == last_live_sequence + 1
+    assert!(eos.contains("event: error"), "EOS must contain error frame");
+    let error_sequence: u64 = eos
+        .lines()
+        .find(|line| line.starts_with("data:"))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(&line[5..]).ok())
+        .and_then(|v| v.get("sequence_number").and_then(serde_json::Value::as_u64))
+        .expect("error frame must have sequence_number");
+    assert_eq!(
+        error_sequence,
+        last_live_sequence + 1,
+        "error frame sequence_number == last_live + 1 (no gap, no rewind)"
+    );
+
+    // Assert (b) error frame is the last frame (no frames after it)
+    let event_count = eos.matches("event:").count();
+    assert_eq!(
+        event_count, 1,
+        "error frame is the last frame (no retraction of earlier frames)"
+    );
+
+    // Assert (c) earlier native progress frame was emitted (verified by progress_out above)
+    assert!(
+        progress_out.contains("file_search_call.in_progress"),
+        "native progress frame was emitted and not retracted"
+    );
+}
+
+// §10 P1: synthesis atomicity validate-all-before-emit (valid item before invalid → both suppressed).
+#[test]
+fn drain_atomicity_valid_item_before_invalid_both_suppressed() {
+    let mut ctx = test_ctx_without_file_search_tool();
+    // accumulated len 6; queue [(5,Native)=valid round_local 0, (2,Native)=underflows with offset 5].
+    let mut state = ResponsesState::default();
+    state.accumulated_output = (0..6)
+        .map(|_| json!({"type":"file_search_call","status":"completed","results":[]}))
+        .collect();
+    state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native), (2, SynthesisKind::Native)];
+    ctx.extensions.insert(state);
+    let mut out = Vec::new();
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, 5, &mut out);
+    assert!(
+        out.is_empty(),
+        "atomicity: the VALID item is not emitted when a later queued item is invalid"
+    );
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_some(),
+        "validation failure sets the five-write"
     );
 }

@@ -13,6 +13,7 @@ pub(crate) mod citations;
 pub(crate) mod client;
 mod config;
 mod model_context;
+mod streaming;
 
 use std::{
     borrow::Cow,
@@ -25,7 +26,7 @@ use bytes::Bytes;
 use http::HeaderMap;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde::{Deserialize, de::SeqAccess};
 use serde_json::Value;
@@ -70,10 +71,14 @@ const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 
 /// Executes pending file search calls against a vector store API compatible backend.
 ///
-/// The enclosing iterative router owns model re-entry. Streaming requests are
-/// rejected because citation markers require an incremental SSE transformer.
-/// Search queries are forwarded unchanged; model context and citation
-/// marker formatting are internal.
+/// The enclosing iterative router owns model re-entry. Streaming is supported via
+/// the terminal-streaming machinery: the step-local `openai_stream_events` filter
+/// (`logical_stream: true`) finalizer synthesizes citation-annotated `file_search`
+/// lifecycle frames at EOS. Search queries are forwarded unchanged; model context
+/// and citation marker formatting are internal.
+///
+/// Cannot share an IRR step with `openai_agentic_loop` due to competing
+/// `accumulated_output` ownership.
 pub struct FileSearchCalloutFilter {
     /// Callout client for the vector store API.
     client: FileSearchClient,
@@ -84,9 +89,6 @@ pub struct FileSearchCalloutFilter {
     /// Whether a failed callout rejects or produces an incomplete result.
     on_failure: OnFailure,
 }
-
-/// Request-local marker used to reject streaming before the first subrequest.
-struct StreamingRequest;
 
 impl FileSearchCalloutFilter {
     /// Create a filter from parsed YAML configuration.
@@ -283,14 +285,7 @@ impl FileSearchCalloutFilter {
     }
 
     /// Execute pending calls before the next inference body is serialized.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "linear sequence: plan → callout → apply → size check"
-    )]
     async fn execute_pending(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if let Some(rejection) = unsupported_streaming_rejection(ctx) {
-            return Ok(rejection);
-        }
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
@@ -317,6 +312,110 @@ impl FileSearchCalloutFilter {
         reset_tool_choice(state);
         state.iteration = state.iteration.saturating_add(1);
         Ok(FilterAction::Continue)
+    }
+
+    /// Streaming EOS entry: STEP 0 gate → STEP 0.5/0.6 → BRANCH A/B (later tasks).
+    /// Owns `ResponsesState` for the call (`agentic_loop` idiom, mod.rs:288-305) so the
+    /// steps can hold `&mut ctx` and `&mut state` together; reinserts on every path.
+    pub(super) fn capture_streaming_response(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+    ) -> Result<FilterAction, FilterError> {
+        let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
+            // No state to reconcile: publish the terminal result and continue.
+            ctx.filter_results
+                .entry("openai_file_search_callout")
+                .or_default()
+                .set("pending", "false")?;
+            return Ok(FilterAction::Continue);
+        };
+        let action = self.capture_streaming_inner(ctx, &mut state);
+        // Reinsert the (mutated) state so stream_events' finalize drain reads it.
+        ctx.extensions.insert(state);
+        action
+    }
+
+    /// Inner steps operate on the owned `&mut state` local. For now: publish
+    /// pending="false" and continue (STEP 0/branches added in later tasks).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear sequence: STEP 0 gate → STEP 0.5/0.6 → BRANCH A (search) / BRANCH B (terminal)"
+    )]
+    fn capture_streaming_inner(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        state: &mut ResponsesState,
+    ) -> Result<FilterAction, FilterError> {
+        if streaming::step_0_gate(ctx, state, MAX_JSON_BODY_BYTES) {
+            return Ok(FilterAction::Continue);
+        }
+        let Ok(translated) = streaming::step_0_5_translate_and_mixed_tool(ctx, state) else {
+            return Ok(FilterAction::Continue);
+        };
+        streaming::step_0_6_apply_budget(state);
+        let plan = build_search_plan(state);
+        if plan.has_pending_calls {
+            let batch = match streaming::admit_or_shed(
+                ctx,
+                state,
+                &streaming::FILE_SEARCH_EOS_ADMISSION_SEM,
+                self.on_failure,
+            ) {
+                streaming::Admission::Admitted(_permit) => {
+                    let headers = callout_request_headers(ctx).into_owned();
+                    let handle = tokio::runtime::Handle::current();
+                    tokio::task::block_in_place(|| handle.block_on(self.execute_plan(&plan, &headers)))
+                },
+                streaming::Admission::ShedClosed => return Ok(FilterAction::Continue),
+                streaming::Admission::ShedOpen => SearchBatch::with_failures(
+                    plan.calls.len(),
+                    plan.calls
+                        .iter()
+                        .enumerate()
+                        .map(|(call_index, _call)| SearchFailure {
+                            call_index,
+                            error: request_error("admission", "file_search admission overloaded"),
+                        })
+                        .collect(),
+                ),
+            };
+            if self.failure_rejection(&batch).is_some() {
+                streaming::fs_end_stream_with_error(
+                    ctx,
+                    state,
+                    "server_error",
+                    "openai_file_search_callout: search failed",
+                );
+                return Ok(FilterAction::Continue);
+            }
+            let framework_bytes = retained_iteration_bytes(ctx);
+            if Self::apply_batch(state, &plan, &batch).is_err() {
+                streaming::fs_end_stream_with_error(
+                    ctx,
+                    state,
+                    "server_error",
+                    "openai_file_search_callout: apply_batch failed",
+                );
+                return Ok(FilterAction::Continue);
+            }
+            streaming::reconcile_round_into_accumulated_output(state, &translated);
+            if !continuation_state_fits(framework_bytes, state, self.max_state_bytes, 0) {
+                streaming::fs_end_stream_with_error(
+                    ctx,
+                    state,
+                    "server_error",
+                    "openai_file_search_callout: continuation state too large",
+                );
+                return Ok(FilterAction::Continue);
+            }
+            reset_tool_choice(state);
+            state.iteration = state.iteration.saturating_add(1);
+            let results = ctx.filter_results.entry("openai_file_search_callout").or_default();
+            results.set("pending", "true")?;
+            results.set("action", "loop")?;
+            return Ok(FilterAction::Continue);
+        }
+        streaming::branch_b_terminal(ctx, state, &translated, MAX_JSON_BODY_BYTES)
     }
 
     /// Capture a model response and expose whether another inference is needed.
@@ -361,17 +460,12 @@ impl FileSearchCalloutFilter {
         if !response.is_object() {
             return Ok(invalid_success_response_action(continued));
         }
-        let has_file_search_tool = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
-            state
-                .tools
-                .iter()
-                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("file_search"))
-        });
-        if has_file_search_tool {
+        let has_file_search = ctx.extensions.get::<ResponsesState>().is_some_and(has_file_search_tool);
+        if has_file_search {
             let translated = translate_function_calls_to_file_search(&mut response);
-            if translated > 0 {
+            if !translated.is_empty() {
                 debug!(
-                    count = translated,
+                    count = translated.len(),
                     "translated function_call(name=file_search) to file_search_call"
                 );
             }
@@ -455,27 +549,30 @@ impl HttpFilter for FileSearchCalloutFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        // Declared `Stream` so this filter can share an iterative-router step with
-        // `responses_to_chat_completions`, which always advertises the streaming
-        // subrequest capability. A statically declared `StreamBuffer` would trip
-        // the per-step build check that rejects a streaming-capable step whose
-        // merged response body mode is `StreamBuffer`. This filter still needs the
-        // complete response to run `capture_response`, so `on_request` ratchets the
-        // runtime body mode back up to `StreamBuffer` (mirroring
-        // `openai_response_store`); a file-search request always rejects
-        // `stream: true`, so the runtime response is never actually streamed.
+        // D9 (§7.1): Stream so a streaming EOS reaches `on_response_body` with
+        // `body=None`; buffered callers still get one full-body call via the IRR
+        // Buffered driver. Declaring `Stream` also keeps this filter composable in
+        // an iterative-router step with `openai_responses_proxy`, which always
+        // advertises the streaming capability and requires every response-body
+        // filter in its step to use `BodyMode::Stream` (or reject streaming)
+        // rather than silently buffer.
         BodyMode::Stream
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // A file-search pipeline never streams (`stream: true` is rejected), so
-        // buffer the complete response for `capture_response`. Declared statically
-        // as `Stream` to stay build-compatible with a streaming-capable step;
-        // ratcheting the runtime mode up to `StreamBuffer` here restores buffering
-        // without reintroducing a static `StreamBuffer` that would trip the check.
-        ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        });
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+            // Consume-on-read the per-consumer marker; fail closed (500) if a
+            // duplicate consumer already took it or stream_events did not publish it.
+            let armed = ctx.get_metadata("responses.logical_stream.file_search") == Some("true");
+            ctx.set_metadata("responses.logical_stream.file_search", "false");
+            if !armed {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    500,
+                    "server_error",
+                    "openai_file_search_callout: logical stream not armed by openai_stream_events",
+                )));
+            }
+        }
         let action = self.execute_pending(ctx).await?;
         if matches!(action, FilterAction::Continue) {
             preserve_original_request_headers(ctx);
@@ -511,7 +608,12 @@ impl HttpFilter for FileSearchCalloutFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        Self::capture_response(ctx, body, self.max_state_bytes)
+        match body.as_ref() {
+            // Buffered/non-streaming path: one full-body call — unchanged.
+            Some(_) => Self::capture_response(ctx, body, self.max_state_bytes),
+            // Streaming path: completion pass with body=None (§7.1 D9).
+            None => self.capture_streaming_response(ctx),
+        }
     }
 }
 
@@ -582,9 +684,6 @@ fn initialize_file_search_state(
 ) -> Option<FilterAction> {
     let bytes = body.as_ref()?;
     let probe = probe_request(bytes)?;
-    if probe.stream {
-        ctx.extensions.insert(StreamingRequest);
-    }
     if ctx.extensions.get::<ResponsesState>().is_some() {
         return None;
     }
@@ -608,10 +707,6 @@ fn initialize_file_search_state(
 /// full request for unrelated Responses calls.
 #[derive(Deserialize)]
 struct FileSearchRequestProbe {
-    /// Whether the client requested an SSE response.
-    #[serde(default)]
-    stream: bool,
-
     /// Whether the request's tools array contains a file-search declaration.
     #[serde(default)]
     tools: FileSearchToolsProbe,
@@ -738,6 +833,10 @@ fn continuation_state_fits(
                 .iter()
                 .map(|((server, tool), _)| server.len().saturating_add(tool.len())),
         )
+        // #313 P1: charge the per-round provider-streamed observation set against the same
+        // ceiling as every other request-scoped field, so one round streaming many distinct
+        // native ids cannot bypass max_state_bytes (finalize clears it between rounds).
+        .chain(state.provider_streamed_terminal_ids.iter().map(String::len))
         .fold(0_usize, usize::saturating_add);
     used = used.saturating_add(string_bytes);
     for value in state.mcp_tool_map.values() {
@@ -1117,6 +1216,7 @@ fn remaining_file_search_call_budget(state: &ResponsesState) -> usize {
     let used_calls = state
         .file_search_output_items
         .iter()
+        .chain(state.accumulated_output.iter())
         .chain(state.output_items())
         .filter(|item| is_builtin_tool_call(item) && !is_pending_file_search_call(item))
         .count();
@@ -1304,21 +1404,6 @@ fn join_queries_bounded(queries: &[String]) -> (String, bool) {
     (joined, false)
 }
 
-/// Reject streaming before the iterative router can silently buffer SSE.
-fn unsupported_streaming_rejection(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
-    (ctx.extensions.get::<StreamingRequest>().is_some()
-        || ctx
-            .get_metadata("openai_responses_format.stream")
-            .is_some_and(|value| value == "true"))
-    .then(|| {
-        FilterAction::Reject(responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "openai_file_search_callout: stream=true is not supported by an iterative file-search pipeline",
-        ))
-    })
-}
-
 /// Return whether one output item still requires local file-search execution.
 ///
 /// Shared with `openai_web_search`, which must exclude these pending
@@ -1333,9 +1418,17 @@ pub(crate) fn is_pending_file_search_call(item: &Value) -> bool {
 }
 
 /// Whether an output item is a vLLM-emitted `function_call` for file search.
-fn is_file_search_function_call(item: &Value) -> bool {
+pub(crate) fn is_file_search_function_call(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("function_call")
         && item.get("name").and_then(Value::as_str) == Some("file_search")
+}
+
+/// Whether the response state contains a file search tool.
+pub(crate) fn has_file_search_tool(state: &ResponsesState) -> bool {
+    state
+        .tools
+        .iter()
+        .any(|tool| tool.get("type").and_then(Value::as_str) == Some("file_search"))
 }
 
 /// Parse file-search queries from a `function_call` arguments string.
@@ -1373,14 +1466,14 @@ fn extract_file_search_queries(arguments: &str) -> Vec<String> {
 /// Translate vLLM `function_call` items with `name == "file_search"` into
 /// `file_search_call` items so the pending-call scan recognizes them.
 ///
-/// Returns the number of translated items.
-fn translate_function_calls_to_file_search(response: &mut Value) -> usize {
+/// Returns the round-local output indices it rewrote.
+fn translate_function_calls_to_file_search(response: &mut Value) -> Vec<usize> {
     let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
-        return 0;
+        return Vec::new();
     };
 
-    let mut translated = 0;
-    for item in output.iter_mut() {
+    let mut translated = Vec::new();
+    for (index, item) in output.iter_mut().enumerate() {
         if !is_file_search_function_call(item) {
             continue;
         }
@@ -1405,7 +1498,7 @@ fn translate_function_calls_to_file_search(response: &mut Value) -> usize {
         object.remove("arguments");
         object.remove("call_id");
 
-        translated += 1;
+        translated.push(index);
     }
     translated
 }
@@ -1527,11 +1620,16 @@ fn ensure_public_file_search_call_id(
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
+    clippy::bool_assert_comparison,
     clippy::expect_used,
+    clippy::field_reassign_with_default,
     clippy::indexing_slicing,
     clippy::needless_raw_string_hashes,
     clippy::needless_raw_strings,
     clippy::panic,
+    clippy::redundant_closure,
+    clippy::significant_drop_tightening,
+    clippy::str_to_string,
     clippy::too_many_lines,
     clippy::unwrap_used,
     reason = "tests"

@@ -155,9 +155,18 @@ fn file_search_callout_example_without_tools_passthrough() {
     assert_eq!(parse_body(&raw), response, "request should reach inference backend");
 }
 
+// #313 §7.1: the buffered file-search-callout example fails closed on `stream:true`.
+// The old `unsupported_streaming_rejection` (400) was removed; the proxy now auto-derives
+// the streaming transport from the client's `stream:true`, so `openai_file_search_callout`
+// runs in a Streaming subrequest mode. Because this buffered pipeline has no
+// `openai_stream_events` ahead of the callout, the logical stream is never armed, and the
+// on_request streaming-arm guard fails closed with a 500 rather than silently passing an
+// unsupervised stream through. Streaming file_search lives in the separate
+// file-search-streaming example, which arms the logical stream.
 #[test]
-fn file_search_callout_example_rejects_streaming_before_inference() {
-    let backend = start_backend_with_shutdown(r#"{"id":"unexpected"}"#);
+fn file_search_callout_example_fails_closed_on_unarmed_streaming() {
+    let response = r#"{"id":"resp_789","object":"response","output":[{"id":"msg_789","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi","annotations":[]}]}]}"#;
+    let backend = start_backend_with_shutdown(response);
     let proxy_port = free_port();
     let config = load_file_search_callout_config(proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_file_search_proxy(&config);
@@ -165,10 +174,14 @@ fn file_search_callout_example_rejects_streaming_before_inference() {
     let body = r#"{"model":"gpt-4.1","input":"Hello","stream":true}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
-    assert_eq!(parse_status(&raw), 400, "streaming should be rejected: {raw}");
+    assert_eq!(
+        parse_status(&raw),
+        500,
+        "buffered example fails closed on unarmed streaming (§7.1): {raw}"
+    );
     assert!(
-        parse_body(&raw).contains("stream=true is not supported"),
-        "rejection should explain the pipeline limitation: {raw}"
+        parse_body(&raw).contains("logical stream not armed by openai_stream_events"),
+        "rejection should explain the missing openai_stream_events arm: {raw}"
     );
 }
 

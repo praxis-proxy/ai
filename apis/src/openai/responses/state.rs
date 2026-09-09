@@ -17,6 +17,18 @@ use bytes::Bytes;
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 
+/// Origin of a reconciled `file_search` item queued for EOS synthesis (#313 §4).
+/// Captured at translate time (a `Private` item's opening was suppressed by
+/// `stream_events` and must be reproduced; a `Native` item's opening already
+/// streamed live, so only the tail is synthesized).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SynthesisKind {
+    /// Translated from a private `function_call` this round; opening must be synthesized.
+    Private,
+    /// Native hybrid `file_search_call`; opening already streamed.
+    Native,
+}
+
 /// Request-scoped state shared across Responses API filters.
 ///
 /// Created by `openai_responses_validate` for every Responses API
@@ -225,6 +237,31 @@ pub(crate) struct ResponsesState {
     /// `mcp_dispatch` records both the approval-request and result item ids;
     /// `web_search` records the id it replaces with executed results.
     pub locally_executed_output_items: HashSet<String>,
+
+    /// Absolute `output_index` values into `accumulated_output` (+ origin) for the
+    /// items `openai_file_search_callout` reconciled this round on the streaming
+    /// path. Drained exactly once by `stream_events` at finalize (§4.2). Index + a
+    /// 1-byte tag (no owned `Value`) so it needs no separate `continuation_state_fits` charge.
+    pub pending_local_tool_synthesis: Vec<(usize, SynthesisKind)>,
+
+    /// Provider `file_search_call` item ids whose terminal lifecycle
+    /// `stream_events` already streamed live — a native hybrid whose terminal
+    /// `output_item.done` passed through, cancelling EOS suppression (§6).
+    /// The streaming reconcile reads this to skip re-queuing such a call for
+    /// synthesis; a synthesized tail would emit a DUPLICATE terminal
+    /// `output_item.done` (#313 P1). Recorded for ANY provider-terminal status
+    /// (completed/failed/incomplete): the set membership — not the status — is
+    /// authoritative. A callout-terminalized `incomplete` call is absent here
+    /// (its live done was suppressed, never passed through) and still synthesizes.
+    /// Keyed by item id (stable across the streamed done and the accumulated item).
+    ///
+    /// Lifecycle is one IRR round: `stream_events` records into it during the round's
+    /// chunks, `file_search`'s EOS reconcile reads it, then `finalize_logical_stream`
+    /// clears it (§6). The ids are stale after their round — they never re-match a later
+    /// round's items — so clearing loses nothing and bounds the set. It is also charged
+    /// against `max_state_bytes` in `continuation_state_fits` like every other
+    /// request-scoped field (#313 P1 `DoS` bound).
+    pub provider_streamed_terminal_ids: BTreeSet<String>,
 }
 
 /// Which client-visible lifecycle milestones a locally generated output item has
@@ -323,6 +360,8 @@ impl Default for ResponsesState {
             accumulated_output: Vec::new(),
             emitted_output_items: HashMap::new(),
             locally_executed_output_items: HashSet::new(),
+            pending_local_tool_synthesis: Vec::new(),
+            provider_streamed_terminal_ids: BTreeSet::new(),
         }
     }
 }
@@ -352,6 +391,7 @@ impl ResponsesState {
             tool_choice,
             tools,
             accumulated_output: Vec::new(),
+            pending_local_tool_synthesis: Vec::new(),
             ..Default::default()
         }
     }
@@ -418,6 +458,11 @@ impl ResponsesState {
         if let Ok(serialized) = serde_json::to_vec(&response) {
             *body = Some(Bytes::from(serialized));
         }
+    }
+
+    /// Move the pending local-tool synthesis queue out, leaving it empty.
+    pub fn drain_pending_local_tool_synthesis(&mut self) -> Vec<(usize, SynthesisKind)> {
+        std::mem::take(&mut self.pending_local_tool_synthesis)
     }
 }
 
@@ -798,5 +843,18 @@ mod tests {
         let body = json!({"model": "gpt-4o", "input": "test"});
         let state = ResponsesState::from_request_body(body);
         assert!(state.mcp_tool_map.is_empty(), "initial mcp_tool_map should be empty");
+    }
+
+    #[test]
+    fn drain_pending_local_tool_synthesis_moves_and_empties() {
+        let mut state = ResponsesState::default();
+        state.pending_local_tool_synthesis.push((3, SynthesisKind::Native));
+        state.pending_local_tool_synthesis.push((7, SynthesisKind::Private));
+        let drained = state.drain_pending_local_tool_synthesis();
+        assert_eq!(drained, vec![(3, SynthesisKind::Native), (7, SynthesisKind::Private)]);
+        assert!(
+            state.pending_local_tool_synthesis.is_empty(),
+            "drain must leave the queue empty (drain-once)"
+        );
     }
 }

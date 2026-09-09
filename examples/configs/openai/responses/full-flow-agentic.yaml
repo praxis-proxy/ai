@@ -7,13 +7,14 @@
 # context back for a second model inference before returning the
 # final Responses API object.
 #
-# This config does NOT support streaming or WebSocket:
-# openai_file_search_callout rejects streaming requests (it must buffer
-# each model response to detect file_search_call items). For streaming
-# without the agentic loop, see full-flow.yaml. For MCP-driven agentic
-# tool loops, see agentic-loop.yaml (these two loop types cannot share
-# an IRR step because agentic_loop and file_search_callout use
-# incompatible response-body accumulation strategies).
+# This config does NOT support streaming or WebSocket in the agentic
+# loop: openai_file_search_callout shares its IRR step with
+# openai_agentic_loop, which fully buffers each model response. For
+# streaming without hosted file_search, see full-flow.yaml. For
+# streaming hosted file_search (without the agentic loop), see
+# file-search-streaming.yaml. file_search_callout cannot share an IRR
+# step with openai_agentic_loop due to competing accumulated_output
+# ownership.
 #
 # Pre-IRR filters run once on the client request to set up shared
 # state (ResponsesState) which persists across all IRR iterations
