@@ -46,7 +46,8 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::{
-    openai_mcp_tool_resolve::encode_function_name,
+    mcp_dispatch::FILTER_RESULT_KEY as MCP_DISPATCH_FILTER_RESULT_KEY,
+    openai_mcp_tool_resolve::McpToolIndex,
     state::{ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions},
 };
 use crate::web_search::{
@@ -343,7 +344,10 @@ impl HttpFilter for WebSearchFilter {
         }
 
         let admissions = state.max_tool_calls.map(|_| {
-            current_round_tool_call_admissions(state, &state.web_search_calls, |item| is_mcp_function_call(state, item))
+            let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+            current_round_tool_call_admissions(state, &state.web_search_calls, |item| {
+                is_mcp_function_call(&tool_index, item)
+            })
         });
         let context_size = ctx
             .get_metadata("tool_parse.search_context_size")
@@ -435,7 +439,7 @@ fn oversized_web_search_batch(ctx: &mut HttpFilterContext<'_>) -> Result<FilterA
         ctx.set_metadata("responses.stream_error_message", MESSAGE);
         ctx.set_metadata("responses.skip_persist", "true");
         ctx.filter_results
-            .entry("openai_mcp_dispatch")
+            .entry(MCP_DISPATCH_FILTER_RESULT_KEY)
             .or_default()
             .set("action", ACTION_DONE)?;
         set_action(ctx, ACTION_DONE)?;
@@ -449,14 +453,12 @@ fn oversized_web_search_batch(ctx: &mut HttpFilterContext<'_>) -> Result<FilterA
 }
 
 /// Return whether an output item is one of this request's resolved MCP calls.
-fn is_mcp_function_call(state: &ResponsesState, item: &Value) -> bool {
+fn is_mcp_function_call(tool_index: &McpToolIndex<'_>, item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("function_call")
-        && item.get("name").and_then(Value::as_str).is_some_and(|encoded| {
-            state
-                .mcp_tool_map
-                .keys()
-                .any(|(label, name)| encode_function_name(label, name) == encoded)
-        })
+        && item
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|encoded| tool_index.contains(encoded))
 }
 
 /// Recover per-request search context after IRR resets step-local metadata.

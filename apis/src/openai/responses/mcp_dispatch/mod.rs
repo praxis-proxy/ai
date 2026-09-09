@@ -44,10 +44,9 @@ mod config;
 )]
 mod tests;
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::{collections::HashSet, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -64,13 +63,13 @@ use self::{
 };
 use super::{
     error::responses_error_rejection,
-    openai_mcp_tool_resolve::encode_function_name,
+    openai_mcp_tool_resolve::{McpToolIndex, McpToolMatch},
     state::{McpApprovalState, ResponsesState, current_round_borrowed_tool_call_admissions},
 };
 use crate::{json_body::serialized_len, mcp_client};
 
 /// Filter result key consumed by `iterative_request_router`.
-const FILTER_RESULT_KEY: &str = "openai_mcp_dispatch";
+pub(super) const FILTER_RESULT_KEY: &str = "openai_mcp_dispatch";
 
 /// Continue with another inference iteration after MCP execution.
 const ACTION_LOOP: &str = "loop";
@@ -154,8 +153,8 @@ impl McpDispatchFilter {
         // sibling dispatcher can request another inference round; otherwise a
         // web-search continuation could re-enter request dispatch and execute
         // an approval-gated call.
-        let tool_map = &state.mcp_tool_map;
-        state.tool_calls.retain(|call| !is_mcp_tool_call(call, tool_map));
+        let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+        state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
 
         if !ungated.is_empty() {
             state.tool_calls.extend(ungated);
@@ -233,14 +232,23 @@ impl McpDispatchFilter {
         &self,
         state: &ResponsesState,
         mcp_calls: &[&serde_json::Value],
+        tool_index: &McpToolIndex<'_>,
     ) -> Result<McpBatchResult, McpResultLimitExceeded> {
         let execute_count = state.max_tool_calls.map_or(mcp_calls.len(), |_| {
-            current_round_borrowed_tool_call_admissions(state, mcp_calls, |item| {
-                is_mcp_tool_call(item, &state.mcp_tool_map)
-            })
-            .iter()
-            .take_while(|admitted| **admitted)
-            .count()
+            let admissions = current_round_borrowed_tool_call_admissions(state, mcp_calls, |item| {
+                is_mcp_tool_call(item, tool_index)
+            });
+            // Admissions are a prefix: the shared remaining budget only
+            // decreases as model calls are visited in provider order.
+            debug_assert!(
+                !admissions
+                    .iter()
+                    .copied()
+                    .skip_while(|admitted| *admitted)
+                    .any(|admitted| admitted),
+                "tool-call admissions must remain monotonic"
+            );
+            admissions.iter().take_while(|admitted| **admitted).count()
         });
         let (executable, rejected) = mcp_calls.split_at(execute_count);
         debug!(
@@ -263,7 +271,7 @@ impl McpDispatchFilter {
             timeout: self.timeout,
             allow_loopback: self.allow_loopback,
         };
-        let mut results = execute_mcp_calls(executable, &state.mcp_tool_map, options).await?;
+        let mut results = execute_mcp_calls(executable, tool_index, options).await?;
         let mut retained_bytes = retained_results_bytes(&results)?;
         for &call in rejected {
             push_result_within_budget(
@@ -304,8 +312,8 @@ impl McpDispatchFilter {
             }
             state.accumulated_output.push(result.output_item);
         }
-        let tool_map = &state.mcp_tool_map;
-        state.tool_calls.retain(|call| !is_mcp_tool_call(call, tool_map));
+        let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+        state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
     }
 
     /// Record a response-wide tool-limit cutoff for terminalization by the loop.
@@ -398,8 +406,12 @@ impl HttpFilter for McpDispatchFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+            return Ok(FilterAction::Continue);
+        }
 
-        let mcp_call_count = count_mcp_tool_calls(&state.tool_calls, &state.mcp_tool_map);
+        let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+        let mcp_call_count = count_mcp_tool_calls(&state.tool_calls, &tool_index);
         if mcp_call_count > self.max_calls_per_round {
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
@@ -407,12 +419,12 @@ impl HttpFilter for McpDispatchFilter {
                 "model response exceeded the configured MCP call limit",
             )));
         }
-        let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &state.mcp_tool_map);
+        let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
         if mcp_calls.is_empty() {
             return Ok(FilterAction::Continue);
         }
 
-        let result = match self.execute_pending_calls(state, &mcp_calls).await {
+        let result = match self.execute_pending_calls(state, &mcp_calls, &tool_index).await {
             Ok(result) => result,
             Err(_limit) => return Self::result_limit_action(ctx),
         };
@@ -439,13 +451,18 @@ impl HttpFilter for McpDispatchFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Continue);
+        }
 
-        let mcp_call_count = count_mcp_tool_calls(&state.tool_calls, &state.mcp_tool_map);
+        let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+        let mcp_call_count = count_mcp_tool_calls(&state.tool_calls, &tool_index);
         if mcp_call_count > self.max_calls_per_round {
             let streaming = state.request_body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
             return Self::oversized_response_action(ctx, streaming);
         }
-        let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &state.mcp_tool_map);
+        let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
         if mcp_calls.is_empty() {
             set_action(ctx, ACTION_DONE)?;
             return Ok(FilterAction::Continue);
@@ -455,15 +472,14 @@ impl HttpFilter for McpDispatchFilter {
             return Self::invalid_call_ids_response_action(ctx, streaming);
         }
 
-        let admissions = current_round_borrowed_tool_call_admissions(state, &mcp_calls, |item| {
-            is_mcp_tool_call(item, &state.mcp_tool_map)
-        });
+        let admissions =
+            current_round_borrowed_tool_call_admissions(state, &mcp_calls, |item| is_mcp_tool_call(item, &tool_index));
         let mut pending = Vec::new();
         let mut ungated_or_rejected = Vec::new();
         for (index, call) in mcp_calls.into_iter().enumerate() {
             if admissions.get(index) == Some(&false) {
                 ungated_or_rejected.push(call);
-            } else if let Some(approval) = check_single_approval(call, &state.mcp_tool_map) {
+            } else if let Some(approval) = check_single_approval(call, &tool_index) {
                 pending.push(approval);
             } else {
                 ungated_or_rejected.push(call);
@@ -533,17 +549,17 @@ fn record_pending_approvals(state: &mut ResponsesState, pending: Vec<PendingAppr
 /// `mcp_tool_map`.
 fn extract_mcp_tool_calls<'a>(
     tool_calls: &'a [serde_json::Value],
-    tool_map: &HashMap<(String, String), serde_json::Value>,
+    tool_index: &McpToolIndex<'_>,
 ) -> Vec<&'a serde_json::Value> {
-    tool_calls.iter().filter(|tc| is_mcp_tool_call(tc, tool_map)).collect()
+    tool_calls
+        .iter()
+        .filter(|tc| is_mcp_tool_call(tc, tool_index))
+        .collect()
 }
 
 /// Count MCP-owned function calls without cloning provider payloads.
-fn count_mcp_tool_calls(
-    tool_calls: &[serde_json::Value],
-    tool_map: &HashMap<(String, String), serde_json::Value>,
-) -> usize {
-    tool_calls.iter().filter(|tc| is_mcp_tool_call(tc, tool_map)).count()
+fn count_mcp_tool_calls(tool_calls: &[serde_json::Value], tool_index: &McpToolIndex<'_>) -> usize {
+    tool_calls.iter().filter(|tc| is_mcp_tool_call(tc, tool_index)).count()
 }
 
 /// Require every MCP function call to carry a distinct non-empty correlation ID.
@@ -572,34 +588,33 @@ fn mcp_call_ids_are_unique_and_new(
 
 /// Check whether a tool call is an MCP tool call by matching the
 /// encoded function name against the tool map.
-fn is_mcp_tool_call(tool_call: &serde_json::Value, tool_map: &HashMap<(String, String), serde_json::Value>) -> bool {
+fn is_mcp_tool_call(tool_call: &serde_json::Value, tool_index: &McpToolIndex<'_>) -> bool {
     tool_call
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|name| find_by_encoded_name(tool_map, name).is_some())
+        .is_some_and(|name| tool_index.contains(name))
 }
 
 /// Find an entry in the tool map by encoded function name.
 ///
-/// Computes `encode_function_name(label, tool_name)` for each key
-/// and returns the first match along with its key. Warns when
-/// multiple entries produce the same encoded name, since routing
-/// is first-match and may be nondeterministic.
+/// Returns the unique match from a precomputed reverse index. Ambiguous lossy
+/// encodings fail closed rather than routing nondeterministically.
+#[cfg(test)]
 fn find_by_encoded_name<'a>(
-    tool_map: &'a HashMap<(String, String), serde_json::Value>,
+    tool_index: &McpToolIndex<'a>,
     encoded_name: &str,
 ) -> Option<(&'a (String, String), &'a serde_json::Value)> {
-    let mut matches = tool_map
-        .iter()
-        .filter(|((label, name), _)| encode_function_name(label, name) == encoded_name);
-    let first = matches.next()?;
-    if matches.next().is_some() {
-        warn!(
-            encoded_name,
-            "multiple entries produce the same encoded tool name; routing to first match"
-        );
+    match tool_index.get(encoded_name)? {
+        McpToolMatch::Unique { key, entry } => Some((key, entry)),
+        McpToolMatch::Ambiguous { count } => {
+            warn!(
+                encoded_name,
+                server_count = count,
+                "multiple entries produce the same encoded tool name"
+            );
+            None
+        },
     }
-    Some((first.0, first.1))
 }
 
 // -----------------------------------------------------------------------------
@@ -614,10 +629,11 @@ fn partition_calls_by_approval(
     mcp_calls: Vec<&serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
 ) -> (Vec<PendingApproval>, Vec<serde_json::Value>) {
+    let tool_index = McpToolIndex::new(tool_map);
     let mut pending = Vec::new();
     let mut ungated = Vec::new();
     for call in mcp_calls {
-        if let Some(approval) = check_single_approval(call, tool_map) {
+        if let Some(approval) = check_single_approval(call, &tool_index) {
             pending.push(approval);
         } else {
             ungated.push((*call).clone());
@@ -670,31 +686,25 @@ fn extract_arguments(tc: &serde_json::Value) -> String {
 /// Returns `Some` with approval details if approval is required,
 /// or if the encoded tool name is ambiguous across servers.
 #[expect(clippy::too_many_lines, reason = "linear validation with clear structure")]
-fn check_single_approval(
-    tc: &serde_json::Value,
-    tool_map: &HashMap<(String, String), serde_json::Value>,
-) -> Option<PendingApproval> {
+fn check_single_approval(tc: &serde_json::Value, tool_index: &McpToolIndex<'_>) -> Option<PendingApproval> {
     let encoded_name = tc.get("name").and_then(serde_json::Value::as_str)?;
 
-    let match_count = tool_map
-        .keys()
-        .filter(|(label, name)| encode_function_name(label, name) == encoded_name)
-        .count();
-    if match_count > 1 {
-        warn!(
-            encoded_name,
-            server_count = match_count,
-            "ambiguous encoded tool name in approval check; requiring approval"
-        );
-        return Some(PendingApproval {
-            call_id: extract_call_id(tc),
-            server_label: "unknown".to_owned(),
-            tool_name: encoded_name.to_owned(),
-            arguments: extract_arguments(tc),
-        });
-    }
-
-    let (key, entry) = find_by_encoded_name(tool_map, encoded_name)?;
+    let (key, entry) = match tool_index.get(encoded_name)? {
+        McpToolMatch::Unique { key, entry } => (key, entry),
+        McpToolMatch::Ambiguous { count } => {
+            warn!(
+                encoded_name,
+                server_count = count,
+                "ambiguous encoded tool name in approval check; requiring approval"
+            );
+            return Some(PendingApproval {
+                call_id: extract_call_id(tc),
+                server_label: "unknown".to_owned(),
+                tool_name: encoded_name.to_owned(),
+                arguments: extract_arguments(tc),
+            });
+        },
+    };
     let original_tool_name = &key.1;
     if !requires_approval(&parse_approval_policy(entry), original_tool_name) {
         return None;
@@ -870,7 +880,7 @@ struct McpExecutionOptions {
 /// sequentially otherwise.
 async fn execute_mcp_calls(
     mcp_calls: &[&serde_json::Value],
-    tool_map: &HashMap<(String, String), serde_json::Value>,
+    tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions,
 ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
     let minimum_reservation = mcp_calls
@@ -891,9 +901,9 @@ async fn execute_mcp_calls(
         ..options
     };
     if options.parallel {
-        Ok(execute_parallel(mcp_calls, tool_map, bounded_options).await)
+        Ok(execute_parallel(mcp_calls, tool_index, bounded_options).await)
     } else {
-        Ok(execute_sequential(mcp_calls, tool_map, bounded_options).await)
+        Ok(execute_sequential(mcp_calls, tool_index, bounded_options).await)
     }
 }
 
@@ -908,7 +918,7 @@ async fn execute_mcp_calls(
 )]
 async fn execute_parallel(
     mcp_calls: &[&serde_json::Value],
-    tool_map: &HashMap<(String, String), serde_json::Value>,
+    tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions,
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
@@ -920,7 +930,7 @@ async fn execute_parallel(
         let futures = chunk.iter().map(|tc| {
             std::panic::AssertUnwindSafe(execute_single_call(
                 tc,
-                tool_map,
+                tool_index,
                 options.max_result_bytes,
                 options.timeout,
                 options.allow_loopback,
@@ -949,14 +959,14 @@ async fn execute_parallel(
 /// for any calls that produce no result.
 async fn execute_sequential(
     mcp_calls: &[&serde_json::Value],
-    tool_map: &HashMap<(String, String), serde_json::Value>,
+    tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions,
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     for tc in mcp_calls {
         let result = if let Some(result) = execute_single_call(
             tc,
-            tool_map,
+            tool_index,
             options.max_result_bytes,
             options.timeout,
             options.allow_loopback,
@@ -977,33 +987,31 @@ async fn execute_sequential(
 /// ambiguity.
 #[expect(clippy::type_complexity, reason = "key+value pair needed by callers")]
 fn resolve_tool_entry<'a>(
-    tool_map: &'a HashMap<(String, String), serde_json::Value>,
+    tool_index: &McpToolIndex<'a>,
     encoded_name: &str,
     call_id: &str,
 ) -> Result<(&'a (String, String), &'a serde_json::Value), Option<Box<McpCallResult>>> {
-    let match_count = tool_map
-        .keys()
-        .filter(|(label, name)| encode_function_name(label, name) == encoded_name)
-        .count();
-    if match_count == 0 {
-        warn!(encoded_name, "tool not found in mcp_tool_map, skipping");
-        return Err(None);
+    match tool_index.get(encoded_name) {
+        Some(McpToolMatch::Unique { key, entry }) => Ok((key, entry)),
+        Some(McpToolMatch::Ambiguous { count }) => {
+            warn!(
+                encoded_name,
+                server_count = count,
+                "ambiguous MCP tool name: multiple entries produce this encoded name"
+            );
+            Err(Some(Box::new(build_error_result(
+                call_id,
+                "unknown",
+                encoded_name,
+                "",
+                &format!("ambiguous tool name: {count} servers expose '{encoded_name}'"),
+            ))))
+        },
+        None => {
+            warn!(encoded_name, "tool not found in mcp_tool_map, skipping");
+            Err(None)
+        },
     }
-    if match_count > 1 {
-        warn!(
-            encoded_name,
-            server_count = match_count,
-            "ambiguous MCP tool name: multiple entries produce this encoded name"
-        );
-        return Err(Some(Box::new(build_error_result(
-            call_id,
-            "unknown",
-            encoded_name,
-            "",
-            &format!("ambiguous tool name: {match_count} servers expose '{encoded_name}'"),
-        ))));
-    }
-    find_by_encoded_name(tool_map, encoded_name).ok_or(None)
 }
 
 /// Parse tool call arguments, handling JSON-string encoding.
@@ -1079,7 +1087,7 @@ fn process_call_result(
 #[expect(clippy::too_many_lines, reason = "linear validation + async call")]
 async fn execute_single_call(
     tool_call: &serde_json::Value,
-    tool_map: &HashMap<(String, String), serde_json::Value>,
+    tool_index: &McpToolIndex<'_>,
     max_result_bytes: usize,
     timeout: Duration,
     allow_loopback: bool,
@@ -1091,7 +1099,7 @@ async fn execute_single_call(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
 
-    let (key, entry) = match resolve_tool_entry(tool_map, encoded_name, call_id) {
+    let (key, entry) = match resolve_tool_entry(tool_index, encoded_name, call_id) {
         Ok(r) => r,
         Err(opt) => return opt.map(|b| *b),
     };

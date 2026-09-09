@@ -121,7 +121,7 @@ use tracing::{debug, trace};
 use self::config::{AgenticLoopConfig, build_config};
 use super::{
     error::responses_error_rejection,
-    openai_mcp_tool_resolve::encode_function_name,
+    openai_mcp_tool_resolve::McpToolIndex,
     state::{McpApprovalState, ResponsesState},
     stream_events::encode_local_completion,
     usage::merge_usage,
@@ -534,13 +534,19 @@ fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
         .output_items()
         .iter()
         .any(super::state::is_client_executed_tool_call);
+    if state.tool_calls.is_empty() {
+        return has_server && has_client;
+    }
+    if state.mcp_tool_map.is_empty() {
+        // With no resolved MCP tools, every function call is client-owned.
+        return has_server;
+    }
+    let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     for call in &state.tool_calls {
-        let is_mcp = call.get("name").and_then(Value::as_str).is_some_and(|encoded| {
-            state
-                .mcp_tool_map
-                .keys()
-                .any(|(label, name)| encode_function_name(label, name) == encoded)
-        });
+        let is_mcp = call
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|encoded| tool_index.contains(encoded));
         has_server |= is_mcp;
         has_client |= !is_mcp;
     }

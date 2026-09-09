@@ -11,8 +11,8 @@ use serde_json::json;
 
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, build_error_result, build_success_result,
-    content_blocks_to_output, encode_function_name, execute_mcp_calls, execute_single_call, extract_arguments,
-    extract_call_id, extract_mcp_tool_calls, find_by_encoded_name, is_mcp_tool_call, mcp_call_ids_are_unique_and_new,
+    content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
+    extract_mcp_tool_calls, find_by_encoded_name, is_mcp_tool_call, mcp_call_ids_are_unique_and_new,
     normalize_arguments, parse_call_arguments, partition_calls_by_approval, process_call_result,
     push_result_within_budget, resolve_tool_entry, result_payload_limit,
 };
@@ -22,6 +22,7 @@ use crate::{
             approval::{ApprovalPolicy, parse_approval_policy, requires_approval},
             config::{McpDispatchConfig, build_config},
         },
+        openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
         state::{McpApprovalState, ResponsesState},
     },
     test_utils::{make_filter_context, make_request},
@@ -325,7 +326,7 @@ fn lossy_collision_tool_map() -> HashMap<(String, String), serde_json::Value> {
 fn is_mcp_tool_call_matches_known_tool() {
     let tool_map = sample_tool_map();
     let tc = json!({"name": "weather__get_weather", "call_id": "call_1"});
-    assert!(is_mcp_tool_call(&tc, &tool_map));
+    assert!(is_mcp_tool_call(&tc, &McpToolIndex::new(&tool_map)));
 }
 
 #[test]
@@ -333,7 +334,7 @@ fn is_mcp_tool_call_rejects_raw_tool_name() {
     let tool_map = sample_tool_map();
     let tc = json!({"name": "get_weather", "call_id": "call_1"});
     assert!(
-        !is_mcp_tool_call(&tc, &tool_map),
+        !is_mcp_tool_call(&tc, &McpToolIndex::new(&tool_map)),
         "raw tool name should not match; inference returns encoded names"
     );
 }
@@ -342,14 +343,14 @@ fn is_mcp_tool_call_rejects_raw_tool_name() {
 fn is_mcp_tool_call_rejects_unknown_tool() {
     let tool_map = sample_tool_map();
     let tc = json!({"name": "my_function", "call_id": "call_2"});
-    assert!(!is_mcp_tool_call(&tc, &tool_map));
+    assert!(!is_mcp_tool_call(&tc, &McpToolIndex::new(&tool_map)));
 }
 
 #[test]
 fn is_mcp_tool_call_rejects_missing_name() {
     let tool_map = sample_tool_map();
     let tc = json!({"call_id": "call_3"});
-    assert!(!is_mcp_tool_call(&tc, &tool_map));
+    assert!(!is_mcp_tool_call(&tc, &McpToolIndex::new(&tool_map)));
 }
 
 #[test]
@@ -360,7 +361,7 @@ fn extract_mcp_tool_calls_filters_correctly() {
         json!({"name": "my_function", "call_id": "call_2"}),
         json!({"name": "docs__search_docs", "call_id": "call_3"}),
     ];
-    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &tool_map);
+    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &McpToolIndex::new(&tool_map));
     assert_eq!(mcp_calls.len(), 2, "should extract only MCP tool calls");
     assert_eq!(mcp_calls[0]["name"], "weather__get_weather");
     assert_eq!(mcp_calls[1]["name"], "docs__search_docs");
@@ -373,7 +374,7 @@ fn extract_mcp_tool_calls_filters_correctly() {
 #[test]
 fn find_by_encoded_name_matches_via_encoding() {
     let map = sample_tool_map();
-    let result = find_by_encoded_name(&map, "weather__get_weather");
+    let result = find_by_encoded_name(&McpToolIndex::new(&map), "weather__get_weather");
     assert!(result.is_some(), "should find entry by encoded name");
     let (key, entry) = result.unwrap();
     assert_eq!(key.0, "weather", "key should have original label");
@@ -385,7 +386,7 @@ fn find_by_encoded_name_matches_via_encoding() {
 fn find_by_encoded_name_rejects_raw_name() {
     let map = sample_tool_map();
     assert!(
-        find_by_encoded_name(&map, "get_weather").is_none(),
+        find_by_encoded_name(&McpToolIndex::new(&map), "get_weather").is_none(),
         "raw tool name should not match; lookup is by encoded name"
     );
 }
@@ -394,7 +395,7 @@ fn find_by_encoded_name_rejects_raw_name() {
 fn extract_mcp_tool_calls_empty_when_no_match() {
     let tool_map = sample_tool_map();
     let tool_calls = vec![json!({"name": "my_function", "call_id": "call_1"})];
-    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &tool_map);
+    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &McpToolIndex::new(&tool_map));
     assert!(mcp_calls.is_empty());
 }
 
@@ -837,7 +838,7 @@ fn process_call_result_preserves_mixed_content_in_both_representations() {
 #[test]
 fn resolve_tool_entry_returns_entry_for_unique_tool() {
     let map = sample_tool_map();
-    let (key, entry) = resolve_tool_entry(&map, "weather__get_weather", "call_1").unwrap();
+    let (key, entry) = resolve_tool_entry(&McpToolIndex::new(&map), "weather__get_weather", "call_1").unwrap();
     assert_eq!(entry.get("server_label").unwrap(), "weather");
     assert_eq!(key.1, "get_weather", "key should contain the original tool name");
 }
@@ -845,14 +846,14 @@ fn resolve_tool_entry_returns_entry_for_unique_tool() {
 #[test]
 fn resolve_tool_entry_returns_none_for_unknown_tool() {
     let map = sample_tool_map();
-    let result = resolve_tool_entry(&map, "nonexistent", "call_1");
+    let result = resolve_tool_entry(&McpToolIndex::new(&map), "nonexistent", "call_1");
     assert!(matches!(result, Err(None)), "unknown tool should return Err(None)");
 }
 
 #[test]
 fn resolve_tool_entry_returns_error_for_ambiguous_tool() {
     let map = lossy_collision_tool_map();
-    let result = resolve_tool_entry(&map, "my_server__get", "call_1");
+    let result = resolve_tool_entry(&McpToolIndex::new(&map), "my_server__get", "call_1");
     let err = result.unwrap_err().expect("should return error result for ambiguity");
     assert!(
         err.output_item["error"].as_str().unwrap().contains("ambiguous"),
@@ -1079,7 +1080,7 @@ async fn execute_single_call_missing_name_returns_none() {
     let tc = json!({"call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
     assert!(
-        execute_single_call(&tc, &map, TEST_MAX_RESULT_BYTES, timeout, true)
+        execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
             .await
             .is_none()
     );
@@ -1091,7 +1092,7 @@ async fn execute_single_call_unknown_tool_returns_none() {
     let tc = json!({"name": "nonexistent", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
     assert!(
-        execute_single_call(&tc, &map, TEST_MAX_RESULT_BYTES, timeout, true)
+        execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
             .await
             .is_none()
     );
@@ -1102,7 +1103,7 @@ async fn execute_single_call_ambiguous_returns_error() {
     let map = lossy_collision_tool_map();
     let tc = json!({"name": "my_server__get", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
-    let result = execute_single_call(&tc, &map, TEST_MAX_RESULT_BYTES, timeout, true)
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
         .await
         .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("ambiguous"));
@@ -1113,7 +1114,7 @@ async fn execute_single_call_malformed_args_returns_error() {
     let map = sample_tool_map();
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "not-json"});
     let timeout = std::time::Duration::from_millis(100);
-    let result = execute_single_call(&tc, &map, TEST_MAX_RESULT_BYTES, timeout, true)
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
         .await
         .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("malformed"));
@@ -1124,7 +1125,7 @@ async fn execute_single_call_connection_error() {
     let map = sample_tool_map();
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": "Paris"}});
     let timeout = std::time::Duration::from_millis(200);
-    let result = execute_single_call(&tc, &map, TEST_MAX_RESULT_BYTES, timeout, true)
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
         .await
         .unwrap();
     assert!(
@@ -1141,7 +1142,7 @@ async fn execute_single_call_connection_error() {
 async fn execute_mcp_calls_empty_input() {
     let map = sample_tool_map();
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&[], &map, execution_options(false, timeout))
+    let results = execute_mcp_calls(&[], &McpToolIndex::new(&map), execution_options(false, timeout))
         .await
         .unwrap();
     assert!(results.is_empty());
@@ -1152,9 +1153,13 @@ async fn execute_mcp_calls_sequential() {
     let map = sample_tool_map();
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
-    let results = execute_mcp_calls(&call_refs(&calls), &map, execution_options(false, timeout))
-        .await
-        .unwrap();
+    let results = execute_mcp_calls(
+        &call_refs(&calls),
+        &McpToolIndex::new(&map),
+        execution_options(false, timeout),
+    )
+    .await
+    .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].output_item["type"], "mcp_call");
 }
@@ -1164,9 +1169,13 @@ async fn execute_mcp_calls_parallel() {
     let map = sample_tool_map();
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
-    let results = execute_mcp_calls(&call_refs(&calls), &map, execution_options(true, timeout))
-        .await
-        .unwrap();
+    let results = execute_mcp_calls(
+        &call_refs(&calls),
+        &McpToolIndex::new(&map),
+        execution_options(true, timeout),
+    )
+    .await
+    .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].output_item["type"], "mcp_call");
 }
@@ -1183,7 +1192,9 @@ async fn execute_mcp_calls_parallel_preserves_order_across_bounded_chunks() {
 
     let mut options = execution_options(true, timeout);
     options.max_parallel_calls = 2;
-    let results = execute_mcp_calls(&call_refs(&calls), &map, options).await.unwrap();
+    let results = execute_mcp_calls(&call_refs(&calls), &McpToolIndex::new(&map), options)
+        .await
+        .unwrap();
 
     let ids: Vec<&str> = results
         .iter()
@@ -1197,9 +1208,13 @@ async fn execute_mcp_calls_emits_error_for_unknown_tools() {
     let map = sample_tool_map();
     let calls = vec![json!({"name": "nonexistent", "call_id": "c1"})];
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&call_refs(&calls), &map, execution_options(false, timeout))
-        .await
-        .unwrap();
+    let results = execute_mcp_calls(
+        &call_refs(&calls),
+        &McpToolIndex::new(&map),
+        execution_options(false, timeout),
+    )
+    .await
+    .unwrap();
     assert_eq!(results.len(), 1);
     assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
 }
@@ -1209,9 +1224,13 @@ async fn execute_mcp_calls_emits_error_for_unknown_tool_without_call_id() {
     let map = sample_tool_map();
     let calls = vec![json!({"name": "nonexistent"})];
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&call_refs(&calls), &map, execution_options(false, timeout))
-        .await
-        .unwrap();
+    let results = execute_mcp_calls(
+        &call_refs(&calls),
+        &McpToolIndex::new(&map),
+        execution_options(false, timeout),
+    )
+    .await
+    .unwrap();
     assert_eq!(results.len(), 1, "must emit error even without call_id");
     assert_eq!(results[0].output_item["id"], "unknown");
     assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
@@ -1225,7 +1244,11 @@ async fn execute_mcp_calls_rejects_an_aggregate_result_overflow() {
     let mut options = execution_options(false, timeout);
     options.max_total_result_bytes = 1;
 
-    assert!(execute_mcp_calls(&call_refs(&calls), &map, options).await.is_err());
+    assert!(
+        execute_mcp_calls(&call_refs(&calls), &McpToolIndex::new(&map), options)
+            .await
+            .is_err()
+    );
 }
 
 // =========================================================================
@@ -1955,11 +1978,11 @@ fn resolve_to_dispatch_encoded_name_roundtrip() {
     );
     assert_dispatch_action(&ctx, "loop");
 
-    let (key, entry) = find_by_encoded_name(&tool_map, &encoded).unwrap();
+    let (key, entry) = find_by_encoded_name(&McpToolIndex::new(&tool_map), &encoded).unwrap();
     assert_eq!((key.0.as_str(), key.1.as_str()), (label, tool_name));
     assert_eq!(entry["server_url"], url);
 
-    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &tool_map);
+    let mcp_calls = extract_mcp_tool_calls(&tool_calls, &McpToolIndex::new(&tool_map));
     assert_eq!(mcp_calls.len(), 1);
     assert_eq!(mcp_calls[0]["name"], encoded);
 }
