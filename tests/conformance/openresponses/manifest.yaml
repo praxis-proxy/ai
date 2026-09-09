@@ -40,13 +40,13 @@ supported:
   - id: assistant-phase
   - id: tool-calling
   - id: streaming-response
-
-unsupported:
   - id: response-output-phase-schema
-    reason: >-
-      Exercises structured-output response phases the translator does not yet
-      synthesize at this suite SHA. In scope for the translation filter — a
-      translator fix promotes this to `supported` and bumps coverage.
+
+# Empty today: every in-scope template the suite exercises passes. A future
+# suite bump (or a newly in-scope template) that the translator does not yet
+# handle lands here, and the CI nudge fails until it is either fixed (promoted
+# to `supported`) or triaged as `inapplicable`.
+unsupported: []
 
 inapplicable:
   - id: image-input

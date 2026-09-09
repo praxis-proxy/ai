@@ -9,15 +9,15 @@ native Responses passthrough.
 
 ## Coverage
 
-**6 / 7 in-scope templates passing (85.7%).** 10 of 17
+**7 / 7 in-scope templates passing (100.0%).** 10 of 17
 suite templates are out of scope and excluded from the denominator.
 
 Coverage counts templates the translation filter is responsible for
 (`supported` + `unsupported`). Fixing a translation gap promotes an
 `unsupported` template to `supported` and bumps this number.
 
-- **Supported (6):** basic-response, system-prompt, multi-turn, assistant-phase, tool-calling, streaming-response
-- **Unsupported (1):** response-output-phase-schema
+- **Supported (7):** basic-response, system-prompt, multi-turn, assistant-phase, tool-calling, streaming-response, response-output-phase-schema
+- **Unsupported (0):** 
 - **Inapplicable (10, excluded):** image-input, compact-response, compact-missing-model, websocket-response, websocket-sequential-responses, websocket-continuation, websocket-reconnect-store-false-recovery, websocket-previous-response-not-found, websocket-failed-continuation-evicts-cache, websocket-compact-new-chain
 
 Per-template rationale lives in the triage manifest
