@@ -203,6 +203,77 @@ impl OpenaiStreamEventsFilter {
         // consumer today.
         ctx.set_metadata("responses.logical_stream.file_search", "true");
     }
+
+    /// Apply the guard [`ArmDecision`], returning an early [`FilterAction`] when
+    /// the request must be rejected before any upstream dispatch.
+    ///
+    /// The pure [`arm_decision`] classifies the request; this applies the
+    /// effects that need the context — installing parser state, stripping
+    /// `Accept-Encoding`, or building the fail-closed rejection.
+    fn apply_arm_decision(&self, ctx: &mut HttpFilterContext<'_>, decision: ArmDecision) -> Option<FilterAction> {
+        match decision {
+            ArmDecision::Ignore => None,
+            ArmDecision::RejectOutsideIrr => {
+                // The filter always composes the current IRR execution into one
+                // logical Responses stream, so it must run inside an
+                // `iterative_request_router` step. A missing `IterationState`
+                // means the filter is placed outside IRR — a server
+                // misconfiguration. Fail closed before any upstream dispatch
+                // rather than emit an unnormalized stream that later
+                // loop-terminal errors could not correct.
+                warn!("openai_stream_events is not inside an iterative_request_router step");
+                Some(FilterAction::Reject(responses_error_rejection(
+                    500,
+                    "server_error",
+                    "openai_stream_events must run inside an iterative_request_router step",
+                    true,
+                )))
+            },
+            ArmDecision::Arm => {
+                trace!("arming stream_events for streaming Responses API request");
+                self.arm(ctx);
+                // The SSE frame parser consumes raw bytes, so a compressed
+                // upstream body would be parsed as opaque data — suppressing the
+                // stream and failing an otherwise valid request. Strip
+                // `Accept-Encoding` whenever logical parsing is armed so a
+                // compliant backend returns plaintext SSE.
+                ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+                None
+            },
+        }
+    }
+}
+
+/// Outcome of the request-phase IRR-placement guard.
+///
+/// Factored out of [`OpenaiStreamEventsFilter`]'s `on_request` so the guard's
+/// fail-closed decision table — the invariant that logical composition only
+/// arms inside an `iterative_request_router` step — is exhaustively unit
+/// testable. The runtime signal it depends on, an [`IterationState`] in request
+/// extensions, cannot be constructed outside praxis-filter (its fields are
+/// private), so the end-to-end arming effect is covered by functional
+/// integration tests while this pure decision is covered directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArmDecision {
+    /// Not a streaming Responses create request; leave the stream untouched.
+    Ignore,
+    /// Streaming Responses request placed outside IRR; reject fail-closed.
+    RejectOutsideIrr,
+    /// Streaming Responses request inside IRR; arm logical composition.
+    Arm,
+}
+
+/// Decide whether to arm logical composition for the current request.
+///
+/// Arms only for a streaming Responses create request, and only inside an IRR
+/// step; the same request outside IRR fails closed rather than emit an
+/// unnormalized stream that later loop-terminal errors could not correct.
+const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDecision {
+    match (is_streaming_responses, inside_irr) {
+        (false, _) => ArmDecision::Ignore,
+        (true, true) => ArmDecision::Arm,
+        (true, false) => ArmDecision::RejectOutsideIrr,
+    }
 }
 
 #[async_trait]
@@ -249,32 +320,13 @@ impl HttpFilter for OpenaiStreamEventsFilter {
                 || has_responses_state);
         let is_streaming =
             typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
-
-        if is_responses && is_streaming {
-            // The filter always composes the current IRR execution into one
-            // logical Responses stream, so it must run inside an
-            // `iterative_request_router` step. `IterationState` is inserted by
-            // the IRR runner before the request phase of every iteration
-            // (including iteration 0), so its absence here means the filter is
-            // placed outside IRR — a server misconfiguration. Fail closed
-            // before any upstream dispatch rather than emit an unnormalized
-            // stream that later loop-terminal errors could not correct.
-            if ctx.extensions.get::<IterationState>().is_none() {
-                warn!("openai_stream_events is not inside an iterative_request_router step");
-                return Ok(FilterAction::Reject(responses_error_rejection(
-                    500,
-                    "server_error",
-                    "openai_stream_events must run inside an iterative_request_router step",
-                    true,
-                )));
-            }
-            trace!("arming stream_events for streaming Responses API request");
-            self.arm(ctx);
-            // The SSE frame parser consumes raw bytes, so a compressed upstream
-            // body would be parsed as opaque data — suppressing the stream and
-            // failing an otherwise valid request. Strip `Accept-Encoding` whenever
-            // logical parsing is armed so a compliant backend returns plaintext SSE.
-            ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+        // `IterationState` is inserted by the IRR runner before the request phase
+        // of every iteration (including iteration 0), so its presence is the
+        // runtime signal that the filter is placed inside an IRR step.
+        let inside_irr = ctx.extensions.get::<IterationState>().is_some();
+        let decision = arm_decision(is_responses && is_streaming, inside_irr);
+        if let Some(action) = self.apply_arm_decision(ctx, decision) {
+            return Ok(action);
         }
 
         Ok(FilterAction::Continue)

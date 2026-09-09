@@ -18,7 +18,8 @@ use praxis_filter::{FilterAction, HttpFilter as _, SubRequestResponseMode};
 use serde_json::json;
 
 use super::{
-    CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object, encode_local_completion,
+    ArmDecision, CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object, arm_decision,
+    encode_local_completion,
 };
 use crate::{
     openai::{
@@ -39,8 +40,10 @@ fn make_filter() -> OpenaiStreamEventsFilter {
 /// `on_request` fails closed unless an `IterationState` is present, and unit
 /// tests cannot construct one (its fields are private to praxis-filter). So
 /// tests arm directly through `arm`, which mirrors what `on_request` does once
-/// the IRR-placement guard has passed. The guard itself and the successful
-/// in-IRR arming path are covered by the functional integration tests.
+/// the IRR-placement guard has admitted the request. The guard's decision table
+/// (arm inside IRR, reject outside, ignore otherwise) is unit tested directly
+/// through `arm_decision`; the end-to-end arming effect with a real IRR-inserted
+/// `IterationState` is covered by the functional integration tests.
 fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
@@ -50,6 +53,22 @@ fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterC
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
     (filter, ctx)
+}
+
+#[test]
+fn arm_decision_arms_streaming_responses_inside_irr() {
+    assert_eq!(arm_decision(true, true), ArmDecision::Arm);
+}
+
+#[test]
+fn arm_decision_rejects_streaming_responses_outside_irr() {
+    assert_eq!(arm_decision(true, false), ArmDecision::RejectOutsideIrr);
+}
+
+#[test]
+fn arm_decision_ignores_non_streaming_or_non_responses_requests() {
+    assert_eq!(arm_decision(false, true), ArmDecision::Ignore);
+    assert_eq!(arm_decision(false, false), ArmDecision::Ignore);
 }
 
 #[test]
