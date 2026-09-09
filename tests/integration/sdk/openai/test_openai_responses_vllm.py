@@ -571,8 +571,9 @@ def _write_agentic_config(
     )
     config = config.replace(
         "max_iterations: 11\n",
+        # agentic-loop.yaml already sets the IRR's overall ``timeout_ms``;
+        # inject only ``step_timeout_ms`` here to avoid a duplicate key.
         "max_iterations: 11\n"
-        "        timeout_ms: 300000\n"
         "        step_timeout_ms: 300000\n",
     )
     config = config.replace(
