@@ -17,7 +17,7 @@
 #![allow(
     clippy::expect_used,
     clippy::print_stdout,
-    reason = "build script: panics are the only error path; println is cargo directives"
+    reason = "build script: expect covers unrecoverable env errors; println is cargo directives"
 )]
 
 use build_support::ActiveFeatures;
@@ -29,17 +29,44 @@ use cargo_metadata::{CargoOpt, Metadata};
 const MANIFEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
 fn main() {
-    let metadata = load_metadata();
+    let Some(metadata) = load_metadata() else {
+        // `cargo metadata` could not resolve this package in isolation. That
+        // happens whenever the manifest is read away from its workspace: notably a
+        // vendored build, where `cargo vendor` flattens the tree so the sibling
+        // `path` dependencies are no longer beside it, as in a hermetic container
+        // build.
+        //
+        // Only discovery of *external* filter crates is lost. Praxis AI's own
+        // filters are registered explicitly by `build_full_registry`, so a server
+        // built this way still has its full built-in pipeline. `load_metadata`
+        // has already reported the cause.
+        write_generated_file(&build_support::generate_registration_code(&[]));
+        // Still emit the static directives: without them Cargo falls back to
+        // watching only this package's directory, so fixing the workspace root
+        // afterwards would not re-run discovery and the empty registration would
+        // be silently linked in.
+        emit_static_rerun_directives();
+        return;
+    };
+
     let crates = build_support::discover_external_filter_crate_names(&metadata);
     let code = build_support::generate_registration_code(&crates);
     write_generated_file(&code);
     emit_rerun_directives(&metadata);
 }
 
+/// Report that external filter discovery was skipped, naming the cause.
+fn warn_discovery_skipped(cause: &dyn std::fmt::Display) {
+    println!("cargo::warning=praxis-ai-proxy: external filter discovery skipped: {cause}");
+}
+
 /// Load cargo metadata, narrowed to dependencies available for the current
 /// target when Cargo provides one.
-fn load_metadata() -> Metadata {
-    let active_features = active_features();
+///
+/// Returns `None` when metadata resolution fails, which is not an error: see the
+/// fallback in [`main`]. This mirrors the equivalent build script in Praxis core.
+fn load_metadata() -> Option<Metadata> {
+    let active_features = active_features()?;
     let mut command = cargo_metadata::MetadataCommand::new();
     command.manifest_path(MANIFEST_PATH);
     apply_active_features(&mut command, active_features);
@@ -47,23 +74,43 @@ fn load_metadata() -> Metadata {
         command.other_options(vec!["--filter-platform".to_owned(), target]);
     }
 
-    command.exec().expect("failed to run cargo metadata")
+    match command.exec() {
+        Ok(metadata) => Some(metadata),
+        Err(error) => {
+            warn_discovery_skipped(&error);
+            None
+        },
+    }
 }
 
 /// Resolve active package features from Cargo's build-script environment.
-fn active_features() -> ActiveFeatures {
-    let metadata = cargo_metadata::MetadataCommand::new()
+///
+/// Returns `None` when this package's own manifest cannot be read, for the same
+/// reasons described in [`main`].
+fn active_features() -> Option<ActiveFeatures> {
+    let metadata = match cargo_metadata::MetadataCommand::new()
         .manifest_path(MANIFEST_PATH)
         .no_deps()
         .exec()
-        .expect("failed to read package feature metadata");
-    let package = metadata
-        .packages
-        .iter()
-        .find(|pkg| pkg.name == env!("CARGO_PKG_NAME"))
-        .expect("praxis-ai package not found in metadata");
+    {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warn_discovery_skipped(&error);
+            return None;
+        },
+    };
+    let Some(package) = metadata.packages.iter().find(|pkg| pkg.name == env!("CARGO_PKG_NAME")) else {
+        warn_discovery_skipped(&concat!(
+            env!("CARGO_PKG_NAME"),
+            " is absent from its own cargo metadata"
+        ));
+        return None;
+    };
 
-    build_support::resolve_active_features(&package.features, std::env::vars())
+    Some(build_support::resolve_active_features(
+        &package.features,
+        std::env::vars(),
+    ))
 }
 
 /// Apply the current build's active feature set to a `cargo metadata` command.
@@ -83,12 +130,20 @@ fn write_generated_file(code: &str) {
     std::fs::write(&dest, code).expect("failed to write external_filters.rs");
 }
 
-/// Tell Cargo when to re-run this build script.
-fn emit_rerun_directives(metadata: &Metadata) {
+/// Tell Cargo to re-run this build script when this crate's own inputs change.
+///
+/// Emitted on every path, including the fallback, because any `rerun-if-changed`
+/// replaces Cargo's default of watching the whole package directory.
+fn emit_static_rerun_directives() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../Cargo.toml");
     println!("cargo:rerun-if-changed=../Cargo.lock");
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Tell Cargo when to re-run this build script.
+fn emit_rerun_directives(metadata: &Metadata) {
+    emit_static_rerun_directives();
 
     for manifest_path in build_support::direct_runtime_dependency_manifest_paths(metadata) {
         println!("cargo:rerun-if-changed={manifest_path}");
