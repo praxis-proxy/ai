@@ -199,33 +199,80 @@ impl SseParser {
     /// A trailing incomplete sequence (fewer than four bytes) is retained for
     /// the next chunk; a genuinely invalid sequence, or an incomplete sequence
     /// at end-of-stream, fails closed.
-    fn decode_utf8(&mut self, chunk: &[u8], end_of_stream: bool) -> Result<String, StreamError> {
-        let combined = if self.utf8_tail.is_empty() {
-            Cow::Borrowed(chunk)
-        } else {
-            let mut pending = std::mem::take(&mut self.utf8_tail);
-            pending.extend_from_slice(chunk);
-            Cow::Owned(pending)
-        };
-        match std::str::from_utf8(&combined) {
-            Ok(text) => Ok(text.to_owned()),
-            Err(error) if error.error_len().is_none() => {
-                if end_of_stream {
-                    return Err(StreamError::MalformedUtf8);
-                }
-                let valid = error.valid_up_to();
-                let tail = combined.get(valid..).ok_or(StreamError::MalformedUtf8)?;
-                if tail.len() > 3 {
-                    return Err(StreamError::MalformedUtf8);
-                }
-                self.utf8_tail = tail.to_vec();
-                let prefix = combined.get(..valid).ok_or(StreamError::MalformedUtf8)?;
-                Ok(std::str::from_utf8(prefix)
-                    .map_err(|_prefix_not_utf8| StreamError::MalformedUtf8)?
-                    .to_owned())
-            },
-            Err(_) => Err(StreamError::MalformedUtf8),
+    ///
+    /// When no tail is retained (the common case) the valid prefix borrows
+    /// `chunk` directly, so a well-formed chunk is validated once and reaches
+    /// `line_buffer` in a single copy with no intermediate heap allocation.
+    /// Only joining a retained tail with `chunk` — the rare split-code-point
+    /// case — needs one owned buffer, which is handed back by value (moved, not
+    /// copied) so no further copy follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamError::MalformedUtf8`] on genuinely invalid UTF-8, on an
+    /// incomplete sequence at end-of-stream, or on a retained tail longer than a
+    /// single truncated code point.
+    fn decode_utf8<'chunk>(
+        &mut self,
+        chunk: &'chunk [u8],
+        end_of_stream: bool,
+    ) -> Result<Cow<'chunk, str>, StreamError> {
+        if self.utf8_tail.is_empty() {
+            // Hot path: with no retained tail the valid prefix borrows `chunk`,
+            // so there is no intermediate `String` to allocate and drop.
+            return match std::str::from_utf8(chunk) {
+                Ok(text) => Ok(Cow::Borrowed(text)),
+                Err(error) if error.error_len().is_none() => {
+                    let valid = self.retain_incomplete_tail(chunk, error.valid_up_to(), end_of_stream)?;
+                    Ok(Cow::Borrowed(
+                        std::str::from_utf8(chunk.get(..valid).ok_or(StreamError::MalformedUtf8)?)
+                            .map_err(|_prefix_not_utf8| StreamError::MalformedUtf8)?,
+                    ))
+                },
+                Err(_) => Err(StreamError::MalformedUtf8),
+            };
         }
+        // A code point split across the previous chunk boundary: joining the
+        // retained tail with `chunk` needs one owned buffer, returned by value
+        // so the decoded text is never copied a second time.
+        let mut pending = std::mem::take(&mut self.utf8_tail);
+        pending.extend_from_slice(chunk);
+        let valid = match std::str::from_utf8(&pending) {
+            Ok(_) => pending.len(),
+            Err(error) if error.error_len().is_none() => {
+                self.retain_incomplete_tail(&pending, error.valid_up_to(), end_of_stream)?
+            },
+            Err(_) => return Err(StreamError::MalformedUtf8),
+        };
+        pending.truncate(valid);
+        Ok(Cow::Owned(
+            String::from_utf8(pending).map_err(|_combined_not_utf8| StreamError::MalformedUtf8)?,
+        ))
+    }
+
+    /// Retain the trailing incomplete UTF-8 sequence of `bytes` (the run after
+    /// `valid`) for the next chunk and return `valid`.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed at end-of-stream (no later chunk can complete the sequence)
+    /// and when the retained tail is longer than a single truncated code point
+    /// (at most three bytes), which is not a mere split.
+    fn retain_incomplete_tail(
+        &mut self,
+        bytes: &[u8],
+        valid: usize,
+        end_of_stream: bool,
+    ) -> Result<usize, StreamError> {
+        if end_of_stream {
+            return Err(StreamError::MalformedUtf8);
+        }
+        let tail = bytes.get(valid..).ok_or(StreamError::MalformedUtf8)?;
+        if tail.len() > 3 {
+            return Err(StreamError::MalformedUtf8);
+        }
+        self.utf8_tail.extend_from_slice(tail);
+        Ok(valid)
     }
 }
 
@@ -1117,6 +1164,31 @@ mod tests {
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].data["t"], "é");
+    }
+
+    #[test]
+    fn buffers_four_byte_utf8_split_one_byte_per_chunk() {
+        // A 4-byte code point (😀 = 0xF0 0x9F 0x98 0x80) delivered one byte per
+        // chunk exercises the retained-tail path re-stashing a *still-incomplete*
+        // sequence across successive chunks, not just a single 2-byte split: the
+        // first byte stashes with an empty tail, the second and third re-stash a
+        // non-empty tail that is not yet a full code point, and the fourth
+        // completes it.
+        let mut parser = SseParser::default();
+        let prefix = b"data: {\"type\":\"x\",\"t\":\"";
+        let suffix = b"\"}\n\n";
+
+        assert!(parser.push(prefix, false, MAX_PARTIAL).unwrap().is_empty());
+        for byte in "😀".as_bytes() {
+            assert!(
+                parser.push(&[*byte], false, MAX_PARTIAL).unwrap().is_empty(),
+                "an incomplete code point yields no event until its final byte arrives",
+            );
+        }
+        let events = parser.push(suffix, false, MAX_PARTIAL).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["t"], "😀");
     }
 
     #[test]
