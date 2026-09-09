@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, free_port, http_send, json_post, parse_body, parse_status, start_capturing_backend, start_proxy,
+    Backend, StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_status, start_proxy,
 };
 
 use super::load_example_config;
@@ -23,15 +23,20 @@ fn azure_proxy(backend_port: u16) -> praxis_test_utils::ProxyGuard {
 
 #[test]
 fn azure_translation_forwards_request_with_api_version() {
-    let backend = start_capturing_backend(
-        &serde_json::json!({
-            "id": "chatcmpl-abc",
-            "object": "chat.completion",
-            "choices": [{"message": {"role": "assistant", "content": "Paris"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}
-        })
-        .to_string(),
-    );
+    let response_json = serde_json::json!({
+        "id": "chatcmpl-abc",
+        "object": "chat.completion",
+        "choices": [{"message": {"role": "assistant", "content": "Paris"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}
+    });
+    // Extra 200s cover Pingora's health-check probe without exhausting
+    // the scripted responses before the real POST.
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, response_json.to_string()),
+        (200, response_json.to_string()),
+        (200, response_json.to_string()),
+    ])
+    .start_with_shutdown();
     let proxy = azure_proxy(backend.port());
 
     let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"What is the capital of France?"}]}"#;
@@ -41,7 +46,23 @@ fn azure_translation_forwards_request_with_api_version() {
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
     assert_eq!(response["choices"][0]["message"]["content"], "Paris");
 
-    let forwarded: serde_json::Value = serde_json::from_str(&backend.body()).expect("captured body should be JSON");
+    // Find the POST request (skip the health-check probe).
+    let requests = backend.requests();
+    let captured = requests
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("should have a POST request");
+    let forwarded_uri = &captured.uri;
+    assert!(
+        forwarded_uri.contains("/openai/deployments/gpt-4o/chat/completions"),
+        "forwarded URI should contain deployment path, got: {forwarded_uri}"
+    );
+    assert!(
+        forwarded_uri.contains("api-version=2024-10-21"),
+        "forwarded URI should contain api-version, got: {forwarded_uri}"
+    );
+
+    let forwarded: serde_json::Value = serde_json::from_str(&captured.body).expect("captured body should be JSON");
     assert!(
         forwarded.get("model").is_none(),
         "model field should be stripped from Azure request"

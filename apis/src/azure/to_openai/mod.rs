@@ -47,8 +47,10 @@ const RESPONSE_STATUS_KEY: &str = "azureai_translation.response_status";
 ///
 /// Azure OpenAI accepts Chat Completions bodies as-is; this filter
 /// handles the `api-version` query parameter, strips Azure-specific
-/// response fields (`prompt_filter_results`, `content_filter_results`),
-/// and normalizes error responses where Azure omits the `type` field.
+/// response fields (`prompt_filter_results`, `content_filter_results`,
+/// `content_filter_offsets`), drops Azure async-filter annotation SSE
+/// chunks (no `delta` and no `finish_reason`), and normalizes error
+/// responses where Azure omits the `type` field.
 ///
 /// # YAML
 ///
@@ -194,15 +196,37 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
 // Request Helpers
 // -----------------------------------------------------------------------------
 
-/// Append `api-version` to the request URI query string.
+/// Set or replace `api-version` on the request URI query string.
+///
+/// Reads from `ctx.rewritten_path` when present so this filter
+/// composes correctly after `path_rewrite`. If the URI already
+/// contains an `api-version` parameter, it is replaced rather than
+/// duplicated.
 fn inject_api_version_query(ctx: &mut HttpFilterContext<'_>, api_version: &str) {
-    let uri = &ctx.request.uri;
-    let path_and_query = uri.path_and_query().map_or_else(|| uri.path(), |pq| pq.as_str());
+    let base = ctx.rewritten_path.as_deref().unwrap_or_else(|| {
+        ctx.request
+            .uri
+            .path_and_query()
+            .map_or_else(|| ctx.request.uri.path(), |pq| pq.as_str())
+    });
 
-    let new_pq = if path_and_query.contains('?') {
-        format!("{path_and_query}&api-version={api_version}")
+    // Strip any existing api-version to avoid duplicates.
+    let (path, existing_query) = match base.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (base, None),
+    };
+
+    let filtered_query: String = existing_query
+        .unwrap_or("")
+        .split('&')
+        .filter(|param| !param.is_empty() && param.split_once('=').map_or(*param, |(k, _)| k) != "api-version")
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let new_pq = if filtered_query.is_empty() {
+        format!("{path}?api-version={api_version}")
     } else {
-        format!("{path_and_query}?api-version={api_version}")
+        format!("{path}?{filtered_query}&api-version={api_version}")
     };
 
     ctx.rewritten_path = Some(new_pq);
@@ -331,6 +355,13 @@ fn rebuild_sse_frames(frames: &[SseFrame]) -> Vec<u8> {
         let stripped = response::strip_azure_fields(&frame.data);
         let data = stripped.as_deref().unwrap_or(&frame.data);
 
+        // Drop async-filter annotation chunks. They have no `delta` or
+        // `finish_reason` and crash standard OpenAI SDKs.
+        if response::is_filter_only_chunk(data) {
+            debug!("dropping Azure async-filter annotation SSE chunk");
+            continue;
+        }
+
         output.extend_from_slice(b"data: ");
         output.extend_from_slice(data);
         output.extend_from_slice(b"\n\n");
@@ -433,6 +464,68 @@ mod tests {
         assert!(
             rewritten.contains("foo=bar&api-version=2025-03-01"),
             "api-version should append to existing query, got: {rewritten}"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_request_reads_rewritten_path_from_prior_filter() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = ChatCompletionsToAzureaiChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&request);
+
+        // Simulate path_rewrite running before this filter.
+        ctx.rewritten_path = Some("/openai/deployments/gpt-4o/chat/completions".to_owned());
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let rewritten = ctx.rewritten_path.as_ref().unwrap();
+        assert_eq!(
+            rewritten, "/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21",
+            "should append api-version to the already-rewritten deployment path"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_request_preserves_query_on_rewritten_path() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = ChatCompletionsToAzureaiChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        ctx.rewritten_path = Some("/openai/deployments/gpt-4o/chat/completions?foo=bar".to_owned());
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(
+            ctx.rewritten_path.as_deref(),
+            Some("/openai/deployments/gpt-4o/chat/completions?foo=bar&api-version=2024-10-21"),
+        );
+    }
+
+    #[tokio::test]
+    async fn on_request_replaces_existing_api_version() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("api_version: \"2025-03-01\"").unwrap();
+        let filter = ChatCompletionsToAzureaiChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(
+            Method::POST,
+            "/openai/deployments/gpt4o/chat/completions?api-version=2023-01-01&foo=bar",
+        );
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let rewritten = ctx.rewritten_path.as_ref().unwrap();
+        assert!(
+            rewritten.contains("api-version=2025-03-01"),
+            "configured api-version should replace existing, got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("2023-01-01"),
+            "old api-version should be removed, got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("foo=bar"),
+            "other query params should be preserved, got: {rewritten}"
         );
     }
 
@@ -643,6 +736,35 @@ mod tests {
     }
 
     #[test]
+    fn strip_sse_chunk_drops_chunk_on_parse_error() {
+        let request = make_request(Method::POST, "/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        ctx.current_filter_id = Some(0);
+        // Tiny limit so a normal Azure SSE frame overflows the parser.
+        ctx.insert_filter_state(SseFrameParser::new(8));
+
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
+        let mut body = Some(Bytes::from(chunk.to_vec()));
+
+        strip_sse_chunk(&mut ctx, &mut body, false);
+
+        let output_bytes = body.unwrap();
+        assert!(
+            output_bytes.is_empty(),
+            "parse error must drop the chunk instead of forwarding it unstripped"
+        );
+        let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
+        assert!(
+            !output.contains("content_filter_results"),
+            "Azure filter fields must not leak on parse error"
+        );
+        assert!(
+            ctx.get_filter_state::<SseFrameParser>().is_some(),
+            "parser should be retained after a parse error"
+        );
+    }
+
+    #[test]
     fn strip_sse_chunk_preserves_multibyte_utf8_across_boundary() {
         let request = make_request(Method::POST, "/chat/completions");
         let mut ctx = make_filter_context(&request);
@@ -664,6 +786,60 @@ mod tests {
         assert!(
             output.contains("שלום"),
             "multi-byte UTF-8 should survive chunk boundary"
+        );
+        assert!(!output.contains("content_filter_results"));
+    }
+
+    #[test]
+    fn strip_sse_chunk_drops_async_filter_only_annotations() {
+        let request = make_request(Method::POST, "/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(SseFrameParser::new(65_536));
+
+        // Mix of normal chunk + async filter-only annotation (no delta).
+        let chunk = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"content_filter_results\":{}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"content_filter_results\":{\"hate\":{\"filtered\":false}},\"content_filter_offsets\":{\"check_offset\":44,\"start_offset\":0,\"end_offset\":44}}]}\n\n",
+        );
+        let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
+
+        strip_sse_chunk(&mut ctx, &mut body, false);
+
+        let output_bytes = body.unwrap();
+        let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
+        assert!(
+            output.contains("\"content\":\"Hi\""),
+            "normal content chunk should be preserved"
+        );
+        assert!(
+            !output.contains("content_filter_offsets"),
+            "filter-only annotation chunk should be dropped entirely"
+        );
+        assert!(
+            !output.contains("content_filter_results"),
+            "content_filter_results should be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_sse_chunk_keeps_finish_reason_with_filter_metadata() {
+        let request = make_request(Method::POST, "/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(SseFrameParser::new(65_536));
+
+        let chunk =
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
+        let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
+
+        strip_sse_chunk(&mut ctx, &mut body, false);
+
+        let output_bytes = body.unwrap();
+        let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
+        assert!(
+            output.contains("\"finish_reason\":\"stop\""),
+            "finish_reason chunk must be forwarded, got: {output}"
         );
         assert!(!output.contains("content_filter_results"));
     }

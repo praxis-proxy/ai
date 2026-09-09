@@ -17,9 +17,10 @@ listeners:
 filter_chains:
   - name: azure-transform
     filters:
-      - filter: openai_chat_completions_to_azureai_chat_completions
-        api_version: "2024-10-21"
-
+      # path_rewrite must run before the Azure filter so api-version is
+      # appended to the deployment path rather than overwriting it.
+      # Azure async content-filter annotations are dropped: they are
+      # not representable in Chat Completions and crash OpenAI SDKs.
       - filter: path_rewrite
         replace:
           pattern: "^/v1/chat/completions$"
@@ -27,6 +28,9 @@ filter_chains:
         conditions:
           - when:
               path_prefix: "/v1/chat/completions"
+
+      - filter: openai_chat_completions_to_azureai_chat_completions
+        api_version: "2024-10-21"
 
       - filter: router
         routes:
