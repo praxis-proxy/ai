@@ -2216,15 +2216,18 @@ class TestAgenticLoopVLLM:
             max_output_tokens=512,
         )
 
-        # Record incremental output-item events in arrival order, plus the
-        # arrival position of the first resumed model text delta so ordering can
-        # be asserted without depending on model prose.
+        # Record incremental output-item events in arrival order, plus every
+        # output_text.delta with its output index, so ordering can be asserted
+        # against *resumed*-round text without depending on model prose.
         added = []  # (output_index, item_type, item_id, sequence_number)
         done = []   # (output_index, item_type, item_id, sequence_number)
         # #276 tool-specific progress/outcome events: (type, item_id, seq).
         mcp_progress = []
         mcp_added_at = None
-        first_text_delta_at = None
+        # (position, output_index) per output_text.delta; the ordering check
+        # isolates resumed text (output_index > mcp_index) from any round-0
+        # narration the model streams before it calls the tool.
+        text_deltas = []
         final_response = None
 
         for position, event in enumerate(stream):
@@ -2251,11 +2254,8 @@ class TestAgenticLoopVLLM:
                 mcp_progress.append(
                     (etype, event.item_id, event.sequence_number)
                 )
-            elif (
-                etype == "response.output_text.delta"
-                and first_text_delta_at is None
-            ):
-                first_text_delta_at = position
+            elif etype == "response.output_text.delta":
+                text_deltas.append((position, event.output_index))
             elif etype == "response.completed":
                 final_response = event.response
 
@@ -2326,17 +2326,26 @@ class TestAgenticLoopVLLM:
             f"done={mcp_done[0][3]}"
         )
 
-        # Ordering: synthesized tool activity must precede the resumed model
-        # output. When the model streams any text, the mcp_call added event
-        # comes first.
-        if first_text_delta_at is not None:
+        # Ordering: synthesized tool activity must precede the *resumed* model
+        # output. The model may narrate (stream output_text) in the round that
+        # declares the tool, before it is dispatched; that round-0 text occupies
+        # an output index below the mcp_call, so it is not "resumed" output.
+        # Resumed text is the first output_text.delta whose output_index is
+        # above the synthesized mcp_call's index -- the mcp_call added event
+        # must precede it.
+        first_resumed_text_delta_at = next(
+            (pos for pos, output_index in text_deltas if output_index > mcp_index),
+            None,
+        )
+        if first_resumed_text_delta_at is not None:
             assert (
                 mcp_added_at is not None
-                and mcp_added_at < first_text_delta_at
+                and mcp_added_at < first_resumed_text_delta_at
             ), (
-                "synthesized mcp_call output_item.added must precede the "
-                f"resumed model text; mcp_added_at={mcp_added_at}, "
-                f"first_text_delta_at={first_text_delta_at}"
+                "synthesized mcp_call output_item.added must precede the resumed "
+                f"model text (output_index > {mcp_index}); "
+                f"mcp_added_at={mcp_added_at}, "
+                f"first_resumed_text_delta_at={first_resumed_text_delta_at}"
             )
 
         # Snapshot agrees with the stream: the terminal response.completed
@@ -2356,7 +2365,7 @@ class TestAgenticLoopVLLM:
         )
 
     def test_web_search_streams_local_call_as_incremental_output_items(
-        self, agentic_client, agentic_proxy,
+        self, translated_agentic_client,
     ):
         """Issue #276: locally executed web-search activity is streamed live.
 
@@ -2372,7 +2381,7 @@ class TestAgenticLoopVLLM:
         across IRR rounds), before the resumed model output, with an id and
         output index that agree with the terminal snapshot.
         """
-        stream = agentic_client.responses.create(
+        stream = translated_agentic_client.responses.create(
             model=VLLM_MODEL,
             input=(
                 "Search the web for the latest Rust release, then answer. "
@@ -2385,15 +2394,18 @@ class TestAgenticLoopVLLM:
             max_output_tokens=512,
         )
 
-        # Record incremental output-item events in arrival order, plus the
-        # arrival position of the first resumed model text delta so ordering can
-        # be asserted without depending on model prose.
+        # Record incremental output-item events in arrival order, plus every
+        # output_text.delta with its output index, so ordering can be asserted
+        # against *resumed*-round text without depending on model prose.
         added = []  # (output_index, item_type, item_id, sequence_number)
         done = []   # (output_index, item_type, item_id, sequence_number)
         # #276 tool-specific progress/outcome events: (type, item_id, seq).
         ws_progress = []
         ws_added_at = None
-        first_text_delta_at = None
+        # (position, output_index) per output_text.delta; the ordering check
+        # isolates resumed text (output_index > ws_index) from any round-0
+        # narration the model streams before it calls the tool.
+        text_deltas = []
         final_response = None
 
         for position, event in enumerate(stream):
@@ -2420,11 +2432,8 @@ class TestAgenticLoopVLLM:
                 ws_progress.append(
                     (etype, event.item_id, event.sequence_number)
                 )
-            elif (
-                etype == "response.output_text.delta"
-                and first_text_delta_at is None
-            ):
-                first_text_delta_at = position
+            elif etype == "response.output_text.delta":
+                text_deltas.append((position, event.output_index))
             elif etype == "response.completed":
                 final_response = event.response
 
@@ -2506,17 +2515,26 @@ class TestAgenticLoopVLLM:
             f"done={ws_done[0][3]}"
         )
 
-        # Ordering: synthesized tool activity must precede the resumed model
-        # output. When the model streams any text, the web_search_call added
-        # event comes first.
-        if first_text_delta_at is not None:
+        # Ordering: synthesized tool activity must precede the *resumed* model
+        # output. The model may narrate (stream output_text) in the round that
+        # declares the tool, before it is dispatched; that round-0 text occupies
+        # an output index below the web_search_call, so it is not "resumed"
+        # output. Resumed text is the first output_text.delta whose output_index
+        # is above the synthesized web_search_call's index -- the web_search_call
+        # added event must precede it.
+        first_resumed_text_delta_at = next(
+            (pos for pos, output_index in text_deltas if output_index > ws_index),
+            None,
+        )
+        if first_resumed_text_delta_at is not None:
             assert (
                 ws_added_at is not None
-                and ws_added_at < first_text_delta_at
+                and ws_added_at < first_resumed_text_delta_at
             ), (
                 "synthesized web_search_call output_item.added must precede the "
-                f"resumed model text; ws_added_at={ws_added_at}, "
-                f"first_text_delta_at={first_text_delta_at}"
+                f"resumed model text (output_index > {ws_index}); "
+                f"ws_added_at={ws_added_at}, "
+                f"first_resumed_text_delta_at={first_resumed_text_delta_at}"
             )
 
         # Snapshot agrees with the stream: the terminal response.completed
