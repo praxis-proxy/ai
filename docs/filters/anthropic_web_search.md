@@ -16,6 +16,7 @@ Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 | `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
 | `base_url` | string | no | Override the provider's default API base URL. |
 | `allow_private_base_url` | bool | no | Allow a `base_url` that targets local-sensitive addresses. DNS names are resolved once per request and every result is checked immediately before the transport connects. By default, any private, loopback, link-local, or otherwise non-public result rejects the callout. Enable this only for a trusted private provider endpoint. |
+| `terminal_streaming` | bool | no | Select Praxis streaming transport for effective `stream: true` Messages requests. When enabled, the terminal inference response is streamed incrementally as one coherent client-visible SSE lifecycle while intermediate tool/search transitions stay internal. This knob is anthropic-only; `openai_web_search` does not accept it. |
 
 ## Examples
 
@@ -43,7 +44,7 @@ max_body_bytes: 67108864
 ```yaml
 # cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
 # WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" cargo run -p praxis-ai-proxy -- \
-#   -c examples/configs/anthropic/messages-web-search.yaml
+#   -c examples/configs/anthropic/full-flow-agentic.yaml
 # curl http://127.0.0.1:8080/v1/messages \
 #   -H 'content-type: application/json' \
 #   -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":"Use web search to look up potato, then summarize in one sentence."}],"tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}'

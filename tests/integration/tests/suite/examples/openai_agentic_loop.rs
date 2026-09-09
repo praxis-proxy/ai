@@ -2205,6 +2205,165 @@ fn two_tool_rounds_streaming_matches_buffered() {
 }
 
 // -----------------------------------------------------------------------------
+// Dependency chain: round-2 args derived from round-1's tool output
+// -----------------------------------------------------------------------------
+//
+// Unlike two_tool_rounds_accumulate_output_and_usage, where the second tool's
+// arguments are a fixed constant, this exercises a genuine data dependency
+// (OGX-style get_user_id -> get_user_permissions): the model reads the first
+// tool's output and passes it as an argument to the second tool. The scripted
+// backend authors the derivation, but the assertions prove the proxy plumbing
+// that makes it possible end to end -- the first result is fed into the second
+// inference round AND the derived value is dispatched verbatim to the
+// downstream MCP server, not just echoed back to the model.
+
+#[test]
+fn dependency_chain_feeds_first_tool_output_into_second_tool_args() {
+    // The MCP mock returns f"mock result for {name}" for a known tool, so the
+    // first tool's output string is deterministic and usable as the marker the
+    // second call must carry.
+    const USER_ID_RESULT: &str = "mock result for get_user_id";
+
+    // Round 1: the model calls get_user_id (no input needed).
+    let first_response = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_user_id",
+            "name": "directory__get_user_id",
+            "arguments": "{}",
+            "status": "completed"
+        }],
+        "usage": usage_json((10, 3, 13))
+    });
+    // Round 2: the model derives get_user_permissions's user_id argument from the
+    // get_user_id result it just received.
+    let second_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_2",
+            "call_id": "call_perms",
+            "name": "directory__get_user_permissions",
+            "arguments": serde_json::to_string(&serde_json::json!({"user_id": USER_ID_RESULT})).unwrap(),
+            "status": "completed"
+        }],
+        "usage": usage_json((20, 4, 24))
+    });
+    // Round 3: the model emits the final assistant message and the loop exits.
+    let final_response = serde_json::json!({
+        "id": "resp_3",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "You have read access."}]
+        }],
+        "usage": usage_json((30, 5, 35))
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+        (200, serde_json::to_string(&final_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_user_id")
+                .with_description("Resolve the current user's id")
+                .with_input_schema(serde_json::json!({"type": "object"})),
+            McpToolFixture::new("get_user_permissions")
+                .with_description("List permissions for a user id")
+                .with_input_schema(object_schema("user_id")),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What permissions does the current user have?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "directory",
+            "server_url": mcp_url,
+            "allowed_tools": ["get_user_id", "get_user_permissions"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "dependency-chain request should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+
+    // Both distinct tools executed exactly once, in order.
+    assert_eq!(mcp.tool_call_count("get_user_id"), 1, "get_user_id runs once");
+    assert_eq!(
+        mcp.tool_call_count("get_user_permissions"),
+        1,
+        "get_user_permissions runs once"
+    );
+    let output_types: Vec<&str> = response["output"]
+        .as_array()
+        .expect("final response output array")
+        .iter()
+        .map(output_item_type)
+        .collect();
+    assert_eq!(
+        output_types,
+        ["function_call", "mcp_call", "function_call", "mcp_call", "message"],
+        "terminal output must interleave both tool rounds then the final message: {output_types:?}"
+    );
+
+    // Derivation is possible: round 2's inference input carries the get_user_id
+    // result the model read to build the second call's argument.
+    let model_reqs = model.requests();
+    assert_eq!(model_reqs.len(), 3, "model backend should receive three requests");
+    let second_input = request_input(&model_reqs[1].body);
+    assert!(
+        second_input.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"].as_str().is_some_and(|out| out.contains(USER_ID_RESULT))
+        }),
+        "round 2 input must carry the get_user_id result so the model can derive the next arg: {second_input:#?}"
+    );
+
+    // The derived value was threaded all the way to the downstream MCP server:
+    // get_user_permissions was dispatched with user_id equal to get_user_id's
+    // output, not just echoed back to the model.
+    let permissions_call = mcp
+        .received_requests()
+        .into_iter()
+        .find(|r| r.tool_name.as_deref() == Some("get_user_permissions"))
+        .expect("MCP server must receive the get_user_permissions call");
+    let dispatched: serde_json::Value =
+        serde_json::from_str(&permissions_call.body).expect("MCP tools/call body should be valid JSON");
+    assert_eq!(
+        dispatched["params"]["arguments"]["user_id"], USER_ID_RESULT,
+        "the second tool must be dispatched with the argument derived from the first tool's output: {dispatched:#?}"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Round-Trip: Web Search via IRR
 // -----------------------------------------------------------------------------
 

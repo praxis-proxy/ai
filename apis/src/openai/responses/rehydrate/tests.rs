@@ -3,13 +3,16 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use praxis_filter::{FilterAction, FilterEntry, FilterPipeline};
 use serde_json::json;
 
 use super::*;
-use crate::store::{
-    ConversationRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+use crate::{
+    openai::sse::{SseFrame, SseFrameParser},
+    store::{
+        ConversationRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+    },
 };
 
 fn default_filter() -> RehydrateFilter {
@@ -1949,15 +1952,32 @@ async fn does_not_restore_for_non_success_status() {
     );
 }
 
-#[tokio::test]
-async fn does_not_restore_for_streaming_response() {
-    let filter = default_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+// -----------------------------------------------------------------------------
+// Streaming (SSE) previous_response_id restore (issue #932, streaming half)
+// -----------------------------------------------------------------------------
+
+/// A 200 response with an SSE content type.
+fn sse_ok_response() -> praxis_filter::Response {
     let mut response = crate::test_utils::make_response();
     response.headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("text/event-stream"),
     );
+    response
+}
+
+/// Re-parse assembled SSE output bytes into frames for assertions.
+fn parse_sse_frames(bytes: &[u8]) -> Vec<SseFrame> {
+    SseFrameParser::new(1 << 20)
+        .parse_chunk(bytes)
+        .expect("assembled SSE output should parse")
+}
+
+#[tokio::test]
+async fn restores_for_streaming_response() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
 
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.current_filter_id = Some(0);
@@ -1967,24 +1987,367 @@ async fn does_not_restore_for_streaming_response() {
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "on_response should continue without arming a restore for an SSE response"
-    );
-    assert!(
-        !ctx.response_headers_modified,
-        "SSE responses must be left as a passthrough stream"
+        "on_response should continue and arm the streaming restore"
     );
 
-    let original = "event: response.created\ndata: {}\n\n";
-    let mut body = Some(Bytes::from(original));
+    let input = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_new\",\"object\":\"response\",\"status\":\"in_progress\",\"previous_response_id\":null}}\n",
+        "\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"Hi\"}\n",
+        "\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_new\",\"object\":\"response\",\"status\":\"completed\",\"previous_response_id\":null}}\n",
+        "\n",
+    );
+    let mut body = Some(Bytes::from_static(input.as_bytes()));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "on_response_body should continue without a rewrite for an SSE response"
+        "on_response_body should continue"
+    );
+
+    let out = body.expect("streaming body should be rewritten in place");
+    let frames = parse_sse_frames(&out);
+    assert_eq!(frames.len(), 3, "all three frames should survive reconstruction");
+
+    for (idx, event) in [(0_usize, "response.created"), (2, "response.completed")] {
+        assert_eq!(frames[idx].event_type.as_deref(), Some(event));
+        let data: Value = serde_json::from_slice(&frames[idx].data).unwrap();
+        assert_eq!(
+            data["response"]["previous_response_id"], "resp_prev",
+            "{event} must carry the restored previous_response_id"
+        );
+        assert_eq!(
+            data["response"]["id"], "resp_new",
+            "other response fields must be preserved"
+        );
+    }
+
+    assert_eq!(
+        frames[1].event_type.as_deref(),
+        Some("response.output_text.delta"),
+        "the delta frame (no top-level response object) passes through untouched"
+    );
+    let delta: Value = serde_json::from_slice(&frames[1].data).unwrap();
+    assert!(
+        delta.get("previous_response_id").is_none(),
+        "a delta frame must not gain a previous_response_id"
+    );
+    assert_eq!(delta["delta"], "Hi", "delta payload must be preserved");
+}
+
+#[tokio::test]
+async fn restores_streaming_across_chunk_boundary() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+
+    // A single lifecycle frame split mid-`data:` across two chunks. The first
+    // chunk completes no frame (its bytes stay buffered in the parser); the
+    // second chunk completes and rewrites the frame.
+    let full = concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"sequence_number\":0,\"response\":{\"id\":\"resp_new\",\"object\":\"response\",\"previous_response_id\":null}}\n",
+        "\n",
+    );
+    let (head, tail) = full.split_at(40);
+
+    let mut assembled = Vec::new();
+    let mut body = Some(Bytes::from_static(head.as_bytes()));
+    let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert!(
+        body.is_none(),
+        "an incomplete frame must not emit partial bytes (they stay buffered)"
+    );
+
+    let mut body = Some(Bytes::from_static(tail.as_bytes()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    if let Some(chunk) = &body {
+        assembled.extend_from_slice(chunk);
+    }
+
+    let frames = parse_sse_frames(&assembled);
+    assert_eq!(frames.len(), 1, "the frame split across chunks should complete once");
+    let data: Value = serde_json::from_slice(&frames[0].data).unwrap();
+    assert_eq!(
+        data["response"]["previous_response_id"], "resp_prev",
+        "a frame split across chunk boundaries must still have its id restored"
+    );
+}
+
+#[tokio::test]
+async fn streaming_delta_frames_pass_through_unchanged() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+
+    let input = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n",
+        "\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\" there\"}\n",
+        "\n",
+    );
+    let mut body = Some(Bytes::from_static(input.as_bytes()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
     );
     assert_eq!(
-        body.as_ref().unwrap().as_ref(),
-        original.as_bytes(),
-        "SSE body should pass through untouched"
+        body.as_deref(),
+        Some(input.as_bytes()),
+        "delta-only frames must be reconstructed byte-identically"
+    );
+}
+
+#[tokio::test]
+async fn streaming_preserves_id_retry_and_comment_lines() {
+    // Finding 2 regression: frames are spliced, not reconstructed. A comment-only
+    // heartbeat and a delta frame pass through byte-for-byte, and a lifecycle frame
+    // keeps its `id:`, `retry:`, and comment lines while only its `data:` JSON is
+    // rewritten. Nothing outside the payload — including CRLF-adjacent SSE fields —
+    // may be dropped.
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+
+    let heartbeat = ": keepalive\n\n";
+    let lifecycle_in = concat!(
+        "id: 42\n",
+        "event: response.created\n",
+        "retry: 1500\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\n",
+        ": trailing note\n",
+        "\n",
+    );
+    let delta = concat!(
+        "event: response.output_text.delta\n",
+        "id: 43\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n",
+        "\n",
+    );
+    let input = format!("{heartbeat}{lifecycle_in}{delta}");
+    let mut body = Some(Bytes::from(input));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+
+    let lifecycle_out = concat!(
+        "id: 42\n",
+        "event: response.created\n",
+        "retry: 1500\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"object\":\"response\",\"previous_response_id\":\"resp_prev\"}}\n",
+        ": trailing note\n",
+        "\n",
+    );
+    let expected = format!("{heartbeat}{lifecycle_out}{delta}");
+    assert_eq!(
+        body.as_deref(),
+        Some(expected.as_bytes()),
+        "id/retry/comment/heartbeat lines must survive; only the lifecycle data payload is rewritten"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_encoded_streaming_response() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    // A gzipped event stream cannot be parsed frame-by-frame, so it must be
+    // declined and passed through verbatim (mirrors the encoded-SSE decline in
+    // stream_events; see issue #668).
+    response
+        .headers
+        .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "an encoded event stream must be left as an untouched passthrough"
+    );
+    assert!(
+        ctx.response_header
+            .as_ref()
+            .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_ENCODING)),
+        "Content-Encoding must be preserved so the client can still decode the stream"
+    );
+
+    let original = concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\n",
+        "\n",
+    );
+    let mut body = Some(Bytes::from_static(original.as_bytes()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_bytes()),
+        "an encoded stream must pass through byte-for-byte with no restore attempt"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_non_ok_streaming_response() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    response.status = http::StatusCode::INTERNAL_SERVER_ERROR;
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a non-200 event stream must not be rewritten"
+    );
+
+    let original = concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\n",
+        "\n",
+    );
+    let mut body = Some(Bytes::from_static(original.as_bytes()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_bytes()),
+        "a non-200 event stream passes through unchanged"
+    );
+}
+
+#[tokio::test]
+async fn declines_streaming_response_with_body_validators() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = sse_ok_response();
+    // SSE normally carries no body validators, but if a backend sets one the
+    // rewritten frames would no longer match its upstream digest. The header phase
+    // cannot recompute or safely strip it (Praxis commits headers before the body
+    // is rewritten), so the stream is declined and passed through byte-for-byte with
+    // its validators intact — the same fail-safe as the non-streaming path.
+    response
+        .headers
+        .insert(http::header::ETAG, http::HeaderValue::from_static("\"abc123\""));
+    response.headers.insert(
+        http::header::LAST_MODIFIED,
+        http::HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+    );
+    response.headers.insert(
+        "content-md5",
+        http::HeaderValue::from_static("Q2hlY2sgSW50ZWdyaXR5IQ=="),
+    );
+    response.headers.insert(
+        "digest",
+        http::HeaderValue::from_static("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE="),
+    );
+    response.headers.insert(
+        "content-digest",
+        http::HeaderValue::from_static("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
+    );
+    response.headers.insert(
+        "repr-digest",
+        http::HeaderValue::from_static("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
+    );
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a validator-bearing event stream must be declined as an untouched passthrough"
+    );
+
+    let headers = &ctx
+        .response_header
+        .as_ref()
+        .expect("response header should still be present")
+        .headers;
+    for validator in [
+        http::header::ETAG.as_str(),
+        http::header::LAST_MODIFIED.as_str(),
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+    ] {
+        assert!(
+            headers.contains_key(validator),
+            "body validator {validator} must be preserved on a declined SSE stream"
+        );
+    }
+
+    let original = concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\n",
+        "\n",
+    );
+    let mut body = Some(Bytes::from_static(original.as_bytes()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_bytes()),
+        "a validator-bearing stream must pass through byte-for-byte with no restore attempt"
     );
 }
 
@@ -2005,7 +2368,6 @@ async fn does_not_rewrite_non_response_json_shape() {
         "on_response should continue and arm the restore for an eligible 2xx JSON response"
     );
 
-    // A 2xx JSON body that is not a Responses resource must be left alone.
     let original = r#"{"object":"list","data":[]}"#;
     let mut body = Some(Bytes::from(original));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -2031,12 +2393,10 @@ async fn ignores_non_end_of_stream_chunks() {
     ctx.extensions.insert(rehydrated_state("resp_prev"));
     ctx.response_header = Some(&mut response);
 
-    // Arm the restore so this exercises the end-of-stream guard, not the
-    // unarmed path.
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "on_response should continue and arm the restore before the body phase"
+        "on_response must arm the restore so the body phase exercises the end-of-stream guard, not the unarmed path"
     );
 
     let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
@@ -2172,7 +2532,6 @@ async fn declines_identity_content_encoding_conservatively() {
 async fn does_not_restore_when_content_type_missing() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    // No Content-Type header at all.
     let mut response = crate::test_utils::make_response();
 
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -2347,7 +2706,6 @@ async fn declines_and_preserves_response_body_validators() {
         "repr-digest",
         http::HeaderValue::from_static("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
     );
-    // Unrelated metadata that must also survive the untouched passthrough.
     response
         .headers
         .insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
@@ -2684,6 +3042,440 @@ fn restore_replaces_null_previous_response_id() {
     assert_eq!(
         patched["previous_response_id"], "resp_prev",
         "a null previous_response_id must be replaced with the caller's id"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Streaming restore pure functions
+// -----------------------------------------------------------------------------
+
+#[test]
+fn rewrite_lifecycle_frame_data_injects_into_response_object() {
+    let data =
+        br#"{"type":"response.created","response":{"id":"resp_new","object":"response","previous_response_id":null}}"#;
+    let out = rewrite_lifecycle_frame_data(data, "resp_prev").expect("a lifecycle frame should be rewritten");
+    let parsed: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        parsed["response"]["previous_response_id"], "resp_prev",
+        "the caller id must be injected into the nested response object"
+    );
+    assert_eq!(parsed["type"], "response.created", "the event type must be preserved");
+    assert_eq!(
+        parsed["response"]["id"], "resp_new",
+        "other response fields must be preserved"
+    );
+}
+
+#[test]
+fn rewrite_lifecycle_frame_data_skips_delta_frame() {
+    let data = br#"{"type":"response.output_text.delta","delta":"Hi"}"#;
+    assert!(
+        rewrite_lifecycle_frame_data(data, "resp_prev").is_none(),
+        "a delta frame has no top-level response object and must be skipped"
+    );
+}
+
+#[test]
+fn rewrite_lifecycle_frame_data_skips_non_response_shaped_object() {
+    let data = br#"{"type":"x","response":{"object":"list"}}"#;
+    assert!(
+        rewrite_lifecycle_frame_data(data, "resp_prev").is_none(),
+        "a response member with a non-response object must be skipped"
+    );
+}
+
+#[test]
+fn rewrite_lifecycle_frame_data_skips_non_json() {
+    assert!(
+        rewrite_lifecycle_frame_data(b"{not json", "resp_prev").is_none(),
+        "a non-JSON payload must be skipped"
+    );
+}
+
+fn armed_stream(max_buffer_bytes: usize, prev_id: &str) -> RestorePreviousResponseIdStream {
+    RestorePreviousResponseIdStream {
+        pending: BytesMut::new(),
+        scan_from: 0,
+        scan_at_line_start: true,
+        max_buffer_bytes,
+        previous_response_id: prev_id.to_owned(),
+    }
+}
+
+#[test]
+fn stream_chunk_fails_open_on_buffer_overflow() {
+    let mut armed = armed_stream(16, "resp_prev");
+    // A single line far exceeding the 16-byte buffer with no frame terminator can
+    // never complete, forcing the fail-open flush.
+    let original: &[u8] =
+        br#"data: {"type":"response.created","response":{"object":"response","previous_response_id":null}}"#;
+    let mut body = Some(Bytes::from_static(original));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(!keep, "a buffer overflow must disarm the restore (fail-open)");
+    assert_eq!(
+        body.as_deref(),
+        Some(original),
+        "on overflow the chunk must pass through untouched, never corrupted or errored"
+    );
+}
+
+#[test]
+fn stream_chunk_withholds_incomplete_frame_bytes() {
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    // No blank line: the frame is incomplete, so no bytes are emitted yet.
+    let mut body = Some(Bytes::from_static(b"event: response.created\ndata: {\"response\":"));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(keep, "an incomplete frame keeps the restore armed");
+    assert!(
+        body.is_none(),
+        "an incomplete frame must not emit partial bytes; they stay buffered"
+    );
+}
+
+#[test]
+fn stream_chunk_flushes_buffered_prefix_on_overflow() {
+    // Finding 1 regression: a partial frame withheld from an earlier chunk lives
+    // only in `pending`. When a later chunk overflows the buffer, the fail-open
+    // flush must include that buffered prefix — never just the overflowing chunk.
+    let mut armed = armed_stream(40, "resp_prev");
+
+    let prefix: &[u8] = b"event: response.created\n";
+    let mut body = Some(Bytes::from_static(prefix));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(keep, "the first partial frame keeps the restore armed");
+    assert!(body.is_none(), "the buffered prefix emits no partial bytes yet");
+
+    let overflow: &[u8] = b"data: {\"partial\":\"loooooong-unterminated\"}";
+    let mut body = Some(Bytes::from_static(overflow));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(!keep, "exceeding the buffer limit disarms the restore (fail-open)");
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(prefix);
+    expected.extend_from_slice(overflow);
+    assert_eq!(
+        body.as_deref(),
+        Some(expected.as_slice()),
+        "fail-open must flush the buffered prefix AND the overflowing chunk — no bytes dropped"
+    );
+}
+
+#[test]
+fn stream_chunk_flushes_unterminated_frame_at_end_of_stream() {
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    let tail: &[u8] = b"event: response.completed\ndata: {\"response\":";
+    let mut body = Some(Bytes::from_static(tail));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, true);
+    assert!(!keep, "end of stream disarms the restore");
+    assert_eq!(
+        body.as_deref(),
+        Some(tail),
+        "an unterminated final frame is flushed raw at end of stream, never withheld"
+    );
+}
+
+#[test]
+fn stream_chunk_fails_open_on_oversized_complete_frame() {
+    // Cap-enforcement regression: the buffer limit must bound a *complete* frame
+    // too, not only an incomplete trailing one. A terminated lifecycle frame larger
+    // than the limit must never be JSON-parsed or rewritten — it is flushed raw and
+    // the restore disarms (fail-open), so `previous_response_id` stays exactly as the
+    // backend sent it (`null`), which proves the oversized frame was not parsed.
+    let mut armed = armed_stream(16, "resp_prev");
+    let original: &[u8] = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\n",
+        "\n",
+    )
+    .as_bytes();
+    let mut body = Some(Bytes::from_static(original));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(!keep, "an oversized complete frame must disarm the restore (fail-open)");
+    assert_eq!(
+        body.as_deref(),
+        Some(original),
+        "an oversized complete frame is flushed raw and never parsed or rewritten"
+    );
+}
+
+#[test]
+fn stream_chunk_forwards_passthrough_frame_without_copying() {
+    // Ownership regression: a chunk that needs no rewrite is forwarded as a
+    // zero-copy slice of the original `Bytes`, never copied into a fresh buffer. The
+    // forwarded chunk must share the input's backing allocation (same pointer).
+    let mut armed = armed_stream(1 << 20, "resp_prev");
+    let original: &[u8] = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n",
+        "\n",
+    )
+    .as_bytes();
+    let input = Bytes::from_static(original);
+    let input_ptr = input.as_ptr();
+    let mut body = Some(input);
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(keep, "a complete pass-through frame keeps the restore armed");
+    let forwarded = body.expect("a complete frame must be forwarded, not withheld");
+    assert_eq!(
+        forwarded.as_ref(),
+        original,
+        "a pass-through frame must be byte-identical"
+    );
+    assert_eq!(
+        forwarded.as_ptr(),
+        input_ptr,
+        "a pass-through chunk must be forwarded without copying its bytes"
+    );
+}
+
+#[test]
+fn stream_chunk_resumes_scan_without_reprocessing_buffered_bytes() {
+    // Amplification regression (P1): a single frame spanning many chunks must be
+    // scanned once, never rescanned from byte zero every chunk. The resume cursor
+    // (`scan_from`) must always sit at the end of everything buffered so far, so the
+    // next chunk only scans its own new bytes. Without this the work is quadratic — a
+    // 64 MiB frame in 16 KiB chunks would copy and scan ~128 GiB.
+    let mut armed = armed_stream(1 << 20, "resp_restored");
+    let head: &[u8] = concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":",
+        "{\"object\":\"response\",\"previous_response_id\":null,\"pad\":\"",
+    )
+    .as_bytes();
+    let mut body = Some(Bytes::copy_from_slice(head));
+    assert!(restore_previous_response_id_stream_chunk(&mut armed, &mut body, false));
+    assert!(body.is_none(), "the opening partial frame is withheld, not emitted");
+    assert_eq!(
+        armed.scan_from,
+        armed.pending.len(),
+        "the resume cursor must sit at the buffer end, proving no rescan from zero"
+    );
+
+    for _ in 0..64 {
+        let mut body = Some(Bytes::from_static(b"xxxxxxxxxxxxxxxx"));
+        assert!(restore_previous_response_id_stream_chunk(&mut armed, &mut body, false));
+        assert!(body.is_none(), "an unterminated frame keeps withholding its bytes");
+        assert_eq!(
+            armed.scan_from,
+            armed.pending.len(),
+            "each chunk resumes at the prior end; buffered bytes are never rescanned"
+        );
+    }
+
+    // Close the frame: the whole buffered lifecycle frame is rewritten and emitted,
+    // and `pending` is drained.
+    let mut body = Some(Bytes::from_static(b"\"}}\n\n"));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(keep, "a completed frame keeps the restore armed");
+    let forwarded = body.expect("the completed frame must be emitted");
+    let text = String::from_utf8(forwarded.to_vec()).expect("utf8");
+    assert!(
+        text.contains("resp_restored"),
+        "the buffered lifecycle frame must have previous_response_id restored"
+    );
+    assert!(
+        !text.contains("null"),
+        "the backend's null previous_response_id must be replaced, not left in place"
+    );
+    assert!(armed.pending.is_empty(), "the emitted frame is drained from pending");
+}
+
+#[test]
+fn stream_chunk_forwards_completed_frame_and_compacts_pending() {
+    // Carry-over path: when a chunk completes a buffered frame and opens a new partial,
+    // the completed frame is emitted (rewritten) and dropped off the FRONT of
+    // `pending`, leaving only the new partial — the buffer never accumulates forwarded
+    // frames.
+    let mut armed = armed_stream(1 << 20, "resp_restored");
+
+    let first: &[u8] = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"respo",
+    )
+    .as_bytes();
+    let mut body = Some(Bytes::from_static(first));
+    assert!(restore_previous_response_id_stream_chunk(&mut armed, &mut body, false));
+    assert!(body.is_none(), "the first partial frame is withheld");
+
+    let rest: &[u8] = concat!(
+        "nse\":{\"object\":\"response\",\"previous_response_id\":null}}\n\n",
+        "event: response.in_progress\ndata: ",
+    )
+    .as_bytes();
+    let mut body = Some(Bytes::from_static(rest));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(keep, "the completed first frame keeps the restore armed");
+
+    let forwarded = body.expect("the completed first frame must be emitted");
+    let text = String::from_utf8(forwarded.to_vec()).expect("utf8");
+    assert!(
+        text.contains("resp_restored"),
+        "the completed lifecycle frame must have previous_response_id restored"
+    );
+    assert!(
+        text.starts_with("event: response.created\n"),
+        "only the completed first frame is emitted, verbatim except the payload"
+    );
+    assert_eq!(
+        armed.pending.as_ref(),
+        b"event: response.in_progress\ndata: ",
+        "the forwarded frame is dropped off the front; only the new partial remains"
+    );
+    assert_eq!(
+        armed.scan_from,
+        armed.pending.len(),
+        "the new partial is fully scanned; the next chunk resumes at its end"
+    );
+}
+
+#[test]
+fn stream_chunk_rewrites_lifecycle_frame_terminated_by_bare_cr_at_end_of_stream() {
+    // Terminator regression (P2): a valid lifecycle frame whose only line endings are
+    // bare carriage returns — ending in a blank `\r\r` — must still be detected and
+    // rewritten at end-of-stream. Mid-stream a trailing lone `\r` is ambiguous (it may
+    // still become `\r\n`), but at end-of-stream no continuation byte can follow, so the
+    // frame completes and `previous_response_id` is restored rather than flushed raw with
+    // the backend's `null`.
+    let mut armed = armed_stream(1 << 20, "resp_restored");
+    let frame: &[u8] = concat!(
+        "event: response.completed\r",
+        "data: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\r",
+        "\r",
+    )
+    .as_bytes();
+    let mut body = Some(Bytes::from_static(frame));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, true);
+    assert!(!keep, "end of stream disarms the restore");
+    let forwarded = body.expect("the final CR-terminated frame must be emitted");
+    let text = String::from_utf8(forwarded.to_vec()).expect("utf8");
+    assert!(
+        text.contains("resp_restored"),
+        "a bare-CR-terminated lifecycle frame must have previous_response_id restored at end of stream"
+    );
+    assert!(
+        !text.contains("null"),
+        "the backend's null previous_response_id must be replaced, not flushed raw"
+    );
+    assert!(
+        text.starts_with("event: response.completed\r"),
+        "the frame's original CR line endings are preserved verbatim outside the payload"
+    );
+}
+
+#[test]
+fn stream_chunk_defers_ambiguous_trailing_cr_across_chunk_boundary() {
+    // The bare-CR fix must stay scoped to end-of-stream: mid-stream a trailing lone `\r`
+    // is still ambiguous, because the next chunk may begin with `\n` to form a single
+    // `\r\n` terminator. Splitting a `\r\n\r\n` frame boundary as `...\r\n\r` + `\n` must
+    // yield exactly one complete frame, never a corrupted early split.
+    let mut armed = armed_stream(1 << 20, "resp_restored");
+    let head: &[u8] = concat!(
+        "event: response.completed\r\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\r\n",
+        "\r",
+    )
+    .as_bytes();
+    let mut body = Some(Bytes::from_static(head));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(keep, "an ambiguous trailing CR keeps the restore armed");
+    assert!(
+        body.is_none(),
+        "the frame boundary is ambiguous until the next byte; nothing is emitted yet"
+    );
+
+    let mut body = Some(Bytes::from_static(b"\n"));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+    assert!(keep, "the completed frame keeps the restore armed");
+    let forwarded = body.expect("the completed frame must be emitted once the CRLF resolves");
+    let text = String::from_utf8(forwarded.to_vec()).expect("utf8");
+    assert!(
+        text.contains("resp_restored"),
+        "the frame completes as one CRLF boundary and gets previous_response_id restored"
+    );
+    assert!(
+        text.ends_with("\r\n\r\n"),
+        "the split \\r\\n\\r + \\n must rejoin into a single CRLF blank-line terminator"
+    );
+    assert!(armed.pending.is_empty(), "the emitted frame is drained from pending");
+}
+
+#[test]
+fn stream_chunk_restores_when_chunk_completes_valid_frame_and_carries_more() {
+    // Cap regression (P2): whether previous_response_id is restored must NOT depend on
+    // how the transport chunked the stream. `max_buffer_bytes` bounds a single SSE frame,
+    // never the transient `pending + incoming` sum. A chunk that finishes a valid carried
+    // lifecycle frame and carries the start of the next frame must be processed in full —
+    // the completed frame rewritten and forwarded, the trailing partial retained — even
+    // when `pending + incoming` transiently exceeds the per-frame budget.
+    let frame1: &[u8] = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"object\":\"response\",\"previous_response_id\":null}}\n",
+        "\n",
+    )
+    .as_bytes();
+    let frame2_partial: &[u8] = b"event: response.in_progress\ndata: {\"type\":\"response.in_prog";
+
+    // The cap admits one whole frame (frame1) but is smaller than `pending + incoming`,
+    // so a sum-based pre-check would wrongly fail open on the completing chunk.
+    let cap = frame1.len() + 8;
+    assert!(frame1.len() <= cap, "frame1 must fit the per-frame budget");
+    assert!(frame2_partial.len() <= cap, "the retained partial must fit the budget");
+    assert!(
+        cap < frame1.len() + frame2_partial.len(),
+        "pending + incoming must exceed the cap to exercise the regression"
+    );
+
+    let mut armed = armed_stream(cap, "resp_restored");
+
+    // Chunk 1: an incomplete opening frame (cut before its blank-line terminator) is
+    // withheld and retained within the cap.
+    let split = frame1.len() - 6;
+    let mut body = Some(Bytes::copy_from_slice(&frame1[..split]));
+    assert!(restore_previous_response_id_stream_chunk(&mut armed, &mut body, false));
+    assert!(body.is_none(), "the opening partial frame is withheld");
+    assert!(
+        armed.pending.len() <= armed.max_buffer_bytes,
+        "the retained buffer stays within the cap"
+    );
+
+    // Chunk 2: finishes frame1 and carries the start of frame2. `pending + incoming`
+    // exceeds the cap, but frame1 itself does not — it must be restored, not failed open.
+    let mut chunk2 = Vec::new();
+    chunk2.extend_from_slice(&frame1[split..]);
+    chunk2.extend_from_slice(frame2_partial);
+    assert!(
+        armed.pending.len() + chunk2.len() > armed.max_buffer_bytes,
+        "the transient pending + incoming sum must exceed the cap here"
+    );
+    let mut body = Some(Bytes::from(chunk2));
+    let keep = restore_previous_response_id_stream_chunk(&mut armed, &mut body, false);
+
+    assert!(
+        keep,
+        "a valid completed frame keeps the restore armed regardless of chunking"
+    );
+    let forwarded = body.expect("the completed frame must be forwarded");
+    let text = String::from_utf8(forwarded.to_vec()).expect("utf8");
+    assert!(
+        text.contains("\"previous_response_id\":\"resp_restored\""),
+        "the completed lifecycle frame has previous_response_id restored: {text}"
+    );
+    assert!(
+        !text.contains("\"previous_response_id\":null"),
+        "the stale null id must be replaced, not forwarded"
+    );
+    assert!(
+        !text.contains("response.in_progress"),
+        "only the completed frame is forwarded; the trailing partial stays withheld"
+    );
+    assert_eq!(
+        armed.pending.as_ref(),
+        frame2_partial,
+        "only the trailing partial frame is retained across the callback"
+    );
+    assert!(
+        armed.pending.len() <= armed.max_buffer_bytes,
+        "the retained partial stays within the cap"
     );
 }
 

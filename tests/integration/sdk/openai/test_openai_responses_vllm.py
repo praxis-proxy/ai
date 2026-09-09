@@ -375,20 +375,51 @@ class MCPHandler(BaseHTTPRequestHandler):
                                 "additionalProperties": False,
                             },
                         },
+                        {
+                            "name": "get_weather_map",
+                            "description": "Get a weather map image link for a city",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                                "additionalProperties": False,
+                            },
+                        },
                     ]
                 },
             )
         elif method == "tools/call":
-            tool_name = req.get("params", {}).get("name")
-            city = req.get("params", {}).get("arguments", {}).get("city", "unknown")
-            result = (
-                f"12:00 PM in {city}"
-                if tool_name == "get_time"
-                else f"72F and sunny in {city}"
-            )
-            self._json_rpc(
-                rid, {"content": [{"type": "text", "text": result}]}
-            )
+            params = req.get("params", {})
+            tool_name = params.get("name")
+            city = params.get("arguments", {}).get("city", "unknown")
+            if tool_name == "get_weather_map":
+                # Non-text MCP content: a resource_link block. The tool result is
+                # server-controlled and deterministic, so this exercises the
+                # proxy's lossless non-text serialization end to end -- through
+                # the wire and into the mcp_call output item the OpenAI SDK
+                # deserializes -- independent of the model's choices.
+                self._json_rpc(
+                    rid,
+                    {
+                        "content": [
+                            {
+                                "type": "resource_link",
+                                "uri": "file:///weather/paris-map.png",
+                                "name": "paris-weather-map",
+                                "mimeType": "image/png",
+                            }
+                        ]
+                    },
+                )
+            else:
+                result = (
+                    f"12:00 PM in {city}"
+                    if tool_name == "get_time"
+                    else f"72F and sunny in {city}"
+                )
+                self._json_rpc(
+                    rid, {"content": [{"type": "text", "text": result}]}
+                )
         elif method == "ping":
             self._json_rpc(rid, {})
         else:
@@ -1219,6 +1250,98 @@ class TestOpenAIResponsesVLLM:
             )
         assert exc_info.value.status_code == 400
         assert "conv_00000000000000000000000000000000" in str(exc_info.value)
+
+    def test_streaming_rehydrated_response_echoes_previous_response_id(
+        self, openai_client
+    ):
+        """Issue #932 (streaming half): a rehydrated ``stream=True`` turn must
+        echo the caller's previous_response_id back inside the SSE lifecycle
+        frames.
+
+        Streaming sibling of
+        ``test_rehydrated_response_echoes_previous_response_id``. Same contract,
+        same full-flow pipeline (store -> stream_events -> rehydrate), but
+        stream=True: the proxy replays prior turns via the ``input`` array and
+        strips previous_response_id from the upstream request, so vLLM streams
+        ``previous_response_id: null`` in every response-lifecycle frame. The
+        rehydrate filter restores the caller's id into each lifecycle frame as
+        it streams -- without buffering the stream -- so the client's terminal
+        ``response.completed`` event carries the id it sent.
+
+        The assertions are metadata-only and independent of model output, so
+        they stay deterministic despite running against a real vLLM backend.
+
+        Manifest linkage: this is the live vLLM regression counterpart of the
+        committed synthetic inference fixture -- coverage feature
+        ``responses.native.continuation``, scenario
+        ``responses/native-continuation-stream`` (see
+        tests/integration/fixtures/inference/). No live recording is committed
+        for that feature -- it stays ``synthetic_only`` because a live recording
+        requires explicit authorization -- so this SDK test provides the
+        real-backend confidence for the streaming path.
+        """
+        first = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: STREAM-ECHO-BASE /no_think",
+            store=True,
+            max_output_tokens=128,
+        )
+
+        assert first.status == "completed"
+        assert first.id
+
+        stream = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: STREAM-ECHO-NEXT /no_think",
+            previous_response_id=first.id,
+            store=True,
+            stream=True,
+            max_output_tokens=128,
+        )
+
+        event_types = []
+        lifecycle_previous_ids = []
+        final_response = None
+
+        for event in stream:
+            event_types.append(event.type)
+            # Only response-lifecycle events (created, in_progress, completed)
+            # carry a full response resource; delta/item events do not.
+            response_obj = getattr(event, "response", None)
+            if response_obj is not None:
+                lifecycle_previous_ids.append(
+                    getattr(response_obj, "previous_response_id", None)
+                )
+            if event.type == "response.completed":
+                final_response = event.response
+
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_response is not None, (
+            "stream must terminate with a response.completed event; "
+            f"got: {event_types}"
+        )
+        assert final_response.status == "completed", final_response.status
+
+        # Core #932 streaming contract: the terminal event the client observes
+        # carries the caller's previous_response_id, not the backend's null.
+        assert final_response.previous_response_id == first.id, (
+            "the streamed terminal response must echo the caller's "
+            "previous_response_id even though the proxy strips it from the "
+            "rehydrated upstream request; got: "
+            f"{final_response.previous_response_id!r}"
+        )
+
+        # The restore rewrites every response-lifecycle frame incrementally, so
+        # no streamed frame may still echo the backend's null id.
+        assert lifecycle_previous_ids, (
+            "the stream must contain at least one response-lifecycle frame; "
+            f"got event types: {event_types}"
+        )
+        assert all(pid == first.id for pid in lifecycle_previous_ids), (
+            "every streamed lifecycle frame must carry the restored "
+            f"previous_response_id; got: {lifecycle_previous_ids}"
+        )
 
     def test_doc_extract_inline_file_to(self, openai_client):
         """Issue #397: inline file_data is extracted to input_text and
@@ -2167,6 +2290,68 @@ class TestAgenticLoopVLLM:
         assert rounds >= 2, (
             "accumulated output should span at least two inference "
             f"rounds; got: {output_types}"
+        )
+
+    def test_mcp_non_text_content_survives_to_openai_client(
+        self,
+        agentic_client,
+        agentic_proxy,
+    ):
+        """A non-text MCP tool result reaches the client via the openai SDK.
+
+        The Rust unit tests cover the ``content_blocks_to_output`` transform in
+        isolation; this proves the complementary layer the unit test cannot
+        reach: a non-text content block (``resource_link``) serializes over the
+        wire and is exposed on the ``mcp_call`` output item exactly as the
+        OpenAI SDK deserializes the response. The tool *result* is
+        server-controlled and deterministic, so only tool *selection* depends
+        on the model -- the same reliability profile as
+        ``test_mcp_tool_auto_executes_and_returns``.
+        """
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather_map function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather_map"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            max_output_tokens=512,
+        )
+
+        assert response.status in ("completed", "incomplete"), (
+            f"expected completed or incomplete (token limit); got: {response.status}"
+        )
+
+        mcp_calls = [item.model_dump() for item in response.output if item.type == "mcp_call"]
+        assert mcp_calls, (
+            "accumulated output should contain the auto-executed MCP tool "
+            f"result (mcp_call); got: {[item.type for item in response.output]}"
+        )
+
+        # The resource_link block survives serialization end to end: its type
+        # and identifying fields land verbatim in the mcp_call output the SDK
+        # deserialized, proving non-text MCP content is not flattened or dropped.
+        output_text = mcp_calls[0].get("output") or ""
+        assert "resource_link" in output_text, (
+            f"mcp_call output must carry the resource_link block; got: {output_text}"
+        )
+        assert "file:///weather/paris-map.png" in output_text, (
+            f"resource uri must survive to the client; got: {output_text}"
+        )
+        assert "paris-weather-map" in output_text, (
+            f"resource name must survive to the client; got: {output_text}"
         )
 
     def test_mcp_approval_request_stops_before_dispatch(

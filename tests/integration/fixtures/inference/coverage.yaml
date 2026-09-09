@@ -149,6 +149,7 @@ features:
     status: synthetic_only
     scenarios:
       - responses/native-continuation
+      - responses/native-continuation-stream
     providers:
       synthetic:
         status: synthetic_only

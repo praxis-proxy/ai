@@ -1282,8 +1282,8 @@ mod tests {
             ]
         );
         assert_eq!(report.features_total, 23);
-        assert_eq!(report.scenarios_total, 21);
-        assert_eq!(report.recordings_total, 26);
+        assert_eq!(report.scenarios_total, 22);
+        assert_eq!(report.recordings_total, 27);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1307,6 +1307,7 @@ mod tests {
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
                 "responses/native-continuation",
+                "responses/native-continuation-stream",
                 "responses/native-tool-call",
             ]
         );
@@ -1393,7 +1394,10 @@ mod tests {
                 ),
                 (
                     &"responses.native.continuation".to_owned(),
-                    &vec!["responses/native-continuation".to_owned()]
+                    &vec![
+                        "responses/native-continuation".to_owned(),
+                        "responses/native-continuation-stream".to_owned(),
+                    ]
                 ),
                 (
                     &"responses.chat.request".to_owned(),
@@ -1890,6 +1894,63 @@ mod tests {
         assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
         assert!(native_turn.expect.client_sse_events.is_empty());
         assert!(native_turn.expect.upstream_sse_events.is_empty());
+
+        let native_continuation_stream =
+            InferenceScenario::load(&root.join("scenarios/responses/native-continuation-stream.yaml")).unwrap();
+        assert_eq!(native_continuation_stream.version, 1);
+        assert_eq!(native_continuation_stream.id, "responses/native-continuation-stream");
+        assert_eq!(native_continuation_stream.protocol, InferenceProtocol::OpenaiResponses);
+        assert_eq!(
+            native_continuation_stream.example_config,
+            "openai/responses/rehydrate-fixture.yaml"
+        );
+        assert_eq!(native_continuation_stream.upstream_authority, "127.0.0.1:3001");
+        assert_eq!(native_continuation_stream.features, ["responses.native.continuation"]);
+        assert_eq!(native_continuation_stream.turns.len(), 2);
+
+        let stream_initial = &native_continuation_stream.turns[0];
+        assert_eq!(stream_initial.name, "initial");
+        assert_eq!(stream_initial.expect.client_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &stream_initial.request.body else {
+            panic!("streaming native continuation initial request body must be JSON");
+        };
+        assert_eq!(value["stream"], false);
+
+        // The continuation turn streams: the client receives SSE while the upstream
+        // request stays JSON, and previous_response_id is restored inside the
+        // lifecycle frames (issue #932 streaming follow-up).
+        let stream_turn = &native_continuation_stream.turns[1];
+        assert_eq!(stream_turn.name, "continuation");
+        assert_eq!(stream_turn.request.path, "/v1/responses");
+        assert_eq!(stream_turn.expect.client_status, 200);
+        assert_eq!(stream_turn.expect.client_body_kind, BodyKind::Sse);
+        assert_eq!(stream_turn.expect.upstream_path, "/v1/responses");
+        assert_eq!(stream_turn.expect.upstream_body_kind, BodyKind::Json);
+        let RecordedBody::Json { value } = &stream_turn.request.body else {
+            panic!("streaming native continuation request body must be JSON");
+        };
+        assert_eq!(value["previous_response_id"], "${PREVIOUS_RESPONSE_ID}");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], true);
+        assert_eq!(
+            stream_turn
+                .expect
+                .client_sse_events
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
 
         let responses_chat_stream =
             InferenceScenario::load(&root.join("scenarios/responses/chat-basic-stream.yaml")).unwrap();

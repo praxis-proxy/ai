@@ -131,6 +131,14 @@ pub(crate) struct WebSearchFilterConfig {
     /// callout. Enable this only for a trusted private provider endpoint.
     #[serde(default)]
     pub(crate) allow_private_base_url: bool,
+
+    /// Select Praxis streaming transport for effective `stream: true`
+    /// Messages requests. When enabled, the terminal inference response is
+    /// streamed incrementally as one coherent client-visible SSE lifecycle
+    /// while intermediate tool/search transitions stay internal. This knob is
+    /// anthropic-only; `openai_web_search` does not accept it.
+    #[serde(default)]
+    pub(crate) terminal_streaming: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -201,6 +209,10 @@ impl OpenAiWebSearchConfig {
             max_body_bytes: None,
             base_url: self.base_url,
             allow_private_base_url: self.allow_private_base_url,
+            // `openai_web_search` has no terminal_streaming knob; its own
+            // deny_unknown_fields config never accepts the field, so the
+            // shared validated form is always off for it.
+            terminal_streaming: false,
         }
     }
 }
@@ -232,6 +244,9 @@ pub(crate) struct ValidatedConfig {
 
     /// Connect-time private-address policy for the provider target.
     pub allow_private_base_url: bool,
+
+    /// Whether to stream the terminal Messages response incrementally.
+    pub terminal_streaming: bool,
 }
 
 impl std::fmt::Debug for ValidatedConfig {
@@ -244,6 +259,7 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("max_body_bytes", &self.max_body_bytes)
             .field("base_url", &self.base_url)
             .field("allow_private_base_url", &self.allow_private_base_url)
+            .field("terminal_streaming", &self.terminal_streaming)
             .finish()
     }
 }
@@ -282,6 +298,7 @@ fn build_validated_config(
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
         base_url: raw.base_url.clone(),
         allow_private_base_url: raw.allow_private_base_url,
+        terminal_streaming: raw.terminal_streaming,
     })
 }
 
@@ -348,7 +365,34 @@ mod tests {
             max_body_bytes: None,
             base_url: None,
             allow_private_base_url: false,
+            terminal_streaming: false,
         }
+    }
+
+    #[test]
+    fn build_config_defaults_terminal_streaming_off() {
+        let validated = build_config("anthropic_web_search", &base_config()).unwrap();
+        assert!(
+            !validated.terminal_streaming,
+            "terminal_streaming must default to off so non-streaming behavior is unchanged"
+        );
+    }
+
+    #[test]
+    fn parse_config_reads_terminal_streaming() {
+        let yaml = serde_yaml::from_str("provider: you\napi_key: k\nterminal_streaming: true").unwrap();
+        let raw = parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml).unwrap();
+        let validated = build_config("anthropic_web_search", &raw).unwrap();
+        assert!(validated.terminal_streaming);
+    }
+
+    #[test]
+    fn openai_web_search_rejects_terminal_streaming() {
+        let yaml = serde_yaml::from_str("provider: you\napi_key: k\nterminal_streaming: true").unwrap();
+        assert!(
+            parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml).is_err(),
+            "terminal_streaming is anthropic-only; openai_web_search must reject the unknown field"
+        );
     }
 
     #[test]

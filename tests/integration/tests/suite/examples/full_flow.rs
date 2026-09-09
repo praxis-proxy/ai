@@ -36,6 +36,19 @@ const FIRST_RESPONSE_JSON: &str = r#"{"id":"resp_first","created_at":1000,"model
 /// `previous_response_id: null` — exactly as modeled here.
 const SECOND_RESPONSE_JSON: &str = r#"{"id":"resp_second","created_at":2000,"model":"gpt-4.1","object":"response","status":"completed","previous_response_id":null,"output":[{"type":"message","content":[{"type":"output_text","text":"Sure"}]}]}"#;
 
+/// Streaming (SSE) second-turn backend response. Every response-lifecycle frame
+/// echoes `previous_response_id: null` — exactly what a provider returns after
+/// the proxy strips the ID from the rehydrated upstream request — so the
+/// rehydrate filter must restore the caller's ID into each lifecycle frame.
+const SECOND_RESPONSE_SSE: &str = concat!(
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_second\",\"created_at\":2000,\"model\":\"gpt-4.1\",\"object\":\"response\",\"status\":\"in_progress\",\"previous_response_id\":null}}\n",
+    "\n",
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_second\",\"created_at\":2000,\"model\":\"gpt-4.1\",\"object\":\"response\",\"status\":\"completed\",\"previous_response_id\":null,\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Sure\"}]}]}}\n",
+    "\n",
+);
+
 /// Maximum time allowed for a test client to complete a WebSocket handshake.
 const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -361,6 +374,84 @@ async fn full_flow_previous_response_id_restored_in_client_response() {
     assert_eq!(
         response["previous_response_id"], "resp_first",
         "client-supplied previous_response_id must be restored into the response (issue #932)"
+    );
+
+    drop(proxy2);
+}
+
+/// The streaming counterpart of the previous test: a rehydrated `stream: true`
+/// turn whose backend emits an SSE stream echoing `previous_response_id: null`.
+/// The rehydrate filter must restore the caller's `previous_response_id` into
+/// each response-lifecycle frame as it streams, without buffering the stream
+/// (regression test for issue #932, streaming half).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_flow_previous_response_id_restored_in_streaming_response() {
+    let backend_guard = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let db = TempSqlite::new("full_flow_prev_restore_stream");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+        .expect("example config should exist");
+    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "first request should succeed");
+
+    drop(backend_guard);
+
+    // Second turn: a fixed backend that streams SSE lifecycle frames echoing
+    // `previous_response_id: null`, modeling a real provider that never saw the
+    // stripped ID.
+    let backend_guard2 = Backend::fixed(SECOND_RESPONSE_SSE)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let patched2 = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend_guard2.port())]),
+    );
+    let config2 = praxis_core::config::Config::from_yaml(&patched2).expect("second patched config should parse");
+    drop(proxy);
+
+    let proxy2 = start_proxy(&config2);
+
+    let raw2 = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_first","stream":true}"#,
+        ),
+    );
+    let status2 = parse_status(&raw2);
+    let body2 = parse_body(&raw2);
+    assert_eq!(
+        status2, 200,
+        "second streaming request with previous_response_id should succeed, raw: {raw2}"
+    );
+
+    assert!(
+        body2.contains(r#""previous_response_id":"resp_first""#),
+        "streamed lifecycle frames must carry the restored previous_response_id (issue #932), body: {body2}"
+    );
+    assert!(
+        !body2.contains(r#""previous_response_id":null"#),
+        "no streamed lifecycle frame should still echo previous_response_id: null, body: {body2}"
+    );
+    assert!(
+        body2.contains(r#""id":"resp_second""#),
+        "client should receive the backend's streamed response resource, body: {body2}"
     );
 
     drop(proxy2);

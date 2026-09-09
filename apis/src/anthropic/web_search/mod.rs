@@ -3,14 +3,16 @@
 
 //! Anthropic Messages web-search loop support.
 
-use std::borrow::Cow;
+mod streaming;
+
+use std::{borrow::Cow, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::header::{CONTENT_TYPE, HeaderValue};
+use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState, NextIterationBody,
-    Rejection, parse_filter_config,
+    Rejection, StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
 };
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
@@ -164,10 +166,13 @@ struct ResponseEnvelope<'a> {
 ///
 /// # Live demo YAML
 ///
+/// The unified example serves both buffered (`stream: false`) and streaming
+/// (`stream: true`) clients from one pipeline via `terminal_streaming: true`.
+///
 /// ```yaml
 /// # cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
 /// # WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" cargo run -p praxis-ai-proxy -- \
-/// #   -c examples/configs/anthropic/messages-web-search.yaml
+/// #   -c examples/configs/anthropic/full-flow-agentic.yaml
 /// # curl http://127.0.0.1:8080/v1/messages \
 /// #   -H 'content-type: application/json' \
 /// #   -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":"Use web search to look up potato, then summarize in one sentence."}],"tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}'
@@ -177,6 +182,10 @@ pub struct AnthropicWebSearchFilter {
     default_context_size: SearchContextSize,
     /// Maximum request and response body size buffered by the loop.
     max_body_bytes: usize,
+    /// Whether an effective `stream: true` Messages request may use Praxis's
+    /// streaming subrequest transport to deliver the terminal response
+    /// incrementally across IRR rounds.
+    terminal_streaming: bool,
     /// Shared provider client used for You.com callouts.
     search_client: SearchClient,
 }
@@ -216,8 +225,28 @@ impl AnthropicWebSearchFilter {
         Ok(Box::new(Self {
             default_context_size: validated.default_context_size,
             max_body_bytes: validated.max_body_bytes,
+            terminal_streaming: validated.terminal_streaming,
             search_client,
         }))
+    }
+
+    /// Align the Praxis subrequest response transport with the outbound body.
+    ///
+    /// Only meaningful under `terminal_streaming`: an effective `stream: true`
+    /// request selects the streaming transport so the terminal Messages
+    /// response reaches the client incrementally, while a non-streaming request
+    /// keeps the buffered transport. The buffered loop leaves the default mode
+    /// untouched.
+    fn apply_streaming_transport(&self, ctx: &mut HttpFilterContext<'_>, streaming: bool) {
+        if !self.terminal_streaming {
+            return;
+        }
+        let mode = if streaming {
+            SubRequestResponseMode::Streaming
+        } else {
+            SubRequestResponseMode::Buffered
+        };
+        ctx.set_subrequest_response_mode(mode);
     }
 
     /// Execute one pending call, returning the provider outcome.
@@ -240,6 +269,19 @@ impl AnthropicWebSearchFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
+        // A streamed round leaves the IRR buffered response empty, so recover the
+        // managed call from the logical stream's reconstruction and reset it for
+        // the upcoming round. A buffered round has no logical stream and falls
+        // back to the accounted previous response below.
+        let reconstructed = ctx
+            .extensions
+            .get_mut::<streaming::LogicalStream>()
+            .and_then(|logical| {
+                let reconstructed = logical.take_reconstructed();
+                logical.begin_round();
+                reconstructed
+            });
+
         let Some(iteration_state) = ctx.extensions.get::<IterationState>() else {
             return Err(FilterError::from(format!(
                 "{FILTER_NAME}: IRR iteration state unavailable during re-entry"
@@ -249,13 +291,17 @@ impl AnthropicWebSearchFilter {
             .accumulator
             .get(REQUEST_ACCUMULATOR_KEY)
             .unwrap_or(&iteration_state.original_request.body);
-        let Some(previous_response) = iteration_state.previous_response.as_ref() else {
-            return Err(FilterError::from(format!(
-                "{FILTER_NAME}: previous IRR response unavailable during re-entry"
-            )));
-        };
 
-        let (pending, assistant_content) = managed_search_from_response(&previous_response.body)?;
+        let (pending, assistant_content) = if let Some(reconstructed) = reconstructed.as_deref() {
+            managed_search_from_response(reconstructed)?
+        } else {
+            let Some(previous_response) = iteration_state.previous_response.as_ref() else {
+                return Err(FilterError::from(format!(
+                    "{FILTER_NAME}: previous IRR response unavailable during re-entry"
+                )));
+            };
+            managed_search_from_response(&previous_response.body)?
+        };
 
         let mut request: Value = match serde_json::from_slice(request_bytes) {
             Ok(value) => value,
@@ -286,6 +332,10 @@ impl AnthropicWebSearchFilter {
             )));
         }
         let rebuilt = Bytes::from(rebuilt);
+        // Every round talks to the backend with the caller's original transport
+        // intent so the terminal round can be streamed the moment it arrives.
+        let streaming = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        self.apply_streaming_transport(ctx, streaming);
         let iteration_state = ctx.extensions.get_mut::<IterationState>().ok_or_else(|| {
             FilterError::from(format!(
                 "{FILTER_NAME}: IRR iteration state unavailable while retaining request"
@@ -300,6 +350,66 @@ impl AnthropicWebSearchFilter {
         ctx.request_headers_to_set
             .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));
         *body = Some(rebuilt);
+        Ok(FilterAction::Continue)
+    }
+
+    /// Forward one terminal-streaming response chunk and drive the loop decision.
+    ///
+    /// The cross-round [`streaming::LogicalStream`] lives in `ctx.extensions` so
+    /// it survives IRR re-entry: text frames are forwarded incrementally, the
+    /// managed `WebSearch` block is suppressed, and a single terminal
+    /// `message_delta` / `message_stop` lifecycle is emitted only when the loop
+    /// finishes. Every framing failure is fail-closed to one terminal `error`
+    /// event so no raw upstream bytes leak into the transformed stream.
+    fn on_streaming_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        // A transport-level failure (connect/IO fault, circuit trip, admission or
+        // idle timeout, deadline, or byte-ceiling breach) surfaces as a Praxis
+        // stream termination during the completion hook (empty body, end of
+        // stream). Convert it into one terminal error event and mark it handled;
+        // otherwise the router discards the completion output and the client
+        // stream ends in an abrupt EOF.
+        if let Some(cause) = ctx.stream_termination().map(praxis_filter::StreamTermination::cause) {
+            return handle_stream_termination(ctx, body, cause);
+        }
+
+        // Only a 2xx, identity-encoded upstream stream is a Messages SSE
+        // lifecycle we can transform. A non-2xx status or a content-encoded body
+        // cannot be parsed as UTF-8 Messages events.
+        //
+        // The IRR streaming body phase leaves `ctx.response_header` unset, so the
+        // status and encoding cannot be re-read here. `on_response` inspects the
+        // still-populated header once per round and records `UntransformableRound`
+        // when the round is not a transformable lifecycle; declining on that
+        // marker keeps a non-2xx or compressed round — including the initial
+        // round, whose raw status and body must pass through unchanged — from
+        // being parsed as events.
+        if ctx.extensions.get::<UntransformableRound>().is_some() {
+            return decline_untransformable_round(ctx, body, end_of_stream);
+        }
+
+        let reentry = router_reentry(ctx);
+        let chunk = body.take();
+        let logical = ctx
+            .extensions
+            .get_or_insert_with(|| streaming::LogicalStream::new(self.max_body_bytes, self.max_body_bytes));
+        if logical.has_failed() {
+            // The stream already failed closed: drop remaining upstream bytes so
+            // exactly one terminal error reaches the client.
+            *body = None;
+            return Ok(FilterAction::Continue);
+        }
+
+        let (output, action) =
+            drive_streaming_chunk(logical, chunk.as_deref().unwrap_or_default(), end_of_stream, reentry);
+        *body = (!output.is_empty()).then(|| Bytes::from(output));
+        if let Some(action) = action {
+            set_action(ctx, action)?;
+        }
         Ok(FilterAction::Continue)
     }
 }
@@ -321,16 +431,37 @@ impl HttpFilter for AnthropicWebSearchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
-    }
-
-    fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
+        // Terminal streaming rewrites the SSE body incrementally; the buffered
+        // loop only inspects the accumulated response.
+        if self.terminal_streaming {
+            BodyAccess::ReadWrite
+        } else {
+            BodyAccess::ReadOnly
         }
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    fn response_body_mode(&self) -> BodyMode {
+        // A streaming-capable response pipeline may not use `StreamBuffer`; the
+        // terminal serializer delivers chunks as they arrive.
+        if self.terminal_streaming {
+            BodyMode::Stream
+        } else {
+            BodyMode::StreamBuffer {
+                max_bytes: Some(self.max_body_bytes),
+            }
+        }
+    }
+
+    fn may_select_streaming_subrequest_response(&self) -> bool {
+        self.terminal_streaming
+    }
+
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Strip client-negotiated content coding so every backend round returns
+        // identity-encoded bytes. A compressed SSE stream cannot be parsed into
+        // Messages events, and a compressed buffered body cannot be classified;
+        // stripping here keeps both the streaming and buffered loops working.
+        ctx.request_headers_to_remove.push(ACCEPT_ENCODING);
         Ok(FilterAction::Continue)
     }
 
@@ -360,14 +491,34 @@ impl HttpFilter for AnthropicWebSearchFilter {
             Ok(value) => value,
             Err(_) => return Ok(FilterAction::Continue),
         };
-        if request.stream == Some(true) {
+        let streaming = request.stream == Some(true);
+        if streaming && !self.terminal_streaming {
             return Ok(FilterAction::Reject(anthropic_rejection(
                 400,
                 "invalid_request_error",
                 "streaming is not supported with anthropic_web_search",
             )));
         }
+        self.apply_streaming_transport(ctx, streaming);
 
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The IRR runs the response-header phase once per streaming round with
+        // `ctx.response_header` populated, then clears it before the streaming
+        // body phase. Record here whether this round can be transformed as a
+        // Messages SSE lifecycle so the body phase — which no longer sees the
+        // status or encoding — declines an untransformable round instead of
+        // parsing non-SSE bytes as events. The marker is re-evaluated every
+        // round, so a success round clears any marker left by a prior one.
+        if self.terminal_streaming {
+            if !is_success_response(ctx) || response_is_encoded(ctx) {
+                ctx.extensions.insert(UntransformableRound);
+            } else {
+                ctx.extensions.remove::<UntransformableRound>();
+            }
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -377,6 +528,13 @@ impl HttpFilter for AnthropicWebSearchFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        // A streamed round (effective `stream: true` under `terminal_streaming`)
+        // is transformed incrementally; a buffered round keeps the accumulate-
+        // then-classify path below.
+        if self.terminal_streaming && ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+            return self.on_streaming_response_body(ctx, body, end_of_stream);
+        }
+
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
@@ -410,11 +568,253 @@ impl HttpFilter for AnthropicWebSearchFilter {
     }
 }
 
+/// Marks the current streaming round as untransformable (non-2xx status or
+/// content-encoded body), recorded in the response-header phase.
+///
+/// The IRR streaming body phase leaves `ctx.response_header` unset, so the
+/// status and encoding cannot be re-checked there. [`on_response`] inspects the
+/// still-populated header once per round and records this marker when the round
+/// cannot be parsed as a Messages SSE lifecycle; the streaming body phase reads
+/// it to decline the round instead of parsing non-SSE bytes as events.
+///
+/// [`on_response`]: AnthropicWebSearchFilter::on_response
+struct UntransformableRound;
+
 /// Whether the current upstream response may contain a managed call.
+///
+/// Reads `ctx.response_header`, which the buffered response path populates but
+/// the IRR streaming body phase leaves unset; an absent header is treated as a
+/// success so a streamed round is transformed rather than declined.
 fn is_success_response(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.response_header
         .as_ref()
         .is_none_or(|response| response.status.is_success())
+}
+
+/// Whether the upstream response carries a `Content-Encoding` header.
+///
+/// Like [`is_success_response`], this reads `ctx.response_header`; it reports
+/// `false` when the header is absent (including the IRR streaming body phase).
+fn response_is_encoded(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.response_header
+        .as_ref()
+        .is_some_and(|response| response.headers.contains_key(CONTENT_ENCODING))
+}
+
+/// Handle a non-2xx or content-encoded upstream response on the streaming path.
+///
+/// Round 0 (no started [`streaming::LogicalStream`]): the client has not yet
+/// seen any transformed SSE bytes, so the raw upstream response is passed
+/// through untouched and the loop ends — the upstream status and body are the
+/// whole client-visible response.
+///
+/// A later round (a stream that has already forwarded `message_start`): the
+/// client is mid-stream on a committed 200 SSE lifecycle, so raw non-2xx or
+/// compressed bytes cannot be forwarded without corrupting it. The stream fails
+/// closed to one terminal `error` event, drops the untransformable upstream
+/// body, and ends the loop.
+fn decline_untransformable_round(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+) -> Result<FilterAction, FilterError> {
+    if let Some(logical) = ctx.extensions.get_mut::<streaming::LogicalStream>()
+        && logical.has_started()
+    {
+        let terminal = (!logical.has_failed()).then(|| {
+            logical.fail();
+            streaming::error_event_bytes(&streaming::StreamError::UpstreamUnprocessable)
+        });
+        *body = terminal.map(Bytes::from);
+        set_action(ctx, ACTION_DONE)?;
+        return Ok(FilterAction::Continue);
+    }
+    if end_of_stream {
+        set_action(ctx, ACTION_DONE)?;
+    }
+    Ok(FilterAction::Continue)
+}
+
+/// Map a Praxis stream-termination cause to the fail-closed [`streaming::StreamError`]
+/// forwarded as the terminal `error` event.
+///
+/// A transport-level deadline reuses the deadline message so the client sees a
+/// consistent reason whether the deadline lapses before re-entry or mid-stream;
+/// every other abnormal cause folds into [`streaming::StreamError::UpstreamTerminated`].
+/// The arms are explicit so a new Praxis cause forces a compile error here rather
+/// than silently mapping to a generic message.
+fn termination_stream_error(cause: StreamTerminationCause) -> streaming::StreamError {
+    match cause {
+        StreamTerminationCause::DeadlineExceeded => streaming::StreamError::DeadlineExceeded,
+        StreamTerminationCause::AdmissionTimeout
+        | StreamTerminationCause::CircuitOpen
+        | StreamTerminationCause::Connect
+        | StreamTerminationCause::IdleTimeout
+        | StreamTerminationCause::Io
+        | StreamTerminationCause::Filter
+        | StreamTerminationCause::ResponseTooLarge => streaming::StreamError::UpstreamTerminated,
+    }
+}
+
+/// Convert an abnormal Praxis stream termination into one terminal `error` event
+/// and mark it handled so the router forwards the completion bytes.
+///
+/// The IRR runs the completion body hook with an empty body at `end_of_stream`
+/// after inserting a [`StreamTermination`]; unless the filter both emits a
+/// terminal sequence and calls [`mark_stream_termination_handled`], the router
+/// discards the completion output and the client sees an abrupt EOF.
+///
+/// A logical stream that already failed closed keeps its single terminal (no
+/// second `error` event); a termination before any bytes still emits one
+/// terminal so the client learns why the stream ended.
+///
+/// [`StreamTermination`]: praxis_filter::StreamTermination
+/// [`mark_stream_termination_handled`]: HttpFilterContext::mark_stream_termination_handled
+fn handle_stream_termination(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    cause: StreamTerminationCause,
+) -> Result<FilterAction, FilterError> {
+    let error = termination_stream_error(cause);
+    let already_terminal = ctx
+        .extensions
+        .get_mut::<streaming::LogicalStream>()
+        .is_some_and(|logical| {
+            let failed = logical.has_failed();
+            logical.fail();
+            failed
+        });
+    *body = (!already_terminal).then(|| Bytes::from(streaming::error_event_bytes(&error)));
+    ctx.mark_stream_termination_handled();
+    set_action(ctx, ACTION_DONE)?;
+    Ok(FilterAction::Continue)
+}
+
+/// Whether the router can open another inference round, and if not, why.
+///
+/// The IRR owns the open-next step and exposes no terminal-failure hook, so a
+/// re-entry it would refuse surfaces as an abrupt EOF. A managed round detects
+/// the deterministic refusal conditions here and terminates with a coherent
+/// error instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reentry {
+    /// The router has iteration and deadline headroom to open the next round.
+    Available,
+    /// Re-entering would meet the router's iteration ceiling.
+    IterationCeiling,
+    /// The router's deadline has elapsed; opening the next round would fail.
+    DeadlineExceeded,
+}
+
+/// Classify whether the router can open another inference round after this one.
+///
+/// Re-entering inference produces the next round at `iteration + 1`; the IRR
+/// checks the iteration ceiling before the deadline when opening a step, so this
+/// mirrors that precedence: an exhausted ceiling reports [`Reentry::IterationCeiling`]
+/// even when the deadline has also elapsed. The deadline check mirrors the IRR's
+/// `open_step`, which refuses to open once no time remains.
+fn reentry_from_state(iteration: u32, max_iterations: u32, deadline: Instant, now: Instant) -> Reentry {
+    if iteration.saturating_add(1) >= max_iterations {
+        Reentry::IterationCeiling
+    } else if deadline.checked_duration_since(now).unwrap_or_default().is_zero() {
+        Reentry::DeadlineExceeded
+    } else {
+        Reentry::Available
+    }
+}
+
+/// Resolve the router's re-entry capacity from the current IRR state.
+///
+/// Absent IRR state (a non-routed unit context) the loop keeps its existing
+/// behavior and re-enters.
+fn router_reentry(ctx: &HttpFilterContext<'_>) -> Reentry {
+    ctx.extensions
+        .get::<IterationState>()
+        .map_or(Reentry::Available, |state| {
+            reentry_from_state(
+                state.iteration(),
+                state.max_iterations(),
+                state.deadline(),
+                Instant::now(),
+            )
+        })
+}
+
+/// Drive one terminal-streaming chunk through the cross-round logical stream.
+///
+/// Returns the client-visible bytes to forward and, once the round completes at
+/// `end_of_stream`, the IRR action to publish. Every framing failure is folded
+/// into a single terminal `error` event so no raw upstream bytes leak downstream.
+///
+/// `reentry` reports whether the router can open the next round. A managed round
+/// that wants to re-enter when the router would refuse is terminated with a
+/// coherent error rather than an [`ACTION_LOOP`] the IRR would fail to open —
+/// which would otherwise abort the client stream with an abrupt EOF. The two
+/// deterministic refusals are detected proactively: the iteration ceiling maps
+/// to [`streaming::StreamError::IterationLimit`] and an elapsed deadline to
+/// [`streaming::StreamError::DeadlineExceeded`]. A transport-level failure that
+/// aborts an already-committed round's body — a connect/IO fault, circuit trip,
+/// admission or idle timeout, deadline, or byte-ceiling breach — instead surfaces
+/// as a Praxis stream termination and is converted into a terminal error by
+/// [`handle_stream_termination`]. The residual gap in praxis 0.5.4 is the failure
+/// to *open* the next round after an [`ACTION_LOOP`]: that transition commits no
+/// response body, so it runs no completion hook and still ends the client stream
+/// in an abrupt EOF — the IRR driver owns the open-next step and exposes no
+/// terminal-failure hook, the same upstream limitation documented for the OpenAI
+/// Responses loop.
+fn drive_streaming_chunk(
+    logical: &mut streaming::LogicalStream,
+    chunk: &[u8],
+    end_of_stream: bool,
+    reentry: Reentry,
+) -> (Vec<u8>, Option<&'static str>) {
+    let mut output = Vec::new();
+    let forwarded = match logical.on_chunk(chunk, end_of_stream) {
+        Ok(forwarded) => forwarded,
+        Err(error) => {
+            output.extend_from_slice(&streaming::error_event_bytes(&error));
+            return (output, Some(ACTION_DONE));
+        },
+    };
+    output.extend_from_slice(&forwarded);
+    if !end_of_stream {
+        return (output, None);
+    }
+    let (terminal, action) = finish_streaming_round(logical, reentry);
+    output.extend_from_slice(&terminal);
+    (output, Some(action))
+}
+
+/// Resolve a completed round into terminal bytes and the IRR action to publish.
+///
+/// A round that wants to re-enter when the router would refuse the next step is
+/// turned into a coherent terminal error rather than an [`ACTION_LOOP`] the IRR
+/// would fail to open: an iteration ceiling maps to
+/// [`streaming::StreamError::IterationLimit`] and an elapsed deadline to
+/// [`streaming::StreamError::DeadlineExceeded`]. Every framing failure is
+/// likewise folded into a single terminal `error` event.
+fn finish_streaming_round(logical: &mut streaming::LogicalStream, reentry: Reentry) -> (Vec<u8>, &'static str) {
+    match logical.finish_round() {
+        Ok(streaming::FinishOutcome {
+            action: streaming::RoundAction::Loop,
+            ..
+        }) => match reentry {
+            Reentry::Available => (Vec::new(), ACTION_LOOP),
+            Reentry::IterationCeiling => (
+                streaming::error_event_bytes(&streaming::StreamError::IterationLimit),
+                ACTION_DONE,
+            ),
+            Reentry::DeadlineExceeded => (
+                streaming::error_event_bytes(&streaming::StreamError::DeadlineExceeded),
+                ACTION_DONE,
+            ),
+        },
+        Ok(streaming::FinishOutcome {
+            action: streaming::RoundAction::Done,
+            terminal,
+        }) => (terminal, ACTION_DONE),
+        Err(error) => (streaming::error_event_bytes(&error), ACTION_DONE),
+    }
 }
 
 /// Select a sole, well-formed server-owned search call.

@@ -719,6 +719,117 @@ fn content_blocks_to_output_preserves_non_text_losslessly() {
     );
 }
 
+#[test]
+fn content_blocks_to_output_preserves_audio_losslessly() {
+    let blocks = vec![rmcp::model::ContentBlock::audio("base64audiodata", "audio/wav")];
+    let output = content_blocks_to_output(&blocks, TEST_MAX_RESULT_BYTES).unwrap();
+
+    assert!(
+        output.contains("\"type\":\"audio\""),
+        "audio block serialized as JSON: {output}"
+    );
+    assert!(output.contains("base64audiodata"), "audio data preserved: {output}");
+    assert!(output.contains("audio/wav"), "audio mime type preserved: {output}");
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(&output).expect("output must be valid JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "audio content must round-trip losslessly, not be dropped"
+    );
+}
+
+#[test]
+fn content_blocks_to_output_preserves_resource_link_losslessly() {
+    let blocks = vec![rmcp::model::ContentBlock::resource_link(
+        rmcp::model::Resource::new("file:///test.txt", "test.txt")
+            .with_mime_type("text/plain")
+            .with_size(100),
+    )];
+    let output = content_blocks_to_output(&blocks, TEST_MAX_RESULT_BYTES).unwrap();
+
+    assert!(
+        output.contains("\"type\":\"resource_link\""),
+        "resource_link block serialized as JSON: {output}"
+    );
+    assert!(output.contains("file:///test.txt"), "resource uri preserved: {output}");
+    assert!(output.contains("test.txt"), "resource name preserved: {output}");
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(&output).expect("output must be valid JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "resource_link content must round-trip losslessly, not be dropped"
+    );
+}
+
+#[test]
+fn content_blocks_to_output_preserves_mixed_content_ordered() {
+    // A single result carrying text, audio, an embedded resource, and a
+    // resource link must serialize as the compact JSON content array and
+    // deserialize back to the exact same ordered blocks, so no variant is
+    // dropped or reordered when several non-text kinds appear together.
+    let blocks = vec![
+        rmcp::model::ContentBlock::text("summary line"),
+        rmcp::model::ContentBlock::audio("base64audiodata", "audio/wav"),
+        rmcp::model::ContentBlock::resource(rmcp::model::ResourceContents::TextResourceContents {
+            uri: "file:///embedded.txt".to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            text: "embedded resource body".to_owned(),
+            meta: None,
+        }),
+        rmcp::model::ContentBlock::resource_link(
+            rmcp::model::Resource::new("file:///linked.png", "linked.png")
+                .with_mime_type("image/png")
+                .with_size(2048),
+        ),
+    ];
+    let output = content_blocks_to_output(&blocks, TEST_MAX_RESULT_BYTES).unwrap();
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(&output).expect("output must be valid JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "#1020: mixed text/audio/embedded-resource/resource-link content must \
+         deserialize back to the original ordered array"
+    );
+}
+
+#[test]
+fn process_call_result_preserves_mixed_content_in_both_representations() {
+    // The model-facing `function_call_output` and the client-facing
+    // `mcp_call.output` are both fed from the same serializer, so a mixed
+    // non-text result must reach both representations identically and
+    // losslessly — neither may silently drop a variant.
+    let blocks = vec![
+        rmcp::model::ContentBlock::text("caption"),
+        rmcp::model::ContentBlock::audio("base64audiodata", "audio/wav"),
+        rmcp::model::ContentBlock::resource_link(
+            rmcp::model::Resource::new("file:///doc.pdf", "doc.pdf").with_mime_type("application/pdf"),
+        ),
+    ];
+    let call_result = rmcp::model::CallToolResult::success(blocks.clone());
+    let result = process_call_result(Ok(call_result), "c1", "srv", "tool", "{}", TEST_MAX_RESULT_BYTES);
+
+    let model_facing = result.message["output"]
+        .as_str()
+        .expect("function_call_output output is a string");
+    let client_facing = result.output_item["output"]
+        .as_str()
+        .expect("mcp_call output is a string");
+    assert_eq!(
+        model_facing, client_facing,
+        "model-facing and client-facing representations must carry identical content"
+    );
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(client_facing).expect("client-facing output must be a JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "both representations must round-trip the mixed content to the original ordered array"
+    );
+}
+
 // =========================================================================
 // resolve_tool_entry
 // =========================================================================
