@@ -1158,10 +1158,15 @@ fn resolve_yaml(proxy_port: u16, backend_port: u16) -> String {
     resolve_yaml_with_timeout(proxy_port, backend_port, 5000)
 }
 
-/// Pipeline mirroring the relevant `full-flow.yaml` ordering for store
-/// retrieval: `openai_response_store` and `openai_stream_events` run before
-/// `openai_mcp_tool_resolve`, so the header-phase `TerminalResponse` triggers
-/// their response-phase persistence of the synthesized failure.
+/// Pipeline mirroring the relevant shipped `full-flow.yaml` ordering for store
+/// retrieval: `openai_response_store` runs pre-IRR, before
+/// `openai_mcp_tool_resolve`. `openai_stream_events` is intentionally absent
+/// here -- it is IRR-only (it fails closed outside an `iterative_request_router`),
+/// and in the shipped `full-flow.yaml` it lives inside the IRR that follows the
+/// resolver, so the resolver's pre-IRR short-circuit never reaches it. The
+/// resolver self-delivers the 200 SSE failure lifecycle and writes
+/// `ResponsesState.response_object` directly, so `openai_response_store` persists
+/// the synthesized failure without any stream_events involvement.
 fn resolve_yaml_full_flow_store(proxy_port: u16, backend_port: u16, db_url: &str, timeout_ms: u64) -> String {
     format!(
         r#"
@@ -1181,7 +1186,6 @@ filter_chains:
         database_url: "{db_url}"
         responses_table: openai_responses
         conversations_table: openai_conversations
-      - filter: openai_stream_events
       - filter: openai_mcp_tool_resolve
         timeout_ms: {timeout_ms}
       - filter: router

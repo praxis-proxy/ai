@@ -48,24 +48,27 @@ fn load_test_config(listener_port: u16, model_port: u16, search_port: u16) -> pr
         .expect("patched config should parse")
 }
 
-/// Load the example with the logical-stream finalizer disabled, modelling a
-/// streaming-capable pipeline that is missing `openai_stream_events`'s
-/// `logical_stream: true`.
-fn load_test_config_without_logical_stream(
+/// Load the example with the logical-stream finalizer removed, modelling a
+/// streaming-capable pipeline that is missing `openai_stream_events`. Without the
+/// finalizer inside the iterative router nothing publishes the
+/// `responses.logical_stream` marker, so `openai_agentic_loop` must fail closed
+/// before any typed-streaming dispatch.
+fn load_test_config_without_stream_events(
     listener_port: u16,
     model_port: u16,
     search_port: u16,
 ) -> praxis_core::config::Config {
-    // Match the `- filter:`/`logical_stream:` pair so the header doc comment,
-    // which also contains the literal `logical_stream: true`, is left untouched.
-    let enabled = "- filter: openai_stream_events\n                logical_stream: true";
-    let disabled = "- filter: openai_stream_events\n                logical_stream: false";
+    // Drop the whole `openai_stream_events` filter entry (and the blank line that
+    // follows it) from the inference step. The header doc comment mentions the
+    // filter by name but never as a `- filter:` list entry, so the match is
+    // unambiguous.
+    let stream_events = "              - filter: openai_stream_events\n\n";
     let yaml = patched_yaml(listener_port, model_port, search_port);
     assert!(
-        yaml.contains(enabled),
-        "expected the openai_stream_events logical_stream toggle in the example; its block may have changed"
+        yaml.contains(stream_events),
+        "expected the openai_stream_events filter entry in the example; its block may have changed"
     );
-    let yaml = yaml.replace(enabled, disabled);
+    let yaml = yaml.replace(stream_events, "");
     praxis_core::config::Config::from_yaml(&yaml).expect("patched config should parse")
 }
 
@@ -378,18 +381,18 @@ fn web_search_chat_completions_streams_dispatch_once_as_one_logical_response() {
 }
 
 #[test]
-fn web_search_chat_completions_streaming_fails_closed_without_logical_stream() {
+fn web_search_chat_completions_streaming_fails_closed_without_stream_events() {
     // responses_to_chat_completions always advertises the streaming subrequest
     // capability and selects the streaming transport for an effective
-    // `"stream": true` request. Without `openai_stream_events`'s
-    // `logical_stream: true` finalizer, typed streaming would commit
-    // `response.completed` to the client as it arrives, so a loop-terminal error
-    // detected later by `openai_agentic_loop` could not reach the client. The
-    // loop must therefore fail closed before any backend dispatch rather than
-    // forward a truncatable typed stream.
+    // `"stream": true` request. Without `openai_stream_events` in the inference
+    // step nothing publishes the `responses.logical_stream` marker, so typed
+    // streaming would commit `response.completed` to the client as it arrives and
+    // a loop-terminal error detected later by `openai_agentic_loop` could not
+    // reach the client. The loop must therefore fail closed before any backend
+    // dispatch rather than forward a truncatable typed stream.
     let model = StatefulCapturingBackend::new(vec![(200, "unexpected".to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_test_config_without_logical_stream(proxy_port, model.port(), free_port());
+    let config = load_test_config_without_stream_events(proxy_port, model.port(), free_port());
     let proxy = start_proxy(&config);
     let request = json!({
         "model": "chat-only-model",
