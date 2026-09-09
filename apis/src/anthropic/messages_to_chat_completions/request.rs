@@ -6,44 +6,71 @@
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
+use crate::json_body::{insert_if_some, take_string};
+
 // -----------------------------------------------------------------------------
 // Request Transformation
 // -----------------------------------------------------------------------------
 
 /// Transform an Anthropic Messages request body into Chat
 /// Completions-compatible format.
-///
 /// Returns the transformed JSON bytes, or an error message.
 pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
     let value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
-    let Some(obj) = value.as_object() else {
+    let Value::Object(mut body) = value else {
         return Err("request body is not a JSON object".to_owned());
     };
 
+    // Take every mapped field up front, in one place. Each becomes an owned
+    // local that is moved into the helper emitting it.
+    let model = body.remove("model");
+    let max_tokens = body.remove("max_tokens");
+    let system = body.remove("system");
+    let messages = body.remove("messages");
+    let stream = body.remove("stream");
+    let stream_options = body.remove("stream_options");
+    let stop_sequences = body.remove("stop_sequences");
+    let temperature = body.remove("temperature");
+    let top_p = body.remove("top_p");
+    let top_k = body.remove("top_k");
+    let tools = body.remove("tools");
+    let tool_choice = body.remove("tool_choice");
+    let had_tools = tools.is_some();
+    // Fields with no Chat Completions mapping are not forwarded. Dropping the
+    // parsed body here makes any later read of it a compile error.
+    drop(body);
+
     let mut chat = Map::new();
-
-    if let Some(model) = obj.get("model") {
-        chat.insert("model".to_owned(), model.clone());
-    }
-
-    let mut messages = Vec::new();
-    hoist_system(&mut messages, obj);
-    convert_messages(&mut messages, obj);
-    chat.insert("messages".to_owned(), Value::Array(messages));
-
-    if let Some(max_tokens) = obj.get("max_tokens") {
-        chat.insert("max_completion_tokens".to_owned(), max_tokens.clone());
-    }
-
-    convert_stream(&mut chat, obj);
-
-    map_parameters(&mut chat, obj);
-    convert_tools(&mut chat, obj);
-    convert_parallel_tool_calls(&mut chat, obj);
-    convert_tool_choice(&mut chat, obj);
+    insert_if_some(&mut chat, "model", model);
+    chat.insert("messages".to_owned(), build_messages(system, messages));
+    insert_if_some(&mut chat, "max_completion_tokens", max_tokens);
+    convert_stream(&mut chat, stream, stream_options);
+    map_parameters(&mut chat, stop_sequences, temperature, top_p, top_k);
+    convert_tools(&mut chat, tools);
+    // Borrows `tool_choice`; the conversion below consumes it. Reordering the
+    // two is a borrow-check error rather than a silent behavior change.
+    convert_parallel_tool_calls(&mut chat, tool_choice.as_ref());
+    convert_tool_choice(&mut chat, tool_choice, had_tools);
 
     serde_json::to_vec(&Value::Object(chat)).map_err(|e| format!("serialization failed: {e}"))
+}
+
+/// Build the Chat Completions `messages` array from the Anthropic `system` and
+/// `messages` fields, which are the only two inputs to it.
+fn build_messages(system: Option<Value>, messages: Option<Value>) -> Value {
+    let mut converted = Vec::new();
+    hoist_system(&mut converted, system);
+    convert_messages(&mut converted, messages);
+    Value::Array(converted)
+}
+
+/// Build a Chat Completions message carrying plain string content.
+fn text_message(role: &str, content: String) -> Value {
+    let mut message = Map::new();
+    message.insert("role".to_owned(), Value::String(role.to_owned()));
+    message.insert("content".to_owned(), Value::String(content));
+    Value::Object(message)
 }
 
 // -----------------------------------------------------------------------------
@@ -51,18 +78,16 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
 // -----------------------------------------------------------------------------
 
 /// Hoist Anthropic top-level `system` to a Chat Completions system message.
-fn hoist_system(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
-    let Some(system) = obj.get("system") else {
-        return;
-    };
-
+fn hoist_system(messages: &mut Vec<Value>, system: Option<Value>) {
     let content = match system {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => {
+        Some(Value::String(text)) => text,
+        Some(Value::Array(blocks)) => {
             let mut parts = Vec::new();
             for block in blocks {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    parts.push(text.to_owned());
+                if let Value::Object(mut block) = block
+                    && let Some(text) = take_string(&mut block, "text")
+                {
+                    parts.push(text);
                 }
             }
             parts.join("\n")
@@ -71,7 +96,7 @@ fn hoist_system(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
     };
 
     if !content.is_empty() {
-        messages.push(json!({"role": "system", "content": content}));
+        messages.push(text_message("system", content));
     }
 }
 
@@ -80,25 +105,28 @@ fn hoist_system(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
 // -----------------------------------------------------------------------------
 
 /// Convert Anthropic messages array to Chat Completions messages.
-fn convert_messages(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
-    let Some(Value::Array(anthropic_messages)) = obj.get("messages") else {
+fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
+    let Some(Value::Array(anthropic_messages)) = source else {
         return;
     };
 
     for msg in anthropic_messages {
-        let Some(role) = msg.get("role").and_then(Value::as_str) else {
+        let Value::Object(mut msg) = msg else {
+            continue;
+        };
+        let Some(role) = take_string(&mut msg, "role") else {
             continue;
         };
 
-        match msg.get("content") {
+        match msg.remove("content") {
             Some(Value::String(text)) => {
-                messages.push(json!({"role": role, "content": text}));
+                messages.push(text_message(&role, text));
             },
             Some(Value::Array(blocks)) => {
-                convert_content_blocks(messages, role, blocks);
+                convert_content_blocks(messages, &role, &blocks);
             },
             _ => {
-                messages.push(json!({"role": role, "content": ""}));
+                messages.push(text_message(&role, String::new()));
             },
         }
     }
@@ -275,7 +303,7 @@ fn flush_text_parts(
             .and_then(Value::as_str)
             == Some("text")
     {
-        messages.push(json!({"role": role, "content": text_parts.join("")}));
+        messages.push(text_message(role, text_parts.join("")));
     } else if !content_parts.is_empty() {
         messages.push(json!({"role": role, "content": std::mem::take(content_parts)}));
     }
@@ -498,45 +526,43 @@ fn non_empty_lines(lines: &[String]) -> Option<String> {
 // Parameter Mapping
 // -----------------------------------------------------------------------------
 
-/// Copy `stream` and request streaming usage when enabled.
-fn convert_stream(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(stream) = obj.get("stream") else {
+/// Move `stream` through and request streaming usage when enabled.
+fn convert_stream(chat: &mut Map<String, Value>, stream: Option<Value>, stream_options: Option<Value>) {
+    let Some(stream) = stream else {
         return;
     };
-    chat.insert("stream".to_owned(), stream.clone());
 
-    if stream.as_bool() == Some(true) {
-        let mut opts = obj
-            .get("stream_options")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        opts.insert("include_usage".to_owned(), Value::Bool(true));
-        chat.insert("stream_options".to_owned(), Value::Object(opts));
+    let streaming = stream.as_bool() == Some(true);
+    chat.insert("stream".to_owned(), stream);
+
+    if !streaming {
+        return;
     }
+
+    let mut opts = match stream_options {
+        Some(Value::Object(opts)) => opts,
+        _ => Map::new(),
+    };
+    opts.insert("include_usage".to_owned(), Value::Bool(true));
+    chat.insert("stream_options".to_owned(), Value::Object(opts));
 }
 
-/// Map Anthropic parameters to Chat Completions-compatible equivalents.
+/// Map Anthropic sampling parameters to Chat Completions-compatible equivalents.
 ///
 /// `top_k` has no standard Chat Completions equivalent but is preserved
 /// as an extra body parameter for backends that support it
 /// (e.g. vLLM).
-fn map_parameters(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    if let Some(stop) = obj.get("stop_sequences") {
-        chat.insert("stop".to_owned(), stop.clone());
-    }
-
-    if let Some(temp) = obj.get("temperature") {
-        chat.insert("temperature".to_owned(), temp.clone());
-    }
-
-    if let Some(top_p) = obj.get("top_p") {
-        chat.insert("top_p".to_owned(), top_p.clone());
-    }
-
-    if let Some(top_k) = obj.get("top_k") {
-        chat.insert("top_k".to_owned(), top_k.clone());
-    }
+fn map_parameters(
+    chat: &mut Map<String, Value>,
+    stop_sequences: Option<Value>,
+    temperature: Option<Value>,
+    top_p: Option<Value>,
+    top_k: Option<Value>,
+) {
+    insert_if_some(chat, "stop", stop_sequences);
+    insert_if_some(chat, "temperature", temperature);
+    insert_if_some(chat, "top_p", top_p);
+    insert_if_some(chat, "top_k", top_k);
 }
 
 // -----------------------------------------------------------------------------
@@ -544,8 +570,8 @@ fn map_parameters(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
 // -----------------------------------------------------------------------------
 
 /// Convert Anthropic tool definitions to Chat Completions function tools.
-fn convert_tools(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(Value::Array(tools)) = obj.get("tools") else {
+fn convert_tools(chat: &mut Map<String, Value>, tools: Option<Value>) {
+    let Some(Value::Array(tools)) = tools else {
         return;
     };
 
@@ -598,30 +624,41 @@ fn is_translatable_client_tool(tool: &Value) -> bool {
 }
 
 /// Convert one Anthropic client tool definition to a Chat Completions tool.
-fn convert_tool_definition(tool: &Value) -> Option<Value> {
-    if !is_translatable_client_tool(tool) {
+///
+/// Consumes the definition so `input_schema` — the largest value in a typical
+/// agentic request — moves into the generated function parameters.
+fn convert_tool_definition(tool: Value) -> Option<Value> {
+    if !is_translatable_client_tool(&tool) {
         return None;
     }
 
-    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-    let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
-    let parameters = tool
-        .get("input_schema")
-        .cloned()
-        .unwrap_or_else(|| json!({"type": "object"}));
+    // A non-object tool entry carries no fields, so it translates to an empty
+    // function exactly as reading through `Value::get` did.
+    let mut tool = if let Value::Object(fields) = tool {
+        fields
+    } else {
+        Map::new()
+    };
+
+    let name = take_string(&mut tool, "name").unwrap_or_default();
+    let description = take_string(&mut tool, "description").unwrap_or_default();
+    let parameters = tool.remove("input_schema").unwrap_or_else(|| json!({"type": "object"}));
+    let strict = tool.get("strict").and_then(Value::as_bool);
 
     let mut function = Map::new();
-    function.insert("name".to_owned(), Value::String(name.to_owned()));
-    function.insert("description".to_owned(), Value::String(description.to_owned()));
+    function.insert("name".to_owned(), Value::String(name));
+    function.insert("description".to_owned(), Value::String(description));
     function.insert("parameters".to_owned(), parameters);
-    if let Some(strict) = tool.get("strict").and_then(Value::as_bool) {
+    if let Some(strict) = strict {
         function.insert("strict".to_owned(), Value::Bool(strict));
     }
 
-    Some(json!({
-        "type": "function",
-        "function": function
-    }))
+    // Built by hand rather than with `json!`, which would deep-clone the
+    // function map back through the serializer.
+    let mut chat_tool = Map::new();
+    chat_tool.insert("type".to_owned(), Value::String("function".to_owned()));
+    chat_tool.insert("function".to_owned(), Value::Object(function));
+    Some(Value::Object(chat_tool))
 }
 
 // -----------------------------------------------------------------------------
@@ -629,8 +666,11 @@ fn convert_tool_definition(tool: &Value) -> Option<Value> {
 // -----------------------------------------------------------------------------
 
 /// Convert Anthropic `disable_parallel_tool_use` to Chat Completions format.
-fn convert_parallel_tool_calls(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(Value::Object(tool_choice)) = obj.get("tool_choice") else {
+///
+/// Reads `tool_choice` without consuming it; [`convert_tool_choice`] takes
+/// ownership afterwards.
+fn convert_parallel_tool_calls(chat: &mut Map<String, Value>, tool_choice: Option<&Value>) {
+    let Some(Value::Object(tool_choice)) = tool_choice else {
         return;
     };
 
@@ -644,37 +684,56 @@ fn convert_parallel_tool_calls(chat: &mut Map<String, Value>, obj: &Map<String, 
 }
 
 /// Convert Anthropic `tool_choice` to Chat Completions format.
-fn convert_tool_choice(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(tool_choice) = obj.get("tool_choice") else {
+///
+/// `had_tools` records whether the request carried a `tools` field at all. A
+/// choice is dropped when every tool was filtered out, so a request whose tools
+/// were all typed server tools cannot force a tool call the backend never saw.
+fn convert_tool_choice(chat: &mut Map<String, Value>, tool_choice: Option<Value>, had_tools: bool) {
+    let Some(tool_choice) = tool_choice else {
         return;
     };
 
-    if obj.contains_key("tools") && !chat.contains_key("tools") {
+    if had_tools && !chat.contains_key("tools") {
         return;
     }
 
     let chat_choice = match tool_choice {
-        Value::String(s) => match s.as_str() {
-            "any" => Value::String("required".to_owned()),
-            "none" => Value::String("none".to_owned()),
-            _ => Value::String("auto".to_owned()),
-        },
-        Value::Object(tc) => match tc.get("type").and_then(Value::as_str) {
-            Some("any") => Value::String("required".to_owned()),
-            Some("none") => Value::String("none".to_owned()),
-            Some("tool") => {
-                if let Some(name) = tc.get("name").and_then(Value::as_str) {
-                    json!({"type": "function", "function": {"name": name}})
-                } else {
-                    Value::String("auto".to_owned())
-                }
-            },
-            _ => Value::String("auto".to_owned()),
-        },
+        Value::String(keyword) => Value::String(tool_choice_keyword(&keyword).to_owned()),
+        Value::Object(tool_choice) => object_tool_choice(tool_choice),
         _ => return,
     };
 
     chat.insert("tool_choice".to_owned(), chat_choice);
+}
+
+/// Map an Anthropic `tool_choice` type to its Chat Completions keyword.
+fn tool_choice_keyword(anthropic: &str) -> &'static str {
+    match anthropic {
+        "any" => "required",
+        "none" => "none",
+        _ => "auto",
+    }
+}
+
+/// Convert an object-form `tool_choice`, moving a named tool's name through.
+fn object_tool_choice(mut tool_choice: Map<String, Value>) -> Value {
+    // Settled before the named-tool branch so the type lookup does not hold a
+    // borrow while `name` is taken out.
+    let names_a_tool = tool_choice.get("type").and_then(Value::as_str) == Some("tool");
+
+    if names_a_tool && let Some(name) = take_string(&mut tool_choice, "name") {
+        let mut function = Map::new();
+        function.insert("name".to_owned(), Value::String(name));
+
+        let mut choice = Map::new();
+        choice.insert("type".to_owned(), Value::String("function".to_owned()));
+        choice.insert("function".to_owned(), Value::Object(function));
+        return Value::Object(choice);
+    }
+
+    // A `tool` choice without a usable name degrades to `auto`.
+    let kind = tool_choice.get("type").and_then(Value::as_str).unwrap_or_default();
+    Value::String(tool_choice_keyword(kind).to_owned())
 }
 
 // -----------------------------------------------------------------------------
@@ -703,6 +762,109 @@ mod tests {
         );
         assert_eq!(parsed["messages"][0]["role"], "user", "user message role");
         assert_eq!(parsed["messages"][0]["content"], "Hello", "user message content");
+    }
+
+    #[test]
+    fn mapped_fields_keep_a_stable_serialized_key_order() {
+        // `serde_json` runs with `preserve_order`, so the order fields are
+        // emitted in `transform_request` is the order sent upstream. Pin it so
+        // reordering the emission sequence cannot silently reshape the wire body.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"stop_sequences":["x"],"temperature":0.5,"top_p":0.9,"top_k":40,"tools":[{"name":"t","input_schema":{"type":"object"}}],"tool_choice":{"type":"any","disable_parallel_tool_use":true},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let keys: Vec<&str> = parsed.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "model",
+                "messages",
+                "max_completion_tokens",
+                "stream",
+                "stream_options",
+                "stop",
+                "temperature",
+                "top_p",
+                "top_k",
+                "tools",
+                "parallel_tool_calls",
+                "tool_choice",
+            ],
+            "translated request key order must stay stable"
+        );
+    }
+
+    #[test]
+    fn untranslated_top_level_fields_are_dropped() {
+        let body = br#"{"model":"m","metadata":{"user_id":"u"},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(
+            parsed.get("metadata").is_none(),
+            "fields with no Chat Completions mapping are not forwarded"
+        );
+    }
+
+    #[test]
+    fn tool_input_schema_is_preserved_verbatim() {
+        let body = br#"{"model":"m","tools":[{"name":"t","description":"d","input_schema":{"type":"object","properties":{"a":{"type":"array","items":{"type":"string"}},"b":{"enum":[1,2,3]}},"required":["a"],"additionalProperties":false}}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["tools"][0]["function"]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {"a": {"type": "array", "items": {"type": "string"}}, "b": {"enum": [1, 2, 3]}},
+                "required": ["a"],
+                "additionalProperties": false
+            }),
+            "moving the schema must not alter its contents"
+        );
+    }
+
+    #[test]
+    fn tool_definition_with_non_string_name_falls_back_to_empty() {
+        let body = br#"{"model":"m","tools":[{"name":42,"description":true,"input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["tools"][0]["function"]["name"], "",
+            "non-string name yields empty"
+        );
+        assert_eq!(
+            parsed["tools"][0]["function"]["description"], "",
+            "non-string description yields empty"
+        );
+    }
+
+    #[test]
+    fn stream_options_dropped_when_streaming_disabled() {
+        let body = br#"{"model":"m","stream":false,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["stream"], false);
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "stream_options is meaningless without streaming"
+        );
+    }
+
+    #[test]
+    fn caller_stream_options_are_preserved_alongside_include_usage() {
+        let body =
+            br#"{"model":"m","stream":true,"stream_options":{"custom":1},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["stream_options"]["custom"], 1,
+            "caller options are moved through"
+        );
+        assert_eq!(parsed["stream_options"]["include_usage"], true);
     }
 
     #[test]

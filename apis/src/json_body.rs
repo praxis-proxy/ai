@@ -22,12 +22,16 @@
 //!
 //! Request-side only: core repairs upstream `Content-Length` framing for mutated request bodies via
 //! `mutated_request_body_len`, so filters must not set `Content-Length` themselves.
+//!
+//! [`take_string`] and [`insert_if_some`] cover the other half of the problem: a filter that translates a
+//! body it is about to discard should *move* each field into the request it builds instead of cloning it out
+//! of a parsed value that dies moments later.
 
 use std::io::{self, Write};
 
 use bytes::Bytes;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::debug;
 
 /// Serialize `value` for a later body replacement.
@@ -205,6 +209,34 @@ impl BodyMutation {
         let new = i64::try_from(self.new_len).unwrap_or(i64::MAX);
         let old = i64::try_from(self.original_len).unwrap_or(i64::MAX);
         new - old
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Field Consumption
+// -----------------------------------------------------------------------------
+
+/// Remove `key` from `map` and return the owned `String` when the value was a JSON string.
+///
+/// The entry is removed either way: a non-string value is dropped and `None` returned, matching the
+/// `get(..).and_then(Value::as_str)` reads this replaces, without re-allocating the string.
+///
+/// If `serde_json` is built with `preserve_order`, [`Map::remove`] is a *swap* remove: the last entry
+/// takes the vacated slot. Take only from a map you are consuming.
+pub fn take_string(map: &mut Map<String, Value>, key: &str) -> Option<String> {
+    match map.remove(key) {
+        Some(Value::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+/// Move `value` into `target` under `key`, doing nothing when the field is absent.
+///
+/// Pairs with [`Map::remove`] so a mapped field travels from the parsed body into the translated body
+/// without an intermediate copy.
+pub fn insert_if_some(target: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        target.insert(key.to_owned(), value);
     }
 }
 
@@ -390,6 +422,70 @@ mod tests {
         let value = json!({"a": 1});
         let serialized = serialize_json_body(&value).unwrap();
         assert_eq!(serialized.as_bytes(), &Bytes::from(serde_json::to_vec(&value).unwrap()));
+    }
+
+    // --- Field consumption ---
+
+    #[test]
+    fn take_string_returns_only_json_strings_and_still_removes_the_field() {
+        let Value::Object(mut tool) = json!({"name": "get_weather", "strict": true}) else {
+            unreachable!("object literal");
+        };
+
+        assert_eq!(take_string(&mut tool, "name"), Some("get_weather".to_owned()));
+        assert_eq!(
+            take_string(&mut tool, "strict"),
+            None,
+            "a non-string value yields None rather than a coerced string"
+        );
+        assert!(tool.is_empty(), "both fields are removed regardless of type");
+    }
+
+    #[test]
+    fn take_string_of_an_absent_key_is_none() {
+        let mut map = Map::new();
+
+        assert_eq!(take_string(&mut map, "name"), None);
+    }
+
+    #[test]
+    fn take_string_moves_rather_than_copies_the_string() {
+        let text = "x".repeat(4096);
+        let mut map = Map::new();
+        map.insert("description".to_owned(), Value::String(text.clone()));
+
+        let taken = take_string(&mut map, "description").expect("string value");
+
+        assert_eq!(taken, text, "the value should come out intact");
+        assert!(map.is_empty(), "a taken field should no longer be in the object");
+    }
+
+    #[test]
+    fn insert_if_some_skips_absent_fields_and_preserves_insertion_order() {
+        let mut target = Map::new();
+        insert_if_some(&mut target, "model", Some(json!("m")));
+        insert_if_some(&mut target, "stream", None);
+        insert_if_some(&mut target, "temperature", Some(json!(0.5)));
+
+        assert_eq!(
+            serde_json::to_string(&Value::Object(target)).unwrap(),
+            r#"{"model":"m","temperature":0.5}"#,
+            "absent fields are skipped and insertion order is the serialized order"
+        );
+    }
+
+    #[test]
+    fn insert_if_some_overwrites_an_existing_key_in_place() {
+        let mut target = Map::new();
+        target.insert("model".to_owned(), json!("old"));
+        target.insert("stream".to_owned(), json!(true));
+        insert_if_some(&mut target, "model", Some(json!("new")));
+
+        assert_eq!(
+            serde_json::to_string(&Value::Object(target)).unwrap(),
+            r#"{"model":"new","stream":true}"#,
+            "an overwrite must not move the key to the end"
+        );
     }
 
     #[test]
