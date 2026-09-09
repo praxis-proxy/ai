@@ -6,6 +6,7 @@ VERSION          ?= $(shell perl -ne 'print $$1 if /^version\s*=\s*"(.+)"/' Carg
 IMAGE            ?= praxis-ai
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 OPENAI_CONFORMANCE_ARGS ?=
+RESPONSES_CONFORMANCE_ARGS ?=
 V                ?=
 
 # Experimental filter features are off by default in builds, so lint and
@@ -22,6 +23,7 @@ endif
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
+	test-responses-conformance \
 	lint fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
@@ -114,6 +116,8 @@ check-openai-conformance-reference:
 
 test-openai-conformance: openai-conformance
 
+test-responses-conformance:
+	uv run tests/integration/sdk/openai/test_responses_conformance.py -v $(RESPONSES_CONFORMANCE_ARGS)
 
 test-environment:
 	cargo test -p praxis-ai-llmd-ext-proc $(_NOCAPTURE)
@@ -141,6 +145,7 @@ lint:
 	cargo xtask sync-responses-readme
 	cargo xtask check-inference
 	cargo xtask check-responses-registry
+	cargo xtask openresponses-coverage
 
 fmt:
 	cargo +nightly fmt --all
@@ -231,6 +236,7 @@ help:
 	@echo "  test-environment     llm-d ext_proc environment tests"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
+	@echo "  test-responses-conformance  Run OpenResponses suite against the translation filter (needs bun, uv, vLLM)"
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint                 clippy + rustfmt + dependency, docs, and example checks"

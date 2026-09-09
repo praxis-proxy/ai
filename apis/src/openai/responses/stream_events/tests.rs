@@ -158,7 +158,8 @@ async fn arm_publishes_logical_stream_marker_when_enabled() {
     filter.on_request(&mut ctx).await.unwrap();
 
     // openai_agentic_loop reads and consumes this marker to fail closed on the
-    // unsafe terminal_streaming + agentic_loop without-logical_stream combo.
+    // unsafe automatic-terminal-streaming + agentic_loop without-logical_stream
+    // combo.
     assert_eq!(
         ctx.get_metadata("responses.logical_stream"),
         Some("true"),
@@ -2321,6 +2322,171 @@ async fn logical_eos_without_terminal_emits_error() {
         ctx.get_metadata("responses.skip_persist"),
         Some("true"),
         "a stream missing its terminal event must not be persisted"
+    );
+}
+
+#[test]
+fn encode_sse_event_writes_compact_json_directly_into_output() {
+    let payload = json!({
+        "type": "response.output_text.delta",
+        "delta": "α".repeat(2048),
+        "sequence_number": 12,
+        "response_id": "resp_logical",
+        "output_index": 3
+    });
+    let json_bytes = serde_json::to_vec(&payload).unwrap();
+    let mut output = Vec::new();
+    super::encode_sse_event("response.output_text.delta", &payload, &mut output);
+
+    let prefix = b"event: response.output_text.delta\ndata: ";
+    let suffix = b"\n\n";
+    assert_eq!(
+        output.len(),
+        prefix.len() + json_bytes.len() + suffix.len(),
+        "logical-stream SSE must be framing plus compact JSON with no intermediate String"
+    );
+    assert_eq!(
+        &output[..prefix.len()],
+        prefix.as_slice(),
+        "SSE event name and data delimiter must be unchanged"
+    );
+    assert_eq!(
+        &output[prefix.len()..prefix.len() + json_bytes.len()],
+        json_bytes.as_slice(),
+        "payload JSON must be written with to_writer compact encoding"
+    );
+    assert_eq!(
+        &output[output.len() - suffix.len()..],
+        suffix.as_slice(),
+        "SSE event delimiter must remain a trailing blank line"
+    );
+}
+
+#[test]
+fn write_json_or_rollback_discards_partial_bytes_on_failure() {
+    let mut output = b"event: response.failed\ndata: ".to_vec();
+    let prefix = output.clone();
+    let result = super::write_json_or_rollback(&mut output, |out| {
+        out.extend_from_slice(br#"{"type":"response.failed""#);
+        Err(std::io::Error::other("injected write failure"))
+    });
+    assert!(
+        result.is_err(),
+        "injected failure must surface so encode_sse_event can skip the SSE delimiter"
+    );
+    let err = result.unwrap_err();
+
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::Other,
+        "rollback must preserve the original write error"
+    );
+    assert_eq!(
+        output, prefix,
+        "a failed payload write must not leave partial JSON in the SSE buffer"
+    );
+    assert!(
+        !output.windows(2).any(|window| window == b"\n\n"),
+        "encode_sse_event must return before appending the SSE delimiter"
+    );
+}
+
+/// Previous logical-stream encoder: compact JSON through an intermediate `String`.
+fn encode_sse_event_with_intermediate_string(event_type: &str, payload: &serde_json::Value, output: &mut Vec<u8>) {
+    output.extend_from_slice(b"event: ");
+    output.extend_from_slice(event_type.as_bytes());
+    output.extend_from_slice(b"\ndata: ");
+    let json = serde_json::to_string(payload).unwrap();
+    output.extend_from_slice(json.as_bytes());
+    output.extend_from_slice(b"\n\n");
+}
+
+fn large_delta_payload() -> serde_json::Value {
+    json!({
+        "type": "response.output_text.delta",
+        "delta": "α".repeat(4096),
+        "sequence_number": 12,
+        "response_id": "resp_logical",
+        "output_index": 3
+    })
+}
+
+fn large_completed_payload() -> serde_json::Value {
+    json!({
+        "type": "response.completed",
+        "sequence_number": 99,
+        "response": {
+            "id": "resp_logical",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "α".repeat(4096)}]
+            }]
+        }
+    })
+}
+
+fn assert_writer_allocates_less_than_string(event_type: &str, payload: &serde_json::Value) {
+    let capacity = serde_json::to_vec(payload).unwrap().len() + 64;
+    let mut via_writer = Vec::with_capacity(capacity);
+    let mut via_string = Vec::with_capacity(capacity);
+    let writer = allocation_counter::measure(|| {
+        super::encode_sse_event(event_type, payload, &mut via_writer);
+    });
+    let string = allocation_counter::measure(|| {
+        encode_sse_event_with_intermediate_string(event_type, payload, &mut via_string);
+    });
+    assert_eq!(
+        via_writer, via_string,
+        "{event_type} SSE bytes must stay equivalent while measuring allocations"
+    );
+    assert!(
+        writer.bytes_total < string.bytes_total,
+        "{event_type} to_writer must allocate fewer bytes than to_string: writer={} string={}",
+        writer.bytes_total,
+        string.bytes_total
+    );
+    assert!(
+        writer.count_total < string.count_total,
+        "{event_type} to_writer must allocate fewer times than to_string: writer={} string={}",
+        writer.count_total,
+        string.count_total
+    );
+}
+
+#[test]
+fn encode_sse_event_allocates_less_than_intermediate_string_for_ordinary_and_deferred_terminal() {
+    assert_writer_allocates_less_than_string("response.output_text.delta", &large_delta_payload());
+    assert_writer_allocates_less_than_string("response.completed", &large_completed_payload());
+}
+
+#[test]
+fn deferred_terminal_stores_moved_payload_without_deep_clone() {
+    let cloned = large_completed_payload();
+    let moved = large_completed_payload();
+    let clone_info = allocation_counter::measure(|| {
+        std::hint::black_box(super::DeferredTerminalEvent {
+            event_type: "response.completed".to_owned(),
+            payload: cloned.clone(),
+        });
+    });
+    let move_info = allocation_counter::measure(|| {
+        std::hint::black_box(super::DeferredTerminalEvent {
+            event_type: "response.completed".to_owned(),
+            payload: moved,
+        });
+    });
+    assert!(
+        clone_info.bytes_total >= 4096,
+        "deferred-terminal clone must copy the completed output text, allocated {}",
+        clone_info.bytes_total
+    );
+    assert!(
+        move_info.bytes_total < clone_info.bytes_total,
+        "deferred-terminal store must move the payload: clone={} move={}",
+        clone_info.bytes_total,
+        move_info.bytes_total
     );
 }
 

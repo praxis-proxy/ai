@@ -56,6 +56,9 @@ CHAT_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/responses-to-chat-completions.yaml"
 )
 COMPACT_CONFIG_PATH = "examples/configs/openai/responses/compact.yaml"
+WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH = (
+    "examples/configs/openai/responses/web-search-chat-completions.yaml"
+)
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -260,6 +263,40 @@ def _write_compact_config(
     return path
 
 
+def _write_web_search_chat_streaming_config(
+    praxis_port: int, search_port: int,
+) -> str:
+    """Patch the streaming web-search-through-Chat example for live vLLM.
+
+    Points the loop at the live vLLM backend and swaps the Brave provider's
+    ``${WEB_SEARCH_API_KEY}`` placeholder for the in-process mock search server.
+    """
+    with open(WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace(
+        '- "127.0.0.1:3001"',
+        f'- "{_vllm_endpoint()}"\n'
+        "                    read_timeout_ms: 300000",
+    )
+    config = config.replace(
+        "- filter: openai_web_search\n"
+        "                provider: brave\n"
+        "                api_key: ${WEB_SEARCH_API_KEY}",
+        "- filter: openai_web_search\n"
+        "                provider: brave\n"
+        "                api_key: test-key\n"
+        f"                base_url: http://127.0.0.1:{search_port}\n"
+        "                allow_private_base_url: true",
+    )
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
 def _wait_for_proxy(
     port: int, proc: subprocess.Popen, log_path: str, timeout: float = 30.0
 ) -> None:
@@ -366,12 +403,24 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 class BraveSearchHandler(BaseHTTPRequestHandler):
-    """Mock Brave Search API returning canned results."""
+    """Mock Brave Search API returning canned results.
+
+    Counts every dispatched query so tests can assert the web-search
+    provider is invoked exactly once per agentic round.
+    """
+
+    #: Total queries served across all instances since the last reset.
+    request_count = 0
+
+    @classmethod
+    def reset(cls):
+        cls.request_count = 0
 
     request_paths: ClassVar[list[str]] = []
 
     def do_GET(self):
         type(self).request_paths.append(self.path)
+        BraveSearchHandler.request_count += 1
         payload = json.dumps(
             {
                 "web": {
@@ -479,7 +528,6 @@ def _write_agentic_config(
     if translate_to_chat:
         config = config.replace(
             "              - filter: openai_responses_proxy\n"
-            "                terminal_streaming: true\n"
             "              - filter: router",
             "              - filter: responses_to_chat_completions\n"
             "              - filter: path_rewrite\n"
@@ -711,6 +759,56 @@ def compact_client(compact_proxy):
     """Return an SDK client using the compact filter example."""
     return OpenAI(
         base_url=f"http://127.0.0.1:{compact_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def web_search_chat_streaming_proxy(tmp_path_factory, request, search_server):
+    """Start the streaming web-search-through-Chat example against live vLLM."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("web-search-chat-streaming")
+    config_path = _write_web_search_chat_streaming_config(port, search_server)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, search_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Web search chat streaming Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
+    """Return an SDK client using streaming web-search-through-Chat translation."""
+    proxy_port, _ = web_search_chat_streaming_proxy
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{proxy_port}/v1",
         api_key="test",
         max_retries=0,
         timeout=300,
@@ -1648,6 +1746,83 @@ class TestResponsesToChatCompletionsVLLM:
                 store=False,
             )
         assert exc_info.value.status_code == 404
+
+    def test_web_search_streams_terminal_round_as_one_logical_response(
+        self, web_search_chat_streaming_client, web_search_chat_streaming_proxy,
+    ):
+        """Streaming web search resumes through the agentic loop (#986).
+
+        A streaming Responses request is translated to Chat Completions,
+        the returned private ``web_search`` tool call is restored to a
+        canonical ``web_search_call``, ``openai_web_search`` dispatches the
+        query, and inference resumes — all exposed to the client as ONE
+        logical Responses SSE lifecycle. The terminal event carries the
+        completed web-search item and the final assistant message.
+        """
+        BraveSearchHandler.reset()
+
+        stream = web_search_chat_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the web_search tool to look up the latest "
+                "Praxis Proxy release, then answer. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[{"type": "web_search"}],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types = []
+        text_parts = []
+        final_response = None
+
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.output_text.delta":
+                text_parts.append(event.delta)
+            if event.type == "response.completed":
+                final_response = event.response
+
+        # AC: one coherent lifecycle framing — created first, completed last,
+        # with no intermediate terminal exposed for the internal search round.
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert event_types.count("response.created") == 1, event_types
+        assert event_types.count("response.completed") == 1, event_types
+        assert final_response is not None, (
+            "stream must terminate with a response.completed event; "
+            f"got: {event_types}"
+        )
+        assert final_response.status in ("completed", "incomplete"), (
+            f"expected completed or incomplete (token limit); got: {final_response.status}"
+        )
+
+        # AC: the configured web-search provider is dispatched exactly once.
+        assert BraveSearchHandler.request_count == 1, (
+            "web search must be dispatched exactly once through the agentic "
+            f"loop; got {BraveSearchHandler.request_count} dispatches"
+        )
+
+        # AC: the terminal output carries the completed web-search item plus a
+        # resumed assistant message — the search round and the final round both
+        # surface in the single logical stream.
+        output_types = [item.type for item in final_response.output]
+        assert "web_search_call" in output_types, (
+            "streamed terminal output should contain the completed "
+            f"web_search_call; got: {output_types}"
+        )
+        search_calls = [
+            item for item in final_response.output if item.type == "web_search_call"
+        ]
+        assert all(item.status == "completed" for item in search_calls), (
+            f"web_search_call items should be completed; got: {search_calls}"
+        )
+        assert "message" in output_types, (
+            "streamed terminal output should contain the final assistant "
+            f"message; got: {output_types}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2696,6 +2871,129 @@ class TestAgenticLoopVLLM:
         )
 
         _assert_multi_round_usage_and_trace(final_response, transport="streaming")
+
+
+# ---------------------------------------------------------------------------
+# Streaming MCP discovery failure (issue #320)
+# ---------------------------------------------------------------------------
+
+
+def _retrieve_with_retry(client, response_id, attempts=15, delay=0.4):
+    """Retrieve a stored response, tolerating brief post-stream write latency.
+
+    Streaming persistence completes as the proxy finishes serving the response
+    body; a retrieve issued the instant the client's stream iterator returns
+    can race that write. Retry a bounded number of times, treating a 404 as
+    "not persisted yet" rather than a hard failure.
+    """
+    from openai import NotFoundError
+
+    last_exc = None
+    for _ in range(attempts):
+        try:
+            return client.responses.retrieve(response_id)
+        except NotFoundError as exc:
+            last_exc = exc
+            time.sleep(delay)
+    raise AssertionError(
+        f"response {response_id} not retrievable after {attempts} attempts: "
+        f"{last_exc}"
+    )
+
+
+class TestStreamingMcpDiscoveryFailureVLLM:
+    """Issue #320: a streaming Responses request whose MCP ``tools/list``
+    discovery fails at runtime must surface to the official OpenAI SDK as a
+    single, well-formed Responses SSE lifecycle terminating in
+    ``response.failed`` -- never an HTTP error, an exception, or a hung
+    stream -- and, when ``store`` is effective, the failed resource must be
+    retrievable via the SDK.
+
+    The failure is triggered with an MCP ``server_url`` pointing at a dead
+    loopback port. The agentic config sets ``allow_loopback: true`` on
+    ``openai_mcp_tool_resolve``, so the refused connection is classified as a
+    genuine *runtime* discovery failure (-> 200 SSE lifecycle) rather than a
+    local SSRF policy rejection (-> HTTP error). Discovery failures
+    short-circuit in the request phase, so vLLM is never contacted -- this
+    test validates the proxy + SDK streaming contract, not model inference.
+
+    Complements the Rust integration suite, which asserts the raw SSE bytes:
+    here we prove the official OpenAI Python SDK parses those frames into a
+    clean event stream and a retrievable failed resource.
+    """
+
+    def test_streaming_discovery_failure_surfaces_failed_lifecycle(
+        self, agentic_client, agentic_proxy,
+    ):
+        dead_port = _free_port()
+        mcp_url = f"http://127.0.0.1:{dead_port}/mcp"
+
+        stream = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="What is the weather in Paris? /no_think",
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=True,
+            stream=True,
+            max_output_tokens=128,
+        )
+
+        event_types = []
+        response_id = None
+        failed_response = None
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.created":
+                response_id = event.response.id
+            if event.type == "response.failed":
+                failed_response = event.response.model_dump()
+
+        # One ordered lifecycle: created first, failed last, with the MCP
+        # discovery-failure event in between.
+        assert event_types, "the stream must yield at least one event"
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.failed", event_types
+        assert "response.mcp_list_tools.failed" in event_types, event_types
+
+        # The terminal response carries the failure, not a partial success.
+        assert failed_response is not None, event_types
+        assert failed_response["status"] == "failed", failed_response
+        assert failed_response["error"]["code"] == "server_error", (
+            failed_response
+        )
+
+        mcp_items = [
+            item
+            for item in failed_response.get("output", [])
+            if item.get("type") == "mcp_list_tools"
+        ]
+        assert mcp_items, (
+            "the failed response must include the mcp_list_tools output item; "
+            f"got output types: "
+            f"{[i.get('type') for i in failed_response.get('output', [])]}"
+        )
+        item = mcp_items[0]
+        assert item["server_label"] == "weather", item
+        assert item["tools"] == [], item
+        assert item["error"], "the failed listing item must carry an error"
+
+        # store=True -> the failed resource is persisted and retrievable
+        # through the SDK, echoing the same failed status and error.
+        assert response_id, "response.created must carry an id for retrieval"
+        retrieved = _retrieve_with_retry(agentic_client, response_id)
+        rd = retrieved.model_dump()
+        assert rd["status"] == "failed", rd
+        assert rd["error"]["code"] == "server_error", rd
+        assert any(
+            it.get("type") == "mcp_list_tools" for it in rd.get("output", [])
+        ), rd
 
 
 # ---------------------------------------------------------------------------

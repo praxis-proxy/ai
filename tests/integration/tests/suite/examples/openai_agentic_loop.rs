@@ -2655,12 +2655,13 @@ fn streaming_web_search_failure_synthesizes_partial_progress_in_one_logical_resp
 
 #[test]
 fn terminal_streaming_without_logical_stream_fails_closed_before_dispatch() {
-    // openai_responses_proxy keeps terminal_streaming: true, but openai_stream_events
-    // is reconfigured with logical_stream: false. Typed streaming commits
-    // response.completed to the client as it arrives, so a loop-terminal error
-    // detected later by openai_agentic_loop could not reach the client. The loop
-    // must therefore reject before any backend request rather than forward a
-    // truncatable success.
+    // openai_responses_proxy selects typed streaming automatically for the
+    // effective stream: true request, but openai_stream_events is reconfigured
+    // with logical_stream: false. Typed streaming commits response.completed to
+    // the client as it arrives, so a loop-terminal error detected later by
+    // openai_agentic_loop could not reach the client. The loop must therefore
+    // reject before any backend request rather than forward a truncatable
+    // success.
     let (model_port, model_requests, _model_thread) = start_streaming_model(vec![vec![sse_event(
         "response.completed",
         serde_json::json!({

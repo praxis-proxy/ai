@@ -367,7 +367,7 @@ fn parse_and_accumulate(
     // milestone is recorded for bytes that never reach the client and EOS
     // recovery still re-synthesizes the executed tool items (#276 finding 3).
     let events = parse_chunk_events(state, &frames, now)?;
-    let logical_output = commit_chunk_events(state, ctx, &events);
+    let logical_output = commit_chunk_events(state, ctx, events);
 
     Ok(state
         .logical_stream
@@ -410,11 +410,11 @@ fn parse_chunk_events(
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
-    events: &[ResponsesEvent],
+    events: Vec<ResponsesEvent>,
 ) -> Vec<u8> {
     let mut logical_output = Vec::new();
     for event in events {
-        accumulate_event(ctx, state, event);
+        accumulate_event(ctx, state, &event);
         if state.logical_stream {
             append_logical_event(state, ctx, event, &mut logical_output);
         }
@@ -426,13 +426,14 @@ fn commit_chunk_events(
 fn append_logical_event(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
-    event: &ResponsesEvent,
+    event: ResponsesEvent,
     output: &mut Vec<u8>,
 ) {
     if event.is_terminal() {
+        let event_type = event.event_type().to_owned();
         state.deferred_terminal = Some(DeferredTerminalEvent {
-            event_type: event.event_type().to_owned(),
-            payload: event.payload().clone(),
+            event_type,
+            payload: event.into_payload(),
         });
         return;
     }
@@ -447,6 +448,28 @@ fn append_logical_event(
         return;
     }
 
+    // #276: reconcile locally executed tool items with the resumed model stream
+    // (record streamed milestones, flush pending local items ahead of the first
+    // resumed event, suppress a premature local-tool `done`). Returns true when
+    // this event must not be forwarded.
+    if commit_local_tool_milestones(state, ctx, &event, output) {
+        return;
+    }
+
+    let event_type = event.event_type().to_owned();
+    let mut payload = event.into_payload();
+    normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
+    encode_sse_event(&event_type, &payload, output);
+}
+
+/// Reconcile locally executed tool items against the resumed model stream for one
+/// forwarded event, returning `true` when that event must be suppressed.
+fn commit_local_tool_milestones(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event: &ResponsesEvent,
+    output: &mut Vec<u8>,
+) -> bool {
     // Record which client-visible milestones the model backend streamed for this
     // item. `output_item.added`/`.done` mark it announced (so a later flush does
     // not re-emit `output_item.added`); an actual `response.web_search_call.*` /
@@ -478,7 +501,7 @@ fn append_logical_event(
     // execution emits the single ordered `done` after the progress events. An item
     // whose lifecycle the model *did* stream in-band keeps its `done` (it is real).
     if is_premature_local_tool_done(ctx, event) {
-        return;
+        return true;
     }
 
     // A local-tool `output_item.done` that survives the premature check finalizes
@@ -487,10 +510,7 @@ fn append_logical_event(
     // duplicate `done` nor (when unchanged) drop the finalizer the client already
     // received.
     mark_local_done_delivered(ctx, event);
-
-    let mut payload = event.payload().clone();
-    normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
-    encode_sse_event(event.event_type(), &payload, output);
+    false
 }
 
 /// Record that a model-streamed `output_item.done` envelope reached the client for
@@ -1058,8 +1078,26 @@ fn encode_sse_event(event_type: &str, payload: &Value, output: &mut Vec<u8>) {
     output.extend_from_slice(b"event: ");
     output.extend_from_slice(event_type.as_bytes());
     output.extend_from_slice(b"\ndata: ");
-    output.extend_from_slice(payload.to_string().as_bytes());
+    // Serialize into the output buffer so logical-stream emission does not
+    // allocate an intermediate `String` via `Display`. Truncate on failure so
+    // a partial JSON write cannot be followed by the SSE delimiter.
+    if let Err(error) = write_json_or_rollback(output, |out| serde_json::to_writer(out, payload)) {
+        debug!(%error, "logical-stream payload serialization failed");
+        return;
+    }
     output.extend_from_slice(b"\n\n");
+}
+
+/// Write into `output`, restoring the pre-write length if `write` fails.
+fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>) -> Result<(), E>) -> Result<(), E> {
+    let start = output.len();
+    match write(output) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            output.truncate(start);
+            Err(error)
+        },
+    }
 }
 
 /// Emit the held terminal event only when the current IRR step is terminal.

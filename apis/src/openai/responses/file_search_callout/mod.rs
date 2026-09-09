@@ -458,12 +458,27 @@ impl HttpFilter for FileSearchCalloutFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        }
+        // Declared `Stream` so this filter can share an iterative-router step with
+        // `responses_to_chat_completions`, which always advertises the streaming
+        // subrequest capability. A statically declared `StreamBuffer` would trip
+        // the per-step build check that rejects a streaming-capable step whose
+        // merged response body mode is `StreamBuffer`. This filter still needs the
+        // complete response to run `capture_response`, so `on_request` ratchets the
+        // runtime body mode back up to `StreamBuffer` (mirroring
+        // `openai_response_store`); a file-search request always rejects
+        // `stream: true`, so the runtime response is never actually streamed.
+        BodyMode::Stream
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // A file-search pipeline never streams (`stream: true` is rejected), so
+        // buffer the complete response for `capture_response`. Declared statically
+        // as `Stream` to stay build-compatible with a streaming-capable step;
+        // ratcheting the runtime mode up to `StreamBuffer` here restores buffering
+        // without reintroducing a static `StreamBuffer` that would trip the check.
+        ctx.set_response_body_mode(BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        });
         let action = self.execute_pending(ctx).await?;
         if matches!(action, FilterAction::Continue) {
             preserve_original_request_headers(ctx);

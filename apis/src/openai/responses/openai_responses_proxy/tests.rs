@@ -71,20 +71,37 @@ fn body_mode_is_stream_buffer() {
 }
 
 #[test]
-fn terminal_streaming_capability_is_opt_in() {
+fn always_advertises_streaming_capability() {
     assert!(
-        !make_filter().may_select_streaming_subrequest_response(),
-        "default configuration must preserve existing buffered IRR pipelines"
+        make_filter().may_select_streaming_subrequest_response(),
+        "openai_responses_proxy must always declare the Praxis streaming capability so \
+         transport follows the effective request, without an operator opt-in"
     );
+}
+
+#[test]
+fn from_config_rejects_removed_terminal_streaming_true() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("terminal_streaming: true").unwrap();
+    let result = super::ResponsesProxyFilter::from_config(&yaml);
     assert!(
-        make_terminal_streaming_filter().may_select_streaming_subrequest_response(),
-        "terminal_streaming must declare the Praxis streaming capability"
+        result.is_err(),
+        "the removed terminal_streaming flag must be rejected so operators migrate their config"
+    );
+}
+
+#[test]
+fn from_config_rejects_removed_terminal_streaming_false() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("terminal_streaming: false").unwrap();
+    let result = super::ResponsesProxyFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "terminal_streaming is removed entirely; even the former default value must be rejected"
     );
 }
 
 #[tokio::test]
-async fn terminal_streaming_selects_streaming_from_effective_passthrough_body() {
-    let filter = make_terminal_streaming_filter();
+async fn selects_streaming_from_effective_passthrough_body() {
+    let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.stream", "false");
@@ -96,7 +113,7 @@ async fn terminal_streaming_selects_streaming_from_effective_passthrough_body() 
 
     assert!(
         matches!(action, FilterAction::Continue),
-        "terminal streaming passthrough should continue"
+        "streaming passthrough should continue"
     );
     assert_eq!(
         ctx.subrequest_response_mode(),
@@ -106,8 +123,8 @@ async fn terminal_streaming_selects_streaming_from_effective_passthrough_body() 
 }
 
 #[tokio::test]
-async fn terminal_streaming_preserves_buffered_mode_when_stream_is_false_or_absent() {
-    let filter = make_terminal_streaming_filter();
+async fn preserves_buffered_mode_when_stream_is_false_or_absent() {
+    let filter = make_filter();
     for original in [
         br#"{"model":"gpt-4.1","input":"hello","stream":false}"#.as_slice(),
         br#"{"model":"gpt-4.1","input":"hello"}"#.as_slice(),
@@ -121,7 +138,7 @@ async fn terminal_streaming_preserves_buffered_mode_when_stream_is_false_or_abse
 
         assert!(
             matches!(action, FilterAction::Continue),
-            "non-streaming terminal request should continue"
+            "non-streaming request should continue"
         );
         assert_eq!(
             ctx.subrequest_response_mode(),
@@ -132,8 +149,8 @@ async fn terminal_streaming_preserves_buffered_mode_when_stream_is_false_or_abse
 }
 
 #[tokio::test]
-async fn terminal_streaming_uses_rebuilt_state_body_not_client_intent_metadata() {
-    let filter = make_terminal_streaming_filter();
+async fn uses_rebuilt_state_body_not_client_intent_metadata() {
+    let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.stream", "true");
@@ -163,8 +180,8 @@ async fn terminal_streaming_uses_rebuilt_state_body_not_client_intent_metadata()
 }
 
 #[tokio::test]
-async fn terminal_streaming_selects_streaming_for_rebuilt_effective_body() {
-    let filter = make_terminal_streaming_filter();
+async fn selects_streaming_for_rebuilt_effective_body() {
+    let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.stream", "false");
@@ -807,9 +824,4 @@ fn compaction_to_assistant_message_handles_invalid_base64() {
 
 fn make_filter() -> Box<dyn HttpFilter> {
     super::ResponsesProxyFilter::from_config(&serde_yaml::Value::Null).unwrap()
-}
-
-fn make_terminal_streaming_filter() -> Box<dyn HttpFilter> {
-    let yaml = serde_yaml::from_str("terminal_streaming: true").unwrap();
-    super::ResponsesProxyFilter::from_config(&yaml).unwrap()
 }

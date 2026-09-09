@@ -580,7 +580,7 @@ fn extract_append_back_items(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) 
 /// Parse the response body and combine request input items with
 /// response output items. Returns `None` when both are empty.
 fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<Vec<Value>> {
-    let response_json: Value = match serde_json::from_slice(bytes) {
+    let mut response_json: Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "conversation append-back: invalid response JSON");
@@ -588,17 +588,18 @@ fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option
         },
     };
 
-    let status = response_json.get("status").and_then(Value::as_str).unwrap_or_default();
-    if status != "completed" {
-        trace!(status, "conversation append-back skipped (response not completed)");
-        return None;
+    {
+        let status = response_json.get("status").and_then(Value::as_str).unwrap_or_default();
+        if status != "completed" {
+            trace!(status, "conversation append-back skipped (response not completed)");
+            return None;
+        }
     }
 
-    let output_items = response_json
-        .get("output")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let output_items = match response_json.get_mut("output").map(Value::take) {
+        Some(Value::Array(items)) => items,
+        _ => Vec::new(),
+    };
 
     let input_items = ctx
         .extensions

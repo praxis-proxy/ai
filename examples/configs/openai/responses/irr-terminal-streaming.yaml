@@ -1,9 +1,10 @@
 # Terminal Responses Streaming through IRR
 #
 # Demonstrates a single-step iterative_request_router pipeline that exposes a
-# native OpenAI Responses SSE body incrementally. `terminal_streaming: true`
-# lets the final serializer select Praxis's typed streaming transport for an
-# effective `"stream": true` request. It is not a Praxis IRR YAML transport
+# native OpenAI Responses SSE body incrementally. `openai_responses_proxy`
+# always advertises the streaming capability and selects Praxis's typed
+# streaming transport automatically for an effective `"stream": true` request;
+# there is no operator opt-in. Streaming is not a Praxis IRR YAML transport
 # mode.
 #
 # `openai_responses_format` publishes descriptive client intent. The final
@@ -45,7 +46,6 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_responses_proxy
-                terminal_streaming: true
 
               - filter: openai_stream_events
 
