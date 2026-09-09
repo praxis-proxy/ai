@@ -220,9 +220,6 @@ impl BodyMutation {
 ///
 /// The entry is removed either way: a non-string value is dropped and `None` returned, matching the
 /// `get(..).and_then(Value::as_str)` reads this replaces, without re-allocating the string.
-///
-/// If `serde_json` is built with `preserve_order`, [`Map::remove`] is a *swap* remove: the last entry
-/// takes the vacated slot. Take only from a map you are consuming.
 pub fn take_string(map: &mut Map<String, Value>, key: &str) -> Option<String> {
     match map.remove(key) {
         Some(Value::String(text)) => Some(text),

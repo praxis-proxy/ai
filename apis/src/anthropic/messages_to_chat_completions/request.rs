@@ -57,7 +57,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Build the Chat Completions `messages` array from the Anthropic `system` and
-/// `messages` fields, which are the only two inputs to it.
+/// `messages` fields.
 fn build_messages(system: Option<Value>, messages: Option<Value>) -> Value {
     let mut converted = Vec::new();
     hoist_system(&mut converted, system);
@@ -67,10 +67,41 @@ fn build_messages(system: Option<Value>, messages: Option<Value>) -> Value {
 
 /// Build a Chat Completions message carrying plain string content.
 fn text_message(role: &str, content: String) -> Value {
+    owned_text_message(role.to_owned(), content)
+}
+
+/// [`text_message`] for callers that already own the role, so it moves through
+/// instead of being copied out of a string that dies immediately after.
+fn owned_text_message(role: String, content: String) -> Value {
     let mut message = Map::new();
-    message.insert("role".to_owned(), Value::String(role.to_owned()));
+    message.insert("role".to_owned(), Value::String(role));
     message.insert("content".to_owned(), Value::String(content));
     Value::Object(message)
+}
+
+/// Build a Chat Completions `text` content part, moving `text` into it.
+///
+/// Built by hand rather than with `json!`, which would deep-clone the string
+/// back through the serializer.
+fn text_content_part(text: String) -> Value {
+    let mut part = Map::new();
+    part.insert("type".to_owned(), Value::String("text".to_owned()));
+    part.insert("text".to_owned(), Value::String(text));
+    Value::Object(part)
+}
+
+/// Build a Chat Completions `image_url` content part, moving `url` into it.
+///
+/// `url` carries the whole base64 payload for inline images, so it must not be
+/// re-serialized through `json!`.
+fn image_content_part(url: String) -> Value {
+    let mut image_url = Map::new();
+    image_url.insert("url".to_owned(), Value::String(url));
+
+    let mut part = Map::new();
+    part.insert("type".to_owned(), Value::String("image_url".to_owned()));
+    part.insert("image_url".to_owned(), Value::Object(image_url));
+    Value::Object(part)
 }
 
 // -----------------------------------------------------------------------------
@@ -120,62 +151,67 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
 
         match msg.remove("content") {
             Some(Value::String(text)) => {
-                messages.push(text_message(&role, text));
+                messages.push(owned_text_message(role, text));
             },
             Some(Value::Array(blocks)) => {
-                convert_content_blocks(messages, &role, &blocks);
+                convert_content_blocks(messages, &role, blocks);
             },
             _ => {
-                messages.push(text_message(&role, String::new()));
+                messages.push(owned_text_message(role, String::new()));
             },
         }
     }
 }
 
 /// Convert typed content blocks to Chat Completions-compatible format.
-fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: &[Value]) {
-    let mut text_parts = Vec::new();
-    let mut content_parts: Vec<Value> = Vec::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
+///
+/// Consumes the blocks: in an agentic request they carry the bulk of the body
+/// (inline images, tool results, accumulated turn history), so every leaf below
+/// moves its payload into the translated message instead of copying it.
+fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    let mut acc = BlockAccumulator::default();
 
     for block in blocks {
-        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
-        convert_single_block(
-            block,
-            block_type,
-            messages,
-            role,
-            &mut text_parts,
-            &mut content_parts,
-            &mut tool_calls,
-        );
+        let Value::Object(mut block) = block else {
+            // A non-object block exposes no `type`, exactly as reading through
+            // `Value::get` saw it.
+            warn!(block_type = "", "dropping unknown Anthropic content block type");
+            continue;
+        };
+        // No branch below reads `type` again, so it is taken out with the rest.
+        let block_type = take_string(&mut block, "type").unwrap_or_default();
+        convert_single_block(block, &block_type, messages, role, &mut acc);
     }
 
-    finalize_content_blocks(messages, role, &mut text_parts, &mut content_parts, tool_calls);
+    finalize_content_blocks(messages, role, acc);
+}
+
+/// Chat Completions output accumulated across one message's content blocks.
+#[derive(Default)]
+struct BlockAccumulator {
+    /// Content parts in wire order. A lone text part later collapses to string
+    /// content, so the text is not tracked separately.
+    content_parts: Vec<Value>,
+    /// Tool calls hoisted out of `tool_use` blocks.
+    tool_calls: Vec<Value>,
 }
 
 /// Process a single content block within a message.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "accumulator pattern requires passing all state"
-)]
 fn convert_single_block(
-    block: &Value,
+    block: Map<String, Value>,
     block_type: &str,
     messages: &mut Vec<Value>,
     role: &str,
-    text_parts: &mut Vec<String>,
-    content_parts: &mut Vec<Value>,
-    tool_calls: &mut Vec<Value>,
+    acc: &mut BlockAccumulator,
 ) {
     match block_type {
-        "text" => convert_text_block(block, text_parts, content_parts),
-        "image" => convert_image_block(block, content_parts),
-        "search_result" => convert_search_result_block(block, text_parts, content_parts),
-        "document" => convert_document_block(block, text_parts, content_parts),
-        "tool_use" => convert_tool_use_block(block, tool_calls),
+        "text" => convert_text_block(block, &mut acc.content_parts),
+        "image" => convert_image_block(block, &mut acc.content_parts),
+        "search_result" => convert_search_result_block(block, &mut acc.content_parts),
+        "document" => convert_document_block(block, &mut acc.content_parts),
+        "tool_use" => convert_tool_use_block(block, &mut acc.tool_calls),
         "tool_result" => {
-            flush_text_parts(messages, text_parts, content_parts, role);
+            flush_content_parts(messages, &mut acc.content_parts, role);
             convert_tool_result_block(block, messages);
         },
         "thinking" | "redacted_thinking" => {
@@ -188,127 +224,159 @@ fn convert_single_block(
 }
 
 /// Convert a text content block.
-fn convert_text_block(block: &Value, text_parts: &mut Vec<String>, content_parts: &mut Vec<Value>) {
-    if let Some(text) = block.get("text").and_then(Value::as_str) {
-        append_text_content(text, text_parts, content_parts);
+fn convert_text_block(mut block: Map<String, Value>, content_parts: &mut Vec<Value>) {
+    if let Some(text) = take_string(&mut block, "text") {
+        content_parts.push(text_content_part(text));
     }
 }
 
 /// Convert an image content block.
-fn convert_image_block(block: &Value, content_parts: &mut Vec<Value>) {
-    if let Some(source) = block.get("source")
+fn convert_image_block(mut block: Map<String, Value>, content_parts: &mut Vec<Value>) {
+    if let Some(source) = block.remove("source")
         && let Some(url_val) = convert_image_source(source)
     {
-        content_parts.push(json!({"type": "image_url", "image_url": {"url": url_val}}));
+        content_parts.push(image_content_part(url_val));
     }
 }
 
 /// Convert a `search_result` block to backend-visible text context.
-fn convert_search_result_block(block: &Value, text_parts: &mut Vec<String>, content_parts: &mut Vec<Value>) {
+fn convert_search_result_block(block: Map<String, Value>, content_parts: &mut Vec<Value>) {
     if let Some(text) = flatten_search_result(block) {
-        append_text_content(&text, text_parts, content_parts);
+        content_parts.push(text_content_part(text));
     }
 }
 
 /// Convert a `document` block to backend-visible text context.
-fn convert_document_block(block: &Value, text_parts: &mut Vec<String>, content_parts: &mut Vec<Value>) {
+fn convert_document_block(block: Map<String, Value>, content_parts: &mut Vec<Value>) {
     if let Some(text) = flatten_document(block) {
-        append_text_content(&text, text_parts, content_parts);
+        content_parts.push(text_content_part(text));
     }
 }
 
-/// Append one Chat Completions text content part and its string equivalent.
-fn append_text_content(text: &str, text_parts: &mut Vec<String>, content_parts: &mut Vec<Value>) {
-    text_parts.push(text.to_owned());
-    content_parts.push(json!({"type": "text", "text": text}));
+/// Take the string out of a `text` content part, leaving other parts untouched.
+///
+/// The part is about to be dropped by both callers, so the payload moves out
+/// instead of being copied.
+fn take_text_part(part: &mut Value) -> Option<String> {
+    let part = part.as_object_mut()?;
+    if part.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    take_string(part, "text")
+}
+
+/// Concatenate the text of every text content part, moving each string out.
+///
+/// `None` means no text part was present, which is distinct from text parts
+/// that are all empty: the caller emits no `content` for the former and an
+/// empty string for the latter.
+fn take_joined_text(content_parts: &mut [Value]) -> Option<String> {
+    let mut joined: Option<String> = None;
+    for part in content_parts {
+        let Some(text) = take_text_part(part) else {
+            continue;
+        };
+        match &mut joined {
+            // The first text moves in whole, so the common single-text case
+            // never copies its payload.
+            None => joined = Some(text),
+            Some(acc) => acc.push_str(&text),
+        }
+    }
+    joined
 }
 
 /// Convert a `tool_use` content block to a Chat Completions tool call.
-fn convert_tool_use_block(block: &Value, tool_calls: &mut Vec<Value>) {
-    let id = block.get("id").and_then(Value::as_str).unwrap_or("");
-    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Value>) {
+    let id = take_string(&mut block, "id").unwrap_or_default();
+    let name = take_string(&mut block, "name").unwrap_or_default();
 
-    let empty = Value::Object(Map::new());
-    let input = block.get("input").unwrap_or(&empty);
-    let args = serde_json::to_string(input).unwrap_or_default();
+    // An absent `input` serializes as the empty object the old placeholder
+    // produced; an explicit `null` still serializes as `null`.
+    let args = match block.remove("input") {
+        Some(input) => serde_json::to_string(&input).unwrap_or_default(),
+        None => "{}".to_owned(),
+    };
 
-    tool_calls.push(json!({
-        "id": id,
-        "type": "function",
-        "function": {"name": name, "arguments": args}
-    }));
+    let mut function = Map::new();
+    function.insert("name".to_owned(), Value::String(name));
+    function.insert("arguments".to_owned(), Value::String(args));
+
+    let mut tool_call = Map::new();
+    tool_call.insert("id".to_owned(), Value::String(id));
+    tool_call.insert("type".to_owned(), Value::String("function".to_owned()));
+    tool_call.insert("function".to_owned(), Value::Object(function));
+    tool_calls.push(Value::Object(tool_call));
 }
 
 /// Convert a `tool_result` content block to a Chat Completions tool message.
-fn convert_tool_result_block(block: &Value, messages: &mut Vec<Value>) {
-    let tool_call_id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-    let mut result_content = extract_tool_result_content(block);
-    let image_content = extract_tool_result_image_content(block);
+fn convert_tool_result_block(mut block: Map<String, Value>, messages: &mut Vec<Value>) {
+    let tool_call_id = take_string(&mut block, "tool_use_id").unwrap_or_default();
+    // Read before `content` is taken: `is_error` decides how the text below is
+    // marked, and both live in the same map.
+    let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
 
-    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+    let (mut result_content, image_content) = split_tool_result_content(block.remove("content"));
+
+    if is_error {
         result_content = mark_tool_result_error(result_content);
     }
 
-    messages.push(json!({
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "content": result_content
-    }));
+    let mut tool_message = Map::new();
+    tool_message.insert("role".to_owned(), Value::String("tool".to_owned()));
+    tool_message.insert("tool_call_id".to_owned(), Value::String(tool_call_id));
+    tool_message.insert("content".to_owned(), Value::String(result_content));
+    messages.push(Value::Object(tool_message));
 
     if !image_content.is_empty() {
-        messages.push(json!({
-            "role": "user",
-            "content": image_content
-        }));
+        let mut image_message = Map::new();
+        image_message.insert("role".to_owned(), Value::String("user".to_owned()));
+        image_message.insert("content".to_owned(), Value::Array(image_content));
+        messages.push(Value::Object(image_message));
     }
 }
 
 /// Emit the final message for accumulated content and tool calls.
-fn finalize_content_blocks(
-    messages: &mut Vec<Value>,
-    role: &str,
-    text_parts: &mut Vec<String>,
-    content_parts: &mut Vec<Value>,
-    tool_calls: Vec<Value>,
-) {
-    if role == "assistant" && !tool_calls.is_empty() {
-        let mut msg = json!({"role": "assistant"});
-        if let Some(obj) = msg.as_object_mut() {
-            if !text_parts.is_empty() {
-                obj.insert("content".to_owned(), Value::String(text_parts.join("")));
-            }
-            obj.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+fn finalize_content_blocks(messages: &mut Vec<Value>, role: &str, mut acc: BlockAccumulator) {
+    if role == "assistant" && !acc.tool_calls.is_empty() {
+        let mut msg = Map::new();
+        msg.insert("role".to_owned(), Value::String("assistant".to_owned()));
+        // This branch carries string content only, so any image part collected
+        // alongside the text is dropped here.
+        if let Some(text) = take_joined_text(&mut acc.content_parts) {
+            msg.insert("content".to_owned(), Value::String(text));
         }
-        messages.push(msg);
+        msg.insert("tool_calls".to_owned(), Value::Array(acc.tool_calls));
+        messages.push(Value::Object(msg));
     } else {
-        flush_text_parts(messages, text_parts, content_parts, role);
+        flush_content_parts(messages, &mut acc.content_parts, role);
     }
 }
 
-/// Flush accumulated text/content parts as a message.
-fn flush_text_parts(
-    messages: &mut Vec<Value>,
-    text_parts: &mut Vec<String>,
-    content_parts: &mut Vec<Value>,
-    role: &str,
-) {
-    if content_parts.is_empty() && text_parts.is_empty() {
+/// Flush accumulated content parts as a message.
+fn flush_content_parts(messages: &mut Vec<Value>, content_parts: &mut Vec<Value>, role: &str) {
+    if content_parts.is_empty() {
         return;
     }
 
-    if content_parts.len() == 1
-        && content_parts
-            .first()
-            .and_then(|p| p.get("type"))
-            .and_then(Value::as_str)
-            == Some("text")
-    {
-        messages.push(text_message(role, text_parts.join("")));
-    } else if !content_parts.is_empty() {
-        messages.push(json!({"role": role, "content": std::mem::take(content_parts)}));
+    // A lone text part collapses to string content; anything else stays an
+    // array. Resolved before the `else` branch so the borrow ends here.
+    let lone_text = match content_parts.as_mut_slice() {
+        [part] => take_text_part(part),
+        _ => None,
+    };
+
+    if let Some(text) = lone_text {
+        messages.push(text_message(role, text));
+    } else {
+        // `json!` would deep-clone every content part — including full inline
+        // image payloads — straight back out of the taken vector.
+        let mut msg = Map::new();
+        msg.insert("role".to_owned(), Value::String(role.to_owned()));
+        msg.insert("content".to_owned(), Value::Array(std::mem::take(content_parts)));
+        messages.push(Value::Object(msg));
     }
 
-    text_parts.clear();
     content_parts.clear();
 }
 
@@ -317,16 +385,22 @@ fn flush_text_parts(
 // -----------------------------------------------------------------------------
 
 /// Convert Anthropic image source to an `image_url` URL string.
-fn convert_image_source(source: &Value) -> Option<String> {
-    let source_type = source.get("type").and_then(Value::as_str)?;
+///
+/// Consumes the source so a `url` source moves its string through untouched and
+/// a `base64` source is copied exactly once, into the data URL.
+fn convert_image_source(source: Value) -> Option<String> {
+    let Value::Object(mut source) = source else {
+        return None;
+    };
+    let source_type = take_string(&mut source, "type")?;
 
-    match source_type {
+    match source_type.as_str() {
         "base64" => {
-            let media_type = source.get("media_type").and_then(Value::as_str)?;
-            let data = source.get("data").and_then(Value::as_str)?;
+            let media_type = take_string(&mut source, "media_type")?;
+            let data = take_string(&mut source, "data")?;
             Some(format!("data:{media_type};base64,{data}"))
         },
-        "url" => source.get("url").and_then(Value::as_str).map(str::to_owned),
+        "url" => take_string(&mut source, "url"),
         _ => None,
     }
 }
@@ -335,36 +409,52 @@ fn convert_image_source(source: &Value) -> Option<String> {
 // Tool Result Content Extraction
 // -----------------------------------------------------------------------------
 
-/// Extract text content from a `tool_result` block.
-fn extract_tool_result_content(block: &Value) -> String {
-    match block.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => {
-            let mut text_parts = Vec::new();
-            for part in parts {
-                match part.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(text) = part.get("text").and_then(Value::as_str) {
-                            text_parts.push(text.to_owned());
-                        }
-                    },
-                    Some("search_result") => {
-                        if let Some(text) = flatten_search_result(part) {
-                            text_parts.push(text);
-                        }
-                    },
-                    Some("document") => {
-                        if let Some(text) = flatten_document(part) {
-                            text_parts.push(text);
-                        }
-                    },
-                    _ => {},
-                }
-            }
-            text_parts.join("\n")
-        },
-        _ => String::new(),
+/// Split a `tool_result` block's `content` into its flattened text and the
+/// image parts promoted to a follow-up user message.
+///
+/// One pass over the owned content: a string result moves out whole, and each
+/// part is consumed by the branch that claims it, so nothing is traversed — or
+/// copied — twice.
+fn split_tool_result_content(content: Option<Value>) -> (String, Vec<Value>) {
+    match content {
+        Some(Value::String(text)) => (text, Vec::new()),
+        Some(Value::Array(parts)) => split_tool_result_parts(parts),
+        _ => (String::new(), Vec::new()),
     }
+}
+
+/// Split the parts of an array-form `tool_result.content`.
+fn split_tool_result_parts(parts: Vec<Value>) -> (String, Vec<Value>) {
+    let mut text_parts = Vec::new();
+    let mut image_parts = Vec::new();
+
+    for part in parts {
+        let Value::Object(mut part) = part else {
+            continue;
+        };
+        // No branch below reads `type` again, so it is taken out with the rest.
+        match take_string(&mut part, "type").as_deref() {
+            Some("text") => {
+                if let Some(text) = take_string(&mut part, "text") {
+                    text_parts.push(text);
+                }
+            },
+            Some("search_result") => {
+                if let Some(text) = flatten_search_result(part) {
+                    text_parts.push(text);
+                }
+            },
+            Some("document") => {
+                if let Some(text) = flatten_document(part) {
+                    text_parts.push(text);
+                }
+            },
+            Some("image") => convert_image_block(part, &mut image_parts),
+            _ => {},
+        }
+    }
+
+    (text_parts.join("\n"), image_parts)
 }
 
 /// Preserve Anthropic's `tool_result.is_error` semantic in text-only tool messages.
@@ -377,32 +467,11 @@ fn mark_tool_result_error(mut content: String) -> String {
     }
 }
 
-/// Extract image content from a `tool_result` block.
-fn extract_tool_result_image_content(block: &Value) -> Vec<Value> {
-    let Some(Value::Array(parts)) = block.get("content") else {
-        return Vec::new();
-    };
-
-    let mut image_parts = Vec::new();
-    for part in parts {
-        if part.get("type").and_then(Value::as_str) == Some("image") {
-            convert_image_block(part, &mut image_parts);
-        }
-    }
-    image_parts
-}
-
 /// Flatten an Anthropic `search_result` block to plain text.
-fn flatten_search_result(block: &Value) -> Option<String> {
-    let title = block
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|title| !title.is_empty());
-    let source = block
-        .get("source")
-        .and_then(Value::as_str)
-        .filter(|source| !source.is_empty());
-    let content = extract_text_blocks(block.get("content"));
+fn flatten_search_result(mut block: Map<String, Value>) -> Option<String> {
+    let title = take_string(&mut block, "title").filter(|title| !title.is_empty());
+    let source = take_string(&mut block, "source").filter(|source| !source.is_empty());
+    let content = extract_text_blocks(block.remove("content"));
 
     if title.is_none() && source.is_none() && content.is_empty() {
         return None;
@@ -411,13 +480,13 @@ fn flatten_search_result(block: &Value) -> Option<String> {
     let mut lines = Vec::new();
 
     if let Some(title) = title {
-        lines.push(format!("Search result: {}", quote_label_value(title)));
+        lines.push(format!("Search result: {}", quote_label_value(&title)));
     } else {
         lines.push("Search result".to_owned());
     }
 
     if let Some(source) = source {
-        lines.push(format!("Source: {}", quote_label_value(source)));
+        lines.push(format!("Source: {}", quote_label_value(&source)));
     }
 
     if !content.is_empty() {
@@ -429,16 +498,10 @@ fn flatten_search_result(block: &Value) -> Option<String> {
 }
 
 /// Flatten an Anthropic `document` block to plain text.
-fn flatten_document(block: &Value) -> Option<String> {
-    let title = block
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|title| !title.is_empty());
-    let context = block
-        .get("context")
-        .and_then(Value::as_str)
-        .filter(|context| !context.is_empty());
-    let source_text = flatten_document_source(block.get("source"));
+fn flatten_document(mut block: Map<String, Value>) -> Option<String> {
+    let title = take_string(&mut block, "title").filter(|title| !title.is_empty());
+    let context = take_string(&mut block, "context").filter(|context| !context.is_empty());
+    let source_text = flatten_document_source(block.remove("source"));
 
     if title.is_none() && context.is_none() && source_text.is_none() {
         return None;
@@ -447,13 +510,13 @@ fn flatten_document(block: &Value) -> Option<String> {
     let mut lines = Vec::new();
 
     if let Some(title) = title {
-        lines.push(format!("Document: {}", quote_label_value(title)));
+        lines.push(format!("Document: {}", quote_label_value(&title)));
     } else {
         lines.push("Document".to_owned());
     }
 
     if let Some(context) = context {
-        lines.push(format!("Context: {}", quote_label_value(context)));
+        lines.push(format!("Context: {}", quote_label_value(&context)));
     }
 
     if let Some(source_text) = source_text {
@@ -464,33 +527,27 @@ fn flatten_document(block: &Value) -> Option<String> {
 }
 
 /// Flatten a `document.source` value to extractable text or a stable reference.
-fn flatten_document_source(source: Option<&Value>) -> Option<String> {
-    let source = source?;
-    let source_type = source.get("type").and_then(Value::as_str)?;
+fn flatten_document_source(source: Option<Value>) -> Option<String> {
+    let Value::Object(mut source) = source? else {
+        return None;
+    };
+    let source_type = take_string(&mut source, "type")?;
 
-    match source_type {
-        "text" => source
-            .get("data")
-            .and_then(Value::as_str)
+    match source_type.as_str() {
+        "text" => take_string(&mut source, "data")
             .filter(|data| !data.is_empty())
             .map(|data| format!("Content:\n{data}")),
         "content" => {
-            let lines = extract_text_blocks(source.get("content"));
+            let lines = extract_text_blocks(source.remove("content"));
             non_empty_lines(&lines).map(|content| format!("Content:\n{content}"))
         },
-        "url" => source
-            .get("url")
-            .and_then(Value::as_str)
+        "url" => take_string(&mut source, "url")
             .filter(|url| !url.is_empty())
-            .map(|url| format!("Source: {}", quote_label_value(url))),
-        "file" => source
-            .get("file_id")
-            .and_then(Value::as_str)
+            .map(|url| format!("Source: {}", quote_label_value(&url))),
+        "file" => take_string(&mut source, "file_id")
             .filter(|file_id| !file_id.is_empty())
             .map(|file_id| format!("Source: {}", quote_label_value(&format!("file:{file_id}")))),
-        "base64" => source
-            .get("media_type")
-            .and_then(Value::as_str)
+        "base64" => take_string(&mut source, "media_type")
             .filter(|media_type| !media_type.is_empty())
             .map(|media_type| format!("Source: {}", quote_label_value(&format!("base64:{media_type}")))),
         _ => None,
@@ -502,19 +559,27 @@ fn quote_label_value(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
 }
 
-/// Extract text from an array of Anthropic text blocks.
-fn extract_text_blocks(value: Option<&Value>) -> Vec<String> {
+/// Extract text from an array of Anthropic text blocks, moving each string out.
+fn extract_text_blocks(value: Option<Value>) -> Vec<String> {
     let Some(Value::Array(blocks)) = value else {
         return Vec::new();
     };
 
-    blocks
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
-        .collect()
+    let mut texts = Vec::new();
+    for block in blocks {
+        let Value::Object(mut block) = block else {
+            continue;
+        };
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        if let Some(text) = take_string(&mut block, "text")
+            && !text.is_empty()
+        {
+            texts.push(text);
+        }
+    }
+    texts
 }
 
 /// Join lines if at least one line contains content.
@@ -1410,6 +1475,82 @@ mod tests {
     }
 
     #[test]
+    fn two_text_blocks_stay_two_content_parts() {
+        // String content is emitted only for a *single* text part. Two text
+        // blocks keep their part boundaries rather than being joined.
+        let body = br#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let content = parsed["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "two text blocks stay two parts");
+        assert_eq!(content[0]["text"], "one");
+        assert_eq!(content[1]["text"], "two");
+    }
+
+    #[test]
+    fn assistant_tool_calls_join_all_text_blocks() {
+        // The assistant+tool_calls branch joins every text part into one string,
+        // a different rule from the single-part case above.
+        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"text","text":"two"},{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let msg = &parsed["messages"][0];
+        assert_eq!(msg["content"], "onetwo", "assistant text parts are joined");
+        assert_eq!(msg["tool_calls"][0]["id"], "c1");
+    }
+
+    #[test]
+    fn assistant_tool_calls_distinguish_empty_text_from_no_text() {
+        // An empty text block still emits `content: ""`; no text block at all
+        // emits no `content` key.
+        let empty = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":""},{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
+        let parsed: Value = serde_json::from_slice(&transform_request(empty).unwrap()).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"], "",
+            "an empty text block still emits content"
+        );
+
+        let none = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
+        let parsed: Value = serde_json::from_slice(&transform_request(none).unwrap()).unwrap();
+        assert!(
+            parsed["messages"][0].get("content").is_none(),
+            "no text block emits no content key"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_calls_drop_image_parts() {
+        // The joined-string branch cannot carry an image part, so it is dropped
+        // while the surrounding text is still joined.
+        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"image","source":{"type":"url","url":"https://example.com/i.png"}},{"type":"text","text":"two"},{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
+        let parsed: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+
+        assert_eq!(
+            parsed["messages"][0]["content"], "onetwo",
+            "text joins across the dropped image"
+        );
+    }
+
+    #[test]
+    fn tool_use_without_input_serializes_an_empty_object() {
+        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f"},{"type":"tool_use","id":"c2","name":"g","input":null}]}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let calls = parsed["messages"][0]["tool_calls"].as_array().unwrap();
+        assert_eq!(
+            calls[0]["function"]["arguments"], "{}",
+            "absent input becomes an empty object"
+        );
+        assert_eq!(
+            calls[1]["function"]["arguments"], "null",
+            "an explicit null input is preserved as null"
+        );
+    }
+
+    #[test]
     fn only_tool_result_blocks_produce_tool_messages() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"result1"},{"type":"tool_result","tool_use_id":"call_2","content":"result2"}]}]}"#;
         let result = transform_request(body).unwrap();
@@ -1427,16 +1568,33 @@ mod tests {
 
     #[test]
     fn extract_tool_result_content_null() {
-        let block = json!({"type": "tool_result", "tool_use_id": "call_1", "content": null});
-        let result = extract_tool_result_content(&block);
-        assert!(result.is_empty(), "null content should return empty string");
+        let (text, images) = split_tool_result_content(Some(Value::Null));
+        assert!(text.is_empty(), "null content should return empty string");
+        assert!(images.is_empty(), "null content carries no images");
     }
 
     #[test]
     fn extract_tool_result_content_missing() {
-        let block = json!({"type": "tool_result", "tool_use_id": "call_1"});
-        let result = extract_tool_result_content(&block);
-        assert!(result.is_empty(), "missing content should return empty string");
+        let (text, images) = split_tool_result_content(None);
+        assert!(text.is_empty(), "missing content should return empty string");
+        assert!(images.is_empty(), "missing content carries no images");
+    }
+
+    #[test]
+    fn tool_result_content_split_keeps_text_and_images_in_one_pass() {
+        let content = json!([
+            {"type": "text", "text": "before"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {"type": "text", "text": "after"},
+            {"type": "thinking", "thinking": "ignored"},
+            "not an object"
+        ]);
+
+        let (text, images) = split_tool_result_content(Some(content));
+
+        assert_eq!(text, "before\nafter", "text parts join in order, skipping non-text");
+        assert_eq!(images.len(), 1, "one image part promoted");
+        assert_eq!(images[0]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     #[test]
