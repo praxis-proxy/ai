@@ -1282,8 +1282,8 @@ mod tests {
             ]
         );
         assert_eq!(report.features_total, 23);
-        assert_eq!(report.scenarios_total, 22);
-        assert_eq!(report.recordings_total, 27);
+        assert_eq!(report.scenarios_total, 23);
+        assert_eq!(report.recordings_total, 28);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1303,6 +1303,7 @@ mod tests {
                 "responses/chat-malformed-compaction",
                 "responses/chat-tool-echo",
                 "responses/chat-web-search",
+                "responses/chat-web-search-stream",
                 "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
@@ -1415,7 +1416,10 @@ mod tests {
                 ),
                 (
                     &"responses.chat.web_search".to_owned(),
-                    &vec!["responses/chat-web-search".to_owned()]
+                    &vec![
+                        "responses/chat-web-search".to_owned(),
+                        "responses/chat-web-search-stream".to_owned()
+                    ]
                 ),
                 (
                     &"responses.chat.file_search".to_owned(),

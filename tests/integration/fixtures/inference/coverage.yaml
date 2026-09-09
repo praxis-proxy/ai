@@ -179,6 +179,7 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-web-search
+      - responses/chat-web-search-stream
     providers:
       synthetic:
         status: synthetic_only
