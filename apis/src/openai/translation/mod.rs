@@ -2163,6 +2163,45 @@ mod tests {
         assert_eq!(mapped["reasoning"]["summary"], "concise");
     }
 
+    #[test]
+    fn conflicting_reasoning_summary_fails_closed_on_resource() {
+        // Request-path validation normally rejects a conflict first, but the
+        // response path must fail closed rather than silently emit summary: null.
+        let request = json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"summary": "detailed", "generate_summary": "concise"},
+        });
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_response(json!("cot"));
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::chat_completions::TranslationError::ConflictingReasoningSummary
+        ));
+    }
+
+    #[test]
+    fn conflicting_reasoning_summary_fails_closed_on_in_progress_snapshot() {
+        // The streaming lifecycle snapshot must fail closed on the same conflict
+        // rather than silently emit reasoning: null.
+        let request = json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"summary": "detailed", "generate_summary": "concise"},
+        });
+        let context = vllm_context(&request);
+
+        let error = super::chat_completions::in_progress_response_resource(&context).unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::chat_completions::TranslationError::ConflictingReasoningSummary
+        ));
+    }
+
     // -------------------------------------------------------------------------
     // Response translation: non-object error
     // -------------------------------------------------------------------------

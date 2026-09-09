@@ -1207,7 +1207,7 @@ pub(crate) fn chat_response_to_response_resource(
         service_tier: &service_tier,
     };
 
-    Ok(response_resource(context, parts))
+    response_resource(context, parts)
 }
 
 /// Validate the minimum successful Chat Completions shape used by translation.
@@ -1357,7 +1357,7 @@ fn is_supported_function_call(tool_call: &Value) -> bool {
 /// Produces the same resource shape as the finite translation but with an empty
 /// output list, null usage, and `in_progress` status, matching the snapshot
 /// carried by `response.created` and `response.in_progress` streaming events.
-pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Value {
+pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Result<Value, TranslationError> {
     let service_tier = context
         .service_tier
         .cloned()
@@ -1388,7 +1388,10 @@ struct ResponseResourceParts<'a> {
 }
 
 /// Build a full `Responses` resource snapshot.
-fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts<'_>) -> Value {
+fn response_resource(
+    context: &ResponseContext<'_>,
+    parts: ResponseResourceParts<'_>,
+) -> Result<Value, TranslationError> {
     let status = parts.status;
     let mut resource = json!({
         "id": context.response_id,
@@ -1404,7 +1407,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "output": Value::Array(parts.output),
         "parallel_tool_calls": context.parallel_tool_calls,
         "previous_response_id": previous_response_id_value(context),
-        "reasoning": reasoning_value(context),
+        "reasoning": reasoning_value(context)?,
         "store": context.store,
         "temperature": number_or_default(context.temperature, 1.0),
         "text": text_value(context),
@@ -1422,7 +1425,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "service_tier": parts.service_tier
     });
     insert_request_resource_fields(&mut resource, context, status);
-    resource
+    Ok(resource)
 }
 
 /// Insert required response fields that are sourced from the original request.
@@ -1534,18 +1537,15 @@ fn previous_response_id_value(context: &ResponseContext<'_>) -> Value {
 }
 
 /// Build the `reasoning` response field.
-fn reasoning_value(context: &ResponseContext<'_>) -> Value {
+fn reasoning_value(context: &ResponseContext<'_>) -> Result<Value, TranslationError> {
     let Some(reasoning) = context.reasoning.and_then(Value::as_object) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
-    let summary = requested_summary(reasoning)
-        .ok()
-        .flatten()
-        .map_or(Value::Null, |mode| Value::String(mode.to_owned()));
-    json!({
+    let summary = requested_summary(reasoning)?.map_or(Value::Null, |mode| Value::String(mode.to_owned()));
+    Ok(json!({
         "effort": reasoning.get("effort").cloned().unwrap_or(Value::Null),
         "summary": summary,
-    })
+    }))
 }
 
 /// Build the `tool_choice` response field.
