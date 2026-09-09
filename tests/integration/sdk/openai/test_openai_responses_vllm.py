@@ -1576,10 +1576,28 @@ class TestResponsesToChatCompletionsVLLM:
             tools=[tool],
             tool_choice="none",
             store=True,
-            max_output_tokens=128,
+            max_output_tokens=512,
         )
-        assert second.status == "completed"
-        assert "68" in second.output_text or "clear" in second.output_text.lower()
+        # Experiment, not a proven fix: the 128-token second-turn budget flaked
+        # once in CI (SQLite job) while PostgreSQL passed the same commit. The
+        # root cause is not yet established -- this turn is free-text
+        # (tool_choice="none", no schema) so it is NOT grammar-bounded, and a
+        # rehydration/storage-path difference between the backends is not ruled
+        # out. Widen only this budget as a controlled experiment and attach
+        # diagnostics so the next failure is analyzable: was it a
+        # max_output_tokens overrun (incomplete_details.reason / usage), did the
+        # model emit a reasoning item (output_types), or was the output empty?
+        detail = (
+            f"status={second.status!r} "
+            f"incomplete_details={getattr(second, 'incomplete_details', None)!r} "
+            f"usage={getattr(second, 'usage', None)!r} "
+            f"output_types={[item.type for item in second.output]} "
+            f"output_text_len={len(second.output_text)}"
+        )
+        assert second.status == "completed", detail
+        assert (
+            "68" in second.output_text or "clear" in second.output_text.lower()
+        ), detail
 
     def test_streaming_response_round_trip(self, chat_streaming_client):
         stream = chat_streaming_client.responses.create(
