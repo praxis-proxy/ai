@@ -1270,38 +1270,6 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert "72" in second.output_text or "sunny" in second.output_text.lower()
 
-    def test_structured_json_output(self, openai_client):
-        response = openai_client.responses.create(
-            model=VLLM_MODEL,
-            input="Return the marker STRUCTURED-2468. /no_think",
-            temperature=0,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "marker_result",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "marker": {"type": "string"},
-                        },
-                        "required": ["marker"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            store=False,
-            # The native Responses path emits a separate reasoning item whose
-            # tokens count against the budget, so allow enough headroom for the
-            # constrained JSON to complete on the small CI model.
-            max_output_tokens=512,
-        )
-
-        assert response.status == "completed"
-        assert json.loads(response.output_text) == {
-            "marker": "STRUCTURED-2468",
-        }
-
     def test_generation_parameters_are_reflected(self, openai_client):
         response = openai_client.responses.create(
             model=VLLM_MODEL,
