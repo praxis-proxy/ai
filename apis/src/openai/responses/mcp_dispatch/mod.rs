@@ -148,15 +148,7 @@ impl McpDispatchFilter {
             warn!("ResponsesState missing when handling approval");
             return Ok(FilterAction::Continue);
         };
-        state.accumulated_output.extend(pending.into_iter().map(|call| {
-            serde_json::json!({
-                "type": "mcp_approval_request",
-                "id": call.call_id,
-                "name": call.tool_name,
-                "server_label": call.server_label,
-                "arguments": call.arguments,
-            })
-        }));
+        record_pending_approvals(state, pending);
 
         // Approval requests are client-owned. Remove every MCP call before any
         // sibling dispatcher can request another inference round; otherwise a
@@ -304,6 +296,12 @@ impl McpDispatchFilter {
         for result in results {
             state.messages.push(result.message.clone());
             state.persisted_messages.push(result.message);
+            // Record execution provenance keyed on the item id `stream_events`
+            // reads, so only this locally executed `mcp_call` gains a synthesized
+            // lifecycle.
+            if let Some(id) = result.output_item.get("id").and_then(serde_json::Value::as_str) {
+                state.locally_executed_output_items.insert(id.to_owned());
+            }
             state.accumulated_output.push(result.output_item);
         }
         let tool_map = &state.mcp_tool_map;
@@ -508,6 +506,23 @@ struct PendingApproval {
     tool_name: String,
     /// Tool arguments as JSON string.
     arguments: String,
+}
+
+/// Emit each pending approval as a client-visible `mcp_approval_request` and
+/// record its execution provenance so `stream_events` may synthesize the item's
+/// lifecycle; a bare `accumulated_output` push is not proof that this filter
+/// produced the item.
+fn record_pending_approvals(state: &mut ResponsesState, pending: Vec<PendingApproval>) {
+    for call in pending {
+        state.locally_executed_output_items.insert(call.call_id.clone());
+        state.accumulated_output.push(serde_json::json!({
+            "type": "mcp_approval_request",
+            "id": call.call_id,
+            "name": call.tool_name,
+            "server_label": call.server_label,
+            "arguments": call.arguments,
+        }));
+    }
 }
 
 // -----------------------------------------------------------------------------

@@ -14,7 +14,11 @@
 pub(crate) mod accumulator;
 mod config;
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeSet, hash_map::DefaultHasher},
+    hash::{Hash as _, Hasher as _},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,8 +36,11 @@ use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::{
-        responses::{error::responses_error_sse_payload, state::ResponsesState},
-        sse::{SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
+        responses::{
+            error::responses_error_sse_payload,
+            state::{EmittedItem, ResponsesState},
+        },
+        sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
     },
 };
 
@@ -57,6 +64,7 @@ pub(super) enum CompletionState {
 }
 
 /// Per-request parser and accumulation state.
+#[expect(clippy::struct_excessive_bools, reason = "independent per-request stream flags")]
 pub(super) struct StreamEventsState {
     /// Byte-level SSE frame parser.
     frame_parser: SseFrameParser,
@@ -88,6 +96,12 @@ pub(super) struct StreamEventsState {
     deferred_terminal: Option<DeferredTerminalEvent>,
     /// Whether a provider `[DONE]` sentinel should follow the logical terminal.
     deferred_done: bool,
+    /// Whether this round already ran the in-band flush of pending local tool
+    /// items. `accumulated_output` is fixed for the duration of a round (the
+    /// agentic loop only rewrites it at round boundaries), so the flush is run at
+    /// most once per round rather than re-serializing every local item ahead of
+    /// each resumed event.
+    local_items_flushed: bool,
 }
 
 /// Accumulates state from native Responses API SSE event streams.
@@ -161,6 +175,7 @@ impl OpenaiStreamEventsFilter {
             output_index_offset,
             deferred_terminal: None,
             deferred_done: false,
+            local_items_flushed: false,
         });
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
@@ -346,17 +361,35 @@ fn parse_and_accumulate(
         |frame| frame.data != b"[DONE]",
     )?;
 
-    let mut logical_output = Vec::new();
-    for frame in &frames {
+    // Parse and validate every frame before mutating shared state or emitting a
+    // byte, then commit accumulation and emission only once the whole chunk
+    // parses. A malformed frame aborts the chunk atomically, so no local-tool
+    // milestone is recorded for bytes that never reach the client and EOS
+    // recovery still re-synthesizes the executed tool items (#276 finding 3).
+    let events = parse_chunk_events(state, &frames, now)?;
+    let logical_output = commit_chunk_events(state, ctx, events);
+
+    Ok(state
+        .logical_stream
+        .then(|| Bytes::from(logical_output))
+        .filter(|bytes| !bytes.is_empty()))
+}
+
+/// Phase 1: parse and validate every frame in a chunk before any mutation.
+///
+/// Returns the parsed non-`[DONE]` events, failing closed on the first malformed
+/// frame so the caller can discard the whole chunk without having recorded any
+/// local-tool milestone (#276 finding 3).
+fn parse_chunk_events(
+    state: &mut StreamEventsState,
+    frames: &[SseFrame],
+    now: Instant,
+) -> Result<Vec<ResponsesEvent>, SseParseError> {
+    let mut events = Vec::with_capacity(frames.len());
+    for frame in frames {
         if frame.data == b"[DONE]" {
             if state.logical_stream {
                 state.deferred_done = true;
-                if let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>() {
-                    // Filter-local parser state is re-armed before request-side
-                    // dispatchers run on the next IRR step. Preserve the
-                    // sentinel decision in shared response state as well.
-                    response_state.deferred_stream_done = true;
-                }
             }
             continue;
         }
@@ -364,16 +397,41 @@ fn parse_and_accumulate(
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
         record_completion(state, &event, now)?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
+///
+/// Both steps are infallible, so every recorded milestone corresponds to bytes
+/// that actually reach the client. Returns the logical-stream bytes (empty when
+/// the logical stream is disabled).
+fn commit_chunk_events(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    events: Vec<ResponsesEvent>,
+) -> Vec<u8> {
+    let mut logical_output = Vec::new();
+    for event in events {
         accumulate_event(ctx, state, &event);
         if state.logical_stream {
             append_logical_event(state, ctx, event, &mut logical_output);
         }
     }
 
-    Ok(state
-        .logical_stream
-        .then(|| Bytes::from(logical_output))
-        .filter(|bytes| !bytes.is_empty()))
+    // Mirror the parser's deferred-`[DONE]` decision into shared response state,
+    // but only now that the whole chunk has parsed and committed. Filter-local
+    // parser state is re-armed before request-side dispatchers run on the next
+    // IRR step, so the sentinel must survive in shared state as well.
+    if state.logical_stream
+        && state.deferred_done
+        && let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        response_state.deferred_stream_done = true;
+    }
+
+    logical_output
 }
 
 /// Append one provider event to the logical stream or defer/suppress it.
@@ -402,10 +460,584 @@ fn append_logical_event(
         return;
     }
 
+    // #276: reconcile locally executed tool items with the resumed model stream
+    // (record streamed milestones, flush pending local items ahead of the first
+    // resumed event, suppress a premature local-tool `done`). Returns true when
+    // this event must not be forwarded.
+    if commit_local_tool_milestones(state, ctx, &event, output) {
+        return;
+    }
+
     let event_type = event.event_type().to_owned();
     let mut payload = event.into_payload();
     normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
     encode_sse_event(&event_type, &payload, output);
+}
+
+/// Reconcile locally executed tool items against the resumed model stream for one
+/// forwarded event, returning `true` when that event must be suppressed.
+fn commit_local_tool_milestones(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event: &ResponsesEvent,
+    output: &mut Vec<u8>,
+) -> bool {
+    // Record which client-visible milestones the model backend streamed for this
+    // item. `output_item.added`/`.done` mark it announced (so a later flush does
+    // not re-emit `output_item.added`); an actual `response.web_search_call.*` /
+    // `response.mcp_call.*` progress event marks the lifecycle as already streamed
+    // in-band (so the flush does not re-synthesize it). Persisted across rounds
+    // via `emitted_output_items`, this is what a resumed round's flush consults.
+    record_model_output_item(ctx, event);
+
+    // #276: ahead of the first resumed model output event, stream any locally
+    // generated tool items (MCP calls/approvals, or web searches absent from the
+    // upstream stream) that the tool-dispatch filters appended to
+    // `accumulated_output` but never emitted incrementally. They must precede the
+    // resumed model output and occupy their reserved output indices.
+    // `accumulated_output` is fixed for the round, so the flush runs once here
+    // rather than re-serializing every local item ahead of each event; the EOS
+    // flush still catches items whose round produced no resumed model event.
+    if state.iteration > 0 && !state.local_items_flushed {
+        flush_local_output_items(ctx, output);
+        state.local_items_flushed = true;
+    }
+
+    // #276 (finding): the model may finalize a local tool item with
+    // `output_item.done` in the very round that declares it, before the dispatch
+    // filter has executed the tool. Passing that `done` through here is premature:
+    // the tool-specific progress lifecycle and real outcome are still unknown, and
+    // the resumed round would then synthesize the progress events plus a second
+    // `done` — leaving the client with `added -> done -> in_progress -> ... ->
+    // done`. Suppress that premature `done`; the flush that follows local
+    // execution emits the single ordered `done` after the progress events. An item
+    // whose lifecycle the model *did* stream in-band keeps its `done` (it is real).
+    if is_premature_local_tool_done(ctx, event) {
+        return true;
+    }
+
+    // A local-tool `output_item.done` that survives the premature check finalizes
+    // the item for the client, so record the envelope as delivered. Tracked apart
+    // from `added`/content: a resumed flush must then synthesize neither a
+    // duplicate `done` nor (when unchanged) drop the finalizer the client already
+    // received.
+    mark_local_done_delivered(ctx, event);
+    false
+}
+
+/// Record that a model-streamed `output_item.done` envelope reached the client for
+/// a locally executed tool item, so a resumed round finalizes each local item with
+/// exactly one `done` — neither dropping it nor duplicating it.
+fn mark_local_done_delivered(ctx: &mut HttpFilterContext<'_>, event: &ResponsesEvent) {
+    let ResponsesEvent::OutputItemDone(payload) = event else {
+        return;
+    };
+    if let Some(item) = payload.get("item").filter(|item| is_local_tool_item(item))
+        && let Some(id) = item.get("id").and_then(Value::as_str)
+    {
+        update_emitted_item(ctx, id, |emitted| emitted.done_delivered = true);
+    }
+}
+
+/// Record which client-visible milestones the model backend streamed for a
+/// local-tool output item, so [`flush_local_output_items`] neither duplicates
+/// them nor drops the progress lifecycle the model never sends.
+///
+/// `output_item.added`/`output_item.done` mark the item *announced* and record
+/// its latest content, but prove nothing about the tool-specific progress
+/// lifecycle: a backend may stream `added` then `done` with no progress events in
+/// between, or only some of them (e.g. `in_progress` then `done`). Only observing
+/// an actual `response.web_search_call.*` / `response.mcp_call.*` event proves
+/// that specific phase reached the client, so each is recorded individually by
+/// its event type. Deriving the lifecycle from `done` would suppress the
+/// synthesized progress a partial `added → in_progress → done` sequence still
+/// owes for its missing `searching`/`completed` phases.
+fn record_model_output_item(ctx: &mut HttpFilterContext<'_>, event: &ResponsesEvent) {
+    match event {
+        ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
+            if let Some(item) = payload.get("item").filter(|item| is_local_tool_item(item))
+                && let Some(id) = item.get("id").and_then(Value::as_str)
+            {
+                let digest = item_digest(item);
+                update_emitted_item(ctx, id, |emitted| {
+                    emitted.added = true;
+                    emitted.content_digest = digest;
+                });
+            }
+        },
+        ResponsesEvent::Unknown { event_type, data } if is_local_tool_progress_event(event_type) => {
+            if let Some(id) = data.get("item_id").and_then(Value::as_str) {
+                let phase = event_type.clone();
+                update_emitted_item(ctx, id, move |emitted| {
+                    emitted.added = true;
+                    emitted.streamed_phases.insert(phase);
+                });
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Whether this event is a model-streamed `output_item.done` for a locally
+/// executed tool item whose *terminal* lifecycle phase has not streamed in-band.
+///
+/// Such a `done` is premature: the dispatch filter runs the tool *after* this
+/// round, so the item's real progress and outcome are unknown here. Emitting it
+/// now would leave the resumed round's flush to add the missing progress events
+/// plus a second `done`, so the caller suppresses it and lets the flush emit the
+/// single ordered `done`.
+///
+/// Prematurity keys on the *terminal* expected phase, not on every phase: once
+/// the last phase of the lifecycle has streamed in-band the item is
+/// authoritatively finished and its `done` passes through, even if the backend
+/// skipped an optional earlier phase (a `web_search_call` may stream `in_progress`
+/// then `completed` without `searching`). Suppressing that `done` would drop the
+/// backend's real terminal event and force the flush to back-fill the skipped
+/// phase *after* the outcome, out of canonical order.
+fn is_premature_local_tool_done(ctx: &HttpFilterContext<'_>, event: &ResponsesEvent) -> bool {
+    let ResponsesEvent::OutputItemDone(payload) = event else {
+        return false;
+    };
+    let Some(item) = payload.get("item").filter(|item| is_local_tool_item(item)) else {
+        return false;
+    };
+    let Some(id) = item.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    let expected = expected_phase_events(item);
+    let streamed = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.emitted_output_items.get(id))
+        .map(|emitted| &emitted.streamed_phases);
+    match expected.last() {
+        // No tool-specific lifecycle (e.g. `mcp_approval_request`): the `done` is
+        // never premature.
+        None => false,
+        Some(&terminal_phase) => !streamed.is_some_and(|phases| phases.contains(terminal_phase)),
+    }
+}
+
+/// Whether an event type is a tool-specific progress or outcome event the model
+/// backend streams in-band for a hosted `web_search_call` or `mcp_call`
+/// (`response.web_search_call.*` / `response.mcp_call.*`). Observing one proves
+/// the progress lifecycle reached the client, so the proxy must not synthesize
+/// it again.
+fn is_local_tool_progress_event(event_type: &str) -> bool {
+    event_type.starts_with("response.web_search_call.") || event_type.starts_with("response.mcp_call.")
+}
+
+/// Whether an accumulated output item was generated locally by a tool-dispatch
+/// filter rather than streamed by the model backend.
+fn is_local_tool_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("mcp_call" | "mcp_approval_request" | "web_search_call")
+    )
+}
+
+/// Fixed-size content digest of an output item, compared across rounds to detect
+/// when a previously streamed item changed and must re-emit its `output_item.done`
+/// envelope.
+///
+/// The whole item is hashed rather than keyed on `type|status` alone so a payload
+/// the model never streamed — e.g. the `action.sources` list `openai_web_search`
+/// adds to a `web_search_call` after local execution — is detected as a change even
+/// when the item's type and status are unchanged.
+///
+/// A `u64` digest rather than a retained serialized string: local tool payloads
+/// already live in `accumulated_output`, and an IRR response can reach tens of MiB
+/// across rounds, so keeping a second full copy per item in `EmittedItem` would be
+/// payload-scale memory amplification. The digest is walked *canonically* (object
+/// keys hashed in sorted order) so it depends only on content: the two sides of a
+/// change comparison come from different backend serializations — an
+/// `output_item.done` payload recorded in one round versus the `accumulated_output`
+/// snapshot rebuilt in the next — whose object key order is not guaranteed stable
+/// (`preserve_order` makes `serde_json` retain insertion order), and a mere key
+/// reorder must not masquerade as a content change and trigger a spurious duplicate
+/// `done`. The walk allocates no intermediate `Value`/`String`.
+///
+/// [`DefaultHasher`]'s algorithm is explicitly not guaranteed stable across Rust
+/// releases, but that is irrelevant here: a digest is only ever compared against
+/// another digest produced by the *same running binary* within one request (it is
+/// never persisted, sent on the wire, or compared across processes or releases), so
+/// only its determinism within a single process — which the fixed-key seed
+/// guarantees — is load-bearing.
+fn item_digest(item: &Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hash_value_canonical(item, &mut hasher);
+    hasher.finish()
+}
+
+/// Feed a JSON value into `hasher` canonically: each value is type-tagged and
+/// containers are length-prefixed so different shapes cannot collide, and object
+/// entries are hashed in sorted key order so key order does not affect the digest.
+///
+/// Sorting keys on the fly (over borrowed `&str`) avoids materializing a
+/// recursively key-sorted copy of the item, so no second full `Value` is allocated
+/// (AGENTS.md ownership rule).
+fn hash_value_canonical(value: &Value, hasher: &mut DefaultHasher) {
+    // Each arm leads with a distinct type tag so different shapes cannot collide
+    // (`0` vs `"0"` vs `false`); scalars fold tag and payload into one tuple hash.
+    // `Number` has no stable `Hash`, so its primitive representation is hashed via
+    // `hash_number_canonical` — covering integer and float without allocating.
+    match value {
+        Value::Null => 0_u8.hash(hasher),
+        Value::Bool(boolean) => (1_u8, boolean).hash(hasher),
+        Value::Number(number) => {
+            2_u8.hash(hasher);
+            hash_number_canonical(number, hasher);
+        },
+        Value::String(string) => (3_u8, string).hash(hasher),
+        Value::Array(items) => {
+            (4_u8, items.len()).hash(hasher);
+            for item in items {
+                hash_value_canonical(item, hasher);
+            }
+        },
+        Value::Object(map) => {
+            (5_u8, map.len()).hash(hasher);
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            for key in keys {
+                key.hash(hasher);
+                // Present because the key came from the map's own key set.
+                hash_value_canonical(&map[key], hasher);
+            }
+        },
+    }
+}
+
+/// Feed a JSON number into `hasher` from its primitive representation, allocating
+/// nothing.
+///
+/// `serde_json` is built here without `arbitrary_precision`, so every `Number` is
+/// stored as exactly one of `u64`/`i64`/`f64` and hashing that primitive is exact.
+/// Integers fold into a common `i128` space under one sub-tag, so the same integer
+/// hashes identically whether serde stored it as `u64` or `i64`; floats hash their
+/// bit pattern under a distinct sub-tag, so integer `5` and float `5.0` stay
+/// distinct values — matching the earlier string-form (`"5"` vs `"5.0"`) behavior
+/// without its per-value allocation. `as_f64` always succeeds for a representable
+/// number, so the final branch is total.
+fn hash_number_canonical(number: &serde_json::Number, hasher: &mut DefaultHasher) {
+    if let Some(unsigned) = number.as_u64() {
+        (0_u8, i128::from(unsigned)).hash(hasher);
+    } else if let Some(signed) = number.as_i64() {
+        (0_u8, i128::from(signed)).hash(hasher);
+    } else if let Some(float) = number.as_f64() {
+        (1_u8, float.to_bits()).hash(hasher);
+    }
+}
+
+/// Merge an update into the tracked client-visible milestones for `id`, creating
+/// the entry when the item has not been seen before.
+///
+/// Milestones accrue independently across events and rounds (an `added` here, a
+/// `streamed_phases` entry there), so callers mutate only the fields they observe
+/// rather than overwriting the whole record and clobbering an earlier milestone.
+fn update_emitted_item(ctx: &mut HttpFilterContext<'_>, id: &str, update: impl FnOnce(&mut EmittedItem)) {
+    let items = &mut ctx
+        .extensions
+        .get_or_insert_with(ResponsesState::default)
+        .emitted_output_items;
+    // The common path across rounds updates an item that already exists; look it up
+    // by borrowed `&str` first so only a genuine first insert allocates an owned key,
+    // rather than allocating one on every `entry()` probe.
+    if let Some(emitted) = items.get_mut(id) {
+        update(emitted);
+        return;
+    }
+    update(items.entry(id.to_owned()).or_default());
+}
+
+/// Emit incremental events for locally generated tool items in
+/// `accumulated_output` that have not yet reached the client or whose outcome
+/// changed since they were last streamed.
+///
+/// Each synthesized item reuses its absolute index in `accumulated_output`, so
+/// the incremental events agree with the final `response.completed` snapshot.
+/// The tracked milestones make this idempotent across rounds, skip the
+/// `output_item.added` and progress events the model backend already streamed,
+/// and trigger outcome-only re-emission when a previously seen item changed.
+fn flush_local_output_items(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
+    let pending = match ctx.extensions.get::<ResponsesState>() {
+        Some(state) => collect_pending_local_items(state),
+        None => return,
+    };
+    for pending in pending {
+        let PendingItem {
+            index,
+            item,
+            digest,
+            plan,
+        } = pending;
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            let id = id.to_owned();
+            // This pass emits the `done` envelope iff the plan says so, so record
+            // the finalizer only when it is actually delivered.
+            let done_delivered = plan.emit_done;
+            update_emitted_item(ctx, &id, |emitted| {
+                emitted.added = true;
+                // Record exactly the phases this pass delivers; the ones the model
+                // already streamed in-band are tracked as they arrived, and a phase
+                // the backend deliberately skipped is left unrecorded so the frontier
+                // rule never back-fills it later. Borrow `plan.phases` rather than
+                // cloning it: the closure runs to completion inside
+                // `update_emitted_item` before `plan` is moved into
+                // `synthesize_local_item` below.
+                for event_type in &plan.phases {
+                    emitted.streamed_phases.insert((*event_type).to_owned());
+                }
+                emitted.done_delivered = emitted.done_delivered || done_delivered;
+                emitted.content_digest = digest;
+            });
+        }
+        synthesize_local_item(ctx, output, index, item, plan);
+    }
+}
+
+/// Collect the locally generated tool items that must be (re)synthesized: those
+/// whose progress lifecycle has not yet been streamed, or whose content changed
+/// since the client last saw them.
+///
+/// Synthesis is gated on execution provenance, not item type. A dispatch filter
+/// records the ids it actually executed in
+/// [`ResponsesState::locally_executed_output_items`]; a tool-typed item that only
+/// reached `accumulated_output` because a failed (non-dispatchable) round copied
+/// the model's placeholder there — e.g. `agentic_loop::collect_streaming_output_items`
+/// after a parse error — has no provenance entry and is skipped, so the terminal
+/// error flush never fabricates a lifecycle for a search that never ran.
+///
+/// One clone per pending item is required to escape the immutable borrow of
+/// `accumulated_output` before the mutable-borrowing synthesis calls in
+/// [`flush_local_output_items`]; the owned item is then moved through the
+/// synthesized events without any further clone (AGENTS.md ownership rule).
+///
+/// [`item_digest`] re-walks each pending item's content (including its on-the-fly
+/// object-key sort) here rather than reading a cached value. The cost is bounded:
+/// this runs at most once per round in-band plus once at end-of-stream, over only
+/// the handful of local tools a round actually executes — so caching the digest
+/// (and the invalidation state a cache would need) buys nothing over recomputing it
+/// against the small, round-stable item set.
+fn collect_pending_local_items(state: &ResponsesState) -> Vec<PendingItem> {
+    state
+        .accumulated_output
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| is_local_tool_item(item))
+        .filter_map(|(index, item)| {
+            let id = item.get("id").and_then(Value::as_str)?;
+            if !state.locally_executed_output_items.contains(id) {
+                return None;
+            }
+            let digest = item_digest(item);
+            let previous = state.emitted_output_items.get(id);
+            let plan = plan_pending_item(previous, item, digest)?;
+            Some(PendingItem {
+                index,
+                item: item.clone(),
+                digest,
+                plan,
+            })
+        })
+        .collect()
+}
+
+/// Decide whether a locally generated item still owes the client any events and,
+/// if so, exactly which lifecycle milestones this synthesis pass must emit.
+///
+/// Returns `None` when the item is fully delivered and unchanged — the client
+/// already saw `output_item.added`, every phase the lifecycle owes, the finalizing
+/// `output_item.done`, and this exact content. Otherwise the plan emits
+/// `output_item.added` only if the item was never announced, the progress events
+/// that come *after* the frontier of phases already streamed in-band, and the
+/// `output_item.done` envelope when it has not yet been delivered or the item's
+/// content changed since it last was.
+///
+/// The three milestones are tracked independently. A backend can stream every
+/// phase in-band yet be cut off before the `done` envelope, so `done_delivered` —
+/// not the phase set or the content digest — governs finalization: without it a
+/// terminal-phase-in-band item with unchanged content would never be finalized.
+/// On a genuine content change only the `done` envelope is re-emitted (it carries
+/// the refreshed item, e.g. a `web_search_call` that gained `action.sources`); the
+/// terminal *phase* event is not, because it carries no item data and re-emitting
+/// it would be a pure duplicate.
+///
+/// The frontier rule is what keeps synthesis in canonical order. Synthesized
+/// events are appended *after* whatever the backend already streamed in-band, so a
+/// phase ordinally earlier than one already streamed can never be emitted without
+/// landing out of order (e.g. `searching` after an already-streamed `completed`).
+/// A backend that streams `in_progress` then `completed` (skipping the optional
+/// `searching`) therefore has its skip honored rather than back-filled, and the
+/// real terminal event it already sent is not duplicated.
+fn plan_pending_item(previous: Option<&EmittedItem>, item: &Value, digest: u64) -> Option<EmissionPlan> {
+    let expected = expected_phase_events(item);
+    let content_changed = previous.is_none_or(|p| p.content_digest != digest);
+    let streamed = previous.map(|p| &p.streamed_phases);
+    let frontier = max_streamed_ordinal(&expected, streamed);
+    let phases: Vec<&'static str> = expected
+        .iter()
+        .enumerate()
+        .filter(|&(ordinal, _)| frontier.is_none_or(|frontier| ordinal > frontier))
+        .map(|(_, &event)| event)
+        .collect();
+    let already_announced = previous.is_some_and(|p| p.added);
+    let done_delivered = previous.is_some_and(|p| p.done_delivered);
+    let emit_done = !done_delivered || content_changed;
+    if already_announced && phases.is_empty() && !emit_done {
+        return None;
+    }
+    Some(EmissionPlan {
+        emit_added: !already_announced,
+        phases,
+        emit_done,
+    })
+}
+
+/// The highest ordinal position within `expected` of a phase already streamed to
+/// the client, or `None` when none have streamed.
+///
+/// This is the frontier past which [`plan_pending_item`] may synthesize leading
+/// progress events. A phase at or before the frontier was either already streamed
+/// or deliberately skipped by the backend; either way re-emitting it now would
+/// place it out of canonical order behind a later phase already sent.
+fn max_streamed_ordinal(expected: &[&'static str], streamed: Option<&BTreeSet<String>>) -> Option<usize> {
+    let streamed = streamed?;
+    expected
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, phase)| streamed.contains(*phase).then_some(ordinal))
+        .max()
+}
+
+/// A locally generated output item awaiting synthesis, carried out of the
+/// immutable `accumulated_output` borrow as a single owned clone.
+struct PendingItem {
+    /// Absolute output index in `accumulated_output`.
+    index: usize,
+    /// The owned output item, moved through the synthesized events.
+    item: Value,
+    /// The item's content digest, recorded before synthesis.
+    digest: u64,
+    /// Which lifecycle milestones this synthesis pass must emit.
+    plan: EmissionPlan,
+}
+
+/// Which parts of a local item's lifecycle a single synthesis pass must emit.
+struct EmissionPlan {
+    /// Whether to emit `output_item.added` (item never announced yet) versus
+    /// reusing the announcement the model or a prior synthesis already streamed.
+    emit_added: bool,
+    /// The exact tool-specific progress/outcome events this pass must synthesize,
+    /// in order — the expected phases that fall after the frontier of phases
+    /// already streamed in-band.
+    phases: Vec<&'static str>,
+    /// Whether to emit the finalizing `output_item.done` envelope: the item has no
+    /// delivered `done` yet, or its content changed since the last one and the
+    /// refreshed item (e.g. now carrying `action.sources`) must reach the client.
+    /// Only the envelope is re-emitted on a content change — the payloadless
+    /// terminal *phase* event carries no item data, so re-emitting it would be a
+    /// pure duplicate.
+    emit_done: bool,
+}
+
+/// Synthesize the incremental event sequence for one locally generated item.
+///
+/// Emits `output_item.added` (only when `plan.emit_added`), then exactly the
+/// tool-specific events in `plan.phases` (the progress/outcome events still owed
+/// after accounting for anything the model streamed in-band), then the finalizing
+/// `output_item.done` (only when `plan.emit_done`). A partial in-band lifecycle
+/// therefore gets only its missing phases; a content-change re-emission gets just
+/// the refreshed `done` envelope. The owned item is moved into `added`, reclaimed
+/// via `take`, then moved into `done`, so the full item is never cloned here.
+fn synthesize_local_item(
+    ctx: &mut HttpFilterContext<'_>,
+    output: &mut Vec<u8>,
+    index: usize,
+    mut item: Value,
+    plan: EmissionPlan,
+) {
+    let output_index = u64::try_from(index).unwrap_or(u64::MAX);
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+
+    if plan.emit_added {
+        let mut added = item_lifecycle_payload("response.output_item.added", output_index, item);
+        normalize_logical_payload(ctx, &mut added, 0);
+        encode_sse_event("response.output_item.added", &added, output);
+        // Reclaim ownership of the item (leaving `null` behind) so the `done`
+        // event below reuses it without a second clone.
+        item = added.get_mut("item").map(Value::take).unwrap_or_default();
+    }
+
+    for event_type in plan.phases {
+        let mut payload = serde_json::json!({
+            "type": event_type,
+            "item_id": item_id,
+            "output_index": output_index,
+            "sequence_number": 0,
+        });
+        normalize_logical_payload(ctx, &mut payload, 0);
+        encode_sse_event(event_type, &payload, output);
+    }
+
+    if plan.emit_done {
+        let mut done = item_lifecycle_payload("response.output_item.done", output_index, item);
+        normalize_logical_payload(ctx, &mut done, 0);
+        encode_sse_event("response.output_item.done", &done, output);
+    }
+}
+
+/// Build an `output_item.added`/`output_item.done` payload, moving the item in.
+///
+/// The object is assembled with `Map::insert` rather than `json!` so the item is
+/// moved rather than deep-cloned through serialization (AGENTS.md ownership
+/// rule). `output_index` is already absolute, so callers normalize with a zero
+/// offset; normalization only rewrites the logical response id and sequence.
+fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("type".to_owned(), Value::String(event_type.to_owned()));
+    object.insert("response_id".to_owned(), Value::Null);
+    object.insert("output_index".to_owned(), Value::from(output_index));
+    object.insert("item".to_owned(), item);
+    object.insert("sequence_number".to_owned(), Value::from(0));
+    Value::Object(object)
+}
+
+/// The full ordered tool-specific lifecycle a local item owes the client between
+/// `output_item.added` and `output_item.done`, per issue #276.
+///
+/// `mcp_call` progresses `in_progress` then `completed`/`failed`;
+/// `web_search_call` progresses `in_progress`, `searching`, then `completed` only
+/// when it actually completed (web search has no conformant `failed` event, so
+/// other outcomes surface through `output_item.done` alone). `mcp_approval_request`
+/// has no dedicated progress events; it surfaces through
+/// `output_item.added`/`output_item.done` alone.
+///
+/// These are distinct API lifecycle events, not one combined milestone. Callers
+/// diff this list against the phases already streamed so a partial in-band
+/// lifecycle still gets exactly its missing events synthesized.
+fn expected_phase_events(item: &Value) -> Vec<&'static str> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("mcp_call") => {
+            let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
+                "response.mcp_call.failed"
+            } else {
+                "response.mcp_call.completed"
+            };
+            vec!["response.mcp_call.in_progress", outcome]
+        },
+        Some("web_search_call") => {
+            let mut events = vec![
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+            ];
+            if item.get("status").and_then(Value::as_str) == Some("completed") {
+                events.push("response.web_search_call.completed");
+            }
+            events
+        },
+        _ => Vec::new(),
+    }
 }
 
 /// Normalize response identity, sequence numbers, and output indices.
@@ -439,12 +1071,16 @@ fn normalize_logical_payload(ctx: &mut HttpFilterContext<'_>, payload: &mut Valu
                 response.insert("id".to_owned(), Value::String(response_id.to_owned()));
             }
         }
-        if object.contains_key("sequence_number") {
-            object.insert(
-                "sequence_number".to_owned(),
-                Value::Number(serde_json::Number::from(state.logical_stream_sequence)),
-            );
-        }
+        // #276/#985: stamp every emitted logical event with the running sequence
+        // number so the client always sees a contiguous `0..N` series. Conformant
+        // OpenAI Responses events always carry `sequence_number`, so this is a
+        // no-op on the exercised paths; inserting it when absent keeps a future or
+        // non-conformant event type from passing through unstamped and silently
+        // opening a gap (the counter still advances once per emitted event).
+        object.insert(
+            "sequence_number".to_owned(),
+            Value::Number(serde_json::Number::from(state.logical_stream_sequence)),
+        );
     }
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 }
@@ -520,25 +1156,44 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     let continues = logical_stream_continues(ctx);
     let mut output = Vec::new();
     if !continues && let Some(mut error) = logical_stream_error(ctx) {
+        // #276: surface any locally executed tool items that never reached the
+        // client before the stream terminates with an error, so already-executed
+        // tool activity is not silently dropped by a resumed-round parse failure.
+        flush_local_output_items(ctx, &mut output);
         normalize_logical_payload(ctx, &mut error, parser_state.output_index_offset);
         encode_sse_event("error", &error, &mut output);
     } else if !continues && let Some(mut terminal) = parser_state.deferred_terminal.take() {
-        let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-        let (accumulated_output, usage) = canonicalize_logical_response(state);
-        if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
-            response.insert("output".to_owned(), Value::Array(accumulated_output));
-            if !usage.is_null() {
-                response.insert("usage".to_owned(), usage);
-            }
-        }
-        normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
-        encode_sse_event(&terminal.event_type, &terminal.payload, &mut output);
-        if parser_state.deferred_done {
-            output.extend_from_slice(b"data: [DONE]\n\n");
-        }
+        emit_deferred_terminal(ctx, &mut terminal, &parser_state, &mut output);
     }
     *body = (!output.is_empty()).then(|| Bytes::from(output));
     ctx.insert_filter_state(parser_state);
+}
+
+/// Emit the deferred terminal snapshot as the logical stream's final event,
+/// preceded by any locally generated tool items not yet streamed to the client.
+fn emit_deferred_terminal(
+    ctx: &mut HttpFilterContext<'_>,
+    terminal: &mut DeferredTerminalEvent,
+    parser_state: &StreamEventsState,
+    output: &mut Vec<u8>,
+) {
+    // #276: stream any locally generated tool items that never reached the
+    // client as incremental events (e.g. an MCP approval request that ends the
+    // loop without a resumed round) before the terminal snapshot.
+    flush_local_output_items(ctx, output);
+    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
+    let (accumulated_output, usage) = canonicalize_logical_response(state);
+    if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
+        response.insert("output".to_owned(), Value::Array(accumulated_output));
+        if !usage.is_null() {
+            response.insert("usage".to_owned(), usage);
+        }
+    }
+    normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
+    encode_sse_event(&terminal.event_type, &terminal.payload, output);
+    if parser_state.deferred_done {
+        output.extend_from_slice(b"data: [DONE]\n\n");
+    }
 }
 
 /// Whether a dispatch filter requested another inference step.

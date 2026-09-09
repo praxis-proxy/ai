@@ -619,6 +619,13 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
+        // Record execution provenance keyed on the item id `stream_events` reads:
+        // this replaces the model's placeholder with an executed result, so only
+        // now may the search's lifecycle be synthesized. A placeholder copied into
+        // `accumulated_output` by a failed round never reaches here.
+        if let Some(id) = output_item.get("id").and_then(Value::as_str) {
+            state.locally_executed_output_items.insert(id.to_owned());
+        }
         upsert_output_item(
             &mut state.accumulated_output,
             state.current_round_output_start,
