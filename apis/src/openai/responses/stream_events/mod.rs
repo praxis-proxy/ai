@@ -623,8 +623,14 @@ fn is_local_tool_item(item: &Value) -> bool {
 /// snapshot rebuilt in the next — whose object key order is not guaranteed stable
 /// (`preserve_order` makes `serde_json` retain insertion order), and a mere key
 /// reorder must not masquerade as a content change and trigger a spurious duplicate
-/// `done`. [`DefaultHasher`] is seeded with fixed keys, so the digest is stable
-/// across calls and processes; the walk allocates no intermediate `Value`/`String`.
+/// `done`. The walk allocates no intermediate `Value`/`String`.
+///
+/// [`DefaultHasher`]'s algorithm is explicitly not guaranteed stable across Rust
+/// releases, but that is irrelevant here: a digest is only ever compared against
+/// another digest produced by the *same running binary* within one request (it is
+/// never persisted, sent on the wire, or compared across processes or releases), so
+/// only its determinism within a single process — which the fixed-key seed
+/// guarantees — is load-bearing.
 fn item_digest(item: &Value) -> u64 {
     let mut hasher = DefaultHasher::new();
     hash_value_canonical(item, &mut hasher);
@@ -698,13 +704,18 @@ fn hash_number_canonical(number: &serde_json::Number, hasher: &mut DefaultHasher
 /// `streamed_phases` entry there), so callers mutate only the fields they observe
 /// rather than overwriting the whole record and clobbering an earlier milestone.
 fn update_emitted_item(ctx: &mut HttpFilterContext<'_>, id: &str, update: impl FnOnce(&mut EmittedItem)) {
-    let emitted = ctx
+    let items = &mut ctx
         .extensions
         .get_or_insert_with(ResponsesState::default)
-        .emitted_output_items
-        .entry(id.to_owned())
-        .or_default();
-    update(emitted);
+        .emitted_output_items;
+    // The common path across rounds updates an item that already exists; look it up
+    // by borrowed `&str` first so only a genuine first insert allocates an owned key,
+    // rather than allocating one on every `entry()` probe.
+    if let Some(emitted) = items.get_mut(id) {
+        update(emitted);
+        return;
+    }
+    update(items.entry(id.to_owned()).or_default());
 }
 
 /// Emit incremental events for locally generated tool items in
@@ -730,18 +741,20 @@ fn flush_local_output_items(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8
         } = pending;
         if let Some(id) = item.get("id").and_then(Value::as_str) {
             let id = id.to_owned();
-            // Record exactly the phases this pass delivers; the ones the model
-            // already streamed in-band are tracked as they arrived, and a phase the
-            // backend deliberately skipped is intentionally left unrecorded so the
-            // frontier rule never back-fills it later.
-            let delivered: Vec<&'static str> = plan.phases.clone();
             // This pass emits the `done` envelope iff the plan says so, so record
             // the finalizer only when it is actually delivered.
             let done_delivered = plan.emit_done;
-            update_emitted_item(ctx, &id, move |emitted| {
+            update_emitted_item(ctx, &id, |emitted| {
                 emitted.added = true;
-                for event_type in delivered {
-                    emitted.streamed_phases.insert(event_type.to_owned());
+                // Record exactly the phases this pass delivers; the ones the model
+                // already streamed in-band are tracked as they arrived, and a phase
+                // the backend deliberately skipped is left unrecorded so the frontier
+                // rule never back-fills it later. Borrow `plan.phases` rather than
+                // cloning it: the closure runs to completion inside
+                // `update_emitted_item` before `plan` is moved into
+                // `synthesize_local_item` below.
+                for event_type in &plan.phases {
+                    emitted.streamed_phases.insert((*event_type).to_owned());
                 }
                 emitted.done_delivered = emitted.done_delivered || done_delivered;
                 emitted.content_digest = digest;
@@ -767,6 +780,13 @@ fn flush_local_output_items(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8
 /// `accumulated_output` before the mutable-borrowing synthesis calls in
 /// [`flush_local_output_items`]; the owned item is then moved through the
 /// synthesized events without any further clone (AGENTS.md ownership rule).
+///
+/// [`item_digest`] re-walks each pending item's content (including its on-the-fly
+/// object-key sort) here rather than reading a cached value. The cost is bounded:
+/// this runs at most once per round in-band plus once at end-of-stream, over only
+/// the handful of local tools a round actually executes — so caching the digest
+/// (and the invalidation state a cache would need) buys nothing over recomputing it
+/// against the small, round-stable item set.
 fn collect_pending_local_items(state: &ResponsesState) -> Vec<PendingItem> {
     state
         .accumulated_output
