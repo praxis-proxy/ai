@@ -48,8 +48,6 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
     convert_stream(&mut chat, stream, stream_options);
     map_parameters(&mut chat, stop_sequences, temperature, top_p, top_k);
     convert_tools(&mut chat, tools);
-    // Borrows `tool_choice`; the conversion below consumes it. Reordering the
-    // two is a borrow-check error rather than a silent behavior change.
     convert_parallel_tool_calls(&mut chat, tool_choice.as_ref());
     convert_tool_choice(&mut chat, tool_choice, had_tools);
 
@@ -66,13 +64,7 @@ fn build_messages(system: Option<Value>, messages: Option<Value>) -> Value {
 }
 
 /// Build a Chat Completions message carrying plain string content.
-fn text_message(role: &str, content: String) -> Value {
-    owned_text_message(role.to_owned(), content)
-}
-
-/// [`text_message`] for callers that already own the role, so it moves through
-/// instead of being copied out of a string that dies immediately after.
-fn owned_text_message(role: String, content: String) -> Value {
+fn text_message(role: String, content: String) -> Value {
     let mut message = Map::new();
     message.insert("role".to_owned(), Value::String(role));
     message.insert("content".to_owned(), Value::String(content));
@@ -80,9 +72,6 @@ fn owned_text_message(role: String, content: String) -> Value {
 }
 
 /// Build a Chat Completions `text` content part, moving `text` into it.
-///
-/// Built by hand rather than with `json!`, which would deep-clone the string
-/// back through the serializer.
 fn text_content_part(text: String) -> Value {
     let mut part = Map::new();
     part.insert("type".to_owned(), Value::String("text".to_owned()));
@@ -91,9 +80,6 @@ fn text_content_part(text: String) -> Value {
 }
 
 /// Build a Chat Completions `image_url` content part, moving `url` into it.
-///
-/// `url` carries the whole base64 payload for inline images, so it must not be
-/// re-serialized through `json!`.
 fn image_content_part(url: String) -> Value {
     let mut image_url = Map::new();
     image_url.insert("url".to_owned(), Value::String(url));
@@ -127,7 +113,7 @@ fn hoist_system(messages: &mut Vec<Value>, system: Option<Value>) {
     };
 
     if !content.is_empty() {
-        messages.push(text_message("system", content));
+        messages.push(text_message("system".to_owned(), content));
     }
 }
 
@@ -151,34 +137,28 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
 
         match msg.remove("content") {
             Some(Value::String(text)) => {
-                messages.push(owned_text_message(role, text));
+                messages.push(text_message(role, text));
             },
             Some(Value::Array(blocks)) => {
                 convert_content_blocks(messages, &role, blocks);
             },
             _ => {
-                messages.push(owned_text_message(role, String::new()));
+                messages.push(text_message(role, String::new()));
             },
         }
     }
 }
 
 /// Convert typed content blocks to Chat Completions-compatible format.
-///
-/// Consumes the blocks: in an agentic request they carry the bulk of the body
-/// (inline images, tool results, accumulated turn history), so every leaf below
-/// moves its payload into the translated message instead of copying it.
+/// Consumes the blocks to move their payloads into the translated message.
 fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
     let mut acc = BlockAccumulator::default();
 
     for block in blocks {
-        let Value::Object(mut block) = block else {
-            // A non-object block exposes no `type`, exactly as reading through
-            // `Value::get` saw it.
-            warn!(block_type = "", "dropping unknown Anthropic content block type");
-            continue;
+        let mut block = match block {
+            Value::Object(block) => block,
+            _ => Map::new(),
         };
-        // No branch below reads `type` again, so it is taken out with the rest.
         let block_type = take_string(&mut block, "type").unwrap_or_default();
         convert_single_block(block, &block_type, messages, role, &mut acc);
     }
@@ -189,8 +169,7 @@ fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Val
 /// Chat Completions output accumulated across one message's content blocks.
 #[derive(Default)]
 struct BlockAccumulator {
-    /// Content parts in wire order. A lone text part later collapses to string
-    /// content, so the text is not tracked separately.
+    /// Content parts in wire order.
     content_parts: Vec<Value>,
     /// Tool calls hoisted out of `tool_use` blocks.
     tool_calls: Vec<Value>,
@@ -254,9 +233,6 @@ fn convert_document_block(block: Map<String, Value>, content_parts: &mut Vec<Val
 }
 
 /// Take the string out of a `text` content part, leaving other parts untouched.
-///
-/// The part is about to be dropped by both callers, so the payload moves out
-/// instead of being copied.
 fn take_text_part(part: &mut Value) -> Option<String> {
     let part = part.as_object_mut()?;
     if part.get("type").and_then(Value::as_str) != Some("text") {
@@ -266,10 +242,6 @@ fn take_text_part(part: &mut Value) -> Option<String> {
 }
 
 /// Concatenate the text of every text content part, moving each string out.
-///
-/// `None` means no text part was present, which is distinct from text parts
-/// that are all empty: the caller emits no `content` for the former and an
-/// empty string for the latter.
 fn take_joined_text(content_parts: &mut [Value]) -> Option<String> {
     let mut joined: Option<String> = None;
     for part in content_parts {
@@ -277,8 +249,6 @@ fn take_joined_text(content_parts: &mut [Value]) -> Option<String> {
             continue;
         };
         match &mut joined {
-            // The first text moves in whole, so the common single-text case
-            // never copies its payload.
             None => joined = Some(text),
             Some(acc) => acc.push_str(&text),
         }
@@ -291,11 +261,9 @@ fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Va
     let id = take_string(&mut block, "id").unwrap_or_default();
     let name = take_string(&mut block, "name").unwrap_or_default();
 
-    // An absent `input` serializes as the empty object the old placeholder
-    // produced; an explicit `null` still serializes as `null`.
     let args = match block.remove("input") {
         Some(input) => serde_json::to_string(&input).unwrap_or_default(),
-        None => "{}".to_owned(),
+        None => serde_json::to_string(&Value::Object(Map::new())).unwrap_or_default(),
     };
 
     let mut function = Map::new();
@@ -312,8 +280,6 @@ fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Va
 /// Convert a `tool_result` content block to a Chat Completions tool message.
 fn convert_tool_result_block(mut block: Map<String, Value>, messages: &mut Vec<Value>) {
     let tool_call_id = take_string(&mut block, "tool_use_id").unwrap_or_default();
-    // Read before `content` is taken: `is_error` decides how the text below is
-    // marked, and both live in the same map.
     let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
 
     let (mut result_content, image_content) = split_tool_result_content(block.remove("content"));
@@ -341,8 +307,6 @@ fn finalize_content_blocks(messages: &mut Vec<Value>, role: &str, mut acc: Block
     if role == "assistant" && !acc.tool_calls.is_empty() {
         let mut msg = Map::new();
         msg.insert("role".to_owned(), Value::String("assistant".to_owned()));
-        // This branch carries string content only, so any image part collected
-        // alongside the text is dropped here.
         if let Some(text) = take_joined_text(&mut acc.content_parts) {
             msg.insert("content".to_owned(), Value::String(text));
         }
@@ -359,18 +323,14 @@ fn flush_content_parts(messages: &mut Vec<Value>, content_parts: &mut Vec<Value>
         return;
     }
 
-    // A lone text part collapses to string content; anything else stays an
-    // array. Resolved before the `else` branch so the borrow ends here.
     let lone_text = match content_parts.as_mut_slice() {
         [part] => take_text_part(part),
         _ => None,
     };
 
     if let Some(text) = lone_text {
-        messages.push(text_message(role, text));
+        messages.push(text_message(role.to_owned(), text));
     } else {
-        // `json!` would deep-clone every content part — including full inline
-        // image payloads — straight back out of the taken vector.
         let mut msg = Map::new();
         msg.insert("role".to_owned(), Value::String(role.to_owned()));
         msg.insert("content".to_owned(), Value::Array(std::mem::take(content_parts)));
@@ -384,10 +344,8 @@ fn flush_content_parts(messages: &mut Vec<Value>, content_parts: &mut Vec<Value>
 // Image Source Conversion
 // -----------------------------------------------------------------------------
 
-/// Convert Anthropic image source to an `image_url` URL string.
-///
-/// Consumes the source so a `url` source moves its string through untouched and
-/// a `base64` source is copied exactly once, into the data URL.
+/// Convert Anthropic image source to an `image_url` URL string consuming the
+/// source.
 fn convert_image_source(source: Value) -> Option<String> {
     let Value::Object(mut source) = source else {
         return None;
@@ -411,10 +369,6 @@ fn convert_image_source(source: Value) -> Option<String> {
 
 /// Split a `tool_result` block's `content` into its flattened text and the
 /// image parts promoted to a follow-up user message.
-///
-/// One pass over the owned content: a string result moves out whole, and each
-/// part is consumed by the branch that claims it, so nothing is traversed — or
-/// copied — twice.
 fn split_tool_result_content(content: Option<Value>) -> (String, Vec<Value>) {
     match content {
         Some(Value::String(text)) => (text, Vec::new()),
@@ -612,7 +566,7 @@ fn convert_stream(chat: &mut Map<String, Value>, stream: Option<Value>, stream_o
     chat.insert("stream_options".to_owned(), Value::Object(opts));
 }
 
-/// Map Anthropic sampling parameters to Chat Completions-compatible equivalents.
+/// Map Anthropic parameters to Chat Completions-compatible equivalents.
 ///
 /// `top_k` has no standard Chat Completions equivalent but is preserved
 /// as an extra body parameter for backends that support it
@@ -697,12 +651,10 @@ fn convert_tool_definition(tool: Value) -> Option<Value> {
         return None;
     }
 
-    // A non-object tool entry carries no fields, so it translates to an empty
-    // function exactly as reading through `Value::get` did.
-    let mut tool = if let Value::Object(fields) = tool {
-        fields
-    } else {
-        Map::new()
+    // A non-object tool entry carries no fields, so it translates to an empty function.
+    let mut tool = match tool {
+        Value::Object(fields) => fields,
+        _ => Map::new(),
     };
 
     let name = take_string(&mut tool, "name").unwrap_or_default();
@@ -731,9 +683,6 @@ fn convert_tool_definition(tool: Value) -> Option<Value> {
 // -----------------------------------------------------------------------------
 
 /// Convert Anthropic `disable_parallel_tool_use` to Chat Completions format.
-///
-/// Reads `tool_choice` without consuming it; [`convert_tool_choice`] takes
-/// ownership afterwards.
 fn convert_parallel_tool_calls(chat: &mut Map<String, Value>, tool_choice: Option<&Value>) {
     let Some(Value::Object(tool_choice)) = tool_choice else {
         return;
@@ -749,10 +698,6 @@ fn convert_parallel_tool_calls(chat: &mut Map<String, Value>, tool_choice: Optio
 }
 
 /// Convert Anthropic `tool_choice` to Chat Completions format.
-///
-/// `had_tools` records whether the request carried a `tools` field at all. A
-/// choice is dropped when every tool was filtered out, so a request whose tools
-/// were all typed server tools cannot force a tool call the backend never saw.
 fn convert_tool_choice(chat: &mut Map<String, Value>, tool_choice: Option<Value>, had_tools: bool) {
     let Some(tool_choice) = tool_choice else {
         return;
@@ -782,8 +727,6 @@ fn tool_choice_keyword(anthropic: &str) -> &'static str {
 
 /// Convert an object-form `tool_choice`, moving a named tool's name through.
 fn object_tool_choice(mut tool_choice: Map<String, Value>) -> Value {
-    // Settled before the named-tool branch so the type lookup does not hold a
-    // borrow while `name` is taken out.
     let names_a_tool = tool_choice.get("type").and_then(Value::as_str) == Some("tool");
 
     if names_a_tool && let Some(name) = take_string(&mut tool_choice, "name") {

@@ -219,7 +219,7 @@ impl BodyMutation {
 /// Remove `key` from `map` and return the owned `String` when the value was a JSON string.
 ///
 /// The entry is removed either way: a non-string value is dropped and `None` returned, matching the
-/// `get(..).and_then(Value::as_str)` reads this replaces, without re-allocating the string.
+/// `get(..).and_then(Value::as_str)` behavior, without re-allocating the string.
 pub fn take_string(map: &mut Map<String, Value>, key: &str) -> Option<String> {
     match map.remove(key) {
         Some(Value::String(text)) => Some(text),
