@@ -14,7 +14,7 @@
 )]
 
 use bytes::Bytes;
-use praxis_filter::{FilterAction, HttpFilter as _, SubRequestResponseMode};
+use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::json;
 
 use super::{
@@ -553,7 +553,7 @@ async fn logical_stream_synthesizes_missing_progress_for_local_and_model_declare
     // locally. #276 must synthesize the missing tool-specific progress lifecycle
     // for every one of them, while never duplicating the `output_item.added` the
     // model already streamed for the model-declared search.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -564,7 +564,7 @@ async fn logical_stream_synthesizes_missing_progress_for_local_and_model_declare
         "stream": true
     })));
 
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     // Round 0: the model streams a web_search_call as an incremental item.
     let mut created = Some(make_sse_chunk(
@@ -612,7 +612,7 @@ async fn logical_stream_synthesizes_missing_progress_for_local_and_model_declare
     ];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut resumed_created = Some(make_sse_chunk(
         "response.created",
@@ -779,8 +779,8 @@ fn mark_accumulated_output_executed(state: &mut ResponsesState) {
 async fn arm_resumed_round_with_accumulated(
     loop_filter: &'static str,
     accumulated: Vec<serde_json::Value>,
-) -> (Box<dyn HttpFilter>, praxis_filter::HttpFilterContext<'static>) {
-    let filter = make_logical_filter();
+) -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -790,7 +790,7 @@ async fn arm_resumed_round_with_accumulated(
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -813,7 +813,7 @@ async fn arm_resumed_round_with_accumulated(
     state.accumulated_output = accumulated;
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove(loop_filter);
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     (filter, ctx)
 }
@@ -856,7 +856,7 @@ async fn logical_stream_failed_mcp_call_emits_failed_outcome_event() {
     )
     .await;
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert!(
         delta.contains("event: response.mcp_call.in_progress"),
         "a failed MCP call still emits an in_progress event first: {delta}"
@@ -973,7 +973,7 @@ async fn logical_stream_synthesizes_progress_for_model_declared_item_without_rep
     // the same id. The proxy must synthesize the full progress lifecycle
     // (in_progress -> searching -> completed) and a fresh `output_item.done`,
     // without repeating the `output_item.added` the model already streamed.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -983,7 +983,7 @@ async fn logical_stream_synthesizes_progress_for_model_declared_item_without_rep
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1019,9 +1019,9 @@ async fn logical_stream_synthesizes_progress_for_model_declared_item_without_rep
     state.accumulated_output = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert!(
         delta.contains("event: response.web_search_call.completed"),
         "a locally completed web search must emit a completed outcome event: {delta}"
@@ -1055,7 +1055,7 @@ async fn logical_stream_synthesizes_progress_when_model_streams_added_then_done_
     // premature round-0 `done` must be suppressed, and the resumed round must fill
     // in the missing in_progress/searching/completed events and emit exactly one
     // ordered `output_item.done` (without repeating the announcement the model sent).
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1065,7 +1065,7 @@ async fn logical_stream_synthesizes_progress_when_model_streams_added_then_done_
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1118,9 +1118,9 @@ async fn logical_stream_synthesizes_progress_when_model_streams_added_then_done_
     state.accumulated_output = vec![completed_item];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert!(
         delta.contains("event: response.web_search_call.in_progress")
             && delta.contains("event: response.web_search_call.searching")
@@ -1158,7 +1158,7 @@ async fn logical_stream_does_not_resynthesize_progress_streamed_in_band_by_model
     // lifecycle was already delivered and neither re-announce nor re-synthesize
     // it. Observing the `response.web_search_call.*` events (never `done`) is what
     // records that the lifecycle streamed.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1168,7 +1168,7 @@ async fn logical_stream_does_not_resynthesize_progress_streamed_in_band_by_model
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1235,9 +1235,9 @@ async fn logical_stream_does_not_resynthesize_progress_streamed_in_band_by_model
     state.accumulated_output = vec![hosted_item];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert!(
         !delta.contains("ws_1"),
         "an item whose lifecycle streamed in-band must not be re-synthesized: {delta}"
@@ -1264,7 +1264,7 @@ async fn logical_stream_synthesizes_missing_phases_after_partial_in_band_lifecyc
     // resumed round must synthesize exactly the still-missing `searching` and
     // `completed` events plus one ordered `done`, without repeating the
     // `output_item.added` or the `in_progress` the client already saw in-band.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1274,7 +1274,7 @@ async fn logical_stream_synthesizes_missing_phases_after_partial_in_band_lifecyc
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1335,9 +1335,9 @@ async fn logical_stream_synthesizes_missing_phases_after_partial_in_band_lifecyc
     state.accumulated_output = vec![completed_item];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     // The missing middle/terminal phases must be filled even though `in_progress`
     // already streamed and the item's content is byte-identical to round 0.
     assert!(
@@ -1379,7 +1379,7 @@ async fn logical_stream_fills_middle_phase_after_leading_in_band_progress() {
     // item's content (status in_progress -> completed). The resumed round must
     // supply the missing `searching` AND `completed` phases, not just the terminal
     // outcome: a single-bool "lifecycle streamed" flag would drop `searching`.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1389,7 +1389,7 @@ async fn logical_stream_fills_middle_phase_after_leading_in_band_progress() {
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1433,9 +1433,9 @@ async fn logical_stream_fills_middle_phase_after_leading_in_band_progress() {
     state.accumulated_output = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert!(
         delta.contains("event: response.web_search_call.searching"),
         "the middle `searching` phase missing in-band must be synthesized, not dropped: {delta}"
@@ -1470,7 +1470,7 @@ async fn logical_stream_keeps_in_band_done_when_outcome_streams_without_searchin
     // pass through unchanged. The resumed round must NOT resurrect the skipped
     // `searching` (it would land after `completed`, out of canonical order) nor
     // replace the backend's real `done` with a synthesized duplicate.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1480,7 +1480,7 @@ async fn logical_stream_keeps_in_band_done_when_outcome_streams_without_searchin
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1547,9 +1547,9 @@ async fn logical_stream_keeps_in_band_done_when_outcome_streams_without_searchin
     state.accumulated_output = vec![completed_item];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert!(
         !delta.contains("event: response.web_search_call.searching"),
         "a phase the backend skipped must not be back-filled after the outcome: {delta}"
@@ -1576,7 +1576,7 @@ async fn logical_stream_honors_skipped_leading_phase_when_only_searching_streame
     // must synthesize only the still-owed `completed` and a single `done`; it must
     // NOT back-fill the skipped `in_progress`, which would land after the already
     // streamed `searching`, out of canonical order.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1586,7 +1586,7 @@ async fn logical_stream_honors_skipped_leading_phase_when_only_searching_streame
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1630,9 +1630,9 @@ async fn logical_stream_honors_skipped_leading_phase_when_only_searching_streame
     state.accumulated_output = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert!(
         delta.contains("event: response.web_search_call.completed"),
         "the still-owed terminal outcome must be synthesized: {delta}"
@@ -1684,7 +1684,7 @@ async fn logical_stream_reemits_outcome_when_local_item_gains_sources() {
     .await;
 
     // Round 1: the isolated web search is synthesized with its full lifecycle.
-    let first = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let first = resumed_text_delta(&filter, &mut ctx);
     assert!(
         first.contains("event: response.output_item.added")
             && first.contains("event: response.web_search_call.in_progress")
@@ -1708,9 +1708,9 @@ async fn logical_stream_reemits_outcome_when_local_item_gains_sources() {
         }
     })];
     mark_accumulated_output_executed(state);
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let second = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let second = resumed_text_delta(&filter, &mut ctx);
     assert!(
         second.contains("blog.rust-lang.org"),
         "the re-emitted output_item.done must carry the newly added sources: {second}"
@@ -1821,7 +1821,7 @@ async fn logical_stream_finalizes_local_item_when_done_envelope_missing_and_cont
     // exactly one `output_item.done` — otherwise the client is left with an item
     // that never received its terminal envelope. No phase may be re-emitted (all
     // already streamed) and no second `output_item.added`.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1831,7 +1831,7 @@ async fn logical_stream_finalizes_local_item_when_done_envelope_missing_and_cont
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1885,9 +1885,9 @@ async fn logical_stream_finalizes_local_item_when_done_envelope_missing_and_cont
     state.accumulated_output = vec![completed_item];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert_eq!(
         delta.matches("event: response.output_item.done").count(),
         1,
@@ -1917,7 +1917,7 @@ async fn logical_stream_finalizes_without_duplicating_terminal_phase_when_conten
     // exactly one `output_item.done` carrying the updated item, and must NOT re-emit
     // the payloadless terminal phase already streamed in-band — that phase event
     // carries no item data, so re-emitting it would be a pure duplicate.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1927,7 +1927,7 @@ async fn logical_stream_finalizes_without_duplicating_terminal_phase_when_conten
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -1982,9 +1982,9 @@ async fn logical_stream_finalizes_without_duplicating_terminal_phase_when_conten
     })];
     mark_accumulated_output_executed(state);
     ctx.filter_results.remove("openai_web_search");
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
-    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    let delta = resumed_text_delta(&filter, &mut ctx);
     assert_eq!(
         delta.matches("event: response.output_item.done").count(),
         1,
@@ -2108,7 +2108,7 @@ async fn logical_stream_error_does_not_fabricate_lifecycle_for_unexecuted_placeh
     // envelope for a search that never ran; only executed local tool items may be
     // synthesized. Without the provenance gate the flush invents a full lifecycle
     // for `ws_ghost`.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -2118,7 +2118,7 @@ async fn logical_stream_error_does_not_fabricate_lifecycle_for_unexecuted_placeh
         "input": "hi",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    filter.arm(&mut ctx);
 
     // The round announces a `web_search_call` placeholder, then hits a parse error
     // before the tool lifecycle streams or the dispatch filter executes it.

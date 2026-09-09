@@ -69,7 +69,6 @@ pub(super) enum CompletionState {
 }
 
 /// Per-request parser and accumulation state.
-#[expect(clippy::struct_excessive_bools, reason = "independent per-request stream flags")]
 pub(super) struct StreamEventsState {
     /// Byte-level SSE frame parser.
     frame_parser: SseFrameParser,
@@ -226,7 +225,6 @@ impl OpenaiStreamEventsFilter {
                     500,
                     "server_error",
                     "openai_stream_events must run inside an iterative_request_router step",
-                    true,
                 )))
             },
             ArmDecision::Arm => {

@@ -17,7 +17,7 @@ use praxis_test_utils::{free_port, json_post, load_example_config, parse_body, p
 const EXAMPLE: &str = "openai/responses/irr-terminal-streaming.yaml";
 const FIRST_EVENT: &str = concat!(
     "event: response.output_text.delta\n",
-    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\",\"sequence_number\":0}\n\n",
 );
 const FINAL_EVENT: &str = concat!(
     "event: response.completed\n",
@@ -44,7 +44,7 @@ fn sse_event_reaches_client_before_upstream_completes() {
         let raw = read_response_incrementally(
             &proxy_addr,
             r#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
-            "\"delta\":\"hel\"}\n\n",
+            "\"delta\":\"hel\",\"sequence_number\":0}\n\n",
             &observed_tx,
         );
         complete_tx.send(raw).expect("test receiver should remain available");
