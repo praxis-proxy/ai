@@ -31,15 +31,25 @@ pub(crate) fn responses_error_body(code: &str, message: &str) -> Bytes {
 ///
 /// Produces `event: error\ndata: <ResponseErrorEvent json>\n\n`.
 pub(crate) fn responses_error_sse_body(code: &str, message: &str) -> Bytes {
-    let json = responses_error_sse_payload(code, message);
+    responses_error_sse_body_at_sequence(code, message, 0)
+}
+
+/// Build a Responses API SSE error at a logical-stream sequence number.
+pub(crate) fn responses_error_sse_body_at_sequence(code: &str, message: &str, sequence_number: u64) -> Bytes {
+    let json = responses_error_sse_payload_at_sequence(code, message, sequence_number);
     Bytes::from(format!("event: error\ndata: {json}\n\n"))
 }
 
 /// Build the JSON payload for a Responses API SSE error event.
 pub(crate) fn responses_error_sse_payload(code: &str, message: &str) -> serde_json::Value {
+    responses_error_sse_payload_at_sequence(code, message, 0)
+}
+
+/// Build the JSON payload for an SSE error at a logical-stream sequence.
+fn responses_error_sse_payload_at_sequence(code: &str, message: &str, sequence_number: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "error",
-        "sequence_number": 0,
+        "sequence_number": sequence_number,
         "error": {
             "type": code,
             "code": code,
@@ -148,6 +158,16 @@ mod tests {
             "SSE error message should match"
         );
         assert!(parsed["error"]["param"].is_null(), "SSE error param should be null");
+    }
+
+    #[test]
+    fn sse_body_preserves_logical_sequence() {
+        let body = responses_error_sse_body_at_sequence("server_error", "oops", 7);
+        let text = std::str::from_utf8(&body).unwrap();
+        let data = text.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(payload["sequence_number"], 7);
     }
 
     #[test]

@@ -441,14 +441,14 @@ fn assert_agentic_parallel_tool_calls(actual: &WireFixture, scenario_id: &str, p
         panic!("scenario `{scenario_id}` and provider `{provider}` must replay a JSON upstream request body");
     };
     assert_eq!(
-        upstream_body["parallel_tool_calls"], false,
-        "agentic loop must inject parallel_tool_calls=false for scenario `{scenario_id}` and provider `{provider}`"
+        upstream_body["parallel_tool_calls"], true,
+        "agentic loop must preserve parallel_tool_calls=true for scenario `{scenario_id}` and provider `{provider}`"
     );
     let RecordedBody::Json { value: client_body } = &turn.client.request.body else {
         panic!("scenario `{scenario_id}` and provider `{provider}` must replay a JSON client request body");
     };
-    assert!(
-        client_body.get("parallel_tool_calls").is_none(),
-        "client request must not contain parallel_tool_calls for scenario `{scenario_id}` and provider `{provider}`"
+    assert_eq!(
+        client_body["parallel_tool_calls"], true,
+        "client request must enable parallel_tool_calls for scenario `{scenario_id}` and provider `{provider}`"
     );
 }

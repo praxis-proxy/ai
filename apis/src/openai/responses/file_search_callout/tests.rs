@@ -1008,6 +1008,28 @@ async fn max_tool_calls_counts_completed_calls_before_pending_execution() {
 }
 
 #[tokio::test]
+async fn max_tool_calls_counts_reused_ids_from_separate_rounds() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let pending = json!({"type":"file_search_call","id":"fs-next","status":"searching","queries":["q"]});
+    let mut state = state_with(&["vs-a"], vec![pending]);
+    state.file_search_output_items = vec![
+        json!({"type":"file_search_call","id":"fs-reused","status":"completed"}),
+        json!({"type":"file_search_call","id":"fs-reused","status":"incomplete"}),
+    ];
+    state.max_tool_calls = Some(2);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.output_items()[0]["status"], "incomplete");
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
 async fn max_tool_calls_counts_completed_calls_in_the_current_output() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
@@ -1123,7 +1145,7 @@ fn final_response_rewrite_clears_representation_headers() {
 }
 
 #[tokio::test]
-async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
+async fn mcp_calls_consume_the_response_wide_builtin_tool_budget() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let mcp = json!({"type":"mcp_call","id":"mcp-prior","status":"completed"});
@@ -1137,8 +1159,31 @@ async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
         FilterAction::Continue
     ));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[1]["status"], "completed");
-    assert_eq!(server.requests().len(), 1);
+    assert_eq!(state.output_items()[1]["status"], "incomplete");
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn prior_agentic_calls_consume_file_search_budget_across_state_owners() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let pending = json!({"type":"file_search_call","id":"fs-new","status":"searching","queries":["q"]});
+    let mut state = state_with(&["vs-a"], vec![pending]);
+    state.max_tool_calls = Some(2);
+    state.web_search_calls_executed = 1;
+    state.accumulated_output = vec![
+        json!({"type":"web_search_call", "id":"ws-prior", "status":"completed"}),
+        json!({"type":"mcp_call", "id":"mcp-prior", "status":"completed"}),
+    ];
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.output_items()[0]["status"], "incomplete");
+    assert!(server.requests().is_empty());
 }
 
 #[tokio::test]

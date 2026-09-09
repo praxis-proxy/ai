@@ -351,6 +351,12 @@ fn parse_and_accumulate(
         if frame.data == b"[DONE]" {
             if state.logical_stream {
                 state.deferred_done = true;
+                if let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    // Filter-local parser state is re-armed before request-side
+                    // dispatchers run on the next IRR step. Preserve the
+                    // sentinel decision in shared response state as well.
+                    response_state.deferred_stream_done = true;
+                }
             }
             continue;
         }
@@ -468,6 +474,37 @@ fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u
             Err(error)
         },
     }
+}
+
+/// Encode a locally completed logical stream after a request-phase dispatch.
+///
+/// Some dispatch lifecycles finish before another upstream response exists, so
+/// the response-body finalizer cannot emit the deferred terminal event. Build
+/// the same canonical terminal representation directly from shared response
+/// state for IRR to append after already-emitted logical stream chunks.
+pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option<Bytes> {
+    let parser_deferred_done = ctx
+        .get_filter_state::<StreamEventsState>()
+        .is_some_and(|state| state.deferred_done);
+    let state = ctx.extensions.get_mut::<ResponsesState>()?;
+    let deferred_done = state.deferred_stream_done || parser_deferred_done;
+    canonicalize_logical_response(state);
+    if !state.response_object.is_object() {
+        return None;
+    }
+
+    let sequence_number = state.logical_stream_sequence;
+    state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
+
+    let mut output = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":".to_vec();
+    serde_json::to_writer(&mut output, &state.response_object).ok()?;
+    output.extend_from_slice(b",\"sequence_number\":");
+    serde_json::to_writer(&mut output, &sequence_number).ok()?;
+    output.extend_from_slice(b"}\n\n");
+    if deferred_done {
+        output.extend_from_slice(b"data: [DONE]\n\n");
+    }
+    Some(Bytes::from(output))
 }
 
 /// Emit the held terminal event only when the current IRR step is terminal.

@@ -327,7 +327,7 @@ def _wait_for_proxy(
 
 
 class MCPHandler(BaseHTTPRequestHandler):
-    """Streamable HTTP MCP server with a single get_weather tool."""
+    """Streamable HTTP MCP server with deterministic weather/time tools."""
 
     authorization_headers: ClassVar[list[str | None]] = []
 
@@ -364,14 +364,30 @@ class MCPHandler(BaseHTTPRequestHandler):
                                 "required": ["city"],
                                 "additionalProperties": False,
                             },
-                        }
+                        },
+                        {
+                            "name": "get_time",
+                            "description": "Get the current local time for a city",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                                "additionalProperties": False,
+                            },
+                        },
                     ]
                 },
             )
         elif method == "tools/call":
+            tool_name = req.get("params", {}).get("name")
             city = req.get("params", {}).get("arguments", {}).get("city", "unknown")
+            result = (
+                f"12:00 PM in {city}"
+                if tool_name == "get_time"
+                else f"72F and sunny in {city}"
+            )
             self._json_rpc(
-                rid, {"content": [{"type": "text", "text": f"72F and sunny in {city}"}]}
+                rid, {"content": [{"type": "text", "text": result}]}
             )
         elif method == "ping":
             self._json_rpc(rid, {})
@@ -504,10 +520,12 @@ def _write_agentic_config(
         "- filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
     )
     config = config.replace(
-        "- filter: openai_mcp_dispatch\n              - filter: openai_agentic_loop",
+        "- filter: openai_mcp_dispatch\n"
+        "                max_calls_per_round: 32\n",
         "- filter: openai_mcp_dispatch\n"
         "                allow_loopback: true\n"
-        "              - filter: openai_agentic_loop",
+        "                max_calls_per_round: 32\n",
+        1,
     )
     config = config.replace(
         "max_iterations: 11\n",
@@ -2256,6 +2274,43 @@ class TestAgenticLoopVLLM:
                 "agentic loop can dispatch it"
             )
         assert len(BraveSearchHandler.request_paths) == request_count + 1
+
+    def test_batched_mcp_tools_honor_parallel_tool_calls(
+        self,
+        agentic_client,
+        agentic_proxy,
+    ):
+        """Two MCP calls emitted in one model round both complete."""
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call both get_weather and get_time for Paris "
+                "in the same turn before answering. Do not omit either "
+                "function. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "utilities",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather", "get_time"],
+                    "require_approval": "never",
+                }
+            ],
+            parallel_tool_calls=True,
+            store=False,
+            max_output_tokens=512,
+        )
+
+        mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+        assert len(mcp_calls) == 2, (
+            "both calls from the batched model round must execute exactly "
+            f"once; got: {[item.type for item in response.output]}"
+        )
+        assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}
 
     def test_mcp_tool_streams_terminal_round_as_one_logical_response(
         self,

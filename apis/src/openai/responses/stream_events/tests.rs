@@ -3,6 +3,7 @@
 
 #![allow(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::indexing_slicing,
     clippy::too_many_lines,
     unused_must_use,
@@ -13,7 +14,9 @@ use bytes::Bytes;
 use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::json;
 
-use super::{CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object};
+use super::{
+    CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object, encode_local_completion,
+};
 use crate::{
     openai::{responses::state::ResponsesState, sse::SseFrameParser},
     test_utils::{make_filter_context, make_request},
@@ -52,6 +55,65 @@ fn custom_config_overrides_apply() {
         serde_yaml::from_str("max_buffer_bytes: 1048576\nmax_events: 500\ntimeout_secs: 60").unwrap();
     let filter = OpenaiStreamEventsFilter::from_config(&yaml);
     assert!(filter.is_ok(), "custom config should parse");
+}
+
+#[test]
+fn local_completion_encodes_canonical_logical_sse_terminal() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        logical_stream_response_id: Some("resp_logical".to_owned()),
+        logical_stream_sequence: 4,
+        accumulated_output: vec![json!({"type":"mcp_approval_request", "id":"call_1"})],
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "output": []
+        }),
+        usage: json!({"total_tokens": 3}),
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("response object should encode");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+
+    assert!(encoded.starts_with("event: response.completed\ndata: "));
+    assert!(encoded.ends_with("\n\n"));
+    let payload: serde_json::Value = serde_json::from_str(
+        encoded
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data line should exist"),
+    )
+    .unwrap();
+    assert_eq!(payload["type"], "response.completed");
+    assert_eq!(payload["sequence_number"], 4);
+    assert_eq!(payload["response"]["id"], "resp_logical");
+    assert_eq!(
+        payload["response"]["output"].as_array().map(Vec::as_slice),
+        Some(state.accumulated_output.as_slice())
+    );
+    assert_eq!(payload["response"]["usage"], state.usage);
+    assert_eq!(state.logical_stream_sequence, 5);
+}
+
+#[test]
+fn local_completion_preserves_deferred_done_sentinel() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({"id":"resp_1", "object":"response", "status":"completed", "output":[]}),
+        deferred_stream_done: true,
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("response object should encode");
+    assert!(
+        encoded.ends_with(b"data: [DONE]\n\n"),
+        "request-side completion must preserve the upstream sentinel"
+    );
 }
 
 #[test]

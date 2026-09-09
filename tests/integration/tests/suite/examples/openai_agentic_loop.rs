@@ -57,9 +57,9 @@ fn single_pass_completes_through_irr() {
     assert_eq!(model_reqs.len(), 1, "model backend should receive one request");
     let model_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("model request body should be valid JSON");
-    assert_eq!(
-        model_body["parallel_tool_calls"], false,
-        "first inference must disable parallel tool calls when the client omits the field"
+    assert!(
+        model_body.get("parallel_tool_calls").is_none(),
+        "an omitted parallel_tool_calls field must remain omitted"
     );
 }
 
@@ -140,16 +140,11 @@ fn client_function_call_returns_without_server_execution() {
 }
 
 // -----------------------------------------------------------------------------
-// IRR Rejection Preservation (regression for #663)
+// Multiple Client-Owned Function Calls
 // -----------------------------------------------------------------------------
 //
-// The agentic-loop filter rejects (400/508) from its `on_response_body` hook,
-// which runs inside IRR. These tests assert IRR surfaces that rejection as a
-// client-visible status instead of aborting the response body.
-// https://github.com/praxis-proxy/ai/issues/663
-
 #[test]
-fn multiple_function_calls_returns_client_visible_400() {
+fn multiple_client_function_calls_return_without_internal_execution() {
     let response = serde_json::json!({
         "id": "resp_parallel_calls",
         "object": "response",
@@ -175,7 +170,7 @@ fn multiple_function_calls_returns_client_visible_400() {
     });
     let model = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_agentic_rejection_config(proxy_port, model.port());
+    let config = load_agentic_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
     let raw = http_send(
@@ -185,16 +180,16 @@ fn multiple_function_calls_returns_client_visible_400() {
 
     assert_eq!(
         parse_status(&raw),
-        400,
-        "IRR must preserve the response-body rejection status: {raw}"
+        200,
+        "client-owned function-call batches must be returned: {raw}"
     );
-    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("rejection body should be valid JSON");
-    assert_eq!(body["error"]["type"], "invalid_request_error");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response body should be valid JSON");
+    assert_eq!(body["output"].as_array().map(Vec::len), Some(2));
     assert_eq!(
-        body["error"]["message"],
-        "openai_agentic_loop supports exactly one function call per round"
+        model.requests().len(),
+        1,
+        "client calls must not trigger hidden inference"
     );
-    assert_eq!(model.requests().len(), 1, "the rejection must stop iteration");
 }
 
 #[test]
@@ -347,8 +342,8 @@ fn round_trip_captures_tool_and_model_requests() {
     let first_model_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("first model request body should be valid JSON");
     assert_eq!(
-        first_model_body["parallel_tool_calls"], false,
-        "first inference must override parallel_tool_calls=true"
+        first_model_body["parallel_tool_calls"], true,
+        "first inference must preserve parallel_tool_calls=true"
     );
     let resolved_tools = first_model_body["tools"]
         .as_array()
@@ -393,13 +388,351 @@ fn round_trip_captures_tool_and_model_requests() {
     // Assert openai_agentic_loop bookkeeping in second request
     // -------------------------------------------------------------------------
     assert_eq!(
-        model_body["parallel_tool_calls"], false,
-        "openai_agentic_loop must force parallel_tool_calls=false on re-entry"
+        model_body["parallel_tool_calls"], true,
+        "openai_agentic_loop must preserve parallel_tool_calls=true on re-entry"
     );
     assert_eq!(
         model_body["tool_choice"], "auto",
         "openai_agentic_loop must reset tool_choice to auto on re-entry"
     );
+}
+
+#[test]
+fn batched_mcp_calls_complete_for_parallel_and_sequential_modes() {
+    for parallel in [true, false] {
+        let first_response = serde_json::json!({
+            "id": "resp_batch_1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_weather",
+                    "call_id": "call_weather",
+                    "name": "utilities__get_weather",
+                    "arguments": r#"{"location":"Paris"}"#,
+                    "status": "completed"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_time",
+                    "call_id": "call_time",
+                    "name": "utilities__get_time",
+                    "arguments": r#"{"timezone":"Europe/Paris"}"#,
+                    "status": "completed"
+                }
+            ]
+        });
+        let second_response = serde_json::json!({
+            "id": "resp_batch_2",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Paris is sunny and the time is noon."}]
+            }]
+        });
+        let model = StatefulCapturingBackend::new(vec![
+            (200, first_response.to_string()),
+            (200, second_response.to_string()),
+        ])
+        .start_with_shutdown();
+        let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+            tools: vec![McpToolFixture::new("get_weather"), McpToolFixture::new("get_time")],
+            ..McpMockConfig::default()
+        });
+        let proxy_port = free_port();
+        let config = load_loopback_mcp_config(proxy_port, model.port());
+        let proxy = start_proxy(&config);
+        let request = serde_json::json!({
+            "model": "gpt-4.1",
+            "input": "Give me the weather and time in Paris.",
+            "parallel_tool_calls": parallel,
+            "tools": [{
+                "type": "mcp",
+                "server_label": "utilities",
+                "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+                "allowed_tools": ["get_weather", "get_time"],
+                "require_approval": "never"
+            }]
+        });
+
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+        assert_eq!(parse_status(&raw), 200, "batch mode parallel={parallel}: {raw}");
+        assert_eq!(mcp.method_count("tools/call"), 2, "both MCP calls must execute once");
+        let model_requests = model.requests();
+        assert_eq!(model_requests.len(), 2, "one continuation should carry the whole batch");
+        let first_body: serde_json::Value = serde_json::from_str(&model_requests[0].body).unwrap();
+        assert_eq!(first_body["parallel_tool_calls"], parallel);
+        let second_body: serde_json::Value = serde_json::from_str(&model_requests[1].body).unwrap();
+        assert_eq!(second_body["parallel_tool_calls"], parallel);
+        assert_eq!(
+            second_body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .count(),
+            2,
+            "the continuation must contain one output per call"
+        );
+    }
+}
+
+#[test]
+fn exhausted_max_tool_calls_returns_without_an_extra_model_round() {
+    let tool_call = |response_id: &str, call_id: &str| {
+        serde_json::json!({
+            "id": response_id,
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": format!("fc_{call_id}"),
+                "call_id": call_id,
+                "name": "utilities__get_weather",
+                "arguments": r#"{"city":"Paris"}"#,
+                "status": "completed"
+            }]
+        })
+    };
+    let model = StatefulCapturingBackend::new(vec![
+        (200, tool_call("resp_limit_1", "call_allowed").to_string()),
+        (200, tool_call("resp_limit_2", "call_rejected").to_string()),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Keep checking the weather.",
+        "max_tool_calls": 1,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "utilities",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "tool limit must terminate normally: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the rejected call must not trigger a third model request"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "only the call within the response-wide limit may execute"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    assert!(output.iter().any(|item| {
+        item["type"] == "mcp_call"
+            && item["id"] == "call_rejected"
+            && item["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("max_tool_calls"))
+    }));
+}
+
+#[test]
+fn mixed_mcp_approval_batch_executes_ungated_call_before_returning_approval() {
+    let first_response = serde_json::json!({
+        "id": "resp_mixed_approval",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_weather",
+                "call_id": "call_weather",
+                "name": "utilities__get_weather",
+                "arguments": r#"{"city":"Paris"}"#,
+                "status": "completed"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_time",
+                "call_id": "call_time",
+                "name": "utilities__get_time",
+                "arguments": r#"{"city":"Paris"}"#,
+                "status": "completed"
+            }
+        ]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather"), McpToolFixture::new("get_time")],
+        ..McpMockConfig::default()
+    });
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Give me the weather and time in Paris.",
+        "parallel_tool_calls": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "utilities",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather", "get_time"],
+            "require_approval": {
+                "always": {"tool_names": ["get_weather"]},
+                "never": {"tool_names": ["get_time"]}
+            }
+        }]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "mixed approval batch must return normally: {raw}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "approval must stop before another inference call"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "only the ungated sibling must execute"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    assert!(output.iter().any(|item| {
+        item["type"] == "mcp_approval_request" && item["id"] == "call_weather" && item["name"] == "get_weather"
+    }));
+    assert!(
+        output
+            .iter()
+            .any(|item| { item["type"] == "mcp_call" && item["id"] == "call_time" && item["name"] == "get_time" })
+    );
+}
+
+#[test]
+fn streaming_mixed_mcp_approval_batch_finishes_logical_sse_response() {
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_stream_approval", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_stream_approval",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_weather",
+                            "call_id": "call_weather",
+                            "name": "utilities__get_weather",
+                            "arguments": r#"{"city":"Paris"}"#,
+                            "status": "completed"
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc_time",
+                            "call_id": "call_time",
+                            "name": "utilities__get_time",
+                            "arguments": r#"{"city":"Paris"}"#,
+                            "status": "completed"
+                        }
+                    ]
+                },
+                "sequence_number": 1
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response]);
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather"), McpToolFixture::new("get_time")],
+        ..McpMockConfig::default()
+    });
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model_port);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Give me the weather and time in Paris.",
+        "parallel_tool_calls": true,
+        "stream": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "utilities",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather", "get_time"],
+            "require_approval": {
+                "always": {"tool_names": ["get_weather"]},
+                "never": {"tool_names": ["get_time"]}
+            }
+        }]
+    });
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed mixed approval must return normally: {raw}"
+    );
+    assert_eq!(
+        model_requests
+            .lock()
+            .expect("model request lock should not be poisoned")
+            .len(),
+        1,
+        "approval must stop before another inference call"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "only the ungated sibling must execute"
+    );
+    assert_eq!(body.matches("event: response.created").count(), 1, "{body}");
+    assert_eq!(body.matches("event: response.completed").count(), 1, "{body}");
+    assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+    assert!(
+        body.contains("mcp_approval_request"),
+        "approval must be in the SSE terminal: {body}"
+    );
+    assert!(body.contains("call_weather"), "gated call must remain pending: {body}");
+    assert!(
+        body.contains("mcp_call"),
+        "ungated result must be in the SSE terminal: {body}"
+    );
+    assert!(
+        body.contains("call_time"),
+        "ungated call result must be retained: {body}"
+    );
+
+    model_thread.join().expect("streaming model thread should finish");
 }
 
 #[test]
@@ -449,23 +782,69 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
             }),
         ),
         sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_stream_1",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_stream_2",
+                    "call_id": "call_stream_2",
+                    "name": "weather__get_time",
+                    "arguments": "",
+                    "status": "in_progress"
+                },
+                "sequence_number": 4
+            }),
+        ),
+        sse_event(
+            "response.function_call_arguments.delta",
+            serde_json::json!({
+                "response_id": "resp_stream_1",
+                "item_id": "fc_stream_2",
+                "output_index": 1,
+                "delta": r#"{"timezone":"America/Los_Angeles"}"#,
+                "sequence_number": 5
+            }),
+        ),
+        sse_event(
+            "response.function_call_arguments.done",
+            serde_json::json!({
+                "response_id": "resp_stream_1",
+                "item_id": "fc_stream_2",
+                "output_index": 1,
+                "arguments": r#"{"timezone":"America/Los_Angeles"}"#,
+                "sequence_number": 6
+            }),
+        ),
+        sse_event(
             "response.completed",
             serde_json::json!({
                 "response": {
                     "id": "resp_stream_1",
                     "object": "response",
                     "status": "completed",
-                    "output": [{
-                        "type": "function_call",
-                        "id": "fc_stream_1",
-                        "call_id": "call_stream_1",
-                        "name": "weather__get_weather",
-                        "arguments": r#"{"location":"SF"}"#,
-                        "status": "completed"
-                    }],
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_stream_1",
+                            "call_id": "call_stream_1",
+                            "name": "weather__get_weather",
+                            "arguments": r#"{"location":"SF"}"#,
+                            "status": "completed"
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc_stream_2",
+                            "call_id": "call_stream_2",
+                            "name": "weather__get_time",
+                            "arguments": r#"{"timezone":"America/Los_Angeles"}"#,
+                            "status": "completed"
+                        }
+                    ],
                     "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
                 },
-                "sequence_number": 4
+                "sequence_number": 7
             }),
         ),
     ];
@@ -528,6 +907,14 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
                     "required": ["location"],
                     "additionalProperties": false
                 })),
+            McpToolFixture::new("get_time")
+                .with_description("Get the current time in a timezone")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"timezone": {"type": "string"}},
+                    "required": ["timezone"],
+                    "additionalProperties": false
+                })),
         ],
         ..McpMockConfig::default()
     });
@@ -536,14 +923,15 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
     let proxy = start_proxy(&config);
     let request = serde_json::json!({
         "model": "gpt-4.1",
-        "input": "What is the weather in SF?",
+        "input": "What are the weather and time in SF?",
+        "parallel_tool_calls": true,
         "stream": true,
         "store": false,
         "tools": [{
             "type": "mcp",
             "server_label": "weather",
             "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
-            "allowed_tools": ["get_weather"],
+            "allowed_tools": ["get_weather", "get_time"],
             "require_approval": "never"
         }]
     });
@@ -588,13 +976,13 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         "resumed turns must retain the first logical response ID: {body}"
     );
     assert!(
-        body.contains(r#""output_index":2"#),
-        "resumed model output should follow function and MCP output items: {body}"
+        body.contains(r#""output_index":4"#),
+        "resumed output should follow both function and MCP output items: {body}"
     );
     assert_eq!(
         mcp.method_count("tools/call"),
-        1,
-        "MCP tool should execute exactly once"
+        2,
+        "both MCP tools should execute exactly once"
     );
 
     model_thread.join().expect("streaming model thread should finish");
@@ -609,12 +997,16 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         .as_array()
         .expect("second request input should be an array");
     assert!(
-        input.iter().any(|item| item["type"] == "function_call"),
-        "second inference should receive the streamed function call"
+        input.iter().filter(|item| item["type"] == "function_call").count() == 2,
+        "second inference should receive both streamed function calls"
     );
     assert!(
-        input.iter().any(|item| item["type"] == "function_call_output"),
-        "second inference should receive the MCP result"
+        input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .count()
+            == 2,
+        "second inference should receive both MCP results"
     );
 }
 
@@ -1190,6 +1582,187 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
 }
 
 #[test]
+fn web_search_batch_respects_response_wide_max_tool_calls() {
+    let first_response = serde_json::json!({
+        "id":"resp_ws_budget",
+        "object":"response",
+        "status":"completed",
+        "output":[
+            {
+                "type":"web_search_call", "id":"ws_allowed", "status":"completed",
+                "action":{"type":"search", "query":"Rust language"}
+            },
+            {
+                "type":"web_search_call", "id":"ws_rejected", "status":"completed",
+                "action":{"type":"search", "query":"second query"}
+            }
+        ]
+    });
+    let model = StatefulCapturingBackend::new(vec![(
+        200,
+        serde_json::to_string(&first_response).expect("serialize model response"),
+    )])
+    .start_with_shutdown();
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    spawn_search_mock(search_listener);
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_web_search_config(proxy_port, model.port(), search_port));
+    let request = serde_json::json!({
+        "model":"gpt-4.1",
+        "input":"Search twice",
+        "tools":[{"type":"web_search_preview"}],
+        "max_tool_calls":1
+    });
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "over-budget calls must not trigger another model round"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    let output = response["output"].as_array().expect("response output array");
+    assert_eq!(output[0]["status"], "completed");
+    assert_eq!(output[1]["status"], "failed");
+}
+
+#[test]
+fn exhausted_shared_budget_retains_mixed_web_and_mcp_calls() {
+    let first_response = serde_json::json!({
+        "id":"resp_mixed_budget",
+        "object":"response",
+        "status":"completed",
+        "output":[
+            {
+                "type":"web_search_call", "id":"ws_rejected", "status":"completed",
+                "action":{"type":"search", "query":"Rust language"}
+            },
+            {
+                "type":"function_call", "id":"fc_rejected", "call_id":"mcp_rejected",
+                "name":"utilities__get_weather", "arguments":r#"{"city":"Paris"}"#, "status":"completed"
+            }
+        ]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_loopback_mcp_config(proxy_port, model.port()));
+    let request = serde_json::json!({
+        "model":"gpt-4.1",
+        "input":"Search and check the weather.",
+        "max_tool_calls":0,
+        "tools":[
+            {"type":"web_search_preview"},
+            {
+                "type":"mcp", "server_label":"utilities",
+                "server_url":format!("http://127.0.0.1:{}/mcp", mcp.port()),
+                "allowed_tools":["get_weather"], "require_approval":"never"
+            }
+        ]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "mixed budget response must finish locally: {raw}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "budget exhaustion must not re-enter inference"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "the over-budget MCP sibling must not execute"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    assert!(
+        output
+            .iter()
+            .any(|item| item["type"] == "web_search_call" && item["id"] == "ws_rejected")
+    );
+    assert!(output.iter().any(|item| {
+        item["type"] == "mcp_call"
+            && item["id"] == "mcp_rejected"
+            && item["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("max_tool_calls"))
+    }));
+}
+
+#[test]
+fn shared_budget_executes_earliest_call_across_mixed_dispatchers() {
+    let first_response = serde_json::json!({
+        "id":"resp_ordered_budget",
+        "object":"response",
+        "status":"completed",
+        "output":[
+            {
+                "type":"function_call", "id":"fc_allowed", "call_id":"mcp_allowed",
+                "name":"utilities__get_weather", "arguments":r#"{"city":"Paris"}"#, "status":"completed"
+            },
+            {
+                "type":"web_search_call", "id":"ws_rejected", "status":"completed",
+                "action":{"type":"search", "query":"Rust language"}
+            }
+        ]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_loopback_mcp_config(proxy_port, model.port()));
+    let request = serde_json::json!({
+        "model":"gpt-4.1",
+        "input":"Check the weather, then search.",
+        "max_tool_calls":1,
+        "tools":[
+            {"type":"web_search_preview"},
+            {
+                "type":"mcp", "server_label":"utilities",
+                "server_url":format!("http://127.0.0.1:{}/mcp", mcp.port()),
+                "allowed_tools":["get_weather"], "require_approval":"never"
+            }
+        ]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "mixed budget response must finish locally: {raw}"
+    );
+    assert_eq!(model.requests().len(), 1, "budget cutoff must not re-enter inference");
+    assert_eq!(mcp.method_count("tools/call"), 1, "the earliest MCP call must execute");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let output = response["output"].as_array().unwrap();
+    assert!(
+        output
+            .iter()
+            .any(|item| { item["type"] == "mcp_call" && item["id"] == "mcp_allowed" && item.get("error").is_none() })
+    );
+    assert!(output.iter().any(|item| {
+        item["type"] == "web_search_call" && item["id"] == "ws_rejected" && item["status"] == "failed"
+    }));
+}
+
+#[test]
 fn web_search_provider_failure_continues_loop_with_failed_result() {
     let first_response = serde_json::json!({
         "id": "resp_ws_1",
@@ -1583,10 +2156,11 @@ fn spawn_counting_search_mock(listener: TcpListener) -> Arc<std::sync::atomic::A
 }
 
 #[test]
-fn web_search_caps_multiple_calls_within_one_round() {
+fn web_search_caps_multiple_calls_within_one_round_without_reentry() {
     // The model requests two searches in a single turn while the client caps
     // built-in tool calls at one. Exactly one provider request must be
-    // dispatched and the excess call must be surfaced as incomplete.
+    // dispatched, the excess call must fail, and exhaustion must not trigger
+    // another model round.
     let first_response = serde_json::json!({
         "id": "resp_ws_cap_1",
         "object": "response",
@@ -1606,22 +2180,8 @@ fn web_search_caps_multiple_calls_within_one_round() {
             }
         ]
     });
-    let second_response = serde_json::json!({
-        "id": "resp_ws_cap_2",
-        "object": "response",
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": "Here is what I found."}]
-        }]
-    });
-
-    let model = StatefulCapturingBackend::new(vec![
-        (200, serde_json::to_string(&first_response).unwrap()),
-        (200, serde_json::to_string(&second_response).unwrap()),
-    ])
-    .start_with_shutdown();
+    let model = StatefulCapturingBackend::new(vec![(200, serde_json::to_string(&first_response).unwrap())])
+        .start_with_shutdown();
 
     let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let search_port = search_listener.local_addr().unwrap().port();
@@ -1657,27 +2217,27 @@ fn web_search_caps_multiple_calls_within_one_round() {
     let body = parse_body(&raw);
     let response: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
     assert_eq!(
-        response["id"], "resp_ws_cap_2",
-        "loop should still complete and return the final model response"
+        response["id"], "resp_ws_cap_1",
+        "tool exhaustion should return the current model response locally"
     );
 
     let output = response["output"]
         .as_array()
         .expect("response output should be an array");
-    let incomplete = output.iter().any(|item| {
+    let rejected = output.iter().any(|item| {
         item["type"] == "web_search_call"
-            && item["status"] == "incomplete"
+            && item["status"] == "failed"
             && item["action"]["query"] == "Rust async runtime"
     });
     assert!(
-        incomplete,
-        "the over-budget web_search_call must be surfaced as incomplete, not executed"
+        rejected,
+        "the over-budget web_search_call must be surfaced as failed, not executed"
     );
 
     assert_eq!(
         model.requests().len(),
-        2,
-        "model backend should receive the initial request plus one post-search continuation"
+        1,
+        "budget exhaustion must not trigger a post-search continuation"
     );
 }
 
@@ -1711,21 +2271,9 @@ fn web_search_budget_persists_across_loop_iterations() {
             "action": {"type": "search", "query": "Rust async runtime"}
         }]
     });
-    let third_response = serde_json::json!({
-        "id": "resp_persist_3",
-        "object": "response",
-        "status": "completed",
-        "output": [{
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": "Here is what I found."}]
-        }]
-    });
-
     let model = StatefulCapturingBackend::new(vec![
         (200, serde_json::to_string(&first_response).unwrap()),
         (200, serde_json::to_string(&second_response).unwrap()),
-        (200, serde_json::to_string(&third_response).unwrap()),
     ])
     .start_with_shutdown();
 
@@ -1759,28 +2307,84 @@ fn web_search_budget_persists_across_loop_iterations() {
     let body = parse_body(&raw);
     let response: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
     assert_eq!(
-        response["id"], "resp_persist_3",
-        "loop should complete and return the final model response"
+        response["id"], "resp_persist_2",
+        "the exhausted second round should complete locally"
     );
 
     let output = response["output"]
         .as_array()
         .expect("response output should be an array");
-    let second_round_incomplete = output.iter().any(|item| {
+    let second_round_rejected = output.iter().any(|item| {
         item["type"] == "web_search_call"
-            && item["status"] == "incomplete"
+            && item["status"] == "failed"
             && item["action"]["query"] == "Rust async runtime"
     });
     assert!(
-        second_round_incomplete,
-        "the second-iteration search must be declined as incomplete once the budget is spent"
+        second_round_rejected,
+        "the second-iteration search must fail once the budget is spent"
     );
 
     assert_eq!(
         model.requests().len(),
-        3,
-        "model backend should receive three requests across the two-search loop"
+        2,
+        "the rejected second search must not trigger a third model request"
     );
+}
+
+#[test]
+fn incomplete_web_search_still_consumes_response_wide_budget() {
+    let first_response = serde_json::json!({
+        "id": "resp_incomplete_budget_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_malformed",
+            "status": "completed",
+            "action": {"type": "search"}
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_incomplete_budget_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_after_incomplete",
+            "status": "completed",
+            "action": {"type": "search", "query": "must not run"}
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, second_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_count = spawn_counting_search_mock(search_listener);
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_web_search_config(proxy_port, model.port(), search_port));
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Try two searches",
+        "max_tool_calls": 1,
+        "tools": [{"type": "web_search_preview"}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "incomplete-budget response failed: {raw}");
+    assert_eq!(search_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the rejected second call must not re-enter inference"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert!(response["output"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "ws_after_incomplete" && item["type"] == "web_search_call" && item["status"] == "failed"
+    }));
 }
 
 /// Encode a typed Responses event as one SSE frame.

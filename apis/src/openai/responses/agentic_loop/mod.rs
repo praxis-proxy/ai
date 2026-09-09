@@ -39,10 +39,9 @@
 //! filter skips body parsing and checks `state.tool_calls` as-is.
 //!
 //! `on_request_body` handles iteration bookkeeping: clearing stale
-//! tool calls and web search calls from the previous round,
-//! forcing `parallel_tool_calls` to `false` (v1 supports one
-//! function call per round), and resetting `tool_choice` to
-//! `"auto"` on re-entry.
+//! tool calls and web search calls from the previous round and
+//! resetting `tool_choice` to `"auto"` on re-entry. The client's
+//! `parallel_tool_calls` value is preserved across every round.
 //!
 //! # Filter order
 //!
@@ -113,14 +112,20 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, SubRequestResponseMode,
     body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
 
 use self::config::{AgenticLoopConfig, build_config};
-use super::{error::responses_error_rejection, state::ResponsesState, usage::merge_usage};
+use super::{
+    error::responses_error_rejection,
+    openai_mcp_tool_resolve::encode_function_name,
+    state::{McpApprovalState, ResponsesState},
+    stream_events::encode_local_completion,
+    usage::merge_usage,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -271,6 +276,10 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         };
 
+        if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
+            return finish_deferred_local_response(ctx, state);
+        }
+
         prepare_iteration(ctx, &mut state);
         trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
         ctx.extensions.insert(state);
@@ -292,12 +301,18 @@ impl HttpFilter for AgenticLoopFilter {
         };
 
         if let Some(bytes) = body.as_ref() {
-            if let Err(msg) = extract_tool_calls_from_body(bytes, &mut state) {
-                return Ok(reject_invalid_function_cardinality(ctx, state, msg));
-            }
+            extract_tool_calls_from_body(bytes, &mut state);
         } else if !prepare_streamed_round(ctx, &mut state)? {
             ctx.extensions.insert(state);
             return Ok(FilterAction::Continue);
+        }
+
+        if is_finish_reason_length(&state) {
+            return finish_incomplete_round(ctx, state, body);
+        }
+
+        if has_mixed_function_call_ownership(&state) {
+            return reject_mixed_ownership_round(ctx, state);
         }
 
         let result = evaluate_loop_decision(ctx, &mut state, body, &self.config)?;
@@ -306,14 +321,73 @@ impl HttpFilter for AgenticLoopFilter {
     }
 }
 
-/// Preserve state while rejecting a buffered round with invalid cardinality.
-fn reject_invalid_function_cardinality(
+/// Complete a locally terminal round after every request-side dispatcher ran.
+fn finish_deferred_local_response(
+    ctx: &mut HttpFilterContext<'_>,
+    mut state: ResponsesState,
+) -> Result<FilterAction, FilterError> {
+    state.deferred_tool_limit_completion = false;
+    state.mcp_approval_state = McpApprovalState::None;
+    state.tool_calls.clear();
+    state.web_search_calls.clear();
+    let streaming = state.request_body.get("stream").and_then(Value::as_bool) == Some(true);
+    let mut body = None;
+    if !streaming {
+        state.finalize_response_body(&mut body);
+    }
+    ctx.extensions.insert(state);
+    if streaming {
+        body = encode_local_completion(ctx);
+    }
+    set_action(ctx, ACTION_DONE)?;
+
+    let mut response = Rejection::status(200)
+        .with_header(
+            "content-type",
+            if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )
+        .preserving_keepalive();
+    if let Some(body) = body {
+        response = response.with_body(body);
+    }
+    Ok(FilterAction::Reject(response))
+}
+
+/// Preserve a model-owned incomplete response before validating tool ownership.
+fn finish_incomplete_round(
     ctx: &mut HttpFilterContext<'_>,
     state: ResponsesState,
-    message: &'static str,
-) -> FilterAction {
+    body: &mut Option<Bytes>,
+) -> Result<FilterAction, FilterError> {
+    ctx.set_metadata(META_STATUS, "incomplete");
+    state.finalize_response_body(body);
+    set_action(ctx, ACTION_DONE)?;
     ctx.extensions.insert(state);
-    FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message, false))
+    Ok(FilterAction::Continue)
+}
+
+/// Reject a completed round that cannot safely split execution ownership.
+fn reject_mixed_ownership_round(
+    ctx: &mut HttpFilterContext<'_>,
+    mut state: ResponsesState,
+) -> Result<FilterAction, FilterError> {
+    const MESSAGE: &str = "model response mixed server-owned and client-owned tool calls in one round";
+    if state.request_body.get("stream").and_then(Value::as_bool) == Some(true) {
+        end_stream_with_error(ctx, &mut state, "server_error", MESSAGE)?;
+        ctx.extensions.insert(state);
+        return Ok(FilterAction::Continue);
+    }
+    ctx.extensions.insert(state);
+    Ok(FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        MESSAGE,
+        false,
+    )))
 }
 
 /// Only a successfully terminated stream may authorize external side effects.
@@ -334,15 +408,6 @@ fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut Responses
         return Ok(false);
     }
     collect_streaming_output_items(state);
-    if state.tool_calls.len() > 1 {
-        end_stream_with_error(
-            ctx,
-            state,
-            "invalid_request_error",
-            "openai_agentic_loop supports exactly one function call per round",
-        )?;
-        return Ok(false);
-    }
     Ok(true)
 }
 
@@ -365,15 +430,12 @@ fn end_stream_with_error(
 // Request-Side Bookkeeping
 // -----------------------------------------------------------------------------
 
-/// Prepare state for the current iteration: clear stale tool calls,
-/// force `parallel_tool_calls=false`, and on re-entry reset
-/// `tool_choice` and set `Content-Type` (subrequests do not inherit
-/// the original client header).
+/// Prepare state for the current iteration: clear stale tool calls and, on
+/// re-entry, reset `tool_choice` and set `Content-Type` (subrequests do not
+/// inherit the original client header).
 fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) {
     state.tool_calls.clear();
     state.web_search_calls.clear();
-    state.parallel_tool_calls = false;
-    set_request_body_field(state, "parallel_tool_calls", Value::Bool(false));
 
     if state.iteration > 0 {
         let original = std::mem::replace(&mut state.tool_choice, json!("auto"));
@@ -413,12 +475,6 @@ fn evaluate_loop_decision(
         return set_done(ctx);
     }
     match check_exit_conditions(state, config) {
-        Some(ExitReason::FinishReasonLength) => {
-            ctx.set_metadata(META_STATUS, "incomplete");
-            state.finalize_response_body(body);
-            set_action(ctx, ACTION_DONE)?;
-            Ok(FilterAction::Continue)
-        },
         Some(ExitReason::IterationLimit) => end_at_iteration_limit(ctx, state),
         None => {
             state.iteration += 1;
@@ -452,30 +508,46 @@ fn end_at_iteration_limit(
 // Body Parsing
 // -----------------------------------------------------------------------------
 
-/// Extract completed function-call items from a non-streaming
-/// response body and populate `state.tool_calls` and
-/// `state.messages`.
-///
-/// Returns `Err` if multiple function calls are found — v1
-/// supports exactly one function call per round.
-fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Result<(), &'static str> {
+/// Extract completed function-call items from a non-streaming response body
+/// and populate `state.tool_calls` and `state.messages`.
+fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
     let response = serde_json::from_slice::<Value>(body)
         .ok()
         .filter(is_responses_api_output);
     let Some(response) = response else {
         state.response_object = Value::Null;
         state.tool_calls.clear();
-        return Ok(());
+        return;
     };
     collect_output_items(&response, state);
     if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
         merge_usage(&mut state.usage, usage);
     }
     state.response_object = response;
-    if state.tool_calls.len() > 1 {
-        return Err("openai_agentic_loop supports exactly one function call per round");
+}
+
+/// Return whether one model round mixed server-owned MCP or web-search calls
+/// with calls that must be executed by the API client. The
+/// current IRR continuation cannot execute the former without sending the
+/// latter back to inference as an unresolved call, so fail before any external
+/// side effect.
+fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
+    let mut has_server = !state.web_search_calls.is_empty();
+    let mut has_client = state
+        .output_items()
+        .iter()
+        .any(super::state::is_client_executed_tool_call);
+    for call in &state.tool_calls {
+        let is_mcp = call.get("name").and_then(Value::as_str).is_some_and(|encoded| {
+            state
+                .mcp_tool_map
+                .keys()
+                .any(|(label, name)| encode_function_name(label, name) == encoded)
+        });
+        has_server |= is_mcp;
+        has_client |= !is_mcp;
     }
-    Ok(())
+    has_server && has_client
 }
 
 /// Distribute output items from a parsed response into the accumulator and state vectors.
@@ -483,6 +555,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
     let Some(Value::Array(output)) = response.get("output") else {
         return;
     };
+    state.current_round_output_start = state.accumulated_output.len();
     for item in output {
         state.accumulated_output.push(item.clone());
         match item.get("type").and_then(Value::as_str) {
@@ -513,6 +586,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
 /// its authoritative response object and tool-call list incrementally.
 fn collect_streaming_output_items(state: &mut ResponsesState) {
     let output = state.output_items().to_vec();
+    state.current_round_output_start = state.accumulated_output.len();
     for item in output {
         // `output` is owned (`to_vec`), so route the owned value into its last
         // consumer by move; only the earlier consumers of a shared item clone.
@@ -558,9 +632,6 @@ fn is_responses_api_output(response: &Value) -> bool {
 
 /// Why the loop should exit early.
 enum ExitReason {
-    /// The model reported `status: "incomplete"` due to output
-    /// token limits — a model-owned reason, passed through as-is.
-    FinishReasonLength,
     /// The proxy's `max_infer_iters` cap was reached — a
     /// proxy-owned reason, returned as a 508 error.
     IterationLimit,
@@ -568,10 +639,6 @@ enum ExitReason {
 
 /// Check whether the loop should exit early.
 fn check_exit_conditions(state: &ResponsesState, config: &AgenticLoopConfig) -> Option<ExitReason> {
-    if is_finish_reason_length(state) {
-        debug!("finish_reason is length, exiting loop as incomplete");
-        return Some(ExitReason::FinishReasonLength);
-    }
     if state.iteration >= config.max_infer_iters {
         debug!(
             iteration = state.iteration,
