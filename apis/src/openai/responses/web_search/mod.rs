@@ -445,7 +445,6 @@ fn oversized_web_search_batch(ctx: &mut HttpFilterContext<'_>) -> Result<FilterA
         502,
         "server_error",
         MESSAGE,
-        false,
     )))
 }
 

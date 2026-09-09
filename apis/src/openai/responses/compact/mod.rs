@@ -183,7 +183,6 @@ impl CompactFilter {
         &self,
         state: &ResponsesState,
         params: &CompactionParams,
-        streaming: bool,
         conversation_text: &str,
     ) -> Result<Option<String>, FilterAction> {
         let model = params.compaction_model.as_deref().unwrap_or(&self.config.default_model);
@@ -199,42 +198,40 @@ impl CompactFilter {
             self.config.address_policy,
         )
         .await;
-        self.handle_subrequest_result(result, streaming)
+        self.handle_subrequest_result(result)
     }
 
     /// Map a subrequest result to a summary string or a filter action.
     fn handle_subrequest_result(
         &self,
         result: Result<subrequest::SubResponse, subrequest::SubRequestError>,
-        streaming: bool,
     ) -> Result<Option<String>, FilterAction> {
         match result {
             Ok(resp) if (200..300).contains(&(resp.status as usize)) => {
                 parse_summarization_response(&resp.body).map(Some).or_else(|e| {
                     warn!(error = %e, "failed to parse summarization response");
-                    self.on_callout_error("failed to parse summarization response", streaming)
+                    self.on_callout_error("failed to parse summarization response")
                 })
             },
             Ok(resp) => {
                 warn!(status = resp.status, "summarization callout returned non-2xx");
-                self.on_callout_error("summarization callout rejected", streaming)
+                self.on_callout_error("summarization callout rejected")
             },
             Err(e) => {
                 warn!(error = %e, "summarization callout failed");
-                self.on_callout_error("summarization callout failed", streaming)
+                self.on_callout_error("summarization callout failed")
             },
         }
     }
 
     /// Apply the configured open/closed policy on a callout error.
-    fn on_callout_error(&self, message: &str, streaming: bool) -> Result<Option<String>, FilterAction> {
+    fn on_callout_error(&self, message: &str) -> Result<Option<String>, FilterAction> {
         match self.config.callout.on_failure {
             OnFailure::Open => Ok(None),
             OnFailure::Closed => Err(FilterAction::Reject(responses_error_rejection(
                 self.config.callout.status_on_error,
                 "server_error",
                 message,
-                streaming,
             ))),
         }
     }
@@ -276,7 +273,6 @@ impl HttpFilter for CompactFilter {
         if !is_responses_request(ctx) {
             return Ok(FilterAction::Release);
         }
-        let streaming = is_streaming(ctx);
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Release);
         };
@@ -284,14 +280,14 @@ impl HttpFilter for CompactFilter {
             Ok(Some(pair)) => pair,
             Ok(None) => return Ok(FilterAction::Release),
             Err(msg) => {
-                let rej = responses_error_rejection(400, "invalid_request_error", &msg, streaming);
+                let rej = responses_error_rejection(400, "invalid_request_error", &msg);
                 return Ok(FilterAction::Reject(rej));
             },
         };
         if !state.history_rehydrated {
             return Ok(FilterAction::Release);
         }
-        let compaction = self.execute_compaction(state, &params, streaming, &conversation_text);
+        let compaction = self.execute_compaction(state, &params, &conversation_text);
         let summary = match compaction.await {
             Ok(Some(s)) => s,
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
@@ -380,12 +376,6 @@ fn build_context_overhead_text(state: &ResponsesState) -> String {
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
-}
-
-/// Check whether the client requested streaming.
-fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream")
-        .is_some_and(|v| v == "true")
 }
 
 /// Parse the `context_management` JSON to find a compaction config.

@@ -205,7 +205,6 @@ impl McpDispatchFilter {
             502,
             "server_error",
             MESSAGE,
-            false,
         )))
     }
 
@@ -230,7 +229,6 @@ impl McpDispatchFilter {
             502,
             "server_error",
             MESSAGE,
-            false,
         )))
     }
 
@@ -355,7 +353,6 @@ impl McpDispatchFilter {
             502,
             "server_error",
             MESSAGE,
-            false,
         )))
     }
 }
@@ -410,7 +407,6 @@ impl HttpFilter for McpDispatchFilter {
                 502,
                 "server_error",
                 "model response exceeded the configured MCP call limit",
-                false,
             )));
         }
         let mcp_calls = extract_mcp_tool_calls(&state.tool_calls, &state.mcp_tool_map);

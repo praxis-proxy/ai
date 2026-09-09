@@ -215,7 +215,6 @@ impl FileSearchCalloutFilter {
                 502,
                 "server_error",
                 "openai_file_search_callout: continuation output exceeds the JSON response byte limit",
-                false,
             )));
         }
         state
@@ -280,7 +279,6 @@ impl FileSearchCalloutFilter {
             502,
             "server_error",
             &format!("openai_file_search_callout: {}", failure.error),
-            false,
         )))
     }
 
@@ -401,7 +399,6 @@ impl FileSearchCalloutFilter {
                 502,
                 "server_error",
                 "openai_file_search_callout: accumulated output exceeds the JSON response byte limit",
-                false,
             )));
         }
         let completed_output = std::mem::take(state.output_items_mut());
@@ -758,7 +755,6 @@ fn continuation_state_rejection() -> FilterAction {
         413,
         "invalid_request_error",
         "openai_file_search_callout: continuation state exceeds max_state_bytes",
-        false,
     ))
 }
 
@@ -769,7 +765,6 @@ fn invalid_success_response_action(continued: bool) -> FilterAction {
             502,
             "server_error",
             "openai_file_search_callout: inference continuation returned an invalid response",
-            false,
         ))
     } else {
         FilterAction::Continue
@@ -803,7 +798,7 @@ fn finalize_public_response(state: &mut ResponsesState) -> Result<Bytes, FilterA
 
 /// Build a consistent failure while assembling a model's final response.
 fn final_response_rejection(message: &str) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(502, "server_error", message, false))
+    FilterAction::Reject(responses_error_rejection(502, "server_error", message))
 }
 
 /// Whether a model output requires a client-supplied function result.
@@ -819,7 +814,6 @@ fn mixed_tool_response_rejection() -> FilterAction {
         502,
         "server_error",
         "openai_file_search_callout: a model response cannot combine file_search_call with client-executed function_call",
-        false,
     ))
 }
 
@@ -1294,7 +1288,6 @@ fn unsupported_streaming_rejection(ctx: &HttpFilterContext<'_>) -> Option<Filter
             400,
             "invalid_request_error",
             "openai_file_search_callout: stream=true is not supported by an iterative file-search pipeline",
-            true,
         ))
     })
 }

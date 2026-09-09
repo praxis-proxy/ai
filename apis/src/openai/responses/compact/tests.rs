@@ -647,7 +647,7 @@ fn make_filter(on_failure: &str) -> CompactFilter {
 #[test]
 fn callout_error_open_mode_skips_compaction() {
     let filter = make_filter("open");
-    let result = filter.on_callout_error("something went wrong", false);
+    let result = filter.on_callout_error("something went wrong");
     assert!(result.is_ok());
     assert!(result.unwrap().is_none(), "open mode should skip compaction");
 }
@@ -655,7 +655,7 @@ fn callout_error_open_mode_skips_compaction() {
 #[test]
 fn callout_error_closed_mode_rejects_request() {
     let filter = make_filter("closed");
-    let result = filter.on_callout_error("something went wrong", false);
+    let result = filter.on_callout_error("something went wrong");
     assert!(result.is_err(), "closed mode should reject the request");
 }
 
@@ -665,7 +665,7 @@ fn parse_failure_open_mode_skips_compaction() {
     let bad_body = b"not valid json";
     let result = parse_summarization_response(bad_body)
         .map(Some)
-        .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
+        .or_else(|_| filter.on_callout_error("failed to parse summarization response"));
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
 }
@@ -676,7 +676,7 @@ fn parse_failure_closed_mode_rejects_request() {
     let bad_body = b"not valid json";
     let result = parse_summarization_response(bad_body)
         .map(Some)
-        .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
+        .or_else(|_| filter.on_callout_error("failed to parse summarization response"));
     assert!(result.is_err());
 }
 
@@ -692,7 +692,7 @@ fn non_2xx_response_open_mode_skips_compaction() {
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"service unavailable"),
     };
-    let result = filter.handle_subrequest_result(Ok(resp), false);
+    let result = filter.handle_subrequest_result(Ok(resp));
     assert!(result.is_ok());
     assert!(result.unwrap().is_none(), "open mode should skip compaction on non-2xx");
 }
@@ -705,7 +705,7 @@ fn non_2xx_response_closed_mode_rejects_request() {
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"rate limited"),
     };
-    let result = filter.handle_subrequest_result(Ok(resp), false);
+    let result = filter.handle_subrequest_result(Ok(resp));
     assert!(result.is_err(), "closed mode should reject on non-2xx");
 }
 

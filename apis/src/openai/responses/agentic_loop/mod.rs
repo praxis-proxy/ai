@@ -255,7 +255,6 @@ impl HttpFilter for AgenticLoopFilter {
                     "openai_agentic_loop with a streaming openai_responses_proxy sub-request requires \
                      openai_stream_events with logical_stream: true so loop-terminal errors can \
                      reach the client",
-                    true,
                 )));
             }
         }
@@ -386,7 +385,6 @@ fn reject_mixed_ownership_round(
         502,
         "server_error",
         MESSAGE,
-        false,
     )))
 }
 
@@ -500,7 +498,6 @@ fn end_at_iteration_limit(
         508,
         "server_error",
         "agentic loop iteration limit exceeded",
-        false,
     )))
 }
 

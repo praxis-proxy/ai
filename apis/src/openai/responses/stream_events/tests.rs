@@ -848,6 +848,33 @@ async fn logical_eos_without_terminal_emits_error() {
         eos.contains("event: error"),
         "a logical stream must explicitly terminate when upstream omits its terminal event: {eos}"
     );
+
+    let data = eos
+        .split("event: error\n")
+        .nth(1)
+        .and_then(|rest| rest.strip_prefix("data: "))
+        .and_then(|rest| rest.split('\n').next())
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(payload["type"], "error", "event type is always \"error\"");
+    assert_eq!(
+        payload["code"], "server_error",
+        "the caller-selected machine-readable code is preserved at the top level"
+    );
+    assert_eq!(
+        payload["message"], "upstream Responses stream did not terminate cleanly",
+        "message is a top-level field"
+    );
+    assert!(payload["param"].is_null(), "param is a top-level field");
+    assert!(
+        payload["sequence_number"].is_number(),
+        "sequence_number is a top-level field normalized to the stream position"
+    );
+    assert!(
+        payload.get("error").is_none(),
+        "a committed-stream SSE error event must not nest fields under an \"error\" object: {payload}"
+    );
+
     assert_eq!(
         ctx.get_metadata("responses.skip_persist"),
         Some("true"),

@@ -628,7 +628,7 @@ fn resolve_error_action(
         });
         return FilterAction::Continue;
     }
-    FilterAction::Reject(responses_error_rejection(status, error_type, &msg, streaming))
+    FilterAction::Reject(responses_error_rejection(status, error_type, &msg))
 }
 
 /// Compact descriptor of a deferred streaming `tools/list` runtime failure.

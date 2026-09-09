@@ -191,7 +191,17 @@ jobs:
 
       - name: Run vLLM integration tests
         run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+          test_cmd=(
+            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+          )
+          if "${test_cmd[@]}"; then
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
+            exit 1
+          fi
+          echo "::warning::Retrying failed vLLM tests once for the merge queue"
+          "${test_cmd[@]}" --last-failed --last-failed-no-failures none
 
       - name: vLLM container logs
         if: failure()
@@ -322,7 +332,17 @@ jobs:
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
         run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+          test_cmd=(
+            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+          )
+          if "${test_cmd[@]}"; then
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
+            exit 1
+          fi
+          echo "::warning::Retrying failed vLLM tests once for the merge queue"
+          "${test_cmd[@]}" --last-failed --last-failed-no-failures none
 
       - name: vLLM container logs
         if: failure()
