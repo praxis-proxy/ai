@@ -1,0 +1,141 @@
+name: OpenResponses Translation Conformance
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apis/src/openai/translation/**"
+      - "apis/src/openai/responses/**"
+      - "examples/configs/openai/responses/responses-to-chat-completions.yaml"
+      - "tests/conformance/openresponses/**"
+      - "tests/integration/sdk/openai/test_responses_conformance.py"
+      - ".github/actions/start-vllm/**"
+      - ".github/workflows/openresponses-conformance.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "apis/src/openai/translation/**"
+      - "apis/src/openai/responses/**"
+      - "examples/configs/openai/responses/responses-to-chat-completions.yaml"
+      - "tests/conformance/openresponses/**"
+      - "tests/integration/sdk/openai/test_responses_conformance.py"
+      - ".github/actions/start-vllm/**"
+      - ".github/workflows/openresponses-conformance.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
+  VLLM_MODEL: "Qwen/Qwen3-0.6B"
+
+jobs:
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Detect relevant path changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
+                                         "${{ github.event.merge_group.head_sha }}" -- \
+            'apis/src/openai/translation/' \
+            'apis/src/openai/responses/' \
+            'examples/configs/openai/responses/responses-to-chat-completions.yaml' \
+            'tests/conformance/openresponses/' \
+            'tests/integration/sdk/openai/test_responses_conformance.py' \
+            '.github/actions/start-vllm/' \
+            '.github/workflows/openresponses-conformance.yaml' \
+            'Cargo.toml' 'Cargo.lock' 'Makefile')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  conformance:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Install bun (pinned)
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            https://bun.sh/install | bash -s "bun-v1.3.12"
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Start vLLM
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.VLLM_MODEL }}
+
+      - name: Run OpenResponses conformance
+        env:
+          PRAXIS_AI_BIN: target/debug/praxis-ai
+          VLLM_BASE_URL: http://127.0.0.1:8000
+          OPENRESPONSES_SUITE_DIR: ${{ runner.temp }}/openresponses
+        run: |
+          mkdir -p "${{ runner.temp }}/openresponses"
+          set -o pipefail
+          make test-responses-conformance 2>&1 | tee "${{ runner.temp }}/openresponses/conformance.log"
+
+      - name: vLLM container logs
+        if: failure()
+        run: docker logs vllm
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: openresponses-conformance-logs
+          path: |
+            ${{ runner.temp }}/openresponses/**/*.log
+          if-no-files-found: ignore
+
+      - name: Stop vLLM
+        if: always()
+        run: docker rm -f vllm || true

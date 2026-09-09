@@ -15,6 +15,24 @@
 # cache write concept, such as OpenAI and Google, never set
 # token.cache_write.
 #
+# Reasoning / thinking tokens are reported as token.reasoning when the
+# provider sends them:
+#   - OpenAI / Azure Chat Completions:
+#     usage.completion_tokens_details.reasoning_tokens
+#     (a breakdown of token.output, not an addition)
+#   - OpenAI / Azure Responses API:
+#     usage.output_tokens_details.reasoning_tokens
+#     (a breakdown of token.output, not an addition)
+#   - Anthropic: usage.output_tokens_details.thinking_tokens
+#     (a breakdown of token.output; on streams, the final message_delta)
+#   - Google: usageMetadata.thoughtsTokenCount
+#     (separate from candidatesTokenCount / token.output; already in
+#     the provider total when totalTokenCount is present, otherwise
+#     included in the computed fallback total)
+#   - Bedrock Converse: not reported (no documented field)
+# An absent key means the provider did not report reasoning; a zero
+# means it reported none.
+#
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/token-counting.yaml
 #   curl http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'

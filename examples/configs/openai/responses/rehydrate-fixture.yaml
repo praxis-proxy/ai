@@ -1,0 +1,63 @@
+# Rehydrate Fixture (native Responses continuation)
+#
+# Minimal native OpenAI Responses pipeline that stores a first turn,
+# rehydrates a stored `previous_response_id` into the outbound `input`
+# history, and proxies to a native /v1/responses backend. Purpose-built
+# for offline inference-fixture replay (no external callout filters and no
+# iterative_request_router), so the replay harness can exercise the full
+# store -> rehydrate -> proxy path deterministically.
+#
+# Pipeline ordering:
+#   1. openai_responses_format   — classifies body, promotes metadata
+#   2. openai_responses_validate — parses JSON, enriches metadata, IDs
+#   3. openai_response_store     — initializes store, registers in ctx
+#   4. openai_responses_rehydrate — resolves previous_response_id into
+#      the message history and, on the response path, restores the
+#      caller's previous_response_id into the client body (issue #932)
+#   5. openai_responses_proxy    — rebuilds the outbound body from the
+#      resolved history and strips previous_response_id upstream
+#
+# The response_store filter must appear before openai_responses_rehydrate
+# so its store backend is registered in `ctx.response_stores` during
+# `on_request`.
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-rehydrate-fixture]
+
+filter_chains:
+  - name: responses-rehydrate-fixture
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+
+      - filter: openai_responses_validate
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: openai_responses_proxy
+        name: inference
+
+      - filter: router
+        routes:
+          - path_prefix: "/v1/responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

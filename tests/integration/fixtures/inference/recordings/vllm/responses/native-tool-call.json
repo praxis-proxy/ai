@@ -71,7 +71,7 @@
             "kind": "json",
             "value": {
               "background": false,
-              "created_at": "1970-01-01T00:00:00Z",
+              "created_at": 0,
               "ec_transfer_params": null,
               "frequency_penalty": 0.0,
               "id": "resp_recorded_0001",
@@ -209,7 +209,7 @@
             "kind": "json",
             "value": {
               "background": false,
-              "created_at": "1970-01-01T00:00:00Z",
+              "created_at": 0,
               "ec_transfer_params": null,
               "frequency_penalty": 0.0,
               "id": "resp_recorded_0001",

@@ -213,6 +213,9 @@ pub(crate) enum TranslationError {
         /// String field whose value had another JSON type.
         field: &'static str,
     },
+    /// A compaction item's `encrypted_content` is not valid base64 or UTF-8.
+    #[error("Responses compaction input item field `encrypted_content` {0}")]
+    InvalidCompactionContent(&'static str),
     /// A Responses message `content` field is neither a string nor an array of parts.
     #[error("Responses message input item field `content` must be a string or array of content parts")]
     InvalidMessageContent,
@@ -234,6 +237,9 @@ pub(crate) enum TranslationError {
     /// A Responses tool choice has no Chat Completions-compatible representation.
     #[error("unsupported Responses tool_choice type for Chat Completions translation: {0}")]
     UnsupportedToolChoiceType(String),
+    /// A successful Chat Completions response is missing required translation state.
+    #[error("invalid Chat Completions response: {0}")]
+    InvalidChatResponse(&'static str),
     /// A client function would be indistinguishable from synthesized web search.
     #[error("Responses function tool name `web_search` conflicts with the synthesized web_search function")]
     WebSearchFunctionNameCollision,
@@ -509,7 +515,7 @@ fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Tran
     match input_item_type(obj)? {
         Some("function_call_output") => append_tool_output(messages, obj)?,
         Some("message") => append_message_item(messages, obj)?,
-        Some("compaction") => append_compaction_item(messages, obj),
+        Some("compaction") => append_compaction_item(messages, obj)?,
         None if obj.contains_key("role") || obj.contains_key("content") => append_message_item(messages, obj)?,
         None => return Err(TranslationError::UnsupportedInputItemType("unknown".to_owned())),
         Some(input_type) => return Err(TranslationError::UnsupportedInputItemType(input_type.to_owned())),
@@ -547,20 +553,26 @@ fn append_message_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> R
 ///
 /// Uses assistant role (not system) to avoid elevating the summary's
 /// instruction priority — it is informational context, not instructions.
-fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
-    use base64::Engine as _;
-    let summary = obj
-        .get("encrypted_content")
-        .and_then(Value::as_str)
-        .and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_default();
+/// Empty decoded summaries are omitted; malformed content fails closed.
+fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    let encoded = required_input_item_string(obj, "compaction", "encrypted_content")?;
+    let summary = decode_compaction_summary(encoded)?;
     if !summary.is_empty() {
         messages.push(json!({
             "role": "assistant",
             "content": format!("[Previous conversation summary]\n\n{summary}")
         }));
     }
+    Ok(())
+}
+
+/// Decode compaction `encrypted_content` as standard base64 UTF-8 text.
+fn decode_compaction_summary(encoded: &str) -> Result<String, TranslationError> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_decode| TranslationError::InvalidCompactionContent("must be valid base64"))?;
+    String::from_utf8(bytes).map_err(|_utf8| TranslationError::InvalidCompactionContent("must be valid UTF-8"))
 }
 
 /// Convert one Responses function-call item to a Chat tool-call object.
@@ -1150,9 +1162,7 @@ pub(crate) fn chat_response_to_response_resource(
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Chat Completions response"))?;
 
-    let finish_reason = first_choice(obj)
-        .and_then(|choice| choice.get("finish_reason"))
-        .and_then(Value::as_str);
+    let finish_reason = validate_chat_response(obj)?;
     let status = response_status(finish_reason);
     let incomplete_details = incomplete_details(finish_reason);
     let output = build_output_items(obj, context, status)?;
@@ -1167,6 +1177,169 @@ pub(crate) fn chat_response_to_response_resource(
     };
 
     Ok(response_resource(context, parts))
+}
+
+/// Validate the minimum successful Chat Completions shape used by translation.
+fn validate_chat_response(obj: &Map<String, Value>) -> Result<&str, TranslationError> {
+    let choices = obj
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or(TranslationError::InvalidChatResponse("choices must be an array"))?;
+    let choice = choices
+        .first()
+        .and_then(Value::as_object)
+        .ok_or(TranslationError::InvalidChatResponse("choices must contain an object"))?;
+    let finish_reason =
+        choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .ok_or(TranslationError::InvalidChatResponse(
+                "first choice must contain a string finish_reason",
+            ))?;
+    if !matches!(finish_reason, "stop" | "length" | "tool_calls" | "content_filter") {
+        return Err(TranslationError::InvalidChatResponse(
+            "first choice contains an unsupported finish_reason",
+        ));
+    }
+
+    validate_chat_message(choice, finish_reason)?;
+    Ok(finish_reason)
+}
+
+/// Validate the assistant message fields that the translator consumes.
+fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Result<(), TranslationError> {
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or(TranslationError::InvalidChatResponse(
+            "first choice must contain a message object",
+        ))?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err(TranslationError::InvalidChatResponse(
+            "first choice message must have the assistant role",
+        ));
+    }
+
+    let has_content = validate_chat_content(message)?;
+    let has_refusal = validate_chat_refusal(message)?;
+    let has_tool_calls = validate_chat_tool_calls(message, finish_reason)?;
+    // A completed terminal must carry at least one translatable output; without
+    // one the translator would synthesize a counterfeit `completed` response with
+    // an empty output array. Incomplete terminals (length, content_filter)
+    // truthfully carry empty output, so they are exempt.
+    let has_output = has_content || has_refusal || has_tool_calls;
+    if response_status(finish_reason) == "completed" && !has_output {
+        return Err(TranslationError::InvalidChatResponse(
+            "first choice message has no supported output",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate optional assistant content and report whether it is present.
+///
+/// `null`, empty strings, and arrays that carry no non-empty text are all
+/// treated as absent, because the emitter produces no output for any of them.
+/// Counting them as content would let a completed terminal translate into a
+/// counterfeit success with an empty output array.
+fn validate_chat_content(message: &Map<String, Value>) -> Result<bool, TranslationError> {
+    match message.get("content") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(text)) => Ok(!text.is_empty()),
+        Some(Value::Array(parts)) if parts.iter().all(is_supported_text_part) => {
+            Ok(parts.iter().any(is_nonempty_text_part))
+        },
+        Some(_) => Err(TranslationError::InvalidChatResponse(
+            "first choice message contains unsupported content",
+        )),
+    }
+}
+
+/// Validate optional assistant refusal content and report whether it is present.
+///
+/// An empty refusal string is treated as absent to match the emitter, which
+/// drops it rather than producing a refusal item.
+fn validate_chat_refusal(message: &Map<String, Value>) -> Result<bool, TranslationError> {
+    match message.get("refusal") {
+        Some(Value::String(refusal)) => Ok(!refusal.is_empty()),
+        Some(Value::Null) | None => Ok(false),
+        Some(_) => Err(TranslationError::InvalidChatResponse(
+            "first choice message contains an invalid refusal",
+        )),
+    }
+}
+
+/// Return whether one provider-specific content part can be translated as text.
+fn is_supported_text_part(part: &Value) -> bool {
+    part.get("text").is_some_and(Value::is_string)
+}
+
+/// Return whether one content part carries non-empty text the emitter will keep.
+fn is_nonempty_text_part(part: &Value) -> bool {
+    part.get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+}
+
+/// Validate optional function calls and require them for a tool-call terminal.
+fn validate_chat_tool_calls(message: &Map<String, Value>, finish_reason: &str) -> Result<bool, TranslationError> {
+    let tool_calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(tool_calls)) => tool_calls.as_slice(),
+        Some(_) => {
+            return Err(TranslationError::InvalidChatResponse(
+                "message tool_calls must be an array",
+            ));
+        },
+    };
+    if tool_calls.is_empty() {
+        if finish_reason == "tool_calls" {
+            return Err(TranslationError::InvalidChatResponse(
+                "tool_calls finish_reason requires function tool calls",
+            ));
+        }
+        return Ok(false);
+    }
+    if !tool_calls.iter().all(is_supported_function_call) {
+        return Err(TranslationError::InvalidChatResponse(
+            "message contains an invalid function tool call",
+        ));
+    }
+    Ok(true)
+}
+
+/// Return whether one Chat Completions tool call has the fields we emit.
+fn is_supported_function_call(tool_call: &Value) -> bool {
+    tool_call.get("id").is_some_and(Value::is_string)
+        && tool_call.get("type").and_then(Value::as_str) == Some("function")
+        && tool_call
+            .get("function")
+            .and_then(Value::as_object)
+            .is_some_and(|function| {
+                function.get("name").is_some_and(Value::is_string)
+                    && function.get("arguments").is_some_and(Value::is_string)
+            })
+}
+
+/// Build an `in_progress` `Responses` resource snapshot for streaming lifecycle events.
+///
+/// Produces the same resource shape as the finite translation but with an empty
+/// output list, null usage, and `in_progress` status, matching the snapshot
+/// carried by `response.created` and `response.in_progress` streaming events.
+pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Value {
+    let service_tier = context
+        .service_tier
+        .filter(|value| value.is_string())
+        .cloned()
+        .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()));
+    let parts = ResponseResourceParts {
+        status: "in_progress",
+        incomplete_details: &Value::Null,
+        output: Vec::new(),
+        usage: &Value::Null,
+        service_tier: &service_tier,
+    };
+    response_resource(context, parts)
 }
 
 /// Values that vary between response resource snapshots.
@@ -1206,7 +1379,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "temperature": number_or_default(context.temperature, 1.0),
         "text": text_value(context),
         "tool_choice": tool_choice_value(context),
-        "tools": Value::Array(context.tools.to_vec()),
+        "tools": Value::Array(normalize_response_tools(context.tools)),
         "top_p": number_or_default(context.top_p, 1.0),
         // TODO(responses): preserve request truncation when the compatibility
         // layer supports truncation semantics instead of emitting the default.
@@ -1267,18 +1440,18 @@ fn chat_logprobs_content(choice: &Value) -> &[Value] {
 }
 
 /// Map a Chat Completions finish reason to a `Responses` status.
-fn response_status(finish_reason: Option<&str>) -> &'static str {
+fn response_status(finish_reason: &str) -> &'static str {
     match finish_reason {
-        Some("length" | "content_filter") => "incomplete",
+        "length" | "content_filter" => "incomplete",
         _ => "completed",
     }
 }
 
 /// Build `Responses` incomplete details from a Chat Completions finish reason.
-fn incomplete_details(finish_reason: Option<&str>) -> Value {
+fn incomplete_details(finish_reason: &str) -> Value {
     match finish_reason {
-        Some("length") => json!({"reason": "max_output_tokens"}),
-        Some("content_filter") => json!({"reason": "content_filter"}),
+        "length" => json!({"reason": "max_output_tokens"}),
+        "content_filter" => json!({"reason": "content_filter"}),
         _ => Value::Null,
     }
 }
@@ -1305,11 +1478,16 @@ fn max_tool_calls_value(context: &ResponseContext<'_>) -> Value {
 }
 
 /// Build the `completed_at` response field.
+///
+/// Only a `completed` response carries a completion timestamp. Every other
+/// status — `in_progress`, `incomplete`, `failed`, `cancelled` — has no
+/// completion moment, so `completed_at` is null, matching the OpenAI Responses
+/// schema where the field is populated only when the response actually completed.
 fn completed_at_value(status: &str, context: &ResponseContext<'_>) -> Value {
-    if status == "in_progress" {
-        Value::Null
-    } else {
+    if status == "completed" {
         Value::Number(context.completed_at.unwrap_or(context.created_at).into())
+    } else {
+        Value::Null
     }
 }
 
@@ -1347,11 +1525,34 @@ fn text_value(context: &ResponseContext<'_>) -> Value {
     context.text.cloned().unwrap_or_else(default_text_config)
 }
 
+/// Normalize echoed request tools to the Responses response-side tool schema.
+///
+/// The Responses request accepts a compact function-tool shape
+/// (`{"type":"function","name":...}`); the response resource must echo the
+/// canonical schema with `description`, `parameters`, and `strict` present.
+/// Non-function tools (e.g. hosted `web_search`) are echoed unchanged.
+fn normalize_response_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| match tool.as_object() {
+            Some(obj) if tool.get("type").and_then(Value::as_str) == Some("function") => {
+                let mut normalized = obj.clone();
+                normalized.entry("description").or_insert(Value::Null);
+                normalized.entry("parameters").or_insert(Value::Null);
+                normalized.entry("strict").or_insert(Value::Bool(false));
+                Value::Object(normalized)
+            },
+            _ => tool.clone(),
+        })
+        .collect()
+}
+
 /// Build provider service tier, falling back to the request context when absent.
 fn service_tier_value_with_context(obj: &Map<String, Value>, context: &ResponseContext<'_>) -> Value {
     obj.get("service_tier")
+        .filter(|value| value.is_string())
+        .or_else(|| context.service_tier.filter(|value| value.is_string()))
         .cloned()
-        .or_else(|| context.service_tier.cloned())
         .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()))
 }
 
@@ -1405,12 +1606,12 @@ fn append_message_output(
 }
 
 /// Build a stable assistant message output item id.
-fn message_item_id(context: &ResponseContext<'_>) -> String {
+pub(crate) fn message_item_id(context: &ResponseContext<'_>) -> String {
     format!("msg_{}", context.response_id)
 }
 
 /// Build a schema-complete `Responses` assistant message item.
-fn message_output_item(context: &ResponseContext<'_>, status: &str, content: Vec<Value>) -> Value {
+pub(crate) fn message_output_item(context: &ResponseContext<'_>, status: &str, content: Vec<Value>) -> Value {
     json!({
         "id": message_item_id(context),
         "type": "message",
@@ -1467,7 +1668,7 @@ fn output_text_items_from_parts(parts: &[Value], logprobs: &[Value]) -> Vec<Valu
 }
 
 /// Build a single schema-complete `Responses` output text item.
-fn output_text_item(text: &str, logprobs: &[Value]) -> Value {
+pub(crate) fn output_text_item(text: &str, logprobs: &[Value]) -> Value {
     json!({
         "type": "output_text",
         "text": text,
@@ -1477,7 +1678,7 @@ fn output_text_item(text: &str, logprobs: &[Value]) -> Value {
 }
 
 /// Build a single `Responses` refusal content item.
-fn refusal_item(refusal: &str) -> Value {
+pub(crate) fn refusal_item(refusal: &str) -> Value {
     json!({
         "type": "refusal",
         "refusal": refusal
@@ -1509,7 +1710,7 @@ fn append_tool_call_outputs(
 }
 
 /// Return whether the original request declared hosted web search.
-fn context_has_web_search(context: &ResponseContext<'_>) -> bool {
+pub(crate) fn context_has_web_search(context: &ResponseContext<'_>) -> bool {
     context.tools.iter().any(|tool| {
         tool.get("type")
             .and_then(Value::as_str)
@@ -1535,7 +1736,24 @@ fn web_search_call_output_item(tool_call: &Value, status: &str) -> Result<Value,
         .ok_or(TranslationError::InvalidWebSearchCall(
             "arguments must be a JSON object encoded as a string",
         ))?;
+    web_search_call_output_item_from_parts(call_id, arguments, status)
+}
+
+/// Build one canonical hosted web-search output item from normalized parts.
+pub(crate) fn web_search_call_output_item_from_parts(
+    call_id: &str,
+    arguments: &str,
+    status: &str,
+) -> Result<Value, TranslationError> {
+    if call_id.is_empty() {
+        return Err(TranslationError::InvalidWebSearchCall("missing call id"));
+    }
     let query = web_search_query(arguments)?;
+    // The response can be incomplete because generation hit a token or content
+    // filter limit, but WebSearchToolCall has no `incomplete` item status.
+    // Preserve the response-level status and represent the interrupted hosted
+    // call with the schema's fail-closed `failed` status.
+    let status = if status == "incomplete" { "failed" } else { status };
 
     Ok(json!({
         "id": call_id,
@@ -1599,7 +1817,7 @@ fn function_call_output_item(tool_call: &Value, status: &str) -> Value {
 }
 
 /// Build one `Responses` function call item from normalized parts.
-fn function_call_output_item_from_parts(call_id: &str, name: &str, arguments: &str, status: &str) -> Value {
+pub(crate) fn function_call_output_item_from_parts(call_id: &str, name: &str, arguments: &str, status: &str) -> Value {
     json!({
         "id": format!("fc_{call_id}"),
         "type": "function_call",

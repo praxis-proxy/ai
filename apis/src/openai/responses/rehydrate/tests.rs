@@ -1769,6 +1769,925 @@ async fn allows_conversation_history_within_limits() {
 }
 
 // -----------------------------------------------------------------------------
+// Response-side previous_response_id restore (issue #932)
+// -----------------------------------------------------------------------------
+
+/// A rehydrated state carrying the caller's `previous_response_id`.
+fn rehydrated_state(prev_id: &str) -> ResponsesState {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "What next?",
+        "previous_response_id": prev_id,
+    }));
+    state.history_rehydrated = true;
+    state
+}
+
+/// A 200 response with a JSON content type.
+fn json_ok_response() -> praxis_filter::Response {
+    let mut response = crate::test_utils::make_response();
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+#[tokio::test]
+async fn restores_previous_response_id_into_response_body() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("74"));
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        ctx.response_headers_modified,
+        "framing headers change should be signalled"
+    );
+    assert!(
+        ctx.response_header
+            .as_ref()
+            .is_some_and(|resp| !resp.headers.contains_key(http::header::CONTENT_LENGTH)),
+        "Content-Length must be dropped so core reframes the rewritten body"
+    );
+
+    let mut body = Some(Bytes::from(
+        r#"{"id":"resp_new","object":"response","status":"completed","previous_response_id":null}"#,
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+
+    let patched: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        patched["previous_response_id"], "resp_prev",
+        "caller previous_response_id should be restored"
+    );
+    assert_eq!(patched["id"], "resp_new", "other response fields should be preserved");
+    assert_eq!(patched["status"], "completed", "status should be preserved");
+}
+
+#[tokio::test]
+async fn does_not_restore_without_rehydration() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    // No ResponsesState in extensions: a plain first-turn request.
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response should continue without arming a restore when no state was rehydrated"
+    );
+    assert!(
+        !ctx.response_headers_modified,
+        "headers should be untouched when nothing was rehydrated"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue without a rewrite when nothing was armed"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "body should pass through untouched"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_conversation_continuation() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    // Conversation-based continuation rehydrates history but carries no
+    // previous_response_id, so the null echo is correct and must stay.
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "What next?",
+        "conversation": "conv_abc",
+    }));
+    state.history_rehydrated = true;
+    ctx.extensions.insert(state);
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response should continue without arming a restore for a conversation continuation"
+    );
+    assert!(
+        !ctx.response_headers_modified,
+        "conversation continuation should not rewrite the response"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue without a rewrite for a conversation continuation"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "conversation continuation should leave previous_response_id null"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_non_success_status() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    response.status = http::StatusCode::BAD_REQUEST;
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response should continue without arming a restore for a non-success status"
+    );
+    assert!(!ctx.response_headers_modified, "error responses must not be rewritten");
+
+    let original = r#"{"error":{"message":"bad request"}}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue without a rewrite for an error response"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "error body should pass through untouched"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_streaming_response() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = crate::test_utils::make_response();
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response should continue without arming a restore for an SSE response"
+    );
+    assert!(
+        !ctx.response_headers_modified,
+        "SSE responses must be left as a passthrough stream"
+    );
+
+    let original = "event: response.created\ndata: {}\n\n";
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue without a rewrite for an SSE response"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "SSE body should pass through untouched"
+    );
+}
+
+#[tokio::test]
+async fn does_not_rewrite_non_response_json_shape() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response should continue and arm the restore for an eligible 2xx JSON response"
+    );
+
+    // A 2xx JSON body that is not a Responses resource must be left alone.
+    let original = r#"{"object":"list","data":[]}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue without a rewrite for a non-response JSON shape"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "non-response JSON should not gain a previous_response_id"
+    );
+}
+
+#[tokio::test]
+async fn ignores_non_end_of_stream_chunks() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    // Arm the restore so this exercises the end-of-stream guard, not the
+    // unarmed path.
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response should continue and arm the restore before the body phase"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue without a rewrite for a non-terminal chunk"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "partial chunk should be left untouched until end-of-stream"
+    );
+}
+
+#[test]
+fn response_body_access_is_read_write() {
+    let filter = default_filter();
+    assert_eq!(
+        filter.response_body_access(),
+        BodyAccess::ReadWrite,
+        "response phase must be able to rewrite the body"
+    );
+    assert_eq!(
+        filter.response_body_mode(),
+        BodyMode::Stream,
+        "response defaults to streaming; buffering is selected dynamically"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_encoded_response() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("64"));
+    // A backend that honored the client's Accept-Encoding returns a compressed
+    // body. The restore step parses the body as JSON, which a compressed body
+    // is not, so the response must be declined and passed through with its
+    // framing headers intact — never stripped and shipped as mislabeled
+    // identity JSON (issue #932 encoded-response corruption).
+    response
+        .headers
+        .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response should continue without arming a restore for an encoded response"
+    );
+    assert!(
+        !ctx.response_headers_modified,
+        "an encoded response must be left as an untouched passthrough"
+    );
+    assert!(
+        ctx.response_header
+            .as_ref()
+            .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_ENCODING)),
+        "Content-Encoding must be preserved so the client can still decode the body"
+    );
+    assert!(
+        ctx.response_header
+            .as_ref()
+            .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_LENGTH)),
+        "Content-Length must be preserved for an untouched passthrough"
+    );
+
+    // Valid JSON so a rewrite WOULD change it: proves the decline, not merely an
+    // unparseable body, prevented the restore.
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue without a rewrite for an encoded response"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "an encoded body must pass through byte-for-byte with no restore attempt"
+    );
+}
+
+#[tokio::test]
+async fn declines_identity_content_encoding_conservatively() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    // `Content-Encoding: identity` means "no coding", but the presence-based
+    // guard declines it anyway to match the sibling stream_events filters. The
+    // only cost is that the previous_response_id echo is not restored for this
+    // (RFC 9110-discouraged) response shape; the body is never corrupted.
+    response.headers.insert(
+        http::header::CONTENT_ENCODING,
+        http::HeaderValue::from_static("identity"),
+    );
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a Content-Encoding: identity response is declined by the presence-based guard"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a declined identity response passes through unchanged"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_when_content_type_missing() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    // No Content-Type header at all.
+    let mut response = crate::test_utils::make_response();
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a response without a Content-Type must not be treated as JSON"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a response without a Content-Type passes through unchanged"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_non_json_content_type() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = crate::test_utils::make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/plain"));
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a non-JSON content type must not be rewritten"
+    );
+
+    let original = "plain text body";
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a non-JSON body passes through unchanged"
+    );
+}
+
+#[tokio::test]
+async fn restores_for_json_content_type_with_charset_parameter() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = crate::test_utils::make_response();
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        ctx.response_headers_modified,
+        "a JSON content type with a charset parameter is still eligible"
+    );
+
+    let mut body = Some(Bytes::from(
+        r#"{"id":"resp_new","object":"response","previous_response_id":null}"#,
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    let patched: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        patched["previous_response_id"], "resp_prev",
+        "charset-parameterized JSON should still have previous_response_id restored"
+    );
+}
+
+#[tokio::test]
+async fn restores_for_uppercase_json_content_type() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = crate::test_utils::make_response();
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("APPLICATION/JSON"),
+    );
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        ctx.response_headers_modified,
+        "content-type matching must be case-insensitive"
+    );
+
+    let mut body = Some(Bytes::from(
+        r#"{"id":"resp_new","object":"response","previous_response_id":null}"#,
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    let patched: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        patched["previous_response_id"], "resp_prev",
+        "uppercase application/json should still have previous_response_id restored"
+    );
+}
+
+#[tokio::test]
+async fn declines_and_preserves_response_body_validators() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    // Validators and integrity digests describe the exact upstream bytes; they
+    // would be invalidated the moment the body is re-serialized with the caller's
+    // previous_response_id. The proxy cannot recompute them from the body phase
+    // (headers are already committed) so it declines the response entirely at
+    // eligibility rather than stripping them and shipping a mismatched body — the
+    // response passes through byte-identical with every validator intact.
+    response
+        .headers
+        .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("65"));
+    response
+        .headers
+        .insert(http::header::ETAG, http::HeaderValue::from_static("\"abc123\""));
+    response.headers.insert(
+        http::header::LAST_MODIFIED,
+        http::HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+    );
+    response.headers.insert(
+        "content-md5",
+        http::HeaderValue::from_static("Q2hlY2sgSW50ZWdyaXR5IQ=="),
+    );
+    response.headers.insert(
+        "digest",
+        http::HeaderValue::from_static("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE="),
+    );
+    response.headers.insert(
+        "content-digest",
+        http::HeaderValue::from_static("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
+    );
+    response.headers.insert(
+        "repr-digest",
+        http::HeaderValue::from_static("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
+    );
+    // Unrelated metadata that must also survive the untouched passthrough.
+    response
+        .headers
+        .insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
+    response
+        .headers
+        .insert("x-request-id", http::HeaderValue::from_static("req_trace_123"));
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a validator-bearing response must be an untouched passthrough"
+    );
+
+    let headers = &ctx
+        .response_header
+        .as_ref()
+        .expect("response header should still be present")
+        .headers;
+    for preserved in [
+        http::header::CONTENT_LENGTH.as_str(),
+        http::header::ETAG.as_str(),
+        http::header::LAST_MODIFIED.as_str(),
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+    ] {
+        assert!(
+            headers.contains_key(preserved),
+            "declined response must keep its body validator {preserved} intact"
+        );
+    }
+    assert_eq!(
+        headers.get(http::header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "caching-policy headers must be preserved"
+    );
+    assert_eq!(
+        headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "content-type must be preserved"
+    );
+    assert_eq!(
+        headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+        Some("req_trace_123"),
+        "routing/tracing headers must be preserved"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a validator-bearing response passes through byte-identical (id not restored)"
+    );
+}
+
+/// Each body validator / integrity digest must decline the restore on its own.
+/// The aggregate test above stays green as long as *any* validator is still
+/// checked, so this per-header sweep guards against a refactor that silently
+/// drops a single entry from `describes_exact_upstream_bytes` (which would let a
+/// response bearing only that header be rewritten and ship a stale validator —
+/// the exact issue #932 regression).
+#[tokio::test]
+async fn each_body_validator_alone_declines_restore() {
+    for (name, value) in [
+        ("etag", "\"abc123\""),
+        ("last-modified", "Wed, 21 Oct 2026 07:28:00 GMT"),
+        ("content-md5", "Q2hlY2sgSW50ZWdyaXR5IQ=="),
+        ("digest", "sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE="),
+        (
+            "content-digest",
+            "sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:",
+        ),
+        ("repr-digest", "sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:"),
+    ] {
+        assert_single_validator_declines(name, value).await;
+    }
+}
+
+/// Drive `on_response` + `on_response_body` for a `200 OK` JSON response carrying
+/// exactly one validator header and assert it is declined: not modified, the
+/// validator preserved, and the body passed through byte-identical.
+async fn assert_single_validator_declines(name: &'static str, value: &'static str) {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    response.headers.insert(name, http::HeaderValue::from_static(value));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let _action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        !ctx.response_headers_modified,
+        "a response carrying only {name} must be declined (untouched passthrough)"
+    );
+    assert!(
+        ctx.response_header
+            .as_ref()
+            .is_some_and(|resp| resp.headers.contains_key(name)),
+        "the sole validator {name} must be preserved on the declined response"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let _action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a response carrying only {name} passes through byte-identical (id not restored)"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_partial_content_status() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    response.status = http::StatusCode::PARTIAL_CONTENT;
+    // A `206 Partial Content` body is a fragment of a larger representation and
+    // carries a `Content-Range`; rewriting it would be unsound.
+    response.headers.insert(
+        http::header::CONTENT_RANGE,
+        http::HeaderValue::from_static("bytes 0-31/64"),
+    );
+    response
+        .headers
+        .insert(http::header::ETAG, http::HeaderValue::from_static("\"partial\""));
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a partial (ranged) response must be an untouched passthrough"
+    );
+    assert!(
+        ctx.response_header
+            .as_ref()
+            .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_RANGE)
+                && resp.headers.contains_key(http::header::ETAG)),
+        "a declined partial response must keep its Content-Range and validators"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a partial response passes through unchanged"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_content_range_on_ok() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    // Even on a `200 OK`, a `Content-Range` marks the body as a partial
+    // representation; the presence-based guard declines it independently of the
+    // status narrowing.
+    response.headers.insert(
+        http::header::CONTENT_RANGE,
+        http::HeaderValue::from_static("bytes 0-31/64"),
+    );
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a Content-Range response must be declined regardless of status"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a ranged 200 response passes through unchanged"
+    );
+}
+
+#[tokio::test]
+async fn does_not_restore_for_non_ok_success_status() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut response = json_ok_response();
+    // A 2xx that is not `200 OK` (here a background `202 Accepted` handoff) is
+    // not a complete Responses resource to rewrite and must pass through.
+    response.status = http::StatusCode::ACCEPTED;
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(rehydrated_state("resp_prev"));
+    ctx.response_header = Some(&mut response);
+
+    let action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "on_response should continue");
+    assert!(
+        !ctx.response_headers_modified,
+        "a non-200 success response must not be rewritten"
+    );
+
+    let original = r#"{"id":"resp_new","object":"response","previous_response_id":null}"#;
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_response_body should continue"
+    );
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original.as_bytes(),
+        "a 202 Accepted body passes through unchanged"
+    );
+}
+
+#[test]
+fn restore_ignores_absent_body() {
+    let mut body: Option<Bytes> = None;
+    restore_previous_response_id("resp_prev".to_owned(), &mut body);
+    assert!(body.is_none(), "an absent body must stay absent");
+}
+
+#[test]
+fn restore_ignores_empty_body() {
+    let mut body = Some(Bytes::new());
+    restore_previous_response_id("resp_prev".to_owned(), &mut body);
+    assert!(
+        body.as_ref().unwrap().is_empty(),
+        "an empty body must be left unchanged"
+    );
+}
+
+#[test]
+fn restore_ignores_malformed_json() {
+    let original: &[u8] = b"{not valid json";
+    let mut body = Some(Bytes::from_static(original));
+    restore_previous_response_id("resp_prev".to_owned(), &mut body);
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original,
+        "a malformed JSON body must pass through unchanged"
+    );
+}
+
+#[test]
+fn restore_ignores_json_array() {
+    let original: &[u8] = b"[1,2,3]";
+    let mut body = Some(Bytes::from_static(original));
+    restore_previous_response_id("resp_prev".to_owned(), &mut body);
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original,
+        "a JSON array must pass through unchanged"
+    );
+}
+
+#[test]
+fn restore_ignores_json_scalar() {
+    let original: &[u8] = b"42";
+    let mut body = Some(Bytes::from_static(original));
+    restore_previous_response_id("resp_prev".to_owned(), &mut body);
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original,
+        "a JSON scalar must pass through unchanged"
+    );
+}
+
+#[test]
+fn restore_ignores_non_response_object() {
+    let original: &[u8] = br#"{"object":"list","data":[]}"#;
+    let mut body = Some(Bytes::from_static(original));
+    restore_previous_response_id("resp_prev".to_owned(), &mut body);
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        original,
+        "a JSON object that is not a Responses resource must pass through unchanged"
+    );
+}
+
+#[test]
+fn restore_inserts_previous_response_id_when_field_absent() {
+    let mut body = Some(Bytes::from_static(br#"{"id":"resp_new","object":"response"}"#));
+    restore_previous_response_id("resp_prev".to_owned(), &mut body);
+    let patched: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        patched["previous_response_id"], "resp_prev",
+        "a Responses resource missing the field should gain it"
+    );
+    assert_eq!(patched["id"], "resp_new", "other fields must be preserved");
+}
+
+#[test]
+fn restore_replaces_null_previous_response_id() {
+    let mut body = Some(Bytes::from_static(
+        br#"{"id":"resp_new","object":"response","previous_response_id":null}"#,
+    ));
+    restore_previous_response_id("resp_prev".to_owned(), &mut body);
+    let patched: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        patched["previous_response_id"], "resp_prev",
+        "a null previous_response_id must be replaced with the caller's id"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 

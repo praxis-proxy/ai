@@ -3427,7 +3427,7 @@ async fn on_response_body_appends_completed_response() {
         "content": "hello from append"
     })];
     ctx.extensions.insert(ResponsesState {
-        input: input_items,
+        input: input_items.clone(),
         ..ResponsesState::default()
     });
 
@@ -3446,6 +3446,13 @@ async fn on_response_body_appends_completed_response() {
     let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .map(|state| state.input.as_slice()),
+        Some(input_items.as_slice()),
+        "append-back must clone ResponsesState.input without taking or clearing it"
+    );
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
     let mut ctx = make_filter_context(&req);
@@ -3457,6 +3464,22 @@ async fn on_response_body_appends_completed_response() {
     let resp = rejection_body(&rejection);
     let items = resp["data"].as_array().unwrap();
     assert_eq!(items.len(), 2, "append-back should persist both input and output items");
+    assert_eq!(
+        items[0]["role"], "user",
+        "request input items must be persisted before response output"
+    );
+    assert_eq!(
+        items[0]["content"][0]["text"], "hello from append",
+        "original request input text must be unchanged"
+    );
+    assert_eq!(
+        items[1]["role"], "assistant",
+        "response output items must follow request input"
+    );
+    assert_eq!(
+        items[1]["content"][0]["text"], "hi from model",
+        "moved response output text must be unchanged"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

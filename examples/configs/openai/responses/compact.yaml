@@ -1,7 +1,14 @@
 # Compact Filter Example
 #
-# Demonstrates the compaction flow: store a response, rehydrate it
-# on the next turn, and count tokens to check if compaction is needed.
+# Demonstrates compaction after rehydrate, file resolve, and document
+# extract so rewritten current-turn content survives history
+# replacement. Store a response, rehydrate it on the next turn, and
+# summarize when the token count exceeds the compact threshold.
+#
+# Pipeline order is required: file_resolve and doc_extract rewrite the
+# current-turn tail in place and leave `state.input` as the original
+# client payload. Compact preserves that rewritten tail rather than
+# restoring `file_url` or `input_file`.
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer
@@ -24,6 +31,11 @@
 #   curl -s -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d "{\"model\":\"llama3.2:1b\",\"input\":\"Compare with QUIC\",\"previous_response_id\":\"$RESP_ID\",\"context_management\":[{\"type\":\"compaction\",\"compact_threshold\":1000}],\"store\":false}"
+#
+#   # Step 3 — compact a follow-up that includes a file_url (needs a
+#   # Files API on 127.0.0.1:9999 only for file_id; file_url is fetched
+#   # directly). The upstream body must contain resolved file_data or
+#   # extracted input_text, never the original file_url.
 
 listeners:
   - name: ai-gateway
@@ -54,6 +66,20 @@ filter_chains:
       - filter: openai_stream_events
 
       - filter: openai_responses_rehydrate
+
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:9999"
+        allow_private_files_api_url: true
+        allow_pre_security_callout: true
+        file_url: resolve
+        forward_headers:
+          - authorization
+        on_missing: reject
+        timeout_ms: 10000
+
+      - filter: openai_doc_extract
+        allow_pre_security_callout: true
+        on_unsupported: continue
 
       - filter: openai_responses_compact
         # This direct summarization callout is anonymous; no downstream or

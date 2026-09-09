@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "scenario_id": "responses/chat-malformed-compaction",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-malformed-compaction-model",
+    "source_id": "controlled-malformed-compaction-base64"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "encrypted_content": "%%%not-base64%%%",
+                  "id": "compact_1",
+                  "type": "compaction"
+                },
+                {
+                  "content": "What did we decide?",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-malformed-compaction-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "Responses compaction input item field `encrypted_content` must be valid base64",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    }
+  ]
+}

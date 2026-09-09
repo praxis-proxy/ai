@@ -201,7 +201,7 @@ struct ResolutionRequest<'a> {
     /// Files API client.
     client: &'a FilesApiClient,
     /// Reference source (file ID or file URL).
-    source: ReferenceSource,
+    source: &'a ReferenceSource,
     /// Maximum resolved bytes remaining for this item collection.
     max_resolved_bytes: usize,
     /// Responses content part type.
@@ -264,7 +264,7 @@ impl ResolutionBudget {
         self.register_reference()?;
 
         let resolution = tokio::time::timeout_at(self.deadline, async {
-            match &source {
+            match source {
                 ReferenceSource::FileId(file_id) => {
                     client
                         .resolve_file(file_id, request_headers, max_resolved_bytes, part_type)
@@ -282,7 +282,7 @@ impl ResolutionBudget {
             }
         })
         .await
-        .unwrap_or_else(|_elapsed| overall_timeout_error_for_source(&source));
+        .unwrap_or_else(|_elapsed| overall_timeout_error_for_source(source));
 
         // Retain one owned outcome for repeated references while
         // returning an independently owned value to the JSON part.
@@ -652,7 +652,7 @@ async fn resolve_reference(
         .budget
         .resolve(ResolutionRequest {
             client: resolver.client,
-            source: source.clone(),
+            source,
             max_resolved_bytes: remaining_resolved_bytes,
             part_type,
             request_headers: resolver.request_headers,

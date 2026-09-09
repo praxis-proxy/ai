@@ -16,6 +16,7 @@ use crate::openai::responses::body_limits::validate_size_limit;
 ///
 /// ```yaml
 /// filter: openai_responses_proxy
+/// max_rewritten_body_bytes: 10485760
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

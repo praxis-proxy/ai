@@ -1,0 +1,61 @@
+version: 1
+id: responses/native-continuation
+description: >-
+  Native OpenAI Responses continuation. The stored first turn is rehydrated
+  into the outbound history and previous_response_id is stripped from the
+  upstream request, while the caller's previous_response_id is restored into
+  the client response (issue #932).
+protocol: openai_responses
+example_config: openai/responses/rehydrate-fixture.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.native.continuation
+# Live vLLM regression counterpart, deliberately not committed as a recording
+# per the live-recording authorization policy (see README "Coverage and
+# provenance"): SDK test test_rehydrated_response_echoes_previous_response_id in
+# tests/integration/sdk/openai/test_openai_responses_vllm.py. This scenario's
+# committed evidence stays synthetic_only.
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: What is 2+2? Reply with just the number.
+          store: true
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: continuation
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: What was the previous answer? Reply with just the number.
+          previous_response_id: ${PREVIOUS_RESPONSE_ID}
+          store: false
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

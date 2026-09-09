@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/anthropics/anthropic-sdk-python",
+  "revision": "1de1957334e7491979ddb21a1d673fa4e56d5459",
+  "path": "scripts/mock-spec.json.gz",
+  "encoding": "gzip",
+  "source_sha256": "611ba1c5e8b50f4d069ebc5063af440b72d12fd47fee46d1628bfa507460191c",
+  "vendored_file": "anthropic-spec.json",
+  "vendored_sha256": "cad4307479def34a9e28935a84eb6266585ac1341d8cccaa109cff901cff1773",
+  "note": "anthropic-spec.json is the verbatim gunzip of the pinned upstream scripts/mock-spec.json.gz (the mock-server OpenAPI document bundled in anthropic-sdk-python). source_sha256 verifies the upstream gzip; vendored_sha256 verifies the decompressed JSON checked in here. Refresh: curl -fsSL https://raw.githubusercontent.com/anthropics/anthropic-sdk-python/<revision>/scripts/mock-spec.json.gz | gunzip > anthropic-spec.json, then update revision and both digests."
+}

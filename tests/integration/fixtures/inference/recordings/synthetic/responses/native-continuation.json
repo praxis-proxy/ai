@@ -1,0 +1,402 @@
+{
+  "version": 1,
+  "scenario_id": "responses/native-continuation",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-native-model",
+    "source_id": "controlled-responses-native-continuation"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_native_controlled_initial": "msg_recorded_0002",
+      "msg_native_controlled_continuation": "msg_recorded_0004",
+      "resp_native_controlled_initial": "resp_recorded_0001",
+      "resp_native_controlled_continuation": "resp_recorded_0003"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is 2+2? Reply with just the number.",
+              "model": "synthetic-native-model",
+              "store": true,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "What is 2+2? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "metadata": {},
+              "model": "synthetic-native-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "previous_response_id": null,
+              "reasoning": null,
+              "status": "completed",
+              "store": true,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is 2+2? Reply with just the number.",
+              "model": "synthetic-native-model",
+              "store": true,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "What is 2+2? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "metadata": {},
+              "model": "synthetic-native-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "previous_response_id": null,
+              "reasoning": null,
+              "status": "completed",
+              "store": true,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "continuation",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What was the previous answer? Reply with just the number.",
+              "model": "synthetic-native-model",
+              "previous_response_id": "resp_recorded_0001",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "id": "resp_recorded_0003",
+              "incomplete_details": null,
+              "input": "What was the previous answer? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "metadata": {},
+              "model": "synthetic-native-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0004",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "previous_response_id": "resp_recorded_0001",
+              "reasoning": null,
+              "status": "completed",
+              "store": false,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 28,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 29
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user",
+                  "type": "message"
+                },
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                },
+                {
+                  "content": "What was the previous answer? Reply with just the number.",
+                  "role": "user",
+                  "type": "message"
+                }
+              ],
+              "model": "synthetic-native-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "id": "resp_recorded_0003",
+              "incomplete_details": null,
+              "input": "What was the previous answer? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "metadata": {},
+              "model": "synthetic-native-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0004",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "previous_response_id": null,
+              "reasoning": null,
+              "status": "completed",
+              "store": false,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 28,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 29
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

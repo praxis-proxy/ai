@@ -37,6 +37,12 @@ const MAX_STRUCTURED_JSON_TEXT_BYTES: usize = MAX_SCRIPTED_RESPONSE_BODY_BYTES *
 /// Maximum object/array nesting inspected before Serde's recursion ceiling.
 const MAX_STRUCTURED_JSON_CONTAINER_DEPTH: usize = 64;
 
+/// Stable placeholder for string-typed timestamp fields (e.g. an ISO-8601
+/// `created_at`). Numeric timestamps normalize to `0`; string timestamps
+/// normalize to this fixed RFC-3339 value so the sanitized field keeps its
+/// original JSON type. Epoch-zero mirrors the numeric `0` placeholder.
+const NORMALIZED_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
+
 /// Redacts sensitive fixture data and deterministically normalizes dynamic values.
 ///
 /// A single identifier mapping is shared by every client and upstream exchange,
@@ -499,12 +505,17 @@ impl<'a> Sanitizer<'a> {
                 continue;
             }
             self.path.push_opaque_key();
-            if key == "created" {
-                nested_value = Value::from(0);
-            } else if key == "created_at" {
-                nested_value = Value::from("1970-01-01T00:00:00Z");
-            } else if key == "completed_at" && !nested_value.is_null() {
-                nested_value = Value::from(0);
+            if key == "created" || key == "created_at" || key == "completed_at" {
+                // Normalize dynamic timestamps deterministically while preserving
+                // their JSON type. `created`/`created_at` are Unix-timestamp
+                // integers in the OpenAI Responses/Chat APIs and normalize to `0`
+                // — the response store reads `created_at` as an `i64`, so a native
+                // passthrough response still parses. A string-typed timestamp
+                // (some resources carry an ISO-8601 `created_at`) normalizes to a
+                // fixed RFC-3339 string instead of a bare `0`, so the sanitized
+                // fixture stays schema-valid; `null` (e.g. an unfinished
+                // `completed_at`) is left untouched.
+                nested_value = normalize_timestamp(nested_value);
             } else {
                 self.sanitize_json_field(&key, &mut nested_value, is_model_object)?;
             }
@@ -732,6 +743,21 @@ fn is_identifier_key(key: &str) -> bool {
         key,
         "id" | "response_id" | "previous_response_id" | "call_id" | "tool_call_id" | "conversation_id" | "item_id"
     )
+}
+
+/// Deterministically normalizes a timestamp value while preserving its JSON type.
+///
+/// Numeric timestamps collapse to `0`; string timestamps collapse to a fixed
+/// RFC-3339 value ([`NORMALIZED_TIMESTAMP`]); every other shape — including
+/// `null` — is returned unchanged. Preserving the type keeps the sanitized
+/// fixture schema-valid regardless of whether a resource models a timestamp as a
+/// Unix integer or an ISO-8601 string.
+fn normalize_timestamp(value: Value) -> Value {
+    match value {
+        Value::Number(_) => Value::from(0),
+        Value::String(_) => Value::String(NORMALIZED_TIMESTAMP.to_owned()),
+        other => other,
+    }
 }
 
 /// Returns the canonical replacement prefix for a recognized provider identifier.
@@ -1706,7 +1732,10 @@ mod tests {
             panic!("fixture response must be JSON")
         };
         assert_eq!(client_response["created"], 0);
-        assert_eq!(client_response["created_at"], "1970-01-01T00:00:00Z");
+        // `created_at` here is an ISO-8601 string, so it normalizes to the stable
+        // RFC-3339 placeholder and keeps its string type (a type-strict compare)
+        // rather than collapsing to a bare integer `0`.
+        assert_eq!(client_response["created_at"], json!("1970-01-01T00:00:00Z"));
         assert!(client_response.get("system_fingerprint").is_none());
         let upstream_response = &fixture.turns[0].upstream.response.body;
         let RecordedBody::Json {
@@ -1717,6 +1746,73 @@ mod tests {
         };
         assert_eq!(upstream_response["previous_response_id"], "resp_recorded_0008");
         assert_eq!(fixture.normalization.linked_ids["resp_literal"], "resp_recorded_0008");
+    }
+
+    #[test]
+    fn sanitize_preserves_integer_created_at_type_normalized_to_zero() {
+        // Arrange: a native Responses `created_at` is a Unix-timestamp integer.
+        let mut fixture = fixture();
+        set_created_at(&mut fixture.turns[0].client.response.body, json!(1_699_999_999_i64));
+        set_created_at(&mut fixture.turns[0].upstream.response.body, json!(1_699_999_999_i64));
+
+        // Act
+        sanitize_fixture(&mut fixture, &RedactionRules::default()).unwrap();
+
+        // Assert: the value is canonicalized to 0 but stays an integer, so a
+        // native passthrough response persists through the response store.
+        assert_integer_created_at_zero(&fixture.turns[0].client.response.body);
+        assert_integer_created_at_zero(&fixture.turns[0].upstream.response.body);
+    }
+
+    #[test]
+    fn sanitize_preserves_string_created_at_type_normalized_to_placeholder() {
+        // Arrange: some resources model `created_at` as an ISO-8601 string.
+        let mut fixture = fixture();
+        set_created_at(
+            &mut fixture.turns[0].client.response.body,
+            json!("2026-08-04T12:00:00Z"),
+        );
+        set_created_at(
+            &mut fixture.turns[0].upstream.response.body,
+            json!("2026-08-04T12:00:00Z"),
+        );
+
+        // Act
+        sanitize_fixture(&mut fixture, &RedactionRules::default()).unwrap();
+
+        // Assert: the value is canonicalized to a stable RFC-3339 placeholder but
+        // stays a string, so a string-typed timestamp fixture remains schema-valid.
+        assert_string_created_at_placeholder(&fixture.turns[0].client.response.body);
+        assert_string_created_at_placeholder(&fixture.turns[0].upstream.response.body);
+    }
+
+    fn set_created_at(body: &mut RecordedBody, value: Value) {
+        let RecordedBody::Json { value: json } = body else {
+            panic!("fixture response must be JSON")
+        };
+        json["created_at"] = value;
+    }
+
+    fn assert_string_created_at_placeholder(body: &RecordedBody) {
+        let RecordedBody::Json { value } = body else {
+            panic!("fixture response must be JSON")
+        };
+        assert_eq!(value["created_at"], json!("1970-01-01T00:00:00Z"));
+        assert!(
+            value["created_at"].is_string(),
+            "string created_at must stay a string after normalization"
+        );
+    }
+
+    fn assert_integer_created_at_zero(body: &RecordedBody) {
+        let RecordedBody::Json { value } = body else {
+            panic!("fixture response must be JSON")
+        };
+        assert_eq!(value["created_at"], json!(0));
+        assert!(
+            value["created_at"].is_i64(),
+            "integer created_at must stay an integer after normalization"
+        );
     }
 
     #[test]

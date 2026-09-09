@@ -9,3 +9,4 @@ Containerfile linguist-detectable=false
 Dockerfile linguist-detectable=false
 tests/integration/fixtures/**/*.json linguist-generated=true
 tests/integration/fixtures/inference/scenarios/**/*.yaml linguist-generated=true
+docs/conformance/specs/anthropic-spec.json linguist-generated=true

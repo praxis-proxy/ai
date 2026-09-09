@@ -57,6 +57,13 @@ pub(crate) struct ResponsesState {
     /// optional sections to populate.
     pub include: Vec<String>,
 
+    /// Stable response ID used while several streamed inference rounds are
+    /// exposed as one logical Responses stream.
+    pub logical_stream_response_id: Option<String>,
+
+    /// Next downstream sequence number for a logical Responses stream.
+    pub logical_stream_sequence: u64,
+
     /// Whether stored history was successfully resolved into this state.
     ///
     /// The proxy uses this to distinguish locally consumed history identifiers
@@ -160,6 +167,18 @@ pub(crate) struct ResponsesState {
     /// one-function-call-per-round limit.
     pub web_search_calls: Vec<serde_json::Value>,
 
+    /// Cumulative web searches dispatched to the provider across all
+    /// agentic-loop iterations.
+    ///
+    /// `openai_web_search` increments this each time it issues a
+    /// provider request so the client-declared `max_tool_calls` budget
+    /// is honored across IRR continuations, not just within one round.
+    /// A dedicated counter is used instead of counting `web_search_call`
+    /// items in [`Self::accumulated_output`] because that field retains
+    /// both the model's echoed call and the executed result, which would
+    /// double-count each search.
+    pub web_search_calls_executed: u32,
+
     /// Tool choice setting. Reset to `"auto"` by `openai_agentic_loop`
     /// after the first iteration; the original value from the
     /// request only applies to the first inference call.
@@ -194,6 +213,7 @@ pub(crate) enum RequestBodyRebuild {
 }
 
 impl Default for ResponsesState {
+    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
         Self {
             citation_files: HashMap::new(),
@@ -201,6 +221,8 @@ impl Default for ResponsesState {
             conversation: None,
             file_search_output_items: Vec::new(),
             include: Vec::new(),
+            logical_stream_response_id: None,
+            logical_stream_sequence: 0,
             history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
@@ -220,6 +242,7 @@ impl Default for ResponsesState {
             response_object: serde_json::Value::Null,
             tool_calls: Vec::new(),
             web_search_calls: Vec::new(),
+            web_search_calls_executed: 0,
             tool_choice: serde_json::Value::String("auto".to_owned()),
             tools: Vec::new(),
             usage: serde_json::Value::Null,
@@ -639,6 +662,7 @@ mod tests {
         assert!(state.response_object.is_null());
         assert!(state.tool_calls.is_empty());
         assert!(state.web_search_calls.is_empty());
+        assert_eq!(state.web_search_calls_executed, 0);
         assert_eq!(state.tool_choice, json!("auto"));
         assert!(state.tools.is_empty());
         assert!(state.usage.is_null());
