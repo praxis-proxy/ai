@@ -42,6 +42,9 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 1
+        # The IRR's 30s default is too short for production model streams.
+        # Allow six minutes total for time-to-first-byte and response streaming.
+        timeout_ms: 360000
         steps:
           - name: inference
             filters:

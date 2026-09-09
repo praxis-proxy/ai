@@ -340,6 +340,10 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 1
+        # The IRR's default 30s end-to-end deadline is too short for model
+        # inference. This single step inherits a 6-minute total deadline for
+        # time-to-first-byte plus response streaming.
+        timeout_ms: 360000
         steps:
           - name: inference
             filters:

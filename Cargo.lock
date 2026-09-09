@@ -3192,6 +3192,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "yaml_serde",
 ]
 
 [[package]]

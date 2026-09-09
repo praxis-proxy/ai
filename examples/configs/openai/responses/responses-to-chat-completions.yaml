@@ -63,6 +63,12 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 1
+        # The OpenResponses suite drives concurrent requests through a CPU
+        # backend, and production model streams may also exceed the IRR's 30s
+        # default. This single step inherits an 11-minute total deadline for
+        # time-to-first-byte plus response streaming; the accumulator below
+        # independently caps its portion of the stream at 10 minutes.
+        timeout_ms: 660000
         steps:
           - name: inference
             filters:

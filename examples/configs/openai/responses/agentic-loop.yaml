@@ -144,6 +144,10 @@ filter_chains:
         initial_step: inference
         max_iterations: 11
         max_stream_response_bytes: 67108864
+        # The IRR's 30s default is too short for production model streams.
+        # Allow six minutes total for time-to-first-byte and logical streaming
+        # across the loop.
+        timeout_ms: 360000
         steps:
           - name: inference
             filters:
