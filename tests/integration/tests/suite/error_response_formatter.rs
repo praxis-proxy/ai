@@ -16,11 +16,9 @@ use praxis_test_utils::{free_port, http_send, json_post, parse_body, parse_statu
 // OpenAI Tests
 // -----------------------------------------------------------------------------
 
-/// An OpenAI Responses request to an unavailable upstream receives an
-/// OpenAI-shaped error with `{"error": {...}}`.
 #[test]
 fn openai_responses_connection_refused_returns_openai_error() {
-    let dead_port = free_port(); // port allocated but nothing listens on it
+    let dead_port = free_port();
     let proxy_port = free_port();
     let config = Config::from_yaml(&openai_yaml(proxy_port, dead_port)).unwrap();
     let proxy = start_proxy(&config);
@@ -53,15 +51,12 @@ fn openai_responses_connection_refused_returns_openai_error() {
         "message must be a string"
     );
 
-    // Must NOT be RFC 9457 Problem Details
     assert!(
         parsed.get("type").is_none() || parsed["type"] != "about:blank",
         "response must not be RFC 9457 Problem Details"
     );
 }
 
-/// An OpenAI Chat Completions request to an unavailable upstream also
-/// receives an OpenAI-shaped error.
 #[test]
 fn openai_chat_completions_connection_refused_returns_openai_error() {
     let dead_port = free_port();
@@ -90,8 +85,6 @@ fn openai_chat_completions_connection_refused_returns_openai_error() {
 // Anthropic Tests
 // -----------------------------------------------------------------------------
 
-/// An Anthropic Messages request to an unavailable upstream receives an
-/// Anthropic-shaped error with `{"type":"error","error":{...}}`.
 #[test]
 fn anthropic_messages_connection_refused_returns_anthropic_error() {
     let dead_port = free_port();
@@ -139,7 +132,6 @@ fn anthropic_messages_connection_refused_returns_anthropic_error() {
         "error message must be a string"
     );
 
-    // request_id must be present (string or null)
     assert!(
         parsed.get("request_id").is_some(),
         "Anthropic response must include request_id"
@@ -150,9 +142,6 @@ fn anthropic_messages_connection_refused_returns_anthropic_error() {
 // Fallback Test
 // -----------------------------------------------------------------------------
 
-/// An unclassified request to an unavailable upstream receives the
-/// generic Praxis fallback (RFC 9457 Problem Details), NOT a provider
-/// envelope.
 #[test]
 fn unclassified_connection_refused_returns_generic_fallback() {
     let dead_port = free_port();
@@ -160,7 +149,6 @@ fn unclassified_connection_refused_returns_generic_fallback() {
     let config = Config::from_yaml(&openai_yaml(proxy_port, dead_port)).unwrap();
     let proxy = start_proxy(&config);
 
-    // Send a body that classifies as UnknownJson (no input, no messages)
     let body = r#"{"prompt":"hello"}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/inference", body));
     let status = parse_status(&raw);
