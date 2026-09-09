@@ -119,11 +119,7 @@ impl ResponsesProxyFilter {
     }
 
     /// Serialize the rebuilt body from conversation state.
-    fn serialize_body(
-        &self,
-        state: &ResponsesState,
-        streaming: bool,
-    ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
+    fn serialize_body(&self, state: &ResponsesState) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let serialized = serialize_outbound_body(state)
             .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
@@ -135,7 +131,6 @@ impl ResponsesProxyFilter {
             return Ok(Err(reject_rewritten_body_too_large(
                 serialized.len(),
                 self.config.max_rewritten_body_bytes,
-                streaming,
             )));
         }
 
@@ -205,11 +200,7 @@ impl HttpFilter for ResponsesProxyFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let streaming = ctx
-            .get_metadata("openai_responses_format.stream")
-            .is_some_and(|v| v == "true");
-
-        let serialized = match self.serialize_body(state, streaming)? {
+        let serialized = match self.serialize_body(state)? {
             Ok(bytes) => bytes,
             Err(action) => return Ok(action),
         };

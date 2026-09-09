@@ -583,10 +583,26 @@ async fn streaming_file_search_is_rejected_before_callout() {
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
     ctx.set_metadata("openai_responses_format.stream", "true");
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
+    let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+        panic!("streaming file_search should be rejected before any callout");
+    };
+    assert_eq!(rejection.status, 400, "pre-stream rejection keeps its 4xx status");
+    let content_type = rejection
+        .headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(
+        content_type,
+        Some("application/json"),
+        "a stream:true pre-stream rejection uses application/json, not text/event-stream"
+    );
+    let body = rejection.body.expect("rejection carries a JSON body");
+    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body is JSON");
+    assert!(
+        parsed.get("error").is_some_and(serde_json::Value::is_object),
+        "pre-stream rejection body is a JSON error envelope, not an SSE event: {parsed}"
+    );
     assert!(server.requests().is_empty());
 }
 

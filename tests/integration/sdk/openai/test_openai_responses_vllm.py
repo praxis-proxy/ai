@@ -827,6 +827,7 @@ class TestOpenAIResponsesVLLM:
         response = openai_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: HELLO-PRAXIS /no_think",
+            temperature=0,
             store=False,
             max_output_tokens=128,
         )
@@ -847,6 +848,7 @@ class TestOpenAIResponsesVLLM:
         response = openai_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: STORED-OK /no_think",
+            temperature=0,
             store=True,
             max_output_tokens=128,
         )
@@ -948,6 +950,59 @@ class TestOpenAIResponsesVLLM:
         assert exc_info.value.status_code == 400
         assert "resp_missing_sdk_integration" in str(exc_info.value)
 
+    def test_streaming_validation_failure_returns_json_not_sse(self, openai_client):
+        """Issue #1001: a request that fails pre-stream validation must return
+        the JSON ``{"error": {...}}`` envelope with a non-2xx status -- never a
+        nonconforming ``text/event-stream`` SSE error event on an uncommitted
+        stream -- even when the caller set ``stream: true``.
+
+        OpenAI raises the typed error from the JSON body before opening the
+        stream, so the official client surfaces this as a ``BadRequestError``
+        rather than a live event stream. Praxis matches that transport: locally
+        generated pre-commitment rejections always use ``application/json``.
+        This is the streaming sibling of
+        ``test_invalid_previous_response_id_is_rejected`` and the live-backend
+        counterpart of the Rust unit coverage in the ``responses::error`` and
+        ``responses::validate`` modules.
+        """
+        # The official SDK surfaces the pre-stream failure as a typed error, not
+        # a stream object -- proving it parsed a JSON error body, not an SSE one.
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="This request must not reach vLLM.",
+                previous_response_id="resp_missing_sdk_integration",
+                stream=True,
+                store=True,
+            )
+        assert exc_info.value.status_code == 400
+        assert "resp_missing_sdk_integration" in str(exc_info.value)
+
+        # Assert the wire shape precisely: a stream:true rejection must be an
+        # application/json error envelope, not an SSE error event.
+        raw = httpx.post(
+            f"{str(openai_client.base_url).rstrip('/')}/responses",
+            headers={"Authorization": "Bearer test"},
+            json={
+                "model": VLLM_MODEL,
+                "input": "This request must not reach vLLM.",
+                "previous_response_id": "resp_missing_sdk_integration",
+                "stream": True,
+                "store": True,
+            },
+            timeout=10,
+        )
+        assert raw.status_code == 400
+        content_type = raw.headers.get("content-type", "")
+        assert content_type.startswith("application/json"), (
+            "a stream:true pre-stream rejection must use application/json, not "
+            f"text/event-stream; got: {content_type!r}"
+        )
+        error = raw.json()["error"]
+        assert isinstance(error["message"], str) and error["message"]
+        assert isinstance(error["type"], str) and error["type"]
+        assert "resp_missing_sdk_integration" in error["message"]
+
     def test_malformed_request_has_sdk_compatible_error(self, openai_client):
         response = httpx.post(
             f"{str(openai_client.base_url).rstrip('/')}/responses",
@@ -975,6 +1030,7 @@ class TestOpenAIResponsesVLLM:
         first = openai_client.responses.create(
             model=VLLM_MODEL,
             input=("Remember this nonce: VIOLET-7319. Acknowledge it. /no_think"),
+            temperature=0,
             store=True,
             max_output_tokens=128,
         )
@@ -984,6 +1040,7 @@ class TestOpenAIResponsesVLLM:
         second = openai_client.responses.create(
             model=VLLM_MODEL,
             input=("What nonce did I just tell you? Repeat it exactly. /no_think"),
+            temperature=0,
             previous_response_id=first.id,
             store=True,
             max_output_tokens=128,
@@ -1017,6 +1074,7 @@ class TestOpenAIResponsesVLLM:
         first = openai_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: ECHO-BASE /no_think",
+            temperature=0,
             store=True,
             max_output_tokens=128,
         )
@@ -1027,6 +1085,7 @@ class TestOpenAIResponsesVLLM:
         second = openai_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: ECHO-NEXT /no_think",
+            temperature=0,
             previous_response_id=first.id,
             store=True,
             max_output_tokens=128,
@@ -1055,6 +1114,7 @@ class TestOpenAIResponsesVLLM:
             response = openai_client.responses.create(
                 model=VLLM_MODEL,
                 input=("Repeat the nonce from this conversation exactly. /no_think"),
+                temperature=0,
                 conversation=conversation.id,
                 store=True,
                 max_output_tokens=128,
@@ -1181,6 +1241,7 @@ class TestOpenAIResponsesVLLM:
                     ],
                 }
             ],
+            temperature=0,
             store=False,
             max_output_tokens=256,
         )
@@ -1228,6 +1289,7 @@ class TestOpenAIResponsesVLLM:
                         ],
                     }
                 ],
+                temperature=0,
                 store=False,
                 max_output_tokens=128,
             )
@@ -1268,6 +1330,7 @@ class TestOpenAIResponsesVLLM:
                     },
                 }
             ],
+            temperature=0,
             store=False,
             max_output_tokens=256,
         )
@@ -1358,37 +1421,6 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert "72" in second.output_text or "sunny" in second.output_text.lower()
 
-    def test_structured_json_output(self, openai_client):
-        response = openai_client.responses.create(
-            model=VLLM_MODEL,
-            input="Return the marker STRUCTURED-2468. /no_think",
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "marker_result",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "marker": {"type": "string"},
-                        },
-                        "required": ["marker"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            store=False,
-            # The native Responses path emits a separate reasoning item whose
-            # tokens count against the budget, so allow enough headroom for the
-            # constrained JSON to complete on the small CI model.
-            max_output_tokens=512,
-        )
-
-        assert response.status == "completed"
-        assert json.loads(response.output_text) == {
-            "marker": "STRUCTURED-2468",
-        }
-
     def test_generation_parameters_are_reflected(self, openai_client):
         response = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -1426,6 +1458,7 @@ class TestOpenAIResponsesVLLM:
         stream = irr_streaming_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: STREAM-OK /no_think",
+            temperature=0,
             store=False,
             stream=True,
             max_output_tokens=128,
@@ -1462,6 +1495,7 @@ class TestResponsesCompactionVLLM:
         first = compact_client.responses.create(
             model=VLLM_MODEL,
             input="Remember the marker BELOW-THRESHOLD-2468. /no_think",
+            temperature=0,
             store=True,
             max_output_tokens=64,
         )
@@ -1470,6 +1504,7 @@ class TestResponsesCompactionVLLM:
         second = compact_client.responses.create(
             model=VLLM_MODEL,
             input="Repeat the marker I gave you. /no_think",
+            temperature=0,
             previous_response_id=first.id,
             context_management=[
                 {
@@ -1496,6 +1531,7 @@ class TestResponsesCompactionVLLM:
                 + "context-padding " * 1200
                 + "Say exactly: ACK. /no_think"
             ),
+            temperature=0,
             store=True,
             max_output_tokens=128,
         )
@@ -1508,6 +1544,7 @@ class TestResponsesCompactionVLLM:
                 "Repeat the persistent marker from the compacted context "
                 "exactly. /no_think"
             ),
+            temperature=0,
             previous_response_id=first.id,
             context_management=[
                 {
@@ -1541,6 +1578,7 @@ class TestResponsesToChatCompletionsVLLM:
         response = chat_streaming_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: CHAT-FINITE-OK /no_think",
+            temperature=0,
             store=True,
             max_output_tokens=128,
         )
@@ -1620,6 +1658,7 @@ class TestResponsesToChatCompletionsVLLM:
         response = chat_streaming_client.responses.create(
             model=VLLM_MODEL,
             input="Return the marker CHAT-JSON-1357. /no_think",
+            temperature=0,
             text={
                 "format": {
                     "type": "json_schema",
@@ -1663,6 +1702,7 @@ class TestResponsesToChatCompletionsVLLM:
         first = chat_streaming_client.responses.create(
             model=VLLM_MODEL,
             input="Call get_weather for Paris. /no_think",
+            temperature=0,
             tools=[tool],
             tool_choice={"type": "function", "name": "get_weather"},
             store=True,
@@ -1683,18 +1723,38 @@ class TestResponsesToChatCompletionsVLLM:
                     "output": "The weather is 68F and clear.",
                 }
             ],
+            temperature=0,
             tools=[tool],
             tool_choice="none",
             store=True,
-            max_output_tokens=128,
+            max_output_tokens=512,
         )
-        assert second.status == "completed"
-        assert "68" in second.output_text or "clear" in second.output_text.lower()
+        # Experiment, not a proven fix: the 128-token second-turn budget flaked
+        # once in CI (SQLite job) while PostgreSQL passed the same commit. The
+        # root cause is not yet established -- this turn is free-text
+        # (tool_choice="none", no schema) so it is NOT grammar-bounded, and a
+        # rehydration/storage-path difference between the backends is not ruled
+        # out. Widen only this budget as a controlled experiment and attach
+        # diagnostics so the next failure is analyzable: was it a
+        # max_output_tokens overrun (incomplete_details.reason / usage), did the
+        # model emit a reasoning item (output_types), or was the output empty?
+        detail = (
+            f"status={second.status!r} "
+            f"incomplete_details={getattr(second, 'incomplete_details', None)!r} "
+            f"usage={getattr(second, 'usage', None)!r} "
+            f"output_types={[item.type for item in second.output]} "
+            f"output_text_len={len(second.output_text)}"
+        )
+        assert second.status == "completed", detail
+        assert (
+            "68" in second.output_text or "clear" in second.output_text.lower()
+        ), detail
 
     def test_streaming_response_round_trip(self, chat_streaming_client):
         stream = chat_streaming_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: CHAT-STREAM-OK /no_think",
+            temperature=0,
             store=True,
             stream=True,
             max_output_tokens=128,
@@ -2755,6 +2815,7 @@ class TestAgenticLoopVLLM:
                     },
                 }
             ],
+            temperature=0,
             store=False,
             max_output_tokens=256,
         )

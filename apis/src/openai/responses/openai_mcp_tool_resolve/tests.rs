@@ -3707,10 +3707,16 @@ fn streaming_failure_classification_excludes_local_request_policy() {
     }
 }
 
-/// A streaming SSRF failure must retain the ordinary HTTP error response (a
-/// single `event: error` frame at the mapped status), not the 200 discovery
-/// lifecycle reserved for runtime `tools/list` failures.
+/// A streaming SSRF failure is a pre-commitment rejection: it fires during
+/// request-body resolution, before any `text/event-stream` is established, so
+/// it returns the ordinary JSON `{"error":{...}}` envelope at the mapped status
+/// (issue #1001) -- never the 200 discovery lifecycle reserved for runtime
+/// `tools/list` failures, and never a committed-stream SSE `error` event.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "comprehensive pre-commitment JSON rejection assertions"
+)]
 fn streaming_ssrf_failure_retains_http_error() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -3732,10 +3738,29 @@ fn streaming_ssrf_failure_retains_http_error() {
         !rejection.preserve_keepalive,
         "a genuine HTTP error closes the connection, unlike the 200 discovery-failure transport"
     );
-    let raw = std::str::from_utf8(rejection.body.as_deref().expect("SSE body")).unwrap();
+    let ct = rejection.headers.iter().find(|(k, _)| k == "content-type");
+    assert_eq!(
+        ct.map(|(_, v)| v.as_str()),
+        Some("application/json"),
+        "a pre-commitment SSRF rejection uses the JSON error envelope, not an SSE event (issue #1001)"
+    );
+    let raw = std::str::from_utf8(rejection.body.as_deref().expect("error body")).unwrap();
     assert!(
-        raw.starts_with("event: error\n"),
-        "SSRF uses the single error frame: {raw}"
+        !raw.starts_with("event: "),
+        "SSRF must not emit a committed-stream SSE error event: {raw}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(
+        parsed["error"]["type"], "server_error",
+        "SSRF maps to a server_error envelope: {raw}"
+    );
+    assert_eq!(
+        parsed["error"]["code"], "server_error",
+        "SSRF maps to a server_error envelope: {raw}"
+    );
+    assert!(
+        parsed["error"]["message"].as_str().is_some_and(|m| m.contains("SSRF")),
+        "the SSRF reason is preserved in the message: {raw}"
     );
     assert!(
         !raw.contains("response.mcp_list_tools.failed") && !raw.contains("response.failed"),

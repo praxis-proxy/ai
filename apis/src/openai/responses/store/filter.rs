@@ -445,7 +445,6 @@ fn delete_not_found_rejection(id: &str) -> Rejection {
         404,
         "invalid_request_error",
         &format!("No response found with id: '{id}'."),
-        false,
     )
 }
 
@@ -1151,16 +1150,15 @@ fn reject_not_found(id: &str) -> Rejection {
         404,
         "invalid_request_error",
         &format!("No response found with id '{id}'."),
-        false,
     )
 }
 
 /// Build a 400 rejection for invalid client-supplied parameters.
 fn reject_invalid_input(message: &str) -> Rejection {
-    responses_error_rejection(400, "invalid_request_error", message, false)
+    responses_error_rejection(400, "invalid_request_error", message)
 }
 
 /// Build a 500 rejection for internal store failures.
 fn reject_store_error() -> Rejection {
-    responses_error_rejection(500, "server_error", "Internal server error.", false)
+    responses_error_rejection(500, "server_error", "Internal server error.")
 }

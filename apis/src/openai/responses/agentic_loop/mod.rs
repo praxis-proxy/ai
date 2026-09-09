@@ -250,7 +250,6 @@ impl HttpFilter for AgenticLoopFilter {
                     "openai_agentic_loop with a streaming openai_responses_proxy sub-request requires \
                      openai_stream_events with logical_stream: true so loop-terminal errors can \
                      reach the client",
-                    true,
                 )));
             }
         }
@@ -313,7 +312,7 @@ fn reject_invalid_function_cardinality(
     message: &'static str,
 ) -> FilterAction {
     ctx.extensions.insert(state);
-    FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message, false))
+    FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message))
 }
 
 /// Only a successfully terminated stream may authorize external side effects.
@@ -444,7 +443,6 @@ fn end_at_iteration_limit(
         508,
         "server_error",
         "agentic loop iteration limit exceeded",
-        false,
     )))
 }
 

@@ -107,14 +107,13 @@ impl RehydrateFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &Option<Bytes>,
-        streaming: bool,
     ) -> Result<FilterAction, FilterError> {
         let Some(bytes) = body.as_ref() else {
             return Ok(FilterAction::Release);
         };
-        match parse_body_and_extract_id(bytes, streaming) {
-            Ok((body, Some(id))) => self.rehydrate_from_response(ctx, body, id, streaming).await,
-            Ok((body, None)) => self.rehydrate_from_conversation(ctx, body, streaming).await,
+        match parse_body_and_extract_id(bytes) {
+            Ok((body, Some(id))) => self.rehydrate_from_response(ctx, body, id).await,
+            Ok((body, None)) => self.rehydrate_from_conversation(ctx, body).await,
             Err(action) => Ok(action),
         }
     }
@@ -125,21 +124,19 @@ impl RehydrateFilter {
         ctx: &mut HttpFilterContext<'_>,
         parsed_body: Value,
         prev_id: String,
-        streaming: bool,
     ) -> Result<FilterAction, FilterError> {
         let tenant_id = ctx
             .get_metadata(TENANT_METADATA_KEY)
             .unwrap_or(DEFAULT_TENANT_ID)
             .to_owned();
-        let record = match fetch_and_validate_previous(ctx, &tenant_id, &prev_id, streaming).await {
+        let record = match fetch_and_validate_previous(ctx, &tenant_id, &prev_id).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        let stored =
-            match stored_messages_for_response(&record, self.max_history_bytes, self.max_history_items, streaming) {
-                Ok(s) => s,
-                Err(action) => return Ok(action),
-            };
+        let stored = match stored_messages_for_response(&record, self.max_history_bytes, self.max_history_items) {
+            Ok(s) => s,
+            Err(action) => return Ok(action),
+        };
         let previous_tools = collect_mcp_tool_listings(&record);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let mut state = build_state(parsed_body, stored, previous_tools, previous_usage);
@@ -157,9 +154,8 @@ impl RehydrateFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         parsed_body: Value,
-        streaming: bool,
     ) -> Result<FilterAction, FilterError> {
-        let conv_id = match resolve_conversation_id(&parsed_body, streaming) {
+        let conv_id = match resolve_conversation_id(&parsed_body) {
             Ok(id) => id,
             Err(action) => return Ok(action),
         };
@@ -167,16 +163,11 @@ impl RehydrateFilter {
             .get_metadata(TENANT_METADATA_KEY)
             .unwrap_or(DEFAULT_TENANT_ID)
             .to_owned();
-        let record = match fetch_conversation(ctx, &tenant_id, &conv_id, streaming).await {
+        let record = match fetch_conversation(ctx, &tenant_id, &conv_id).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        let stored = match stored_messages_for_conversation(
-            &record,
-            self.max_history_bytes,
-            self.max_history_items,
-            streaming,
-        ) {
+        let stored = match stored_messages_for_conversation(&record, self.max_history_bytes, self.max_history_items) {
             Ok(s) => s,
             Err(action) => return Ok(action),
         };
@@ -263,11 +254,7 @@ impl HttpFilter for RehydrateFilter {
             return Ok(FilterAction::Release);
         }
 
-        let streaming = ctx
-            .get_metadata("openai_responses_format.stream")
-            .is_some_and(|v| v == "true");
-
-        self.rehydrate(ctx, body, streaming).await
+        self.rehydrate(ctx, body).await
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -475,36 +462,25 @@ fn is_responses_cancel_path(path: &str) -> bool {
 }
 
 /// Reject when `items` exceeds the configured byte-size or item-count cap.
-fn check_history_limits(
-    items: &[Value],
-    max_bytes: usize,
-    max_items: Option<usize>,
-    streaming: bool,
-) -> Result<(), FilterAction> {
+fn check_history_limits(items: &[Value], max_bytes: usize, max_items: Option<usize>) -> Result<(), FilterAction> {
     if let Some(max) = max_items {
         let count = items.len();
         if count > max {
-            return Err(reject_too_large(
-                &format!(
-                    "stored conversation history contains {count} items, \
+            return Err(reject_too_large(&format!(
+                "stored conversation history contains {count} items, \
                    exceeding the {max} item limit; \
                    compact or shorten the conversation before continuing"
-                ),
-                streaming,
-            ));
+            )));
         }
     }
 
     let byte_size = serialized_len(items).unwrap_or(usize::MAX);
     if byte_size > max_bytes {
-        return Err(reject_too_large(
-            &format!(
-                "stored conversation history is {byte_size} bytes, \
+        return Err(reject_too_large(&format!(
+            "stored conversation history is {byte_size} bytes, \
                exceeding the {max_bytes} byte limit; \
                compact or shorten the conversation before continuing"
-            ),
-            streaming,
-        ));
+        )));
     }
 
     Ok(())
@@ -519,13 +495,12 @@ fn stored_messages_for_response(
     record: &ResponseRecord,
     max_bytes: usize,
     max_items: Option<usize>,
-    streaming: bool,
 ) -> Result<Vec<Value>, FilterAction> {
     if let Some(messages) = record.messages.as_array().filter(|a| !a.is_empty()) {
-        check_history_limits(messages, max_bytes, max_items, streaming)?;
+        check_history_limits(messages, max_bytes, max_items)?;
         return Ok(messages.clone());
     }
-    reconstruct_messages_from_public_response(record, max_bytes, max_items, streaming)
+    reconstruct_messages_from_public_response(record, max_bytes, max_items)
 }
 
 /// Stored messages from a conversation record, checking limits before cloning.
@@ -533,11 +508,10 @@ fn stored_messages_for_conversation(
     record: &ConversationRecord,
     max_bytes: usize,
     max_items: Option<usize>,
-    streaming: bool,
 ) -> Result<Vec<Value>, FilterAction> {
     let empty: &[Value] = &[];
     let messages = record.messages.as_array().map_or(empty, Vec::as_slice);
-    check_history_limits(messages, max_bytes, max_items, streaming)?;
+    check_history_limits(messages, max_bytes, max_items)?;
     Ok(messages.to_vec())
 }
 
@@ -546,17 +520,16 @@ async fn fetch_and_validate_previous(
     ctx: &HttpFilterContext<'_>,
     tenant_id: &str,
     prev_id: &str,
-    streaming: bool,
 ) -> Result<ResponseRecord, FilterAction> {
-    let record = fetch_previous_response(ctx, tenant_id, prev_id, streaming).await?;
-    validate_response_status(&record, streaming)?;
+    let record = fetch_previous_response(ctx, tenant_id, prev_id).await?;
+    validate_response_status(&record)?;
     Ok(record)
 }
 
 /// Resolve the conversation ID from the request body, returning a
 /// `Release` when no conversation field is present or a `Reject`
 /// when the field is malformed.
-fn resolve_conversation_id(body: &Value, streaming: bool) -> Result<String, FilterAction> {
+fn resolve_conversation_id(body: &Value) -> Result<String, FilterAction> {
     let has_field = body.get("conversation").is_some();
     extract_conversation_id(body).ok_or_else(|| {
         if has_field {
@@ -564,7 +537,6 @@ fn resolve_conversation_id(body: &Value, streaming: bool) -> Result<String, Filt
                 400,
                 "invalid_request_error",
                 "invalid conversation value: expected a string ID or {\"id\": \"...\"}",
-                streaming,
             ))
         } else {
             FilterAction::Release
@@ -577,26 +549,25 @@ async fn fetch_conversation(
     ctx: &HttpFilterContext<'_>,
     tenant_id: &str,
     conv_id: &str,
-    streaming: bool,
 ) -> Result<ConversationRecord, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
-        reject_server_error("response store is not available", streaming)
+        reject_server_error("response store is not available")
     })?;
 
     let store = registry.get(DEFAULT_STORE_NAME).ok_or_else(|| {
         warn!("rehydrate: default response store not registered");
-        reject_server_error("response store is not available", streaming)
+        reject_server_error("response store is not available")
     })?;
 
     let record = store.get_conversation(tenant_id, conv_id).await.map_err(|e| {
         warn!(error = %e, "rehydrate: failed to fetch conversation");
-        reject_server_error("failed to fetch conversation", streaming)
+        reject_server_error("failed to fetch conversation")
     })?;
 
     record.ok_or_else(|| {
         debug!(id = %conv_id, "rehydrate: conversation not found");
-        reject_invalid(&format!("conversation '{conv_id}' not found"), streaming)
+        reject_invalid(&format!("conversation '{conv_id}' not found"))
     })
 }
 
@@ -623,7 +594,6 @@ fn reconstruct_messages_from_public_response(
     record: &ResponseRecord,
     max_bytes: usize,
     max_items: Option<usize>,
-    streaming: bool,
 ) -> Result<Vec<Value>, FilterAction> {
     let mut messages = Vec::new();
 
@@ -633,7 +603,7 @@ fn reconstruct_messages_from_public_response(
         append_stored_output_items(&mut messages, output);
     }
 
-    check_history_limits(&messages, max_bytes, max_items, streaming)?;
+    check_history_limits(&messages, max_bytes, max_items)?;
     Ok(messages)
 }
 
@@ -655,16 +625,16 @@ fn replay_messages_from_stored(stored: &[Value]) -> Vec<Value> {
 ///
 /// Returns the parsed body alongside the optional ID so callers
 /// can reuse it for [`ResponsesState`] construction.
-fn parse_body_and_extract_id(bytes: &[u8], streaming: bool) -> Result<(Value, Option<String>), FilterAction> {
+fn parse_body_and_extract_id(bytes: &[u8]) -> Result<(Value, Option<String>), FilterAction> {
     let parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
         debug!(error = %e, "rehydrate: invalid request JSON");
-        reject_invalid(&format!("invalid request body: {e}"), streaming)
+        reject_invalid(&format!("invalid request body: {e}"))
     })?;
 
     let id = match parsed.get("previous_response_id") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(s.clone()),
-        Some(_) => return Err(reject_invalid("previous_response_id must be a string", streaming)),
+        Some(_) => return Err(reject_invalid("previous_response_id must be a string")),
     };
 
     Ok((parsed, id))
@@ -679,31 +649,30 @@ async fn fetch_previous_response(
     ctx: &HttpFilterContext<'_>,
     tenant_id: &str,
     prev_id: &str,
-    streaming: bool,
 ) -> Result<ResponseRecord, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
-        reject_server_error("response store is not available", streaming)
+        reject_server_error("response store is not available")
     })?;
 
     let store = registry.get(DEFAULT_STORE_NAME).ok_or_else(|| {
         warn!("rehydrate: default response store not registered");
-        reject_server_error("response store is not available", streaming)
+        reject_server_error("response store is not available")
     })?;
 
     let record = store.get_response(tenant_id, prev_id).await.map_err(|e| {
         warn!(error = %e, "rehydrate: failed to fetch previous response");
-        reject_server_error("failed to fetch previous response", streaming)
+        reject_server_error("failed to fetch previous response")
     })?;
 
     record.ok_or_else(|| {
         debug!(id = %prev_id, "rehydrate: previous response not found");
-        reject_invalid(&format!("response '{prev_id}' not found"), streaming)
+        reject_invalid(&format!("response '{prev_id}' not found"))
     })
 }
 
 /// Validate that the stored response has status `"completed"`.
-fn validate_response_status(record: &ResponseRecord, streaming: bool) -> Result<(), FilterAction> {
+fn validate_response_status(record: &ResponseRecord) -> Result<(), FilterAction> {
     let status = record
         .response_object
         .get("status")
@@ -711,10 +680,9 @@ fn validate_response_status(record: &ResponseRecord, streaming: bool) -> Result<
         .unwrap_or("unknown");
 
     if status != "completed" {
-        return Err(reject_invalid(
-            &format!("cannot continue from response with status '{status}'"),
-            streaming,
-        ));
+        return Err(reject_invalid(&format!(
+            "cannot continue from response with status '{status}'"
+        )));
     }
 
     Ok(())
@@ -809,28 +777,18 @@ fn write_previous_usage_metadata(ctx: &mut HttpFilterContext<'_>, usage: Option<
 // -----------------------------------------------------------------------------
 
 /// Build a 400 rejection with a Responses API error body.
-fn reject_invalid(message: &str, streaming: bool) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(
-        400,
-        "invalid_request_error",
-        message,
-        streaming,
-    ))
+fn reject_invalid(message: &str) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message))
 }
 
 /// Build a 500 rejection with a Responses API error body.
-fn reject_server_error(message: &str, streaming: bool) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(500, "server_error", message, streaming))
+fn reject_server_error(message: &str) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(500, "server_error", message))
 }
 
 /// Build a 413 rejection with a Responses API error body.
-fn reject_too_large(message: &str, streaming: bool) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(
-        413,
-        "invalid_request_error",
-        message,
-        streaming,
-    ))
+fn reject_too_large(message: &str) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(413, "invalid_request_error", message))
 }
 
 // -----------------------------------------------------------------------------

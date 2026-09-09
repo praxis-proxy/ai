@@ -165,8 +165,7 @@ impl ResponsesToChatCompletionsFilter {
         &self,
         ctx: &HttpFilterContext<'_>,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let streaming = request_is_streaming(ctx);
-        let translated = match translate_canonical_state(ctx, streaming) {
+        let translated = match translate_canonical_state(ctx) {
             Ok(value) => value,
             Err(action) => return Ok(Err(action)),
         };
@@ -181,7 +180,6 @@ impl ResponsesToChatCompletionsFilter {
             return Ok(Err(reject_rewritten_body_too_large(
                 serialized.len(),
                 self.config.max_rewritten_body_bytes,
-                streaming,
             )));
         }
         Ok(Ok(serialized))
@@ -251,11 +249,10 @@ impl ResponsesToChatCompletionsFilter {
                 502,
                 "server_error",
                 "upstream provider returned an unsupported response representation",
-                streaming_requested,
             )));
         }
         let Some((response_id, created_at)) = stream_identity(ctx) else {
-            return Ok(missing_pipeline_state(streaming_requested));
+            return Ok(missing_pipeline_state());
         };
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
         // Downgrade the reconciled pipeline body mode to `Stream`. A downstream
@@ -380,7 +377,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             if ctx.response_header.as_ref().map(|response| response.status) == Some(http::StatusCode::OK) {
                 return self.install_stream_converter(ctx);
             }
-            return Ok(non_ok_sse_rejection(ctx));
+            return Ok(non_ok_sse_rejection());
         }
 
         if is_non_sse_streaming_success(ctx) {
@@ -521,21 +518,21 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
                 prerequisite = "openai_responses_format",
                 "request pipeline state is unavailable"
             );
-            Some(missing_pipeline_state(false))
+            Some(missing_pipeline_state())
         },
     }
 }
 
 /// Convert the validator-owned canonical state to a Chat request value.
-fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Result<serde_json::Value, FilterAction> {
+fn translate_canonical_state(ctx: &HttpFilterContext<'_>) -> Result<serde_json::Value, FilterAction> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         warn!(
             prerequisite = "openai_responses_validate",
             "request pipeline state is unavailable"
         );
-        return Err(missing_pipeline_state(streaming));
+        return Err(missing_pipeline_state());
     };
-    ensure_previous_response_rehydrated(state, streaming)?;
+    ensure_previous_response_rehydrated(state)?;
     responses_state_to_chat_request(&state.request_body, &state.messages, &state.tools, &state.tool_choice).map_err(
         |error| {
             debug!(error = %error, "Responses request cannot be represented by Chat Completions");
@@ -543,20 +540,19 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Re
                 400,
                 "invalid_request_error",
                 &error.to_string(),
-                streaming,
             ))
         },
     )
 }
 
 /// Require stored history before translating a continuation request.
-fn ensure_previous_response_rehydrated(state: &ResponsesState, streaming: bool) -> Result<(), FilterAction> {
+fn ensure_previous_response_rehydrated(state: &ResponsesState) -> Result<(), FilterAction> {
     if state.previous_response_id.is_some() && !state.history_rehydrated {
         warn!(
             prerequisite = "openai_responses_rehydrate",
             "previous_response_id was not resolved before Chat Completions translation"
         );
-        return Err(missing_pipeline_state(streaming));
+        return Err(missing_pipeline_state());
     }
     Ok(())
 }
@@ -639,7 +635,6 @@ fn finite_response_transform(ctx: &HttpFilterContext<'_>) -> Result<Option<&'sta
                 502,
                 "server_error",
                 "upstream provider returned an unsupported response representation",
-                request_is_streaming(ctx),
             )));
         }
         return Ok(Some(RESPONSE_TRANSFORM_SUCCESS));
@@ -748,7 +743,6 @@ fn sse_for_non_streaming_rejection() -> FilterAction {
         502,
         "server_error",
         "upstream provider returned a streaming response for a non-streaming request",
-        false,
     ))
 }
 
@@ -758,26 +752,23 @@ fn non_sse_success_for_streaming_rejection() -> FilterAction {
         502,
         "server_error",
         "upstream provider returned a non-streaming success response for a streaming request",
-        true,
     ))
 }
 
 /// Reject a provider error stream without leaking Chat Completions framing.
-fn non_ok_sse_rejection(ctx: &HttpFilterContext<'_>) -> FilterAction {
+fn non_ok_sse_rejection() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         502,
         "server_error",
         "upstream provider returned an error event stream",
-        request_is_streaming(ctx),
     ))
 }
 
 /// Build the fail-closed action for missing classifier or validator state.
-fn missing_pipeline_state(streaming: bool) -> FilterAction {
+fn missing_pipeline_state() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         500,
         "server_error",
         "request pipeline state is unavailable",
-        streaming,
     ))
 }

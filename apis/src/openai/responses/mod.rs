@@ -362,7 +362,6 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
                 400,
                 "invalid_request_error",
                 message,
-                false,
             )))
         },
     }

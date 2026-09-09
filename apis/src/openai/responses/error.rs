@@ -3,9 +3,12 @@
 
 //! Responses API error formatting.
 //!
-//! Builds OpenAI-compatible error responses. Non-streaming errors use
-//! the HTTP API `{"error":{...}}` envelope; streaming errors use the
-//! Responses API SSE `error` event shape.
+//! Builds OpenAI-compatible error responses. Locally generated rejections
+//! are pre-commitment short-circuits and always use the HTTP API
+//! `{"error":{...}}` envelope, matching OpenAI's behavior of returning a
+//! JSON error with a non-2xx status even when the request set `stream: true`.
+//! The Responses API SSE `error` event shape is used only for errors on an
+//! already-committed `text/event-stream` (see the `stream_events` filter).
 
 use bytes::Bytes;
 use praxis_filter::Rejection;
@@ -27,43 +30,40 @@ pub(crate) fn responses_error_body(code: &str, message: &str) -> Bytes {
     )
 }
 
-/// Build a Responses API error as an SSE event.
+/// Build the JSON payload for a Responses API SSE `error` event.
 ///
-/// Produces `event: error\ndata: <ResponseErrorEvent json>\n\n`.
-pub(crate) fn responses_error_sse_body(code: &str, message: &str) -> Bytes {
-    let json = responses_error_sse_payload(code, message);
-    Bytes::from(format!("event: error\ndata: {json}\n\n"))
-}
-
-/// Build the JSON payload for a Responses API SSE error event.
+/// Matches the pinned OpenAI `ResponseErrorEvent` schema: `type` (always
+/// `"error"`), `code`, `message`, `param`, and `sequence_number` are all
+/// top-level fields — there is no nested `error` object. The caller-selected
+/// machine-readable `code` is preserved as the top-level `code`.
+///
+/// Used only for errors on an already-committed streaming response (the
+/// `stream_events` logical-stream terminal error). Pre-commitment rejections
+/// use the JSON envelope via [`responses_error_rejection`] instead.
 pub(crate) fn responses_error_sse_payload(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "error",
         "sequence_number": 0,
-        "error": {
-            "type": code,
-            "code": code,
-            "message": message,
-            "param": null,
-        },
+        "code": code,
+        "message": message,
+        "param": null,
     })
 }
 
-/// Build a [`Rejection`] with the appropriate OpenAI error format.
+/// Build a [`Rejection`] carrying the OpenAI HTTP error envelope.
 ///
-/// When `streaming` is true, produces `text/event-stream` with a
-/// Responses API SSE error event. Otherwise produces `application/json`
-/// with the HTTP API error envelope.
-pub(crate) fn responses_error_rejection(status: u16, code: &str, message: &str, streaming: bool) -> Rejection {
-    if streaming {
-        Rejection::status(status)
-            .with_header("content-type", "text/event-stream")
-            .with_body(responses_error_sse_body(code, message))
-    } else {
-        Rejection::status(status)
-            .with_header("content-type", "application/json")
-            .with_body(responses_error_body(code, message))
-    }
+/// A [`Rejection`] is always a pre-commitment short-circuit: it replaces the
+/// entire HTTP response before any streaming body is committed downstream, so
+/// no `text/event-stream` has been established. OpenAI returns errors detected
+/// before a stream starts as an ordinary JSON `{"error":{...}}` body with a
+/// non-2xx status, even when the request set `stream: true`; SSE `error`
+/// events are reserved for failures on an already-committed stream and are
+/// emitted by the `stream_events` filter, not here. Every rejection therefore
+/// uses `application/json`.
+pub(crate) fn responses_error_rejection(status: u16, code: &str, message: &str) -> Rejection {
+    Rejection::status(status)
+        .with_header("content-type", "application/json")
+        .with_body(responses_error_body(code, message))
 }
 
 // -----------------------------------------------------------------------------
@@ -111,94 +111,83 @@ mod tests {
     }
 
     #[test]
-    fn sse_body_has_event_and_data_lines() {
-        let body = responses_error_sse_body("server_error", "oops");
-        let text = std::str::from_utf8(&body).unwrap();
+    fn sse_payload_matches_pinned_response_error_event_schema() {
+        let payload = responses_error_sse_payload("rate_limit_exceeded", "slow down");
 
-        assert!(text.starts_with("event: error\n"), "should start with event line");
-        assert!(text.contains("data: {"), "should have data line with JSON");
-        assert!(text.ends_with("\n\n"), "should end with double newline");
+        assert_eq!(payload["type"], "error", "event type is always \"error\"");
+        assert_eq!(payload["sequence_number"], 0, "sequence_number is a top-level field");
+        assert_eq!(
+            payload["code"], "rate_limit_exceeded",
+            "the caller-selected machine-readable code is preserved at the top level"
+        );
+        assert_eq!(payload["message"], "slow down", "message is a top-level field");
+        assert!(payload["param"].is_null(), "param is a top-level field");
+        assert!(
+            payload.get("error").is_none(),
+            "an SSE error event must not nest fields under an \"error\" object"
+        );
+
+        let keys: std::collections::BTreeSet<&str> = payload.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["code", "message", "param", "sequence_number", "type"]
+                .into_iter()
+                .collect(),
+            "payload must contain only the schema-defined top-level fields"
+        );
     }
 
     #[test]
-    fn sse_body_contains_valid_json() {
-        let body = responses_error_sse_body("invalid_request_error", "missing field");
-        let text = std::str::from_utf8(&body).unwrap();
-
-        let data_line = text
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .unwrap()
-            .strip_prefix("data: ")
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(data_line).unwrap();
-
-        assert_eq!(parsed["type"], "error", "SSE event type should be error");
-        assert_eq!(parsed["sequence_number"], 0, "SSE error should include sequence number");
-        assert_eq!(
-            parsed["error"]["type"], "invalid_request_error",
-            "SSE error type should match"
-        );
-        assert_eq!(
-            parsed["error"]["code"], "invalid_request_error",
-            "SSE error code should match"
-        );
-        assert_eq!(
-            parsed["error"]["message"], "missing field",
-            "SSE error message should match"
-        );
-        assert!(parsed["error"]["param"].is_null(), "SSE error param should be null");
-    }
-
-    #[test]
-    fn rejection_non_streaming_uses_json_content_type() {
-        let r = responses_error_rejection(400, "invalid_request_error", "bad", false);
+    fn rejection_uses_json_content_type() {
+        let r = responses_error_rejection(400, "invalid_request_error", "bad");
 
         assert_eq!(r.status, 400, "status should be preserved");
         let ct = r.headers.iter().find(|(k, _)| k == "content-type");
         assert_eq!(
             ct.map(|(_, v)| v.as_str()),
             Some("application/json"),
-            "non-streaming should use application/json"
+            "rejections use application/json"
         );
     }
 
     #[test]
-    fn rejection_streaming_uses_sse_content_type() {
-        let r = responses_error_rejection(500, "server_error", "fail", true);
+    fn rejection_uses_json_content_type_for_server_errors() {
+        let r = responses_error_rejection(500, "server_error", "fail");
 
         assert_eq!(r.status, 500, "status should be preserved");
         let ct = r.headers.iter().find(|(k, _)| k == "content-type");
         assert_eq!(
             ct.map(|(_, v)| v.as_str()),
-            Some("text/event-stream"),
-            "streaming should use text/event-stream"
+            Some("application/json"),
+            "rejections use application/json regardless of status"
         );
     }
 
     #[test]
-    fn rejection_non_streaming_body_is_plain_json() {
-        let r = responses_error_rejection(404, "invalid_request_error", "not found", false);
-        let body = r.body.unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            parsed["error"]["type"], "invalid_request_error",
-            "non-streaming error type should match"
-        );
-        assert_eq!(
-            parsed["error"]["message"], "not found",
-            "non-streaming error message should match"
-        );
-    }
-
-    #[test]
-    fn rejection_streaming_body_is_sse_event() {
-        let r = responses_error_rejection(400, "invalid_request_error", "bad", true);
+    fn rejection_body_is_json_envelope() {
+        let r = responses_error_rejection(404, "invalid_request_error", "not found");
         let body = r.body.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(
-            text.starts_with("event: error\n"),
-            "streaming body should start with error event"
+            !text.starts_with("event: "),
+            "a rejection body must not be an SSE event"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["error"]["type"], "invalid_request_error",
+            "rejection error type should match"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "invalid_request_error",
+            "rejection error code should match"
+        );
+        assert_eq!(
+            parsed["error"]["message"], "not found",
+            "rejection error message should match"
+        );
+        assert!(
+            parsed["error"]["param"].is_null(),
+            "rejection error param should be null"
         );
     }
 }

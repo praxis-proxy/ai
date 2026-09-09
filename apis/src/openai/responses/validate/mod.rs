@@ -112,7 +112,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
             return Ok(FilterAction::Release);
         }
 
-        let parsed = match parse_request_body(ctx, body) {
+        let parsed = match parse_request_body(body) {
             Ok(v) => v,
             Err(action) => return Ok(action),
         };
@@ -145,20 +145,17 @@ fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::V
 }
 
 /// Parse the request body as JSON.
-fn parse_request_body(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> Result<serde_json::Value, FilterAction> {
-    let streaming = ctx
-        .get_metadata("openai_responses_format.stream")
-        .is_some_and(|v| v == "true");
+fn parse_request_body(body: &Option<Bytes>) -> Result<serde_json::Value, FilterAction> {
     let Some(chunk) = body.as_deref() else {
         debug!("rejecting request with missing body");
-        return Err(reject_invalid("request body is required", streaming));
+        return Err(reject_invalid("request body is required"));
     };
 
     match serde_json::from_slice(chunk) {
         Ok(v) => Ok(v),
         Err(e) => {
             debug!(error = %e, "failed to parse request body");
-            Err(reject_invalid(&format!("invalid request body: {e}"), streaming))
+            Err(reject_invalid(&format!("invalid request body: {e}")))
         },
     }
 }
@@ -181,13 +178,8 @@ fn is_bodyless_responses_request(method: &http::Method, path: &str) -> bool {
 }
 
 /// Build a 400 rejection with a Responses API error body.
-fn reject_invalid(message: &str, streaming: bool) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(
-        400,
-        "invalid_request_error",
-        message,
-        streaming,
-    ))
+fn reject_invalid(message: &str) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message))
 }
 
 /// Extract or generate a conversation ID for the request.
@@ -443,16 +435,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_rejection_has_sse_content_type() {
+    async fn streaming_request_rejection_uses_json_content_type() {
         let action = run_filter_raw("not valid json", &[("openai_responses_format.stream", "true")]).await;
         if let FilterAction::Reject(rejection) = action {
             let has_content_type = rejection
                 .headers
                 .iter()
-                .any(|(k, v)| k == "content-type" && v == "text/event-stream");
+                .any(|(k, v)| k == "content-type" && v == "application/json");
             assert!(
                 has_content_type,
-                "streaming rejection should have text/event-stream content-type"
+                "a stream:true request that fails pre-stream should still use application/json"
+            );
+            let body = rejection.body.expect("rejection should carry a JSON body");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body should be JSON");
+            assert!(
+                parsed.get("error").is_some_and(serde_json::Value::is_object),
+                "pre-stream rejection body should be a JSON error envelope, not an SSE event: {parsed}"
             );
         } else {
             panic!("expected rejection");
@@ -502,7 +500,7 @@ mod tests {
 
     #[test]
     fn reject_invalid_escapes_control_characters() {
-        let action = reject_invalid("line1\nline2", false);
+        let action = reject_invalid("line1\nline2");
         if let FilterAction::Reject(rejection) = action {
             let body = rejection.body.unwrap();
             let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
