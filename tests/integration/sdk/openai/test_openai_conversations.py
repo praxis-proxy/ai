@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#     "httpx>=0.27",
 #     "openai>=2.0",
 #     "pytest>=8.0",
 # ]
@@ -14,22 +15,22 @@ then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
 Usage:
-    cargo build -p praxis-proxy
-    uv run pytest tests/integration/scripts/test_openai_conversations.py -v
+    cargo build -p praxis-ai-proxy
+    uv run tests/integration/sdk/openai/test_openai_conversations.py -v
 """
 
-import sys
 import json
 import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
+import httpx
 import pytest
 from openai import BadRequestError, NotFoundError, OpenAI
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -43,11 +44,16 @@ def _free_port() -> int:
 
 
 def _find_binary() -> str:
-    for candidate in ["target/debug/praxis", "target/release/praxis"]:
+    configured = os.environ.get("PRAXIS_AI_BIN")
+    if configured:
+        if os.path.isfile(configured):
+            return configured
+        raise FileNotFoundError(f"PRAXIS_AI_BIN={configured!r} not found")
+    for candidate in ["target/debug/praxis-ai", "target/release/praxis-ai"]:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis binary not found — run `cargo build -p praxis-proxy` first"
+        "praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first"
     )
 
 
@@ -178,7 +184,8 @@ class TestOpenAIConversations:
         )
 
         updated = openai_client.conversations.update(
-            conversation.id, metadata={"topic": "project-x"},
+            conversation.id,
+            metadata={"topic": "project-x"},
         )
 
         assert updated.id == conversation.id
@@ -188,7 +195,8 @@ class TestOpenAIConversations:
     def test_conversation_update_nonexistent(self, openai_client):
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.update(
-                "conv_nonexistent", metadata={"topic": "nope"},
+                "conv_nonexistent",
+                metadata={"topic": "nope"},
             )
         assert exc_info.value.status_code == 404
 
@@ -269,6 +277,81 @@ class TestOpenAIConversations:
         assert item.status == "completed"
         assert item.content[0].type == "input_text"
         assert item.content[0].text == "hello"
+
+    def test_item_create_returns_all_items(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        created = openai_client.conversations.items.create(
+            conversation.id,
+            items=[
+                {
+                    "id": "item_batch_user",
+                    "type": "message",
+                    "role": "user",
+                    "content": "question",
+                },
+                {
+                    "id": "item_batch_assistant",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "answer",
+                },
+            ],
+        )
+
+        assert created.object == "list"
+        assert [item.id for item in created.data] == [
+            "item_batch_user",
+            "item_batch_assistant",
+        ]
+        assert created.first_id == "item_batch_user"
+        assert created.last_id == "item_batch_assistant"
+        assert created.has_more is False
+
+    def test_item_list_cursor_pagination_and_order(self, openai_client):
+        conversation = openai_client.conversations.create(
+            items=[
+                {
+                    "id": f"item_page_{index}",
+                    "type": "message",
+                    "role": "user",
+                    "content": f"message {index}",
+                }
+                for index in range(3)
+            ],
+        )
+
+        first = openai_client.conversations.items.list(
+            conversation.id,
+            limit=2,
+            order="asc",
+        )
+        assert [item.id for item in first.data] == [
+            "item_page_0",
+            "item_page_1",
+        ]
+        assert first.first_id == "item_page_0"
+        assert first.last_id == "item_page_1"
+        assert first.has_more is True
+
+        second = openai_client.conversations.items.list(
+            conversation.id,
+            after=first.last_id,
+            limit=2,
+            order="asc",
+        )
+        assert [item.id for item in second.data] == ["item_page_2"]
+        assert second.has_more is False
+
+        descending = openai_client.conversations.items.list(
+            conversation.id,
+            order="desc",
+        )
+        assert [item.id for item in descending.data] == [
+            "item_page_2",
+            "item_page_1",
+            "item_page_0",
+        ]
 
     def test_item_crud_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -358,6 +441,87 @@ class TestOpenAIConversations:
                 conversation_id=conversation.id,
             )
 
+    def test_item_operations_for_missing_resources(self, openai_client):
+        missing_conversation = "conv_missing_sdk_integration"
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.list(missing_conversation)
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.create(
+                missing_conversation,
+                items=[
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "unreachable",
+                    }
+                ],
+            )
+        assert exc_info.value.status_code == 404
+
+        conversation = openai_client.conversations.create()
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.retrieve(
+                "item_missing_sdk_integration",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.delete(
+                "item_missing_sdk_integration",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
+    def test_duplicate_item_id_is_rejected(self, openai_client):
+        conversation = openai_client.conversations.create(
+            items=[
+                {
+                    "id": "item_duplicate",
+                    "type": "message",
+                    "role": "user",
+                    "content": "first",
+                }
+            ],
+        )
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=[
+                    {
+                        "id": "item_duplicate",
+                        "type": "message",
+                        "role": "user",
+                        "content": "second",
+                    }
+                ],
+            )
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.parametrize(
+        "query",
+        ["limit=101", "limit=-1", "order=sideways", "after="],
+    )
+    def test_invalid_item_list_query_is_rejected(
+        self,
+        openai_client,
+        query,
+    ):
+        conversation = openai_client.conversations.create()
+        response = httpx.get(
+            f"{str(openai_client.base_url).rstrip('/')}"
+            f"/conversations/{conversation.id}/items?{query}",
+            headers={"Authorization": "Bearer not-needed"},
+            timeout=10,
+        )
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["message"]
+
     def test_conversation_invalid_metadata_type(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.conversations.create(metadata="not-an-object")
@@ -376,7 +540,8 @@ class TestOpenAIConversations:
         assert conversation.id.startswith("conv_")
 
         updated = openai_client.conversations.update(
-            conversation.id, metadata={"topic": "workflow-complete"},
+            conversation.id,
+            metadata={"topic": "workflow-complete"},
         )
         assert updated.metadata["topic"] == "workflow-complete"
         assert updated.created_at == conversation.created_at

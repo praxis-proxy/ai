@@ -53,13 +53,16 @@ const META_TOKEN_CACHE_READ: &str = "token.cache_read";
 /// Metadata key for input tokens written to the provider's prompt cache.
 const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
 
+/// Metadata key for reasoning / thinking tokens reported by the provider.
+const META_TOKEN_REASONING: &str = "token.reasoning";
+
 /// Unified token usage extracted from an AI provider response.
 ///
 /// Providers that support prompt caching also report how much of the input was
-/// served from, or written to, their cache. Those tokens are priced differently
-/// from fresh input — typically a fraction of the fresh rate for a cache read
-/// and a premium for a cache write — so they are carried alongside the totals
-/// rather than folded away.
+/// served from, or written to, their cache. Reasoning models similarly report
+/// thinking tokens separately from visible output. Both breakdowns are priced
+/// differently from the parent total, so they are carried alongside rather
+/// than folded away.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TokenUsage {
     /// Tokens in the input/prompt, cached tokens included.
@@ -83,6 +86,13 @@ struct TokenUsage {
     /// `None` when the provider did not report the count at all, as for
     /// providers whose API has no cache-write concept.
     cache_write: Option<u64>,
+
+    /// Reasoning / thinking tokens reported by the provider.
+    ///
+    /// `None` when the provider did not report the count. OpenAI and Anthropic
+    /// count these as a subset of output; Google reports them separately from
+    /// `candidatesTokenCount`.
+    reasoning: Option<u64>,
 }
 
 impl TokenUsage {
@@ -107,6 +117,15 @@ impl TokenUsage {
     fn with_cache(mut self, cache_read: Option<u64>, cache_write: Option<u64>) -> Self {
         self.cache_read = cache_read;
         self.cache_write = cache_write;
+        self
+    }
+
+    /// Attaches reasoning / thinking tokens reported by the provider.
+    ///
+    /// Pass `None` when the provider omitted the count, so absence stays
+    /// distinguishable from a reported zero.
+    fn with_reasoning(mut self, reasoning: Option<u64>) -> Self {
+        self.reasoning = reasoning;
         self
     }
 
@@ -136,6 +155,11 @@ impl TokenUsage {
     fn cache_write_tokens(self) -> Option<u64> {
         self.cache_write
     }
+
+    /// Returns reasoning / thinking tokens, or `None` when unreported.
+    fn reasoning_tokens(self) -> Option<u64> {
+        self.reasoning
+    }
 }
 
 /// Token counts recovered from a single streaming event.
@@ -155,6 +179,9 @@ struct StreamingTokens {
 
     /// Input tokens the event reports as written to the prompt cache.
     cache_write: Option<u64>,
+
+    /// Reasoning / thinking tokens the event reports.
+    reasoning: Option<u64>,
 }
 
 /// Stores normalized token usage for downstream filters, logging, and metrics.
@@ -180,11 +207,22 @@ fn set_token_status_overflow(ctx: &mut HttpFilterContext<'_>) {
 /// Each count is written only when the provider reported it, so a consumer can
 /// tell "no cache information in this response" from "cache reported zero".
 fn set_cache_token_usage(ctx: &mut HttpFilterContext<'_>, cache_read: Option<u64>, cache_write: Option<u64>) {
-    if let Some(cache_read) = cache_read {
-        ctx.set_metadata(META_TOKEN_CACHE_READ, cache_read.to_string());
-    }
+    set_optional_count(ctx, META_TOKEN_CACHE_READ, cache_read);
+    set_optional_count(ctx, META_TOKEN_CACHE_WRITE, cache_write);
+}
 
-    if let Some(cache_write) = cache_write {
-        ctx.set_metadata(META_TOKEN_CACHE_WRITE, cache_write.to_string());
+/// Stores reasoning / thinking tokens when the provider reported them.
+///
+/// OpenAI and Anthropic count these as a breakdown of output, not an addition
+/// to it. Google reports them separately from candidate output. The key is
+/// omitted entirely when the provider sent no reasoning field.
+fn set_reasoning_token_usage(ctx: &mut HttpFilterContext<'_>, reasoning: Option<u64>) {
+    set_optional_count(ctx, META_TOKEN_REASONING, reasoning);
+}
+
+/// Writes one optional count; skips the key when the provider omitted it.
+fn set_optional_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        ctx.set_metadata(key, value.to_string());
     }
 }

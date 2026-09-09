@@ -1,0 +1,35 @@
+version: 1
+id: responses/chat-malformed-compaction
+description: Malformed Responses compaction encrypted_content fails closed before Chat Completions translation.
+protocol: openai_responses
+example_config: openai/responses/responses-to-chat-completions.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.malformed_compaction
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input:
+            - type: compaction
+              id: compact_1
+              encrypted_content: "%%%not-base64%%%"
+            - role: user
+              content: What did we decide?
+          store: false
+          stream: false
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []

@@ -26,6 +26,12 @@ use crate::{
     test_utils::{make_filter_context, make_request},
 };
 
+/// Borrow owned test tool calls the way the filter passes them:
+/// the dispatch and approval paths take calls by reference.
+fn call_refs(calls: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    calls.iter().collect()
+}
+
 // =========================================================================
 // Approval Policy Parsing
 // =========================================================================
@@ -195,13 +201,8 @@ fn filter_response_body_mode() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
     assert!(
-        matches!(
-            filter.response_body_mode(),
-            praxis_filter::BodyMode::StreamBuffer {
-                max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
-            }
-        ),
-        "should buffer up to the absolute ceiling; body_limits governs the raw cap"
+        matches!(filter.response_body_mode(), praxis_filter::BodyMode::Stream),
+        "agentic responses must remain stream-compatible"
     );
 }
 
@@ -367,7 +368,7 @@ fn find_approval_required_returns_none_when_all_never() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2"}),
     ];
-    assert!(find_approval_required(&calls, &tool_map).is_none());
+    assert!(find_approval_required(&call_refs(&calls), &tool_map).is_none());
 }
 
 #[test]
@@ -377,7 +378,7 @@ fn find_approval_required_returns_first_when_absent() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2"}),
     ];
-    let pending = find_approval_required(&calls, &tool_map).unwrap();
+    let pending = find_approval_required(&call_refs(&calls), &tool_map).unwrap();
     assert_eq!(pending.tool_name, "get_weather");
 }
 
@@ -395,7 +396,7 @@ fn find_approval_required_returns_first_requiring() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2", "arguments": {"query": "rust"}}),
     ];
-    let pending = find_approval_required(&calls, &tool_map).unwrap();
+    let pending = find_approval_required(&call_refs(&calls), &tool_map).unwrap();
     assert_eq!(pending.tool_name, "search_docs");
     assert_eq!(pending.call_id, "call_2");
     assert_eq!(pending.server_label, "docs");
@@ -406,7 +407,7 @@ fn find_approval_required_defaults_to_approval_when_absent() {
     let tool_map = sample_tool_map();
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "call_1"})];
     assert!(
-        find_approval_required(&calls, &tool_map).is_some(),
+        find_approval_required(&call_refs(&calls), &tool_map).is_some(),
         "absent require_approval should default to requiring approval"
     );
 }
@@ -415,7 +416,7 @@ fn find_approval_required_defaults_to_approval_when_absent() {
 fn find_approval_required_ambiguous_tool_requires_approval() {
     let tool_map = lossy_collision_tool_map();
     let calls = vec![json!({"name": "my_server__get", "call_id": "call_1"})];
-    let pending = find_approval_required(&calls, &tool_map);
+    let pending = find_approval_required(&call_refs(&calls), &tool_map);
     assert!(
         pending.is_some(),
         "ambiguous encoded name should require approval even when all servers say never"
@@ -652,9 +653,33 @@ fn parse_call_arguments_malformed_string_returns_error() {
 #[test]
 fn parse_call_arguments_absent_defaults_to_empty_object() {
     let tc = serde_json::json!({"name": "tool"});
-    let (args, _) = parse_call_arguments(&tc, "c1", "srv", "tool").unwrap();
+    let (args, args_str) = parse_call_arguments(&tc, "c1", "srv", "tool").unwrap();
     assert!(args.is_object());
     assert!(args.as_object().unwrap().is_empty());
+    assert_eq!(
+        args_str, "{}",
+        "absent arguments keep the canonical empty-object string"
+    );
+}
+
+#[test]
+fn parse_call_arguments_string_not_double_encoded() {
+    let tc = serde_json::json!({"name": "tool", "arguments": "{\"a\": 1}"});
+    let (_, args_str) = parse_call_arguments(&tc, "c1", "srv", "tool").unwrap();
+    assert_eq!(
+        args_str, "{\"a\": 1}",
+        "string arguments keep their original representation verbatim"
+    );
+}
+
+#[test]
+fn parse_call_arguments_malformed_string_error_keeps_raw_arguments() {
+    let tc = serde_json::json!({"name": "tool", "arguments": "not-json"});
+    let err = parse_call_arguments(&tc, "c1", "srv", "tool").unwrap_err();
+    assert_eq!(
+        err.output_item["arguments"], "not-json",
+        "the malformed raw string must survive into the error body"
+    );
 }
 
 // =========================================================================
@@ -873,7 +898,7 @@ async fn execute_mcp_calls_sequential() {
     let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
-    let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
+    let results = execute_mcp_calls(&call_refs(&calls), &map, false, timeout, true).await;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].output_item["type"], "mcp_call");
 }
@@ -883,7 +908,7 @@ async fn execute_mcp_calls_parallel() {
     let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
-    let results = execute_mcp_calls(&calls, &map, true, timeout, true).await;
+    let results = execute_mcp_calls(&call_refs(&calls), &map, true, timeout, true).await;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].output_item["type"], "mcp_call");
 }
@@ -893,7 +918,7 @@ async fn execute_mcp_calls_emits_error_for_unknown_tools() {
     let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "nonexistent", "call_id": "c1"})];
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
+    let results = execute_mcp_calls(&call_refs(&calls), &map, false, timeout, true).await;
     assert_eq!(results.len(), 1);
     assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
 }
@@ -903,7 +928,7 @@ async fn execute_mcp_calls_emits_error_for_unknown_tool_without_call_id() {
     let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "nonexistent"})];
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
+    let results = execute_mcp_calls(&call_refs(&calls), &map, false, timeout, true).await;
     assert_eq!(results.len(), 1, "must emit error even without call_id");
     assert_eq!(results[0].output_item["id"], "unknown");
     assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
@@ -975,13 +1000,16 @@ fn assert_dispatch_action(ctx: &praxis_filter::HttpFilterContext<'_>, expected: 
 }
 
 #[test]
-fn on_response_body_not_end_of_stream_returns_release() {
+fn on_response_body_not_end_of_stream_continues_to_stream_parser() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     let mut body = Some(Bytes::from("data"));
     let result = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-    assert!(matches!(result, FilterAction::Release));
+    assert!(
+        matches!(result, FilterAction::Continue),
+        "stream chunks must reach the downstream openai_stream_events filter"
+    );
 }
 
 #[test]

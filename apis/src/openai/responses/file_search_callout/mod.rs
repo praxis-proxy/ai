@@ -42,6 +42,7 @@ use self::{
 };
 use crate::{
     callout_policy::OnFailure,
+    http_hop::{connection_nominates_header, is_hop_by_hop},
     openai::responses::{
         bounded_json_size,
         error::responses_error_rejection,
@@ -457,12 +458,27 @@ impl HttpFilter for FileSearchCalloutFilter {
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        }
+        // Declared `Stream` so this filter can share an iterative-router step with
+        // `responses_to_chat_completions`, which always advertises the streaming
+        // subrequest capability. A statically declared `StreamBuffer` would trip
+        // the per-step build check that rejects a streaming-capable step whose
+        // merged response body mode is `StreamBuffer`. This filter still needs the
+        // complete response to run `capture_response`, so `on_request` ratchets the
+        // runtime body mode back up to `StreamBuffer` (mirroring
+        // `openai_response_store`); a file-search request always rejects
+        // `stream: true`, so the runtime response is never actually streamed.
+        BodyMode::Stream
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // A file-search pipeline never streams (`stream: true` is rejected), so
+        // buffer the complete response for `capture_response`. Declared statically
+        // as `Stream` to stay build-compatible with a streaming-capable step;
+        // ratcheting the runtime mode up to `StreamBuffer` here restores buffering
+        // without reintroducing a static `StreamBuffer` that would trip the check.
+        ctx.set_response_body_mode(BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        });
         let action = self.execute_pending(ctx).await?;
         if matches!(action, FilterAction::Continue) {
             preserve_original_request_headers(ctx);
@@ -542,24 +558,13 @@ fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
     ctx.request_headers_to_set.extend(headers);
 }
 
-/// Whether `Connection` marks a request header as specific to one hop.
-fn connection_nominates_header(headers: &HeaderMap, name: &http::header::HeaderName) -> bool {
-    headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .any(|token| token.eq_ignore_ascii_case(name.as_str()))
-}
-
 /// Whether a header remains valid after the continuation body is rewritten.
 fn should_replay_original_header(name: &http::header::HeaderName) -> bool {
     !praxis_core::reserved_headers::is_reserved(name.as_str())
+        && !is_hop_by_hop(name.as_str())
         && !matches!(
             name.as_str(),
             "accept-encoding"
-                | "connection"
                 | "content-encoding"
                 | "content-length"
                 | "content-md5"
@@ -567,15 +572,8 @@ fn should_replay_original_header(name: &http::header::HeaderName) -> bool {
                 | "expect"
                 | "host"
                 | "idempotency-key"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
                 | "signature"
                 | "signature-input"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
         )
 }
 
@@ -1153,7 +1151,10 @@ fn combined_output_fits(state: &ResponsesState, incoming_response: &Value, max_b
 }
 
 /// Return whether an output item is a provider-hosted built-in tool call.
-fn is_builtin_tool_call(item: &Value) -> bool {
+///
+/// Shared with `openai_web_search`, which counts non-web built-in calls against
+/// the same client-declared `max_tool_calls` budget.
+pub(crate) fn is_builtin_tool_call(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
         Some(
@@ -1326,7 +1327,11 @@ fn unsupported_streaming_rejection(ctx: &HttpFilterContext<'_>) -> Option<Filter
 }
 
 /// Return whether one output item still requires local file-search execution.
-fn is_pending_file_search_call(item: &Value) -> bool {
+///
+/// Shared with `openai_web_search`, which must exclude these pending
+/// placeholders when counting non-web built-in calls against the shared
+/// `max_tool_calls` budget, mirroring [`remaining_file_search_call_budget`].
+pub(crate) fn is_pending_file_search_call(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("file_search_call")
         && matches!(
             item.get("status").and_then(Value::as_str),

@@ -7,11 +7,11 @@
 //! request shape, transforms compatible non-streaming successes back, and
 //! normalizes pre-stream upstream errors for both request modes. Successful
 //! streaming SSE transformation is handled by the separate
-//! `anthropic_stream_events` filter.
+//! `anthropic_messages_to_chat_completions_stream` filter.
 //!
-//! The filter name preserves the proposal/config surface. `OpenAI` here
-//! means the Chat Completions wire shape, not the Responses API or
-//! OpenAI-only backends.
+//! The name refers to the Chat Completions wire shape, not the OpenAI
+//! Responses API: any Chat Completions-compatible backend is a valid
+//! target, not only OpenAI.
 
 mod config;
 pub(crate) mod request;
@@ -24,63 +24,64 @@ use praxis_filter::{
 };
 use tracing::{debug, warn};
 
-use self::config::{AnthropicToOpenaiConfig, build_config};
+use self::config::{AnthropicMessagesToChatCompletionsConfig, build_config};
 use crate::anthropic::wire;
 
 /// Metadata key selecting success or error response transformation.
-const RESPONSE_TRANSFORM_KEY: &str = "anthropic_to_openai.response_transform";
+const RESPONSE_TRANSFORM_KEY: &str = "anthropic_messages_to_chat_completions.response_transform";
 /// Response transform marker for a successful response.
 const RESPONSE_TRANSFORM_SUCCESS: &str = "success";
 /// Response transform marker for an upstream error.
 const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// Metadata key preserving the upstream error status for the body phase.
-const RESPONSE_STATUS_KEY: &str = "anthropic_to_openai.response_status";
+const RESPONSE_STATUS_KEY: &str = "anthropic_messages_to_chat_completions.response_status";
 /// Metadata key preserving the upstream request ID for the body phase.
-const RESPONSE_REQUEST_ID_KEY: &str = "anthropic_to_openai.response_request_id";
+const RESPONSE_REQUEST_ID_KEY: &str = "anthropic_messages_to_chat_completions.response_request_id";
 
 // -----------------------------------------------------------------------------
-// AnthropicToOpenaiFilter
+// AnthropicMessagesToChatCompletionsFilter
 // -----------------------------------------------------------------------------
 
 /// Transforms Anthropic Messages API requests to Chat Completions-compatible
-/// request bodies and transforms compatible responses back. The filter name
-/// refers to the OpenAI Chat Completions wire shape, not the Responses API;
-/// non-OpenAI compatible backends are valid targets.
+/// request bodies and transforms compatible responses back. The name refers to
+/// the Chat Completions wire shape, not the OpenAI Responses API; any Chat
+/// Completions-compatible backend is a valid target, not only OpenAI.
 ///
 /// # YAML
 ///
 /// ```yaml
-/// filter: anthropic_to_openai
+/// filter: anthropic_messages_to_chat_completions
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: anthropic_to_openai
+/// filter: anthropic_messages_to_chat_completions
 /// max_body_bytes: 1048576
 /// ```
-pub struct AnthropicToOpenaiFilter {
+pub struct AnthropicMessagesToChatCompletionsFilter {
     /// Parsed and validated configuration.
-    config: AnthropicToOpenaiConfig,
+    config: AnthropicMessagesToChatCompletionsConfig,
 }
 
-impl AnthropicToOpenaiFilter {
+impl AnthropicMessagesToChatCompletionsFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: AnthropicToOpenaiConfig = parse_filter_config("anthropic_to_openai", config)?;
+        let cfg: AnthropicMessagesToChatCompletionsConfig =
+            parse_filter_config("anthropic_messages_to_chat_completions", config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
 }
 
 #[async_trait]
-impl HttpFilter for AnthropicToOpenaiFilter {
+impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     fn name(&self) -> &'static str {
-        "anthropic_to_openai"
+        "anthropic_messages_to_chat_completions"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -183,7 +184,7 @@ impl HttpFilter for AnthropicToOpenaiFilter {
         } else {
             let request_model = ctx
                 .filter_metadata
-                .get("anthropic_to_openai.model")
+                .get("anthropic_messages_to_chat_completions.model")
                 .map_or("", String::as_str);
             let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
             if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id) {
@@ -202,7 +203,7 @@ impl HttpFilter for AnthropicToOpenaiFilter {
 /// Extract streaming and model metadata from the request body.
 fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, bytes: &[u8]) {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         return;
     };
 
@@ -211,7 +212,7 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, bytes: &[u8]) {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     ctx.set_metadata(
-        "anthropic_to_openai.streaming",
+        "anthropic_messages_to_chat_completions.streaming",
         if is_streaming { "true" } else { "false" },
     );
 
@@ -220,7 +221,7 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, bytes: &[u8]) {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .unwrap_or_default();
-    ctx.set_metadata("anthropic_to_openai.model", model);
+    ctx.set_metadata("anthropic_messages_to_chat_completions.model", model);
 }
 
 /// Transform the request body and return the appropriate filter action.
@@ -298,7 +299,7 @@ fn should_transform_response(ctx: &HttpFilterContext<'_>) -> bool {
 fn response_transform(ctx: &HttpFilterContext<'_>) -> Option<&'static str> {
     let is_streaming = ctx
         .filter_metadata
-        .get("anthropic_to_openai.streaming")
+        .get("anthropic_messages_to_chat_completions.streaming")
         .is_some_and(|v| v == "true");
     let status = ctx.response_header.as_ref().map(|response| response.status);
     let is_error = status.is_some_and(|status| status.is_client_error() || status.is_server_error());
@@ -388,15 +389,19 @@ mod tests {
     #[test]
     fn default_config_parses() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
 
-        assert_eq!(filter.name(), "anthropic_to_openai", "filter name should match");
+        assert_eq!(
+            filter.name(),
+            "anthropic_messages_to_chat_completions",
+            "filter name should match"
+        );
     }
 
     #[test]
     fn unknown_config_field_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("strip_unsupported: true").unwrap();
-        let result = AnthropicToOpenaiFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml);
 
         assert!(result.is_err(), "unknown config fields should be rejected");
     }
@@ -404,7 +409,7 @@ mod tests {
     #[test]
     fn zero_max_body_bytes_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 0").unwrap();
-        let result = AnthropicToOpenaiFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml);
 
         assert!(result.is_err(), "zero max_body_bytes should be rejected");
     }
@@ -412,7 +417,7 @@ mod tests {
     #[test]
     fn rejects_max_body_bytes_above_ceiling() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 67108865").unwrap();
-        let result = AnthropicToOpenaiFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml);
 
         assert!(
             result.is_err(),
@@ -423,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn error_response_state_survives_body_phase_without_headers() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
         let mut response = make_response();
@@ -433,8 +438,8 @@ mod tests {
             .headers
             .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("72"));
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true");
-        ctx.set_metadata("anthropic_to_openai.model", "gpt-4");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.model", "gpt-4");
         let action = filter.on_response(&mut ctx).await.unwrap();
 
         assert!(matches!(action, FilterAction::Continue), "filter should continue");
@@ -471,7 +476,7 @@ mod tests {
     async fn rewritten_errors_remove_stale_representation_headers() {
         for content_encoding in ["gzip", "br"] {
             let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 4096").unwrap();
-            let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+            let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
             let request = make_request(Method::POST, "/v1/messages");
             let mut ctx = make_filter_context(&request);
             let mut response = make_response();
@@ -536,11 +541,15 @@ mod tests {
         extract_request_metadata(&mut ctx, bytes);
 
         assert_eq!(
-            ctx.filter_metadata.get("anthropic_to_openai.streaming").unwrap(),
+            ctx.filter_metadata
+                .get("anthropic_messages_to_chat_completions.streaming")
+                .unwrap(),
             "true"
         );
         assert_eq!(
-            ctx.filter_metadata.get("anthropic_to_openai.model").unwrap(),
+            ctx.filter_metadata
+                .get("anthropic_messages_to_chat_completions.model")
+                .unwrap(),
             "claude-opus-4-8"
         );
     }
@@ -554,10 +563,17 @@ mod tests {
         extract_request_metadata(&mut ctx, bytes);
 
         assert_eq!(
-            ctx.filter_metadata.get("anthropic_to_openai.streaming").unwrap(),
+            ctx.filter_metadata
+                .get("anthropic_messages_to_chat_completions.streaming")
+                .unwrap(),
             "false"
         );
-        assert_eq!(ctx.filter_metadata.get("anthropic_to_openai.model").unwrap(), "gpt-4");
+        assert_eq!(
+            ctx.filter_metadata
+                .get("anthropic_messages_to_chat_completions.model")
+                .unwrap(),
+            "gpt-4"
+        );
     }
 
     #[test]
@@ -568,12 +584,15 @@ mod tests {
         extract_request_metadata(&mut ctx, b"not json");
 
         assert_eq!(
-            ctx.filter_metadata.get("anthropic_to_openai.streaming").unwrap(),
+            ctx.filter_metadata
+                .get("anthropic_messages_to_chat_completions.streaming")
+                .unwrap(),
             "false",
             "invalid JSON should default streaming to false"
         );
         assert!(
-            !ctx.filter_metadata.contains_key("anthropic_to_openai.model"),
+            !ctx.filter_metadata
+                .contains_key("anthropic_messages_to_chat_completions.model"),
             "invalid JSON should not set model"
         );
     }
@@ -592,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn on_request_prevents_upstream_response_encoding() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
 
@@ -643,7 +662,7 @@ mod tests {
     fn should_transform_response_streaming_returns_false() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
         let mut response = make_response();
         ctx.response_header = Some(&mut response);
 
@@ -657,7 +676,7 @@ mod tests {
     fn should_transform_response_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         ctx.response_header = Some(&mut response);
 
@@ -671,7 +690,7 @@ mod tests {
     fn should_not_transform_encoded_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response
             .headers
@@ -687,10 +706,10 @@ mod tests {
     #[tokio::test]
     async fn encoded_non_streaming_success_passes_through_unchanged() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response
             .headers
@@ -717,10 +736,10 @@ mod tests {
     #[tokio::test]
     async fn non_json_success_passes_through_unchanged() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response
             .headers
@@ -748,10 +767,10 @@ mod tests {
     async fn successful_responses_canonicalize_request_id() {
         for is_streaming in ["false", "true"] {
             let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-            let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+            let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
             let request = make_request(Method::POST, "/v1/messages");
             let mut ctx = make_filter_context(&request);
-            ctx.set_metadata("anthropic_to_openai.streaming", is_streaming);
+            ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", is_streaming);
             let mut response = make_response();
             response.headers.insert("x-request-id", "req_success".parse().unwrap());
             ctx.response_header = Some(&mut response);
@@ -773,7 +792,7 @@ mod tests {
     fn should_not_transform_partial_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response.status = StatusCode::PARTIAL_CONTENT;
         response.headers.insert(
@@ -794,7 +813,7 @@ mod tests {
             for status in [StatusCode::BAD_REQUEST, StatusCode::INTERNAL_SERVER_ERROR] {
                 let request = make_request(Method::POST, "/v1/messages");
                 let mut ctx = make_filter_context(&request);
-                ctx.set_metadata("anthropic_to_openai.streaming", is_streaming);
+                ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", is_streaming);
                 let mut response = make_response();
                 response.status = status;
                 ctx.response_header = Some(&mut response);
@@ -811,7 +830,7 @@ mod tests {
     fn should_not_transform_redirect_response() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_to_openai.streaming", "false");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         let mut response = make_response();
         response.status = StatusCode::FOUND;
         ctx.response_header = Some(&mut response);
@@ -863,11 +882,11 @@ mod tests {
     #[tokio::test]
     async fn malformed_non_streaming_success_returns_anthropic_api_error() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        let filter = AnthropicToOpenaiFilter::from_config(&yaml).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_to_openai.streaming", "false");
-        ctx.set_metadata("anthropic_to_openai.model", "gpt-4");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.set_metadata("anthropic_messages_to_chat_completions.model", "gpt-4");
         let mut response = make_response();
         response
             .headers

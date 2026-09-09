@@ -18,6 +18,7 @@ pub mod callout;
 pub mod gcp;
 pub mod guardrails;
 pub mod inference;
+pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
 pub mod prompt_enrich;
@@ -38,6 +39,7 @@ pub use callout::HttpCalloutFilter;
 pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use inference::ModelToHeaderFilter;
+pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};

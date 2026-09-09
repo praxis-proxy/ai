@@ -8,6 +8,9 @@ mod config;
 /// Finite provider error normalization.
 mod error;
 
+/// Incremental Chat Completions SSE to Responses SSE conversion.
+mod stream;
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -23,14 +26,16 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
+use serde::Deserialize;
 use tracing::{debug, trace, warn};
 
 use self::{
     config::{ResponsesToChatCompletionsConfig, build_config},
     error::normalize_provider_error,
+    stream::{SnapshotInputs, StreamConverter},
 };
 use super::{
     body_limits::reject_rewritten_body_too_large,
@@ -62,6 +67,9 @@ const RESPONSE_TRANSFORM_SUCCESS: &str = "success";
 /// Marker for a finite provider error response.
 const RESPONSE_TRANSFORM_ERROR: &str = "error";
 
+/// Marker for a streaming Chat Completions SSE response.
+const RESPONSE_TRANSFORM_STREAM: &str = "stream";
+
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
 /// The filter consumes the classification metadata and `ResponsesState`
@@ -72,8 +80,9 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// Supported hosted web-search tools are exposed to the Chat backend as a
 /// private, bounded `web_search` function. Returned calls are restored to
 /// canonical `web_search_call` output before downstream agentic filters run.
-/// Chat Completions SSE is left byte-for-byte unchanged for the separate
-/// incremental stream converter.
+/// Streaming Chat Completions SSE responses are translated incrementally into
+/// Responses SSE events by an internal state machine that reuses the finite
+/// translation builders for the terminal snapshot.
 ///
 /// Configure `path_rewrite` after this filter when the upstream endpoint must
 /// change from `/v1/responses` to `/v1/chat/completions`.
@@ -82,12 +91,39 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// `openai_response_store` and `openai_responses_rehydrate` earlier in the
 /// request pipeline. The filter fails closed if stored history has not been
 /// resolved, preventing a continuation from silently losing prior turns.
-/// Chat Completions SSE response conversion is tracked separately in
-/// [issue #36](https://github.com/praxis-proxy/ai/issues/36).
 /// For finite web-search loops, place `openai_web_search` and
 /// `openai_agentic_loop` before this filter in an iterative-router step. The
 /// reverse response order then restores the hosted call before those filters
 /// inspect it.
+///
+/// To emit translated SSE events incrementally, this filter forces the
+/// reconciled response body mode to `Stream` for the entire filter chain. The
+/// protocol layer reconciles a single chain-wide response body mode with no
+/// per-filter provenance, so this downgrade cannot be scoped to one neighbor: it
+/// overrides every response filter's `StreamBuffer` requirement, not only
+/// `openai_response_store`'s. Only compose response-body filters after this one
+/// that tolerate incremental fragments; `openai_stream_events` and
+/// `openai_response_store` are compatible because they persist streamed turns
+/// from the accumulator, not a buffered body, whereas any other response-body
+/// rewriter needing the complete buffered body would instead receive fragments.
+///
+/// # Streaming through the agentic loop
+///
+/// Because this filter runs inside the iterative router, it always declares the
+/// streaming subrequest capability and selects the transport per request from
+/// the effective `stream` bit: an effective `"stream": true` request uses
+/// Praxis's typed streaming transport, and a buffered request uses the buffered
+/// transport. Selecting streaming keeps each translated per-round stream internal
+/// to the router instead of delivering the whole upstream SSE body to
+/// `openai_agentic_loop` as one buffered blob — a blob is not a Responses
+/// resource, so the loop could not detect a returned `web_search_call` and would
+/// terminate before any search dispatches. With streaming, `openai_web_search`
+/// dispatches the search, inference resumes, and `openai_stream_events` (with
+/// `logical_stream: true`, placed first in the step) composes one client-facing
+/// Responses SSE lifecycle across the model, search, and resumed model output.
+/// Every response filter co-located in a step with this one must therefore use
+/// `BodyMode::Stream`; a static `StreamBuffer` filter in the same step must
+/// instead buffer dynamically (see `openai_file_search_callout`).
 ///
 /// # YAML
 ///
@@ -192,6 +228,104 @@ impl ResponsesToChatCompletionsFilter {
             },
         }
     }
+
+    /// Install the streaming SSE converter while response headers are mutable.
+    ///
+    /// Rejects unsupported representations (non-`200`, content-encoded, or
+    /// ranged) before headers commit and fails closed when the response id or
+    /// creation timestamp is unavailable.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "mirrors the fallible response dispatch handlers so on_response can return every branch uniformly with `?`/`return`"
+    )]
+    fn install_stream_converter(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        let streaming_requested = request_is_streaming(ctx);
+        let Some(status) = ctx.response_header.as_ref().map(|response| response.status) else {
+            return Ok(FilterAction::Continue);
+        };
+        if !streaming_requested {
+            return Ok(sse_for_non_streaming_rejection());
+        }
+        if status != http::StatusCode::OK || has_unsupported_success_representation(ctx) {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                "upstream provider returned an unsupported response representation",
+                streaming_requested,
+            )));
+        }
+        let Some((response_id, created_at)) = stream_identity(ctx) else {
+            return Ok(missing_pipeline_state(streaming_requested));
+        };
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
+        // Downgrade the reconciled pipeline body mode to `Stream`. A downstream
+        // `openai_response_store` declares `StreamBuffer`, so without this the
+        // protocol layer buffers the raw first chunk and, when the store
+        // releases the stream, flushes that raw chunk verbatim — discarding this
+        // filter's translation of it. Opting out of buffering lets each
+        // translated chunk flow incrementally; the store still persists streamed
+        // turns from the `openai_stream_events` accumulator, not the body buffer.
+        //
+        // This body mode is reconciled chain-wide with no per-filter provenance,
+        // so the downgrade cannot be scoped to `openai_response_store`: it applies
+        // to every response filter. Composing any other downstream response-body
+        // rewriter that needs the complete buffered body is therefore unsupported
+        // (see the filter's "Response body mode" documentation).
+        //
+        // `set_response_body_mode` ratchets modes up only (StreamBuffer > Stream)
+        // and cannot express this downgrade, so assign the field directly. The
+        // protocol layer's `clamp_body_mode_to_ceiling` documents this exact
+        // opt-out as always memory-safe.
+        ctx.response_body_mode = BodyMode::Stream;
+        prepare_transformed_stream_headers(ctx);
+        ctx.insert_filter_state(StreamConverter::new(
+            response_id,
+            created_at,
+            self.config.stream_limits(),
+        ));
+        Ok(FilterAction::Continue)
+    }
+
+    /// Translate one streaming response body callback incrementally.
+    ///
+    /// Emits only the Responses SSE events completed by the current chunk;
+    /// partial provider framing is never forwarded. Recoverable translation
+    /// failures surface as a `response.failed` event from the converter, so only
+    /// internal serialization failures propagate as [`FilterError`].
+    fn transform_stream_response(
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let Some(mut converter) = ctx.remove_filter_state::<StreamConverter>() else {
+            return Ok(FilterAction::Continue);
+        };
+        let now = ctx.time_source.now().as_secs();
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return Err("responses_to_chat_completions: missing Responses state for streaming translation".into());
+        };
+        let inputs = SnapshotInputs {
+            request_body: &state.request_body,
+            original_tool_choice: state.original_tool_choice.as_ref(),
+            now,
+        };
+
+        let mut out = Vec::new();
+        if let Some(chunk) = body.take()
+            && let Some(events) = converter.push(&chunk, &inputs)?
+        {
+            out.extend_from_slice(&events);
+        }
+        if end_of_stream && let Some(events) = converter.finish(&inputs)? {
+            out.extend_from_slice(&events);
+        }
+
+        *body = (!out.is_empty()).then(|| Bytes::from(out));
+        if !end_of_stream {
+            ctx.insert_filter_state(converter);
+        }
+        Ok(FilterAction::Continue)
+    }
 }
 
 #[async_trait]
@@ -221,6 +355,18 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         BodyAccess::ReadWrite
     }
 
+    fn may_select_streaming_subrequest_response(&self) -> bool {
+        // This filter runs inside the iterative router and always advertises the
+        // streaming subrequest capability. The transport is chosen per request in
+        // `on_request_body` from the effective `stream` bit: an effective
+        // `"stream": true` request streams so each translated per-round stream
+        // stays internal to the router (letting `openai_agentic_loop` parse it and
+        // dispatch tools), and a buffered request buffers. A build-time flag would
+        // make a `stream: true` request silently buffer — and so fail to dispatch
+        // the search — by default, so the capability is declared unconditionally.
+        true
+    }
+
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
@@ -228,6 +374,17 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if ctx.get_metadata(ARMED_KEY) != Some("true") {
             return Ok(FilterAction::Continue);
+        }
+
+        if is_sse_response(ctx) {
+            if ctx.response_header.as_ref().map(|response| response.status) == Some(http::StatusCode::OK) {
+                return self.install_stream_converter(ctx);
+            }
+            return Ok(non_ok_sse_rejection(ctx));
+        }
+
+        if is_non_sse_streaming_success(ctx) {
+            return Ok(non_sse_success_for_streaming_rejection());
         }
 
         let transform = match finite_response_transform(ctx) {
@@ -257,15 +414,20 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if ctx.get_metadata(ARMED_KEY) != Some("true")
-            || ctx.get_metadata(RESPONSE_TRANSFORM_KEY).is_none()
-            || !end_of_stream
-        {
+        if ctx.get_metadata(ARMED_KEY) != Some("true") {
             return Ok(FilterAction::Continue);
         }
 
-        self.transform_finite_response(ctx, body)?;
-        Ok(FilterAction::Continue)
+        match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
+            Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
+            Some(_) => {
+                if end_of_stream {
+                    self.transform_finite_response(ctx, body)?;
+                }
+                Ok(FilterAction::Continue)
+            },
+            None => Ok(FilterAction::Continue),
+        }
     }
 
     async fn on_request_body(
@@ -289,6 +451,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
         ctx.set_metadata(ARMED_KEY, "true");
+        select_terminal_response_mode(ctx, body);
         let now = ctx.time_source.now().as_secs();
         let created_at = ctx
             .extensions
@@ -298,6 +461,40 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
 
         Ok(FilterAction::Continue)
     }
+}
+
+/// Narrow deserialization target for the provider-visible stream bit.
+///
+/// Only `stream` participates in transport selection; every other translated
+/// request field is intentionally ignored.
+#[derive(Deserialize)]
+struct EffectiveResponseMode {
+    /// Whether the translated outbound Chat Completions request asks for SSE.
+    #[serde(default)]
+    stream: bool,
+}
+
+/// Align the typed Praxis response transport with the translated outbound body.
+///
+/// The translated Chat Completions body carries the effective `stream` bit
+/// copied from the client Responses request, so this selects the transport
+/// matching the bytes it leaves for the backend: incremental typed streaming for
+/// an SSE request, buffered otherwise. Selecting streaming is what keeps each
+/// translated per-round stream internal to the iterative router — buffering it
+/// would deliver the whole SSE body to `openai_agentic_loop` as an opaque blob
+/// it cannot parse as a Responses resource, so the loop would terminate before
+/// `openai_web_search` ever dispatches.
+fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) {
+    let mode = if body
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<EffectiveResponseMode>(bytes).ok())
+        .is_some_and(|selection| selection.stream)
+    {
+        SubRequestResponseMode::Streaming
+    } else {
+        SubRequestResponseMode::Buffered
+    };
+    ctx.set_subrequest_response_mode(mode);
 }
 
 /// Decide whether the current request should translate, release, or fail closed.
@@ -388,6 +585,12 @@ fn is_sse_response(ctx: &HttpFilterContext<'_>) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
+/// Return whether a streaming request received a successful non-SSE response.
+fn is_non_sse_streaming_success(ctx: &HttpFilterContext<'_>) -> bool {
+    request_is_streaming(ctx)
+        && ctx.response_header.as_ref().map(|response| response.status) == Some(http::StatusCode::OK)
+}
+
 /// Read and validate the status captured before response headers were committed.
 fn captured_response_status(ctx: &HttpFilterContext<'_>) -> Result<http::StatusCode, FilterError> {
     let status = ctx
@@ -470,6 +673,39 @@ fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
     }
 }
 
+/// Read the response id and creation timestamp needed to seed the converter.
+fn stream_identity(ctx: &HttpFilterContext<'_>) -> Option<(String, u64)> {
+    let state = ctx.extensions.get::<ResponsesState>();
+    let response_id = ctx
+        .get_metadata("responses.response_id")
+        .map(str::to_owned)
+        .or_else(|| state.and_then(|state| state.response_id.clone()))?;
+    let created_at = ctx
+        .get_metadata(CREATED_AT_KEY)
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| state.and_then(|state| state.response_created_at))?;
+    Some((response_id, created_at))
+}
+
+/// Strip representation metadata invalidated by rewriting a streaming body while
+/// preserving the `text/event-stream` media type shared by both SSE formats.
+fn prepare_transformed_stream_headers(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(response) = &mut ctx.response_header {
+        response.headers.remove(http::header::CONTENT_LENGTH);
+        response.headers.remove(http::header::CONTENT_ENCODING);
+        response.headers.remove(http::header::CONTENT_RANGE);
+        response.headers.remove(http::header::ETAG);
+        for header in ["content-digest", "content-md5", "digest", "repr-digest"] {
+            response.headers.remove(header);
+        }
+        response.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        ctx.response_headers_modified = true;
+    }
+}
+
 /// Convert a finite successful Chat response into a Responses resource.
 fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Result<Bytes, FilterError> {
     let state = ctx
@@ -498,6 +734,42 @@ fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Resul
     let serialized = serde_json::to_vec(&translated)
         .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
     Ok(Bytes::from(serialized))
+}
+
+/// Build the fail-closed action for an SSE backend body on a non-streaming
+/// request.
+///
+/// The client sent `stream:false` and expects a single finite JSON response. An
+/// SSE backend body cannot satisfy that contract, and the finite path cannot
+/// parse it as JSON, so fail closed with a finite error rather than translate it
+/// into a Responses event stream the client never requested.
+fn sse_for_non_streaming_rejection() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        "upstream provider returned a streaming response for a non-streaming request",
+        false,
+    ))
+}
+
+/// Reject a successful finite response that cannot satisfy a streaming client.
+fn non_sse_success_for_streaming_rejection() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        "upstream provider returned a non-streaming success response for a streaming request",
+        true,
+    ))
+}
+
+/// Reject a provider error stream without leaking Chat Completions framing.
+fn non_ok_sse_rejection(ctx: &HttpFilterContext<'_>) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        "upstream provider returned an error event stream",
+        request_is_streaming(ctx),
+    ))
 }
 
 /// Build the fail-closed action for missing classifier or validator state.

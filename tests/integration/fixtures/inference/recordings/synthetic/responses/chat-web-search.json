@@ -48,7 +48,7 @@
             "value": {
               "background": false,
               "completed_at": 0,
-              "created_at": "1970-01-01T00:00:00Z",
+              "created_at": 0,
               "error": null,
               "frequency_penalty": 0.0,
               "id": "resp_recorded_0001",

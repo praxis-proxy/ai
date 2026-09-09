@@ -365,6 +365,10 @@ pub struct ScenarioExpectation {
     /// The expected client response body representation.
     pub client_body_kind: BodyKind,
     /// The expected upstream request path.
+    ///
+    /// An empty path means the turn must fail before contacting the provider.
+    /// Replay then records an empty upstream exchange and does not script a
+    /// backend response.
     pub upstream_path: String,
     /// The expected upstream request body representation.
     pub upstream_body_kind: BodyKind,

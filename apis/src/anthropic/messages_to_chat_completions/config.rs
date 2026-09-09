@@ -14,15 +14,15 @@ use serde::Deserialize;
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 
 // -----------------------------------------------------------------------------
-// AnthropicToOpenaiConfig
+// AnthropicMessagesToChatCompletionsConfig
 // -----------------------------------------------------------------------------
 
-/// YAML configuration for the [`AnthropicToOpenaiFilter`].
+/// YAML configuration for the [`AnthropicMessagesToChatCompletionsFilter`].
 ///
-/// [`AnthropicToOpenaiFilter`]: super::AnthropicToOpenaiFilter
+/// [`AnthropicMessagesToChatCompletionsFilter`]: super::AnthropicMessagesToChatCompletionsFilter
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AnthropicToOpenaiConfig {
+pub(crate) struct AnthropicMessagesToChatCompletionsConfig {
     /// Maximum body size in bytes for `StreamBuffer` mode.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
@@ -38,7 +38,9 @@ fn default_max_body_bytes() -> usize {
 // -----------------------------------------------------------------------------
 
 /// Validate the parsed configuration.
-pub(crate) fn build_config(cfg: AnthropicToOpenaiConfig) -> Result<AnthropicToOpenaiConfig, FilterError> {
-    validate_max_body_bytes("anthropic_to_openai", cfg.max_body_bytes)?;
+pub(crate) fn build_config(
+    cfg: AnthropicMessagesToChatCompletionsConfig,
+) -> Result<AnthropicMessagesToChatCompletionsConfig, FilterError> {
+    validate_max_body_bytes("anthropic_messages_to_chat_completions", cfg.max_body_bytes)?;
     Ok(cfg)
 }

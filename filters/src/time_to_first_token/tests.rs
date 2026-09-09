@@ -240,11 +240,11 @@ fn resolve_model_anthropic() {
 }
 
 #[test]
-fn resolve_model_anthropic_to_openai() {
+fn resolve_model_anthropic_messages_to_chat_completions() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.set_metadata("anthropic_to_openai.model", "claude-haiku-4-5");
+    ctx.set_metadata("anthropic_messages_to_chat_completions.model", "claude-haiku-4-5");
     assert_eq!(resolve_model(&ctx), "claude-haiku-4-5");
 }
 
@@ -271,7 +271,7 @@ fn resolve_model_rejects_control_characters() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.set_metadata("anthropic_to_openai.model", "model\ninjection");
+    ctx.set_metadata("anthropic_messages_to_chat_completions.model", "model\ninjection");
     assert_eq!(resolve_model(&ctx), "unknown");
 }
 

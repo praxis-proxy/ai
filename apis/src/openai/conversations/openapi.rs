@@ -167,6 +167,61 @@ mod tests {
     }
 
     #[test]
+    fn generated_append_items_body_omits_top_level_type() {
+        let document = implementation_openapi_value().unwrap();
+        let base = "/components/schemas/CreateConversationItemsRequest";
+
+        assert!(
+            document.pointer(&format!("{base}/type")).is_none(),
+            "the append-items body omits the top-level type to match the official inline schema"
+        );
+        assert_eq!(
+            document.pointer(&format!("{base}/required/0")),
+            Some(&Value::String("items".to_owned())),
+            "the append-items body requires the items property"
+        );
+        assert_eq!(
+            document.pointer(&format!("{base}/properties/items/items/$ref")),
+            Some(&Value::String("#/components/schemas/InputItem".to_owned())),
+            "the append-items array references the InputItem union"
+        );
+    }
+
+    #[test]
+    fn generated_list_items_limit_matches_reference_schema() {
+        let document = serde_json::to_value(implementation_openapi()).unwrap();
+        let parameters = document
+            .pointer("/paths/~1conversations~1{conversation_id}~1items/get/parameters")
+            .and_then(Value::as_array)
+            .unwrap();
+        let limit = parameters
+            .iter()
+            .find(|parameter| parameter.get("name") == Some(&Value::String("limit".to_owned())))
+            .unwrap();
+
+        assert_eq!(limit["in"], "query");
+        assert_eq!(limit["required"], false);
+        assert_eq!(
+            limit.pointer("/schema/type"),
+            Some(&Value::String("integer".to_owned())),
+            "limit schema should be an integer"
+        );
+        assert_eq!(
+            limit.pointer("/schema/default"),
+            Some(&Value::Number(serde_json::Number::from(20_u64))),
+            "limit schema should carry the reference default of 20"
+        );
+        assert!(
+            limit.pointer("/schema/format").is_none(),
+            "limit schema must not add the int32 format the reference omits"
+        );
+        assert!(
+            limit.pointer("/schema/minimum").is_none(),
+            "limit schema must not add the minimum the reference omits"
+        );
+    }
+
+    #[test]
     fn generated_create_request_contract_matches_runtime() {
         let document = serde_json::to_value(implementation_openapi()).unwrap();
 

@@ -600,11 +600,22 @@ pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result
     };
     map.insert("id".to_owned(), Value::String(item_id.clone()));
     normalize_message_item(&mut map)?;
-    map.entry("status".to_owned())
-        .or_insert_with(|| Value::String("completed".to_owned()));
+    default_item_status(&mut map);
     let item = Value::Object(map);
     validate_output_item(&item)?;
     Ok((item_id, item))
+}
+
+/// Default a missing or `null` item `status` to `completed`.
+///
+/// The API contract requires a concrete status enum on returned items, but some
+/// backends emit `status: null` (or omit it) on output items such as reasoning.
+/// Treat a present-but-null status the same as an absent one so append-back does
+/// not fail closed on schema validation.
+fn default_item_status(map: &mut Map<String, Value>) {
+    if map.get("status").is_none_or(Value::is_null) {
+        map.insert("status".to_owned(), Value::String("completed".to_owned()));
+    }
 }
 
 /// Normalize easy SDK message inputs into conversation message response objects.
@@ -649,8 +660,33 @@ fn normalize_message_content(role: &str, content: Value) -> Result<Value, String
             };
             Ok(Value::Array(vec![content_item]))
         },
-        Value::Array(_) => Ok(content),
+        Value::Array(mut parts) => {
+            if role == "assistant" {
+                normalize_assistant_content_parts(&mut parts);
+            }
+            Ok(Value::Array(parts))
+        },
         _ => Err("message content must be a string or array".to_owned()),
+    }
+}
+
+/// Fill in the optional `annotations` and `logprobs` fields that some backends
+/// omit or send as `null` on assistant `output_text` parts, so append-back
+/// matches the API contract.
+fn normalize_assistant_content_parts(parts: &mut [Value]) {
+    for part in parts {
+        let Some(part) = part.as_object_mut() else {
+            continue;
+        };
+        if part.get("type").and_then(Value::as_str) != Some("output_text") {
+            continue;
+        }
+        if part.get("annotations").is_none_or(Value::is_null) {
+            part.insert("annotations".to_owned(), Value::Array(Vec::new()));
+        }
+        if part.get("logprobs").is_none_or(Value::is_null) {
+            part.insert("logprobs".to_owned(), Value::Array(Vec::new()));
+        }
     }
 }
 
@@ -1070,6 +1106,57 @@ mod tests {
 
     use super::*;
     use crate::store::SqliteResponseStore;
+
+    #[test]
+    fn assistant_output_text_normalizes_nullable_provider_fields() {
+        let normalized = normalize_message_content(
+            "assistant",
+            serde_json::json!([{
+                "type": "output_text",
+                "text": "hello",
+                "annotations": [],
+                "logprobs": null
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(normalized[0]["annotations"], serde_json::json!([]));
+        assert_eq!(normalized[0]["logprobs"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn reasoning_item_with_null_status_normalizes_and_validates() {
+        // Backends such as vLLM emit `status: null` on reasoning output items;
+        // the status must be defaulted before it satisfies the item contract.
+        let mut map = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "\n\n"}],
+            "encrypted_content": null,
+            "status": null
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert!(validate_output_item(&Value::Object(map.clone())).is_err());
+
+        default_item_status(&mut map);
+
+        assert_eq!(map["status"], serde_json::json!("completed"));
+        validate_output_item(&Value::Object(map)).unwrap();
+    }
+
+    #[test]
+    fn default_item_status_preserves_existing_status() {
+        let mut map = serde_json::json!({"status": "in_progress"})
+            .as_object()
+            .unwrap()
+            .clone();
+        default_item_status(&mut map);
+        assert_eq!(map["status"], serde_json::json!("in_progress"));
+    }
 
     // -------------------------------------------------------------------------
     // store_error_response

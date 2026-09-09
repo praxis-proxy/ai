@@ -48,6 +48,10 @@ env:
   CARGO_TERM_COLOR: always
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
+  # Pinned + single-sourced so the pre-install and Start OGX specs are provably
+  # identical (uv reuses the same cached environment) and the two jobs can't
+  # drift. Bump this line deliberately to pull a newer OGX.
+  OGX_SPEC: "ogx[starter]==1.3.1"
 
 jobs:
   # ----------------------------------------------------------------------------
@@ -99,7 +103,7 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -115,52 +119,74 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-
-      - name: Pull vLLM CPU image
-        run: docker pull "$VLLM_IMAGE"
+        with:
+          # Persist uv's wheel/download cache across runs so the pinned OGX
+          # closure and the test's PEP-723 deps are not re-downloaded every run.
+          # Keyed on the files that carry those pins, so the cache invalidates
+          # only when a pin actually changes.
+          enable-cache: true
+          cache-dependency-glob: |
+            .github/workflows/vllm-integration.yaml
+            tests/integration/sdk/openai/test_openai_responses_vllm.py
 
       - name: Start vLLM
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.VLLM_MODEL }}
+
+      - name: Pre-install OGX dependencies
         run: |
-          docker run -d --name vllm \
-            -p 8000:8000 \
-            --privileged=true \
-            "$VLLM_IMAGE" \
-            --model /root/.cache/Qwen/Qwen3-0.6B \
-            --max-model-len 4096 \
-            --served-model-name "$VLLM_MODEL" \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.5
+          # Resolve + download the full OGX dependency closure (torch, CUDA
+          # wheels, faiss, transformers, ...) synchronously and OFF the readiness
+          # clock. Without this the download runs backgrounded inside the
+          # "Wait for OGX readiness" window and loses the race under network
+          # variance, so the server never binds port 8321 in time (exit 124).
+          echo "Pre-installing OGX ($OGX_SPEC)..."
+          uv run --with "$OGX_SPEC" ogx --help > /dev/null
+          echo "OGX environment ready"
 
       - name: Start OGX
         run: |
-          uv run --with 'ogx[starter]' ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          # Same "$OGX_SPEC" as the pre-install above, so uv reuses the already
+          # materialized environment and the server binds within seconds.
+          uv run --with "$OGX_SPEC" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
 
-      - name: Wait for vLLM readiness
+      - name: Run Conversations SDK integration tests
         run: |
-          echo "Waiting for vLLM health and model endpoints..."
-          timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-            if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
-              echo "::error::vLLM container exited unexpectedly"
-              docker logs vllm 2>&1
-              exit 1
-            fi
-            sleep 5
-          done'
-          echo "vLLM is ready"
+          uv run tests/integration/sdk/openai/test_openai_conversations.py -s
 
       - name: Wait for OGX readiness
         run: |
           echo "Waiting for OGX server..."
-          timeout 120 bash -c 'until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+          # Poll in the current shell (no nested `bash -c`) so we can both bound
+          # the wait and check process liveness: fail fast if the backgrounded
+          # OGX process dies, and dump the log inline so a readiness failure is
+          # diagnosable from this step (mirrors the vLLM liveness check, which
+          # previously produced only an opaque exit 124 here).
+          dump_ogx_log() {
+            echo "----- /tmp/ogx.log (tail -n 200) -----"
+            tail -n 200 /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+          }
+          OGX_PID="$(cat /tmp/ogx.pid)"
+          deadline=$((SECONDS + 300))
+          until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+            if ! kill -0 "$OGX_PID" 2>/dev/null; then
+              echo "::error::OGX process (pid $OGX_PID) exited before binding port 8321"
+              dump_ogx_log
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::OGX did not become ready within 300s"
+              dump_ogx_log
+              exit 1
+            fi
             sleep 2
-          done'
+          done
           echo "OGX is ready"
 
       - name: Run vLLM integration tests
@@ -196,7 +222,7 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     permissions:
       contents: read
     services:
@@ -226,52 +252,70 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-
-      - name: Pull vLLM CPU image
-        run: docker pull "$VLLM_IMAGE"
+        with:
+          # Persist uv's wheel/download cache across runs so the pinned OGX
+          # closure and the test's PEP-723 deps are not re-downloaded every run.
+          # Keyed on the files that carry those pins, so the cache invalidates
+          # only when a pin actually changes.
+          enable-cache: true
+          cache-dependency-glob: |
+            .github/workflows/vllm-integration.yaml
+            tests/integration/sdk/openai/test_openai_responses_vllm.py
 
       - name: Start vLLM
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.VLLM_MODEL }}
+
+      - name: Pre-install OGX dependencies
         run: |
-          docker run -d --name vllm \
-            -p 8000:8000 \
-            --privileged=true \
-            "$VLLM_IMAGE" \
-            --model /root/.cache/Qwen/Qwen3-0.6B \
-            --max-model-len 4096 \
-            --served-model-name "$VLLM_MODEL" \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.5
+          # Resolve + download the full OGX dependency closure (torch, CUDA
+          # wheels, faiss, transformers, ...) synchronously and OFF the readiness
+          # clock. Without this the download runs backgrounded inside the
+          # "Wait for OGX readiness" window and loses the race under network
+          # variance, so the server never binds port 8321 in time (exit 124).
+          echo "Pre-installing OGX ($OGX_SPEC)..."
+          uv run --with "$OGX_SPEC" ogx --help > /dev/null
+          echo "OGX environment ready"
 
       - name: Start OGX
         run: |
-          uv run --with 'ogx[starter]' ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          # Same "$OGX_SPEC" as the pre-install above, so uv reuses the already
+          # materialized environment and the server binds within seconds.
+          uv run --with "$OGX_SPEC" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
 
-      - name: Wait for vLLM readiness
-        run: |
-          echo "Waiting for vLLM health and model endpoints..."
-          timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-            if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
-              echo "::error::vLLM container exited unexpectedly"
-              docker logs vllm 2>&1
-              exit 1
-            fi
-            sleep 5
-          done'
-          echo "vLLM is ready"
-
       - name: Wait for OGX readiness
         run: |
           echo "Waiting for OGX server..."
-          timeout 120 bash -c 'until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+          # Poll in the current shell (no nested `bash -c`) so we can both bound
+          # the wait and check process liveness: fail fast if the backgrounded
+          # OGX process dies, and dump the log inline so a readiness failure is
+          # diagnosable from this step (mirrors the vLLM liveness check, which
+          # previously produced only an opaque exit 124 here).
+          dump_ogx_log() {
+            echo "----- /tmp/ogx.log (tail -n 200) -----"
+            tail -n 200 /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+          }
+          OGX_PID="$(cat /tmp/ogx.pid)"
+          deadline=$((SECONDS + 300))
+          until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+            if ! kill -0 "$OGX_PID" 2>/dev/null; then
+              echo "::error::OGX process (pid $OGX_PID) exited before binding port 8321"
+              dump_ogx_log
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::OGX did not become ready within 300s"
+              dump_ogx_log
+              exit 1
+            fi
             sleep 2
-          done'
+          done
           echo "OGX is ready"
 
       - name: Run vLLM integration tests (PostgreSQL store)

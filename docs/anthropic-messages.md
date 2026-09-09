@@ -12,8 +12,8 @@ Anthropic requests to reach any backend.
 | `anthropic_messages_format` | Classify requests and promote routing facts to headers |
 | `anthropic_validate` | Validate the JSON request envelope before forwarding |
 | `anthropic_messages_protocol` | Header management for native `/v1/messages` backends |
-| `anthropic_to_openai` | Bidirectional body transformation to `OpenAI` Chat Completions |
-| `anthropic_stream_events` | SSE event transformation (per-chunk streaming, conformant with Inference Proxy Conformance Guidelines) |
+| `anthropic_messages_to_chat_completions` | Bidirectional body transformation to the Chat Completions wire shape |
+| `anthropic_messages_to_chat_completions_stream` | SSE event transformation (per-chunk streaming, conformant with Inference Proxy Conformance Guidelines) |
 
 ## Passthrough to vLLM
 
@@ -146,10 +146,10 @@ filter_chains:
 
       - filter: anthropic_validate
 
-      - filter: anthropic_to_openai
+      - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
 
-      - filter: anthropic_stream_events
+      - filter: anthropic_messages_to_chat_completions_stream
         response_conditions:
           - when:
               headers:
@@ -175,7 +175,7 @@ filter_chains:
               - "127.0.0.1:8000"
 ```
 
-The `anthropic_to_openai` filter:
+The `anthropic_messages_to_chat_completions` filter:
 - Hoists `system` to an OpenAI system message
 - Flattens content blocks (text, image, tool_use,
   tool_result, document, search_result)
@@ -196,10 +196,10 @@ The `anthropic_to_openai` filter:
 - Preserves original `finish_reason` in filter
   metadata as `openai.finish_reason`
 
-Add `anthropic_stream_events` with a `text/event-stream`
+Add `anthropic_messages_to_chat_completions_stream` with a `text/event-stream`
 response condition when the backend may return streaming
 Chat Completions SSE. Keep it response-gated so normal
-JSON responses stay on the buffered `anthropic_to_openai`
+JSON responses stay on the buffered `anthropic_messages_to_chat_completions`
 path.
 
 ## Filter Configuration Reference
@@ -255,24 +255,24 @@ filter: anthropic_messages_protocol
 default_version: "2023-06-01"
 ```
 
-### `anthropic_to_openai`
+### `anthropic_messages_to_chat_completions`
 
 Bidirectional request/response transformation.
-Non-streaming only; use `anthropic_stream_events`
+Non-streaming only; use `anthropic_messages_to_chat_completions_stream`
 for SSE responses.
 
 ```yaml
-filter: anthropic_to_openai
+filter: anthropic_messages_to_chat_completions
 max_body_bytes: 1048576    # 1 MiB
 ```
 
-### `anthropic_stream_events`
+### `anthropic_messages_to_chat_completions_stream`
 
-Transforms OpenAI SSE chunks to Anthropic SSE
+Transforms Chat Completions SSE chunks to Anthropic SSE
 events. Processes SSE chunks incrementally as they arrive.
 
 ```yaml
-filter: anthropic_stream_events
+filter: anthropic_messages_to_chat_completions_stream
 max_partial_event_bytes: 10485760
 response_conditions:
   - when:

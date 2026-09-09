@@ -49,7 +49,7 @@ impl ErrorResponseFormatter for AnthropicErrorFormatter {
 /// Map an HTTP error status to an Anthropic error type.
 ///
 /// The mapping is consistent with the existing `error_type_for_status` in
-/// `to_openai/response.rs`.
+/// `messages_to_chat_completions/response.rs`.
 fn anthropic_error_type(status: u16) -> &'static str {
     match status {
         401 => "authentication_error",

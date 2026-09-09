@@ -61,43 +61,67 @@ struct AnthropicMessageDelta {
 struct AnthropicDeltaUsage {
     /// Tokens in the output completion.
     output_tokens: u64,
+
+    /// Breakdown of the output tokens (extended thinking). Present only on
+    /// the terminal `message_delta`.
+    output_tokens_details: Option<AnthropicOutputTokensDetails>,
+}
+
+/// Anthropic output token breakdown.
+#[derive(Deserialize)]
+struct AnthropicOutputTokensDetails {
+    /// Thinking tokens, already counted in `output_tokens`.
+    thinking_tokens: Option<u64>,
 }
 
 /// Parses Anthropic streaming events for partial token counts.
 ///
-/// Input and cache counts arrive in `message_start`; output counts arrive in
-/// `message_delta`. Cache counts break down the input rather than adding to it.
+/// Input and cache counts arrive in `message_start`; output and thinking
+/// counts arrive in `message_delta`. Cache counts break down the input;
+/// thinking tokens break down the output.
 pub(super) fn parse_anthropic_event(data: &[u8]) -> StreamingTokens {
-    if let Ok(start) = serde_json::from_slice::<AnthropicMessageStart>(data)
-        && start.event_type.as_deref() == Some("message_start")
-        && let Some(message) = start.message
-        && let Some(usage) = message.usage
-    {
-        let cache_write = usage.cache_creation_input_tokens;
-        let cache_read = usage.cache_read_input_tokens;
-        let actual_input = usage
-            .input_tokens
-            .saturating_add(cache_write.unwrap_or(0))
-            .saturating_add(cache_read.unwrap_or(0));
-        return StreamingTokens {
-            input: Some(actual_input),
-            cache_read,
-            cache_write,
-            ..StreamingTokens::default()
-        };
+    if let Some(tokens) = parse_anthropic_message_start(data) {
+        return tokens;
     }
-
-    if let Ok(delta) = serde_json::from_slice::<AnthropicMessageDelta>(data)
-        && delta.event_type.as_deref() == Some("message_delta")
-        && let Some(usage) = delta.usage
-    {
-        return StreamingTokens {
-            output: Some(usage.output_tokens),
-            ..StreamingTokens::default()
-        };
+    if let Some(tokens) = parse_anthropic_message_delta(data) {
+        return tokens;
     }
-
     StreamingTokens::default()
+}
+
+/// Input and cache counts from a `message_start` event.
+fn parse_anthropic_message_start(data: &[u8]) -> Option<StreamingTokens> {
+    let start = serde_json::from_slice::<AnthropicMessageStart>(data).ok()?;
+    if start.event_type.as_deref() != Some("message_start") {
+        return None;
+    }
+    let usage = start.message?.usage?;
+    let cache_write = usage.cache_creation_input_tokens;
+    let cache_read = usage.cache_read_input_tokens;
+    let actual_input = usage
+        .input_tokens
+        .saturating_add(cache_write.unwrap_or(0))
+        .saturating_add(cache_read.unwrap_or(0));
+    Some(StreamingTokens {
+        input: Some(actual_input),
+        cache_read,
+        cache_write,
+        ..StreamingTokens::default()
+    })
+}
+
+/// Output and thinking counts from a `message_delta` event.
+fn parse_anthropic_message_delta(data: &[u8]) -> Option<StreamingTokens> {
+    let delta = serde_json::from_slice::<AnthropicMessageDelta>(data).ok()?;
+    if delta.event_type.as_deref() != Some("message_delta") {
+        return None;
+    }
+    let usage = delta.usage?;
+    Some(StreamingTokens {
+        output: Some(usage.output_tokens),
+        reasoning: usage.output_tokens_details.and_then(|details| details.thinking_tokens),
+        ..StreamingTokens::default()
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -235,6 +259,7 @@ mod tests {
                 output: None,
                 cache_read: Some(3000),
                 cache_write: Some(200),
+                reasoning: None,
             }
         );
     }
@@ -250,6 +275,7 @@ mod tests {
                 output: None,
                 cache_read: None,
                 cache_write: None,
+                reasoning: None,
             },
             "omitted cache fields stay absent instead of accumulating a zero"
         );
@@ -266,6 +292,7 @@ mod tests {
                 output: None,
                 cache_read: Some(0),
                 cache_write: Some(0),
+                reasoning: None,
             },
             "an explicit zero is a reported cache miss, distinct from an absent count"
         );
@@ -282,6 +309,7 @@ mod tests {
                 output: Some(42),
                 cache_read: None,
                 cache_write: None,
+                reasoning: None,
             }
         );
     }
@@ -297,7 +325,61 @@ mod tests {
                 output: Some(11),
                 cache_read: None,
                 cache_write: None,
+                reasoning: None,
             }
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Reasoning / thinking token breakdown
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn anthropic_message_delta_reports_thinking_tokens() {
+        let event = br#"{"type":"message_delta","usage":{
+            "output_tokens":1500,
+            "output_tokens_details":{"thinking_tokens":1200}
+        }}"#;
+
+        assert_eq!(
+            parse_anthropic_event(event),
+            StreamingTokens {
+                input: None,
+                output: Some(1500),
+                cache_read: None,
+                cache_write: None,
+                reasoning: Some(1200),
+            }
+        );
+    }
+
+    #[test]
+    fn anthropic_message_delta_thinking_zero_is_reported() {
+        let event = br#"{"type":"message_delta","usage":{
+            "output_tokens":42,
+            "output_tokens_details":{"thinking_tokens":0}
+        }}"#;
+
+        assert_eq!(
+            parse_anthropic_event(event),
+            StreamingTokens {
+                input: None,
+                output: Some(42),
+                cache_read: None,
+                cache_write: None,
+                reasoning: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn anthropic_message_start_reports_no_reasoning() {
+        let event = br#"{"type":"message_start","message":{"usage":{"input_tokens":25}}}"#;
+
+        assert_eq!(
+            parse_anthropic_event(event).reasoning,
+            None,
+            "message_start never carries thinking tokens"
         );
     }
 }
