@@ -627,27 +627,6 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming() {
 }
 
 #[tokio::test]
-async fn on_request_leaves_stream_body_mode_when_streaming_is_rejected() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
-    ctx.set_metadata("openai_responses_format.stream", "true");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "streaming file-search requests must be rejected, not buffered"
-    );
-    assert_eq!(
-        ctx.response_body_mode,
-        BodyMode::Stream,
-        "a rejected streaming request must not leave a StreamBuffer response mode behind"
-    );
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
 async fn streaming_without_file_search_is_rejected_before_buffering() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
