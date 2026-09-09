@@ -560,6 +560,38 @@ async fn reconcile_is_a_noop_without_prior_admission_metadata() {
     ));
 }
 
+/// Missing `META_ESTIMATE` must skip settlement rather than treat the
+/// estimate as 0 (which would debit `actual - 0` on top of the original
+/// reservation and over-charge the window).
+#[tokio::test]
+async fn missing_meta_estimate_skips_reconciliation_instead_of_settling_at_zero() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 500");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.filter_metadata.remove(super::META_ESTIMATE);
+    ctx.set_metadata(META_TOKEN_TOTAL, "200");
+    let mut body = None;
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+
+    // Reservation of 500 still stands (no bogus +200 overage). A second
+    // 500-token admit fits remaining capacity; it would not if settlement
+    // had charged 700.
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
+        "skipping reconcile must leave the original 500-token reservation, not 700"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Lost-request handling (the proposal's still-open question, answered here
 // via reservation_timeout)
@@ -649,8 +681,10 @@ fn debug_format_lists_configured_rule_names() {
         .map(|rule| super::compile_rule(rule, &backend))
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
+    let needs_body = rules.iter().any(|r| r.estimation.needs_body());
     let filter = TokenRateLimitFilter {
         rules,
+        needs_body,
         epoch: std::time::Instant::now(),
     };
     let debug = format!("{filter:?}");
@@ -898,6 +932,63 @@ async fn token_bucket_rule_admits_within_capacity_and_denies_over_it() {
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Reject(_)
     ));
+}
+
+#[tokio::test]
+async fn input_plus_max_tokens_strategy_computes_from_body_and_content_length() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10000\nestimation:\n  strategy: \
+         input_plus_max_tokens\n  fallback_estimate: 100\n  bytes_per_token: 4.0",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let body_bytes = br#"{"max_tokens": 200, "messages": [{"role": "user", "content": "hello"}]}"#;
+    req.headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_str(&body_bytes.len().to_string()).unwrap(),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "needs_body=true, on_request should defer to on_request_body"
+    );
+
+    let mut body = Some(bytes::Bytes::from(&body_bytes[..]));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "estimate = ceil(body_len/4) + 200 should be within capacity"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
+        "reservation should have been created"
+    );
+}
+
+#[tokio::test]
+async fn malformed_json_body_uses_fallback_estimate() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  \
+         fallback_estimate: 100",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from("not valid json at all"));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "malformed JSON should fall back to fallback_estimate=100 and admit"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
+        "fallback estimate should create a reservation"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1153,5 +1244,670 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
     assert!(
         settled,
         "worker-based reconciliation should eventually credit into the shared bucket"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Estimation strategies (M3)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn from_config_parses_fixed_estimation_strategy() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: fixed\n  fallback_estimate: 500",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_parses_max_tokens_strategy() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_parses_input_plus_max_tokens_strategy() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: input_plus_max_tokens\n  fallback_estimate: 100\n  bytes_per_token: 3.5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_parses_model_scaled_strategy() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: model_scaled\n  fallback_estimate: 100\n  default_multiplier: 1.5\n  model_multipliers:\n    gpt-4: 2.0\n    gpt-3.5-turbo: 0.5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_both_reserved_tokens_and_estimation() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 50\nestimation:\n  strategy: fixed\n  fallback_estimate: 500",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("cannot specify both"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_neither_reserved_tokens_nor_estimation() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000");
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("must have either"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_fixed_strategy_without_fallback_estimate() {
+    let yaml =
+        single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: fixed");
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("fallback_estimate"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_strategy_irrelevant_estimation_fields() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: fixed\n  fallback_estimate: 100\n  model_multipliers:\n    gpt-4: 2.0",
+            "fixed",
+        ),
+        (
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100\n  bytes_per_token: 3.5",
+            "max_tokens",
+        ),
+        (
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: input_plus_max_tokens\n  fallback_estimate: 100\n  default_multiplier: 1.5",
+            "input_plus_max_tokens",
+        ),
+        (
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: model_scaled\n  fallback_estimate: 100\n  bytes_per_token: 3.5",
+            "model_scaled",
+        ),
+    ];
+    for (body, strategy) in cases {
+        let err = TokenRateLimitFilter::from_config(&single_rule_yaml(body))
+            .err()
+            .unwrap_or_else(|| panic!("{strategy} must reject irrelevant fields"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not accept"),
+            "{strategy}: expected unused-field error, got: {msg}"
+        );
+    }
+}
+
+#[test]
+fn from_config_rejects_fixed_estimate_exceeding_capacity() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimation:\n  strategy: fixed\n  fallback_estimate: 200",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("must not exceed capacity"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_non_finite_estimation_multiplier() {
+    for literal in [".nan", ".inf"] {
+        let yaml = single_rule_yaml(&format!(
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  multiplier: {literal}\n  fallback_estimate: 100"
+        ));
+        let err = TokenRateLimitFilter::from_config(&yaml)
+            .err()
+            .unwrap_or_else(|| panic!("multiplier: {literal} must be rejected"));
+        assert!(
+            err.to_string().contains("multiplier"),
+            "got: {err} for multiplier: {literal}"
+        );
+    }
+}
+
+#[test]
+fn from_config_rejects_non_finite_bytes_per_token() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: input_plus_max_tokens\n  bytes_per_token: .nan\n  fallback_estimate: 100",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("bytes_per_token"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_non_finite_model_multiplier_entry() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: model_scaled\n  default_multiplier: 1.0\n  fallback_estimate: 100\n  model_multipliers:\n    gpt-4: .inf",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("model_multipliers"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_non_finite_default_multiplier() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: model_scaled\n  default_multiplier: .nan\n  fallback_estimate: 100",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("default_multiplier"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_fallback_estimate_exceeding_capacity() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 200",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("fallback_estimate must not exceed capacity"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn fixed_estimation_strategy_reserves_like_legacy_reserved_tokens() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: fixed\n  fallback_estimate: 200",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "fixed estimation should admit within budget"
+    );
+    assert!(ctx.get_metadata("token_rate_limit.reservation_id").is_some());
+}
+
+#[tokio::test]
+async fn max_tokens_strategy_defers_to_on_request_body() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "on_request should pass through when needs_body=true"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        "no reservation should be made in on_request when needs_body=true"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_strategy_extracts_from_body_and_reserves() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 500, "messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should admit with max_tokens=500 within capacity=1000"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
+        "reservation should be made in on_request_body"
+    );
+
+    let estimate_meta = ctx.get_metadata("token_rate_limit.estimate").unwrap();
+    assert_eq!(
+        estimate_meta, "500",
+        "estimate metadata should reflect extracted max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_strategy_prefers_max_tokens_over_max_completion_tokens() {
+    let yaml =
+        single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(
+        r#"{"max_tokens": 300, "max_completion_tokens": 500, "messages": []}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "300",
+        "max_tokens should take priority over max_completion_tokens"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_strategy_falls_back_to_max_completion_tokens() {
+    let yaml =
+        single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_completion_tokens": 250, "messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "250",
+        "should fall back to max_completion_tokens when max_tokens is absent"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_strategy_uses_fallback_when_body_has_no_tokens_field() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 42",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "42",
+        "should fall back to fallback_estimate when body has no max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_strategy_admits_without_reservation_when_no_fallback_and_no_body_field() {
+    let yaml =
+        single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should admit without reservation when strategy can't extract a value and no fallback"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        "no reservation should be made when estimate is unavailable"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_strategy_applies_multiplier() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10000\nestimation:\n  strategy: max_tokens\n  multiplier: 1.5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "150",
+        "100 * 1.5 = 150"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_strategy_denies_when_body_estimate_exceeds_budget() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut first_ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 60}"#));
+    let action = filter.on_request_body(&mut first_ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut second_ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 60}"#));
+    let action = filter.on_request_body(&mut second_ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "second 60-token request should be denied (only 40 of 100 remaining)"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_is_noop_before_end_of_stream() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 500}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "should continue without reservation before end_of_stream"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        "no reservation before end_of_stream"
+    );
+}
+
+#[tokio::test]
+async fn model_scaled_strategy_applies_per_model_multiplier() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10000\nestimation:\n  strategy: model_scaled\n  default_multiplier: 1.0\n  model_multipliers:\n    gpt-4: 2.0\n    gpt-3.5-turbo: 0.5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100, "model": "gpt-4"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "200",
+        "100 * 2.0 (gpt-4 multiplier) = 200"
+    );
+}
+
+#[tokio::test]
+async fn model_scaled_strategy_uses_default_multiplier_for_unknown_model() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10000\nestimation:\n  strategy: model_scaled\n  default_multiplier: 1.5\n  model_multipliers:\n    gpt-4: 2.0",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100, "model": "claude-3"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "150",
+        "100 * 1.5 (default multiplier for unknown model) = 150"
+    );
+}
+
+#[tokio::test]
+async fn model_scaled_strategy_reads_model_from_x_model_header_fallback() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10000\nestimation:\n  strategy: model_scaled\n  default_multiplier: 1.0\n  model_multipliers:\n    gpt-4: 3.0",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-model"),
+        http::HeaderValue::from_static("gpt-4"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "300",
+        "100 * 3.0 (gpt-4 via x-model header) = 300"
+    );
+}
+
+#[tokio::test]
+async fn body_dependent_reconciliation_uses_meta_estimate() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 500}"#));
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    ctx.set_metadata(META_TOKEN_TOTAL, "200");
+
+    let mut resp_body = None;
+    drop(filter.on_response_body(&mut ctx, &mut resp_body, true).unwrap());
+
+    // Reserved 500 via body, actual 200 -> refund 300 -> 800 remaining.
+    // A second 500-token request body should be admitted (800 >= 500).
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut second_ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 500}"#));
+    let action = filter.on_request_body(&mut second_ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "800 remaining should admit a 500-token request"
+    );
+}
+
+#[test]
+fn from_config_estimation_with_token_bucket_algorithm() {
+    let yaml = single_rule_yaml(
+        "algorithm: token_bucket\ncapacity: 1000\nrefill_rate: 10\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
+    );
+    assert!(
+        TokenRateLimitFilter::from_config(&yaml).is_ok(),
+        "estimation strategies must work with both algorithms"
+    );
+}
+
+#[test]
+fn from_config_fixed_strategy_applies_multiplier_to_estimate() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: fixed\n  fallback_estimate: 100\n  multiplier: 1.5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn request_body_access_is_none_for_fixed_strategy() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: fixed\n  fallback_estimate: 500",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), praxis_filter::BodyAccess::None);
+}
+
+#[test]
+fn request_body_access_is_read_only_for_body_dependent_strategy() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), praxis_filter::BodyAccess::ReadOnly);
+}
+
+#[test]
+fn request_body_mode_is_stream_buffer_for_body_dependent_strategy() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    assert!(
+        matches!(
+            filter.request_body_mode(),
+            praxis_filter::BodyMode::StreamBuffer {
+                max_bytes: Some(2_097_152)
+            }
+        ),
+        "body-dependent strategies should buffer up to 2 MiB"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Edge cases: empty body, mixed strategies, missing Content-Length,
+// model_scaled outer multiplier composition
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_body_uses_fallback_estimate() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  \
+         fallback_estimate: 75",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body: Option<bytes::Bytes> = None;
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "empty body should fall back to fallback_estimate=75 and admit"
+    );
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "75",
+        "estimate should be the fallback when body is absent"
+    );
+}
+
+#[tokio::test]
+async fn mixed_rules_fixed_strategy_ignores_body_when_filter_buffers() {
+    let filter = TokenRateLimitFilter::from_config(&mixed_fixed_and_body_dependent_yaml()).unwrap();
+
+    let fixed_req = make_request_with_header("x-app-id", "fixed-app");
+    let mut ctx = crate::test_utils::make_filter_context(&fixed_req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 9999}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "200",
+        "fixed-strategy rule must use its constant (200), not the body's max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn mixed_rules_body_dependent_strategy_extracts_from_body() {
+    let filter = TokenRateLimitFilter::from_config(&mixed_fixed_and_body_dependent_yaml()).unwrap();
+
+    let body_req = make_request_with_header("x-app-id", "body-app");
+    let mut ctx = crate::test_utils::make_filter_context(&body_req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 300}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "300",
+        "body-dependent rule must use extracted max_tokens (300)"
+    );
+}
+
+fn mixed_fixed_and_body_dependent_yaml() -> serde_yaml::Value {
+    serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: fixed-rule\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: fixed-app\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000\n\
+         \x20   reserved_tokens: 200\n\
+         \x20 - name: body-rule\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: body-app\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20     fallback_estimate: 100\n",
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn input_plus_max_tokens_defaults_to_zero_input_when_content_length_absent() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: \
+         input_plus_max_tokens\n  fallback_estimate: 100\n  bytes_per_token: 4.0",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    // No Content-Length header set.
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 400}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    // input = ceil(0 / 4.0) = 0, output = 400, total = 400
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "400",
+        "missing Content-Length should default input to 0, estimate = 0 + max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn model_scaled_outer_multiplier_composes_with_per_model_multiplier() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10000\nestimation:\n  strategy: model_scaled\n  \
+         multiplier: 1.5\n  model_multipliers:\n    gpt-4: 2.0\n  default_multiplier: 1.0",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    // gpt-4: effective multiplier = 2.0 * 1.5 = 3.0, max_tokens=100 → estimate=300
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100, "model": "gpt-4"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        "300",
+        "gpt-4 with outer multiplier 1.5 × model multiplier 2.0 = 3.0 × 100 = 300"
     );
 }
