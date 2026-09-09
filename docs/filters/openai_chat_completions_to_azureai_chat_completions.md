@@ -7,7 +7,7 @@ Transforms requests targeting Azure OpenAI deployments into standard Chat Comple
 
 ## Configuration Notes
 
-Azure OpenAI accepts Chat Completions bodies as-is; this filter handles the `api-version` query parameter, strips Azure-specific response fields (`prompt_filter_results`, `content_filter_results`), and normalizes error responses where Azure omits the `type` field.
+Azure OpenAI accepts Chat Completions bodies as-is; this filter handles the `api-version` query parameter, strips Azure-specific response fields (`prompt_filter_results`, `content_filter_results`, `content_filter_offsets`), drops Azure async-filter annotation SSE chunks (no `delta` and no `finish_reason`), and normalizes error responses where Azure omits the `type` field.
 
 ## Configuration
 
