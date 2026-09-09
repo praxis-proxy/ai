@@ -829,8 +829,7 @@ mod tests {
         ctx.current_filter_id = Some(0);
         ctx.insert_filter_state(SseFrameParser::new(65_536));
 
-        let chunk =
-            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
+        let chunk = "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
 
         strip_sse_chunk(&mut ctx, &mut body, false);
