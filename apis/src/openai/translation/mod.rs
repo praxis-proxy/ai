@@ -2620,15 +2620,16 @@ mod tests {
 
     #[test]
     fn null_service_tier_in_request_context_defaults_in_progress_snapshot() {
-        // The `response.created` / `response.in_progress` streaming snapshot
-        // funnels through `in_progress_response_resource`, which was hardened
-        // alongside the finite path; guard that a present-but-null request
-        // `service_tier` cannot leak into the snapshot.
         let request = json!({"model": "gpt-4.1-mini", "input": "Hi", "service_tier": Value::Null});
         let context = make_response_context(&request);
         let snapshot = super::chat_completions::in_progress_response_resource(&context);
         assert_eq!(snapshot["status"], "in_progress");
-        assert_eq!(snapshot["service_tier"], "default");
+        assert_eq!(
+            snapshot["service_tier"], "default",
+            "a present-but-null request service_tier must not leak into the \
+             response.created/response.in_progress snapshot, which funnels through \
+             in_progress_response_resource (hardened alongside the finite path)"
+        );
     }
 
     // -------------------------------------------------------------------------
