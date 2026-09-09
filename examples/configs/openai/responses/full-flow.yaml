@@ -86,7 +86,7 @@
 #
 #   11. openai_responses_proxy reads the assembled ResponsesState and
 #      rebuilds the outbound request body with the full conversation
-#      history, then (terminal_streaming: true) selects the typed
+#      history, then automatically selects the typed
 #      streaming transport so each backend SSE chunk reaches
 #      openai_stream_events incrementally. openai_stream_events composes
 #      the inference round into one logical Responses stream and
@@ -330,7 +330,7 @@ filter_chains:
 
       # Classified openai_responses POST /v1/responses create requests flow
       # here. The IRR runs a single inference round; openai_responses_proxy
-      # (terminal_streaming) selects the typed streaming transport, and
+      # automatically selects the typed streaming transport, and
       # openai_stream_events composes the round into one logical Responses
       # stream while accumulating the response object into ResponsesState.
       # The pre-IRR openai_response_store then persists that object on the
@@ -344,7 +344,6 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_responses_proxy
-                terminal_streaming: true
 
               # Composes the inference stream into one logical Responses
               # lifecycle and accumulates the response object for

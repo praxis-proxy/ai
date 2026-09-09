@@ -18,7 +18,7 @@
 # config order, so the store persists after the step composes the
 # terminal event.
 #
-# `openai_responses_proxy` (`terminal_streaming: true`) selects Praxis's
+# `openai_responses_proxy` automatically selects Praxis's
 # typed streaming transport for the effective `stream: true` request, so
 # each SSE chunk reaches `openai_stream_events` incrementally.
 #
@@ -75,7 +75,6 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_responses_proxy
-                terminal_streaming: true
 
               # Composes the inference stream into one logical Responses
               # lifecycle. Armed by a `stream: true` request; always
