@@ -215,7 +215,7 @@ fn reject_file_url_failed_returns_502() {
 
 #[test]
 fn reject_rewritten_body_too_large_returns_413() {
-    let action = reject_rewritten_body_too_large(2048, 1024, false);
+    let action = reject_rewritten_body_too_large(2048, 1024);
     match action {
         FilterAction::Reject(r) => {
             assert_eq!(r.status, 413, "oversized rewritten body should produce 413");

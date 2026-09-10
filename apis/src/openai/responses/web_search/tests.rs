@@ -98,6 +98,22 @@ unknown_field: true
 }
 
 #[test]
+fn from_config_validates_max_calls_per_round() {
+    for max_calls in [0, MAX_CALLS_PER_ROUND + 1] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "provider: brave\napi_key: test-key\nmax_calls_per_round: {max_calls}"
+        ))
+        .unwrap();
+        assert!(WebSearchFilter::from_config(&yaml).is_err());
+    }
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "provider: brave\napi_key: test-key\nmax_calls_per_round: {MAX_CALLS_PER_ROUND}"
+    ))
+    .unwrap();
+    assert!(WebSearchFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
 fn from_config_rejects_max_body_bytes() {
     // openai_web_search is a read-only reader that produces no request body,
     // so it carries no per-filter raw-body cap: raw request size is governed
@@ -255,6 +271,61 @@ fn on_response_body_passthrough_on_non_end_of_stream() {
     assert!(
         ctx.filter_results.is_empty(),
         "should not set filter_results on non-end-of-stream"
+    );
+}
+
+#[test]
+fn on_response_body_rejects_web_search_batch_over_server_cap() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("provider: brave\napi_key: test-key\nmax_calls_per_round: 1").unwrap();
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        web_search_calls: vec![serde_json::json!({"id":"ws_1"}), serde_json::json!({"id":"ws_2"})],
+        ..ResponsesState::default()
+    });
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(response) if response.status == 502));
+}
+
+#[test]
+fn on_response_body_ends_stream_for_web_search_batch_over_server_cap() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("provider: brave\napi_key: test-key\nmax_calls_per_round: 1").unwrap();
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        request_body: serde_json::json!({"stream":true}),
+        web_search_calls: vec![serde_json::json!({"id":"ws_1"}), serde_json::json!({"id":"ws_2"})],
+        ..ResponsesState::default()
+    });
+    ctx.filter_results
+        .entry("openai_mcp_dispatch")
+        .or_default()
+        .set("action", "loop")
+        .unwrap();
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_mcp_dispatch")
+            .and_then(|results| results.get("action")),
+        Some("done"),
+        "stream rejection must clear a sibling MCP loop transition"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .web_search_calls
+            .is_empty()
     );
 }
 
@@ -713,6 +784,48 @@ async fn on_request_body_mixed_batch_preserves_completed_and_failed() {
     );
 }
 
+#[tokio::test]
+async fn on_request_body_enforces_shared_max_tool_calls_across_web_search_batch() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_search_responses(listener, vec![(200, brave_ok_body())]);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let calls = vec![
+        serde_json::json!({
+            "type":"web_search_call", "id":"ws_allowed",
+            "action":{"type":"search", "query":"rust language"}
+        }),
+        serde_json::json!({
+            "type":"web_search_call", "id":"ws_rejected",
+            "action":{"type":"search", "query":"second query"}
+        }),
+    ];
+    let mut state = ResponsesState::from_request_body(serde_json::json!({
+        "model":"gpt-4o", "input":"test", "max_tool_calls":1
+    }));
+    state.response_object = serde_json::json!({"object":"response", "output":calls.clone()});
+    state.accumulated_output = calls.clone();
+    state.web_search_calls = calls;
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.filter_results["openai_web_search"].get("action"), Some("done"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.deferred_tool_limit_completion,
+        "the agentic loop must finish only after sibling dispatchers run"
+    );
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["status"], "failed");
+    assert_eq!(state.messages.last().unwrap()["output"], TOOL_LIMIT_OUTPUT);
+}
+
 // -----------------------------------------------------------------------------
 // on_request_body: Backend-Valid Continuation (issue #808)
 // -----------------------------------------------------------------------------
@@ -1027,17 +1140,21 @@ fn build_failed_tool_result_messages_carry_bounded_notice() {
 }
 
 #[test]
-fn upsert_output_item_replaces_matching_web_search_call() {
+fn upsert_output_item_replaces_current_round_position() {
     let mut accumulated = vec![
         serde_json::json!({"type": "message", "id": "msg_1"}),
-        serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+        serde_json::json!({"type": "web_search_call", "id": "duplicate", "status": "completed"}),
+        serde_json::json!({"type": "web_search_call", "id": "duplicate", "status": "completed"}),
     ];
     upsert_output_item(
         &mut accumulated,
-        serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "failed"}),
+        1,
+        1,
+        serde_json::json!({"type": "web_search_call", "id": "duplicate", "status": "failed"}),
     );
-    assert_eq!(accumulated.len(), 2, "matching id replaces rather than appends");
-    assert_eq!(accumulated[1]["status"], "failed");
+    assert_eq!(accumulated.len(), 3, "the indexed placeholder is replaced");
+    assert_eq!(accumulated[1]["status"], "completed");
+    assert_eq!(accumulated[2]["status"], "failed");
 }
 
 #[test]
@@ -1045,10 +1162,41 @@ fn upsert_output_item_appends_when_no_match() {
     let mut accumulated = vec![serde_json::json!({"type": "web_search_call", "id": "ws_1"})];
     upsert_output_item(
         &mut accumulated,
+        0,
+        1,
         serde_json::json!({"type": "web_search_call", "id": "ws_2", "status": "failed"}),
     );
-    assert_eq!(accumulated.len(), 2, "a new id appends a fresh item");
+    assert_eq!(
+        accumulated.len(),
+        2,
+        "a missing indexed placeholder appends a fresh item"
+    );
     assert_eq!(accumulated[1]["id"], "ws_2");
+}
+
+#[test]
+fn upsert_output_item_replaces_missing_id_placeholders_independently() {
+    let mut accumulated = vec![
+        serde_json::json!({"type": "web_search_call", "status": "in_progress"}),
+        serde_json::json!({"type": "web_search_call", "status": "in_progress"}),
+    ];
+
+    upsert_output_item(
+        &mut accumulated,
+        0,
+        0,
+        serde_json::json!({"type": "web_search_call", "id": "ws_unknown", "status": "completed"}),
+    );
+    upsert_output_item(
+        &mut accumulated,
+        0,
+        1,
+        serde_json::json!({"type": "web_search_call", "id": "ws_unknown", "status": "failed"}),
+    );
+
+    assert_eq!(accumulated.len(), 2);
+    assert_eq!(accumulated[0]["status"], "completed");
+    assert_eq!(accumulated[1]["status"], "failed");
 }
 
 #[test]
@@ -1170,15 +1318,18 @@ fn remaining_budget_caps_large_max_tool_calls_at_server_cap() {
 }
 
 #[test]
-fn remaining_budget_subtracts_prior_executions() {
+fn remaining_budget_subtracts_prior_model_calls() {
     let mut state =
         ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 5}));
     assert_eq!(remaining_web_search_budget(&state), 5);
-    state.web_search_calls_executed = 2;
+    state.accumulated_output = vec![
+        serde_json::json!({"type":"web_search_call", "id":"ws_1", "status":"completed"}),
+        serde_json::json!({"type":"web_search_call", "id":"ws_2", "status":"incomplete"}),
+    ];
     assert_eq!(
         remaining_web_search_budget(&state),
         3,
-        "prior dispatches reduce the remaining client allowance"
+        "prior model calls reduce the remaining client allowance regardless of execution status"
     );
 }
 
@@ -1186,7 +1337,9 @@ fn remaining_budget_subtracts_prior_executions() {
 fn remaining_budget_saturates_when_exhausted() {
     let mut state =
         ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 2}));
-    state.web_search_calls_executed = 5;
+    state.accumulated_output = (0..5)
+        .map(|index| serde_json::json!({"type":"web_search_call", "id":format!("ws_{index}"), "status":"completed"}))
+        .collect();
     assert_eq!(
         remaining_web_search_budget(&state),
         0,
@@ -1214,23 +1367,21 @@ fn remaining_budget_subtracts_non_web_builtin_calls() {
 
 #[test]
 fn remaining_budget_counts_web_and_non_web_builtin_together() {
-    // A dispatched web search (counter) and a completed file search (output
-    // item) both draw down the same shared allowance.
+    // Two web-search model calls and a completed file search all draw down the
+    // same shared allowance.
     let mut state =
         ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 5}));
-    state.web_search_calls_executed = 2;
     state.accumulated_output = vec![
         serde_json::json!({"type": "file_search_call", "id": "fs_1", "status": "completed"}),
-        // A prior web_search_call output item must NOT be double counted: web
-        // searches are already tracked by web_search_calls_executed.
         serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+        serde_json::json!({"type": "web_search_call", "id": "ws_2", "status": "incomplete"}),
         // A non-built-in item (a message) must not consume budget.
         serde_json::json!({"type": "message", "id": "msg_1"}),
     ];
     assert_eq!(
         remaining_web_search_budget(&state),
         2,
-        "5 - (2 web dispatched + 1 file search) = 2; the echoed web_search_call is not double counted"
+        "5 - (2 web calls + 1 file search) = 2"
     );
 }
 
@@ -1275,16 +1426,15 @@ fn remaining_budget_dedups_file_search_call_across_collections() {
 #[test]
 fn remaining_budget_ignores_pending_file_search_calls() {
     // A file-search call that is still `searching`/`in_progress` has not yet
-    // consumed a provider call, so it must not draw down the shared budget.
-    // `remaining_file_search_call_budget` already excludes these placeholders;
-    // counting them here would let a mixed pending file-search/web-search
-    // response decline the web search before either call runs.
+    // been admitted by its local dispatcher, so this prior-call helper must not
+    // draw it down before ordered current-round admission evaluates it.
     let mut state =
         ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 1}));
-    state.accumulated_output = vec![
-        serde_json::json!({"type": "file_search_call", "id": "fs_pending", "status": "searching"}),
-        serde_json::json!({"type": "web_search_call", "id": "ws_pending", "status": "in_progress"}),
-    ];
+    state.accumulated_output = vec![serde_json::json!({
+        "type": "file_search_call",
+        "id": "fs_pending",
+        "status": "searching",
+    })];
     assert_eq!(
         remaining_web_search_budget(&state),
         1,
@@ -1376,9 +1526,17 @@ async fn on_request_body_budget_spans_iterations() {
 
     let body = serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 2});
     let mut state = ResponsesState::from_request_body(body);
-    // Simulate one search already dispatched in a prior IRR iteration.
+    // Simulate one admitted search in a prior IRR iteration.
     state.web_search_calls_executed = 1;
-    state.web_search_calls = vec![web_search_call("ws_c", "third"), web_search_call("ws_d", "fourth")];
+    let current = vec![web_search_call("ws_c", "third"), web_search_call("ws_d", "fourth")];
+    state.current_round_output_start = 1;
+    state.accumulated_output = vec![
+        serde_json::json!({"type":"web_search_call", "id":"ws_prior", "status":"completed"}),
+        current[0].clone(),
+        current[1].clone(),
+    ];
+    state.response_object = serde_json::json!({"output": current});
+    state.web_search_calls = state.output_items().to_vec();
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -1395,8 +1553,46 @@ async fn on_request_body_budget_spans_iterations() {
         state.web_search_calls_executed, 2,
         "cumulative executions reach but do not exceed the client budget"
     );
-    assert_eq!(state.accumulated_output[0]["status"], "completed");
-    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    assert_eq!(state.accumulated_output[1]["status"], "completed");
+    assert_eq!(state.accumulated_output[2]["status"], "failed");
+}
+
+#[tokio::test]
+async fn incomplete_prior_call_still_exhausts_later_round_budget() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let next = web_search_call("ws_reentry", "must not run");
+    let mut state =
+        ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 1}));
+    state.current_round_output_start = 1;
+    state.accumulated_output = vec![
+        serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_malformed",
+            "status": "incomplete",
+            "action": {"type": "search", "query": ""},
+        }),
+        next.clone(),
+    ];
+    state.response_object = serde_json::json!({"output": [next.clone()]});
+    state.web_search_calls = vec![next];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 0, "no provider request was admitted");
+    assert_eq!(state.accumulated_output[1]["status"], "failed");
+    assert!(state.deferred_tool_limit_completion);
+    assert_eq!(
+        ctx.filter_results["openai_web_search"].get("action"),
+        Some(ACTION_DONE),
+        "budget exhaustion must terminate instead of re-entering inference"
+    );
 }
 
 #[tokio::test]
@@ -1411,7 +1607,15 @@ async fn on_request_body_exhausted_budget_dispatches_nothing() {
     let body = serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 2});
     let mut state = ResponsesState::from_request_body(body);
     state.web_search_calls_executed = 2;
-    state.web_search_calls = vec![web_search_call("ws_e", "fifth")];
+    let current = web_search_call("ws_e", "fifth");
+    state.current_round_output_start = 2;
+    state.accumulated_output = vec![
+        serde_json::json!({"type":"web_search_call", "id":"ws_prior_1", "status":"completed"}),
+        serde_json::json!({"type":"web_search_call", "id":"ws_prior_2", "status":"completed"}),
+        current.clone(),
+    ];
+    state.response_object = serde_json::json!({"output":[current.clone()]});
+    state.web_search_calls = vec![current];
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -1420,9 +1624,9 @@ async fn on_request_body_exhausted_budget_dispatches_nothing() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.web_search_calls_executed, 2, "no further searches executed");
     assert!(state.web_search_calls.is_empty());
-    assert_eq!(state.accumulated_output.len(), 1);
-    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
-    assert_eq!(state.accumulated_output[0]["action"]["query"], "fifth");
+    assert_eq!(state.accumulated_output.len(), 3);
+    assert_eq!(state.accumulated_output[2]["status"], "failed");
+    assert_eq!(state.accumulated_output[2]["action"]["query"], "fifth");
 }
 
 #[tokio::test]

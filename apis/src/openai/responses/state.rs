@@ -10,12 +10,179 @@
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
+
+/// Origin of a reconciled `file_search` item queued for EOS synthesis (#313 §4).
+/// Captured at translate time (a `Private` item's opening was suppressed by
+/// `stream_events` and must be reproduced; a `Native` item's opening already
+/// streamed live, so only the tail is synthesized).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SynthesisKind {
+    /// Translated from a private `function_call` this round; opening must be synthesized.
+    Private,
+    /// Native hybrid `file_search_call`; opening already streamed.
+    Native,
+}
+
+/// Return whether an output item consumes the response-wide built-in tool-call budget.
+///
+/// All local built-in dispatchers share this classifier so adding a provider
+/// call type cannot make their `max_tool_calls` accounting disagree.
+pub(crate) fn is_builtin_tool_call(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "apply_patch_call"
+                | "code_interpreter_call"
+                | "computer_call"
+                | "custom_tool_call"
+                | "file_search_call"
+                | "image_generation_call"
+                | "local_shell_call"
+                | "mcp_call"
+                | "multi_agent_call"
+                | "shell_call"
+                | "tool_search_call"
+                | "web_search_call"
+        )
+    )
+}
+
+/// Return whether an output item requires a result from the API client.
+///
+/// These calls cannot share a completed model round with locally dispatched
+/// MCP or web-search calls: continuing inference would treat the client-owned
+/// call as resolved before its matching output exists.
+pub(crate) fn is_client_executed_tool_call(item: &serde_json::Value) -> bool {
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("apply_patch_call" | "computer_call" | "custom_tool_call" | "local_shell_call") => true,
+        Some("shell_call") => {
+            item.get("environment")
+                .and_then(|environment| environment.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("local")
+        },
+        Some("tool_search_call") => item.get("execution").and_then(serde_json::Value::as_str) == Some("client"),
+        _ => false,
+    }
+}
+
+/// Count admitted built-in tool-call occurrences across every retained owner.
+///
+/// A call is charged when the model makes it, even when local execution later
+/// produces an `incomplete` result. Retained owners can echo the same call, so
+/// matching `(type, id)` multiplicities are merged by their maximum rather than
+/// summed. This preserves separate same-ID occurrences within one owner while
+/// avoiding double-counting a call copied between lifecycle stores.
+pub(crate) fn consumed_builtin_tool_calls(state: &ResponsesState) -> usize {
+    let owners = [
+        state.accumulated_output.as_slice(),
+        state.file_search_output_items.as_slice(),
+        state.output_items(),
+    ];
+    let web_calls = count_tool_call_occurrences(&owners, ToolCallClass::Web);
+    web_calls.saturating_add(count_tool_call_occurrences(&owners, ToolCallClass::NonWeb))
+}
+
+/// Count calls consumed before the current model round began.
+///
+/// Current-round calls are admitted separately in model output order. This
+/// helper therefore excludes the current suffix of `accumulated_output` while
+/// still including moved file-search calls and prior web-search executions.
+pub(crate) fn consumed_builtin_tool_calls_before_current_round(state: &ResponsesState) -> usize {
+    let prior_end = if state.current_round_output_start == 0 && state.output_items().is_empty() {
+        state.accumulated_output.len()
+    } else {
+        state.current_round_output_start
+    };
+    let prior_agentic_output = state.accumulated_output.get(..prior_end).unwrap_or_default();
+    let owners = [prior_agentic_output, state.file_search_output_items.as_slice()];
+    let web_calls = count_tool_call_occurrences(&owners, ToolCallClass::Web);
+    web_calls.saturating_add(count_tool_call_occurrences(&owners, ToolCallClass::NonWeb))
+}
+
+/// Which locally supported model-call occurrences to count.
+#[derive(Clone, Copy)]
+enum ToolCallClass {
+    /// Hosted web-search calls, regardless of execution outcome.
+    Web,
+    /// Every other built-in call after a local file-search placeholder advances.
+    NonWeb,
+}
+
+/// Return whether an item belongs to one accounting class.
+fn is_counted_tool_call(item: &serde_json::Value, item_type: &str, class: ToolCallClass) -> bool {
+    match class {
+        ToolCallClass::Web => item_type == "web_search_call",
+        ToolCallClass::NonWeb => {
+            item_type != "web_search_call" && is_builtin_tool_call(item) && !is_pending_file_search_call(item)
+        },
+    }
+}
+
+/// Count call occurrences without collapsing repeated IDs from separate rounds.
+fn count_tool_call_occurrences(owners: &[&[serde_json::Value]], class: ToolCallClass) -> usize {
+    let mut maximum_multiplicity: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut calls_without_ids = 0_usize;
+
+    for items in owners {
+        let mut owner_multiplicity: HashMap<(&str, &str), usize> = HashMap::new();
+        for item in *items {
+            let Some(item_type) = item.get("type").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !is_counted_tool_call(item, item_type, class) {
+                continue;
+            }
+            let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
+                // Without an identity there is no safe way to prove that two
+                // retained values are the same call. Conservatively count each.
+                calls_without_ids = calls_without_ids.saturating_add(1);
+                continue;
+            };
+            let count = owner_multiplicity.entry((item_type, id)).or_default();
+            *count = count.saturating_add(1);
+        }
+        for (key, count) in owner_multiplicity {
+            maximum_multiplicity
+                .entry(key)
+                .and_modify(|maximum| *maximum = (*maximum).max(count))
+                .or_insert(count);
+        }
+    }
+
+    maximum_multiplicity
+        .into_values()
+        .fold(calls_without_ids, usize::saturating_add)
+}
+
+/// Return whether a file-search call is waiting for local execution.
+fn is_pending_file_search_call(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(serde_json::Value::as_str) == Some("file_search_call")
+        && matches!(
+            item.get("status").and_then(serde_json::Value::as_str),
+            Some("searching" | "in_progress")
+        )
+}
+
+/// Lifecycle state for MCP batches that must return after local execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum McpApprovalState {
+    /// No deferred local response exists.
+    #[default]
+    None,
+    /// Return approval requests after a sibling dispatcher finishes re-entry.
+    ApprovalPendingThenReturn,
+    /// Execute ungated siblings, then return the pending approval response.
+    ExecuteUngatedThenReturn,
+    /// Execute the allowed prefix, then return calls rejected by `max_tool_calls`.
+    ToolLimitExceededThenReturn,
+}
 
 /// Request-scoped state shared across Responses API filters.
 ///
@@ -28,6 +195,13 @@ pub(crate) const MAX_CITATION_FILES: usize = 1_024;
 /// without affecting external callers.
 ///
 /// [`RequestExtensions`]: praxis_filter::RequestExtensions
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "request-scoped state bag; the request, transport, and deferred \
+              lifecycle bool flags (history_rehydrated, parallel_tool_calls, \
+              store_persist_armed) are independent request facts, not a state \
+              machine or refactorable enum"
+)]
 pub(crate) struct ResponsesState {
     /// Maps file IDs to filenames for citation annotation extraction.
     pub citation_files: HashMap<String, String>,
@@ -64,6 +238,14 @@ pub(crate) struct ResponsesState {
     /// Next downstream sequence number for a logical Responses stream.
     pub logical_stream_sequence: u64,
 
+    /// Index where the current model round begins in `accumulated_output`.
+    ///
+    /// Local dispatchers may append approval or result items before every
+    /// sibling dispatcher has evaluated the round. Keeping the boundary
+    /// explicitly prevents those local items from being mistaken for prior
+    /// model output during response-wide tool-budget admission.
+    pub current_round_output_start: usize,
+
     /// Whether stored history was successfully resolved into this state.
     ///
     /// The proxy uses this to distinguish locally consumed history identifiers
@@ -83,9 +265,8 @@ pub(crate) struct ResponsesState {
 
     /// Maximum number of built-in tool invocations.
     ///
-    /// Reserved for future use by built-in tool filters. Not
-    /// currently enforced by any filter. `None` means no explicit
-    /// limit was set by the client.
+    /// Enforced by built-in tool filters across retained output.
+    /// `None` means no explicit limit was set by the client.
     pub max_tool_calls: Option<u32>,
 
     /// Resolved MCP tool definitions keyed by `(server_label,
@@ -94,6 +275,22 @@ pub(crate) struct ResponsesState {
     /// Built by `openai_mcp_tool_resolve` from `tools/list` responses.
     /// Consumed by `mcp_tool` (#27) for dispatch routing.
     pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
+
+    /// Lifecycle state for an MCP batch that must return after execution.
+    pub mcp_approval_state: McpApprovalState,
+
+    /// Whether a local dispatcher exhausted the response-wide tool budget.
+    ///
+    /// Request filters run in pipeline order. Deferring the terminal response
+    /// lets later dispatchers retain rejected sibling calls before the agentic
+    /// loop completes the current response locally.
+    pub deferred_tool_limit_completion: bool,
+
+    /// Whether an upstream logical stream supplied a `[DONE]` sentinel.
+    ///
+    /// This survives filter-state re-arming between IRR request steps so a
+    /// request-side local completion can preserve the original stream shape.
+    pub deferred_stream_done: bool,
 
     /// Resolved conversation history sent to the backend.
     ///
@@ -115,6 +312,30 @@ pub(crate) struct ResponsesState {
     /// [`Self::messages`] because it is not forwarded to backend
     /// inference.
     pub persisted_messages: Vec<serde_json::Value>,
+
+    /// Server-owned pending MCP approvals emitted during this request.
+    ///
+    /// Populated by `mcp_dispatch` when it pauses on an
+    /// `mcp_approval_request`, this is drained by the store filter and
+    /// persisted as the authoritative record for correlating a later
+    /// `mcp_approval_response`. Consent provenance lives here and in the
+    /// store, never in the (client-influenced) conversation history.
+    pub pending_approvals: Vec<crate::store::PendingApprovalRecord>,
+
+    /// Whether the store filter armed persistence for this exchange.
+    ///
+    /// Set by `openai_response_store` during the request phase only after it
+    /// initializes and registers a backend AND classifies this request as one
+    /// whose response will be persisted. `mcp_dispatch` reads this
+    /// exchange-scoped marker before emitting an `mcp_approval_request`: unlike
+    /// pipeline-scoped registry membership, it proves the store filter actually
+    /// ran and intends to persist THIS response, so it also catches a store
+    /// filter that is absent, request-conditioned out, or ordered after
+    /// dispatch. It cannot observe a response-phase persistence skip (a
+    /// `response_conditions`-gated store filter, a non-2xx status, etc.); that
+    /// narrower residual is unsupported for approval pipelines and still fails
+    /// closed at resume.
+    pub store_persist_armed: bool,
 
     /// ID of a previous response to continue from.
     ///
@@ -163,20 +384,15 @@ pub(crate) struct ResponsesState {
     /// Cleared by `openai_agentic_loop` at the start of each iteration.
     /// Stored separately from `tool_calls` because `web_search_call`
     /// items have a different shape (`action.query` instead of
-    /// `name`/`arguments`) and must not trigger the
-    /// one-function-call-per-round limit.
+    /// `name`/`arguments`) and are dispatched by a different filter.
     pub web_search_calls: Vec<serde_json::Value>,
 
     /// Cumulative web searches dispatched to the provider across all
     /// agentic-loop iterations.
     ///
-    /// `openai_web_search` increments this each time it issues a
-    /// provider request so the client-declared `max_tool_calls` budget
-    /// is honored across IRR continuations, not just within one round.
-    /// A dedicated counter is used instead of counting `web_search_call`
-    /// items in [`Self::accumulated_output`] because that field retains
-    /// both the model's echoed call and the executed result, which would
-    /// double-count each search.
+    /// This is operational execution state, not `max_tool_calls` accounting:
+    /// the response-wide API limit charges retained model-call admissions,
+    /// including calls whose local execution is incomplete.
     pub web_search_calls_executed: u32,
 
     /// Tool choice setting. Reset to `"auto"` by `openai_agentic_loop`
@@ -199,6 +415,105 @@ pub(crate) struct ResponsesState {
     /// trace. `openai_agentic_loop` writes model items, `mcp_dispatch`
     /// writes `mcp_call` and `mcp_approval_request` items.
     pub accumulated_output: Vec<serde_json::Value>,
+
+    /// Client-visible lifecycle progress of output items, keyed by item id.
+    ///
+    /// Tracked across IRR rounds so `stream_events` can synthesize incremental
+    /// events for locally generated tool items (MCP calls and approvals, or web
+    /// searches absent from the upstream stream): each milestone (`added`, the
+    /// progress/outcome lifecycle, the last delivered content) exactly once,
+    /// without duplicating an `output_item.added` the model already streamed,
+    /// yet still re-emitting the outcome when the same item changes locally
+    /// (e.g. a model `web_search_call` placeholder later completed under the
+    /// same id, or gaining `action.sources` after local execution).
+    pub emitted_output_items: HashMap<String, EmittedItem>,
+
+    /// Item ids of local tool calls a dispatch filter actually executed this
+    /// request (execution provenance), keyed by the output item's `id`.
+    ///
+    /// `stream_events` synthesizes the client-visible progress/outcome lifecycle
+    /// only for items recorded here, never for every tool-typed item that reaches
+    /// [`Self::accumulated_output`]. A non-dispatchable round that aborts on a
+    /// parse error still copies the model's `web_search_call` placeholder into
+    /// `accumulated_output` (via `agentic_loop::collect_streaming_output_items`),
+    /// so keying synthesis on item type alone would fabricate an
+    /// `in_progress`/`searching`/`done` lifecycle for a search that never ran.
+    /// `mcp_dispatch` records both the approval-request and result item ids;
+    /// `web_search` records the id it replaces with executed results.
+    pub locally_executed_output_items: HashSet<String>,
+
+    /// Absolute `output_index` values into `accumulated_output` (+ origin) for the
+    /// items `openai_file_search_callout` reconciled this round on the streaming
+    /// path. Drained exactly once by `stream_events` at finalize (§4.2). Index + a
+    /// 1-byte tag (no owned `Value`) so it needs no separate `continuation_state_fits` charge.
+    pub pending_local_tool_synthesis: Vec<(usize, SynthesisKind)>,
+
+    /// Provider `file_search_call` item ids whose terminal lifecycle
+    /// `stream_events` already streamed live — a native hybrid whose terminal
+    /// `output_item.done` passed through, cancelling EOS suppression (§6).
+    /// The streaming reconcile reads this to skip re-queuing such a call for
+    /// synthesis; a synthesized tail would emit a DUPLICATE terminal
+    /// `output_item.done` (#313 P1). Recorded for ANY provider-terminal status
+    /// (completed/failed/incomplete): the set membership — not the status — is
+    /// authoritative. A callout-terminalized `incomplete` call is absent here
+    /// (its live done was suppressed, never passed through) and still synthesizes.
+    /// Keyed by item id (stable across the streamed done and the accumulated item).
+    ///
+    /// Lifecycle is one IRR round: `stream_events` records into it during the round's
+    /// chunks, `file_search`'s EOS reconcile reads it, then `finalize_logical_stream`
+    /// clears it (§6). The ids are stale after their round — they never re-match a later
+    /// round's items — so clearing loses nothing and bounds the set. It is also charged
+    /// against `max_state_bytes` in `continuation_state_fits` like every other
+    /// request-scoped field (#313 P1 `DoS` bound).
+    pub provider_streamed_terminal_ids: BTreeSet<String>,
+}
+
+/// Which client-visible lifecycle milestones a locally generated output item has
+/// already reached the client, so `stream_events` synthesizes each exactly once
+/// yet re-emits the outcome when the item's content later changes.
+///
+/// The model backend streams at most `output_item.added`/`output_item.done` for
+/// these items and often never the tool-specific progress events
+/// (`*.in_progress`, `*.searching`, `*.completed`, `*.failed`), so tracking each
+/// milestone separately from content lets the proxy fill in the missing progress
+/// lifecycle even when local execution leaves the item's content byte-identical
+/// to the model's placeholder.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EmittedItem {
+    /// `output_item.added` reached the client (model passthrough or synthesis).
+    pub added: bool,
+    /// The finalizing `output_item.done` envelope reached the client for this item
+    /// (model passthrough that survived the premature-`done` check, or synthesis).
+    ///
+    /// Tracked separately from [`Self::added`] and the phase set: a backend may
+    /// stream every tool-specific phase in-band yet be cut off before the `done`
+    /// envelope, so a resumed round must still finalize the item with exactly one
+    /// `done`. Conversely, once the envelope has been delivered it is re-emitted
+    /// only when the item's content changes, never merely because a phase was
+    /// synthesized.
+    pub done_delivered: bool,
+    /// The individual tool-specific progress and outcome events that have reached
+    /// the client for this item (e.g. `response.web_search_call.in_progress`,
+    /// `response.mcp_call.completed`), keyed by their event type.
+    ///
+    /// Each phase is tracked independently — they are distinct API lifecycle
+    /// events, not one combined milestone. An entry is added only by observing an
+    /// actual progress event (model passthrough) or by synthesizing one; never by
+    /// `output_item.added`/`output_item.done` alone, which announce the item and
+    /// carry its content but are no proof that any progress event was delivered.
+    /// Tracking each phase separately lets the proxy fill in exactly the events a
+    /// partial in-band lifecycle (e.g. `in_progress` then `done`) still owes,
+    /// without duplicating the ones the model already streamed.
+    pub streamed_phases: BTreeSet<String>,
+    /// Fixed-size digest of the item content last delivered to the client,
+    /// compared across rounds to re-emit the `output_item.done` envelope when the
+    /// same item changes locally (e.g. gains `action.sources`).
+    ///
+    /// A digest rather than the full serialized item so retained state stays
+    /// bounded: local tool payloads already live in `accumulated_output`, and an
+    /// IRR response can reach tens of MiB across rounds, so keeping a second full
+    /// copy per item here would be payload-scale memory amplification.
+    pub content_digest: u64,
 }
 
 /// Whether the proxy can preserve the original request bytes.
@@ -223,14 +538,20 @@ impl Default for ResponsesState {
             include: Vec::new(),
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
+            current_round_output_start: 0,
             history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
             max_tool_calls: None,
+            mcp_approval_state: McpApprovalState::None,
+            deferred_tool_limit_completion: false,
+            deferred_stream_done: false,
             mcp_tool_map: HashMap::new(),
             messages: Vec::new(),
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
+            pending_approvals: Vec::new(),
+            store_persist_armed: false,
             previous_response_id: None,
             previous_tools: Vec::new(),
             previous_usage: None,
@@ -247,6 +568,10 @@ impl Default for ResponsesState {
             tools: Vec::new(),
             usage: serde_json::Value::Null,
             accumulated_output: Vec::new(),
+            emitted_output_items: HashMap::new(),
+            locally_executed_output_items: HashSet::new(),
+            pending_local_tool_synthesis: Vec::new(),
+            provider_streamed_terminal_ids: BTreeSet::new(),
         }
     }
 }
@@ -276,6 +601,7 @@ impl ResponsesState {
             tool_choice,
             tools,
             accumulated_output: Vec::new(),
+            pending_local_tool_synthesis: Vec::new(),
             ..Default::default()
         }
     }
@@ -343,6 +669,75 @@ impl ResponsesState {
             *body = Some(Bytes::from(serialized));
         }
     }
+
+    /// Move the pending local-tool synthesis queue out, leaving it empty.
+    pub fn drain_pending_local_tool_synthesis(&mut self) -> Vec<(usize, SynthesisKind)> {
+        std::mem::take(&mut self.pending_local_tool_synthesis)
+    }
+}
+
+/// Return budget admission decisions for one kind of current-round local call.
+///
+/// Dispatch filters run independently on request re-entry, but the response-wide
+/// limit applies in model output order. Replaying the immutable current response
+/// here prevents pipeline order from letting a later web search displace an
+/// earlier MCP call (or vice versa).
+pub(crate) fn current_round_tool_call_admissions(
+    state: &ResponsesState,
+    target_calls: &[serde_json::Value],
+    is_mcp_function: impl Fn(&serde_json::Value) -> bool,
+) -> Vec<bool> {
+    current_round_tool_call_admissions_by(
+        state,
+        target_calls.len(),
+        |index| target_calls.get(index),
+        is_mcp_function,
+    )
+}
+
+/// Return current-round admissions for callers that already borrow tool calls.
+pub(crate) fn current_round_borrowed_tool_call_admissions(
+    state: &ResponsesState,
+    target_calls: &[&serde_json::Value],
+    is_mcp_function: impl Fn(&serde_json::Value) -> bool,
+) -> Vec<bool> {
+    current_round_tool_call_admissions_by(
+        state,
+        target_calls.len(),
+        |index| target_calls.get(index).copied(),
+        is_mcp_function,
+    )
+}
+
+/// Replay model output order against an arbitrary borrowed target-call view.
+fn current_round_tool_call_admissions_by<'a>(
+    state: &ResponsesState,
+    target_count: usize,
+    target_call: impl Fn(usize) -> Option<&'a serde_json::Value>,
+    is_mcp_function: impl Fn(&serde_json::Value) -> bool,
+) -> Vec<bool> {
+    let previous_calls = consumed_builtin_tool_calls_before_current_round(state);
+    let mut remaining = state.max_tool_calls.map_or(usize::MAX, |limit| {
+        usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(previous_calls)
+    });
+    let mut admissions = Vec::new();
+    let mut target_index = 0;
+
+    for item in state.output_items() {
+        let mcp = is_mcp_function(item);
+        let consumes_budget = mcp || is_builtin_tool_call(item);
+        let admitted = !consumes_budget || remaining > 0;
+        if consumes_budget {
+            remaining = remaining.saturating_sub(1);
+        }
+        if target_index < target_count && target_call(target_index) == Some(item) {
+            admissions.push(admitted);
+            target_index = target_index.saturating_add(1);
+        }
+    }
+    admissions
 }
 
 /// Normalize the `input` field into a message array.
@@ -635,6 +1030,126 @@ mod tests {
     }
 
     #[test]
+    fn current_round_budget_admission_follows_model_output_order() {
+        let mcp = json!({
+            "type":"function_call", "call_id":"mcp_1",
+            "name":"utilities__weather", "status":"completed"
+        });
+        let web = json!({"type":"web_search_call", "id":"ws_1", "status":"completed"});
+        let state = ResponsesState {
+            max_tool_calls: Some(2),
+            current_round_output_start: 1,
+            accumulated_output: vec![json!({"type":"mcp_call", "id":"prior"}), mcp.clone(), web.clone()],
+            response_object: json!({"output":[mcp, web]}),
+            ..ResponsesState::default()
+        };
+        let is_mcp = |item: &serde_json::Value| {
+            item.get("name").and_then(serde_json::Value::as_str) == Some("utilities__weather")
+        };
+
+        assert_eq!(current_round_tool_call_admissions(&state, &[mcp], is_mcp), vec![true]);
+        assert_eq!(current_round_tool_call_admissions(&state, &[web], is_mcp), vec![false]);
+    }
+
+    #[test]
+    fn incomplete_web_call_remains_charged_in_later_rounds() {
+        let next = json!({"type":"web_search_call", "id":"ws_next", "status":"in_progress"});
+        let state = ResponsesState {
+            max_tool_calls: Some(1),
+            current_round_output_start: 1,
+            accumulated_output: vec![
+                json!({"type":"web_search_call", "id":"ws_malformed", "status":"incomplete"}),
+                next.clone(),
+            ],
+            response_object: json!({"output":[next.clone()]}),
+            ..ResponsesState::default()
+        };
+
+        assert_eq!(consumed_builtin_tool_calls_before_current_round(&state), 1);
+        assert_eq!(
+            current_round_tool_call_admissions(&state, &[next], |_| false),
+            vec![false],
+            "an admitted call stays charged even when local execution was incomplete"
+        );
+    }
+
+    #[test]
+    fn current_provider_execution_does_not_double_charge_round_admission() {
+        let web = json!({"type":"web_search_call", "id":"ws_current", "status":"completed"});
+        let mcp = json!({
+            "type":"function_call", "call_id":"mcp_current",
+            "name":"utilities__weather", "status":"completed"
+        });
+        let state = ResponsesState {
+            max_tool_calls: Some(2),
+            web_search_calls_executed: 1,
+            accumulated_output: vec![web.clone(), mcp.clone()],
+            response_object: json!({"output":[web, mcp.clone()]}),
+            ..ResponsesState::default()
+        };
+
+        assert_eq!(
+            current_round_tool_call_admissions(&state, &[mcp], |item| {
+                item.get("name").and_then(serde_json::Value::as_str) == Some("utilities__weather")
+            }),
+            vec![true],
+            "the execution counter must not charge a current web call before ordered admission"
+        );
+    }
+
+    #[test]
+    fn repeated_file_search_ids_count_as_separate_occurrences() {
+        let first = json!({"type":"file_search_call", "id":"fs_reused", "status":"completed"});
+        let second = json!({"type":"file_search_call", "id":"fs_reused", "status":"incomplete"});
+        let state = ResponsesState {
+            accumulated_output: vec![first.clone(), second.clone()],
+            // Echoes in another lifecycle owner must not add two more calls.
+            file_search_output_items: vec![first, second],
+            ..ResponsesState::default()
+        };
+
+        assert_eq!(
+            consumed_builtin_tool_calls(&state),
+            2,
+            "same-ID calls from separate rounds remain separate budget occurrences"
+        );
+    }
+
+    #[test]
+    fn current_round_budget_ignores_locally_appended_approval_items() {
+        let web = json!({"type":"web_search_call", "id":"ws_1", "status":"completed"});
+        let gated = json!({
+            "type":"function_call", "call_id":"mcp_gated",
+            "name":"utilities__gated", "status":"completed"
+        });
+        let ungated = json!({
+            "type":"function_call", "call_id":"mcp_ungated",
+            "name":"utilities__ungated", "status":"completed"
+        });
+        let state = ResponsesState {
+            max_tool_calls: Some(3),
+            accumulated_output: vec![
+                web.clone(),
+                gated.clone(),
+                ungated.clone(),
+                json!({"type":"mcp_approval_request", "id":"mcp_gated"}),
+            ],
+            response_object: json!({"output":[web, gated, ungated.clone()]}),
+            ..ResponsesState::default()
+        };
+        let is_mcp = |item: &serde_json::Value| {
+            item.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.starts_with("utilities__"))
+        };
+
+        assert_eq!(
+            current_round_tool_call_admissions(&state, &[ungated], is_mcp),
+            vec![true]
+        );
+    }
+
+    #[test]
     fn parallel_tool_calls_defaults_to_true() {
         let body = json!({"model": "gpt-4o", "input": "test"});
         let state = ResponsesState::from_request_body(body);
@@ -642,6 +1157,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "exhaustive one-assert-per-field check of every default value"
+    )]
     fn default_produces_expected_values() {
         let state = ResponsesState::default();
         assert!(state.context_management.is_none());
@@ -655,6 +1174,7 @@ mod tests {
         assert!(state.output_items().is_empty());
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
+        assert!(!state.store_persist_armed);
         assert!(state.previous_response_id.is_none());
         assert!(state.previous_tools.is_empty());
         assert!(state.previous_usage.is_none());
@@ -667,6 +1187,8 @@ mod tests {
         assert!(state.tools.is_empty());
         assert!(state.usage.is_null());
         assert!(state.accumulated_output.is_empty());
+        assert!(state.emitted_output_items.is_empty());
+        assert!(state.locally_executed_output_items.is_empty());
     }
 
     #[test]
@@ -716,5 +1238,71 @@ mod tests {
         let body = json!({"model": "gpt-4o", "input": "test"});
         let state = ResponsesState::from_request_body(body);
         assert!(state.mcp_tool_map.is_empty(), "initial mcp_tool_map should be empty");
+    }
+
+    #[test]
+    fn drain_pending_local_tool_synthesis_moves_and_empties() {
+        let mut state = ResponsesState::default();
+        state.pending_local_tool_synthesis.push((3, SynthesisKind::Native));
+        state.pending_local_tool_synthesis.push((7, SynthesisKind::Private));
+        let drained = state.drain_pending_local_tool_synthesis();
+        assert_eq!(drained, vec![(3, SynthesisKind::Native), (7, SynthesisKind::Private)]);
+        assert!(
+            state.pending_local_tool_synthesis.is_empty(),
+            "drain must leave the queue empty (drain-once)"
+        );
+    }
+
+    #[test]
+    fn builtin_tool_call_classifier_covers_shared_dispatch_budget_types() {
+        for call_type in [
+            "apply_patch_call",
+            "code_interpreter_call",
+            "computer_call",
+            "custom_tool_call",
+            "file_search_call",
+            "image_generation_call",
+            "local_shell_call",
+            "mcp_call",
+            "multi_agent_call",
+            "shell_call",
+            "tool_search_call",
+            "web_search_call",
+        ] {
+            assert!(
+                is_builtin_tool_call(&json!({"type":call_type})),
+                "{call_type} must consume the shared built-in tool-call budget"
+            );
+        }
+        assert!(!is_builtin_tool_call(&json!({"type":"function_call"})));
+        assert!(!is_builtin_tool_call(&json!({"type":"message"})));
+    }
+
+    #[test]
+    fn client_executed_tool_call_classifier_covers_result_owned_types() {
+        for call_type in [
+            "apply_patch_call",
+            "computer_call",
+            "custom_tool_call",
+            "local_shell_call",
+        ] {
+            assert!(
+                is_client_executed_tool_call(&json!({"type":call_type})),
+                "{call_type} requires a client-supplied result"
+            );
+        }
+        assert!(is_client_executed_tool_call(
+            &json!({"type":"tool_search_call", "execution":"client"})
+        ));
+        assert!(!is_client_executed_tool_call(
+            &json!({"type":"tool_search_call", "execution":"server"})
+        ));
+        assert!(is_client_executed_tool_call(
+            &json!({"type":"shell_call", "environment":{"type":"local"}})
+        ));
+        assert!(!is_client_executed_tool_call(
+            &json!({"type":"shell_call", "environment":{"type":"container_reference", "container_id":"cntr_1"}})
+        ));
+        assert!(!is_client_executed_tool_call(&json!({"type":"web_search_call"})));
     }
 }

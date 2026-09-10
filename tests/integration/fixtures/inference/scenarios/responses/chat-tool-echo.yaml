@@ -1,0 +1,40 @@
+version: 1
+id: responses/chat-tool-echo
+description: Function-tool Responses request; the translated resource echoes the normalized tool schema.
+protocol: openai_responses
+example_config: openai/responses/responses-to-chat-completions.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.tools.function_echo
+turns:
+  - name: function-tool-echo
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: What's the weather like in San Francisco?
+          store: false
+          stream: false
+          tools:
+            - type: function
+              name: get_weather
+              description: Get the current weather for a location
+              parameters:
+                type: object
+                properties:
+                  location:
+                    type: string
+                required: [location]
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

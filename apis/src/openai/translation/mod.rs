@@ -2924,6 +2924,64 @@ mod tests {
         assert_eq!(mapped["service_tier"], "default");
     }
 
+    #[test]
+    fn null_service_tier_in_response_falls_back_to_default() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "Hi"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "gpt-4.1-mini",
+            "service_tier": Value::Null,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        assert_eq!(mapped["service_tier"], "default");
+    }
+
+    #[test]
+    fn null_service_tier_in_response_falls_back_to_request_context() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "Hi", "service_tier": "flex"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "gpt-4.1-mini",
+            "service_tier": Value::Null,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        assert_eq!(mapped["service_tier"], "flex");
+    }
+
+    #[test]
+    fn null_service_tier_in_request_context_falls_back_to_default() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "Hi", "service_tier": Value::Null});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        assert_eq!(mapped["service_tier"], "default");
+    }
+
+    #[test]
+    fn null_service_tier_in_request_context_defaults_in_progress_snapshot() {
+        let request = json!({"model": "gpt-4.1-mini", "input": "Hi", "service_tier": Value::Null});
+        let context = make_response_context(&request);
+        let snapshot = super::chat_completions::in_progress_response_resource(&context).unwrap();
+        assert_eq!(snapshot["status"], "in_progress");
+        assert_eq!(
+            snapshot["service_tier"], "default",
+            "a present-but-null request service_tier must not leak into the \
+             response.created/response.in_progress snapshot, which funnels through \
+             in_progress_response_resource (hardened alongside the finite path)"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Response translation: tool call output items
     // -------------------------------------------------------------------------
@@ -3132,6 +3190,71 @@ mod tests {
 
         assert_eq!(mapped["output"][0]["content"][0]["annotations"], json!([]));
         assert_eq!(mapped["output"][0]["content"][0]["logprobs"], json!([]));
+    }
+
+    // -------------------------------------------------------------------------
+    // Response translation: echoed function tools normalization
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn function_tool_echo_normalized_to_response_schema() {
+        let request = json!({
+            "model": "gpt-4.1-mini",
+            "input": "What's the weather in San Francisco?",
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get the current weather for a location",
+                "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}
+            }]
+        });
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1", "object": "chat.completion", "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        let tool = &mapped["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "get_weather");
+        assert_eq!(tool["strict"], false);
+        assert_eq!(tool["description"], "Get the current weather for a location");
+        assert!(tool["parameters"].is_object());
+    }
+
+    #[test]
+    fn minimal_function_tool_echo_fills_response_schema_fields() {
+        let request = json!({
+            "model": "gpt-4.1-mini", "input": "Hi",
+            "tools": [{"type": "function", "name": "f"}]
+        });
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1", "object": "chat.completion", "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        let tool = &mapped["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "f");
+        assert_eq!(tool["strict"], false);
+        assert_eq!(tool["description"], Value::Null);
+        assert_eq!(tool["parameters"], Value::Null);
+    }
+
+    #[test]
+    fn hosted_tool_echo_passes_through_unchanged() {
+        let request = json!({
+            "model": "gpt-4.1-mini", "input": "Hi",
+            "tools": [{"type": "web_search", "search_context_size": "high"}]
+        });
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl_1", "object": "chat.completion", "model": "gpt-4.1-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        });
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+        assert_eq!(mapped["tools"], request["tools"]);
     }
 
     // -------------------------------------------------------------------------

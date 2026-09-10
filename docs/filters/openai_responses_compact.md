@@ -9,7 +9,13 @@ Summarizes conversation history when the token count exceeds a configured thresh
 
 `compact_threshold` in `context_management` must be an integer of at least 1000. Invalid or missing `compact_threshold` values produce an `invalid_request_error`.
 
-Compaction only applies to multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history. Single-turn requests are released without compaction.
+Compaction applies in two scenarios:
+
+- **Rehydrated history** - stored history loaded via `previous_response_id` or `conversation`. Only the stored history is summarized; the current turn is preserved.
+
+- **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an inline `input` conversation and/or a `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract.
+
+Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because `state.input == state.messages` - there is no separable "current turn" to preserve after summarization. Requests without rehydrated history are released without compaction.
 
 Praxis runs `StreamBuffer` body hooks before header-phase request filters. This filter therefore requires `allow_pre_security_callout: true` and should only be used behind an outer authentication and authorization boundary.
 
@@ -22,6 +28,7 @@ Praxis runs `StreamBuffer` body hooks before header-phase request filters. This 
 | `allow_private_inference_url` | bool | no | Allow the inference target to resolve to non-public addresses. |
 | `default_model` | string | no | Default model for summarization when not overridden in the request's `context_management`. |
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
+| `summary_prefix` | string | no | Prefix prepended to the summary when translating compaction items to backend messages. Defaults to `"[Previous conversation summary]\n\n"`. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `on_failure` | `closed` \| `open` | no | Failure mode for the inference callout. |
 | `status_on_error` | integer | no | HTTP error status code (`400..=599`) to return when rejecting on error. |
@@ -47,6 +54,7 @@ inference_url: "http://localhost:11434/v1/chat/completions"
 allow_private_inference_url: true
 default_model: gpt-4o-mini
 tiktoken_encoding: cl100k_base
+summary_prefix: "[Previous conversation summary]\n\n"
 timeout_ms: 30000
 on_failure: closed
 status_on_error: 502

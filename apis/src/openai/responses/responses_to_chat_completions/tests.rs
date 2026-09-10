@@ -404,7 +404,7 @@ async fn unresolved_previous_response_id_fails_closed() {
 }
 
 #[tokio::test]
-async fn unresolved_streaming_previous_response_id_fails_closed_with_sse_error() {
+async fn unresolved_streaming_previous_response_id_fails_closed_with_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -429,15 +429,10 @@ async fn unresolved_streaming_previous_response_id_fails_closed_with_sse_error()
     assert_eq!(rejection.status, 500);
     assert_eq!(
         rejection.headers.iter().find(|(name, _)| name == "content-type"),
-        Some(&("content-type".to_owned(), "text/event-stream".to_owned()))
+        Some(&("content-type".to_owned(), "application/json".to_owned())),
+        "an unresolved streaming request that fails before the stream is committed returns a JSON error envelope, not an SSE event (issue #1001)"
     );
-    let event = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
-    assert!(
-        event.starts_with("event: error\ndata: "),
-        "streaming rejection must use SSE error event format"
-    );
-    let data = event.strip_prefix("event: error\ndata: ").unwrap().trim_end();
-    let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], "server_error");
     assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
     assert_eq!(body.as_deref(), Some(original.as_ref()));
@@ -452,7 +447,7 @@ async fn unresolved_streaming_previous_response_id_fails_closed_with_sse_error()
 }
 
 #[tokio::test]
-async fn streaming_responses_create_without_state_uses_sse_error() {
+async fn streaming_responses_create_without_state_uses_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -468,15 +463,10 @@ async fn streaming_responses_create_without_state_uses_sse_error() {
     assert_eq!(rejection.status, 500);
     assert_eq!(
         rejection.headers.iter().find(|(name, _)| name == "content-type"),
-        Some(&("content-type".to_owned(), "text/event-stream".to_owned()))
+        Some(&("content-type".to_owned(), "application/json".to_owned())),
+        "a streaming request that fails before the stream is committed returns a JSON error envelope, not an SSE event (issue #1001)"
     );
-    let event = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
-    assert!(
-        event.starts_with("event: error\ndata: "),
-        "stateless streaming rejection must use SSE error event format"
-    );
-    let data = event.strip_prefix("event: error\ndata: ").unwrap().trim_end();
-    let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], "server_error");
     assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
 }
@@ -789,7 +779,7 @@ async fn web_search_translation_preserves_canonical_hosted_tool_state() {
 }
 
 #[tokio::test]
-async fn streaming_translation_error_uses_responses_sse_error_event() {
+async fn streaming_translation_error_uses_responses_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
@@ -810,7 +800,7 @@ async fn streaming_translation_error_uses_responses_sse_error_event() {
     let FilterAction::Reject(rejection) = action else {
         panic!("expected rejection");
     };
-    assert_responses_sse_translation_error(&rejection);
+    assert_responses_json_translation_error(&rejection);
     assert!(
         context.get_metadata(ARMED_KEY).is_none(),
         "streaming translation error must not arm response processing"
@@ -821,25 +811,14 @@ async fn streaming_translation_error_uses_responses_sse_error_event() {
     );
 }
 
-fn assert_responses_sse_translation_error(rejection: &praxis_filter::Rejection) {
+fn assert_responses_json_translation_error(rejection: &praxis_filter::Rejection) {
     assert_eq!(rejection.status, 400);
     assert_eq!(
         rejection.headers.iter().find(|(name, _)| name == "content-type"),
-        Some(&("content-type".to_owned(), "text/event-stream".to_owned()))
+        Some(&("content-type".to_owned(), "application/json".to_owned())),
+        "a request-phase translation failure returns a JSON error envelope, not an SSE event (issue #1001)"
     );
-    let event = std::str::from_utf8(rejection.body.as_deref().unwrap()).unwrap();
-    assert!(
-        event.starts_with("event: error\ndata: "),
-        "the SSE rejection body must be a Responses error event"
-    );
-    assert!(
-        event.ends_with("\n\n"),
-        "the SSE error event must be terminated by a blank line"
-    );
-    let data = event.strip_prefix("event: error\ndata: ").unwrap().trim_end();
-    let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
-    assert_eq!(parsed["type"], "error");
-    assert_eq!(parsed["sequence_number"], 0);
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(parsed["error"]["type"], "invalid_request_error");
     assert_eq!(parsed["error"]["code"], "invalid_request_error");
     assert_eq!(
@@ -957,8 +936,8 @@ async fn non_sse_success_for_streaming_request_is_rejected() {
     );
     assert_eq!(
         rejection.headers.iter().find(|(name, _)| name == "content-type"),
-        Some(&("content-type".to_owned(), "text/event-stream".to_owned())),
-        "the fail-closed response must use the streaming client's SSE representation",
+        Some(&("content-type".to_owned(), "application/json".to_owned())),
+        "the rejection is produced before any stream is committed, so it uses the JSON error envelope",
     );
 }
 

@@ -7,6 +7,7 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+mod bounded_http;
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -33,6 +34,8 @@ use rmcp::{
     model::{CallToolRequestParams, PaginatedRequestParams},
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
+
+use self::bounded_http::BoundedMcpHttpClient;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -276,15 +279,18 @@ pub(crate) async fn call_tool(
     tool_name: &str,
     arguments: serde_json::Value,
     timeout: Duration,
+    max_result_bytes: usize,
     allow_loopback: bool,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let display_url = parse_display_url(server_url);
 
     let work = async {
         let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
+        let bounded_client = BoundedMcpHttpClient::new(build_pinned_client(&resolved)?, max_result_bytes);
+        let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
-            build_pinned_client(&resolved)?,
-            build_transport_config(server_url, headers, authorization)?,
+            bounded_client,
+            build_transport_config(server_url, headers, authorization)?.max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
 

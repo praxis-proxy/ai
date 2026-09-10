@@ -60,7 +60,7 @@ use tracing::{debug, trace, warn};
 use super::{
     super::{
         DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
-        error::responses_error_rejection, state::ResponsesState,
+        compact::is_explicit_compact_request, error::responses_error_rejection, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
@@ -71,7 +71,8 @@ use crate::{
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
     store::{
-        PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        PendingApprovalRecord, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore, StoreError,
     },
 };
 
@@ -214,6 +215,18 @@ impl ResponseStoreFilter {
         }
     }
 
+    /// Best-effort store init for the explicit compact endpoint.
+    ///
+    /// The compact filter handles a missing store with its own error,
+    /// so a failed init here does not reject the request.
+    async fn try_init_store_for_compact(&self, ctx: &HttpFilterContext<'_>) {
+        if is_explicit_compact_request(ctx)
+            && let Some(store) = &self.get_or_init_store().await
+        {
+            register_store_in_context(ctx, store);
+        }
+    }
+
     /// Handle `DELETE /v1/responses/{id}` by deleting from the store.
     async fn handle_delete(&self, tenant_id: &str, id: &str) -> Result<FilterAction, FilterError> {
         let Some(store) = self.ensure_store().await else {
@@ -283,12 +296,16 @@ impl ResponseStoreFilter {
             .remove_filter_state::<ResponseStoreRequestState>()
             .map(|state| state.input);
 
+        // Capture the proxy-issued pending approvals before building the record;
+        // the borrow is released before `build_record_from_state` re-borrows ctx.
+        let pending_approvals = pending_approvals_from_ctx(ctx);
+
         let Some(record) = build_record_from_state(ctx, &tenant_id, request_input) else {
             trace!("skipping streaming persistence: no accumulated state");
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(store, &record)?;
+        persist_response_blocking(store, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
 
@@ -312,11 +329,12 @@ impl ResponseStoreFilter {
             .extensions
             .get::<ResponsesState>()
             .map(|state| state.persisted_messages.clone());
+        let pending_approvals = pending_approvals_from_ctx(ctx);
         let Some(record) = parse_response_record(bytes, &tenant_id, request_input, state_messages) else {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(store, &record)?;
+        persist_response_blocking(store, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
 }
@@ -421,6 +439,26 @@ fn register_store_in_context(ctx: &HttpFilterContext<'_>, store: &Arc<dyn Respon
     }
 }
 
+/// Mark this exchange as persistence-armed on the shared [`ResponsesState`].
+///
+/// This is the exchange-scoped signal `mcp_dispatch` requires before emitting an
+/// `mcp_approval_request`. It is set only when this store filter both registers a
+/// backend and classifies the request as one whose response it will persist, so
+/// — unlike pipeline-scoped registry membership — it proves persistence is armed
+/// for THIS exchange and catches a store filter that is absent,
+/// request-conditioned out, or ordered after dispatch.
+///
+/// It is written from `on_request_body` because `openai_responses_validate`
+/// creates `ResponsesState` in its own `on_request_body`, which runs earlier in
+/// the same body phase; `ResponsesState` is not yet present during `on_request`.
+fn arm_persistence_if_persisting(ctx: &mut HttpFilterContext<'_>) {
+    if request_will_persist_response(ctx)
+        && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        state.store_persist_armed = true;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Delete Response Helpers
 // -----------------------------------------------------------------------------
@@ -445,7 +483,6 @@ fn delete_not_found_rejection(id: &str) -> Rejection {
         404,
         "invalid_request_error",
         &format!("No response found with id: '{id}'."),
-        false,
     )
 }
 
@@ -658,17 +695,50 @@ pub(super) fn build_record_from_state(
 /// races where a subsequent `DELETE /v1/responses/{id}` arrives
 /// before the upsert completes.
 ///
+/// Any server-owned pending approval requests the proxy emitted on this turn are
+/// recorded in the **same transaction** as the response, so a follow-up
+/// `mcp_approval_response` can correlate against a durable, server-written record
+/// rather than trusting the (client-influenced) conversation history. Committing
+/// both together, serialized against deletion, prevents a concurrent
+/// `DELETE /v1/responses/{id}` from landing between the two writes and orphaning a
+/// pending approval. `persist_response_with_pending_approvals` is insert-if-absent
+/// for the approvals, so re-persisting the same response never resets an
+/// already-consumed approval.
+///
 /// [`block_in_place`]: tokio::task::block_in_place
-fn persist_response_blocking(store: &dyn ResponseStore, record: &ResponseRecord) -> Result<(), FilterError> {
+fn persist_response_blocking(
+    store: &dyn ResponseStore,
+    record: &ResponseRecord,
+    pending_approvals: &[PendingApprovalRecord],
+) -> Result<(), FilterError> {
     debug!(
         id = %record.id,
         model = %record.model,
+        pending_approvals = pending_approvals.len(),
         "persisting response"
     );
 
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| handle.block_on(store.upsert_response(record)))
-        .map_err(|e| -> FilterError { Box::new(e) })
+    tokio::task::block_in_place(|| {
+        handle.block_on(async {
+            store
+                .persist_response_with_pending_approvals(record, pending_approvals)
+                .await
+        })
+    })
+    .map_err(|e| -> FilterError { Box::new(e) })
+}
+
+/// Snapshot the proxy-issued pending approvals from request-scoped state.
+///
+/// Cloned because the record is written on the blocking store hook after `ctx`
+/// is re-borrowed to build the response record; the buffer is small (one entry
+/// per approval the proxy issued this turn).
+fn pending_approvals_from_ctx(ctx: &HttpFilterContext<'_>) -> Vec<PendingApprovalRecord> {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .map(|state| state.pending_approvals.clone())
+        .unwrap_or_default()
 }
 
 // -----------------------------------------------------------------------------
@@ -725,6 +795,7 @@ impl HttpFilter for ResponseStoreFilter {
         }
 
         if !should_init_store_for_request(ctx) {
+            self.try_init_store_for_compact(ctx).await;
             return Ok(FilterAction::Continue);
         }
 
@@ -758,6 +829,13 @@ impl HttpFilter for ResponseStoreFilter {
                 Some(store) => register_store_in_context(ctx, store),
                 None => return Ok(FilterAction::Reject(reject_store_error())),
             }
+            // Publish the exchange-scoped persistence-armed marker so a
+            // downstream approval pause (mcp_dispatch) can tell that THIS
+            // response will be persisted, not merely that a store is registered
+            // somewhere in the pipeline.
+            arm_persistence_if_persisting(ctx);
+        } else {
+            self.try_init_store_for_compact(ctx).await;
         }
         Ok(FilterAction::Continue)
     }
@@ -1151,16 +1229,15 @@ fn reject_not_found(id: &str) -> Rejection {
         404,
         "invalid_request_error",
         &format!("No response found with id '{id}'."),
-        false,
     )
 }
 
 /// Build a 400 rejection for invalid client-supplied parameters.
 fn reject_invalid_input(message: &str) -> Rejection {
-    responses_error_rejection(400, "invalid_request_error", message, false)
+    responses_error_rejection(400, "invalid_request_error", message)
 }
 
 /// Build a 500 rejection for internal store failures.
 fn reject_store_error() -> Rejection {
-    responses_error_rejection(500, "server_error", "Internal server error.", false)
+    responses_error_rejection(500, "server_error", "Internal server error.")
 }

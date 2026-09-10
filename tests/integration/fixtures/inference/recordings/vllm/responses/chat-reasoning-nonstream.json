@@ -11,10 +11,10 @@
   "normalization": {
     "version": 1,
     "linked_ids": {
-      "chatcmpl-aaaf53f831a374e6": "chatcmpl-recorded-0004",
-      "msg_resp_5afc00ba28ff6c03ac0c000000000000": "msg_recorded_0003",
-      "resp_5afc00ba28ff6c03ac0c000000000000": "resp_recorded_0001",
-      "rs_resp_5afc00ba28ff6c03ac0c000000000000": "rs_recorded_0002"
+      "chatcmpl-9de28af1f824d4f1": "chatcmpl-recorded-0004",
+      "msg_resp_5b27e0df91cefc2e2ec4000000000000": "msg_recorded_0003",
+      "resp_5b27e0df91cefc2e2ec4000000000000": "resp_recorded_0001",
+      "rs_resp_5b27e0df91cefc2e2ec4000000000000": "rs_recorded_0002"
     }
   },
   "turns": [
@@ -70,7 +70,7 @@
                 {
                   "content": [
                     {
-                      "text": "The user is asking a simple arithmetic question: \"What is 2+2?\".\nThe user specified a constraint: \"Reply with just the number.\"\n\n    *   2 + 2 = 4.\nThe answer must be just the number \"4\".",
+                      "text": "The user is asking for the result of the addition \"2+2\".\nThe user requested the output to be \"just the number\".\n2 + 2 = 4.\nThe output should be \"4\".",
                       "type": "reasoning_text"
                     }
                   ],
@@ -103,7 +103,7 @@
                 "summary": null
               },
               "safety_identifier": null,
-              "service_tier": null,
+              "service_tier": "default",
               "status": "completed",
               "store": true,
               "temperature": 1.0,
@@ -122,11 +122,11 @@
                 "input_tokens_details": {
                   "cached_tokens": 0
                 },
-                "output_tokens": 60,
+                "output_tokens": 51,
                 "output_tokens_details": {
                   "reasoning_tokens": 0
                 },
-                "total_tokens": 89
+                "total_tokens": 80
               }
             }
           }
@@ -176,7 +176,7 @@
                     "audio": null,
                     "content": "4",
                     "function_call": null,
-                    "reasoning": "The user is asking a simple arithmetic question: \"What is 2+2?\".\nThe user specified a constraint: \"Reply with just the number.\"\n\n    *   2 + 2 = 4.\nThe answer must be just the number \"4\".",
+                    "reasoning": "The user is asking for the result of the addition \"2+2\".\nThe user requested the output to be \"just the number\".\n2 + 2 = 4.\nThe output should be \"4\".",
                     "refusal": null,
                     "role": "assistant",
                     "tool_calls": []
@@ -196,10 +196,10 @@
               "prompt_token_ids": null,
               "service_tier": null,
               "usage": {
-                "completion_tokens": 60,
+                "completion_tokens": 51,
                 "prompt_tokens": 29,
                 "prompt_tokens_details": null,
-                "total_tokens": 89
+                "total_tokens": 80
               }
             }
           }

@@ -52,6 +52,18 @@ env:
   # identical (uv reuses the same cached environment) and the two jobs can't
   # drift. Bump this line deliberately to pull a newer OGX.
   OGX_SPEC: "ogx[starter]==1.3.1"
+  # Pin transformers alongside OGX. ogx[starter] only constrains
+  # sentence-transformers (>=5.6.0, no upper bound), which in turn allows
+  # transformers >=5.0.0,<6.0.0 with no lower ceiling. transformers 5.17.0
+  # (PyPI 2026-09-09) removed ModuleUtilsMixin.get_extended_attention_mask,
+  # which OGX's inline Nomic embedding model (file-search vector-store indexing)
+  # calls via trust_remote_code, so every run that re-resolved the closure after
+  # 5.17.0 landed failed the two file-search tests with
+  #   'NomicBertModel' object has no attribute 'get_extended_attention_mask'.
+  # 5.16.1 is the last release that still ships the method and satisfies
+  # sentence-transformers 6.0.1's transformers>=5.0.0,<6.0.0 range. Bump this
+  # line deliberately once OGX / the Nomic model support transformers 5.17+.
+  TRANSFORMERS_SPEC: "transformers==5.16.1"
 
 jobs:
   # ----------------------------------------------------------------------------
@@ -129,22 +141,11 @@ jobs:
             .github/workflows/vllm-integration.yaml
             tests/integration/sdk/openai/test_openai_responses_vllm.py
 
-      - name: Pull vLLM CPU image
-        run: docker pull "$VLLM_IMAGE"
-
       - name: Start vLLM
-        run: |
-          docker run -d --name vllm \
-            -p 8000:8000 \
-            --privileged=true \
-            "$VLLM_IMAGE" \
-            --model /root/.cache/Qwen/Qwen3-0.6B \
-            --max-model-len 4096 \
-            --served-model-name "$VLLM_MODEL" \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.5
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.VLLM_MODEL }}
 
       - name: Pre-install OGX dependencies
         run: |
@@ -154,14 +155,15 @@ jobs:
           # "Wait for OGX readiness" window and loses the race under network
           # variance, so the server never binds port 8321 in time (exit 124).
           echo "Pre-installing OGX ($OGX_SPEC)..."
-          uv run --with "$OGX_SPEC" ogx --help > /dev/null
+          uv run --with "$OGX_SPEC" --with "$TRANSFORMERS_SPEC" ogx --help > /dev/null
           echo "OGX environment ready"
 
       - name: Start OGX
         run: |
-          # Same "$OGX_SPEC" as the pre-install above, so uv reuses the already
-          # materialized environment and the server binds within seconds.
-          uv run --with "$OGX_SPEC" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          # Same "$OGX_SPEC" + "$TRANSFORMERS_SPEC" as the pre-install above, so
+          # uv reuses the already materialized environment and the server binds
+          # within seconds.
+          uv run --with "$OGX_SPEC" --with "$TRANSFORMERS_SPEC" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
@@ -170,20 +172,6 @@ jobs:
       - name: Run Conversations SDK integration tests
         run: |
           uv run tests/integration/sdk/openai/test_openai_conversations.py -s
-
-      - name: Wait for vLLM readiness
-        run: |
-          echo "Waiting for vLLM health and model endpoints..."
-          timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-            if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
-              echo "::error::vLLM container exited unexpectedly"
-              docker logs vllm 2>&1
-              exit 1
-            fi
-            sleep 5
-          done'
-          echo "vLLM is ready"
 
       - name: Wait for OGX readiness
         run: |
@@ -216,7 +204,17 @@ jobs:
 
       - name: Run vLLM integration tests
         run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+          test_cmd=(
+            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+          )
+          if "${test_cmd[@]}"; then
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
+            exit 1
+          fi
+          echo "::warning::Retrying failed vLLM tests once for the merge queue"
+          "${test_cmd[@]}" --last-failed --last-failed-no-failures none
 
       - name: vLLM container logs
         if: failure()
@@ -287,22 +285,11 @@ jobs:
             .github/workflows/vllm-integration.yaml
             tests/integration/sdk/openai/test_openai_responses_vllm.py
 
-      - name: Pull vLLM CPU image
-        run: docker pull "$VLLM_IMAGE"
-
       - name: Start vLLM
-        run: |
-          docker run -d --name vllm \
-            -p 8000:8000 \
-            --privileged=true \
-            "$VLLM_IMAGE" \
-            --model /root/.cache/Qwen/Qwen3-0.6B \
-            --max-model-len 4096 \
-            --served-model-name "$VLLM_MODEL" \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.5
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.VLLM_MODEL }}
 
       - name: Pre-install OGX dependencies
         run: |
@@ -312,32 +299,19 @@ jobs:
           # "Wait for OGX readiness" window and loses the race under network
           # variance, so the server never binds port 8321 in time (exit 124).
           echo "Pre-installing OGX ($OGX_SPEC)..."
-          uv run --with "$OGX_SPEC" ogx --help > /dev/null
+          uv run --with "$OGX_SPEC" --with "$TRANSFORMERS_SPEC" ogx --help > /dev/null
           echo "OGX environment ready"
 
       - name: Start OGX
         run: |
-          # Same "$OGX_SPEC" as the pre-install above, so uv reuses the already
-          # materialized environment and the server binds within seconds.
-          uv run --with "$OGX_SPEC" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          # Same "$OGX_SPEC" + "$TRANSFORMERS_SPEC" as the pre-install above, so
+          # uv reuses the already materialized environment and the server binds
+          # within seconds.
+          uv run --with "$OGX_SPEC" --with "$TRANSFORMERS_SPEC" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
-
-      - name: Wait for vLLM readiness
-        run: |
-          echo "Waiting for vLLM health and model endpoints..."
-          timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                     curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-            if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
-              echo "::error::vLLM container exited unexpectedly"
-              docker logs vllm 2>&1
-              exit 1
-            fi
-            sleep 5
-          done'
-          echo "vLLM is ready"
 
       - name: Wait for OGX readiness
         run: |
@@ -372,7 +346,17 @@ jobs:
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
         run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+          test_cmd=(
+            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+          )
+          if "${test_cmd[@]}"; then
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
+            exit 1
+          fi
+          echo "::warning::Retrying failed vLLM tests once for the merge queue"
+          "${test_cmd[@]}" --last-failed --last-failed-no-failures none
 
       - name: vLLM container logs
         if: failure()

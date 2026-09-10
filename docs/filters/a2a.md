@@ -13,7 +13,7 @@ When `task_routing.enabled` is true, the filter captures task and context owners
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `headers` | A2aHeaders | no | Header names for A2A metadata promotion. |
+| `headers` | A2aHeaders | no | Header names for A2A metadata promotion. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated `x-praxis-a2a-*` defaults remain allowed. |
 | `headers.context_id` | string | no | Header name for the extracted context ID (e.g. `x-praxis-a2a-context-id`). |
 | `headers.family` | string | no | Header name for the A2A family (e.g. `x-praxis-a2a-family`). |
 | `headers.kind` | string | no | Header name for the JSON-RPC kind (e.g. `x-praxis-a2a-kind`). |

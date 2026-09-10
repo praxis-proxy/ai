@@ -12,8 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::{FilterAction, HttpFilter};
+use bytes::Bytes;
+use praxis_filter::{BodyMode, FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
 use super::{
     client::{
@@ -22,9 +24,13 @@ use super::{
         VectorStoreSearchResponse, request_error,
     },
     config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
-    *,
+    streaming, *,
 };
-use crate::subrequest::{SubRequestError, SubResponse};
+use crate::{
+    callout_policy::OnFailure,
+    openai::responses::state::SynthesisKind,
+    subrequest::{SubRequestError, SubResponse},
+};
 // -----------------------------------------------------------------------------
 // Configuration and transport validation
 // -----------------------------------------------------------------------------
@@ -577,82 +583,33 @@ async fn initial_state_is_rejected_before_oversized_json_duplication() {
 }
 
 #[tokio::test]
-async fn streaming_file_search_is_rejected_before_callout() {
+async fn streaming_without_marker_rejects_500() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
-    ctx.set_metadata("openai_responses_format.stream", "true");
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    // no responses.logical_stream.file_search marker published → fail closed
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("streaming file_search without an armed logical stream must fail closed");
+    };
+    assert_eq!(rejection.status, 500);
     assert!(server.requests().is_empty());
 }
 
 #[tokio::test]
-async fn streaming_without_file_search_is_rejected_before_buffering() {
+async fn streaming_consumes_marker_on_read() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let mut ctx = make_context(None);
-    let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
-    ));
-
-    assert!(matches!(
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn streaming_rehydrated_citations_are_rejected_without_a_pending_call() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut state = state_with(&["vs-a"], vec![]);
-    state.citation_files.insert("file-a".to_owned(), "a.txt".to_owned());
-    let mut ctx = make_context(Some(state));
-    ctx.set_metadata("openai_responses_format.stream", "true");
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn streaming_rehydrated_state_is_rejected_from_the_request_body() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut state = state_with(&["vs-a"], vec![]);
-    state.history_rehydrated = true;
-    let mut ctx = make_context(Some(state));
-    let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1","input":"search","stream":true,"tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]}"#,
-    ));
-
-    assert!(matches!(
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn first_pass_streaming_file_search_is_rejected() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut ctx = make_context(Some(state_with(&["vs-a"], vec![])));
-    ctx.set_metadata("openai_responses_format.stream", "true");
-    ctx.set_metadata("openai_tool_parse.has_file_search", "true");
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(server.requests().is_empty());
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.set_metadata("responses.logical_stream.file_search", "true");
+    let _unused = filter.on_request(&mut ctx).await.unwrap();
+    assert_eq!(
+        ctx.get_metadata("responses.logical_stream.file_search"),
+        Some("false"),
+        "consume-on-read"
+    );
 }
 
 #[tokio::test]
@@ -972,6 +929,28 @@ async fn max_tool_calls_counts_completed_calls_before_pending_execution() {
 }
 
 #[tokio::test]
+async fn max_tool_calls_counts_reused_ids_from_separate_rounds() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let pending = json!({"type":"file_search_call","id":"fs-next","status":"searching","queries":["q"]});
+    let mut state = state_with(&["vs-a"], vec![pending]);
+    state.file_search_output_items = vec![
+        json!({"type":"file_search_call","id":"fs-reused","status":"completed"}),
+        json!({"type":"file_search_call","id":"fs-reused","status":"incomplete"}),
+    ];
+    state.max_tool_calls = Some(2);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.output_items()[0]["status"], "incomplete");
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
 async fn max_tool_calls_counts_completed_calls_in_the_current_output() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
@@ -1087,7 +1066,7 @@ fn final_response_rewrite_clears_representation_headers() {
 }
 
 #[tokio::test]
-async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
+async fn mcp_calls_consume_the_response_wide_builtin_tool_budget() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let mcp = json!({"type":"mcp_call","id":"mcp-prior","status":"completed"});
@@ -1101,8 +1080,31 @@ async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
         FilterAction::Continue
     ));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[1]["status"], "completed");
-    assert_eq!(server.requests().len(), 1);
+    assert_eq!(state.output_items()[1]["status"], "incomplete");
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn prior_agentic_calls_consume_file_search_budget_across_state_owners() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let pending = json!({"type":"file_search_call","id":"fs-new","status":"searching","queries":["q"]});
+    let mut state = state_with(&["vs-a"], vec![pending]);
+    state.max_tool_calls = Some(2);
+    state.web_search_calls_executed = 1;
+    state.accumulated_output = vec![
+        json!({"type":"web_search_call", "id":"ws-prior", "status":"completed"}),
+        json!({"type":"mcp_call", "id":"mcp-prior", "status":"completed"}),
+    ];
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.output_items()[0]["status"], "incomplete");
+    assert!(server.requests().is_empty());
 }
 
 #[tokio::test]
@@ -1651,7 +1653,7 @@ fn translate_single_query() {
 
     let count = translate_function_calls_to_file_search(&mut response);
 
-    assert_eq!(count, 1, "one item should be translated");
+    assert_eq!(count, vec![0], "one item translated at round-local index 0");
     let item = &response["output"][0];
     assert_eq!(item["type"], "file_search_call", "type should be rewritten");
     assert_eq!(item["status"], "searching", "status should be set to searching");
@@ -1721,7 +1723,10 @@ fn translate_skips_non_file_search() {
 
     let count = translate_function_calls_to_file_search(&mut response);
 
-    assert_eq!(count, 0, "non-file_search function_calls should not be translated");
+    assert!(
+        count.is_empty(),
+        "non-file_search function_calls should not be translated"
+    );
     assert_eq!(
         response["output"][0]["type"], "function_call",
         "type should remain function_call"
@@ -2196,4 +2201,827 @@ impl MockServer {
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
+}
+
+#[test]
+fn budget_counts_accumulated_output_on_streaming_path() {
+    let mut state = ResponsesState::default();
+    state.max_tool_calls = Some(2);
+    // Streaming: prior rounds live in accumulated_output, file_search_output_items empty.
+    state.accumulated_output = vec![
+        json!({"type": "file_search_call", "status": "completed"}),
+        json!({"type": "file_search_call", "status": "completed"}),
+    ];
+    assert_eq!(
+        remaining_file_search_call_budget(&state),
+        0,
+        "two prior streaming calls exhaust the cap"
+    );
+}
+
+#[test]
+fn budget_unchanged_on_buffered_path() {
+    let mut state = ResponsesState::default();
+    state.max_tool_calls = Some(2);
+    // Buffered: prior rounds live in file_search_output_items, accumulated_output empty.
+    state.file_search_output_items = vec![json!({"type": "file_search_call", "status": "completed"})];
+    assert_eq!(
+        remaining_file_search_call_budget(&state),
+        1,
+        "buffered accounting is unchanged"
+    );
+}
+
+#[test]
+fn file_search_predicates_are_crate_visible() {
+    use super::{has_file_search_tool, is_file_search_function_call, is_pending_file_search_call};
+    let pending = serde_json::json!({"type": "file_search_call", "status": "searching"});
+    let private = serde_json::json!({"type": "function_call", "name": "file_search"});
+    assert!(is_pending_file_search_call(&pending));
+    assert!(is_file_search_function_call(&private));
+    let mut state = ResponsesState::default();
+    state.tools = vec![serde_json::json!({"type": "file_search"})];
+    assert!(has_file_search_tool(&state));
+}
+
+#[tokio::test]
+async fn streaming_response_body_none_dispatches_to_streaming_branch() {
+    // body == None at EOS on the streaming path routes to capture_streaming_response,
+    // which (for now) publishes pending="false", reinserts state, and returns Continue.
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let mut ctx = make_context(Some(state_with(&["vs-a"], vec![])));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    let mut body: Option<Bytes> = None;
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("pending")),
+        Some("false")
+    );
+    // The remove→insert shell must round-trip the state for stream_events' finalize drain.
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_some(),
+        "capture_streaming_response must reinsert the mutated state"
+    );
+}
+
+#[test]
+fn response_body_mode_is_stream() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    assert!(matches!(filter.response_body_mode(), BodyMode::Stream));
+}
+
+#[test]
+fn wrapper_clears_tool_calls_and_applies_five_writes() {
+    let mut state = one_pending_state(&["vs-a"]);
+    state
+        .tool_calls
+        .push(serde_json::json!({"id": "call-1", "type": "function"}));
+    state
+        .tool_calls
+        .push(serde_json::json!({"id": "call-2", "type": "function"}));
+    assert!(
+        !state.tool_calls.is_empty(),
+        "precondition: tool_calls must be non-empty"
+    );
+    let mut ctx = make_context(None);
+    streaming::fs_end_stream_with_error(&mut ctx, &mut state, "server_error", "boom");
+    assert!(state.tool_calls.is_empty(), "wrapper must clear tool_calls");
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("pending")),
+        Some("false")
+    );
+}
+
+#[test]
+fn step_0_5_translates_private_call_to_searchable() {
+    let mut state = ResponsesState::default();
+    state.tools = vec![json!({"type": "file_search"})];
+    state.response_object = json!({"output": [
+        {"type": "function_call", "name": "file_search", "call_id": "c1", "arguments": "{\"query\":\"x\"}"}
+    ]});
+    let mut ctx = make_context(None);
+    let translated = streaming::step_0_5_translate_and_mixed_tool(&mut ctx, &mut state).expect("gate holds");
+    assert_eq!(
+        translated,
+        vec![0],
+        "the private call at round-local index 0 is reported as translated"
+    );
+    assert!(
+        state.output_items().iter().any(is_pending_file_search_call),
+        "private function_call must be translated to a pending file_search_call"
+    );
+}
+
+#[test]
+fn step_0_5_mixed_tool_fails_closed() {
+    let mut state = ResponsesState::default();
+    state.tools = vec![json!({"type": "file_search"})];
+    state.response_object = json!({"output": [
+        {"type": "file_search_call", "status": "searching"},
+        {"type": "function_call", "name": "client_tool", "call_id": "c2", "arguments": "{}"}
+    ]});
+    let mut ctx = make_context(None);
+    assert!(streaming::step_0_5_translate_and_mixed_tool(&mut ctx, &mut state).is_err());
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_some(),
+        "mixed-tool fails closed via fs_end_stream_with_error, not Reject"
+    );
+}
+
+#[test]
+fn step_0_6_zero_budget_terminalizes_before_planning() {
+    let mut state = ResponsesState::default();
+    state.max_tool_calls = Some(1);
+    state.accumulated_output = vec![json!({"type": "file_search_call", "status": "completed"})]; // budget already 0
+    state.response_object = json!({"output": [{"type": "file_search_call", "status": "searching"}]});
+    streaming::step_0_6_apply_budget(&mut state);
+    assert!(
+        !state.output_items().iter().any(is_pending_file_search_call),
+        "zero-budget round terminalizes every pending call to incomplete"
+    );
+    assert!(
+        !build_search_plan(&state).has_pending_calls,
+        "planner then takes BRANCH B"
+    );
+}
+
+#[test]
+fn admission_overload_closed_sets_error_without_bridge() {
+    let sem = Semaphore::new(streaming::FILE_SEARCH_EOS_ADMISSION);
+    let _held: Vec<_> = (0..streaming::FILE_SEARCH_EOS_ADMISSION)
+        .map(|_| sem.try_acquire().unwrap())
+        .collect();
+    let mut ctx = make_context(None);
+    let mut state = ResponsesState::default();
+    let outcome = streaming::admit_or_shed(&mut ctx, &mut state, &sem, OnFailure::Closed);
+    assert!(matches!(outcome, streaming::Admission::ShedClosed));
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_busy"));
+}
+
+#[test]
+fn admission_overload_open_sheds_without_error() {
+    let sem = Semaphore::new(streaming::FILE_SEARCH_EOS_ADMISSION);
+    let _held: Vec<_> = (0..streaming::FILE_SEARCH_EOS_ADMISSION)
+        .map(|_| sem.try_acquire().unwrap())
+        .collect();
+    let mut ctx = make_context(None);
+    let mut state = ResponsesState::default();
+    let outcome = streaming::admit_or_shed(&mut ctx, &mut state, &sem, OnFailure::Open);
+    assert!(matches!(outcome, streaming::Admission::ShedOpen));
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        None,
+        "open shed sets no stream_error_*"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_a_reconciles_round_and_continues() {
+    let server = MockServer::json(200, &one_result("file-a", "report.pdf", 0.95, "Revenue grew."));
+    let filter = make_filter(server.port, "");
+    let mut state = state_with(
+        &["vs-a"],
+        vec![json!({
+            "type": "file_search_call",
+            "id": "fs-1",
+            "status": "searching",
+            "queries": ["revenue"]
+        })],
+    );
+    state.include.push("file_search_call.results".to_owned());
+    let mut ctx = make_context(Some(state));
+    // Streaming EOS completion pass: body = None, end_of_stream = true.
+    let mut body: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    // D-ACC: the executed call is reconciled into accumulated_output as completed.
+    assert!(state.accumulated_output.iter().any(|it| {
+        it.get("type").and_then(Value::as_str) == Some("file_search_call")
+            && it.get("status").and_then(Value::as_str) == Some("completed")
+    }));
+    assert!(state.output_items().is_empty(), "round moved out, valid [] left");
+    assert_eq!(state.iteration, 1, "iteration bumped exactly once");
+    assert_eq!(
+        state.pending_local_tool_synthesis,
+        vec![(state.accumulated_output.len() - 1, SynthesisKind::Native)],
+        "reconciled call queued once with its absolute index + native origin"
+    );
+    let r = ctx.filter_results.get("openai_file_search_callout").unwrap();
+    assert_eq!(r.get("pending"), Some("true"));
+    assert_eq!(r.get("action"), Some("loop"));
+}
+
+#[test]
+fn branch_b_terminal_round_enters_accumulated_output_annotated() {
+    let mut state = ResponsesState::default();
+    state.tools = vec![json!({"type": "file_search"})];
+    state.citation_files = std::iter::once(("file-1".to_string(), "notes.md".to_string())).collect();
+    state.response_object = json!({"output": [
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "answer <|file-1|>"}]}
+    ]});
+    let mut ctx = make_context(None);
+    let action = streaming::branch_b_terminal(&mut ctx, &mut state, &[], usize::MAX).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        state.accumulated_output.len(),
+        1,
+        "final answer entered accumulated_output (single sink)"
+    );
+    let text = state.accumulated_output[0]["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("<|file-1|>"), "terminal citations annotated once");
+    assert!(
+        state.file_search_output_items.is_empty(),
+        "buffered assembly bypassed on streaming path"
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("pending")),
+        Some("false")
+    );
+    assert_eq!(state.iteration, 0, "terminal round does not bump iteration");
+    assert!(state.pending_local_tool_synthesis.is_empty());
+}
+
+#[test]
+fn branch_b_full_canonical_bound_rejects_oversize() {
+    let mut state = ResponsesState::default();
+    state.response_object = json!({"output": [{"type": "message", "role": "assistant", "content": []}]});
+    state.usage = json!({"total_tokens": 1});
+    let mut ctx = make_context(None);
+    let action = streaming::branch_b_terminal(&mut ctx, &mut state, &[], 4).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_some(),
+        "overflow → fs_end_stream_with_error"
+    );
+    assert_eq!(
+        state.usage,
+        json!({"total_tokens": 1}),
+        "usage swap-restored, not consumed"
+    );
+    assert_eq!(state.accumulated_output.len(), 1, "output swap-restored, not consumed");
+}
+
+#[test]
+fn step_0_gate_fail_preserves_sanitized_annotated_partial() {
+    let mut state = ResponsesState::default();
+    state.request_body = json!({"stream": true});
+    state.tools = vec![json!({"type": "file_search"})];
+    state.citation_files = std::iter::once(("f1".to_string(), "a.md".to_string())).collect();
+    state.response_object = json!({"status": "incomplete", "output": [
+        {"type": "function_call", "name": "file_search", "call_id": "c1", "arguments": "{}"},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial <|file-f1|>"}]}
+    ]});
+    let mut ctx = make_context(None); // stream_completion NOT terminal → gate fails
+    let handled = streaming::step_0_gate(&mut ctx, &mut state, usize::MAX);
+    assert!(handled, "gate-fail path handled the round");
+    // Private function_call dropped; message retained + annotated.
+    assert!(
+        !state
+            .accumulated_output
+            .iter()
+            .any(|it| is_file_search_function_call(it))
+    );
+    let text = state
+        .accumulated_output
+        .iter()
+        .find_map(|it| it.get("content")?.get(0)?.get("text")?.as_str())
+        .unwrap();
+    assert!(
+        !text.contains("<|file-f1|>"),
+        "partial answer annotated, no raw marker leak"
+    );
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_none(),
+        "upstream non-success is NOT our error"
+    );
+}
+
+#[test]
+fn step_0_error_shaped_terminal_accumulates_nothing() {
+    let mut state = ResponsesState::default();
+    state.request_body = json!({"stream": true});
+    let mut ctx = make_context(None);
+    ctx.set_metadata("responses.stream_error_code", "bad_response"); // our parse error already set
+    let handled = streaming::step_0_gate(&mut ctx, &mut state, usize::MAX);
+    assert!(handled);
+    assert!(
+        state.accumulated_output.is_empty(),
+        "error-shaped terminals push nothing"
+    );
+}
+
+// F2: an empty terminal round (incomplete/failed with output: []) that carries no
+// stream_error_code must STILL run the shared annotate + size bound over the partial
+// accumulated by earlier BRANCH A rounds. The old `|| !has_output` early return skipped
+// annotation, shipping raw `<|file-...|>` citation markers, and skipped the byte bound.
+#[test]
+fn step_0_gate_empty_incomplete_round_annotates_prior_accumulated_output() {
+    let mut state = ResponsesState::default();
+    state.request_body = json!({"stream": true});
+    state.tools = vec![json!({"type": "file_search"})];
+    state.citation_files = std::iter::once(("f1".to_string(), "a.md".to_string())).collect();
+    // Prior BRANCH A round left an un-annotated assistant message with a raw marker.
+    state.accumulated_output = vec![json!({
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "prior <|file-f1|>"}]
+    })];
+    // THIS round: empty output + incomplete (no error code).
+    state.response_object = json!({"status": "incomplete", "output": []});
+    let mut ctx = make_context(None); // not terminal → gate fails
+    let handled = streaming::step_0_gate(&mut ctx, &mut state, usize::MAX);
+    assert!(handled, "empty incomplete round handled by the gate-fail path");
+    let text = state
+        .accumulated_output
+        .iter()
+        .find_map(|it| it.get("content")?.get(0)?.get("text")?.as_str())
+        .unwrap();
+    assert!(
+        !text.contains("<|file-f1|>"),
+        "empty incomplete round must still annotate prior accumulated_output (F2)"
+    );
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_none(),
+        "upstream non-success is NOT our error"
+    );
+}
+
+// F3: with NO hosted file_search tool, a client's OWN function named literally
+// "file_search" must be preserved on a gate-fail partial — suppression only applies to
+// proxy-injected hosted calls. The old ungated drop silently lost the client's tool call.
+#[test]
+fn step_0_gate_fail_without_hosted_tool_keeps_client_file_search_function() {
+    let mut state = ResponsesState::default();
+    state.request_body = json!({"stream": true});
+    // Client's own function tool named "file_search"; NO hosted file_search tool.
+    state.tools = vec![json!({"type": "function", "name": "file_search"})];
+    state.response_object = json!({"status": "incomplete", "output": [
+        {"type": "function_call", "name": "file_search", "call_id": "c1", "arguments": "{}"},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial"}]}
+    ]});
+    let mut ctx = make_context(None); // not terminal → gate fails
+    let handled = streaming::step_0_gate(&mut ctx, &mut state, usize::MAX);
+    assert!(handled);
+    assert!(
+        state
+            .accumulated_output
+            .iter()
+            .any(|it| is_file_search_function_call(it)),
+        "client function named file_search retained when no hosted tool is configured (F3)"
+    );
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_none(),
+        "upstream non-success is NOT our error"
+    );
+}
+
+// F1/F6: the reconcile queues private (translated) + callout-terminalized-incomplete
+// calls but SKIPS a native call whose terminal lifecycle the provider streamed live
+// (recorded in provider_streamed_terminal_ids) — a synthesized tail would duplicate its
+// output_item.done. translated is sorted ascending; binary_search must classify each
+// index correctly. nat_done is observed (skipped); nat_inc is NOT observed
+// (callout-terminalized, still synthesized) even though both are terminal statuses.
+#[test]
+fn reconcile_skips_observed_provider_streamed_native() {
+    let mut state = ResponsesState::default();
+    state.response_object = json!({"output": [
+        {"type": "file_search_call", "id": "priv", "status": "completed"},
+        {"type": "file_search_call", "id": "nat_done", "status": "completed"},
+        {"type": "file_search_call", "id": "nat_inc", "status": "incomplete"},
+        {"type": "message", "role": "assistant", "content": []}
+    ]});
+    // index 0 is the private (translated) call; nat_done streamed its terminal done live.
+    state.provider_streamed_terminal_ids.insert("nat_done".to_owned());
+    streaming::reconcile_round_into_accumulated_output(&mut state, &[0]);
+    assert_eq!(
+        state.pending_local_tool_synthesis,
+        vec![(0, SynthesisKind::Private), (2, SynthesisKind::Native)],
+        "queues private + callout-terminalized-incomplete native, skips the observed provider-streamed native (P1)"
+    );
+    assert_eq!(
+        state.accumulated_output.len(),
+        4,
+        "every item is still committed to accumulated_output"
+    );
+}
+
+// #313 P1: a native file_search_call whose terminal lifecycle the provider streamed live
+// is recorded for ANY status. Reconcile must skip re-queuing it regardless of the status
+// string — the old heuristic skipped only `completed`, so a provider-streamed
+// `failed`/`incomplete` native was wrongly re-queued and emitted a duplicate terminal done.
+#[test]
+fn reconcile_skips_observed_provider_terminal_regardless_of_status() {
+    let mut state = ResponsesState::default();
+    state.response_object = json!({"output": [
+        {"type": "file_search_call", "id": "nat_failed", "status": "failed"},
+        {"type": "file_search_call", "id": "nat_inc_live", "status": "incomplete"}
+    ]});
+    state.provider_streamed_terminal_ids.insert("nat_failed".to_owned());
+    state.provider_streamed_terminal_ids.insert("nat_inc_live".to_owned());
+    streaming::reconcile_round_into_accumulated_output(&mut state, &[]);
+    assert!(
+        state.pending_local_tool_synthesis.is_empty(),
+        "provider-streamed terminal natives (failed/incomplete) must not be re-queued (P1)"
+    );
+    assert_eq!(state.accumulated_output.len(), 2, "both items are still committed");
+}
+
+// Contrast: a completed native NOT recorded as provider-streamed (its live done was
+// suppressed because the proxy resolved it) MUST still be queued for synthesis — set
+// membership, not status, is authoritative.
+#[test]
+fn reconcile_queues_unobserved_completed_native() {
+    let mut state = ResponsesState::default();
+    state.response_object = json!({"output": [
+        {"type": "file_search_call", "id": "nat_done", "status": "completed"}
+    ]});
+    // provider_streamed_terminal_ids intentionally empty: this native was proxy-resolved.
+    streaming::reconcile_round_into_accumulated_output(&mut state, &[]);
+    assert_eq!(
+        state.pending_local_tool_synthesis,
+        vec![(0, SynthesisKind::Native)],
+        "an unobserved completed native (proxy-resolved) must still synthesize"
+    );
+}
+
+// §10 P0: a gate-fail partial whose local processing (annotate/bound) fails MUST
+// fail closed with the five-write error frame, not silently commit a truncated body.
+#[test]
+fn step_0_gate_fail_local_failure_emits_error_frame() {
+    let mut state = ResponsesState::default();
+    state.request_body = json!({"stream": true});
+    state.tools = vec![json!({"type": "file_search"})];
+    state.response_object = json!({"status": "incomplete", "output": [
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial answer that will not fit"}]}
+    ]});
+    let mut ctx = make_context(None); // not terminal → gate fails
+    let handled = streaming::step_0_gate(&mut ctx, &mut state, /* max = */ 4); // tiny cap → bound fails
+    assert!(handled);
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "gate-fail local bound failure → fs_end_stream_with_error five-write"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+// #313 P2: a flat upstream `error` completion sets stream_completion="error" but NOT
+// stream_error_code. step_0_gate must recognize it, arm the two-layer stop (clearing any
+// stale action=loop), and bypass local terminal processing — so a local bound/annotate
+// failure never replaces the provider error with our generic server_error.
+#[test]
+fn step_0_gate_flat_error_completion_bypasses_local_processing() {
+    let mut state = ResponsesState::default();
+    state.request_body = json!({"stream": true});
+    state.tools = vec![json!({"type": "file_search"})];
+    // A partial that WOULD fail the terminal bound if local processing ran.
+    state.response_object = json!({"status": "failed", "output": [
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial that will not fit"}]}
+    ]});
+    let mut ctx = make_context(None);
+    ctx.set_metadata("responses.stream_completion", "error");
+    // A stale continuation a prior successful round armed.
+    ctx.filter_results
+        .entry("openai_file_search_callout")
+        .or_default()
+        .set("action", "loop")
+        .unwrap();
+    let handled = streaming::step_0_gate(&mut ctx, &mut state, /* tiny cap = */ 4);
+    assert!(handled, "flat error is handled by the gate");
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_none(),
+        "flat provider error must NOT be replaced by our server_error (P2)"
+    );
+    assert!(
+        state.accumulated_output.is_empty(),
+        "no local terminal processing runs on a flat error round"
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("action")),
+        Some("done"),
+        "the flat error arms the stop, clearing the stale action=loop (P1)"
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("pending")),
+        Some("false"),
+        "pending=false ends the IRR router layer"
+    );
+}
+
+// #313 P1: fs_end_stream_with_error_ctx preserves the first (most-specific) error's
+// code/message but ALWAYS arms the two-layer stop, even on a pre-existing error — so a
+// stale action=loop cannot survive a terminal failure and suppress the error frame.
+#[test]
+fn fs_end_stream_with_error_preserves_prior_error_but_always_arms_stop() {
+    let mut ctx = make_context(None);
+    // A prior parse error already recorded (e.g., by stream_events handle_parse_error).
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", "first failure");
+    // A stale continuation from a prior successful round.
+    ctx.filter_results
+        .entry("openai_file_search_callout")
+        .or_default()
+        .set("action", "loop")
+        .unwrap();
+    crate::openai::responses::fs_end_stream_with_error_ctx(&mut ctx, "second_code", "second failure");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "the first error code is preserved, not clobbered"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some("first failure"),
+        "the first error message is preserved"
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("action")),
+        Some("done"),
+        "the stop is ALWAYS armed, clearing the stale action=loop (P1)"
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("pending")),
+        Some("false"),
+        "pending=false is always armed alongside action=done"
+    );
+}
+
+// §10 P0: streaming does not call merge_usage (buffered path does, streaming bypasses it).
+#[test]
+fn streaming_path_does_not_merge_usage() {
+    let mut state = ResponsesState::default();
+    state.request_body = json!({"stream": true});
+    state.tools = vec![json!({"type": "file_search"})];
+    // Seed with existing usage from prior rounds
+    state.usage = json!({"input_tokens": 100, "output_tokens": 50});
+    // Terminal round with new usage in response_object
+    state.response_object = json!({"output": [
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]}
+    ], "usage": {"input_tokens": 10, "output_tokens": 5}});
+    let mut ctx = make_context(None);
+    let action = streaming::branch_b_terminal(&mut ctx, &mut state, &[], usize::MAX).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    // On the streaming path, usage is NOT merged — state.usage is left unchanged.
+    // The buffered path (mod.rs:381) calls merge_usage and would yield {"input_tokens": 110, "output_tokens": 55}.
+    // Streaming bypasses merge_usage entirely, so state.usage retains its seeded value.
+    assert_eq!(
+        state.usage,
+        json!({"input_tokens": 100, "output_tokens": 50}),
+        "streaming path does not merge usage — state.usage unchanged from its seeded value"
+    );
+}
+
+// §10 P0: EOS commitment increments iteration exactly once, resets tool_choice.
+// Tested via the BRANCH A inline path (lines 156-164 in streaming.rs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eos_commitment_increments_iteration_once() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let mut state = state_with(
+        &["vs-a"],
+        vec![json!({
+            "type": "file_search_call",
+            "id": "fs-1",
+            "status": "searching",
+            "queries": ["q"]
+        })],
+    );
+    state.iteration = 5;
+    state.tool_choice = json!({"type": "function", "function": {"name": "file_search"}});
+    let mut ctx = make_context(Some(state));
+    let mut body: Option<Bytes> = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    // BRANCH A bumps iteration once (line 158)
+    assert_eq!(state.iteration, 6, "iteration incremented exactly once");
+    // tool_choice reset (line 157 → reset_tool_choice → "auto")
+    assert_eq!(
+        state.tool_choice,
+        json!("auto"),
+        "tool_choice reset to auto (not re-forced to file_search)"
+    );
+    // Verify loop continuation published
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("action")),
+        Some("loop")
+    );
+}
+
+// §10 P0: post-commit state-size overflow → fs_end_stream_with_error (not Reject).
+#[test]
+fn post_commit_state_overflow_fails_closed() {
+    let mut state = ResponsesState::default();
+    state.tools = vec![json!({"type": "file_search"})];
+    // Build a state that definitely exceeds the max_state_bytes cap
+    state.messages = (0..10_000)
+        .map(|i| json!({"role": "user", "content": format!("message {}", i)}))
+        .collect();
+    state.accumulated_output = (0..1_000)
+        .map(|_| json!({"type": "file_search_call", "status": "completed", "results": []}))
+        .collect();
+
+    // Overflow DETECTION: continuation_state_fits returns false for the oversized post-reconcile state,
+    // true for a small one — this is what drives the streaming code (streaming.rs:151) to fail-closed (not Reject).
+    assert!(
+        !continuation_state_fits(0, &state, 4, 0),
+        "oversized post-commit state does not fit"
+    );
+    let small = ResponsesState::default();
+    assert!(continuation_state_fits(0, &small, usize::MAX, 0), "small state fits");
+
+    let mut ctx = make_context(None);
+    // When continuation_state_fits fails, streaming.rs:151-153 calls fs_end_stream_with_error
+    streaming::fs_end_stream_with_error(&mut ctx, &mut state, "server_error", "continuation state too large");
+    // Verify it uses the five-write fail-closed contract, not Reject
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("pending")),
+        Some("false")
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("action")),
+        Some("done")
+    );
+}
+
+// #313 P1 (DoS bound): the per-round provider-streamed observation set is charged against
+// max_state_bytes like every other request-scoped field, so a backend streaming many distinct
+// native ids in one round cannot bypass the ceiling within that round.
+#[test]
+fn continuation_state_charges_provider_streamed_terminal_ids() {
+    let mut state = ResponsesState::default();
+    assert!(
+        continuation_state_fits(0, &state, 64, 0),
+        "an empty observation set fits a tiny ceiling"
+    );
+    // ~48 bytes each × 100 ids ≫ 64-byte ceiling: only charged bytes can trip this.
+    state.provider_streamed_terminal_ids = (0..100).map(|i| format!("fs_call_{i:040}")).collect();
+    assert!(
+        !continuation_state_fits(0, &state, 64, 0),
+        "a large observation set is charged and overflows the ceiling (P1 DoS bound)"
+    );
+}
+
+// §10 P0: config-transition regression — pending="false" result falls through to default → done.
+#[test]
+fn config_transition_pending_false_implies_done() {
+    // This is a filter_results semantics test: if pending="false", action should be "done"
+    // (the stream_events filter reads pending="false" → cancels synthesis → done).
+    let mut ctx = make_context(None);
+    let mut state = ResponsesState::default();
+    streaming::fs_end_stream_with_error(&mut ctx, &mut state, "server_error", "test");
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("pending")),
+        Some("false")
+    );
+    assert_eq!(
+        ctx.filter_results
+            .get("openai_file_search_callout")
+            .and_then(|r| r.get("action")),
+        Some("done"),
+        "fs_end_stream_with_error sets action=done, not loop"
+    );
+}
+
+// §10 P1: single terminal annotation pass — BRANCH A does not annotate, terminal does.
+#[test]
+fn single_terminal_annotation_pass() {
+    let mut state = ResponsesState::default();
+    state.tools = vec![json!({"type": "file_search"})];
+    state.citation_files = std::iter::once(("f1".to_string(), "doc.md".to_string())).collect();
+    // Simulate a BRANCH A reconciled round with raw markers (not annotated)
+    state.accumulated_output = vec![
+        json!({"type": "file_search_call", "status": "completed", "results": []}),
+        json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial <|file-f1|>"}]}),
+    ];
+    // BRANCH B terminal round
+    state.response_object = json!({"output": [
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "final <|file-f1|>"}]}
+    ]});
+    let mut ctx = make_context(None);
+    let action = streaming::branch_b_terminal(&mut ctx, &mut state, &[], usize::MAX).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    // Terminal annotates ALL accumulated_output (response-wide, not round-local)
+    let text_after_terminal = state.accumulated_output[2]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text_after_terminal.contains("<|file-f1|>"),
+        "terminal annotates the new round"
+    );
+    // Verify earlier round's raw markers are ALSO annotated in the terminal pass
+    let text_first_round = state.accumulated_output[1]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text_first_round.contains("<|file-f1|>"),
+        "terminal annotation is response-wide, not round-local"
+    );
+}
+
+// §10 P0: max_tool_calls counts prior streaming rounds.
+#[test]
+fn max_tool_calls_counts_prior_streaming_rounds() {
+    let mut state = ResponsesState::default();
+    state.max_tool_calls = Some(2);
+    // First round: one completed call (budget now 1 remaining)
+    state.accumulated_output = vec![json!({"type": "file_search_call", "status": "completed", "results": []})];
+    // Second round: one more completed call (budget now 0 remaining)
+    state
+        .accumulated_output
+        .push(json!({"type": "file_search_call", "status": "completed", "results": []}));
+    // Third round: new pending call → should be terminalized (over budget)
+    state.response_object = json!({"output": [
+        {"type": "file_search_call", "id": "fs-3", "status": "searching", "queries": ["q"]}
+    ]});
+    assert_eq!(
+        remaining_file_search_call_budget(&state),
+        0,
+        "budget accounts for all accumulated completed calls across rounds"
+    );
+    streaming::step_0_6_apply_budget(&mut state);
+    assert_eq!(
+        state.output_items()[0]["status"],
+        "incomplete",
+        "later round's pending call is over budget and terminalized"
+    );
+}
+
+// §10 P0: budget-terminalized incomplete call records its index in reconcile (BRANCH B step 1).
+#[test]
+fn terminalized_incomplete_call_records_index_in_reconcile() {
+    let mut state = ResponsesState::default();
+    state.tools = vec![json!({"type": "file_search"})];
+    // BRANCH B terminal round with a terminalized incomplete call (zero-budget round)
+    state.response_object = json!({"output": [
+        {"type": "file_search_call", "id": "fs-x", "status": "incomplete"}
+    ]});
+    let mut ctx = make_context(None);
+    let action = streaming::branch_b_terminal(&mut ctx, &mut state, &[], usize::MAX).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        state.pending_local_tool_synthesis.contains(&(0, SynthesisKind::Native)),
+        "terminalized incomplete call records its index (Native) in reconcile step 4"
+    );
+}
+
+// §10 P1: STEP 0 gate-fail still-pending native incomplete tail.
+#[test]
+fn step_0_gate_fail_pending_native_incomplete_tail() {
+    let mut state = ResponsesState::default();
+    state.request_body = json!({"stream": true});
+    state.tools = vec![json!({"type": "file_search"})];
+    state.response_object = json!({"status": "incomplete", "output": [
+        {"type": "file_search_call", "id": "fs-1", "status": "searching", "queries": ["q"]},
+        {"type": "file_search_call", "id": "fs-2", "status": "completed", "results": []},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "partial"}]}
+    ]});
+    let mut ctx = make_context(None); // not terminal → gate fails
+    let handled = streaming::step_0_gate(&mut ctx, &mut state, usize::MAX);
+    assert!(handled);
+    // Pending native item (fs-1) gets incomplete tail at its own index (0)
+    assert_eq!(
+        state.accumulated_output[0]["status"], "incomplete",
+        "still-pending native closed as incomplete"
+    );
+    assert!(
+        state.pending_local_tool_synthesis.contains(&(0, SynthesisKind::Native)),
+        "pending native queued for incomplete tail synthesis at index 0"
+    );
+    // Provider-terminal native (fs-2) untouched
+    assert_eq!(
+        state.accumulated_output[1]["status"], "completed",
+        "provider-terminal native untouched"
+    );
+    // Private calls (if any) would be dropped, but this test has none
+    assert_eq!(
+        state.accumulated_output.len(),
+        3,
+        "three items: incomplete + completed + message"
+    );
 }

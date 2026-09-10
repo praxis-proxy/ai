@@ -1769,6 +1769,122 @@ fn mcp_tool_to_function_tool_prefers_input_schema_camel_case() {
     );
 }
 
+/// A complex `inputSchema` (`$ref`, `$defs`, `anyOf`, nested objects) is
+/// carried into `parameters` verbatim, not sanitized or flattened. The
+/// rewrite is a blind whole-value clone, and this pins that contract so a
+/// future schema-walking regression cannot silently drop JSON Schema
+/// constructs the backend needs to constrain tool arguments.
+#[test]
+fn mcp_tool_to_function_tool_preserves_nested_schema_verbatim() {
+    let input_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "shape": {"$ref": "#/$defs/shape"},
+            "mode": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "nested": {"type": "object", "additionalProperties": false,
+                       "properties": {"deep": {"type": "array", "items": {"type": "integer"}}}}
+        },
+        "required": ["shape"],
+        "additionalProperties": false,
+        "$defs": {
+            "shape": {"type": "object", "required": ["kind"],
+                      "properties": {"kind": {"type": "string"}}}
+        }
+    });
+    let definition = serde_json::json!({
+        "name": "complex_tool",
+        "description": "Uses a nested schema",
+        "inputSchema": input_schema,
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert_eq!(
+        function_tool["parameters"], input_schema,
+        "nested $ref/$defs/anyOf inputSchema must survive the rewrite bit-for-bit"
+    );
+}
+
+/// `outputSchema` has no slot in the Responses function-tool format and is
+/// intentionally dropped by the rewrite. This pins the drop so it stays a
+/// deliberate decision rather than an accident: the emitted tool carries
+/// only `type`/`name`/`description`/`parameters`.
+#[test]
+fn mcp_tool_to_function_tool_drops_output_schema() {
+    let definition = serde_json::json!({
+        "name": "structured_tool",
+        "description": "Returns structured output",
+        "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}},
+        "outputSchema": {"type": "object", "required": ["answer"],
+                         "properties": {"answer": {"type": "string"}}}
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert!(
+        function_tool.get("outputSchema").is_none(),
+        "outputSchema has no function-tool slot and must be dropped"
+    );
+    assert!(
+        function_tool.get("output_schema").is_none(),
+        "snake_case output_schema must also be absent"
+    );
+    let obj = function_tool.as_object().expect("function tool is an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["description", "name", "parameters", "type"],
+        "function tool carries only the Responses-supported fields"
+    );
+}
+
+/// Fresh discovery and cached continuation must rewrite the same logical tool
+/// to the identical function tool.
+///
+/// A fresh `tools/list` callout serializes schemas with the `camelCase`
+/// `inputSchema` spelling, while a cached `mcp_list_tools` listing carries the
+/// `snake_case` `input_schema` spelling. Both provenances funnel through
+/// [`mcp_tool_to_function_tool`] in `build_entry_resolution`, so the same tool
+/// must produce byte-equivalent parameters regardless of which path resolved
+/// it — otherwise a cache hit could hand the model a different tool contract
+/// than a fresh discovery of the same server.
+#[test]
+fn mcp_tool_to_function_tool_fresh_and_cached_schemas_are_equivalent() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "shape": {"$ref": "#/$defs/shape"},
+            "mode": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "tags": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["shape"],
+        "additionalProperties": false,
+        "$defs": {"shape": {"type": "object", "properties": {"kind": {"type": "string"}}}}
+    });
+
+    // Fresh discovery: rmcp serializes `tools/list` with camelCase `inputSchema`.
+    let fresh = serde_json::json!({
+        "name": "lookup", "description": "Look something up", "inputSchema": schema,
+    });
+    // Cached continuation: stored `mcp_list_tools` items carry snake_case.
+    let cached = serde_json::json!({
+        "name": "lookup", "description": "Look something up", "input_schema": schema,
+    });
+
+    let fresh_tool = mcp_tool_to_function_tool("srv", &fresh);
+    let cached_tool = mcp_tool_to_function_tool("srv", &cached);
+
+    assert_eq!(
+        fresh_tool, cached_tool,
+        "fresh discovery and cached continuation must rewrite to the identical function tool"
+    );
+    assert_eq!(
+        fresh_tool["parameters"], schema,
+        "the shared rewrite must preserve the complex schema verbatim on both paths"
+    );
+}
+
 // =========================================================================
 // Function Name Encoding
 // =========================================================================
@@ -3707,10 +3823,16 @@ fn streaming_failure_classification_excludes_local_request_policy() {
     }
 }
 
-/// A streaming SSRF failure must retain the ordinary HTTP error response (a
-/// single `event: error` frame at the mapped status), not the 200 discovery
-/// lifecycle reserved for runtime `tools/list` failures.
+/// A streaming SSRF failure is a pre-commitment rejection: it fires during
+/// request-body resolution, before any `text/event-stream` is established, so
+/// it returns the ordinary JSON `{"error":{...}}` envelope at the mapped status
+/// (issue #1001) -- never the 200 discovery lifecycle reserved for runtime
+/// `tools/list` failures, and never a committed-stream SSE `error` event.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "comprehensive pre-commitment JSON rejection assertions"
+)]
 fn streaming_ssrf_failure_retains_http_error() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -3732,10 +3854,29 @@ fn streaming_ssrf_failure_retains_http_error() {
         !rejection.preserve_keepalive,
         "a genuine HTTP error closes the connection, unlike the 200 discovery-failure transport"
     );
-    let raw = std::str::from_utf8(rejection.body.as_deref().expect("SSE body")).unwrap();
+    let ct = rejection.headers.iter().find(|(k, _)| k == "content-type");
+    assert_eq!(
+        ct.map(|(_, v)| v.as_str()),
+        Some("application/json"),
+        "a pre-commitment SSRF rejection uses the JSON error envelope, not an SSE event (issue #1001)"
+    );
+    let raw = std::str::from_utf8(rejection.body.as_deref().expect("error body")).unwrap();
     assert!(
-        raw.starts_with("event: error\n"),
-        "SSRF uses the single error frame: {raw}"
+        !raw.starts_with("event: "),
+        "SSRF must not emit a committed-stream SSE error event: {raw}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(
+        parsed["error"]["type"], "server_error",
+        "SSRF maps to a server_error envelope: {raw}"
+    );
+    assert_eq!(
+        parsed["error"]["code"], "server_error",
+        "SSRF maps to a server_error envelope: {raw}"
+    );
+    assert!(
+        parsed["error"]["message"].as_str().is_some_and(|m| m.contains("SSRF")),
+        "the SSRF reason is preserved in the message: {raw}"
     );
     assert!(
         !raw.contains("response.mcp_list_tools.failed") && !raw.contains("response.failed"),

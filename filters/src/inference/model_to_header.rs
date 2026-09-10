@@ -27,6 +27,9 @@ const DEFAULT_HEADER: &str = "X-Model";
 #[serde(deny_unknown_fields)]
 struct ModelToHeaderConfig {
     /// Header name for the promoted model value.
+    ///
+    /// Must not be a hop-by-hop, framing, Host, credential, API-key, or
+    /// internal `x-praxis-*` header. Defaults to `X-Model`.
     #[serde(default = "default_header")]
     header: String,
 }
@@ -71,7 +74,8 @@ impl ModelToHeaderFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the inner `JsonBodyFieldFilter` config is invalid.
+    /// Returns [`FilterError`] if the header name is unsafe or the inner
+    /// `JsonBodyFieldFilter` config is invalid.
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     ///
@@ -85,6 +89,12 @@ impl ModelToHeaderFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ModelToHeaderConfig = parse_filter_config("model_to_header", config)?;
         let header = &cfg.header;
+        praxis_ai_apis::promotion::validate_dedicated_promotion_header(
+            "model_to_header",
+            "header",
+            Some(header.as_str()),
+            &[],
+        )?;
 
         let mut inner_config = serde_yaml::Mapping::new();
         inner_config.insert(
@@ -186,6 +196,30 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("header: X-AI-Model").unwrap();
         let filter = ModelToHeaderFilter::from_config(&yaml).unwrap();
         assert_eq!(filter.name(), "model_to_header", "custom header config should parse");
+    }
+
+    #[test]
+    fn from_config_rejects_api_key_header() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("header: x-api-key").unwrap();
+        let err = ModelToHeaderFilter::from_config(&yaml)
+            .err()
+            .expect("x-api-key should be rejected");
+        assert!(
+            err.to_string().contains("x-api-key"),
+            "x-api-key promotion header should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_format_routing_header() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("header: x-praxis-ai-format").unwrap();
+        let err = ModelToHeaderFilter::from_config(&yaml)
+            .err()
+            .expect("x-praxis-ai-format should be rejected");
+        assert!(
+            err.to_string().contains("x-praxis-ai-format"),
+            "x-praxis-ai-format promotion header should be rejected: {err}"
+        );
     }
 
     #[test]

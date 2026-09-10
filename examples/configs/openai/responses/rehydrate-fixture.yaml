@@ -13,7 +13,8 @@
 #   3. openai_response_store     — initializes store, registers in ctx
 #   4. openai_responses_rehydrate — resolves previous_response_id into
 #      the message history and, on the response path, restores the
-#      caller's previous_response_id into the client body (issue #932)
+#      caller's previous_response_id into the client body — both native
+#      JSON responses and streaming SSE lifecycle frames (issue #932)
 #   5. openai_responses_proxy    — rebuilds the outbound body from the
 #      resolved history and strips previous_response_id upstream
 #

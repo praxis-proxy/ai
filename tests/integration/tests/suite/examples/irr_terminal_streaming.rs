@@ -17,7 +17,7 @@ use praxis_test_utils::{free_port, json_post, load_example_config, parse_body, p
 const EXAMPLE: &str = "openai/responses/irr-terminal-streaming.yaml";
 const FIRST_EVENT: &str = concat!(
     "event: response.output_text.delta\n",
-    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\",\"sequence_number\":0}\n\n",
 );
 const FINAL_EVENT: &str = concat!(
     "event: response.completed\n",
@@ -44,7 +44,7 @@ fn sse_event_reaches_client_before_upstream_completes() {
         let raw = read_response_incrementally(
             &proxy_addr,
             r#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
-            "\"delta\":\"hel\"}\n\n",
+            "\"delta\":\"hel\",\"sequence_number\":0}\n\n",
             &observed_tx,
         );
         complete_tx.send(raw).expect("test receiver should remain available");
@@ -149,10 +149,21 @@ fn downstream_cancellation_closes_terminal_upstream_stream() {
             .recv_timeout(Duration::from_secs(2))
             .expect("client should drop the downstream stream");
         thread::sleep(Duration::from_millis(50));
-        let payload = "x".repeat(64 * 1024);
+        // The client has dropped. Keep producing *valid* SSE events: the
+        // compose filter forwards each normalized event downstream, and it is
+        // that downstream write that surfaces the client disconnect. Raw
+        // non-SSE bytes would be buffered by the SSE parser as an incomplete
+        // frame and never reach a downstream write, so the drop would go
+        // unnoticed. Each event carries a 64 KiB payload to fill socket
+        // buffers and force the write error promptly.
+        let filler = "x".repeat(64 * 1024);
+        let event = format!(
+            "event: response.output_text.delta\n\
+             data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{filler}\"}}\n\n"
+        );
         let mut upstream_closed = false;
         for _ in 0..256 {
-            if write!(stream, "{:x}\r\n{payload}\r\n", payload.len())
+            if write!(stream, "{:x}\r\n{event}\r\n", event.len())
                 .and_then(|()| stream.flush())
                 .is_err()
             {

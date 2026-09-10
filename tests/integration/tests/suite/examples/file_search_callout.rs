@@ -140,6 +140,75 @@ fn file_search_callout_example_runs_model_search_model_round_trip() {
 }
 
 #[test]
+fn reused_file_search_ids_do_not_restore_response_wide_budget() {
+    let file_call = |query: &str| {
+        json!({
+            "id": "fs_reused",
+            "type": "file_search_call",
+            "status": "searching",
+            "queries": [query]
+        })
+    };
+    let mut responses = vec![(200, r#"{"status":"ready"}"#.to_owned())];
+    responses.extend(
+        ["first", "second", "must not run"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, query)| {
+                (
+                    200,
+                    json!({
+                        "id": format!("resp_reused_{index}"),
+                        "object": "response",
+                        "status": "completed",
+                        "output": [file_call(query)]
+                    })
+                    .to_string(),
+                )
+            }),
+    );
+    let model = start_stateful_backend(responses);
+    let empty_search = json!({"data": []}).to_string();
+    let search = start_stateful_backend(vec![
+        (200, empty_search.clone()),
+        (200, empty_search.clone()),
+        (200, empty_search),
+    ]);
+    let proxy_port = free_port();
+    let config = load_file_search_callout_config(
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:8001", search.port())]),
+    );
+    let proxy = start_file_search_proxy(&config);
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "Search repeatedly",
+        "max_tool_calls": 2,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_reused"]}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "reused-ID response failed: {raw}");
+    assert_eq!(
+        search.requests().len(),
+        2,
+        "two same-ID model calls consume both slots; the third must not execute"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let calls = response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "file_search_call")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["status"], "completed");
+    assert_eq!(calls[1]["status"], "completed");
+    assert_eq!(calls[2]["status"], "incomplete");
+}
+
+#[test]
 fn file_search_callout_example_without_tools_passthrough() {
     let response = r#"{"id":"resp_456","object":"response","output":[{"id":"msg_456","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}]}"#;
     let backend = start_backend_with_shutdown(response);
@@ -155,9 +224,18 @@ fn file_search_callout_example_without_tools_passthrough() {
     assert_eq!(parse_body(&raw), response, "request should reach inference backend");
 }
 
+// #313 §7.1: the buffered file-search-callout example fails closed on `stream:true`.
+// The old `unsupported_streaming_rejection` (400) was removed; the proxy now auto-derives
+// the streaming transport from the client's `stream:true`, so `openai_file_search_callout`
+// runs in a Streaming subrequest mode. Because this buffered pipeline has no
+// `openai_stream_events` ahead of the callout, the logical stream is never armed, and the
+// on_request streaming-arm guard fails closed with a 500 rather than silently passing an
+// unsupervised stream through. Streaming file_search lives in the separate
+// file-search-streaming example, which arms the logical stream.
 #[test]
-fn file_search_callout_example_rejects_streaming_before_inference() {
-    let backend = start_backend_with_shutdown(r#"{"id":"unexpected"}"#);
+fn file_search_callout_example_fails_closed_on_unarmed_streaming() {
+    let response = r#"{"id":"resp_789","object":"response","output":[{"id":"msg_789","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi","annotations":[]}]}]}"#;
+    let backend = start_backend_with_shutdown(response);
     let proxy_port = free_port();
     let config = load_file_search_callout_config(proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_file_search_proxy(&config);
@@ -165,10 +243,14 @@ fn file_search_callout_example_rejects_streaming_before_inference() {
     let body = r#"{"model":"gpt-4.1","input":"Hello","stream":true}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
-    assert_eq!(parse_status(&raw), 400, "streaming should be rejected: {raw}");
+    assert_eq!(
+        parse_status(&raw),
+        500,
+        "buffered example fails closed on unarmed streaming (§7.1): {raw}"
+    );
     assert!(
-        parse_body(&raw).contains("stream=true is not supported"),
-        "rejection should explain the pipeline limitation: {raw}"
+        parse_body(&raw).contains("logical stream not armed by openai_stream_events"),
+        "rejection should explain the missing openai_stream_events arm: {raw}"
     );
 }
 

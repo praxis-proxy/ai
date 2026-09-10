@@ -19,9 +19,45 @@ const RESPONSE_JSON: &str = r#"{"id":"resp_stream_example","created_at":1000,"mo
 
 const RESPONSES_TABLE: &str = "openai_responses";
 
+const STREAMING_EXAMPLES: [(&str, u64); 5] = [
+    ("openai/responses/agentic-loop.yaml", 360_000),
+    ("openai/responses/full-flow.yaml", 360_000),
+    ("openai/responses/irr-terminal-streaming.yaml", 360_000),
+    ("openai/responses/responses-to-chat-completions.yaml", 660_000),
+    ("openai/responses/stream-events.yaml", 360_000),
+];
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+#[test]
+fn streaming_examples_override_short_irr_default_deadline() {
+    for (example, minimum_timeout_ms) in STREAMING_EXAMPLES {
+        let yaml = std::fs::read_to_string(example_config_path(example)).expect("example config should exist");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("example config should be valid YAML");
+        let filters = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filter chain should contain filters");
+        let irr = filters
+            .iter()
+            .find(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
+            .unwrap_or_else(|| panic!("{example} should contain an iterative_request_router"));
+        let overall_timeout_ms = irr["timeout_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{example} streaming IRR should configure an overall timeout"));
+        let step_timeout_ms = irr["step_timeout_ms"].as_u64().unwrap_or(overall_timeout_ms);
+
+        assert!(
+            overall_timeout_ms >= minimum_timeout_ms,
+            "{example} IRR overall timeout ({overall_timeout_ms}ms) must be at least {minimum_timeout_ms}ms"
+        );
+        assert!(
+            step_timeout_ms >= minimum_timeout_ms,
+            "{example} IRR step timeout ({step_timeout_ms}ms) must be at least {minimum_timeout_ms}ms"
+        );
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {

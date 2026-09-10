@@ -205,6 +205,37 @@ impl ResponsesEvent {
         }
     }
 
+    /// Take ownership of the JSON payload after read-only consumers are done.
+    pub fn into_payload(self) -> Value {
+        match self {
+            Self::ResponseCreated(payload)
+            | Self::ResponseQueued(payload)
+            | Self::ResponseInProgress(payload)
+            | Self::ResponseCompleted(payload)
+            | Self::ResponseIncomplete(payload)
+            | Self::ResponseFailed(payload)
+            | Self::OutputItemAdded(payload)
+            | Self::OutputItemDone(payload)
+            | Self::ContentPartAdded(payload)
+            | Self::ContentPartDone(payload)
+            | Self::OutputTextDelta(payload)
+            | Self::OutputTextDone(payload)
+            | Self::OutputTextAnnotationAdded(payload)
+            | Self::FunctionCallArgumentsDelta(payload)
+            | Self::FunctionCallArgumentsDone(payload)
+            | Self::RefusalDelta(payload)
+            | Self::RefusalDone(payload)
+            | Self::ReasoningDelta(payload)
+            | Self::ReasoningDone(payload)
+            | Self::ReasoningSummaryTextDelta(payload)
+            | Self::ReasoningSummaryTextDone(payload)
+            | Self::ReasoningSummaryPartAdded(payload)
+            | Self::ReasoningSummaryPartDone(payload)
+            | Self::Error(payload)
+            | Self::Unknown { data: payload, .. } => payload,
+        }
+    }
+
     /// Return the event type string.
     pub fn event_type(&self) -> &str {
         match self {
@@ -575,6 +606,38 @@ mod tests {
                 "event_type() should roundtrip for '{event_type}'"
             );
         }
+    }
+
+    #[test]
+    fn into_payload_moves_owned_json() {
+        let data = json!({"id": "resp_1", "delta": "x".repeat(4096)});
+        let borrowed = ResponsesEvent::from_event_type("response.output_text.delta", data.clone());
+        assert_eq!(borrowed.payload(), &data, "payload() should borrow the owned JSON");
+
+        let clone_event = ResponsesEvent::from_event_type("response.output_text.delta", data.clone());
+        let move_event = ResponsesEvent::from_event_type("response.output_text.delta", data.clone());
+        let clone_info = allocation_counter::measure(|| {
+            std::hint::black_box(clone_event.payload().clone());
+        });
+        let move_info = allocation_counter::measure(|| {
+            std::hint::black_box(move_event.into_payload());
+        });
+        assert!(
+            clone_info.bytes_total >= 4096,
+            "payload().clone() must deep-copy the delta string, allocated {}",
+            clone_info.bytes_total
+        );
+        assert!(
+            move_info.bytes_total < clone_info.bytes_total,
+            "into_payload() must move the JSON: clone={} bytes, move={} bytes",
+            clone_info.bytes_total,
+            move_info.bytes_total
+        );
+        assert_eq!(
+            ResponsesEvent::from_event_type("response.output_text.delta", data.clone()).into_payload(),
+            data,
+            "into_payload() should yield the original JSON value"
+        );
     }
 
     #[test]
