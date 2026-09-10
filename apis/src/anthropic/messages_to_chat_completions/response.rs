@@ -182,12 +182,17 @@ fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<Con
     };
 
     for tc in tool_calls {
-        let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+        let id = tc
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "tool call missing required non-empty `id`".to_owned())?;
         let name = tc
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
-            .unwrap_or("");
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "tool call missing required non-empty function `name`".to_owned())?;
         let args_str = tc
             .get("function")
             .and_then(|f| f.get("arguments"))
@@ -632,6 +637,50 @@ mod tests {
                 "non-object arguments {arguments} should fail response transformation: {error}"
             );
         }
+    }
+
+    #[test]
+    fn missing_tool_call_id_fails_transformation() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let error = transform_response(body, "gpt-4").err().unwrap();
+
+        assert!(
+            error.contains("non-empty `id`"),
+            "a missing tool call id should fail response transformation: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_tool_call_id_fails_transformation() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"","type":"function","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let error = transform_response(body, "gpt-4").err().unwrap();
+
+        assert!(
+            error.contains("non-empty `id`"),
+            "an empty tool call id should fail response transformation: {error}"
+        );
+    }
+
+    #[test]
+    fn missing_tool_call_function_name_fails_transformation() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let error = transform_response(body, "gpt-4").err().unwrap();
+
+        assert!(
+            error.contains("non-empty function `name`"),
+            "a missing function name should fail response transformation: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_tool_call_function_name_fails_transformation() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let error = transform_response(body, "gpt-4").err().unwrap();
+
+        assert!(
+            error.contains("non-empty function `name`"),
+            "an empty function name should fail response transformation: {error}"
+        );
     }
 
     #[test]

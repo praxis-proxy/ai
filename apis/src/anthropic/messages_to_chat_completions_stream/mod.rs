@@ -703,12 +703,7 @@ fn emit_tool_block_start(
     }
 
     let idx = get_block_index(ctx);
-    let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
-    let name = tc
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let (id, name) = extract_tool_id_and_name(tc)?;
     let content_block = ContentBlock::tool_use(id, serde_json::Map::new(), name);
 
     emit_event(
@@ -726,6 +721,24 @@ fn emit_tool_block_start(
     ctx.set_metadata(TOOL_BLOCK_COUNT_KEY, (opened + 1).to_string());
 
     Ok(())
+}
+
+/// Extract and validate the tool-call ID and function name from an OpenAI tool-call delta.
+fn extract_tool_id_and_name(tc: &Value) -> Result<(&str, &str), FilterError> {
+    let id = tc
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| FilterError::from("anthropic_stream_events: tool call missing required non-empty `id`"))?;
+    let name = tc
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            FilterError::from("anthropic_stream_events: tool call missing required non-empty function `name`")
+        })?;
+    Ok((id, name))
 }
 
 /// Emit an `input_json_delta` if the tool call has non-empty arguments.
