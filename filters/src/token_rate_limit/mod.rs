@@ -717,8 +717,8 @@ impl TokenRateLimitFilter {
 /// [`TokenRateLimitFilter::record_admission`] stays within clippy's
 /// argument-count budget.
 struct AdmittedReservation {
-    /// The budget key this reservation was admitted under (see
-    /// [`FALLBACK_KEY`] -- always that sentinel in this milestone).
+    /// The global sentinel or opaque authenticated-subject key under which
+    /// this reservation was admitted.
     key: String,
     /// The backend-issued reservation ID, stashed for later reconciliation.
     reservation_id: u64,
