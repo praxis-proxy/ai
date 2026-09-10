@@ -11,9 +11,12 @@ use serde_json::json;
 
 use super::{
     ARMED_KEY, CREATED_AT_KEY, RESPONSE_STATUS_KEY, RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM,
-    ResponsesToChatCompletionsFilter, error::normalize_provider_error,
+    ResponsesToChatCompletionsFilter, error::normalize_provider_error, reject_incompatible_reasoning,
 };
-use crate::openai::responses::state::ResponsesState;
+use crate::openai::{
+    responses::state::ResponsesState,
+    translation::reasoning::{ReasoningDialect, ReasoningOptions},
+};
 
 #[test]
 fn default_config_parses() {
@@ -127,6 +130,39 @@ fn legacy_max_body_bytes_is_rejected() {
         ResponsesToChatCompletionsFilter::from_config(&yaml).is_err(),
         "legacy max_body_bytes should be rejected as an unknown field"
     );
+}
+
+#[test]
+fn streaming_with_reasoning_dialect_is_rejected() {
+    // Streaming reasoning translation is deferred (#36).
+    let request = json!({"model": "m", "input": "hi", "stream": true});
+    let vllm = ReasoningOptions {
+        dialect: ReasoningDialect::Vllm,
+        ..ReasoningOptions::default()
+    };
+
+    let action = reject_incompatible_reasoning(&request, &vllm, true)
+        .expect_err("streaming must be rejected while a reasoning dialect is enabled");
+    assert!(matches!(action, FilterAction::Reject(_)));
+}
+
+#[test]
+fn streaming_without_reasoning_dialect_is_allowed() {
+    let request = json!({"model": "m", "input": "hi", "stream": true});
+
+    reject_incompatible_reasoning(&request, &ReasoningOptions::default(), true)
+        .expect("the default dialect performs no reasoning translation and permits streaming");
+}
+
+#[test]
+fn non_streaming_with_reasoning_dialect_is_allowed() {
+    let request = json!({"model": "m", "input": "hi"});
+    let vllm = ReasoningOptions {
+        dialect: ReasoningDialect::Vllm,
+        ..ReasoningOptions::default()
+    };
+
+    reject_incompatible_reasoning(&request, &vllm, false).expect("non-streaming reasoning translation is supported");
 }
 
 #[test]

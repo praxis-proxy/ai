@@ -30,6 +30,14 @@ impl ReasoningDialect {
             Self::None | Self::Vllm => false,
         }
     }
+
+    /// Whether a backend reasoning contract is active.
+    pub(crate) const fn is_enabled(self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Vllm => true,
+        }
+    }
 }
 
 /// Resolved backend-specific reasoning configuration.
@@ -51,16 +59,31 @@ impl Default for ReasoningOptions {
     }
 }
 
-/// Resolve the requested reasoning summary mode from a `reasoning` block,
+/// Resolve the requested reasoning summary from a `reasoning` block,
 /// treating the deprecated `generate_summary` as an alias of `summary`.
 /// Conflicting non-null string values are rejected.
 pub(crate) fn requested_summary(reasoning: &Map<String, Value>) -> Result<Option<&str>, TranslationError> {
-    let summary = reasoning.get("summary").and_then(Value::as_str);
-    let generate = reasoning.get("generate_summary").and_then(Value::as_str);
+    let summary = summary_control(reasoning, "summary")?;
+    let generate = summary_control(reasoning, "generate_summary")?;
     match (summary, generate) {
         (Some(summary), Some(generate)) if summary != generate => Err(TranslationError::ConflictingReasoningSummary),
-        (Some(mode), _) | (_, Some(mode)) => Ok(Some(mode)),
+        (Some(summary), _) | (_, Some(summary)) => Ok(Some(summary)),
         (None, None) => Ok(None),
+    }
+}
+
+/// Read a summary control field, failing closed on non-string, non-null values.
+fn summary_control<'a>(
+    reasoning: &'a Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<&'a str>, TranslationError> {
+    match reasoning.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(summary)) => Ok(Some(summary)),
+        Some(other) => Err(TranslationError::MalformedReasoningSummary {
+            field,
+            actual: json_type_name(other).to_owned(),
+        }),
     }
 }
 

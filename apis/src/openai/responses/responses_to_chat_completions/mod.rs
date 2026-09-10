@@ -106,7 +106,9 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// `content` is `reasoning_text`. Raw reasoning is never placed in the item
 /// summary, which is reserved for safe summaries. No current dialect can
 /// generate a safe summary, so a client that requests `reasoning.summary` (or
-/// the deprecated `reasoning.generate_summary`) is rejected.
+/// the deprecated `reasoning.generate_summary`) is rejected. Streaming reasoning
+/// translation is not yet implemented, so a streaming request is rejected when
+/// valid reasoning dialect is configured.
 ///
 /// To emit translated SSE events incrementally, this filter forces the
 /// reconciled response body mode to `Stream` for the entire filter chain. The
@@ -578,6 +580,16 @@ fn reject_incompatible_reasoning(
     let Some(request) = request_body.as_object() else {
         return Ok(());
     };
+    // Streaming reasoning translation is not yet implemented.
+    if streaming && reasoning.dialect.is_enabled() {
+        debug!("streaming reasoning translation is unsupported for the configured dialect");
+        return Err(FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "streaming is not supported when a reasoning dialect is configured",
+            streaming,
+        )));
+    }
     validate_requested_reasoning(request, reasoning).map_err(|error| {
         debug!(error = %error, "reasoning request rejected before forwarding");
         FilterAction::Reject(responses_error_rejection(

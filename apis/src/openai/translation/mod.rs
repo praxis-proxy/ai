@@ -1972,6 +1972,46 @@ mod tests {
         assert!(error.contains("reasoning.summary is not supported"));
     }
 
+    #[test]
+    fn non_string_summary_control_is_rejected() {
+        for control in ["summary", "generate_summary"] {
+            for value in [json!(true), json!(1), json!({}), json!([])] {
+                let error = validate_reasoning(
+                    &json!({"model": "m", "input": "hi", "reasoning": {control: value}}),
+                    &vllm_options(),
+                )
+                .unwrap_err();
+
+                assert!(
+                    error.contains(&format!("reasoning.{control} must be a string or null")),
+                    "expected malformed {control} rejection, got: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rehydrated_reasoning_input_item_is_dropped_not_rejected() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {
+                    "id": "rs_abc",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "prior cot"}]
+                },
+                {"role": "user", "content": "continue"}
+            ]
+        }));
+
+        let messages = mapped["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "continue");
+    }
+
     // -------------------------------------------------------------------------
     // Response translation: reasoning extraction
     // -------------------------------------------------------------------------

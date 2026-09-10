@@ -286,6 +286,14 @@ pub(crate) enum TranslationError {
     /// The provider returned raw reasoning in an unexpected shape.
     #[error("provider returned malformed raw reasoning content: expected string, found {0}")]
     MalformedReasoning(String),
+    /// A reasoning summary control was present but not a string or null.
+    #[error("reasoning.{field} must be a string or null, found {actual}")]
+    MalformedReasoningSummary {
+        /// The summary control field name.
+        field: &'static str,
+        /// The observed JSON type.
+        actual: String,
+    },
 }
 
 /// Borrowed canonical request fields that supersede their original request values.
@@ -547,6 +555,7 @@ fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Tran
         Some("function_call_output") => append_tool_output(messages, obj)?,
         Some("message") => append_message_item(messages, obj)?,
         Some("compaction") => append_compaction_item(messages, obj)?,
+        Some("reasoning") => {},
         None if obj.contains_key("role") || obj.contains_key("content") => append_message_item(messages, obj)?,
         None => return Err(TranslationError::UnsupportedInputItemType("unknown".to_owned())),
         Some(input_type) => return Err(TranslationError::UnsupportedInputItemType(input_type.to_owned())),
@@ -1541,7 +1550,7 @@ fn reasoning_value(context: &ResponseContext<'_>) -> Result<Value, TranslationEr
     let Some(reasoning) = context.reasoning.and_then(Value::as_object) else {
         return Ok(Value::Null);
     };
-    let summary = requested_summary(reasoning)?.map_or(Value::Null, |mode| Value::String(mode.to_owned()));
+    let summary = requested_summary(reasoning)?.map_or(Value::Null, |summary| Value::String(summary.to_owned()));
     Ok(json!({
         "effort": reasoning.get("effort").cloned().unwrap_or(Value::Null),
         "summary": summary,
