@@ -431,24 +431,29 @@ fn flatten_search_result(mut block: Map<String, Value>) -> Option<String> {
         return None;
     }
 
-    let mut lines = Vec::new();
+    let mut flattened = String::new();
 
     if let Some(title) = title {
-        lines.push(format!("Search result: {}", quote_label_value(&title)));
+        flattened.push_str("Search result: ");
+        flattened.push_str(&quote_label_value(&title));
     } else {
-        lines.push("Search result".to_owned());
+        flattened.push_str("Search result");
     }
 
     if let Some(source) = source {
-        lines.push(format!("Source: {}", quote_label_value(&source)));
+        flattened.push_str("\nSource: ");
+        flattened.push_str(&quote_label_value(&source));
     }
 
     if !content.is_empty() {
-        lines.push("Content:".to_owned());
+        flattened.push_str("\nContent:");
+        for text in content {
+            flattened.push('\n');
+            flattened.push_str(&text);
+        }
     }
 
-    lines.extend(content);
-    non_empty_lines(&lines)
+    Some(flattened)
 }
 
 /// Flatten an Anthropic `document` block to plain text.
@@ -461,23 +466,26 @@ fn flatten_document(mut block: Map<String, Value>) -> Option<String> {
         return None;
     }
 
-    let mut lines = Vec::new();
+    let mut flattened = String::new();
 
     if let Some(title) = title {
-        lines.push(format!("Document: {}", quote_label_value(&title)));
+        flattened.push_str("Document: ");
+        flattened.push_str(&quote_label_value(&title));
     } else {
-        lines.push("Document".to_owned());
+        flattened.push_str("Document");
     }
 
     if let Some(context) = context {
-        lines.push(format!("Context: {}", quote_label_value(&context)));
+        flattened.push_str("\nContext: ");
+        flattened.push_str(&quote_label_value(&context));
     }
 
     if let Some(source_text) = source_text {
-        lines.push(source_text);
+        flattened.push('\n');
+        flattened.push_str(&source_text);
     }
 
-    non_empty_lines(&lines)
+    Some(flattened)
 }
 
 /// Flatten a `document.source` value to extractable text or a stable reference.
