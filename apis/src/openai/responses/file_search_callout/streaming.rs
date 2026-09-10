@@ -254,7 +254,7 @@ pub(super) fn reconcile_round_into_accumulated_output(state: &mut ResponsesState
 /// BRANCH B (§6): terminal round — the model's final answer OR a zero-budget round
 /// whose pending calls were all terminalized to `incomplete`. Reconcile → annotate
 /// (single terminal pass) → full-canonical bound → publish pending=false. Child-module
-/// free fn (no `pub(super)`): only `capture_streaming_inner` and this file's tests call it.
+/// `pub(super)` free fn: only `capture_streaming_inner` and this file's tests call it.
 pub(super) fn branch_b_terminal(
     ctx: &mut HttpFilterContext<'_>,
     state: &mut ResponsesState,
