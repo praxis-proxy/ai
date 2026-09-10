@@ -3,7 +3,7 @@
 
 //! Anthropic Messages to Chat Completions-compatible request transformation.
 
-use serde_json::{Error, Map, Value, json};
+use serde_json::{Map, Value, json};
 use tracing::warn;
 
 use crate::json_body::{insert_if_some, take_string};
@@ -12,12 +12,10 @@ use crate::json_body::{insert_if_some, take_string};
 // Request Transformation
 // -----------------------------------------------------------------------------
 
-/// Transform parsed Anthropic Messages request body into Chat
+/// Transform a parsed Anthropic Messages request body into Chat
 /// Completions-compatible format.
 /// Returns the transformed JSON bytes, or an error message.
-pub(crate) fn transform_request(value: Result<Value, Error>) -> Result<Vec<u8>, String> {
-    let value = value.map_err(|e| format!("invalid JSON: {e}"))?;
-
+pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
     let Value::Object(mut body) = value else {
         return Err("request body is not a JSON object".to_owned());
     };
@@ -756,9 +754,10 @@ mod tests {
     use super::*;
 
     /// Parse a raw request body and transform it, mirroring the filter's
-    /// parse-once call path.
+    /// parse-once call path including its parse-error message.
     fn transform_bytes(body: &[u8]) -> Result<Vec<u8>, String> {
-        transform_request(serde_json::from_slice(body))
+        let value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        transform_request(value)
     }
 
     #[test]
