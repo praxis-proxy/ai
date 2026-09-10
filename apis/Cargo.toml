@@ -39,6 +39,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true, optional = true }
+sse-stream = { workspace = true }
 thiserror = { workspace = true }
 tiktoken-rs = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }

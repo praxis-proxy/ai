@@ -15,6 +15,12 @@ use crate::callout_policy;
 /// Default callout timeout (10 seconds — search APIs can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
+/// Default model-driven web searches accepted from one response round.
+pub(crate) const DEFAULT_MAX_CALLS_PER_ROUND: usize = 32;
+
+/// Absolute model-driven web-search calls accepted from one response round.
+pub(crate) const MAX_CALLS_PER_ROUND: usize = 1_024;
+
 // -----------------------------------------------------------------------------
 // SearchProvider
 // -----------------------------------------------------------------------------
@@ -165,6 +171,10 @@ pub(crate) struct OpenAiWebSearchConfig {
     #[serde(default)]
     timeout_ms: Option<u64>,
 
+    /// Hard cap on web-search calls processed from one model response (1..=1024; default: 32).
+    #[serde(default = "default_max_calls_per_round")]
+    pub(crate) max_calls_per_round: usize,
+
     /// Override the provider's default API base URL.
     #[serde(default)]
     base_url: Option<String>,
@@ -177,6 +187,11 @@ pub(crate) struct OpenAiWebSearchConfig {
     /// callout. Enable this only for a trusted private provider endpoint.
     #[serde(default)]
     allow_private_base_url: bool,
+}
+
+/// Default value for `OpenAiWebSearchConfig::max_calls_per_round`.
+fn default_max_calls_per_round() -> usize {
+    DEFAULT_MAX_CALLS_PER_ROUND
 }
 
 impl OpenAiWebSearchConfig {

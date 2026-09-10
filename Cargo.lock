@@ -2883,6 +2883,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "sse-stream",
  "tempfile",
  "thiserror 2.0.20",
  "tiktoken-rs",

@@ -117,8 +117,8 @@ filter_chains:
               # streaming automatically for an effective `"stream": true`
               # request. Typed streaming commits `response.completed` to the
               # client as it arrives, so a loop-terminal error detected by
-              # `openai_agentic_loop` (e.g. an SSE parse failure or a tool-call
-              # cardinality violation) can only reach the client through this
+              # `openai_agentic_loop` (e.g. an SSE parse failure or mixed
+              # client/server function-call ownership) can only reach the client through this
               # filter's logical-stream finalizer, which defers each round's
               # terminal event and can replace it with an error frame. Without
               # `logical_stream: true` that error is silently dropped after the
@@ -135,10 +135,15 @@ filter_chains:
               - filter: openai_web_search
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
+                max_calls_per_round: 32
               # Runs second on request re-entry to execute pending MCP
               # calls, and second-to-last on the model response to
               # classify MCP tool calls.
               - filter: openai_mcp_dispatch
+                max_calls_per_round: 32
+                max_parallel_calls: 8
+                max_result_bytes: 1048576
+                max_total_result_bytes: 8388608
               - filter: openai_agentic_loop
                 max_infer_iters: 10
               # Selects typed streaming automatically when the effective

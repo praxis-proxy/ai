@@ -140,6 +140,75 @@ fn file_search_callout_example_runs_model_search_model_round_trip() {
 }
 
 #[test]
+fn reused_file_search_ids_do_not_restore_response_wide_budget() {
+    let file_call = |query: &str| {
+        json!({
+            "id": "fs_reused",
+            "type": "file_search_call",
+            "status": "searching",
+            "queries": [query]
+        })
+    };
+    let mut responses = vec![(200, r#"{"status":"ready"}"#.to_owned())];
+    responses.extend(
+        ["first", "second", "must not run"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, query)| {
+                (
+                    200,
+                    json!({
+                        "id": format!("resp_reused_{index}"),
+                        "object": "response",
+                        "status": "completed",
+                        "output": [file_call(query)]
+                    })
+                    .to_string(),
+                )
+            }),
+    );
+    let model = start_stateful_backend(responses);
+    let empty_search = json!({"data": []}).to_string();
+    let search = start_stateful_backend(vec![
+        (200, empty_search.clone()),
+        (200, empty_search.clone()),
+        (200, empty_search),
+    ]);
+    let proxy_port = free_port();
+    let config = load_file_search_callout_config(
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:8001", search.port())]),
+    );
+    let proxy = start_file_search_proxy(&config);
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "Search repeatedly",
+        "max_tool_calls": 2,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_reused"]}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "reused-ID response failed: {raw}");
+    assert_eq!(
+        search.requests().len(),
+        2,
+        "two same-ID model calls consume both slots; the third must not execute"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    let calls = response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "file_search_call")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["status"], "completed");
+    assert_eq!(calls[1]["status"], "completed");
+    assert_eq!(calls[2]["status"], "incomplete");
+}
+
+#[test]
 fn file_search_callout_example_without_tools_passthrough() {
     let response = r#"{"id":"resp_456","object":"response","output":[{"id":"msg_456","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}]}"#;
     let backend = start_backend_with_shutdown(response);

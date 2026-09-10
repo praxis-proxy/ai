@@ -47,7 +47,7 @@ use crate::{
     openai::responses::{
         bounded_json_size,
         error::responses_error_rejection,
-        state::{MAX_CITATION_FILES, ResponsesState},
+        state::{MAX_CITATION_FILES, ResponsesState, consumed_builtin_tool_calls},
         usage::merge_usage,
     },
     subrequest::SubRequestClient,
@@ -1213,13 +1213,7 @@ fn remaining_file_search_call_budget(state: &ResponsesState) -> usize {
     let Some(max_tool_calls) = state.max_tool_calls else {
         return MAX_PENDING_CALLS;
     };
-    let used_calls = state
-        .file_search_output_items
-        .iter()
-        .chain(state.accumulated_output.iter())
-        .chain(state.output_items())
-        .filter(|item| is_builtin_tool_call(item) && !is_pending_file_search_call(item))
-        .count();
+    let used_calls = consumed_builtin_tool_calls(state);
     usize::try_from(max_tool_calls)
         .unwrap_or(usize::MAX)
         .saturating_sub(used_calls)
@@ -1242,28 +1236,6 @@ fn combined_output_fits(state: &ResponsesState, incoming_response: &Value, max_b
     .ok()
     .flatten()
     .is_some()
-}
-
-/// Return whether an output item is a provider-hosted built-in tool call.
-///
-/// Shared with `openai_web_search`, which counts non-web built-in calls against
-/// the same client-declared `max_tool_calls` budget.
-pub(crate) fn is_builtin_tool_call(item: &Value) -> bool {
-    matches!(
-        item.get("type").and_then(Value::as_str),
-        Some(
-            "apply_patch_call"
-                | "code_interpreter_call"
-                | "computer_call"
-                | "file_search_call"
-                | "image_generation_call"
-                | "local_shell_call"
-                | "multi_agent_call"
-                | "shell_call"
-                | "tool_search_call"
-                | "web_search_call"
-        )
-    )
 }
 
 /// Schedule bounded search coordinates while retaining every pending call.

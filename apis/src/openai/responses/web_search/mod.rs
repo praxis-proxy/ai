@@ -34,7 +34,7 @@
 )]
 mod tests;
 
-use std::{collections::HashSet, mem};
+use std::mem;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -45,10 +45,14 @@ use praxis_filter::{
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::state::ResponsesState;
+use super::{
+    mcp_dispatch::FILTER_RESULT_KEY as MCP_DISPATCH_FILTER_RESULT_KEY,
+    openai_mcp_tool_resolve::McpToolIndex,
+    state::{ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions},
+};
 use crate::web_search::{
     OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult,
-    build_config, format_search_results, is_web_search_tool_type,
+    build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
 };
 
 // -----------------------------------------------------------------------------
@@ -80,6 +84,21 @@ const MAX_WEB_SEARCH_CALLS_PER_CONTINUATION: usize = 64;
 /// Model-facing result for a malformed call without `action.query`.
 const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query was missing.";
 
+/// Model-facing result when the response-wide tool budget is exhausted.
+const TOOL_LIMIT_OUTPUT: &str = "Web search was not executed because max_tool_calls was exhausted.";
+
+/// Borrowed inputs for one request-side web-search dispatch batch.
+struct PendingSearchBatch<'a> {
+    /// Calls retained from the current model round.
+    calls: &'a [Value],
+    /// Ordered response-wide budget decisions, when the client set a limit.
+    admissions: Option<&'a [bool]>,
+    /// Remaining provider requests allowed by the cumulative budget.
+    provider_budget: usize,
+    /// Search result size requested for this response.
+    context_size: SearchContextSize,
+}
+
 // -----------------------------------------------------------------------------
 // WebSearchFilter
 // -----------------------------------------------------------------------------
@@ -106,12 +125,15 @@ const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query w
 /// api_key: ${WEB_SEARCH_API_KEY}
 /// default_context_size: medium
 /// timeout_ms: 10000
+/// max_calls_per_round: 32
 /// ```
 pub struct WebSearchFilter {
     /// The search client for executing queries.
     search_client: SearchClient,
     /// Default search context size.
     default_context_size: SearchContextSize,
+    /// Maximum calls accepted from one model response.
+    max_calls_per_round: usize,
 }
 
 impl WebSearchFilter {
@@ -161,11 +183,18 @@ impl WebSearchFilter {
         subrequest_client: crate::subrequest::SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search", config)?;
+        if cfg.max_calls_per_round == 0 || cfg.max_calls_per_round > MAX_CALLS_PER_ROUND {
+            return Err(
+                format!("openai_web_search: max_calls_per_round must be between 1 and {MAX_CALLS_PER_ROUND}").into(),
+            );
+        }
+        let max_calls_per_round = cfg.max_calls_per_round;
         let validated = build_config("openai_web_search", &cfg.into_shared())?;
         let search_client = SearchClient::from_config("openai_web_search", &validated, subrequest_client)?;
         Ok(Box::new(Self {
             search_client,
             default_context_size: validated.default_context_size,
+            max_calls_per_round,
         }))
     }
 
@@ -197,19 +226,13 @@ impl WebSearchFilter {
         let Some(query) = query else {
             warn!(call_id, "web_search_call missing action.query, skipping");
             let bridge = bridge_call_id(call_id, "", index);
-            let ids = SearchCallIds {
-                public: call_id,
-                bridge: &bridge,
-            };
+            let ids = SearchCallIds::new(call_id, &bridge, index);
             append_incomplete(ctx, &ids);
             return false;
         };
 
         let bridge = bridge_call_id(call_id, query, index);
-        let ids = SearchCallIds {
-            public: call_id,
-            bridge: &bridge,
-        };
+        let ids = SearchCallIds::new(call_id, &bridge, index);
         match self.search_client.search(query, Some(context_size)).await {
             SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
             SearchOutcome::Failed => {
@@ -223,29 +246,36 @@ impl WebSearchFilter {
         true
     }
 
-    /// Execute pending web search `calls` up to `budget`, then update the
-    /// cumulative execution count and clear the pending queue.
+    /// Execute admitted web search `calls` up to the provider-request `budget`,
+    /// then update the cumulative execution count and clear the pending queue.
     ///
     /// Calls beyond `budget` are surfaced as incomplete without issuing a
     /// (potentially paid) provider request, honoring the client's
     /// `max_tool_calls` allowance and the per-continuation server cap. Only
-    /// dispatched calls (a `Results` or `Failed` outcome) are charged against
-    /// the budget; a missing-query call is surfaced as incomplete without a
-    /// provider request and does not consume budget.
-    async fn execute_pending_searches(
-        &self,
-        ctx: &mut HttpFilterContext<'_>,
-        calls: &[Value],
-        budget: usize,
-        context_size: SearchContextSize,
-    ) {
+    /// Calls rejected by the response-wide ordered admission pass receive a
+    /// failed result and force local completion without another model round.
+    /// Separately, calls beyond the provider-request budget are surfaced as
+    /// incomplete. Only dispatched calls (a `Results` or `Failed` outcome) are
+    /// added to the cumulative provider counter; a missing-query call consumes
+    /// its model-call admission but does not issue a provider request.
+    async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
         let mut dispatched = 0_usize;
-        for (index, call) in calls.iter().enumerate() {
-            if dispatched >= budget {
+        let mut tool_limit_exceeded = false;
+        for (index, call) in batch.calls.iter().enumerate() {
+            if batch
+                .admissions
+                .and_then(|values| values.get(index))
+                .is_some_and(|admitted| !admitted)
+            {
+                append_tool_limit_exceeded(ctx, call, index);
+                tool_limit_exceeded = true;
+                continue;
+            }
+            if dispatched >= batch.provider_budget {
                 append_excess_incomplete(ctx, call, index);
                 continue;
             }
-            if self.execute_single_search(ctx, call, index, context_size).await {
+            if self.execute_single_search(ctx, call, index, batch.context_size).await {
                 dispatched = dispatched.saturating_add(1);
             }
         }
@@ -256,6 +286,7 @@ impl WebSearchFilter {
                 .saturating_add(u32::try_from(dispatched).unwrap_or(u32::MAX));
             state.web_search_calls.clear();
         }
+        tool_limit_exceeded
     }
 }
 
@@ -290,6 +321,10 @@ impl HttpFilter for WebSearchFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "budgeted dispatch and local terminal response form one lifecycle"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -308,6 +343,12 @@ impl HttpFilter for WebSearchFilter {
             return Ok(FilterAction::Continue);
         }
 
+        let admissions = state.max_tool_calls.map(|_| {
+            let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+            current_round_tool_call_admissions(state, &state.web_search_calls, |item| {
+                is_mcp_function_call(&tool_index, item)
+            })
+        });
         let context_size = ctx
             .get_metadata("tool_parse.search_context_size")
             .or_else(|| web_search_context_size_from_state(state))
@@ -323,12 +364,33 @@ impl HttpFilter for WebSearchFilter {
             .map(|state| mem::take(&mut state.web_search_calls))
             .unwrap_or_default();
 
+        let execute_count = admissions.as_ref().map_or(calls.len(), |values| {
+            values.iter().filter(|admitted| **admitted).count()
+        });
+        let rejected_count = calls.len().saturating_sub(execute_count);
         debug!(
-            count = calls.len(),
-            budget, "executing pending web search calls within budget"
+            count = execute_count,
+            rejected = rejected_count,
+            "executing pending web search calls"
         );
 
-        self.execute_pending_searches(ctx, &calls, budget, context_size).await;
+        let tool_limit_exceeded = self
+            .execute_pending_searches(
+                ctx,
+                PendingSearchBatch {
+                    calls: &calls,
+                    admissions: admissions.as_deref(),
+                    provider_budget: budget,
+                    context_size,
+                },
+            )
+            .await;
+        if tool_limit_exceeded {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.deferred_tool_limit_completion = true;
+            }
+            set_action(ctx, ACTION_DONE)?;
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -351,6 +413,10 @@ impl HttpFilter for WebSearchFilter {
             return Ok(FilterAction::Continue);
         }
 
+        if state.web_search_calls.len() > self.max_calls_per_round {
+            return oversized_web_search_batch(ctx);
+        }
+
         debug!(
             count = state.web_search_calls.len(),
             "web search calls pending, signaling loop"
@@ -358,6 +424,41 @@ impl HttpFilter for WebSearchFilter {
         set_action(ctx, ACTION_LOOP)?;
         Ok(FilterAction::Continue)
     }
+}
+
+/// Reject a model response whose web-search fan-out exceeds the server cap.
+fn oversized_web_search_batch(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    const MESSAGE: &str = "model response exceeded the configured web-search call limit";
+    let streaming = ctx.extensions.get_mut::<ResponsesState>().is_some_and(|state| {
+        state.tool_calls.clear();
+        state.web_search_calls.clear();
+        state.request_body.get("stream").and_then(Value::as_bool) == Some(true)
+    });
+    if streaming {
+        ctx.set_metadata("responses.stream_error_code", "server_error");
+        ctx.set_metadata("responses.stream_error_message", MESSAGE);
+        ctx.set_metadata("responses.skip_persist", "true");
+        ctx.filter_results
+            .entry(MCP_DISPATCH_FILTER_RESULT_KEY)
+            .or_default()
+            .set("action", ACTION_DONE)?;
+        set_action(ctx, ACTION_DONE)?;
+        return Ok(FilterAction::Continue);
+    }
+    Ok(FilterAction::Reject(super::error::responses_error_rejection(
+        502,
+        "server_error",
+        MESSAGE,
+    )))
+}
+
+/// Return whether an output item is one of this request's resolved MCP calls.
+fn is_mcp_function_call(tool_index: &McpToolIndex<'_>, item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("function_call")
+        && item
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|encoded| tool_index.contains(encoded))
 }
 
 /// Recover per-request search context after IRR resets step-local metadata.
@@ -384,6 +485,15 @@ struct SearchCallIds<'a> {
     public: &'a str,
     /// Bounded, backend-valid id for the synthetic bridge pair.
     bridge: &'a str,
+    /// Position within the current model round.
+    index: usize,
+}
+
+impl<'a> SearchCallIds<'a> {
+    /// Pair one provider-facing ID with its bounded bridge ID and round position.
+    fn new(public: &'a str, bridge: &'a str, index: usize) -> Self {
+        Self { public, bridge, index }
+    }
 }
 
 /// Remaining web searches this continuation may dispatch.
@@ -394,75 +504,19 @@ struct SearchCallIds<'a> {
 ///
 /// `max_tool_calls` is a single budget shared across *every* built-in tool
 /// type, so the allowance is the declared maximum minus all built-in calls
-/// already consumed — web searches dispatched across prior iterations
-/// ([`ResponsesState::web_search_calls_executed`]) *plus* completed non-web
-/// built-in calls (e.g. file search) recorded on the state. Without the second
-/// term a mixed pipeline could dispatch a full web-search allowance on top of
-/// already-executed file searches and overshoot the client's cap. Web searches
-/// are counted through the dedicated counter rather than by scanning the output
-/// collections to avoid the echoed-call/result double count documented on
-/// [`ResponsesState::accumulated_output`]; non-web built-in calls have no such
-/// counter and are counted directly, mirroring
+/// already admitted in prior model rounds. Calls are reconstructed from retained
+/// output occurrences rather than provider execution counts, so incomplete
+/// calls remain charged and a current-round web execution cannot be counted
+/// again when a sibling dispatcher evaluates ordered admission. Matching calls
+/// copied between state owners are reconciled by occurrence multiplicity,
+/// mirroring
 /// [`remaining_file_search_call_budget`](super::file_search_callout).
 fn remaining_web_search_budget(state: &ResponsesState) -> usize {
-    let web_executed = usize::try_from(state.web_search_calls_executed).unwrap_or(usize::MAX);
-    let other_builtin_calls = count_non_web_builtin_calls(state);
-    let used = web_executed.saturating_add(other_builtin_calls);
+    let used = consumed_builtin_tool_calls_before_current_round(state);
     let client_remaining = state.max_tool_calls.map_or(usize::MAX, |max| {
         usize::try_from(max).unwrap_or(usize::MAX).saturating_sub(used)
     });
     client_remaining.min(MAX_WEB_SEARCH_CALLS_PER_CONTINUATION)
-}
-
-/// Count distinct non-web built-in tool calls already spent against the shared
-/// `max_tool_calls` budget.
-///
-/// A completed file-search call is moved out of the response object into
-/// [`ResponsesState::file_search_output_items`] before the next iterative round,
-/// so scanning only [`ResponsesState::accumulated_output`] would miss it and let
-/// a mixed file-search/web-search pipeline dispatch a full web-search allowance
-/// on top of an already-executed file search, overshooting the client's cap.
-/// Every collection that can retain a built-in call is scanned —
-/// `accumulated_output`, the moved-out `file_search_output_items`, and the live
-/// [`ResponsesState::output_items`] — and results are deduplicated by item `id`,
-/// because a single call can be echoed into more than one collection (e.g.
-/// accumulated during the response phase *and* retained after the move).
-/// Web-search calls are excluded here; they are tracked through
-/// [`ResponsesState::web_search_calls_executed`]. Pending file-search
-/// placeholders (`searching`/`in_progress`) are also excluded, mirroring
-/// [`remaining_file_search_call_budget`](super::file_search_callout): they have
-/// not yet consumed a provider call, so counting them would let a mixed pending
-/// file-search/web-search response decline the web search before either call
-/// runs.
-fn count_non_web_builtin_calls(state: &ResponsesState) -> usize {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut count = 0_usize;
-    let candidates = state
-        .accumulated_output
-        .iter()
-        .chain(&state.file_search_output_items)
-        .chain(state.output_items());
-    for item in candidates {
-        let is_non_web_builtin = super::file_search_callout::is_builtin_tool_call(item)
-            && item.get("type").and_then(Value::as_str) != Some("web_search_call")
-            && !super::file_search_callout::is_pending_file_search_call(item);
-        if !is_non_web_builtin {
-            continue;
-        }
-        match item.get("id").and_then(Value::as_str) {
-            // Distinct calls always carry an id; dedup avoids counting a call
-            // echoed into several collections more than once.
-            Some(id) => {
-                if seen.insert(id) {
-                    count = count.saturating_add(1);
-                }
-            },
-            // An id-less built-in call cannot be deduplicated; count it so the
-            // budget errs toward the client's cap rather than overshooting it.
-            None => count = count.saturating_add(1),
-        }
-    }
-    count
 }
 
 /// Surface an over-budget web search call as incomplete without dispatching.
@@ -479,10 +533,7 @@ fn append_excess_incomplete(ctx: &mut HttpFilterContext<'_>, call: &Value, index
         .and_then(Value::as_str)
         .unwrap_or_default();
     let bridge = bridge_call_id(call_id, query, index);
-    let ids = SearchCallIds {
-        public: call_id,
-        bridge: &bridge,
-    };
+    let ids = SearchCallIds::new(call_id, &bridge, index);
     append_result(ctx, &ids, "incomplete", query, &[]);
 }
 
@@ -505,7 +556,7 @@ fn append_result(
     let include_sources = include_action_sources(ctx);
     let output_item = build_output_item(ids.public, status, query, results, include_sources);
     let bridge = build_tool_result_messages(ids.bridge, status, query, results);
-    push_search_turn(ctx, output_item, bridge);
+    push_search_turn(ctx, output_item, bridge, ids.index);
 }
 
 /// Append a malformed search turn to [`ResponsesState`].
@@ -518,7 +569,7 @@ fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
     let include_sources = include_action_sources(ctx);
     let output_item = build_output_item(ids.public, "incomplete", "", &[], include_sources);
     let bridge = build_incomplete_tool_result_messages(ids.bridge);
-    push_search_turn(ctx, output_item, bridge);
+    push_search_turn(ctx, output_item, bridge, ids.index);
 }
 
 /// Append a failed search turn to [`ResponsesState`].
@@ -532,7 +583,22 @@ fn append_failed(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, query
     let include_sources = include_action_sources(ctx);
     let output_item = build_output_item(ids.public, "failed", query, &[], include_sources);
     let bridge = build_failed_tool_result_messages(ids.bridge, query);
-    push_search_turn(ctx, output_item, bridge);
+    push_search_turn(ctx, output_item, bridge, ids.index);
+}
+
+/// Append a bounded failure for a call rejected by `max_tool_calls`.
+fn append_tool_limit_exceeded(ctx: &mut HttpFilterContext<'_>, call: &Value, index: usize) {
+    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
+    let query = call
+        .get("action")
+        .and_then(|action| action.get("query"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let bridge_id = bridge_call_id(call_id, query, index);
+    let include_sources = include_action_sources(ctx);
+    let output_item = build_output_item(call_id, "failed", query, &[], include_sources);
+    let bridge = build_failed_tool_result_messages_with_output(&bridge_id, query, TOOL_LIMIT_OUTPUT);
+    push_search_turn(ctx, output_item, bridge, index);
 }
 
 /// Whether `action.sources` should be included in output items, per the
@@ -551,7 +617,7 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
 /// distinct owners of the bridge messages. The public `output_item` is upserted
 /// so the placeholder accumulated during the response phase is replaced in
 /// place, never duplicated.
-fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2]) {
+fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], index: usize) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
@@ -562,24 +628,28 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
         if let Some(id) = output_item.get("id").and_then(Value::as_str) {
             state.locally_executed_output_items.insert(id.to_owned());
         }
-        upsert_output_item(&mut state.accumulated_output, output_item);
+        upsert_output_item(
+            &mut state.accumulated_output,
+            state.current_round_output_start,
+            index,
+            output_item,
+        );
     }
 }
 
-/// Replace the accumulated `web_search_call` sharing this id, or append it.
+/// Replace one current-round `web_search_call` by model position, or append it.
 ///
 /// The response phase (`agentic_loop::collect_output_items`) already
-/// accumulated the model's placeholder `web_search_call` for this id. Updating
-/// it in place keeps exactly one public item per call, rather than emitting a
-/// contradictory `completed` + `failed` pair for the same id. When no
-/// placeholder exists (isolated unit contexts), the item is appended.
-fn upsert_output_item(accumulated: &mut Vec<Value>, output_item: Value) {
-    if let Some(id) = output_item.get("id").and_then(Value::as_str)
-        && let Some(slot) = accumulated.iter_mut().find(|item| {
-            item.get("type").and_then(Value::as_str) == Some("web_search_call")
-                && item.get("id").and_then(Value::as_str) == Some(id)
-        })
-    {
+/// accumulated each model placeholder in output order. Updating the indexed
+/// placeholder keeps duplicate and absent provider IDs distinct. When no
+/// current-round placeholder exists (isolated unit contexts), append instead.
+fn upsert_output_item(accumulated: &mut Vec<Value>, round_start: usize, index: usize, output_item: Value) {
+    if let Some(slot) = accumulated.get_mut(round_start..).and_then(|items| {
+        items
+            .iter_mut()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+            .nth(index)
+    }) {
         *slot = output_item;
         return;
     }
@@ -751,6 +821,11 @@ pub(crate) fn bridge_call_id(source_id: &str, query: &str, index: usize) -> Stri
 /// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
 /// 64-character `call_id` limit.
 pub(crate) fn build_failed_tool_result_messages(call_id: &str, query: &str) -> [Value; 2] {
+    build_failed_tool_result_messages_with_output(call_id, query, SEARCH_UNAVAILABLE)
+}
+
+/// Build a failed web-search bridge with a caller-selected bounded message.
+fn build_failed_tool_result_messages_with_output(call_id: &str, query: &str, output: &'static str) -> [Value; 2] {
     let arguments = serde_json::json!({ "query": query }).to_string();
 
     [
@@ -764,7 +839,7 @@ pub(crate) fn build_failed_tool_result_messages(call_id: &str, query: &str) -> [
         serde_json::json!({
             "type": "function_call_output",
             "call_id": call_id,
-            "output": SEARCH_UNAVAILABLE,
+            "output": output,
         }),
     ]
 }

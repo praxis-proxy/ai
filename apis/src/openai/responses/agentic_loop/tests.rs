@@ -9,7 +9,10 @@ use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    openai::responses::state::McpApprovalState,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -----------------------------------------------------------------------------
 // Config Parsing
@@ -65,6 +68,67 @@ async fn passthrough_without_state_on_request_body() {
     assert!(
         ctx.filter_results.is_empty(),
         "should not write filter_results without state"
+    );
+}
+
+#[tokio::test]
+async fn deferred_tool_limit_completes_after_request_side_dispatchers() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        deferred_tool_limit_completion: true,
+        response_object: json!({"id":"resp_limit", "object":"response", "status":"completed", "output":[]}),
+        accumulated_output: vec![json!({
+            "type":"web_search_call", "id":"ws_rejected", "status":"failed",
+            "error":"max_tool_calls exhausted"
+        })],
+        ..ResponsesState::default()
+    });
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let FilterAction::Reject(response) = action else {
+        panic!("the last request-side filter must complete the response locally");
+    };
+    assert_eq!(response.status, 200);
+    let body: Value = serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["output"][0]["id"], "ws_rejected");
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .deferred_tool_limit_completion
+    );
+}
+
+#[tokio::test]
+async fn deferred_mcp_approval_completes_after_sibling_dispatchers() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        mcp_approval_state: McpApprovalState::ApprovalPendingThenReturn,
+        response_object: json!({"id":"resp_approval", "object":"response", "status":"completed", "output":[]}),
+        accumulated_output: vec![json!({
+            "type":"mcp_approval_request", "id":"approval_1", "name":"dangerous"
+        })],
+        ..ResponsesState::default()
+    });
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let FilterAction::Reject(response) = action else {
+        panic!("the trailing loop filter must complete the approval response locally");
+    };
+    assert_eq!(response.status, 200);
+    let body: Value = serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["output"][0]["id"], "approval_1");
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().mcp_approval_state,
+        McpApprovalState::None
     );
 }
 
@@ -279,7 +343,7 @@ async fn does_not_set_content_type_on_first_pass() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn forces_parallel_tool_calls_false() {
+async fn preserves_default_parallel_tool_calls_true() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -298,15 +362,32 @@ async fn forces_parallel_tool_calls_false() {
     drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(!state.parallel_tool_calls, "should be forced to false");
+    assert!(state.parallel_tool_calls, "the API default should be preserved");
     assert_eq!(
-        state.request_body["parallel_tool_calls"], false,
-        "request_body should contain parallel_tool_calls=false for proxy serialization"
+        state.request_body.get("parallel_tool_calls"),
+        None,
+        "an omitted field should stay omitted for byte-exact passthrough"
     );
     assert!(
-        state.request_body_requires_rebuild(),
-        "inserting parallel_tool_calls must require proxy serialization"
+        !state.request_body_requires_rebuild(),
+        "preserving caller intent must not require proxy serialization"
     );
+}
+
+#[tokio::test]
+async fn preserves_explicit_parallel_tool_calls_true() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let body = json!({"model": "gpt-4o", "input": "test", "parallel_tool_calls": true});
+    ctx.extensions.insert(ResponsesState::from_request_body(body));
+
+    drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.parallel_tool_calls);
+    assert_eq!(state.request_body["parallel_tool_calls"], true);
+    assert!(!state.request_body_requires_rebuild());
 }
 
 #[tokio::test]
@@ -534,7 +615,7 @@ fn streamed_web_search_call_is_available_to_dispatch_filter() {
 }
 
 #[test]
-fn multiple_streamed_function_calls_end_with_sse_error() {
+fn multiple_streamed_client_function_calls_remain_dispatchable() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -555,27 +636,18 @@ fn multiple_streamed_function_calls_end_with_sse_error() {
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "a streamed cardinality error must yield Continue after selecting the terminal SSE error"
+        "a streamed batch must remain available to its owning dispatch filter"
     );
-    assert_action(&ctx, "done");
-    assert_eq!(
-        ctx.get_metadata("responses.stream_error_code"),
-        Some("invalid_request_error"),
-        "post-commit validation must select a terminal SSE error"
-    );
+    assert_action(&ctx, "loop");
     assert!(
-        ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
-        "invalid streamed calls must not remain dispatchable"
+        ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len() == 2,
+        "both streamed calls must remain available"
     );
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), None);
 }
 
 #[test]
-fn multiple_streamed_function_calls_do_not_finalize_body() {
-    // A streamed cardinality error must terminate through the SSE-error path
-    // without falling through to `evaluate_loop_decision`, which would serialize
-    // `response_object` into the body. With `logical_stream: false` nothing
-    // downstream would overwrite it, so the JSON would leak to the client after
-    // the SSE events.
+fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -586,9 +658,13 @@ fn multiple_streamed_function_calls_do_not_finalize_body() {
         "stream": true
     }));
     state.tool_calls = vec![
-        json!({"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"}),
-        json!({"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}),
+        json!({"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"}),
+        json!({"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}),
     ];
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "lookup".to_owned()),
+        json!({"server_label":"server", "server_url":"http://example.com", "require_approval":"never"}),
+    );
     state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
@@ -598,18 +674,14 @@ fn multiple_streamed_function_calls_do_not_finalize_body() {
 
     assert!(
         matches!(action, FilterAction::Continue),
-        "a streamed cardinality error must yield Continue without buffering a replacement body"
+        "a mixed streamed batch must terminate through the logical SSE error path"
     );
     assert_action(&ctx, "done");
     assert!(
         body.is_none(),
-        "a streamed SSE error must not serialize a JSON body onto the committed stream"
+        "a streamed SSE error must not serialize JSON onto the committed stream"
     );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "a locally terminated stream must not be persisted"
-    );
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
 }
 
 #[test]
@@ -852,7 +924,7 @@ fn iteration_limit_returns_508_error() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn multiple_function_calls_returns_error() {
+fn multiple_client_function_calls_are_preserved() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -886,14 +958,149 @@ fn multiple_function_calls_returns_error() {
 
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(
-        matches!(&action, FilterAction::Reject(r) if r.status == 400),
-        "multiple function calls should produce a 400 rejection"
+        matches!(&action, FilterAction::Continue),
+        "multiple client function calls should be returned without rejection"
     );
+    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len(), 2);
+}
 
-    assert!(
-        ctx.extensions.get::<ResponsesState>().is_some(),
-        "ResponsesState should be preserved after rejection"
+#[test]
+fn mixed_buffered_function_call_ownership_returns_upstream_error() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "lookup".to_owned()),
+        json!({"server_label":"server", "server_url":"http://example.com", "require_approval":"never"}),
     );
+    ctx.extensions.insert(state);
+    let response = json!({
+        "id":"resp_mixed",
+        "object":"response",
+        "status":"completed",
+        "output":[
+            {"type":"function_call", "call_id":"c1", "name":"server__lookup", "status":"completed"},
+            {"type":"function_call", "call_id":"c2", "name":"client_lookup", "status":"completed"}
+        ]
+    });
+    let mut body = Some(Bytes::from(response.to_string()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("mixed ownership must fail before server-side dispatch");
+    };
+    assert_eq!(
+        rejection.status, 502,
+        "the backend response, not the client request, is invalid"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().is_some());
+}
+
+#[test]
+fn mixed_buffered_custom_and_mcp_calls_return_upstream_error() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "lookup".to_owned()),
+        json!({"server_label":"server", "server_url":"http://example.com", "require_approval":"never"}),
+    );
+    ctx.extensions.insert(state);
+    let response = json!({
+        "id":"resp_mixed_custom",
+        "object":"response",
+        "status":"completed",
+        "output":[
+            {"type":"function_call", "call_id":"c1", "name":"server__lookup", "status":"completed"},
+            {"type":"custom_tool_call", "call_id":"c2", "name":"client_code", "input":"echo hello"}
+        ]
+    });
+    let mut body = Some(Bytes::from(response.to_string()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("mixed custom/MCP ownership must fail before server-side dispatch");
+    };
+    assert_eq!(rejection.status, 502);
+}
+
+#[test]
+fn all_client_executed_call_types_conflict_with_mcp_dispatch() {
+    for client_call in [
+        json!({"type":"apply_patch_call", "call_id":"c2"}),
+        json!({"type":"computer_call", "call_id":"c2"}),
+        json!({"type":"local_shell_call", "call_id":"c2"}),
+        json!({"type":"shell_call", "call_id":"c2", "environment":{"type":"local"}}),
+        json!({"type":"tool_search_call", "call_id":"c2", "execution":"client"}),
+    ] {
+        let mut state = make_state_with_tool_calls(vec![json!({
+            "type":"function_call", "call_id":"c1", "name":"server__lookup", "status":"completed"
+        })]);
+        state.mcp_tool_map.insert(
+            ("server".to_owned(), "lookup".to_owned()),
+            json!({"server_label":"server", "server_url":"http://example.com"}),
+        );
+        state.response_object = json!({"output":[client_call.clone()]});
+
+        assert!(
+            super::has_mixed_function_call_ownership(&state),
+            "client-owned call was not protected: {client_call}"
+        );
+    }
+}
+
+#[test]
+fn hosted_container_shell_call_does_not_conflict_with_mcp_dispatch() {
+    let mut state = make_state_with_tool_calls(vec![json!({
+        "type":"function_call", "call_id":"c1", "name":"server__lookup", "status":"completed"
+    })]);
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "lookup".to_owned()),
+        json!({"server_label":"server", "server_url":"http://example.com"}),
+    );
+    state.response_object = json!({"output":[{
+        "type":"shell_call", "call_id":"c2",
+        "environment":{"type":"container_reference", "container_id":"cntr_1"}
+    }]});
+
+    assert!(!super::has_mixed_function_call_ownership(&state));
+}
+
+#[test]
+fn mixed_ownership_incomplete_response_is_preserved() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "lookup".to_owned()),
+        json!({"server_label":"server", "server_url":"http://example.com", "require_approval":"never"}),
+    );
+    ctx.extensions.insert(state);
+    let response = json!({
+        "id":"resp_incomplete",
+        "object":"response",
+        "status":"incomplete",
+        "incomplete_details":{"reason":"max_output_tokens"},
+        "output":[
+            {"type":"function_call", "call_id":"c1", "name":"server__lookup", "status":"completed"},
+            {"type":"function_call", "call_id":"c2", "name":"client_lookup", "status":"completed"}
+        ]
+    });
+    let mut body = Some(Bytes::from(response.to_string()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "done");
+    assert_eq!(ctx.get_metadata("responses.status"), Some("incomplete"));
+    let returned: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(returned["status"], "incomplete");
+    assert_eq!(returned["incomplete_details"]["reason"], "max_output_tokens");
 }
 
 // -----------------------------------------------------------------------------
@@ -1446,7 +1653,7 @@ fn web_search_call_alone_increments_iteration() {
 }
 
 #[test]
-fn mixed_function_and_web_search_calls() {
+fn mixed_client_function_and_web_search_calls_fail_before_dispatch() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -1476,18 +1683,11 @@ fn mixed_function_and_web_search_calls() {
     });
     let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
 
-    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
-    assert_action(&ctx, "loop");
-
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1, "one function_call in tool_calls");
-    assert_eq!(
-        state.web_search_calls.len(),
-        1,
-        "one web_search_call in web_search_calls"
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "mixed client/server ownership must fail before web-search side effects"
     );
-    assert_eq!(state.tool_calls[0]["call_id"], "call_1");
-    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
 }
 
 #[test]
