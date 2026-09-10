@@ -470,6 +470,11 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
         "arguments": "{}",
         "status": "completed"
     }));
+    state.tool_search_calls.push(json!({
+        "type": "tool_search_call",
+        "id": "tsc_partial",
+        "status": "completed"
+    }));
     state.response_object = json!({
         "id": "resp_incomplete",
         "object": "response",
@@ -501,6 +506,14 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
     assert!(
         ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
         "a tool from a truncated stream must not remain dispatchable"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .tool_search_calls
+            .is_empty(),
+        "a tool_search_call from a truncated stream must not remain dispatchable"
     );
     assert_eq!(
         ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[0]["id"],
@@ -703,6 +716,11 @@ fn streaming_iteration_limit_ends_with_sse_error() {
         "name": "must_not_run",
         "status": "completed"
     })];
+    state.tool_search_calls = vec![json!({
+        "type": "tool_search_call",
+        "id": "tsc_limit",
+        "status": "completed"
+    })];
     state.response_object = json!({"id": "resp_limit", "object": "response", "status": "completed", "output": []});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
@@ -721,6 +739,14 @@ fn streaming_iteration_limit_ends_with_sse_error() {
     assert!(
         ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty(),
         "iteration-limit errors must not leave calls dispatchable"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .tool_search_calls
+            .is_empty(),
+        "iteration-limit errors must not leave tool_search_calls dispatchable"
     );
 }
 
@@ -1068,6 +1094,34 @@ fn hosted_container_shell_call_does_not_conflict_with_mcp_dispatch() {
     }]});
 
     assert!(!super::has_mixed_function_call_ownership(&state));
+}
+
+#[test]
+fn hosted_tool_search_conflicts_with_client_function_call() {
+    let mut state = make_state_with_tool_calls(vec![json!({
+        "type":"function_call", "call_id":"c1", "name":"get_weather", "status":"completed"
+    })]);
+    state.tool_search_calls = vec![json!({
+        "type":"tool_search_call", "id":"tsc_1", "status":"completed"
+    })];
+
+    assert!(
+        super::has_mixed_function_call_ownership(&state),
+        "hosted tool_search_call mixed with a client function_call must be rejected"
+    );
+}
+
+#[test]
+fn hosted_tool_search_alone_is_not_mixed_ownership() {
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.tool_search_calls = vec![json!({
+        "type":"tool_search_call", "id":"tsc_1", "status":"completed"
+    })];
+
+    assert!(
+        !super::has_mixed_function_call_ownership(&state),
+        "a hosted tool_search_call by itself must still loop for deferred discovery"
+    );
 }
 
 #[test]
@@ -1691,6 +1745,43 @@ fn mixed_client_function_and_web_search_calls_fail_before_dispatch() {
 }
 
 #[test]
+fn mixed_client_function_and_tool_search_calls_fail_before_dispatch() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{}",
+                "status": "completed"
+            },
+            {
+                "type": "tool_search_call",
+                "id": "tsc_1",
+                "status": "completed"
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "mixed client function_call and hosted tool_search_call must fail before deferred discovery"
+    );
+}
+
+#[test]
 fn web_search_call_subject_to_iteration_limit() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 2").unwrap();
     let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
@@ -1797,6 +1888,177 @@ fn web_search_call_excluded_from_messages_but_persisted() {
             .iter()
             .any(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call")),
         "web_search_call should be in accumulated_output"
+    );
+}
+
+#[test]
+fn tool_search_call_queued_for_deferred_discovery() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [
+            {
+                "type": "tool_search_call",
+                "id": "tsc_1",
+                "status": "completed"
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "tool_search_call should continue so dispatch can loop"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.tool_search_calls.len(), 1);
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("tool_search_call")),
+        "tool_search_call should not enter backend messages"
+    );
+    assert!(
+        state
+            .persisted_messages
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_call")),
+        "tool_search_call should be persisted"
+    );
+}
+
+#[test]
+fn incomplete_tool_search_call_is_not_queued_for_deferred_discovery() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let state = make_state_with_tool_calls(vec![]);
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [
+            {
+                "type": "tool_search_call",
+                "id": "tsc_in_progress",
+                "status": "in_progress"
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an in-progress search must not reject the round"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_search_calls.is_empty(),
+        "only completed tool_search_call items may trigger tools/list"
+    );
+    assert!(
+        state
+            .accumulated_output
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some("tsc_in_progress")),
+        "the in-progress item remains client-visible in accumulated output"
+    );
+}
+
+#[test]
+fn streamed_tool_search_call_is_queued_for_deferred_discovery() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.response_object = json!({
+        "id": "resp_search",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "tool_search_call",
+            "id": "tsc_1",
+            "status": "completed"
+        }]
+    });
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streamed tool_search_call round must yield Continue while it loops for discovery"
+    );
+    assert_action(&ctx, "loop");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.tool_search_calls.len(),
+        1,
+        "streamed tool_search_call must be visible to openai_mcp_dispatch"
+    );
+    assert!(
+        !state
+            .messages
+            .iter()
+            .any(|m| m.get("type").and_then(Value::as_str) == Some("tool_search_call")),
+        "a hosted tool_search_call is not a valid OpenResponses input item and must not \
+         enter model-facing messages"
+    );
+}
+
+#[test]
+fn streamed_incomplete_tool_search_call_is_not_queued() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.response_object = json!({
+        "id": "resp_search",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "tool_search_call",
+            "id": "tsc_incomplete",
+            "status": "incomplete"
+        }]
+    });
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "done");
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .tool_search_calls
+            .is_empty(),
+        "incomplete streamed searches must not trigger tools/list"
     );
 }
 

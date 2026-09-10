@@ -485,16 +485,17 @@ fn commit_local_tool_milestones(
     // Record which client-visible milestones the model backend streamed for this
     // item. `output_item.added`/`.done` mark it announced (so a later flush does
     // not re-emit `output_item.added`); an actual `response.web_search_call.*` /
-    // `response.mcp_call.*` progress event marks the lifecycle as already streamed
-    // in-band (so the flush does not re-synthesize it). Persisted across rounds
-    // via `emitted_output_items`, this is what a resumed round's flush consults.
+    // `response.mcp_call.*` / `response.mcp_list_tools.*` progress event marks
+    // the lifecycle as already streamed in-band (so the flush does not
+    // re-synthesize it). Persisted across rounds via `emitted_output_items`,
+    // this is what a resumed round's flush consults.
     record_model_output_item(ctx, event);
 
     // #276: ahead of the first resumed model output event, stream any locally
-    // generated tool items (MCP calls/approvals, or web searches absent from the
-    // upstream stream) that the tool-dispatch filters appended to
-    // `accumulated_output` but never emitted incrementally. They must precede the
-    // resumed model output and occupy their reserved output indices.
+    // generated tool items (MCP calls/approvals/listings, or web searches
+    // absent from the upstream stream) that the tool-dispatch filters appended
+    // to `accumulated_output` but never emitted incrementally. They must
+    // precede the resumed model output and occupy their reserved output indices.
     // `accumulated_output` is fixed for the round, so the flush runs once here
     // rather than re-serializing every local item ahead of each event; the EOS
     // flush still catches items whose round produced no resumed model event.
@@ -547,11 +548,12 @@ fn mark_local_done_delivered(ctx: &mut HttpFilterContext<'_>, event: &ResponsesE
 /// its latest content, but prove nothing about the tool-specific progress
 /// lifecycle: a backend may stream `added` then `done` with no progress events in
 /// between, or only some of them (e.g. `in_progress` then `done`). Only observing
-/// an actual `response.web_search_call.*` / `response.mcp_call.*` event proves
-/// that specific phase reached the client, so each is recorded individually by
-/// its event type. Deriving the lifecycle from `done` would suppress the
-/// synthesized progress a partial `added → in_progress → done` sequence still
-/// owes for its missing `searching`/`completed` phases.
+/// an actual `response.web_search_call.*` / `response.mcp_call.*` /
+/// `response.mcp_list_tools.*` event proves that specific phase reached the
+/// client, so each is recorded individually by its event type. Deriving the
+/// lifecycle from `done` would suppress the synthesized progress a partial
+/// `added → in_progress → done` sequence still owes for its missing
+/// `searching`/`completed` phases.
 fn record_model_output_item(ctx: &mut HttpFilterContext<'_>, event: &ResponsesEvent) {
     match event {
         ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
@@ -619,12 +621,14 @@ fn is_premature_local_tool_done(ctx: &HttpFilterContext<'_>, event: &ResponsesEv
 }
 
 /// Whether an event type is a tool-specific progress or outcome event the model
-/// backend streams in-band for a hosted `web_search_call` or `mcp_call`
-/// (`response.web_search_call.*` / `response.mcp_call.*`). Observing one proves
-/// the progress lifecycle reached the client, so the proxy must not synthesize
-/// it again.
+/// backend streams in-band for a hosted `web_search_call`, `mcp_call`, or
+/// `mcp_list_tools` (`response.web_search_call.*` / `response.mcp_call.*` /
+/// `response.mcp_list_tools.*`). Observing one proves the progress lifecycle
+/// reached the client, so the proxy must not synthesize it again.
 fn is_local_tool_progress_event(event_type: &str) -> bool {
-    event_type.starts_with("response.web_search_call.") || event_type.starts_with("response.mcp_call.")
+    event_type.starts_with("response.web_search_call.")
+        || event_type.starts_with("response.mcp_call.")
+        || event_type.starts_with("response.mcp_list_tools.")
 }
 
 /// Whether an accumulated output item was generated locally by a tool-dispatch
@@ -632,7 +636,7 @@ fn is_local_tool_progress_event(event_type: &str) -> bool {
 fn is_local_tool_item(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
-        Some("mcp_call" | "mcp_approval_request" | "web_search_call")
+        Some("mcp_call" | "mcp_approval_request" | "mcp_list_tools" | "web_search_call")
     )
 }
 
@@ -1006,7 +1010,7 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// The full ordered tool-specific lifecycle a local item owes the client between
 /// `output_item.added` and `output_item.done`, per issue #276.
 ///
-/// `mcp_call` progresses `in_progress` then `completed`/`failed`;
+/// `mcp_call` and `mcp_list_tools` progress `in_progress` then `completed`/`failed`;
 /// `web_search_call` progresses `in_progress`, `searching`, then `completed` only
 /// when it actually completed (web search has no conformant `failed` event, so
 /// other outcomes surface through `output_item.done` alone). `mcp_approval_request`
@@ -1025,6 +1029,14 @@ fn expected_phase_events(item: &Value) -> Vec<&'static str> {
                 "response.mcp_call.completed"
             };
             vec!["response.mcp_call.in_progress", outcome]
+        },
+        Some("mcp_list_tools") => {
+            let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
+                "response.mcp_list_tools.failed"
+            } else {
+                "response.mcp_list_tools.completed"
+            };
+            vec!["response.mcp_list_tools.in_progress", outcome]
         },
         Some("web_search_call") => {
             let mut events = vec![

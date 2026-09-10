@@ -6,12 +6,16 @@
 //! Operates in two phases within an
 //! `iterative_request_router` inference step:
 //!
-//! 1. **Response path** (`on_response_body`): after `openai_agentic_loop` extracts model-produced function calls,
-//!    identifies calls backed by [`ResponsesState::mcp_tool_map`], checks approval policies, and writes
-//!    `openai_mcp_dispatch.action = "loop"` to filter results.
-//! 2. **Request-body path** (`on_request_body`, next IRR iteration): executes pending MCP calls via
-//!    [`mcp_client::call_tool`] and appends results to `messages`, `persisted_messages`, and `output_items` before
-//!    `openai_responses_proxy` serializes the next inference request.
+//! 1. **Response path** (`on_response_body`): after `openai_agentic_loop` extracts model-produced function calls or
+//!    `tool_search_call` items, identifies MCP-backed work, checks approval policies, and writes
+//!    `openai_mcp_dispatch.action = "loop"` to filter results. Deferred connectors loop with `discover_mcp` until
+//!    `tools/list` can run on the next iteration.
+//! 2. **Request-body path** (`on_request_body`, next IRR iteration): loads deferred connector tools when a
+//!    `tool_search_call` is pending, then executes pending MCP calls via [`mcp_client::call_tool`] and appends results
+//!    to `messages`, `persisted_messages`, and `output_items` before `openai_responses_proxy` serializes the next
+//!    inference request. A streaming deferred `tools/list` runtime failure stashes a descriptor during this pre-read
+//!    and the header-phase `on_request` emits the same `response.mcp_list_tools.failed` / `response.failed` SSE
+//!    lifecycle as the initial resolver.
 //!
 //! # Pipeline dependencies
 //!
@@ -63,7 +67,10 @@ use self::{
 };
 use super::{
     error::responses_error_rejection,
-    openai_mcp_tool_resolve::{McpToolIndex, McpToolMatch},
+    openai_mcp_tool_resolve::{
+        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure, discover_deferred_connectors,
+        has_pending_deferred_discovery, resolve_error_action,
+    },
     state::{McpApprovalState, ResponsesState, current_round_borrowed_tool_call_admissions},
 };
 use crate::{json_body::serialized_len, mcp_client};
@@ -83,6 +90,12 @@ const ACTION_DONE: &str = "done";
 
 /// Executes MCP tool calls against upstream MCP servers within
 /// the Responses API agentic loop.
+///
+/// When `openai_mcp_tool_resolve` stored deferred connectors and the
+/// model returns a `tool_search_call`, this filter loads every pending
+/// deferred connector from its internally resolved endpoint on the next
+/// iteration, then dispatches later MCP calls through the existing
+/// `tools/call` path.
 ///
 /// # YAML
 ///
@@ -389,18 +402,51 @@ impl HttpFilter for McpDispatchFilter {
         BodyMode::Stream
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        Ok(FilterAction::Continue)
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Streaming deferred-discovery failures are stashed during the
+        // request-body pre-read and emitted here, matching the initial
+        // `openai_mcp_tool_resolve` header-phase lifecycle.
+        Ok(consume_pending_list_tools_failure(ctx).unwrap_or(FilterAction::Continue))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deferred discovery and batched MCP execution must stay on one request-body path"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        _body: &mut Option<Bytes>,
+        body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return Ok(FilterAction::Continue);
+        };
+        let needs_discovery = has_pending_deferred_discovery(state);
+        if !needs_discovery && (state.tool_calls.is_empty() || state.mcp_tool_map.is_empty()) {
+            return Ok(FilterAction::Continue);
+        }
+        if needs_discovery {
+            let fallback = if body.as_ref().is_none_or(Bytes::is_empty) {
+                ctx.extensions
+                    .get::<ResponsesState>()
+                    .and_then(|state| serde_json::to_vec(&state.request_body).ok())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let bytes = body
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())
+                .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
+            let action = discover_pending_connectors(ctx, bytes).await?;
+            if !matches!(action, FilterAction::Continue) {
+                return Ok(action);
+            }
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
@@ -451,6 +497,14 @@ impl HttpFilter for McpDispatchFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if has_pending_deferred_discovery(state) {
+            let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+            if count_mcp_tool_calls(&state.tool_calls, &tool_index) == 0 {
+                ctx.set_metadata("openai_mcp_dispatch.action".to_owned(), "discover_mcp".to_owned());
+                set_action(ctx, ACTION_LOOP)?;
+                return Ok(FilterAction::Continue);
+            }
+        }
         if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
             set_action(ctx, ACTION_DONE)?;
             return Ok(FilterAction::Continue);
@@ -496,6 +550,26 @@ impl HttpFilter for McpDispatchFilter {
         set_action(ctx, ACTION_LOOP)?;
 
         Ok(FilterAction::Continue)
+    }
+}
+
+/// Load deferred connector tools when a `tool_search_call` is pending.
+async fn discover_pending_connectors(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &[u8],
+) -> Result<FilterAction, FilterError> {
+    let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+        warn!("ResponsesState missing when discovering deferred MCP connectors");
+        return Ok(FilterAction::Continue);
+    };
+    match discover_deferred_connectors(state).await {
+        Ok(()) => Ok(FilterAction::Continue),
+        Err(err) => {
+            let streaming = ctx
+                .get_metadata("openai_responses_format.stream")
+                .is_some_and(|v| v == "true");
+            Ok(resolve_error_action(ctx, &err, streaming, body))
+        },
     }
 }
 

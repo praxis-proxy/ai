@@ -1110,6 +1110,133 @@ fn connector_with_authorization_forwarded() {
 }
 
 #[test]
+fn deferred_connector_skips_eager_tools_list_and_strips_internal_fields() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("search")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!("        connectors:\n          - id: corp_drive\n            server_url: {mcp_url}");
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"tool_search"},{"type":"mcp","server_label":"drive","connector_id":"corp_drive","defer_loading":true,"authorization":"Bearer secret","allowed_tools":["search"]}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 200, "deferred connector should be accepted");
+
+    let echoed = parse_body(&raw);
+    assert!(
+        !echoed.contains("connector_id"),
+        "connector_id must not reach the inference backend: {echoed}"
+    );
+    assert!(
+        !echoed.contains(&mcp_url),
+        "configured MCP URL must not reach the inference backend: {echoed}"
+    );
+    assert!(
+        !echoed.contains("Bearer secret"),
+        "MCP credentials must not reach the inference backend: {echoed}"
+    );
+    assert!(
+        echoed.contains("defer_loading"),
+        "sanitized deferred MCP entry should remain for tool_search: {echoed}"
+    );
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        0,
+        "deferred connectors must not eager-call tools/list"
+    );
+}
+
+#[test]
+fn deferred_unknown_connector_rejected_before_callout() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"tool_search"},{"type":"mcp","server_label":"s","connector_id":"nonexistent","defer_loading":true}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 400, "unknown deferred connector should be 400");
+    assert_eq!(mcp_server.method_count("tools/list"), 0);
+}
+
+#[test]
+fn deferred_connector_and_server_url_rejected_before_callout() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(
+        proxy_port,
+        backend_guard.port(),
+        &format!("        connectors:\n          - id: corp_drive\n            server_url: {mcp_url}"),
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"tool_search"}},{{"type":"mcp","server_label":"drive","connector_id":"corp_drive","server_url":"{mcp_url}","defer_loading":true}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "connector_id plus server_url should be rejected before outbound activity"
+    );
+    assert_eq!(mcp_server.method_count("tools/list"), 0);
+    assert_eq!(mcp_server.method_count("tools/call"), 0);
+}
+
+#[test]
+fn deferred_connector_without_tool_search_rejected() {
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(
+        proxy_port,
+        backend_guard.port(),
+        "        connectors:\n          - id: corp_drive\n            server_url: https://drive.example.com/mcp",
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"drive","connector_id":"corp_drive","defer_loading":true}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "deferred connector without tool_search should be 400"
+    );
+    let response_body = parse_body(&raw);
+    assert!(
+        response_body.contains("tool_search"),
+        "rejection should mention tool_search: {response_body}"
+    );
+}
+
+#[test]
 fn direct_url_alongside_connector_both_resolved() {
     let mcp_config_a = McpMockConfig {
         tools: vec![McpToolFixture::new("tool_a")],

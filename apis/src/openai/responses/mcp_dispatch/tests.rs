@@ -23,7 +23,7 @@ use crate::{
             config::{McpDispatchConfig, build_config},
         },
         openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
-        state::{McpApprovalState, ResponsesState},
+        state::{DeferredMcpConnector, McpApprovalState, ResponsesState},
     },
     test_utils::{make_filter_context, make_request},
 };
@@ -1401,6 +1401,39 @@ fn on_response_body_with_mcp_calls_sets_execute_metadata() {
 }
 
 #[test]
+fn on_response_body_deferred_tool_search_sets_loop() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let state = ResponsesState {
+        deferred_mcp: vec![DeferredMcpConnector {
+            allow_loopback: true,
+            authorization: None,
+            allowed_tools: None,
+            connector_id: "corp_drive".to_owned(),
+            headers: None,
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: None,
+            server_label: "drive".to_owned(),
+            server_url: "https://drive.example.com/mcp".to_owned(),
+            timeout: std::time::Duration::from_secs(5),
+        }],
+        tool_search_calls: vec![json!({"type": "tool_search_call", "id": "tsc_1"})],
+        ..ResponsesState::default()
+    };
+    ctx.extensions.insert(state);
+    let mut body = None;
+    let result = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(result, FilterAction::Continue));
+    assert_eq!(
+        ctx.filter_metadata.get("openai_mcp_dispatch.action"),
+        Some(&"discover_mcp".to_owned())
+    );
+    assert_dispatch_action(&ctx, "loop");
+}
+
+#[test]
 fn on_response_body_rejects_duplicate_mcp_call_ids_before_dispatch() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
@@ -1806,6 +1839,74 @@ async fn on_request_no_mcp_calls_returns_continue() {
     ctx.extensions.insert(ResponsesState::default());
     let result = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(result, FilterAction::Continue));
+}
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "header-phase SSE lifecycle assertions")]
+async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    drop(listener);
+
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("responses.response_id", "resp_deferred_listing_failure");
+
+    let body_json = json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.response_id = Some("resp_deferred_listing_failure".to_owned());
+    state.deferred_mcp = vec![DeferredMcpConnector {
+        allow_loopback: true,
+        authorization: None,
+        allowed_tools: None,
+        connector_id: "corp_drive".to_owned(),
+        headers: None,
+        max_rewritten_body_bytes: 67_108_864,
+        max_tools: 128,
+        require_approval: None,
+        server_label: "drive".to_owned(),
+        server_url,
+        timeout: std::time::Duration::from_secs(1),
+    }];
+    state.tool_search_calls = vec![json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"})];
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streaming deferred listing failure defers to the header phase"
+    );
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::TerminalResponse(terminal) = action else {
+        panic!("failed deferred discovery should terminate with a terminal SSE response");
+    };
+    assert_eq!(terminal.status, 200, "SSE lifecycle must be visible to SDK clients");
+    let raw = std::str::from_utf8(terminal.body.as_deref().expect("SSE body")).unwrap();
+    for event in [
+        "response.created",
+        "response.in_progress",
+        "response.mcp_list_tools.in_progress",
+        "response.mcp_list_tools.failed",
+        "response.failed",
+    ] {
+        assert!(
+            raw.contains(&format!("event: {event}")),
+            "deferred streaming failure must emit {event}: {raw}"
+        );
+    }
+    assert!(
+        !raw.contains("event: error"),
+        "deferred streaming failure must not use the sequence-zero SSE error path: {raw}"
+    );
 }
 
 #[tokio::test]

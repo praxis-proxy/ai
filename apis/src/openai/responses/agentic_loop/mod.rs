@@ -154,6 +154,11 @@ const META_STATUS: &str = "responses.status";
 /// control in `on_response_body` (end-of-stream), writing
 /// `filter_results` for `iterative_request_router` transitions.
 ///
+/// Also extracts `tool_search_call` items into
+/// `ResponsesState.tool_search_calls` so `openai_mcp_dispatch` can
+/// load deferred connectors on the next iteration without forwarding
+/// those items to the inference backend.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -401,6 +406,7 @@ fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut Responses
     if !streamed_round_is_dispatchable(ctx, state) {
         collect_streaming_output_items(state);
         state.tool_calls.clear();
+        state.tool_search_calls.clear();
         state.web_search_calls.clear();
         set_action(ctx, ACTION_DONE)?;
         return Ok(false);
@@ -417,6 +423,7 @@ fn end_stream_with_error(
     message: &'static str,
 ) -> Result<(), FilterError> {
     state.tool_calls.clear();
+    state.tool_search_calls.clear();
     state.web_search_calls.clear();
     ctx.set_metadata("responses.stream_error_code", code);
     ctx.set_metadata("responses.stream_error_message", message);
@@ -433,6 +440,7 @@ fn end_stream_with_error(
 /// inherit the original client header).
 fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) {
     state.tool_calls.clear();
+    state.tool_search_calls.clear();
     state.web_search_calls.clear();
 
     if state.iteration > 0 {
@@ -467,7 +475,7 @@ fn evaluate_loop_decision(
     body: &mut Option<Bytes>,
     config: &AgenticLoopConfig,
 ) -> Result<FilterAction, FilterError> {
-    if state.tool_calls.is_empty() && state.web_search_calls.is_empty() {
+    if state.tool_calls.is_empty() && state.web_search_calls.is_empty() && state.tool_search_calls.is_empty() {
         trace!("no tool calls, signaling done");
         state.finalize_response_body(body);
         return set_done(ctx);
@@ -523,13 +531,17 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
     state.response_object = response;
 }
 
-/// Return whether one model round mixed server-owned MCP or web-search calls
-/// with calls that must be executed by the API client. The
-/// current IRR continuation cannot execute the former without sending the
-/// latter back to inference as an unresolved call, so fail before any external
-/// side effect.
+/// Return whether one model round mixed server-owned MCP, web-search, or
+/// hosted tool-search calls with calls that must be executed by the API
+/// client. The current IRR continuation cannot execute the former without
+/// sending the latter back to inference as an unresolved call, so fail
+/// before any external side effect.
 fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
-    let mut has_server = !state.web_search_calls.is_empty();
+    let mut has_server = !state.web_search_calls.is_empty()
+        || state
+            .tool_search_calls
+            .iter()
+            .any(|item| !super::state::is_client_executed_tool_call(item));
     let mut has_client = state
         .output_items()
         .iter()
@@ -562,7 +574,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
     for item in output {
         state.accumulated_output.push(item.clone());
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call") if item.get("status").and_then(Value::as_str) == Some("completed") => {
+            Some("function_call") if is_completed_output_item(item) => {
                 state.tool_calls.push(item.clone());
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
@@ -578,6 +590,13 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
                 // appends a backend-valid function_call/function_call_output
                 // bridge for the next inference step.
                 state.web_search_calls.push(item.clone());
+                state.persisted_messages.push(item.clone());
+            },
+            Some("tool_search_call") if is_completed_output_item(item) => {
+                // Mirror function-call handling: only a completed search may
+                // trigger deferred `tools/list`. In-progress or incomplete
+                // items stay in `accumulated_output` without network effects.
+                state.tool_search_calls.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
             _ => {},
@@ -610,11 +629,25 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 state.accumulated_output.push(item.clone());
                 state.persisted_messages.push(item);
             },
+            Some("tool_search_call") if is_completed_output_item(&item) => {
+                // Mirror the buffered collector: a completed hosted
+                // `tool_search_call` is not a valid OpenResponses input item, so
+                // it must not enter `messages`. `openai_mcp_dispatch` consumes
+                // `tool_search_calls` to list deferred connectors.
+                state.tool_search_calls.push(item.clone());
+                state.accumulated_output.push(item.clone());
+                state.persisted_messages.push(item);
+            },
             _ => {
                 state.accumulated_output.push(item);
             },
         }
     }
+}
+
+/// Whether an output item is a completed tool or search call.
+fn is_completed_output_item(item: &Value) -> bool {
+    item.get("status").and_then(Value::as_str) == Some("completed")
 }
 
 /// Check whether a parsed response is a valid Responses API output.

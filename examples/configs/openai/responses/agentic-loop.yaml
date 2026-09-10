@@ -10,6 +10,14 @@
 # model via the loop. Client-side function calls do not match any
 # dispatch filter and are returned to the client without looping.
 #
+# Configured `connector_id` values can be combined with `defer_loading: true`
+# and a `tool_search` tool so discovery waits for a later `tool_search_call`.
+# Connector IDs are pipeline-local; they are never forwarded to the
+# inference backend. The first inference round keeps a sanitized
+# `type: mcp` stub plus `tool_search` (the backend must accept those
+# OpenAI hosted-tool shapes). Any later `tool_search_call` loads every
+# pending deferred connector from its internally resolved endpoint.
+#
 # Pre-IRR filters run once on the client request to set up shared
 # state (ResponsesState) which persists across all IRR iterations
 # via extension swapping.
@@ -70,6 +78,25 @@
 #                  "require_approval": "never"}]
 #     }'
 #
+#   # Deferred configured connector (loaded on a later tool_search_call)
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "Search drive for quarterly reports",
+#       "tools": [
+#         {"type": "tool_search"},
+#         {
+#           "type": "mcp",
+#           "server_label": "drive",
+#           "connector_id": "corp_drive",
+#           "defer_loading": true,
+#           "allowed_tools": ["search"],
+#           "require_approval": "never"
+#         }
+#       ]
+#     }'
+#
 # Build:
 #   cargo build -p praxis-ai-proxy
 
@@ -101,6 +128,9 @@ filter_chains:
       - filter: openai_responses_rehydrate
 
       - filter: openai_mcp_tool_resolve
+        connectors:
+          - id: corp_drive
+            server_url: https://drive-mcp.internal:8443/mcp
 
       - filter: iterative_request_router
         initial_step: inference

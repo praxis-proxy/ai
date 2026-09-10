@@ -210,6 +210,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.agentic.deferred_mcp_connectors
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/agentic-deferred-mcp-connectors
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.continuation
     scopes:
       - responses_to_chat_completions

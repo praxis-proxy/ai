@@ -1244,6 +1244,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1279,11 +1280,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 23);
-        assert_eq!(report.scenarios_total, 23);
-        assert_eq!(report.recordings_total, 28);
+        assert_eq!(report.features_total, 24);
+        assert_eq!(report.scenarios_total, 24);
+        assert_eq!(report.recordings_total, 29);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1296,6 +1298,7 @@ mod tests {
                 "messages/native-tool-use",
                 "messages/typed-server-tools",
                 "messages/upstream-error",
+                "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/chat-basic-nonstream",
                 "responses/chat-basic-stream",
@@ -1312,7 +1315,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 23);
+        assert_eq!(manifest.features.len(), 24);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1432,6 +1435,10 @@ mod tests {
                 (
                     &"responses.agentic.irr_terminal_streaming".to_owned(),
                     &vec!["responses/irr-terminal-streaming".to_owned()]
+                ),
+                (
+                    &"responses.agentic.deferred_mcp_connectors".to_owned(),
+                    &vec!["responses/agentic-deferred-mcp-connectors".to_owned()]
                 ),
                 (
                     &"responses.chat.continuation".to_owned(),

@@ -11,6 +11,18 @@
 //! [`ResponsesState`], and rewrites `type: "mcp"` entries in the
 //! request body to `type: "function"`.
 //!
+//! Configured `connector_id` entries with `defer_loading: true` are
+//! accepted when the request also includes a `tool_search` tool.
+//! Those entries are resolved to an internal endpoint without an
+//! eager `tools/list` call; `connector_id`, the configured URL, and
+//! credentials are stripped from the outbound body. Deferred loading
+//! requires `openai_mcp_dispatch` inside an agentic loop. The first
+//! inference round keeps a sanitized `type: mcp` stub plus
+//! `tool_search`; any later `tool_search_call` loads every pending
+//! deferred connector. Streaming deferred `tools/list` failures use the
+//! same header-phase SSE lifecycle as the initial resolver
+//! (`response.mcp_list_tools.failed` then `response.failed`).
+//!
 //! # Function name encoding
 //!
 //! Each rewritten function tool is named
@@ -36,12 +48,14 @@ mod config;
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     reason = "tests"
 )]
 mod tests;
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::{Hash as _, Hasher as _},
     time::Duration,
 };
 
@@ -54,7 +68,10 @@ use praxis_filter::{
 use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
-use super::{error::responses_error_rejection, state::ResponsesState};
+use super::{
+    error::responses_error_rejection,
+    state::{DeferredMcpConnector, ResponsesState},
+};
 use crate::{
     json_body::{SerializedJson, serialize_json_body},
     mcp_client,
@@ -76,6 +93,16 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// more resolvable MCP entries share the same `server_label`
 /// (including entries that differ only by credentials).
 ///
+/// Configured `connector_id` entries with `defer_loading: true` are
+/// accepted when the request also includes a `tool_search` tool.
+/// Those entries are resolved to an internal endpoint without an
+/// eager `tools/list` call; `connector_id`, the configured URL, and
+/// credentials are stripped from the outbound body. Deferred loading
+/// requires `openai_mcp_dispatch` inside an agentic loop. The first
+/// inference round keeps a sanitized `type: mcp` stub plus
+/// `tool_search` (an OpenAI-shaped hosted-tool backend); any later
+/// `tool_search_call` loads every pending deferred connector.
+///
 /// For streaming requests, a runtime or response-processing failure from
 /// `tools/list` is returned as a successful SSE transport
 /// containing `response.mcp_list_tools.failed` and a terminal
@@ -95,6 +122,9 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// timeout_ms: 5000
 /// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
+/// connectors:
+///   - id: corp_drive
+///     server_url: https://drive-mcp.internal/mcp
 /// ```
 pub struct McpToolResolveFilter {
     /// Allow connections to loopback addresses.
@@ -161,32 +191,55 @@ impl McpToolResolveFilter {
         }
 
         resolve_connector_ids(&self.connectors, &mut mcp_entries)?;
+        require_tool_search_for_deferred(ctx, &mcp_entries)?;
         self.validate_entries(&mcp_entries)?;
 
+        let deferred_mcp = collect_deferred_connectors(
+            &mcp_entries,
+            self.timeout,
+            self.max_tools,
+            self.max_rewritten_body_bytes,
+            self.allow_loopback,
+        );
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
-
         let resolution = self.resolve_all_entries(&mcp_entries, previous_tools).await?;
-
-        if !resolution.has_resolved {
+        if !resolution.has_resolved && deferred_mcp.is_empty() {
             return Ok(FilterAction::Continue);
         }
+        debug!(
+            tool_count = resolution.tool_map.len(),
+            deferred_count = deferred_mcp.len(),
+            "mcp_tool_map built"
+        );
+        self.commit_resolved_tools(ctx, body, &original_bytes, resolution, deferred_mcp)
+    }
 
-        debug!(tool_count = resolution.tool_map.len(), "mcp_tool_map built");
-
+    /// Rewrite the request body and store resolved plus deferred MCP state.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "rewrite needs body, original bytes, and both resolved maps"
+    )]
+    fn commit_resolved_tools(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        original_bytes: &Bytes,
+        resolution: Resolution,
+        deferred_mcp: Vec<DeferredMcpConnector>,
+    ) -> Result<FilterAction, ResolveError> {
         let Resolution {
             per_entry,
             tool_map,
             resolved_labels,
             ..
         } = resolution;
-        let Some(serialized) = rewrite_request_body(&original_bytes, per_entry, &tool_map, &resolved_labels)? else {
+        let Some(serialized) = rewrite_request_body(original_bytes, per_entry, &tool_map, &resolved_labels)? else {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
         serialized.commit(body, self.name(), "tools");
-
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
-        write_state(ctx, body_for_state, tool_map);
+        write_state(ctx, body_for_state, tool_map, deferred_mcp);
         Ok(FilterAction::Continue)
     }
 
@@ -291,12 +344,7 @@ impl HttpFilter for McpToolResolveFilter {
         // `Continue`. Consuming the stash exactly once yields the terminal SSE;
         // routing it through the response phase lets `openai_stream_events` and
         // `openai_response_store` observe and persist the failed response.
-        if let Some(pending) = ctx.remove_filter_state::<PendingListToolsFailure>() {
-            return Ok(FilterAction::TerminalResponse(Box::new(
-                build_list_tools_failure_response(ctx, &pending),
-            )));
-        }
-        Ok(FilterAction::Continue)
+        Ok(consume_pending_list_tools_failure(ctx).unwrap_or(FilterAction::Continue))
     }
 
     async fn on_request_body(
@@ -335,7 +383,7 @@ impl HttpFilter for McpToolResolveFilter {
 
 /// Internal error type for the resolution flow.
 #[derive(Debug, thiserror::Error)]
-enum ResolveError {
+pub(crate) enum ResolveError {
     /// MCP client call failed.
     #[error("MCP tools/list failed for server_label \"{server_label}\": {source}")]
     Client {
@@ -386,9 +434,9 @@ enum ResolveError {
     #[error("connector_id and server_url are mutually exclusive on entry \"{0}\"")]
     MutuallyExclusiveTarget(String),
 
-    /// Connector ID combined with `defer_loading`.
-    #[error("connector_id cannot be combined with defer_loading on entry \"{0}\"")]
-    DeferredConnector(String),
+    /// Connector ID combined with `defer_loading` without `tool_search`.
+    #[error("connector_id with defer_loading requires a tool_search tool on entry \"{0}\"")]
+    MissingToolSearch(String),
 
     /// Invalid `connector_id` value (not a non-empty string).
     #[error("connector_id must be a non-empty string")]
@@ -417,8 +465,10 @@ enum ResolveError {
 
 /// Per-entry resolution outcome.
 enum EntryResolution {
-    /// Entry was not resolved (deferred or no `server_url`).
+    /// Entry was not resolved (direct-URL deferred or no `server_url`).
     PassThrough,
+    /// Connector-backed deferred entry: strip internal fields from the body.
+    SanitizeDeferred,
     /// Entry was resolved to zero or more function tools.
     Resolved(Vec<serde_json::Value>),
 }
@@ -470,6 +520,8 @@ fn collect_resolutions(
             has_resolved = true;
             resolved_labels.insert(server_label(entry).to_owned());
             per_entry.push(resolution);
+        } else if is_deferred_connector(entry) {
+            per_entry.push(EntryResolution::SanitizeDeferred);
         } else {
             per_entry.push(EntryResolution::PassThrough);
         }
@@ -530,14 +582,6 @@ fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Re
         return Err(ResolveError::MutuallyExclusiveTarget(connector_id.to_owned()));
     }
 
-    if entry
-        .get("defer_loading")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(ResolveError::DeferredConnector(connector_id.to_owned()));
-    }
-
     Ok(())
 }
 
@@ -586,6 +630,38 @@ fn redact_connector_client_error(
     }
 }
 
+/// HTTP status and OpenAI error `type` for a [`ResolveError`].
+fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
+    match err {
+        ResolveError::DuplicateLabel(_)
+        | ResolveError::TooManyServers { .. }
+        | ResolveError::NameCollision(_)
+        | ResolveError::UnknownConnector(_)
+        | ResolveError::MutuallyExclusiveTarget(_)
+        | ResolveError::MissingToolSearch(_)
+        | ResolveError::InvalidConnectorId
+        | ResolveError::MissingConnectorLabel(_)
+        | ResolveError::EmptyResolvedToolChoice(_) => (400, "invalid_request_error"),
+        ResolveError::BodyTooLarge { .. } => (413, "invalid_request_error"),
+        ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } => (502, "server_error"),
+        ResolveError::Serialization(_) => (500, "server_error"),
+    }
+}
+
+/// Map a [`ResolveError`] to an HTTP rejection.
+///
+/// Pre-commitment failures (including `stream: true` SSRF and other local
+/// request-policy errors) reject immediately with the JSON `{"error":{...}}`
+/// envelope. Streaming `tools/list` runtime failures use
+/// [`resolve_error_action`] so the header phase can emit the canonical SSE
+/// lifecycle.
+pub(crate) fn resolve_error_rejection(err: &ResolveError) -> FilterAction {
+    let (status, error_type) = resolve_error_status(err);
+    let msg = err.to_string();
+    debug!(error = %msg, "openai_mcp_tool_resolve rejected");
+    FilterAction::Reject(responses_error_rejection(status, error_type, &msg))
+}
+
 /// Map a [`ResolveError`] to the [`FilterAction`] returned from the
 /// request-body phase.
 ///
@@ -593,33 +669,23 @@ fn redact_connector_client_error(
 /// [`PendingListToolsFailure`] descriptor is stashed and `Continue` is
 /// returned, because a `TerminalResponse` produced here (a body-phase hook)
 /// would be swallowed as `Continue` by the pipeline. The header-phase
-/// [`McpToolResolveFilter::on_request`] consumes the stash and emits the
+/// [`consume_pending_list_tools_failure`] consumes the stash and emits the
 /// terminal SSE so the response phase can observe and persist it. All other
 /// failures -- and every local request-policy failure such as SSRF -- are
 /// rejected immediately via [`FilterAction::Reject`].
-fn resolve_error_action(
+///
+/// Called from both the initial resolver and later-round deferred discovery
+/// in `openai_mcp_dispatch`.
+pub(crate) fn resolve_error_action(
     ctx: &mut HttpFilterContext<'_>,
     err: &ResolveError,
     streaming: bool,
     body: &[u8],
 ) -> FilterAction {
-    let (status, error_type) = match err {
-        ResolveError::DuplicateLabel(_)
-        | ResolveError::TooManyServers { .. }
-        | ResolveError::NameCollision(_)
-        | ResolveError::UnknownConnector(_)
-        | ResolveError::MutuallyExclusiveTarget(_)
-        | ResolveError::DeferredConnector(_)
-        | ResolveError::InvalidConnectorId
-        | ResolveError::MissingConnectorLabel(_)
-        | ResolveError::EmptyResolvedToolChoice(_) => (400, "invalid_request_error"),
-        ResolveError::BodyTooLarge { .. } => (413, "invalid_request_error"),
-        ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } => (502, "server_error"),
-        ResolveError::Serialization(_) => (500, "server_error"),
-    };
-    let msg = err.to_string();
-    debug!(error = %msg, "openai_mcp_tool_resolve rejected");
     if streaming && is_mcp_listing_runtime_failure(err) {
+        let (_, error_type) = resolve_error_status(err);
+        let msg = err.to_string();
+        debug!(error = %msg, "openai_mcp_tool_resolve rejected");
         ctx.insert_filter_state(PendingListToolsFailure {
             server_label: failure_server_label(err).to_owned(),
             error_type,
@@ -628,7 +694,20 @@ fn resolve_error_action(
         });
         return FilterAction::Continue;
     }
-    FilterAction::Reject(responses_error_rejection(status, error_type, &msg))
+    resolve_error_rejection(err)
+}
+
+/// Consume a stashed streaming listing failure and emit the terminal SSE.
+///
+/// Used from the header-phase `on_request` of both `openai_mcp_tool_resolve`
+/// (initial eager listing) and `openai_mcp_dispatch` (later-round deferred
+/// discovery). Filter state is keyed by the stashing filter's pipeline index,
+/// so each filter consumes only its own descriptor.
+pub(crate) fn consume_pending_list_tools_failure(ctx: &mut HttpFilterContext<'_>) -> Option<FilterAction> {
+    let pending = ctx.remove_filter_state::<PendingListToolsFailure>()?;
+    Some(FilterAction::TerminalResponse(Box::new(
+        build_list_tools_failure_response(ctx, &pending),
+    )))
 }
 
 /// Compact descriptor of a deferred streaming `tools/list` runtime failure.
@@ -1132,10 +1211,83 @@ fn resolvable_server_url(entry: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        debug!(server_url, "skipping deferred MCP entry");
+        debug!(label = server_label(entry), "skipping deferred MCP entry");
         return None;
     }
     Some(server_url)
+}
+
+/// Whether an MCP entry occupies a `server_label` for uniqueness checks.
+fn occupies_server_label(entry: &serde_json::Value) -> bool {
+    resolvable_server_url(entry).is_some() || is_deferred_connector(entry)
+}
+
+/// Whether this entry is a configured connector with `defer_loading: true`.
+fn is_deferred_connector(entry: &serde_json::Value) -> bool {
+    entry.get("connector_id").is_some()
+        && entry
+            .get("defer_loading")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// Reject deferred connectors unless `openai_tool_parse` detected `tool_search`.
+fn require_tool_search_for_deferred(
+    ctx: &HttpFilterContext<'_>,
+    entries: &[serde_json::Value],
+) -> Result<(), ResolveError> {
+    let Some(entry) = entries.iter().find(|entry| is_deferred_connector(entry)) else {
+        return Ok(());
+    };
+    if has_tool_search(ctx) {
+        return Ok(());
+    }
+    let connector_id = entry
+        .get("connector_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    Err(ResolveError::MissingToolSearch(connector_id))
+}
+
+/// Check whether `openai_tool_parse` detected a `tool_search` tool.
+fn has_tool_search(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_metadata("openai_tool_parse.has_tool_search")
+        .is_some_and(|v| v == "true")
+}
+
+/// Snapshot deferred connector entries into request-scoped state.
+fn collect_deferred_connectors(
+    entries: &[serde_json::Value],
+    timeout: Duration,
+    max_tools: usize,
+    max_rewritten_body_bytes: usize,
+    allow_loopback: bool,
+) -> Vec<DeferredMcpConnector> {
+    entries
+        .iter()
+        .filter(|entry| is_deferred_connector(entry))
+        .filter_map(|entry| {
+            let connector_id = entry.get("connector_id").and_then(serde_json::Value::as_str)?;
+            let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
+            Some(DeferredMcpConnector {
+                allow_loopback,
+                authorization: entry
+                    .get("authorization")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                allowed_tools: entry.get("allowed_tools").cloned(),
+                connector_id: connector_id.to_owned(),
+                headers: entry.get("headers").cloned(),
+                max_rewritten_body_bytes,
+                max_tools,
+                require_approval: entry.get("require_approval").cloned(),
+                server_label: server_label(entry).to_owned(),
+                server_url: server_url.to_owned(),
+                timeout,
+            })
+        })
+        .collect()
 }
 
 /// Reject requests containing more than one resolvable MCP entry
@@ -1149,12 +1301,11 @@ fn resolvable_server_url(entry: &serde_json::Value) -> Option<&str> {
 fn check_duplicate_labels(entries: &[serde_json::Value]) -> Result<(), ResolveError> {
     let mut seen = HashSet::new();
     for entry in entries {
-        if resolvable_server_url(entry).is_none() {
-            continue;
-        }
-        let label = server_label(entry);
-        if !seen.insert(label) {
-            return Err(ResolveError::DuplicateLabel(label.to_owned()));
+        if occupies_server_label(entry) {
+            let label = server_label(entry);
+            if !seen.insert(label) {
+                return Err(ResolveError::DuplicateLabel(label.to_owned()));
+            }
         }
     }
     Ok(())
@@ -1224,6 +1375,10 @@ fn count_distinct_servers(entries: &[serde_json::Value]) -> usize {
     for entry in entries {
         if let Some(url) = resolvable_server_url(entry) {
             seen.insert((server_label(entry), url));
+        } else if is_deferred_connector(entry)
+            && let Some(url) = entry.get("server_url").and_then(serde_json::Value::as_str)
+        {
+            seen.insert((server_label(entry), url));
         }
     }
     seen.len()
@@ -1238,7 +1393,7 @@ async fn fetch_tools(
     max_tools: usize,
     allow_loopback: bool,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
-    debug!(server_url, "calling MCP tools/list");
+    debug!(label = server_label(entry), "calling MCP tools/list");
     let auth = entry.get("authorization").and_then(serde_json::Value::as_str);
     mcp_client::list_tools(
         server_url,
@@ -1270,8 +1425,11 @@ async fn fetch_tools(
 /// inference backend. When every tool resolves away this yields an
 /// empty `tools` array rather than the original (credentialed) body.
 ///
-/// MCP entries that were not resolved (no `server_url` or deferred)
-/// are left unchanged for upstream to handle.
+/// MCP entries that were not resolved (direct-URL deferred or no
+/// `server_url`) are left unchanged for upstream to handle.
+/// Connector-backed deferred entries are sanitized so the
+/// pipeline-local `connector_id`, configured URL, and credentials
+/// never reach the inference backend.
 fn rewrite_request_body(
     original_bytes: &[u8],
     per_entry: Vec<EntryResolution>,
@@ -1330,6 +1488,9 @@ fn rewrite_tools_array(
             EntryResolution::PassThrough => {
                 result.push(tool);
             },
+            EntryResolution::SanitizeDeferred => {
+                result.push(sanitize_deferred_connector_tool(tool));
+            },
             EntryResolution::Resolved(function_tools) => {
                 for ft in function_tools {
                     if let Some(name) = ft.get("name").and_then(serde_json::Value::as_str) {
@@ -1342,6 +1503,28 @@ fn rewrite_tools_array(
     }
 
     (result, generated_names)
+}
+
+/// Copy only the client-visible deferred MCP fields into the outbound tool.
+fn sanitize_deferred_connector_tool(tool: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = tool.as_object() else {
+        return tool;
+    };
+    let mut sanitized = serde_json::Map::new();
+    for key in [
+        "type",
+        "server_label",
+        "server_description",
+        "defer_loading",
+        "allowed_tools",
+        "allowed_callers",
+        "require_approval",
+    ] {
+        if let Some(value) = obj.get(key) {
+            sanitized.insert(key.to_owned(), value.clone());
+        }
+    }
+    serde_json::Value::Object(sanitized)
 }
 
 /// Detect duplicate function names involving at least one
@@ -1721,9 +1904,15 @@ impl<'a> McpToolIndex<'a> {
 /// Skips state creation when the body carries
 /// `previous_response_id` to avoid the downstream rebuild
 /// path in `openai_responses_proxy` which would strip it.
-fn write_state(ctx: &mut HttpFilterContext<'_>, body: &[u8], map: HashMap<(String, String), serde_json::Value>) {
+fn write_state(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &[u8],
+    map: HashMap<(String, String), serde_json::Value>,
+    deferred_mcp: Vec<DeferredMcpConnector>,
+) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.mcp_tool_map = map;
+        state.deferred_mcp = deferred_mcp;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) {
             state.tools = parsed
                 .get("tools")
@@ -1738,8 +1927,281 @@ fn write_state(ctx: &mut HttpFilterContext<'_>, body: &[u8], map: HashMap<(Strin
     } else if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) {
         let mut state = ResponsesState::from_request_body(parsed);
         state.mcp_tool_map = map;
+        state.deferred_mcp = deferred_mcp;
         ctx.extensions.insert(state);
     }
+}
+
+/// Whether deferred connector discovery should run on this IRR iteration.
+pub(crate) fn has_pending_deferred_discovery(state: &ResponsesState) -> bool {
+    !state.tool_search_calls.is_empty() && !state.deferred_mcp.is_empty()
+}
+
+/// Load tools for deferred connectors after a `tool_search_call`.
+///
+/// Lists every pending connector before mutating state. Applies
+/// `allowed_tools`, collision detection, and `max_rewritten_body_bytes`
+/// to the expanded tools, then writes `mcp_tool_map` and replaces
+/// sanitized deferred MCP entries with function tools.
+pub(crate) async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), ResolveError> {
+    if state.deferred_mcp.is_empty() {
+        return Ok(());
+    }
+
+    let pending = std::mem::take(&mut state.deferred_mcp);
+    let prepared = match prepare_deferred_listings(&pending).await {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            state.deferred_mcp = pending;
+            return Err(err);
+        },
+    };
+    let max_bytes = pending
+        .first()
+        .map_or(MAX_JSON_BODY_BYTES, |connector| connector.max_rewritten_body_bytes);
+    if let Err(err) = commit_deferred_listings(state, prepared, max_bytes) {
+        state.deferred_mcp = pending;
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Listed connector payload held until collision and size checks pass.
+struct PreparedDeferredListing {
+    /// Reconstructed MCP entry used to populate `mcp_tool_map`.
+    entry: serde_json::Value,
+    /// `allowed_tools`-filtered listing.
+    filtered: Vec<serde_json::Value>,
+    /// Function tools generated from `filtered`.
+    functions: Vec<serde_json::Value>,
+    /// Public `mcp_list_tools` item with no URL or credentials.
+    listing_item: serde_json::Value,
+    /// Server label used to replace the sanitized deferred MCP tool.
+    server_label: String,
+}
+
+/// Call `tools/list` for every deferred connector without mutating state.
+///
+/// Independent servers are listed concurrently so total latency is bounded by
+/// the slowest connector rather than the sum of per-server timeouts. Commit
+/// remains transactional in [`discover_deferred_connectors`].
+async fn prepare_deferred_listings(
+    pending: &[DeferredMcpConnector],
+) -> Result<Vec<PreparedDeferredListing>, ResolveError> {
+    futures::future::try_join_all(pending.iter().map(prepare_deferred_listing)).await
+}
+
+/// List and rewrite one deferred connector without mutating shared state.
+async fn prepare_deferred_listing(connector: &DeferredMcpConnector) -> Result<PreparedDeferredListing, ResolveError> {
+    let listing = list_deferred_connector(connector).await?;
+    let entry = deferred_entry_view(connector);
+    let allowed = extract_allowed_tools(&entry);
+    let filtered = apply_allowed_tools_filter(listing, &allowed);
+    let functions: Vec<serde_json::Value> = filtered
+        .iter()
+        .map(|def| mcp_tool_to_function_tool(&connector.server_label, def))
+        .collect();
+    let listing_item = mcp_list_tools_item(&connector.server_label, &filtered);
+    Ok(PreparedDeferredListing {
+        entry,
+        filtered,
+        functions,
+        listing_item,
+        server_label: connector.server_label.clone(),
+    })
+}
+
+/// Apply deferred listings after collision and body-size checks succeed.
+fn commit_deferred_listings(
+    state: &mut ResponsesState,
+    prepared: Vec<PreparedDeferredListing>,
+    max_rewritten_body_bytes: usize,
+) -> Result<(), ResolveError> {
+    let mut function_tools_by_label: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut generated_names = HashSet::new();
+    for item in &prepared {
+        for name in item
+            .functions
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        {
+            generated_names.insert(name.to_owned());
+        }
+        function_tools_by_label.insert(item.server_label.clone(), item.functions.clone());
+    }
+
+    let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
+    detect_name_collisions(&expanded_tools, &generated_names)?;
+    let request_body = expanded_request_body(&state.request_body, &function_tools_by_label);
+    check_json_body_size(&request_body, max_rewritten_body_bytes)?;
+
+    for item in prepared {
+        insert_tools(item.filtered, &item.entry, &mut state.mcp_tool_map);
+        if let Some(id) = item.listing_item.get("id").and_then(serde_json::Value::as_str) {
+            state.locally_executed_output_items.insert(id.to_owned());
+        }
+        state.persisted_messages.push(item.listing_item.clone());
+        state.accumulated_output.push(item.listing_item);
+    }
+    state.tools = expanded_tools;
+    state.request_body = request_body;
+    state.mark_request_body_for_rebuild();
+    Ok(())
+}
+
+/// Expand deferred MCP entries in a cloned request body for size checking.
+fn expanded_request_body(
+    request_body: &serde_json::Value,
+    functions_by_label: &HashMap<String, Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let mut body = request_body.clone();
+    if let Some(obj) = body.as_object_mut()
+        && let Some(serde_json::Value::Array(tools)) = obj.remove("tools")
+    {
+        obj.insert(
+            "tools".to_owned(),
+            serde_json::Value::Array(expand_deferred_tools_array(tools, functions_by_label)),
+        );
+    }
+    body
+}
+
+/// Reject an expanded provider body that exceeds `max_rewritten_body_bytes`.
+fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usize) -> Result<(), ResolveError> {
+    let actual = serde_json::to_vec(body).map_err(ResolveError::Serialization)?.len();
+    if actual > max_rewritten_body_bytes {
+        return Err(ResolveError::BodyTooLarge {
+            actual,
+            limit: max_rewritten_body_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Call `tools/list` for one deferred connector, redacting URLs on error.
+async fn list_deferred_connector(connector: &DeferredMcpConnector) -> Result<Vec<serde_json::Value>, ResolveError> {
+    let entry = deferred_entry_view(connector);
+    mcp_client::validate_mcp_url(&connector.server_url, connector.timeout, connector.allow_loopback)
+        .await
+        .map_err(|source| deferred_connector_client_error(connector, source))?;
+    fetch_tools(
+        &entry,
+        &connector.server_url,
+        connector.timeout,
+        connector.max_tools,
+        connector.allow_loopback,
+    )
+    .await
+    .map_err(|err| match err {
+        ResolveError::Client { source, .. } => deferred_connector_client_error(connector, source),
+        other => other,
+    })
+}
+
+/// URL-redacted connector failure for deferred `tools/list`.
+fn deferred_connector_client_error(
+    connector: &DeferredMcpConnector,
+    source: mcp_client::McpClientError,
+) -> ResolveError {
+    debug!(connector_id = %connector.connector_id, "deferred connector listing failed");
+    ResolveError::ConnectorClient {
+        connector_id: connector.connector_id.clone(),
+        label: connector.server_label.clone(),
+        source,
+    }
+}
+
+/// Reconstruct a JSON MCP entry from stored deferred connector state.
+fn deferred_entry_view(connector: &DeferredMcpConnector) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "connector_id".to_owned(),
+        serde_json::Value::String(connector.connector_id.clone()),
+    );
+    obj.insert(
+        "server_label".to_owned(),
+        serde_json::Value::String(connector.server_label.clone()),
+    );
+    obj.insert(
+        "server_url".to_owned(),
+        serde_json::Value::String(connector.server_url.clone()),
+    );
+    if let Some(auth) = &connector.authorization {
+        obj.insert("authorization".to_owned(), serde_json::Value::String(auth.clone()));
+    }
+    if let Some(headers) = &connector.headers {
+        obj.insert("headers".to_owned(), headers.clone());
+    }
+    if let Some(allowed) = &connector.allowed_tools {
+        obj.insert("allowed_tools".to_owned(), allowed.clone());
+    }
+    if let Some(approval) = &connector.require_approval {
+        obj.insert("require_approval".to_owned(), approval.clone());
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Public `mcp_list_tools` item with no URL, credentials, or connector id.
+///
+/// MCP `tools/list` returns `inputSchema`; the Responses item schema requires
+/// `input_schema`. Map each listed tool onto the public shape so typed SDKs
+/// can parse a successful deferred listing.
+fn mcp_list_tools_item(server_label: &str, tools: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::json!({
+        "id": mcp_list_tools_id(server_label),
+        "type": "mcp_list_tools",
+        "server_label": server_label,
+        "tools": tools.iter().map(mcp_listing_tool_for_responses).collect::<Vec<_>>(),
+    })
+}
+
+/// Map one MCP tool definition onto the Responses `mcp_list_tools` tool shape.
+fn mcp_listing_tool_for_responses(definition: &serde_json::Value) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for key in ["name", "description", "annotations"] {
+        if let Some(value) = definition.get(key) {
+            obj.insert(key.to_owned(), value.clone());
+        }
+    }
+    let schema = definition
+        .get("input_schema")
+        .or_else(|| definition.get("inputSchema"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+    obj.insert("input_schema".to_owned(), schema);
+    serde_json::Value::Object(obj)
+}
+
+/// Opaque listing id that does not embed the client-supplied label.
+fn mcp_list_tools_id(server_label: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    server_label.hash(&mut hasher);
+    format!("mcpl_{:016x}", hasher.finish())
+}
+
+/// Swap deferred MCP entries for the given label with generated function tools.
+fn expand_deferred_tools_array(
+    tools: Vec<serde_json::Value>,
+    functions_by_label: &HashMap<String, Vec<serde_json::Value>>,
+) -> Vec<serde_json::Value> {
+    let mut result = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let is_deferred_mcp = tool.get("type").and_then(serde_json::Value::as_str) == Some("mcp")
+            && tool
+                .get("defer_loading")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        let label = tool
+            .get("server_label")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if is_deferred_mcp && let Some(functions) = functions_by_label.get(label) {
+            result.extend(functions.iter().cloned());
+        } else {
+            result.push(tool);
+        }
+    }
+    result
 }
 
 /// Check whether `openai_tool_parse` detected MCP tools.

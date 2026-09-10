@@ -853,6 +853,49 @@ async fn logical_stream_failed_mcp_call_emits_failed_outcome_event() {
 }
 
 #[tokio::test]
+async fn logical_stream_successful_mcp_list_tools_emits_lifecycle_events() {
+    // Locally generated deferred listings must surface as incremental
+    // added / in_progress / completed / done events, not only the final
+    // response snapshot.
+    let (filter, mut ctx) = arm_resumed_round_with_accumulated(
+        "openai_mcp_dispatch",
+        vec![json!({
+            "type": "mcp_list_tools",
+            "id": "mcpl_1",
+            "server_label": "weather",
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+        })],
+    )
+    .await;
+
+    let delta = resumed_text_delta(filter.as_ref(), &mut ctx);
+    assert!(
+        delta.contains("event: response.output_item.added") && delta.contains("event: response.output_item.done"),
+        "a locally generated listing must surface as incremental output-item events: {delta}"
+    );
+    assert!(
+        delta.contains("event: response.mcp_list_tools.in_progress"),
+        "a successful listing must emit an in_progress progress event: {delta}"
+    );
+    assert!(
+        delta.contains("event: response.mcp_list_tools.completed"),
+        "a successful listing must emit a completed outcome event: {delta}"
+    );
+    assert!(
+        !delta.contains("event: response.mcp_list_tools.failed"),
+        "a successful listing must not emit a failed outcome event: {delta}"
+    );
+    let added = delta.find("event: response.output_item.added").unwrap();
+    let in_progress = delta.find("event: response.mcp_list_tools.in_progress").unwrap();
+    let completed = delta.find("event: response.mcp_list_tools.completed").unwrap();
+    let done = delta.find("event: response.output_item.done").unwrap();
+    assert!(
+        added < in_progress && in_progress < completed && completed < done,
+        "listing lifecycle must be ordered added -> in_progress -> completed -> done: {delta}"
+    );
+}
+
+#[tokio::test]
 async fn logical_stream_synthesizes_progress_for_model_declared_item_without_repeating_added() {
     // #276 (Finding 1): the model announces a `web_search_call` placeholder with
     // `output_item.added` (status `in_progress`) but never streams the

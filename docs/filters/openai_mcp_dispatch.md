@@ -5,6 +5,10 @@
 
 Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop.
 
+## Configuration Notes
+
+When `openai_mcp_tool_resolve` stored deferred connectors and the model returns a `tool_search_call`, this filter loads every pending deferred connector from its internally resolved endpoint on the next iteration, then dispatches later MCP calls through the existing `tools/call` path.
+
 ## Configuration
 
 | Field | Type | Required | Description |

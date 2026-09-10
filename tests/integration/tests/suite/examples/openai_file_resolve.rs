@@ -729,16 +729,18 @@ fn example_config_rejects_ssrf_blocked_file_url_with_403() {
             "role": "user",
             "content": [{
                 "type": "input_file",
-                "file_url": "http://169.254.169.254/latest/meta-data/"
+                "file_url": "http://192.0.2.1/latest/meta-data/"
             }]
         }]
     }"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    let status = parse_status(&raw);
 
     assert_eq!(
-        parse_status(&raw),
+        status,
         403,
-        "metadata file_url should be rejected before proxying"
+        "documentation-range file_url should be rejected before proxying, body: {}",
+        parse_body(&raw)
     );
     let error: serde_json::Value =
         serde_json::from_str(&parse_body(&raw)).expect("error response should be valid JSON");
