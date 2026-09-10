@@ -156,7 +156,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         let transformed = match serde_json::from_slice::<serde_json::Value>(bytes) {
             Ok(value) => {
                 extract_request_metadata(ctx, Some(&value));
-                request::transform_request(value, bytes.len())
+                request::transform_request(value)
             },
             Err(error) => {
                 extract_request_metadata(ctx, None);
@@ -551,7 +551,7 @@ mod tests {
     fn translate(body: &[u8]) -> Result<Vec<u8>, String> {
         let value: serde_json::Value =
             serde_json::from_slice(body).map_err(|error| format!("invalid JSON: {error}"))?;
-        request::transform_request(value, body.len())
+        request::transform_request(value)
     }
 
     #[test]

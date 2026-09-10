@@ -13,7 +13,7 @@ use tracing::warn;
 /// Transform a parsed Anthropic Messages request body into Chat
 /// Completions-compatible format.
 /// Returns the transformed JSON bytes, or an error message.
-pub(crate) fn transform_request(value: Value, original_len: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
     let Value::Object(mut body) = value else {
         return Err("request body is not a JSON object".to_owned());
     };
@@ -45,7 +45,7 @@ pub(crate) fn transform_request(value: Value, original_len: usize) -> Result<Vec
     convert_parallel_tool_calls(&mut chat, tool_choice.as_ref());
     convert_tool_choice(&mut chat, tool_choice, had_tools);
 
-    serialize_chat(chat, original_len)
+    serde_json::to_vec(&Value::Object(chat)).map_err(|e| format!("serialization failed: {e}"))
 }
 
 // -----------------------------------------------------------------------------
@@ -71,18 +71,6 @@ fn insert_if_some(target: &mut Map<String, Value>, key: &str, value: Option<Valu
     if let Some(value) = value {
         target.insert(key.to_owned(), value);
     }
-}
-
-// -----------------------------------------------------------------------------
-// Serialization
-// -----------------------------------------------------------------------------
-
-/// Serialize the translated body into a buffer pre-sized from the Anthropic
-/// body it was translated from.
-fn serialize_chat(chat: Map<String, Value>, original_len: usize) -> Result<Vec<u8>, String> {
-    let mut buffer = Vec::with_capacity(original_len);
-    serde_json::to_writer(&mut buffer, &Value::Object(chat)).map_err(|e| format!("serialization failed: {e}"))?;
-    Ok(buffer)
 }
 
 /// Build the Chat Completions `messages` array from the Anthropic `system` and
@@ -791,7 +779,7 @@ mod tests {
     /// parse-once call path including its parse-error message.
     fn transform_bytes(body: &[u8]) -> Result<Vec<u8>, String> {
         let value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
-        transform_request(value, body.len())
+        transform_request(value)
     }
 
     #[test]
