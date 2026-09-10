@@ -487,8 +487,7 @@ fn parse_chunk_events(
 /// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
 ///
 /// Both steps are infallible, so every recorded milestone corresponds to bytes
-/// that actually reach the client. Returns the logical-stream bytes (empty when
-/// the logical stream is disabled).
+/// that actually reach the client. Returns the logical-stream bytes.
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
@@ -504,8 +503,7 @@ fn commit_chunk_events(
     // but only now that the whole chunk has parsed and committed. Filter-local
     // parser state is re-armed before request-side dispatchers run on the next
     // IRR step, so the sentinel must survive in shared state as well.
-    if state.logical_stream
-        && state.deferred_done
+    if state.deferred_done
         && let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>()
     {
         response_state.deferred_stream_done = true;

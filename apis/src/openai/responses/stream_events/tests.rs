@@ -18,8 +18,8 @@ use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::json;
 
 use super::{
-    ArmDecision, CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object, arm_decision,
-    encode_local_completion,
+    ArmDecision, CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object,
+    arm_decision, encode_local_completion,
 };
 use crate::{
     openai::{
