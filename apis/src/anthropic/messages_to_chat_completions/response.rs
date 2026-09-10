@@ -187,6 +187,9 @@ fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<Con
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "tool call missing required non-empty `id`".to_owned())?;
+        if !wire::is_valid_tool_use_id(id) {
+            return Err("tool call `id` must match ^[a-zA-Z0-9_-]+$".to_owned());
+        }
         let name = tc
             .get("function")
             .and_then(|f| f.get("name"))
