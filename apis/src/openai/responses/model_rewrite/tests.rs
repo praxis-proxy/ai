@@ -205,6 +205,69 @@ headers:
 }
 
 #[test]
+fn from_config_rejects_transport_promotion_header() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+default_model: "test"
+headers:
+  effective_model: content-length
+"#,
+    )
+    .unwrap();
+    let result = ModelRewriteFilter::from_config(&yaml);
+    assert!(result.is_err(), "content-length promotion header should be rejected");
+}
+
+#[test]
+fn from_config_rejects_api_key_promotion_header() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+default_model: "test"
+headers:
+  effective_model: x-api-key
+"#,
+    )
+    .unwrap();
+    let result = ModelRewriteFilter::from_config(&yaml);
+    assert!(result.is_err(), "x-api-key promotion header should be rejected");
+}
+
+#[test]
+fn from_config_rejects_format_routing_promotion_header() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+default_model: "test"
+headers:
+  effective_model: x-praxis-ai-format
+"#,
+    )
+    .unwrap();
+    let result = ModelRewriteFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "x-praxis-ai-format promotion header should be rejected"
+    );
+}
+
+#[test]
+fn from_config_rejects_duplicate_promotion_headers() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+default_model: "test"
+headers:
+  effective_model: x-shared-model
+  original_model: x-shared-model
+"#,
+    )
+    .unwrap();
+    let result = ModelRewriteFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "the same promotion header for both values should be rejected"
+    );
+}
+
+#[test]
 fn from_config_null_headers_suppress_promotion() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"

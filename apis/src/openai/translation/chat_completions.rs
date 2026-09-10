@@ -558,9 +558,13 @@ fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -
     let encoded = required_input_item_string(obj, "compaction", "encrypted_content")?;
     let summary = decode_compaction_summary(encoded)?;
     if !summary.is_empty() {
+        let prefix = obj
+            .get("summary_prefix")
+            .and_then(Value::as_str)
+            .unwrap_or(crate::openai::responses::compact::DEFAULT_SUMMARY_PREFIX);
         messages.push(json!({
             "role": "assistant",
-            "content": format!("[Previous conversation summary]\n\n{summary}")
+            "content": format!("{prefix}{summary}")
         }));
     }
     Ok(())
@@ -1329,6 +1333,7 @@ fn is_supported_function_call(tool_call: &Value) -> bool {
 pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Value {
     let service_tier = context
         .service_tier
+        .filter(|value| value.is_string())
         .cloned()
         .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()));
     let parts = ResponseResourceParts {
@@ -1378,7 +1383,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "temperature": number_or_default(context.temperature, 1.0),
         "text": text_value(context),
         "tool_choice": tool_choice_value(context),
-        "tools": Value::Array(context.tools.to_vec()),
+        "tools": Value::Array(normalize_response_tools(context.tools)),
         "top_p": number_or_default(context.top_p, 1.0),
         // TODO(responses): preserve request truncation when the compatibility
         // layer supports truncation semantics instead of emitting the default.
@@ -1524,11 +1529,34 @@ fn text_value(context: &ResponseContext<'_>) -> Value {
     context.text.cloned().unwrap_or_else(default_text_config)
 }
 
+/// Normalize echoed request tools to the Responses response-side tool schema.
+///
+/// The Responses request accepts a compact function-tool shape
+/// (`{"type":"function","name":...}`); the response resource must echo the
+/// canonical schema with `description`, `parameters`, and `strict` present.
+/// Non-function tools (e.g. hosted `web_search`) are echoed unchanged.
+fn normalize_response_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| match tool.as_object() {
+            Some(obj) if tool.get("type").and_then(Value::as_str) == Some("function") => {
+                let mut normalized = obj.clone();
+                normalized.entry("description").or_insert(Value::Null);
+                normalized.entry("parameters").or_insert(Value::Null);
+                normalized.entry("strict").or_insert(Value::Bool(false));
+                Value::Object(normalized)
+            },
+            _ => tool.clone(),
+        })
+        .collect()
+}
+
 /// Build provider service tier, falling back to the request context when absent.
 fn service_tier_value_with_context(obj: &Map<String, Value>, context: &ResponseContext<'_>) -> Value {
     obj.get("service_tier")
+        .filter(|value| value.is_string())
+        .or_else(|| context.service_tier.filter(|value| value.is_string()))
         .cloned()
-        .or_else(|| context.service_tier.cloned())
         .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()))
 }
 

@@ -1,0 +1,235 @@
+{
+  "version": 1,
+  "scenario_id": "responses/chat-tool-echo",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-chat-model",
+    "source_id": "responses/chat-tool-echo"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_1": "call_recorded_0002",
+      "chatcmpl-tool-echo": "chatcmpl-recorded-0003",
+      "resp_5af671940311c470ca6f000000000000": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "function-tool-echo",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What's the weather like in San Francisco?",
+              "model": "synthetic-chat-model",
+              "store": false,
+              "stream": false,
+              "tools": [
+                {
+                  "description": "Get the current weather for a location",
+                  "name": "get_weather",
+                  "parameters": {
+                    "properties": {
+                      "location": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "location"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "What's the weather like in San Francisco?",
+              "instructions": null,
+              "max_output_tokens": null,
+              "max_tool_calls": null,
+              "metadata": {},
+              "model": "synthetic-chat-model",
+              "object": "response",
+              "output": [
+                {
+                  "arguments": "{\"location\":\"San Francisco, CA\"}",
+                  "call_id": "call_recorded_0002",
+                  "id": "fc_call_recorded_0002",
+                  "name": "get_weather",
+                  "status": "completed",
+                  "type": "function_call"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt_cache_key": null,
+              "reasoning": null,
+              "safety_identifier": null,
+              "service_tier": "default",
+              "status": "completed",
+              "store": false,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [
+                {
+                  "description": "Get the current weather for a location",
+                  "name": "get_weather",
+                  "parameters": {
+                    "properties": {
+                      "location": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "location"
+                    ],
+                    "type": "object"
+                  },
+                  "strict": false,
+                  "type": "function"
+                }
+              ],
+              "top_logprobs": 0,
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 20,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 10,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 30
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "What's the weather like in San Francisco?",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-chat-model",
+              "stream": false,
+              "tool_choice": "auto",
+              "tools": [
+                {
+                  "function": {
+                    "description": "Get the current weather for a location",
+                    "name": "get_weather",
+                    "parameters": {
+                      "properties": {
+                        "location": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "location"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "tool_calls",
+                  "index": 0,
+                  "message": {
+                    "content": null,
+                    "role": "assistant",
+                    "tool_calls": [
+                      {
+                        "function": {
+                          "arguments": "{\"location\":\"San Francisco, CA\"}",
+                          "name": "get_weather"
+                        },
+                        "id": "call_recorded_0002",
+                        "type": "function"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0003",
+              "model": "synthetic-chat-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 10,
+                "prompt_tokens": 20,
+                "total_tokens": 30
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

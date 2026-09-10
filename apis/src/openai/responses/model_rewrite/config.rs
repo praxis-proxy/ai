@@ -39,6 +39,8 @@ pub(super) struct ModelRewriteConfig {
     pub default_model: Option<String>,
 
     /// Header names for promoted model values.
+    ///
+    /// `effective_model` and `original_model` must use distinct names.
     #[serde(default)]
     pub headers: ModelRewriteHeaders,
 
@@ -58,14 +60,28 @@ pub(super) struct ModelRewriteConfig {
 // -----------------------------------------------------------------------------
 
 /// Configurable header names for promoted model values.
+///
+/// Transport, credential, API-key, and other internal `x-praxis-*` names
+/// are rejected. Dedicated defaults remain allowed. The two fields must
+/// not share the same name.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ModelRewriteHeaders {
     /// Header name for the effective (post-rewrite) model value.
+    ///
+    /// Must not be a hop-by-hop, framing, Host, credential, API-key, or
+    /// other internal `x-praxis-*` header. Dedicated default
+    /// `x-praxis-ai-effective-model` remains allowed. Must differ from
+    /// `original_model`.
     #[serde(default = "default_effective_model_header")]
     pub effective_model: Option<String>,
 
     /// Header name for the original (pre-rewrite) model value.
+    ///
+    /// Must not be a hop-by-hop, framing, Host, credential, API-key, or
+    /// other internal `x-praxis-*` header. Dedicated default
+    /// `x-praxis-ai-original-model` remains allowed. Must differ from
+    /// `effective_model`.
     #[serde(default = "default_original_model_header")]
     pub original_model: Option<String>,
 }
@@ -139,10 +155,22 @@ pub(super) fn validate_config(cfg: &ModelRewriteConfig) -> Result<(), FilterErro
     }
 
     validate_aliases(&cfg.model_aliases)?;
-    validate_header_name("effective_model", cfg.headers.effective_model.as_deref())?;
-    validate_header_name("original_model", cfg.headers.original_model.as_deref())?;
+    validate_promotion_headers(&cfg.headers)?;
 
     Ok(())
+}
+
+/// Reject empty, invalid, unsafe, or duplicated promotion headers.
+fn validate_promotion_headers(headers: &ModelRewriteHeaders) -> Result<(), FilterError> {
+    validate_header_name("effective_model", headers.effective_model.as_deref())?;
+    validate_header_name("original_model", headers.original_model.as_deref())?;
+    crate::promotion::reject_duplicate_promotion_fields(
+        "openai_responses_model_rewrite",
+        &[
+            ("effective_model", headers.effective_model.as_deref()),
+            ("original_model", headers.original_model.as_deref()),
+        ],
+    )
 }
 
 /// Validate alias map entries.
@@ -166,20 +194,9 @@ fn validate_aliases(aliases: &HashMap<String, String>) -> Result<(), FilterError
     Ok(())
 }
 
-/// Validate a configured header name using the HTTP header-name parser.
+/// Validate a configured promotion header name.
 fn validate_header_name(field: &str, name: Option<&str>) -> Result<(), FilterError> {
-    let Some(name) = name else {
-        return Ok(());
-    };
-    if name.is_empty() {
-        return Err(format!("openai_responses_model_rewrite: '{field}' header name must not be empty").into());
-    }
-    if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
-        return Err(
-            format!("openai_responses_model_rewrite: '{field}' header name is not a valid HTTP header name").into(),
-        );
-    }
-    Ok(())
+    crate::promotion::validate_model_identity_promotion_header("openai_responses_model_rewrite", field, name)
 }
 
 // -----------------------------------------------------------------------------
@@ -426,6 +443,103 @@ extra: true
     #[test]
     fn validate_header_name_valid_accepted() {
         assert!(validate_header_name("test", Some("x-custom-header")).is_ok());
+    }
+
+    #[test]
+    fn validate_header_name_rejects_content_length() {
+        let err = validate_header_name("effective_model", Some("content-length")).unwrap_err();
+        assert!(
+            err.to_string().contains("transport, credential, or internal header"),
+            "content-length should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_header_name_rejects_host_case_insensitively() {
+        let err = validate_header_name("original_model", Some("Host")).unwrap_err();
+        assert!(
+            err.to_string().contains("host"),
+            "Host should be rejected as transport header: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_header_name_rejects_authorization() {
+        let err = validate_header_name("effective_model", Some("authorization")).unwrap_err();
+        assert!(
+            err.to_string().contains("authorization"),
+            "authorization should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_header_name_rejects_unrelated_internal_header() {
+        let err = validate_header_name("effective_model", Some("x-praxis-route")).unwrap_err();
+        assert!(
+            err.to_string().contains("x-praxis-route"),
+            "unrelated x-praxis-* promotion target should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_header_name_rejects_x_api_key() {
+        let err = validate_header_name("effective_model", Some("x-api-key")).unwrap_err();
+        assert!(
+            err.to_string().contains("x-api-key"),
+            "x-api-key promotion target should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_header_name_rejects_format_routing_header() {
+        let err = validate_header_name("effective_model", Some("x-praxis-ai-format")).unwrap_err();
+        assert!(
+            err.to_string().contains("x-praxis-ai-format"),
+            "x-praxis-ai-format must not receive a client-derived model: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_header_name_accepts_dedicated_effective_model_header() {
+        assert!(
+            validate_header_name("effective_model", Some("x-praxis-ai-effective-model")).is_ok(),
+            "dedicated effective-model header should remain allowed"
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_duplicate_promotion_headers() {
+        let cfg = ModelRewriteConfig {
+            default_model: Some("llama-3.3-70b".into()),
+            headers: ModelRewriteHeaders {
+                effective_model: Some("x-model".into()),
+                original_model: Some("X-Model".into()),
+            },
+            model_aliases: HashMap::new(),
+            on_invalid: OnInvalidBehavior::Continue,
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("same header name"),
+            "duplicate promotion headers should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_config_accepts_distinct_custom_promotion_headers() {
+        let cfg = ModelRewriteConfig {
+            default_model: Some("llama-3.3-70b".into()),
+            headers: ModelRewriteHeaders {
+                effective_model: Some("x-effective-model".into()),
+                original_model: Some("x-original-model".into()),
+            },
+            model_aliases: HashMap::new(),
+            on_invalid: OnInvalidBehavior::Continue,
+        };
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "distinct custom headers should be accepted"
+        );
     }
 
     // -- null header disables promotion ---------------------------------------

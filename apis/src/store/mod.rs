@@ -41,7 +41,7 @@ pub use self::{
     postgres::{PostgresResponseStore, SslMode},
     sqlite::SqliteResponseStore,
     trait_def::{ConversationItemStore, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, ResponseRecord, StoreError},
+    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };
 
 // -----------------------------------------------------------------------------

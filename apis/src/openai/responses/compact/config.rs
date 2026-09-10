@@ -52,6 +52,12 @@ pub(super) struct CompactFilterConfig {
     #[serde(default = "default_tiktoken_encoding")]
     pub tiktoken_encoding: String,
 
+    /// Prefix prepended to the summary when translating compaction
+    /// items to backend messages. Defaults to
+    /// `"[Previous conversation summary]\n\n"`.
+    #[serde(default)]
+    pub summary_prefix: Option<String>,
+
     /// Callout timeout in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
@@ -93,6 +99,9 @@ pub(super) struct ValidatedConfig {
 
     /// Tiktoken encoding name.
     pub tiktoken_encoding: String,
+
+    /// Prefix prepended to the summary in backend messages.
+    pub summary_prefix: String,
 
     /// Shared callout settings (timeout, failure mode, status).
     pub callout: CalloutSettings,
@@ -143,6 +152,10 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
         address_policy,
         default_model: raw.default_model.clone(),
         tiktoken_encoding: raw.tiktoken_encoding.clone(),
+        summary_prefix: raw
+            .summary_prefix
+            .clone()
+            .unwrap_or_else(|| crate::openai::responses::compact::DEFAULT_SUMMARY_PREFIX.to_owned()),
         callout: CalloutSettings {
             timeout_ms,
             on_failure: raw.on_failure.unwrap_or(OnFailure::Closed),

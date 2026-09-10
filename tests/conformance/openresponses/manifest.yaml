@@ -1,0 +1,101 @@
+# OpenResponses conformance triage for the responses_to_chat_completions filter.
+#
+# Source suite: https://github.com/openresponses/openresponses
+# Pinned commit: 92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c
+# Runner: bun 1.3.12, zod 3.25.76
+#
+# Every one of the suite's templates is triaged into exactly one bucket:
+#
+#   supported     in-scope templates the translation filter passes today.
+#                 Numerator of the coverage metric; the live CI job runs these
+#                 as a strict all-pass gate.
+#   unsupported   in-scope templates the filter does NOT pass yet. Denominator
+#                 headroom — fixing the translator promotes an entry to
+#                 `supported` and bumps coverage. A CI nudge fails if one of
+#                 these starts passing, so the bump can never go unnoticed.
+#   inapplicable  out of scope for an HTTP request/response translation proxy
+#                 (wrong transport, backend modality the pinned CPU model lacks,
+#                 or an operation outside the translation surface). Excluded
+#                 from the coverage denominator entirely.
+#
+# Coverage = supported / (supported + unsupported). Regenerate the committed
+# report with `cargo xtask openresponses-coverage --fix`.
+#
+# The launcher (tests/integration/sdk/openai/test_responses_conformance.py)
+# enumerates the suite's template ids and asserts they exactly equal
+# (supported ∪ unsupported ∪ inapplicable) below. A new or removed suite
+# template fails the run until this manifest is updated — no template can
+# silently go untriaged.
+
+suite:
+  repo: https://github.com/openresponses/openresponses
+  commit: 92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c
+  bun: 1.3.12
+  zod: 3.25.76
+
+supported:
+  - id: basic-response
+  - id: system-prompt
+  - id: multi-turn
+  - id: assistant-phase
+  - id: tool-calling
+  - id: streaming-response
+  - id: response-output-phase-schema
+
+# Empty today: every in-scope template the suite exercises passes. A future
+# suite bump (or a newly in-scope template) that the translator does not yet
+# handle lands here, and the CI nudge fails until it is either fixed (promoted
+# to `supported`) or triaged as `inapplicable`.
+unsupported: []
+
+inapplicable:
+  - id: image-input
+    reason: >-
+      Requires a vision-capable backend; the pinned Qwen3-0.6B CPU model is
+      text-only, so no translator change can make it pass in this harness.
+  - id: compact-response
+    reason: >-
+      Separate /responses/compact operation outside the Responses-create
+      translation surface. Belongs to a whole-Responses-API metric, not this
+      responses_to_chat_completions (POST /v1/responses) coverage.
+  - id: compact-missing-model
+    reason: >-
+      Separate /responses/compact operation (negative case) outside the
+      Responses-create translation surface. Belongs to a whole-Responses-API
+      metric, not this responses_to_chat_completions (POST /v1/responses)
+      coverage.
+  - id: websocket-response
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
+  - id: websocket-sequential-responses
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
+  - id: websocket-continuation
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
+  - id: websocket-reconnect-store-false-recovery
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
+  - id: websocket-previous-response-not-found
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
+  - id: websocket-failed-continuation-evicts-cache
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.
+  - id: websocket-compact-new-chain
+    reason: >-
+      WebSocket transport is not part of the HTTP translation surface.
+      These tests auto-skip in browser runtime but the CLI runs runtime:"server",
+      so they must be excluded via this manifest.

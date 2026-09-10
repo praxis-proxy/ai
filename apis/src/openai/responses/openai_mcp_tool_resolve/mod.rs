@@ -48,8 +48,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, TerminalResponse,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::debug;
 
@@ -75,6 +75,12 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// Rejects the request with HTTP 400 before any callouts if two or
 /// more resolvable MCP entries share the same `server_label`
 /// (including entries that differ only by credentials).
+///
+/// For streaming requests, a runtime or response-processing failure from
+/// `tools/list` is returned as a successful SSE transport
+/// containing `response.mcp_list_tools.failed` and a terminal
+/// `response.failed` event. Local policy failures such as SSRF blocking
+/// remain HTTP error responses.
 ///
 /// # YAML
 ///
@@ -243,7 +249,10 @@ impl McpToolResolveFilter {
         let is_connector = entry.get("connector_id").is_some();
         mcp_client::validate_mcp_url(server_url, self.timeout, self.allow_loopback)
             .await
-            .map_err(ResolveError::Client)?;
+            .map_err(|source| ResolveError::Client {
+                server_label: label.to_owned(),
+                source,
+            })?;
         if !has_entry_credentials(entry)
             && let Some(cached) =
                 find_cached_listing(previous_tools, label, server_url, cache_allowed_names, is_connector)
@@ -275,7 +284,18 @@ impl HttpFilter for McpToolResolveFilter {
         }
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // A streaming `tools/list` runtime failure detected during the
+        // request-body pre-read is emitted here, in the header phase, because a
+        // `TerminalResponse` returned from a body-phase hook is discarded as
+        // `Continue`. Consuming the stash exactly once yields the terminal SSE;
+        // routing it through the response phase lets `openai_stream_events` and
+        // `openai_response_store` observe and persist the failed response.
+        if let Some(pending) = ctx.remove_filter_state::<PendingListToolsFailure>() {
+            return Ok(FilterAction::TerminalResponse(Box::new(
+                build_list_tools_failure_response(ctx, &pending),
+            )));
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -299,9 +319,12 @@ impl HttpFilter for McpToolResolveFilter {
 
         let streaming = is_streaming(ctx);
 
-        match Box::pin(self.resolve_mcp_tools(ctx, body, bytes)).await {
+        // `bytes` is an `Arc`-backed `Bytes`; cloning bumps a refcount rather than
+        // copying the body, so keeping a handle for the failure path (which
+        // captures the size-bounded request options from it) is cheap.
+        match Box::pin(self.resolve_mcp_tools(ctx, body, bytes.clone())).await {
             Ok(action) => Ok(action),
-            Err(e) => Ok(resolve_error_rejection(&e, streaming)),
+            Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
         }
     }
 }
@@ -314,8 +337,15 @@ impl HttpFilter for McpToolResolveFilter {
 #[derive(Debug, thiserror::Error)]
 enum ResolveError {
     /// MCP client call failed.
-    #[error("{0}")]
-    Client(#[from] mcp_client::McpClientError),
+    #[error("MCP tools/list failed for server_label \"{server_label}\": {source}")]
+    Client {
+        /// Client-visible label of the MCP server that failed.
+        server_label: String,
+
+        /// Transport or protocol failure returned by the MCP client.
+        #[source]
+        source: mcp_client::McpClientError,
+    },
 
     /// Generated function names collide after sanitization or
     /// truncation.
@@ -375,6 +405,9 @@ enum ResolveError {
         connector_id: String,
         /// The server label from the request.
         label: String,
+        /// Internal failure retained for classification and diagnostics.
+        #[source]
+        source: mcp_client::McpClientError,
     },
 
     /// A `tool_choice` references a resolved server with zero tools.
@@ -535,22 +568,41 @@ fn redact_connector_client_error(
     entry: &serde_json::Value,
 ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
     match result {
-        Err(ResolveError::Client(client_err)) if entry.get("connector_id").is_some() => {
-            debug!(error = %client_err, "connector resolution failed (redacting URL for client)");
+        Err(ResolveError::Client { source, .. }) if entry.get("connector_id").is_some() => {
+            debug!(error = %source, "connector resolution failed (redacting URL for client)");
             let connector_id = entry
                 .get("connector_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_owned();
             let label = server_label(entry).to_owned();
-            Err(ResolveError::ConnectorClient { connector_id, label })
+            Err(ResolveError::ConnectorClient {
+                connector_id,
+                label,
+                source,
+            })
         },
         other => other,
     }
 }
 
-/// Map a [`ResolveError`] to an appropriate rejection response.
-fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction {
+/// Map a [`ResolveError`] to the [`FilterAction`] returned from the
+/// request-body phase.
+///
+/// A streaming `tools/list` runtime failure is *deferred*: a compact
+/// [`PendingListToolsFailure`] descriptor is stashed and `Continue` is
+/// returned, because a `TerminalResponse` produced here (a body-phase hook)
+/// would be swallowed as `Continue` by the pipeline. The header-phase
+/// [`McpToolResolveFilter::on_request`] consumes the stash and emits the
+/// terminal SSE so the response phase can observe and persist it. All other
+/// failures -- and every local request-policy failure such as SSRF -- are
+/// rejected immediately via [`FilterAction::Reject`].
+fn resolve_error_action(
+    ctx: &mut HttpFilterContext<'_>,
+    err: &ResolveError,
+    streaming: bool,
+    body: &[u8],
+) -> FilterAction {
     let (status, error_type) = match err {
         ResolveError::DuplicateLabel(_)
         | ResolveError::TooManyServers { .. }
@@ -562,12 +614,508 @@ fn resolve_error_rejection(err: &ResolveError, streaming: bool) -> FilterAction 
         | ResolveError::MissingConnectorLabel(_)
         | ResolveError::EmptyResolvedToolChoice(_) => (400, "invalid_request_error"),
         ResolveError::BodyTooLarge { .. } => (413, "invalid_request_error"),
-        ResolveError::Client(_) | ResolveError::ConnectorClient { .. } => (502, "server_error"),
+        ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } => (502, "server_error"),
         ResolveError::Serialization(_) => (500, "server_error"),
     };
     let msg = err.to_string();
     debug!(error = %msg, "openai_mcp_tool_resolve rejected");
-    FilterAction::Reject(responses_error_rejection(status, error_type, &msg, streaming))
+    if streaming && is_mcp_listing_runtime_failure(err) {
+        ctx.insert_filter_state(PendingListToolsFailure {
+            server_label: failure_server_label(err).to_owned(),
+            error_type,
+            message: msg,
+            options: capture_echoed_options(body),
+        });
+        return FilterAction::Continue;
+    }
+    FilterAction::Reject(responses_error_rejection(status, error_type, &msg))
+}
+
+/// Compact descriptor of a deferred streaming `tools/list` runtime failure.
+///
+/// Stashed as per-filter state during the request-body pre-read and consumed
+/// once in the header phase to build the terminal SSE response. Holds only the
+/// small error-derived strings the lifecycle needs -- never the request or its
+/// body bytes.
+struct PendingListToolsFailure {
+    /// Client-visible label of the MCP server that failed.
+    server_label: String,
+
+    /// OpenAI error `code` (always `server_error` for runtime failures).
+    error_type: &'static str,
+
+    /// Client-safe failure message embedded in the terminal events.
+    message: String,
+
+    /// Size-bounded, credential-free subset of the caller's request options,
+    /// captured from the request body during the pre-read and echoed into the
+    /// synthesized failure snapshot. Captured here -- rather than read from
+    /// `ResponsesState` in the header phase -- so the caller's real options are
+    /// echoed even in a pipeline without
+    /// `openai_responses_validate`/`openai_responses_rehydrate` (which never
+    /// builds that state), and so a large `instructions`/`metadata` cannot be
+    /// amplified across the snapshots. `None` when the body is unparseable,
+    /// carries no echoable field, or the whitelisted subset exceeds
+    /// [`MAX_ECHOED_OPTIONS_BYTES`]; every echoed field then falls back to its
+    /// OpenAI API default.
+    options: Option<serde_json::Value>,
+}
+
+/// Extract the client-visible server label from a resolve error.
+fn failure_server_label(err: &ResolveError) -> &str {
+    match err {
+        ResolveError::Client { server_label, .. }
+        | ResolveError::ConnectorClient {
+            label: server_label, ..
+        } => server_label.as_str(),
+        _ => "unknown",
+    }
+}
+
+/// Return whether an MCP client error represents a discovery attempt that
+/// reached runtime I/O or response processing. Local request-policy failures
+/// such as SSRF blocking and malformed authorization retain their HTTP error.
+fn is_mcp_listing_runtime_failure(err: &ResolveError) -> bool {
+    let (ResolveError::Client { source, .. } | ResolveError::ConnectorClient { source, .. }) = err else {
+        return false;
+    };
+    matches!(
+        source,
+        mcp_client::McpClientError::Connection { .. }
+            | mcp_client::McpClientError::ListTools { .. }
+            | mcp_client::McpClientError::Timeout { .. }
+            | mcp_client::McpClientError::Serialization(_)
+            | mcp_client::McpClientError::TooManyTools { .. }
+    )
+}
+
+/// Request fields echoed into a synthesized discovery-failure snapshot, ordered
+/// by increasing potential size so the small fixed-size options are always
+/// captured and only a large trailing blob (`instructions`/`metadata`) can be
+/// dropped by the size bound. `input` and `tools` are intentionally excluded:
+/// they are not needed to describe the failure, and `tools` may carry per-entry
+/// MCP credentials that must never be persisted.
+const ECHOED_REQUEST_FIELDS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "tool_choice",
+    "truncation",
+    "model",
+    "reasoning",
+    "text",
+    "metadata",
+    "instructions",
+];
+
+/// Upper bound on the aggregate serialized size of the captured echo options.
+///
+/// The snapshot is embedded in three SSE frames (`response.created`,
+/// `response.in_progress`, `response.failed`) and published to
+/// `ResponsesState.response_object`, so every echoed byte is copied several
+/// times. A valid request may carry a multi-megabyte `instructions` or
+/// `metadata`; echoing it unbounded would amplify a 64 MiB request into hundreds
+/// of MiB. Capping the captured options keeps the synthesized failure bounded
+/// regardless of the request size. A field that would push the running total past
+/// this bound is omitted and falls back to its API default in the snapshot.
+const MAX_ECHOED_OPTIONS_BYTES: usize = 256 * 1024;
+
+/// An [`std::io::Write`] sink that counts bytes and discards them, used to
+/// measure a value's serialized JSON size without allocating a buffer for it.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialized JSON byte length of `value`, computed without materializing the
+/// serialized bytes so that measuring a large field never copies it.
+fn serialized_len(value: &serde_json::Value) -> usize {
+    let mut counter = ByteCounter(0);
+    // Serializing an in-memory `Value` (no non-string map keys, no non-finite
+    // floats) into a counting sink that never errors cannot fail. Should the
+    // impossible happen, report the value as maximally large so the caller skips
+    // (never echoes) it — fail-safe for the size bound rather than panicking.
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
+
+/// Extract the size-bounded, credential-free subset of request options echoed
+/// into a streaming discovery-failure snapshot.
+///
+/// Only [`ECHOED_REQUEST_FIELDS`] are copied (never `input`/`tools`), and a field
+/// is skipped once including it would push the aggregate past
+/// [`MAX_ECHOED_OPTIONS_BYTES`], so a large `instructions`/`metadata` cannot be
+/// amplified across the synthesized snapshots. Returns `None` when the body is
+/// unparseable or no whitelisted field survives, in which case the snapshot falls
+/// back to API defaults for every echoed field.
+fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = parsed.as_object()?;
+    let mut total = 0_usize;
+    let mut captured = serde_json::Map::new();
+    for &field in ECHOED_REQUEST_FIELDS {
+        let Some(value) = obj.get(field) else {
+            continue;
+        };
+        // Measure before cloning so an oversized field is never copied into the
+        // capture, and skip (rather than truncate) any field that would exceed
+        // the aggregate bound so the retained JSON stays well-formed.
+        let len = serialized_len(value);
+        if total.saturating_add(len) > MAX_ECHOED_OPTIONS_BYTES {
+            continue;
+        }
+        total += len;
+        captured.insert(field.to_owned(), value.clone());
+    }
+    (!captured.is_empty()).then_some(serde_json::Value::Object(captured))
+}
+
+/// Build the terminal HTTP 200 SSE response for a deferred MCP discovery
+/// failure.
+///
+/// Consumes the [`PendingListToolsFailure`] stashed during the body pre-read.
+/// A successful HTTP status is required for Responses SDKs to expose SSE events
+/// to callers; the terminal `response.failed` event carries the request failure
+/// instead. Emitting as a `TerminalResponse` (rather than `Reject`) runs the
+/// already-executed request-phase filters on the response path, so
+/// `openai_stream_events` accumulates the failure and `openai_response_store`
+/// persists it for later retrieval when `store` is enabled.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the complete local Responses failure lifecycle is easier to audit in event order"
+)]
+fn build_list_tools_failure_response(
+    ctx: &mut HttpFilterContext<'_>,
+    pending: &PendingListToolsFailure,
+) -> TerminalResponse {
+    let server_label = pending.server_label.as_str();
+    let error_type = pending.error_type;
+    let message = pending.message.as_str();
+    // Effective storage mirrors the store filter's own gate exactly: persist
+    // unless the caller set `store: false`. Explicit-true and omitted both store
+    // (the OpenAI default). `openai_stream_events` accumulates this failure into
+    // `ResponsesState` and `openai_response_store` persists it, so this flag must
+    // match what the caller observes on retrieval.
+    let store = ctx.get_metadata("openai_responses_format.store") != Some("false");
+    let response_id = ctx
+        .get_metadata("responses.response_id")
+        .or_else(|| {
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.response_id.as_deref())
+        })
+        .map_or_else(
+            || format!("resp_{}", ctx.id_generator.generate(ctx.time_source)),
+            ToOwned::to_owned,
+        );
+    let item_id = format!("mcpl_{}", ctx.id_generator.generate(ctx.time_source));
+    let created_at = ctx.time_source.now().as_secs();
+    // Size-bounded, credential-free request options captured from the request
+    // body during the pre-read (see `capture_echoed_options`). The failure
+    // resource echoes these parameters (see `discovery_response`) so a persisted
+    // or streamed failure reports the same configuration a real Responses object
+    // would. Sourcing them from the captured descriptor -- rather than
+    // `ResponsesState.request_body` -- keeps fidelity correct even in a pipeline
+    // without `openai_responses_validate`/`openai_responses_rehydrate` (which
+    // never builds that state), and bounds the size so a large
+    // `instructions`/`metadata` is not amplified across the snapshots. `None` (no
+    // echoable field, or over the cap) falls back to API defaults.
+    let options = pending.options.as_ref();
+    // Echo the requested model, matching a real Responses stream. The format
+    // filter promotes it to metadata before this filter runs, so it is present
+    // even when no `ResponsesState` was built (e.g. no validate/rehydrate in the
+    // pipeline); fall back to the captured options, then to an empty string.
+    let model = ctx
+        .get_metadata("openai_responses_format.model")
+        .or_else(|| {
+            options
+                .and_then(|body| body.get("model"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default();
+
+    let params = DiscoveryResponseParams {
+        response_id: &response_id,
+        created_at,
+        model,
+        store,
+        request: options,
+    };
+    let response = discovery_response(&params, DiscoveryResponseState::InProgress);
+    let pending_item = serde_json::json!({
+        "id": item_id,
+        "type": "mcp_list_tools",
+        "server_label": server_label,
+        "tools": [],
+        "error": null,
+    });
+    let mut body = Vec::new();
+
+    // Each lifecycle event embeds a response snapshot. `json!` takes `response`
+    // by reference (so the same value is reused across the created/in_progress
+    // frames without a `.clone()` at the call site), but interpolating a `Value`
+    // deep-copies it into each frame via `serde_json::to_value`. This is a cold,
+    // one-shot local failure path, so the extra copies are immaterial. The
+    // snapshot echoes the caller's request parameters (see `discovery_response`);
+    // request `input` and `tools` are intentionally absent, the latter because
+    // MCP entries can carry per-entry credentials that must not be persisted.
+    append_sse_event(
+        "response.created",
+        &serde_json::json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": response,
+        }),
+        &mut body,
+    );
+    append_sse_event(
+        "response.in_progress",
+        &serde_json::json!({
+            "type": "response.in_progress",
+            "sequence_number": 1,
+            "response": response,
+        }),
+        &mut body,
+    );
+    append_sse_event(
+        "response.output_item.added",
+        &serde_json::json!({
+            "type": "response.output_item.added",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": pending_item,
+        }),
+        &mut body,
+    );
+    append_sse_event(
+        "response.mcp_list_tools.in_progress",
+        &serde_json::json!({
+            "type": "response.mcp_list_tools.in_progress",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item_id": item_id,
+        }),
+        &mut body,
+    );
+
+    append_sse_event(
+        "response.mcp_list_tools.failed",
+        &serde_json::json!({
+            "type": "response.mcp_list_tools.failed",
+            "sequence_number": 4,
+            "output_index": 0,
+            "item_id": item_id,
+        }),
+        &mut body,
+    );
+    let failed_item = serde_json::json!({
+        "id": item_id,
+        "type": "mcp_list_tools",
+        "server_label": server_label,
+        "tools": [],
+        "error": message,
+    });
+    append_sse_event(
+        "response.output_item.done",
+        &serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 5,
+            "output_index": 0,
+            "item": failed_item,
+        }),
+        &mut body,
+    );
+
+    let response = discovery_response(
+        &params,
+        DiscoveryResponseState::Failed {
+            error_type,
+            message,
+            item: &failed_item,
+        },
+    );
+    append_sse_event(
+        "response.failed",
+        &serde_json::json!({
+            "type": "response.failed",
+            "sequence_number": 6,
+            "response": response,
+        }),
+        &mut body,
+    );
+
+    // Publish the terminal failed resource directly into the shared state so
+    // `openai_response_store` can persist it. Streaming persistence reads
+    // `ResponsesState.response_object`, which is normally populated by
+    // `openai_stream_events` accumulating the terminal frame on the response
+    // phase. But this filter's short-circuiting `TerminalResponse` means any
+    // filter ordered *after* it never runs on the response phase, so persistence
+    // cannot rely on `openai_stream_events` to populate the field:
+    //   * In `agentic-loop.yaml`, `openai_stream_events` is nested in the iterative_request_router that follows this
+    //     filter, so it never runs.
+    //   * A pipeline with `openai_response_store` + this filter but without
+    //     `openai_responses_validate`/`openai_responses_rehydrate` never builds a `ResponsesState` up front, yet still
+    //     persists purely from `response_object` (the store reads only that field, not `request_body`).
+    // `get_or_insert_with` therefore both creates the state when absent and
+    // writes the snapshot, making persistence independent of pipeline ordering
+    // and of which upstream filters ran. When `openai_stream_events` *does* run
+    // on the response phase it overwrites this with the identical snapshot parsed
+    // from the same terminal frame (a full overwrite, not an append), so this
+    // write is a harmless no-op in that ordering. The echoed options borrow
+    // `pending` (not `ctx`) and the `model` metadata borrow of `ctx` both ended
+    // with the final `discovery_response` call above, so the snapshot is moved
+    // into state here without a clone.
+    ctx.extensions
+        .get_or_insert_with(ResponsesState::default)
+        .response_object = response;
+
+    // Emit as a header-phase `TerminalResponse`, not a `Reject`. A terminal
+    // response preserves downstream keepalive (this is a successful 200 transport
+    // of a failure, so it must pool like any normal Responses stream) and runs
+    // the response-phase filters that already executed in the request phase. That
+    // response-phase pass is the point: `openai_stream_events` accumulates the
+    // terminal `response.failed` into `ResponsesState` and `openai_response_store`
+    // persists it, so a caller with `store` enabled can retrieve the failed
+    // response afterwards. The failure was stashed during the body pre-read and
+    // this response is built once here in the header phase, after the full request
+    // body was consumed, so upstream routing and I/O are skipped.
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/event-stream"),
+    );
+    TerminalResponse::new(200)
+        .with_headers(headers)
+        .with_body(Bytes::from(body))
+}
+
+/// Lifecycle stage a discovery-failure response snapshot represents.
+///
+/// The same locally generated response resource is emitted twice: once while
+/// the MCP listing is in progress and once after it fails.
+#[derive(Clone, Copy)]
+enum DiscoveryResponseState<'a> {
+    /// Listing still in progress; `status: "in_progress"`, no error or output.
+    InProgress,
+
+    /// Listing failed; `status: "failed"` with an error object and the failed
+    /// `mcp_list_tools` output item.
+    Failed {
+        /// OpenAI error `code` (e.g. `server_error`).
+        error_type: &'a str,
+
+        /// Client-safe failure message.
+        message: &'a str,
+
+        /// The failed `mcp_list_tools` output item to place in `output`.
+        item: &'a serde_json::Value,
+    },
+}
+
+/// Fixed inputs shared by every discovery-failure snapshot, independent of the
+/// lifecycle [`DiscoveryResponseState`]. Bundled so the snapshot can be built
+/// twice (in-progress and failed) from a single construction.
+struct DiscoveryResponseParams<'a> {
+    /// Stable response id echoed in every frame.
+    response_id: &'a str,
+
+    /// Response creation timestamp (unix seconds).
+    created_at: u64,
+
+    /// Requested model, echoed to match a real Responses stream.
+    model: &'a str,
+
+    /// Effective storage flag advertised on the snapshot.
+    store: bool,
+
+    /// Size-bounded, credential-free capture of the caller's request options;
+    /// its parameters are echoed into the snapshot. `None` (unparseable body, no
+    /// echoable field, or over the size cap) falls back to the API defaults.
+    request: Option<&'a serde_json::Value>,
+}
+
+/// Construct the minimal schema-complete response shared by the lifecycle
+/// events emitted for local MCP discovery failures.
+#[expect(clippy::too_many_lines, reason = "minimal Responses resource schema")]
+fn discovery_response(params: &DiscoveryResponseParams<'_>, state: DiscoveryResponseState<'_>) -> serde_json::Value {
+    let &DiscoveryResponseParams {
+        response_id,
+        created_at,
+        model,
+        store,
+        request,
+    } = params;
+    let (status, error, output) = match state {
+        DiscoveryResponseState::InProgress => {
+            ("in_progress", serde_json::Value::Null, serde_json::Value::Array(vec![]))
+        },
+        DiscoveryResponseState::Failed {
+            error_type,
+            message,
+            item,
+        } => (
+            "failed",
+            serde_json::json!({"code": error_type, "message": message}),
+            serde_json::json!([item]),
+        ),
+    };
+    // Echo the caller-supplied request parameters so the persisted or streamed
+    // failure reports the same configuration a successful Responses object would;
+    // otherwise a caller who set e.g. `temperature: 0.2` would retrieve a stored
+    // failure claiming the default `1.0`. Absent the field (or the captured
+    // options) each falls back to the OpenAI API default. Request `input` and
+    // `tools` are deliberately omitted -- they are not needed to describe the
+    // failure and `tools` may carry per-entry MCP credentials that must not be
+    // persisted.
+    let echo = |field: &str, default: serde_json::Value| -> serde_json::Value {
+        request.and_then(|body| body.get(field)).cloned().unwrap_or(default)
+    };
+    serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "completed_at": null,
+        "status": status,
+        "error": error,
+        "incomplete_details": null,
+        "instructions": echo("instructions", serde_json::Value::Null),
+        "max_output_tokens": echo("max_output_tokens", serde_json::Value::Null),
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": echo("parallel_tool_calls", serde_json::Value::Bool(true)),
+        "previous_response_id": echo("previous_response_id", serde_json::Value::Null),
+        "reasoning": echo("reasoning", serde_json::Value::Null),
+        "store": store,
+        "temperature": echo("temperature", serde_json::json!(1.0)),
+        "text": echo("text", serde_json::json!({"format": {"type": "text"}})),
+        "tool_choice": echo("tool_choice", serde_json::json!("auto")),
+        "tools": [],
+        "top_p": echo("top_p", serde_json::json!(1.0)),
+        "truncation": echo("truncation", serde_json::json!("disabled")),
+        "usage": null,
+        "metadata": echo("metadata", serde_json::json!({})),
+    })
+}
+
+/// Serialize one named SSE frame.
+fn append_sse_event(event_type: &str, payload: &serde_json::Value, output: &mut Vec<u8>) {
+    output.extend_from_slice(b"event: ");
+    output.extend_from_slice(event_type.as_bytes());
+    output.extend_from_slice(b"\ndata: ");
+    output.extend_from_slice(payload.to_string().as_bytes());
+    output.extend_from_slice(b"\n\n");
 }
 
 /// Return the `server_url` if the entry should be eagerly
@@ -701,7 +1249,10 @@ async fn fetch_tools(
         allow_loopback,
     )
     .await
-    .map_err(ResolveError::Client)
+    .map_err(|source| ResolveError::Client {
+        server_label: server_label(entry).to_owned(),
+        source,
+    })
 }
 
 /// Rewrite the request body, replacing resolved `type: "mcp"`
@@ -1042,6 +1593,16 @@ fn mcp_tool_to_function_tool(label: &str, definition: &serde_json::Value) -> ser
     let encoded_name = encode_function_name(label, tool_name);
 
     let description = definition.get("description").cloned();
+    // Carry the MCP `inputSchema` into `parameters` verbatim, accepting both
+    // the camelCase spelling from a fresh `tools/list` and the snake_case
+    // `input_schema` spelling stored in a cached `mcp_list_tools` listing so
+    // both provenances rewrite identically.
+    //
+    // The Responses function-tool format has slots only for
+    // `type`/`name`/`description`/`parameters`; an MCP `outputSchema` has no
+    // representation here and is intentionally dropped rather than silently
+    // lost downstream. The model still receives the tool's actual result
+    // content at dispatch time, so the output contract is unaffected.
     let parameters = definition
         .get("inputSchema")
         .or_else(|| definition.get("input_schema"))
@@ -1087,6 +1648,64 @@ pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
         sanitized
     } else {
         sanitized.chars().take(MAX_FUNCTION_NAME_LEN).collect()
+    }
+}
+
+/// Reverse lookup for model-facing MCP function names.
+///
+/// Building this once per filter phase avoids repeatedly encoding every
+/// resolved `(server_label, tool_name)` pair for each model-emitted call.
+/// Lossy name collisions remain explicit so dispatch can fail closed.
+pub(crate) struct McpToolIndex<'a> {
+    /// Encoded function names mapped to their unique entry or collision count.
+    entries: HashMap<String, McpToolMatch<'a>>,
+}
+
+/// Resolution state for one encoded MCP function name.
+#[derive(Clone, Copy)]
+pub(crate) enum McpToolMatch<'a> {
+    /// Exactly one resolved MCP tool owns the encoded name.
+    Unique {
+        /// Original `(server_label, tool_name)` key.
+        key: &'a (String, String),
+        /// Resolved dispatch metadata.
+        entry: &'a serde_json::Value,
+    },
+    /// Multiple tools collapsed to the same lossy encoded name.
+    Ambiguous {
+        /// Number of colliding tools.
+        count: usize,
+    },
+}
+
+impl<'a> McpToolIndex<'a> {
+    /// Build a reverse index for one resolved MCP tool map.
+    pub(crate) fn new(tool_map: &'a HashMap<(String, String), serde_json::Value>) -> Self {
+        let mut entries = HashMap::with_capacity(tool_map.len());
+        for (key @ (label, tool_name), entry) in tool_map {
+            let encoded_name = encode_function_name(label, tool_name);
+            entries
+                .entry(encoded_name)
+                .and_modify(|existing| {
+                    let count = match existing {
+                        McpToolMatch::Unique { .. } => 2,
+                        McpToolMatch::Ambiguous { count } => count.saturating_add(1),
+                    };
+                    *existing = McpToolMatch::Ambiguous { count };
+                })
+                .or_insert(McpToolMatch::Unique { key, entry });
+        }
+        Self { entries }
+    }
+
+    /// Return whether any resolved MCP tool owns `encoded_name`.
+    pub(crate) fn contains(&self, encoded_name: &str) -> bool {
+        self.entries.contains_key(encoded_name)
+    }
+
+    /// Return the unique entry or collision state for `encoded_name`.
+    pub(crate) fn get(&self, encoded_name: &str) -> Option<McpToolMatch<'a>> {
+        self.entries.get(encoded_name).copied()
     }
 }
 

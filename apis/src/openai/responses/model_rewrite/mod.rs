@@ -125,17 +125,13 @@ impl ModelRewriteFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let streaming = ctx
-            .get_metadata("openai_responses_format.stream")
-            .is_some_and(|v| v == "true");
-
         let mut value: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
-            Err(_) => return Ok(invalid_body_action(self.on_invalid, streaming)),
+            Err(_) => return Ok(invalid_body_action(self.on_invalid)),
         };
 
         let Some(obj) = value.as_object_mut() else {
-            return Ok(invalid_body_action(self.on_invalid, streaming));
+            return Ok(invalid_body_action(self.on_invalid));
         };
 
         let result = apply_rewrite(obj, &self.model_aliases, self.default_model.as_deref());
@@ -487,14 +483,13 @@ fn set_filter_result(
 }
 
 /// Map [`OnInvalidBehavior`] to the appropriate [`FilterAction`].
-fn invalid_body_action(behavior: OnInvalidBehavior, streaming: bool) -> FilterAction {
+fn invalid_body_action(behavior: OnInvalidBehavior) -> FilterAction {
     match behavior {
         OnInvalidBehavior::Continue => FilterAction::Continue,
         OnInvalidBehavior::Reject => FilterAction::Reject(responses_error_rejection(
             400,
             "invalid_request_error",
             "invalid JSON body",
-            streaming,
         )),
     }
 }

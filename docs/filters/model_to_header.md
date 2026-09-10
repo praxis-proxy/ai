@@ -9,7 +9,7 @@ Promotes the JSON `"model"` field from the request body to a request header.
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `header` | string | no | Header name for the promoted model value. |
+| `header` | string | no | Header name for the promoted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or internal `x-praxis-*` header. Defaults to `X-Model`. |
 
 ## Example
 

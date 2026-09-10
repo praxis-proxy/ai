@@ -13,11 +13,11 @@ use tracing::info;
 use super::{
     pool::{PoolConfig, apply_pool_config},
     schemas::{
-        ColumnCheck, SCHEMA_VERSION, TableNames, VERSION_COLUMNS, check_column_presence, expected_table_columns,
-        generate_ddl, schema_version_table,
+        ColumnCheck, PENDING_APPROVALS_COLUMNS, SCHEMA_VERSION, TableNames, VERSION_COLUMNS, check_column_presence,
+        expected_table_columns, generate_ddl, pending_approvals_table, schema_version_table,
     },
     trait_def::{ConversationItemStore, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, ResponseRecord, StoreError},
+    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -208,8 +208,9 @@ async fn table_column_names(pool: &SqlitePool, table: &str) -> Result<Vec<String
 /// Query column metadata for each table and verify expected columns exist.
 async fn validate_schema(pool: &SqlitePool, tables: &TableNames) -> Result<(), StoreError> {
     let version_table = schema_version_table(&tables.responses);
+    let approvals_table = pending_approvals_table(&tables.responses);
     let expected = expected_table_columns(tables);
-    let mut results = Vec::with_capacity(expected.len() + 1);
+    let mut results = Vec::with_capacity(expected.len() + 2);
 
     for (table_name, expected_cols) in &expected {
         results.push((*table_name, *expected_cols, table_column_names(pool, table_name).await?));
@@ -218,6 +219,11 @@ async fn validate_schema(pool: &SqlitePool, tables: &TableNames) -> Result<(), S
         version_table.as_str(),
         VERSION_COLUMNS,
         table_column_names(pool, &version_table).await?,
+    ));
+    results.push((
+        approvals_table.as_str(),
+        PENDING_APPROVALS_COLUMNS,
+        table_column_names(pool, &approvals_table).await?,
     ));
 
     let refs: Vec<ColumnCheck<'_>> = results
@@ -305,14 +311,36 @@ impl ResponseStore for SqliteResponseStore {
     }
 
     async fn delete_response(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError> {
-        let sql = format!("DELETE FROM {} WHERE id = ? AND tenant_id = ?", self.tables.responses);
+        let delete_response_sql = format!("DELETE FROM {} WHERE id = ? AND tenant_id = ?", self.tables.responses);
+        // Any pending approvals this response issued must go with it, so a
+        // deleted response leaves no consumable approval behind and retains no
+        // sensitive tool arguments. Both deletes commit atomically.
+        let delete_approvals_sql = format!(
+            "DELETE FROM {} WHERE tenant_id = ? AND response_id = ?",
+            pending_approvals_table(&self.tables.responses)
+        );
 
-        let result = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .bind(id)
-            .bind(tenant_id)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        let result = sqlx::query(AssertSqlSafe(delete_response_sql.as_str()))
+            .bind(id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlx::query(AssertSqlSafe(delete_approvals_sql.as_str()))
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -323,6 +351,190 @@ impl ResponseStore for SqliteResponseStore {
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         self.get_conversation_record(tenant_id, conversation_id).await
+    }
+
+    async fn record_pending_approvals(
+        &self,
+        tenant_id: &str,
+        response_id: &str,
+        records: &[PendingApprovalRecord],
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let sql = pending_approval_insert_sql(&self.tables.responses);
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        for record in records {
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(tenant_id)
+                .bind(response_id)
+                .bind(&record.approval_id)
+                .bind(&record.server_label)
+                .bind(&record.tool_name)
+                .bind(&record.arguments)
+                .bind(&record.target_fingerprint)
+                .bind(created_at)
+                .bind(Option::<i64>::None)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_lines, reason = "sequential per-record bind within a transaction")]
+    async fn persist_response_with_pending_approvals(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<(), StoreError> {
+        // No approvals: nothing to make atomic, so take the plain upsert path.
+        if pending_approvals.is_empty() {
+            return self.upsert_response(record).await;
+        }
+
+        let response_object =
+            serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let input = serde_json::to_string(&record.input).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+        let upsert_sql = format!(
+            "INSERT OR REPLACE INTO {} \
+             (id, tenant_id, created_at, model, response_object, input, messages) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.tables.responses
+        );
+        let approval_sql = pending_approval_insert_sql(&self.tables.responses);
+
+        // One transaction so the response and its pending approvals commit
+        // together or not at all. Serialized against delete_response, this closes
+        // the window where a concurrent DELETE could land between the two writes
+        // and orphan an approval row still holding the tool arguments.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlx::query(AssertSqlSafe(upsert_sql.as_str()))
+            .bind(&record.id)
+            .bind(&record.tenant_id)
+            .bind(record.created_at)
+            .bind(&record.model)
+            .bind(&response_object)
+            .bind(&input)
+            .bind(&messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        for approval in pending_approvals {
+            sqlx::query(AssertSqlSafe(approval_sql.as_str()))
+                .bind(&record.tenant_id)
+                .bind(&record.id)
+                .bind(&approval.approval_id)
+                .bind(&approval.server_label)
+                .bind(&approval.tool_name)
+                .bind(&approval.arguments)
+                .bind(&approval.target_fingerprint)
+                .bind(record.created_at)
+                .bind(Option::<i64>::None)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_pending_approvals(
+        &self,
+        tenant_id: &str,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+        if approval_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = pending_approvals_table(&self.tables.responses);
+        let placeholders = std::iter::repeat_n("?", approval_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT approval_id, server_label, tool_name, arguments, target_fingerprint \
+             FROM {table} \
+             WHERE tenant_id = ? AND response_id = ? AND approval_id IN ({placeholders})"
+        );
+
+        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(tenant_id)
+            .bind(response_id);
+        for approval_id in approval_ids {
+            query = query.bind(*approval_id);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        rows.iter().map(row_to_pending_approval_record).collect()
+    }
+
+    async fn consume_approvals(
+        &self,
+        tenant_id: &str,
+        response_id: &str,
+        approval_ids: &[&str],
+        consumed_at: i64,
+    ) -> Result<Option<usize>, StoreError> {
+        if approval_ids.is_empty() {
+            return Ok(None);
+        }
+        let table = pending_approvals_table(&self.tables.responses);
+        // Conditional transition outstanding->consumed, scoped to the issuing
+        // response. Callers looked the rows up first under the same response_id,
+        // so a zero-row update means the approval was already consumed rather
+        // than never issued.
+        let sql = format!(
+            "UPDATE {table} SET consumed_at = ? \
+             WHERE tenant_id = ? AND response_id = ? AND approval_id = ? AND consumed_at IS NULL"
+        );
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        for (index, approval_id) in approval_ids.iter().enumerate() {
+            let result = sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(consumed_at)
+                .bind(tenant_id)
+                .bind(response_id)
+                .bind(*approval_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            if result.rows_affected() == 0 {
+                // Already consumed by a prior request, or a duplicate earlier
+                // in this batch. Roll back so no id in the batch is claimed.
+                tx.rollback().await.map_err(|e| StoreError::Database(e.to_string()))?;
+                return Ok(Some(index));
+            }
+        }
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(None)
     }
 }
 
@@ -849,6 +1061,42 @@ async fn sqlite_rebuild_messages(
 // -----------------------------------------------------------------------------
 // Row Conversion
 // -----------------------------------------------------------------------------
+
+/// Build the insert-if-absent SQL for recording pending approvals.
+///
+/// `ON CONFLICT DO NOTHING` guarantees a re-emit never resets `consumed_at` back
+/// to outstanding, so an already-consumed approval can never be replayed.
+fn pending_approval_insert_sql(responses_table: &str) -> String {
+    let table = pending_approvals_table(responses_table);
+    format!(
+        "INSERT INTO {table} \
+         (tenant_id, response_id, approval_id, server_label, tool_name, arguments, target_fingerprint, created_at, \
+         consumed_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (tenant_id, response_id, approval_id) DO NOTHING"
+    )
+}
+
+/// Convert a sqlx row to a [`PendingApprovalRecord`].
+fn row_to_pending_approval_record(row: &sqlx::sqlite::SqliteRow) -> Result<PendingApprovalRecord, StoreError> {
+    Ok(PendingApprovalRecord {
+        approval_id: row
+            .try_get("approval_id")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+        server_label: row
+            .try_get("server_label")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+        tool_name: row
+            .try_get("tool_name")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+        arguments: row
+            .try_get("arguments")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+        target_fingerprint: row
+            .try_get("target_fingerprint")
+            .map_err(|e| StoreError::Database(e.to_string()))?,
+    })
+}
 
 /// Convert a sqlx row to a [`ResponseRecord`].
 fn row_to_response_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResponseRecord, StoreError> {

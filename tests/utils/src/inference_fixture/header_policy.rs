@@ -167,10 +167,7 @@ pub(super) fn headers_contain_configured_credential(configured: &HeaderMap, resp
 
 /// Returns whether a header name is known to carry credentials.
 pub(super) fn is_credential_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key" | "api-key" | "x-goog-api-key"
-    )
+    praxis_ai_apis::promotion::is_credential_header(name)
 }
 
 /// Returns whether a header uses the HTTP authorization value grammar.
@@ -378,6 +375,7 @@ mod tests {
             ("X-Api-Key".to_owned(), vec!["secret".to_owned()]),
             ("Api-Key".to_owned(), vec!["secret".to_owned()]),
             ("X-Goog-Api-Key".to_owned(), vec!["secret".to_owned()]),
+            ("WWW-Authenticate".to_owned(), vec!["Bearer".to_owned()]),
             ("X-Safe".to_owned(), vec!["first".to_owned(), "second".to_owned()]),
             (
                 "X-Request-Id".to_owned(),
@@ -408,6 +406,7 @@ mod tests {
             "x-api-key",
             "api-key",
             "x-goog-api-key",
+            "www-authenticate",
         ] {
             assert!(!transport.contains_key(removed), "transport retained {removed}");
         }
@@ -430,6 +429,7 @@ mod tests {
             "x-api-key",
             "api-key",
             "x-goog-api-key",
+            "www-authenticate",
         ] {
             assert!(!fixture.contains_key(removed), "fixture retained {removed}");
         }

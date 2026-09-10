@@ -5,10 +5,7 @@
 
 use praxis_filter::{
     FilterError,
-    builtins::http::payload_processing::{
-        OnInvalidBehavior,
-        config_validation::{validate_header_name, validate_max_body_bytes},
-    },
+    builtins::http::payload_processing::{OnInvalidBehavior, config_validation::validate_max_body_bytes},
 };
 use serde::Deserialize;
 
@@ -68,6 +65,10 @@ pub(crate) struct HeaderValidation {
 // -----------------------------------------------------------------------------
 
 /// Promoted header names for MCP metadata.
+///
+/// Transport, credential, API-key, and other internal `x-praxis-*` names
+/// are rejected. Each field may use its dedicated `x-praxis-mcp-*` default
+/// or a custom non-`x-praxis-*` header.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpHeaders {
@@ -158,6 +159,10 @@ pub(crate) struct McpConfig {
     pub header_validation: HeaderValidation,
 
     /// Header names for MCP metadata promotion.
+    ///
+    /// Must not be hop-by-hop, framing, Host, credential, API-key, or
+    /// other internal `x-praxis-*` names. Dedicated `x-praxis-mcp-*`
+    /// defaults remain allowed.
     #[serde(default)]
     pub headers: McpHeaders,
 
@@ -182,10 +187,33 @@ fn default_max_body_bytes() -> usize {
 /// Validate and build the final configuration.
 pub(crate) fn build_config(cfg: McpConfig) -> Result<McpConfig, FilterError> {
     validate_max_body_bytes("mcp", cfg.max_body_bytes)?;
-    validate_header_name("mcp", "method", cfg.headers.method.as_deref())?;
-    validate_header_name("mcp", "name", cfg.headers.name.as_deref())?;
-    validate_header_name("mcp", "kind", cfg.headers.kind.as_deref())?;
-    validate_header_name("mcp", "protocol_version", cfg.headers.protocol_version.as_deref())?;
-    validate_header_name("mcp", "session_present", cfg.headers.session_present.as_deref())?;
+    validate_mcp_promotion_header("method", cfg.headers.method.as_deref(), "x-praxis-mcp-method")?;
+    validate_mcp_promotion_header("name", cfg.headers.name.as_deref(), "x-praxis-mcp-name")?;
+    validate_mcp_promotion_header("kind", cfg.headers.kind.as_deref(), "x-praxis-mcp-kind")?;
+    validate_mcp_promotion_header(
+        "protocol_version",
+        cfg.headers.protocol_version.as_deref(),
+        "x-praxis-mcp-protocol-version",
+    )?;
+    validate_mcp_promotion_header(
+        "session_present",
+        cfg.headers.session_present.as_deref(),
+        "x-praxis-mcp-session-present",
+    )?;
+    praxis_ai_apis::promotion::reject_duplicate_promotion_fields(
+        "mcp",
+        &[
+            ("method", cfg.headers.method.as_deref()),
+            ("name", cfg.headers.name.as_deref()),
+            ("kind", cfg.headers.kind.as_deref()),
+            ("protocol_version", cfg.headers.protocol_version.as_deref()),
+            ("session_present", cfg.headers.session_present.as_deref()),
+        ],
+    )?;
     Ok(cfg)
+}
+
+/// Validate an MCP body-derived promotion header.
+fn validate_mcp_promotion_header(field: &str, name: Option<&str>, dedicated: &str) -> Result<(), FilterError> {
+    praxis_ai_apis::promotion::validate_dedicated_promotion_header("mcp", field, name, &[dedicated])
 }

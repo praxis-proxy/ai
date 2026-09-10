@@ -1769,6 +1769,122 @@ fn mcp_tool_to_function_tool_prefers_input_schema_camel_case() {
     );
 }
 
+/// A complex `inputSchema` (`$ref`, `$defs`, `anyOf`, nested objects) is
+/// carried into `parameters` verbatim, not sanitized or flattened. The
+/// rewrite is a blind whole-value clone, and this pins that contract so a
+/// future schema-walking regression cannot silently drop JSON Schema
+/// constructs the backend needs to constrain tool arguments.
+#[test]
+fn mcp_tool_to_function_tool_preserves_nested_schema_verbatim() {
+    let input_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "shape": {"$ref": "#/$defs/shape"},
+            "mode": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "nested": {"type": "object", "additionalProperties": false,
+                       "properties": {"deep": {"type": "array", "items": {"type": "integer"}}}}
+        },
+        "required": ["shape"],
+        "additionalProperties": false,
+        "$defs": {
+            "shape": {"type": "object", "required": ["kind"],
+                      "properties": {"kind": {"type": "string"}}}
+        }
+    });
+    let definition = serde_json::json!({
+        "name": "complex_tool",
+        "description": "Uses a nested schema",
+        "inputSchema": input_schema,
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert_eq!(
+        function_tool["parameters"], input_schema,
+        "nested $ref/$defs/anyOf inputSchema must survive the rewrite bit-for-bit"
+    );
+}
+
+/// `outputSchema` has no slot in the Responses function-tool format and is
+/// intentionally dropped by the rewrite. This pins the drop so it stays a
+/// deliberate decision rather than an accident: the emitted tool carries
+/// only `type`/`name`/`description`/`parameters`.
+#[test]
+fn mcp_tool_to_function_tool_drops_output_schema() {
+    let definition = serde_json::json!({
+        "name": "structured_tool",
+        "description": "Returns structured output",
+        "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}},
+        "outputSchema": {"type": "object", "required": ["answer"],
+                         "properties": {"answer": {"type": "string"}}}
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert!(
+        function_tool.get("outputSchema").is_none(),
+        "outputSchema has no function-tool slot and must be dropped"
+    );
+    assert!(
+        function_tool.get("output_schema").is_none(),
+        "snake_case output_schema must also be absent"
+    );
+    let obj = function_tool.as_object().expect("function tool is an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["description", "name", "parameters", "type"],
+        "function tool carries only the Responses-supported fields"
+    );
+}
+
+/// Fresh discovery and cached continuation must rewrite the same logical tool
+/// to the identical function tool.
+///
+/// A fresh `tools/list` callout serializes schemas with the `camelCase`
+/// `inputSchema` spelling, while a cached `mcp_list_tools` listing carries the
+/// `snake_case` `input_schema` spelling. Both provenances funnel through
+/// [`mcp_tool_to_function_tool`] in `build_entry_resolution`, so the same tool
+/// must produce byte-equivalent parameters regardless of which path resolved
+/// it — otherwise a cache hit could hand the model a different tool contract
+/// than a fresh discovery of the same server.
+#[test]
+fn mcp_tool_to_function_tool_fresh_and_cached_schemas_are_equivalent() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "shape": {"$ref": "#/$defs/shape"},
+            "mode": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "tags": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["shape"],
+        "additionalProperties": false,
+        "$defs": {"shape": {"type": "object", "properties": {"kind": {"type": "string"}}}}
+    });
+
+    // Fresh discovery: rmcp serializes `tools/list` with camelCase `inputSchema`.
+    let fresh = serde_json::json!({
+        "name": "lookup", "description": "Look something up", "inputSchema": schema,
+    });
+    // Cached continuation: stored `mcp_list_tools` items carry snake_case.
+    let cached = serde_json::json!({
+        "name": "lookup", "description": "Look something up", "input_schema": schema,
+    });
+
+    let fresh_tool = mcp_tool_to_function_tool("srv", &fresh);
+    let cached_tool = mcp_tool_to_function_tool("srv", &cached);
+
+    assert_eq!(
+        fresh_tool, cached_tool,
+        "fresh discovery and cached continuation must rewrite to the identical function tool"
+    );
+    assert_eq!(
+        fresh_tool["parameters"], schema,
+        "the shared rewrite must preserve the complex schema verbatim on both paths"
+    );
+}
+
 // =========================================================================
 // Function Name Encoding
 // =========================================================================
@@ -2657,11 +2773,13 @@ async fn expanded_body_at_exact_limit_continues() {
 /// `BodyTooLarge` maps to HTTP 413 with `invalid_request_error`.
 #[test]
 fn body_too_large_maps_to_413() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
     let err = ResolveError::BodyTooLarge {
         actual: 1_000_000,
         limit: 65_536,
     };
-    let action = resolve_error_rejection(&err, false);
+    let action = resolve_error_action(&mut ctx, &err, false, b"{}");
     let rejection = match action {
         FilterAction::Reject(r) => r,
         other => panic!("expected Reject, got {other:?}"),
@@ -3238,7 +3356,10 @@ fn redact_connector_client_error_replaces_url() {
     let client_err = mcp_client::McpClientError::Connection {
         url: mcp_client::McpDisplayUrl::from_uri(&uri),
     };
-    let result: Result<Option<Vec<serde_json::Value>>, ResolveError> = Err(ResolveError::Client(client_err));
+    let result: Result<Option<Vec<serde_json::Value>>, ResolveError> = Err(ResolveError::Client {
+        server_label: "drive".to_owned(),
+        source: client_err,
+    });
 
     let redacted = redact_connector_client_error(result, &entry);
     let err = redacted.unwrap_err();
@@ -3262,12 +3383,15 @@ fn redact_connector_client_error_passes_through_direct_url() {
     let client_err = mcp_client::McpClientError::Connection {
         url: mcp_client::McpDisplayUrl::from_uri(&uri),
     };
-    let result: Result<Option<Vec<serde_json::Value>>, ResolveError> = Err(ResolveError::Client(client_err));
+    let result: Result<Option<Vec<serde_json::Value>>, ResolveError> = Err(ResolveError::Client {
+        server_label: "drive".to_owned(),
+        source: client_err,
+    });
 
     let redacted = redact_connector_client_error(result, &entry);
     let err = redacted.unwrap_err();
     assert!(
-        matches!(err, ResolveError::Client(_)),
+        matches!(err, ResolveError::Client { .. }),
         "direct URL errors should not be redacted"
     );
 }
@@ -3462,4 +3586,691 @@ async fn zero_permitted_tools_does_not_leak_credentials_to_backend() {
         serde_json::json!([]),
         "all tools filtered out → empty tools array"
     );
+}
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "full Responses lifecycle assertions")]
+async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    drop(listener);
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("allow_loopback: true\ntimeout_ms: 1000").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    // Per-filter state (the deferred-failure stash) is keyed by the filter's
+    // pipeline index, which the real pre-read machinery sets. Emulate it so the
+    // body-phase stash survives into the header phase.
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("responses.response_id", "resp_listing_failure");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": server_url,
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.response_id = Some("resp_listing_failure".to_owned());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    // The body phase defers: a `TerminalResponse` returned here would be swallowed
+    // as `Continue`, so the runtime failure is stashed and `Continue` returned.
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streaming runtime discovery failure defers to the header phase"
+    );
+
+    // The header phase consumes the stash and emits the terminal SSE response.
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::TerminalResponse(terminal) = action else {
+        panic!("failed MCP discovery should terminate locally with a terminal response");
+    };
+
+    assert_eq!(terminal.status, 200, "SSE lifecycle must be visible to SDK clients");
+    assert_eq!(
+        terminal
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "failure lifecycle must use SSE content type"
+    );
+    let raw = std::str::from_utf8(terminal.body.as_deref().expect("SSE body")).unwrap();
+    let events = parse_named_sse_events(raw);
+    let event_types: Vec<_> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        event_types,
+        [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.mcp_list_tools.in_progress",
+            "response.mcp_list_tools.failed",
+            "response.output_item.done",
+            "response.failed",
+        ],
+        "failure stream should form a complete Responses lifecycle"
+    );
+
+    for (expected, (_, payload)) in events.iter().enumerate() {
+        assert_eq!(
+            payload["sequence_number"].as_u64(),
+            Some(expected as u64),
+            "sequence numbers should be monotonic"
+        );
+    }
+    let failed = &events[4].1;
+    assert_eq!(failed["output_index"], 0);
+    assert!(
+        failed["item_id"].as_str().is_some_and(|id| id.starts_with("mcpl_")),
+        "failure event should identify the MCP list item"
+    );
+    assert_eq!(
+        failed.as_object().map(serde_json::Map::len),
+        Some(4),
+        "the standard failure event must not grow non-schema server or error fields"
+    );
+
+    let done_item = &events[5].1["item"];
+    assert_eq!(done_item["server_label"], "weather");
+    assert_eq!(done_item["id"], failed["item_id"]);
+    assert!(
+        done_item["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("server_label \"weather\"") && error.contains(&server_url)),
+        "the output item should carry the server identity and diagnostic"
+    );
+    let failed_response = &events[6].1["response"];
+    assert_eq!(failed_response["id"], "resp_listing_failure");
+    assert_eq!(failed_response["status"], "failed");
+    assert_eq!(failed_response["output"][0], *done_item);
+    assert_eq!(failed_response["error"]["code"], "server_error");
+
+    // The requested model must be echoed in every snapshot. No
+    // `openai_responses_format.model` metadata is set here, so this exercises
+    // the `ResponsesState.request_body` fallback branch.
+    let created_response = &events[0].1["response"];
+    assert_eq!(
+        created_response["model"], "gpt-4o-mini",
+        "created snapshot echoes model"
+    );
+    assert_eq!(failed_response["model"], "gpt-4o-mini", "failed snapshot echoes model");
+
+    // No `openai_responses_format.store` metadata is set, so the effective store
+    // is the OpenAI default (true). The snapshot must advertise that so a caller
+    // who later retrieves the persisted failure sees a consistent resource.
+    assert_eq!(
+        created_response["store"], true,
+        "store defaults to true when omitted, matching the store filter's own gate"
+    );
+    assert_eq!(
+        failed_response["store"], true,
+        "failed snapshot mirrors effective store"
+    );
+
+    // Pin the exact top-level key set of the synthesized response resource so a
+    // future refactor cannot silently drop a required field or add a non-schema
+    // one. The in-progress snapshot shares this shape with the failed one.
+    let mut created_keys: Vec<&str> = created_response
+        .as_object()
+        .expect("response object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    created_keys.sort_unstable();
+    assert_eq!(
+        created_keys,
+        [
+            "completed_at",
+            "created_at",
+            "error",
+            "id",
+            "incomplete_details",
+            "instructions",
+            "max_output_tokens",
+            "metadata",
+            "model",
+            "object",
+            "output",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "reasoning",
+            "status",
+            "store",
+            "temperature",
+            "text",
+            "tool_choice",
+            "tools",
+            "top_p",
+            "truncation",
+            "usage",
+        ],
+        "response snapshot must carry exactly the schema fields"
+    );
+}
+
+#[test]
+fn streaming_failure_classification_includes_runtime_tools_list_failures() {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    let url = || mcp_client::McpDisplayUrl::from_uri(&uri);
+    let client = |source: mcp_client::McpClientError| ResolveError::Client {
+        server_label: "drive".to_owned(),
+        source,
+    };
+
+    // Every runtime/transport failure of `tools/list` discovery must defer to the
+    // 200 SSE lifecycle. Pinning each arm guards the core feature: a refactor that
+    // drops one would silently return a hard HTTP error for that failure mode.
+    for source in [
+        mcp_client::McpClientError::Connection { url: url() },
+        mcp_client::McpClientError::ListTools { url: url() },
+        mcp_client::McpClientError::Timeout {
+            url: url(),
+            timeout: Duration::from_secs(1),
+        },
+        mcp_client::McpClientError::TooManyTools {
+            url: url(),
+            count: 11,
+            max: 10,
+        },
+        mcp_client::McpClientError::Serialization(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+    ] {
+        assert!(
+            is_mcp_listing_runtime_failure(&client(source)),
+            "runtime tools/list failure must defer to the SSE lifecycle"
+        );
+    }
+}
+
+#[test]
+fn streaming_failure_classification_excludes_local_request_policy() {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    let url = || mcp_client::McpDisplayUrl::from_uri(&uri);
+    let client = |source: mcp_client::McpClientError| ResolveError::Client {
+        server_label: "drive".to_owned(),
+        source,
+    };
+
+    // Local request-policy failures retain their HTTP error. SSRF blocking is the
+    // headline exclusion documented on the filter: it must never be downgraded to
+    // the 200 SSE lifecycle. `CallTool` is a non-listing operation and cannot
+    // arise from the tools/list path.
+    for source in [
+        mcp_client::McpClientError::InvalidAuthorization,
+        mcp_client::McpClientError::SsrfBlocked {
+            url: url(),
+            reason: "resolves to a private address",
+        },
+        mcp_client::McpClientError::CallTool {
+            url: url(),
+            tool_name: "x".to_owned(),
+        },
+    ] {
+        assert!(
+            !is_mcp_listing_runtime_failure(&client(source)),
+            "local policy / non-listing failure must retain its HTTP error"
+        );
+    }
+}
+
+/// A streaming SSRF failure is a pre-commitment rejection: it fires during
+/// request-body resolution, before any `text/event-stream` is established, so
+/// it returns the ordinary JSON `{"error":{...}}` envelope at the mapped status
+/// (issue #1001) -- never the 200 discovery lifecycle reserved for runtime
+/// `tools/list` failures, and never a committed-stream SSE `error` event.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "comprehensive pre-commitment JSON rejection assertions"
+)]
+fn streaming_ssrf_failure_retains_http_error() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let uri: http::Uri = "https://mcp.internal/tools".parse().unwrap();
+    let err = ResolveError::Client {
+        server_label: "internal".to_owned(),
+        source: mcp_client::McpClientError::SsrfBlocked {
+            url: mcp_client::McpDisplayUrl::from_uri(&uri),
+            reason: "resolves to a private address",
+        },
+    };
+
+    let FilterAction::Reject(rejection) = resolve_error_action(&mut ctx, &err, true, b"{}") else {
+        panic!("expected Reject");
+    };
+
+    assert_eq!(rejection.status, 502, "SSRF keeps its upstream error status");
+    assert!(
+        !rejection.preserve_keepalive,
+        "a genuine HTTP error closes the connection, unlike the 200 discovery-failure transport"
+    );
+    let ct = rejection.headers.iter().find(|(k, _)| k == "content-type");
+    assert_eq!(
+        ct.map(|(_, v)| v.as_str()),
+        Some("application/json"),
+        "a pre-commitment SSRF rejection uses the JSON error envelope, not an SSE event (issue #1001)"
+    );
+    let raw = std::str::from_utf8(rejection.body.as_deref().expect("error body")).unwrap();
+    assert!(
+        !raw.starts_with("event: "),
+        "SSRF must not emit a committed-stream SSE error event: {raw}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(
+        parsed["error"]["type"], "server_error",
+        "SSRF maps to a server_error envelope: {raw}"
+    );
+    assert_eq!(
+        parsed["error"]["code"], "server_error",
+        "SSRF maps to a server_error envelope: {raw}"
+    );
+    assert!(
+        parsed["error"]["message"].as_str().is_some_and(|m| m.contains("SSRF")),
+        "the SSRF reason is preserved in the message: {raw}"
+    );
+    assert!(
+        !raw.contains("response.mcp_list_tools.failed") && !raw.contains("response.failed"),
+        "SSRF must not emit the discovery lifecycle: {raw}"
+    );
+}
+
+/// Drive the deferred-failure path end to end and return the parsed lifecycle
+/// events, so tests can inspect the response snapshots embedded in each frame.
+///
+/// A streaming runtime failure stashes a descriptor and returns `Continue`, and
+/// the header phase consumes it to build the terminal SSE. `body` is the raw
+/// request body the resolver captured its size-bounded echo options from.
+fn failure_lifecycle_events(
+    ctx: &mut HttpFilterContext<'_>,
+    err: &ResolveError,
+    body: &[u8],
+) -> Vec<(String, serde_json::Value)> {
+    ctx.current_filter_id = Some(0);
+    assert!(
+        matches!(resolve_error_action(ctx, err, true, body), FilterAction::Continue),
+        "a streaming runtime discovery failure should defer"
+    );
+    let pending = ctx
+        .remove_filter_state::<PendingListToolsFailure>()
+        .expect("deferred failure descriptor stashed");
+    let terminal = build_list_tools_failure_response(ctx, &pending);
+    let raw = std::str::from_utf8(terminal.body.as_deref().expect("SSE body")).unwrap();
+    parse_named_sse_events(raw)
+}
+
+/// The id from the terminal `response.failed` event of the deferred-failure path.
+fn failed_response_id(ctx: &mut HttpFilterContext<'_>, err: &ResolveError, body: &[u8]) -> String {
+    let events = failure_lifecycle_events(ctx, err, body);
+    events[6].1["response"]["id"].as_str().expect("response id").to_owned()
+}
+
+/// A connection failure descriptor, the canonical runtime `tools/list` failure.
+fn connection_failure() -> ResolveError {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    ResolveError::Client {
+        server_label: "weather".to_owned(),
+        source: mcp_client::McpClientError::Connection {
+            url: mcp_client::McpDisplayUrl::from_uri(&uri),
+        },
+    }
+}
+
+/// The synthesized failure resource must echo the caller's request parameters in
+/// every snapshot, so a persisted or streamed failure reports the same
+/// configuration a real Responses object would rather than silently substituting
+/// API defaults. `input` and `tools` are intentionally omitted -- the latter so
+/// per-entry MCP credentials are never persisted.
+#[test]
+#[expect(clippy::too_many_lines, reason = "one assertion per echoed request field")]
+fn streaming_failure_snapshot_echoes_request_parameters() {
+    let body_json = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+        "temperature": 0.2,
+        "top_p": 0.5,
+        "parallel_tool_calls": false,
+        "max_output_tokens": 256,
+        "instructions": "be terse",
+        "truncation": "auto",
+        "tool_choice": "required",
+        "previous_response_id": "resp_prev",
+        "text": {"format": {"type": "json_object"}},
+        "reasoning": {"effort": "high"},
+        "metadata": {"trace": "abc123"},
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": "https://mcp.example/tools",
+            "authorization": "secret-token",
+        }],
+    });
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    // Deliberately insert NO `ResponsesState`: the echoed parameters must come
+    // from the size-bounded capture taken from the request body during the
+    // pre-read, so a pipeline without validate/rehydrate still reports the
+    // caller's real configuration.
+    let body = serde_json::to_vec(&body_json).unwrap();
+
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), &body);
+    // Every snapshot shares the echoed parameters; assert on the created and
+    // failed frames that bracket the stream.
+    for response in [&events[0].1["response"], &events[6].1["response"]] {
+        assert_eq!(response["temperature"], 0.2, "temperature echoes the request");
+        assert_eq!(response["top_p"], 0.5, "top_p echoes the request");
+        assert_eq!(response["parallel_tool_calls"], false, "parallel_tool_calls echoes");
+        assert_eq!(response["max_output_tokens"], 256, "max_output_tokens echoes");
+        assert_eq!(response["instructions"], "be terse", "instructions echoes");
+        assert_eq!(response["truncation"], "auto", "truncation echoes");
+        assert_eq!(response["tool_choice"], "required", "tool_choice echoes");
+        assert_eq!(
+            response["previous_response_id"], "resp_prev",
+            "previous_response_id echoes"
+        );
+        assert_eq!(
+            response["text"],
+            serde_json::json!({"format": {"type": "json_object"}}),
+            "text echoes"
+        );
+        assert_eq!(
+            response["reasoning"],
+            serde_json::json!({"effort": "high"}),
+            "reasoning echoes"
+        );
+        assert_eq!(
+            response["metadata"],
+            serde_json::json!({"trace": "abc123"}),
+            "metadata echoes"
+        );
+        // Never persist tools (credential leak) or input.
+        assert_eq!(
+            response["tools"],
+            serde_json::json!([]),
+            "tools must not leak credentials"
+        );
+        assert!(response.get("input").is_none(), "request input must not be persisted");
+    }
+}
+
+/// When no request option is captured (a body carrying no echoable field), every
+/// echoed field falls back to its OpenAI API default. Persistence is unaffected:
+/// it depends only on `response_object`, not on the echoed options.
+#[test]
+fn streaming_failure_snapshot_uses_api_defaults_without_captured_options() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), b"{}");
+    let response = &events[6].1["response"];
+    for (field, default) in [
+        ("temperature", serde_json::json!(1.0)),
+        ("top_p", serde_json::json!(1.0)),
+        ("parallel_tool_calls", serde_json::json!(true)),
+        ("tool_choice", serde_json::json!("auto")),
+        ("truncation", serde_json::json!("disabled")),
+        ("previous_response_id", serde_json::Value::Null),
+        ("max_output_tokens", serde_json::Value::Null),
+        ("instructions", serde_json::Value::Null),
+        ("reasoning", serde_json::Value::Null),
+        ("text", serde_json::json!({"format": {"type": "text"}})),
+        ("metadata", serde_json::json!({})),
+    ] {
+        assert_eq!(response[field], default, "{field} falls back to its API default");
+    }
+}
+
+/// `capture_echoed_options` copies only the whitelisted request options -- never
+/// `input` or the credentialed `tools` array -- so nothing that could leak a
+/// secret or bloat the snapshot survives the capture.
+#[test]
+fn capture_echoed_options_whitelists_safe_fields_only() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "gpt-4o-mini",
+        "temperature": 0.2,
+        "metadata": {"trace": "abc123"},
+        "input": "secret prompt",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "authorization": "secret-token",
+        }],
+    }))
+    .unwrap();
+
+    let captured = capture_echoed_options(&body).expect("whitelisted fields are captured");
+    assert_eq!(captured["temperature"], 0.2, "temperature is whitelisted");
+    assert_eq!(
+        captured["metadata"],
+        serde_json::json!({"trace": "abc123"}),
+        "metadata is whitelisted"
+    );
+    assert_eq!(captured["model"], "gpt-4o-mini", "model is whitelisted");
+    assert!(captured.get("input").is_none(), "input must never be captured");
+    assert!(
+        captured.get("tools").is_none(),
+        "tools must never be captured (credential leak)"
+    );
+}
+
+/// `capture_echoed_options` returns `None` when nothing echoable survives -- an
+/// empty object, a body with only non-echoed fields, or an unparseable body --
+/// so the snapshot falls back to API defaults for every field.
+#[test]
+fn capture_echoed_options_none_without_whitelisted_fields() {
+    assert!(
+        capture_echoed_options(br#"{"input":"hi","tools":[]}"#).is_none(),
+        "a body with only non-echoed fields captures nothing"
+    );
+    assert!(
+        capture_echoed_options(b"{}").is_none(),
+        "an empty object captures nothing"
+    );
+    assert!(
+        capture_echoed_options(b"not json").is_none(),
+        "an unparseable body captures nothing"
+    );
+}
+
+/// A single oversized field (`instructions`) is dropped from the capture so it
+/// cannot be amplified across the SSE snapshots, while the smaller fields
+/// captured before it are retained. This bounds a valid-but-large request rather
+/// than rejecting it or losing all fidelity.
+#[test]
+fn capture_echoed_options_drops_oversized_field_keeps_small_ones() {
+    let huge = "x".repeat(MAX_ECHOED_OPTIONS_BYTES + 1);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "temperature": 0.2,
+        "metadata": {"trace": "abc123"},
+        "instructions": huge,
+    }))
+    .unwrap();
+
+    let captured = capture_echoed_options(&body).expect("small fields are still captured");
+    assert_eq!(captured["temperature"], 0.2, "a small field is retained");
+    assert_eq!(
+        captured["metadata"],
+        serde_json::json!({"trace": "abc123"}),
+        "a small field is retained"
+    );
+    assert!(
+        captured.get("instructions").is_none(),
+        "an oversized field is dropped from the capture"
+    );
+}
+
+/// End to end, an oversized `instructions` must not be amplified across the three
+/// SSE snapshots: the terminal failure echoes the default `instructions` (null)
+/// while still echoing the small fields, and the whole SSE body stays far below
+/// the size of the request that produced it.
+#[test]
+fn streaming_failure_snapshot_drops_oversized_options() {
+    let huge = "x".repeat(MAX_ECHOED_OPTIONS_BYTES + 1);
+    let body_json = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+        "temperature": 0.2,
+        "instructions": huge,
+    });
+    let body = serde_json::to_vec(&body_json).unwrap();
+    let request_len = body.len();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), &body);
+
+    let response = &events[6].1["response"];
+    assert_eq!(response["temperature"], 0.2, "the small option still echoes");
+    assert_eq!(
+        response["instructions"],
+        serde_json::Value::Null,
+        "the oversized instructions is dropped to its API default, not amplified"
+    );
+
+    // The SSE body embeds a snapshot in three frames; if the oversized field had
+    // been echoed it would appear ~3x. Assert the whole stream stays a small
+    // fraction of the single request that carried it.
+    let sse_len: usize = events
+        .iter()
+        .map(|(name, payload)| name.len() + payload.to_string().len())
+        .sum();
+    assert!(
+        sse_len < MAX_ECHOED_OPTIONS_BYTES,
+        "oversized options must not amplify the {request_len}-byte request into the SSE body \
+         (got {sse_len} bytes)"
+    );
+}
+
+/// Building the terminal failure must publish the failed snapshot directly into
+/// `ResponsesState.response_object`, the field `openai_response_store` reads to
+/// persist streaming responses. In `agentic-loop.yaml` `openai_stream_events`
+/// runs *after* this filter (nested in the `iterative_request_router`), so the
+/// short-circuiting `TerminalResponse` means `stream_events` never accumulates the
+/// failure -- persistence depends on this direct write. The written snapshot must
+/// be exactly the terminal `response.failed` resource so the store persists the
+/// same object the client received.
+#[test]
+fn build_failure_populates_response_object_state() {
+    let body_json = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+    });
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(body_json.clone()));
+
+    let body = serde_json::to_vec(&body_json).unwrap();
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), &body);
+    let terminal_response = events[6].1["response"].clone();
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
+    assert_eq!(
+        state.response_object, terminal_response,
+        "response_object must hold the terminal response.failed snapshot for the store to persist"
+    );
+    assert_eq!(
+        state.response_object["status"], "failed",
+        "persisted snapshot records the failure"
+    );
+}
+
+/// When no `ResponsesState` exists yet -- a valid pipeline of
+/// `openai_response_store` + this filter *without*
+/// `openai_responses_validate`/`openai_responses_rehydrate` to build state up
+/// front -- the terminal-failure build must still CREATE the state and populate
+/// `response_object`, or the store would have nothing to persist and the failure
+/// would be lost. `get_or_insert_with` (not `get_mut`) is what makes this work.
+#[test]
+fn build_failure_creates_response_object_state_when_absent() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    // Deliberately insert NO ResponsesState before building the failure.
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "precondition: no state exists yet"
+    );
+
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), b"{}");
+    let terminal_response = events[6].1["response"].clone();
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("building the failure must create the state so the store can persist");
+    assert_eq!(
+        state.response_object, terminal_response,
+        "created state must hold the terminal response.failed snapshot"
+    );
+    assert_eq!(
+        state.response_object["status"], "failed",
+        "persisted snapshot records the failure"
+    );
+}
+
+/// `response_id` resolves from metadata first, then `ResponsesState`, then a
+/// generated `resp_` id. The lifecycle test covers the metadata branch; this
+/// covers the state fallback and the generated fallback.
+#[test]
+fn failure_lifecycle_response_id_falls_back_to_state_then_generated() {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    let make_err = || ResolveError::Client {
+        server_label: "weather".to_owned(),
+        source: mcp_client::McpClientError::Connection {
+            url: mcp_client::McpDisplayUrl::from_uri(&uri),
+        },
+    };
+
+    // No metadata, but ResponsesState carries a response_id → use it.
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o-mini"}));
+    state.response_id = Some("resp_from_state".to_owned());
+    ctx.extensions.insert(state);
+    assert_eq!(
+        failed_response_id(&mut ctx, &make_err(), b"{}"),
+        "resp_from_state",
+        "state fallback used"
+    );
+
+    // No metadata and no ResponsesState → generated resp_ id.
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        failed_response_id(&mut ctx, &make_err(), b"{}").starts_with("resp_"),
+        "generated fallback should produce a resp_ id"
+    );
+}
+
+fn parse_named_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .map(|frame| {
+            let mut lines = frame.lines();
+            let name = lines
+                .next()
+                .and_then(|line| line.strip_prefix("event: "))
+                .expect("named SSE event")
+                .to_owned();
+            let payload = lines
+                .next()
+                .and_then(|line| line.strip_prefix("data: "))
+                .expect("SSE data line");
+            (name, serde_json::from_str(payload).expect("valid SSE JSON payload"))
+        })
+        .collect()
 }

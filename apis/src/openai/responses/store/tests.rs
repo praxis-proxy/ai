@@ -512,6 +512,94 @@ async fn on_request_body_does_not_initialize_store_for_store_false_without_previ
 }
 
 // -----------------------------------------------------------------------------
+// Exchange-scoped persistence arming
+// -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_request_body_arms_persistence_for_persisted_response() {
+    // A Responses create that will persist its response must publish the
+    // exchange-scoped persistence-armed marker so a downstream approval pause can
+    // tell that THIS response will be stored, not merely that a store exists in
+    // the pipeline.
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponseStoreRegistry::new());
+    // openai_responses_validate creates ResponsesState earlier in this body phase.
+    ctx.extensions.insert(ResponsesState::default());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "request body phase should continue"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed,
+        "a persisted Responses create must arm persistence for this exchange"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_request_body_does_not_arm_persistence_when_store_false() {
+    // store=false will not persist, so persistence must not be armed. mcp_dispatch
+    // rejects such an approval with a client-facing 400 before this point, but the
+    // marker must stay honest regardless.
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.store", "false");
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi","store":false}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "request body phase should continue"
+    );
+    assert!(
+        !ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed,
+        "store=false must not arm persistence"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_request_body_does_not_arm_persistence_for_rehydrate_only() {
+    // A store=false request with previous_response_id registers the store so
+    // rehydrate can read history, but it will not persist a new response, so it
+    // must not arm persistence. Arming on registration alone would resurrect the
+    // pipeline-scoped bug this marker exists to fix.
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let registry = ResponseStoreRegistry::new();
+    ctx.extensions.insert(registry.clone());
+    ctx.extensions.insert(ResponsesState::default());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.store", "false");
+    ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"Hi","store":false,"previous_response_id":"resp_prev"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "request body phase should continue"
+    );
+    assert!(
+        registry.get("default").is_some(),
+        "rehydrate still needs the store registered"
+    );
+    assert!(
+        !ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed,
+        "a rehydrate-only request that will not persist must not arm persistence"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // on_response
 // -----------------------------------------------------------------------------
 
@@ -3360,6 +3448,41 @@ async fn get_input_items_pagination_usable_for_id_less_array_items() {
     assert_eq!(follow_up_body["has_more"], false);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_hides_compaction_items() {
+    let filter = make_filter();
+    init_store_and_seed(
+        &filter,
+        "resp_compact_hidden",
+        "default",
+        json!([
+            {"type": "compaction", "id": "compact_1", "encrypted_content": "c3VtbWFyeQ=="},
+            {"type": "message", "role": "user", "content": "hello"}
+        ]),
+    )
+    .await;
+
+    let req = crate::test_utils::make_request(
+        http::Method::GET,
+        "/v1/responses/resp_compact_hidden/input_items?order=asc",
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "compaction item should be hidden");
+    assert_eq!(data[0]["content"], "hello");
+    assert!(
+        !data
+            .iter()
+            .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("compaction")),
+        "no compaction items should appear in input_items"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // DELETE
 // -----------------------------------------------------------------------------
@@ -5374,4 +5497,42 @@ conversations_table: conversations
     let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
     validate_config(&cfg).unwrap();
     assert!(cfg.pool.is_none(), "omitted pool should be None");
+}
+
+#[test]
+fn postgres_uppercase_table_name_rejected_at_config_load() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://user:pw@1.2.3.4/praxis"
+allow_private_database_url: true
+responses_table: OpenAIResponses
+conversations_table: openai_conversations
+"#,
+    )
+    .unwrap();
+
+    let err = ResponseStoreFilter::from_config(&yaml).map(|_| ()).unwrap_err();
+    assert!(
+        err.to_string().contains("must be lowercase"),
+        "PostgreSQL uppercase table name should be rejected at config load, got: {err}"
+    );
+}
+
+#[test]
+fn sqlite_uppercase_table_name_still_accepted() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: OpenAIResponses
+conversations_table: openai_conversations
+"#,
+    )
+    .unwrap();
+
+    assert!(
+        ResponseStoreFilter::from_config(&yaml).is_ok(),
+        "SQLite compares names case-insensitively, so uppercase must still be accepted"
+    );
 }

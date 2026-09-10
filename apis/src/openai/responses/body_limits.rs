@@ -14,8 +14,7 @@
 //! This module centralizes:
 //! - [`validate_size_limit`]: config validation that names the actual field (unlike praxis core's
 //!   `validate_max_body_bytes`, which hardcodes the string `"max_body_bytes"`).
-//! - [`reject_rewritten_body_too_large`]: a streaming-aware 413 built on the shared [`responses_error_rejection`]
-//!   envelope.
+//! - [`reject_rewritten_body_too_large`]: a 413 built on the shared [`responses_error_rejection`] JSON envelope.
 //!
 //! [`responses_error_rejection`]: super::error::responses_error_rejection
 
@@ -41,18 +40,17 @@ pub(crate) fn validate_size_limit(filter: &str, field: &str, value: usize) -> Re
     Ok(())
 }
 
-/// Build a streaming-aware 413 for a rewritten/resolved body that
-/// exceeds the filter's configured limit.
+/// Build a 413 for a rewritten/resolved body that exceeds the filter's
+/// configured limit.
 ///
-/// `len` is the measured serialized length, `limit` the configured
-/// maximum, and `streaming` selects the SSE error envelope over the
-/// JSON one.
-pub(crate) fn reject_rewritten_body_too_large(len: usize, limit: usize, streaming: bool) -> FilterAction {
+/// `len` is the measured serialized length and `limit` the configured
+/// maximum. This is a pre-commitment rejection, so it always uses the
+/// JSON error envelope (see [`responses_error_rejection`]).
+pub(crate) fn reject_rewritten_body_too_large(len: usize, limit: usize) -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         413,
         "invalid_request_error",
         &format!("rewritten request body ({len} bytes) exceeds maximum ({limit} bytes)"),
-        streaming,
     ))
 }
 
@@ -98,8 +96,8 @@ mod tests {
     }
 
     #[test]
-    fn reject_rewritten_body_non_streaming_is_json_413() {
-        let FilterAction::Reject(r) = reject_rewritten_body_too_large(100, 50, false) else {
+    fn reject_rewritten_body_is_json_413() {
+        let FilterAction::Reject(r) = reject_rewritten_body_too_large(100, 50) else {
             panic!("expected a rejection");
         };
         assert_eq!(r.status, 413, "oversized rewritten body should be 413");
@@ -107,21 +105,7 @@ mod tests {
         assert_eq!(
             ct.map(|(_, v)| v.as_str()),
             Some("application/json"),
-            "non-streaming should use application/json"
-        );
-    }
-
-    #[test]
-    fn reject_rewritten_body_streaming_is_sse_413() {
-        let FilterAction::Reject(r) = reject_rewritten_body_too_large(100, 50, true) else {
-            panic!("expected a rejection");
-        };
-        assert_eq!(r.status, 413, "oversized rewritten body should be 413");
-        let ct = r.headers.iter().find(|(k, _)| k == "content-type");
-        assert_eq!(
-            ct.map(|(_, v)| v.as_str()),
-            Some("text/event-stream"),
-            "streaming should use text/event-stream"
+            "pre-commitment rejection should always use application/json"
         );
     }
 }

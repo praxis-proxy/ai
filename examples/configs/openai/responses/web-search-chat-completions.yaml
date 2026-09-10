@@ -1,22 +1,41 @@
 # Responses Web Search with a Chat Completions Backend
 #
-# Accepts finite OpenAI Responses requests with hosted web search while
-# targeting a backend that only implements /v1/chat/completions. The
-# compatibility filter privately exposes web_search to that backend as a
-# strict function tool. The existing openai_web_search executor handles the
-# returned call and IRR drives the second inference round.
+# Accepts OpenAI Responses requests with hosted web search while targeting a
+# backend that only implements /v1/chat/completions. Serves both finite
+# (`"stream": false`) and streaming (`"stream": true`) requests from one
+# pipeline. The compatibility filter privately exposes web_search to that
+# backend as a strict function tool. The existing openai_web_search executor
+# handles the returned call and IRR drives the second inference round.
+#
+# responses_to_chat_completions runs inside the iterative router and selects its
+# transport from the effective request: a `"stream": true` request streams, so
+# each translated per-round stream stays internal to the router; a finite request
+# buffers. openai_stream_events accumulates each translated
+# per-round Responses SSE stream and withholds per-round terminal events until the
+# IRR transition is known, exposing one coherent client-facing Responses SSE
+# lifecycle across the model round, the web search, and the resumed model output.
+# On a finite request openai_stream_events never arms (the response is not SSE),
+# so it is a no-op and the finite round-trip is unaffected.
 #
 # Request order inside IRR:
-#   openai_web_search -> openai_agentic_loop
+#   openai_stream_events -> openai_web_search -> openai_agentic_loop
 #     -> responses_to_chat_completions -> path_rewrite -> router
 #
-# Response filters run in reverse. Each Chat Completions response is therefore
-# converted into a Responses resource before openai_agentic_loop sees it. A
-# private function_call(name="web_search") becomes a canonical web_search_call,
-# which openai_web_search executes on the next iteration.
+# Response filters run in reverse. Each Chat Completions response (finite JSON or
+# streamed SSE) is therefore converted into a Responses resource before
+# openai_agentic_loop and openai_web_search see it, and openai_stream_events
+# (client-facing) composes the logical stream last. A private
+# function_call(name="web_search") becomes a canonical web_search_call, which
+# openai_web_search executes on the next iteration.
 #
-# This pipeline is finite only. Streaming composition depends on the separate
-# Chat SSE conversion and streaming-across-IRR work.
+#   curl -N http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather in SF?",
+#       "stream": true,
+#       "tools": [{"type": "web_search"}]
+#     }'
 
 listeners:
   - name: responses-web-search-chat-gateway
@@ -40,9 +59,23 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 11
+        # Terminal streaming rounds resume real inference after the web-search
+        # dispatch, so allow generous per-request and per-step deadlines for
+        # slower backends (mirrors full-flow-agentic.yaml). The default step
+        # deadline is too tight for a full translated streaming generation.
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_stream_response_bytes: 67108864
         steps:
           - name: inference
             filters:
+              # Parses every translated inference SSE stream, preserves one
+              # logical response identity across rounds, and withholds per-round
+              # terminal events until the IRR transition is known. Runs last in
+              # the response phase so it observes the translated Responses SSE. A
+              # no-op on finite (non-SSE) responses.
+              - filter: openai_stream_events
+
               - filter: openai_web_search
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}

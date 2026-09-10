@@ -70,6 +70,44 @@
 #                  "require_approval": "never"}]
 #     }'
 #
+# MCP approval round trip (require_approval: "always"):
+#
+#   A tool guarded by approval pauses the loop and returns an
+#   `mcp_approval_request` output item (id == the model's call_id) instead of
+#   executing. The client resumes by echoing an `mcp_approval_response` on the
+#   next turn (with previous_response_id and the same tools so the server is
+#   re-resolved). `approve: true` runs the tool exactly once; `approve: false`
+#   feeds the model a truthful denial and runs zero tool calls. Consumption is
+#   single-use — replaying an approval fails closed and never executes twice.
+#
+#   # Turn 1 — the model asks to call the tool; approval is required:
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather in SF?",
+#       "tools": [{"type": "mcp", "server_label": "weather",
+#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "allowed_tools": ["get_weather"],
+#                  "require_approval": "always"}]
+#     }'
+#   # → returns an mcp_approval_request output item, e.g. id "call_abc123".
+#
+#   # Turn 2 — approve the pending call (reuse the returned response id):
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "previous_response_id": "<response id from turn 1>",
+#       "tools": [{"type": "mcp", "server_label": "weather",
+#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "allowed_tools": ["get_weather"],
+#                  "require_approval": "always"}],
+#       "input": [{"type": "mcp_approval_response",
+#                  "approval_request_id": "call_abc123",
+#                  "approve": true}]
+#     }'
+#
 # Build:
 #   cargo build -p praxis-ai-proxy
 
@@ -106,27 +144,34 @@ filter_chains:
         initial_step: inference
         max_iterations: 11
         max_stream_response_bytes: 67108864
+        # The IRR's 30s default is too short for production model streams.
+        # Allow six minutes total for time-to-first-byte and logical streaming
+        # across the loop.
+        timeout_ms: 360000
         steps:
           - name: inference
             filters:
-              # Parses every inference SSE stream, preserves one logical
-              # response identity across rounds, and withholds per-round
-              # terminal events until the IRR transition is known.
+              # Composes every inference SSE stream into one logical Responses
+              # lifecycle: preserves one response identity across rounds and
+              # withholds per-round terminal events until the IRR transition is
+              # known. A single inference round is just a one-round logical
+              # stream, so this filter always composes and must run inside this
+              # IRR step.
               #
-              # REQUIRED with `openai_responses_proxy: terminal_streaming`
-              # below. Typed streaming commits `response.completed` to the
+              # REQUIRED because `openai_responses_proxy` below selects typed
+              # streaming automatically for an effective `"stream": true`
+              # request. Typed streaming commits `response.completed` to the
               # client as it arrives, so a loop-terminal error detected by
-              # `openai_agentic_loop` (e.g. an SSE parse failure or a tool-call
-              # cardinality violation) can only reach the client through this
+              # `openai_agentic_loop` (e.g. an SSE parse failure or mixed
+              # client/server function-call ownership) can only reach the client through this
               # filter's logical-stream finalizer, which defers each round's
-              # terminal event and can replace it with an error frame. Without
-              # `logical_stream: true` that error is silently dropped after the
-              # success is already on the wire, so `openai_agentic_loop` fails
-              # closed with a 500 before any backend request when the two are
-              # misconfigured together. (Startup validation of this pairing is
-              # left to a future Praxis-core improvement.)
+              # terminal event and can replace it with an error frame. When this
+              # filter is absent from the step, that error would be silently
+              # dropped after the success is already on the wire, so
+              # `openai_agentic_loop` fails closed with a 500 before any backend
+              # request. (Startup validation of this pairing is left to a future
+              # Praxis-core improvement.)
               - filter: openai_stream_events
-                logical_stream: true
 
               # Runs first on request re-entry to execute pending web
               # searches, and last on the model response to detect
@@ -134,14 +179,20 @@ filter_chains:
               - filter: openai_web_search
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
+                max_calls_per_round: 32
               # Runs second on request re-entry to execute pending MCP
               # calls, and second-to-last on the model response to
               # classify MCP tool calls.
               - filter: openai_mcp_dispatch
+                max_calls_per_round: 32
+                max_parallel_calls: 8
+                max_result_bytes: 1048576
+                max_total_result_bytes: 8388608
               - filter: openai_agentic_loop
                 max_infer_iters: 10
+              # Selects typed streaming automatically when the effective
+              # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy
-                terminal_streaming: true
               - filter: router
                 routes:
                   - path_prefix: "/"

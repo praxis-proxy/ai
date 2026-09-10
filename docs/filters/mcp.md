@@ -28,7 +28,7 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 | `header_validation` | HeaderValidation | no | Header validation settings. |
 | `header_validation.mismatch` | `reject` \| `ignore` | no | Behavior when header value conflicts with body-derived value. |
 | `header_validation.missing` | `ignore` \| `synthesize` \| `reject` | no | Behavior when expected MCP headers are absent. |
-| `headers` | McpHeaders | no | Header names for MCP metadata promotion. |
+| `headers` | McpHeaders | no | Header names for MCP metadata promotion. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated `x-praxis-mcp-*` defaults remain allowed. |
 | `headers.kind` | string | no | Header name for the JSON-RPC kind (e.g. `x-praxis-mcp-kind`). |
 | `headers.method` | string | no | Header name for the MCP method (e.g. `x-praxis-mcp-method`). |
 | `headers.name` | string | no | Header name for the tool/resource/prompt name (e.g. `x-praxis-mcp-name`). |

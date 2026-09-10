@@ -1,0 +1,100 @@
+# File Search Callout Filter — Streaming (stream: true)
+#
+# Demonstrates streaming hosted file_search through the iterative_request_router.
+# The IRR sends the request to the model, executes any returned file_search_call
+# through the vector store, and streams the enriched context back through a second
+# model inference before finalizing the SSE lifecycle with citation annotations.
+#
+# This config uses the streaming step order mandated by §5 of the #313 spec:
+# `openai_stream_events` is REQUIRED ahead of `openai_file_search_callout` and
+# `openai_responses_proxy`. It always composes the current IRR execution into
+# one logical Responses stream. The proxy derives
+# the streaming transport automatically from the effective outbound `stream:
+# true`; there is no operator opt-in. Typed streaming commits response.completed
+# to the client as it arrives, so a loop-terminal error detected after that event
+# must reach the client through the logical-stream finalizer, which defers each
+# round's terminal event and can replace it with an error frame. Without the
+# stream-events finalizer that error is silently dropped after the success is
+# already on the wire.
+#
+# Cannot share an IRR step with openai_agentic_loop due to competing
+# accumulated_output ownership.
+#
+# Configuration:
+#   vector_store_url:         Vector store API base URL
+#   allow_private_url:        Permit local-sensitive targets for development only
+#   timeout_ms:               Whole-call timeout in milliseconds
+#   max_response_bytes:       Maximum response bytes retained per callout
+#   max_total_response_bytes: Maximum successful bytes across one fan-out
+#   on_failure:               closed (fail closed) or open (fail open)
+#   forward_headers:          Headers to forward from the client request
+#                             (e.g. Authorization) to the vector store API
+#
+# Shared sub-request connector settings under `runtime` are restart-required.
+# When `runtime.subrequest_circuit_breaker` is set, client-aware filters such
+# as this one inherit peer-level failure isolation from the shared client:
+#
+# runtime:
+#   subrequest_circuit_breaker:
+#     consecutive_failures: 5
+#     recovery_window_secs: 30
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [file-search-streaming-pipeline]
+
+filter_chains:
+  - name: file-search-streaming-pipeline
+    filters:
+      - filter: openai_responses_format
+      - filter: openai_responses_validate
+      - filter: openai_tool_parse
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 8
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_stream_response_bytes: 67108864
+        # Retains one 64 MiB request plus one 64 MiB response and metadata.
+        max_state_bytes: 136314880
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+              - filter: openai_file_search_callout
+                vector_store_url: http://127.0.0.1:8001
+                allow_private_url: true
+                timeout_ms: 5000
+                max_response_bytes: 10485760
+                max_total_response_bytes: 67108864
+                # The filter and the enclosing iterative router may use
+                # different values; the smaller limit wins at runtime.
+                max_state_bytes: 136314880
+                on_failure: closed
+                forward_headers:
+                  - authorization
+              - filter: openai_responses_proxy
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+              - filter: router
+                routes:
+                  - path: "/v1/responses"
+                    cluster: "inference"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_file_search_callout
+                key: pending
+                value: "true"
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

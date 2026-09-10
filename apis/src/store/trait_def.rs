@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use super::types::{ConversationItemRecord, ConversationRecord, ResponseRecord, StoreError};
+use super::types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError};
 
 // -----------------------------------------------------------------------------
 // ResponseStore Trait
@@ -52,6 +52,10 @@ pub trait ResponseStore: Send + Sync {
     /// Returns `true` if a record was deleted, `false` if no
     /// matching record existed for this tenant.
     ///
+    /// Any server-owned pending approvals issued by the deleted response are
+    /// removed in the same transaction, so deleting a response leaves no
+    /// consumable approval behind and retains no sensitive tool arguments.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the database operation fails.
@@ -70,6 +74,145 @@ pub trait ResponseStore: Send + Sync {
         tenant_id: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError>;
+
+    /// Record server-owned pending MCP approvals emitted by the proxy.
+    ///
+    /// Called from the proxy **output** path the moment one or more
+    /// `mcp_approval_request` items are emitted, this writes the sole source
+    /// of truth for correlating a later `mcp_approval_response` back to the
+    /// call the proxy actually paused on. Each record captures the complete
+    /// resolved target (server label, tool name, arguments, fingerprint) with
+    /// `consumed_at` left `NULL`.
+    ///
+    /// `response_id` is the id of the response that issued these approvals; it
+    /// scopes every row so a later `mcp_approval_response` must supply the same
+    /// originating `previous_response_id` to load or consume it.
+    ///
+    /// Writes are idempotent: a row that already exists for
+    /// `(tenant_id, response_id, approval_id)` is left untouched, so re-emitting
+    /// the same pending approval never resets an already-consumed row back to
+    /// outstanding (which would enable replay).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn record_pending_approvals(
+        &self,
+        tenant_id: &str,
+        response_id: &str,
+        records: &[PendingApprovalRecord],
+        created_at: i64,
+    ) -> Result<(), StoreError>;
+
+    /// Persist a response and the pending approvals it issued together.
+    ///
+    /// Called from the proxy output path when a streamed or buffered response
+    /// carries one or more `mcp_approval_request` items. The pending rows are
+    /// scoped to `record.id` (via [`record_pending_approvals`]) so a later
+    /// `mcp_approval_response` correlates back through `previous_response_id`.
+    ///
+    /// Transactional backends **must** commit both writes in a single
+    /// transaction, serialized against [`delete_response`]. A streaming client
+    /// already knows the response id and can issue a concurrent
+    /// `DELETE /v1/responses/{id}`; writing the two records separately leaves a
+    /// window where the delete lands between them and the later approval insert
+    /// orphans a row still holding the tool arguments. One transaction closes
+    /// that window: a delete observes either both records or neither.
+    ///
+    /// The provided default persists the two records sequentially. It is correct
+    /// for in-memory or non-transactional stores that are not subject to
+    /// concurrent deletion, but it is **not** atomic; SQL backends override it.
+    /// Like [`record_pending_approvals`], the approval writes are insert-if-absent,
+    /// so re-persisting the same response never resets an already-consumed row.
+    ///
+    /// [`record_pending_approvals`]: ResponseStore::record_pending_approvals
+    /// [`delete_response`]: ResponseStore::delete_response
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn persist_response_with_pending_approvals(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<(), StoreError> {
+        self.upsert_response(record).await?;
+        if !pending_approvals.is_empty() {
+            self.record_pending_approvals(&record.tenant_id, &record.id, pending_approvals, record.created_at)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Fetch the server-owned pending approvals matching `approval_ids` that
+    /// were issued by `response_id`.
+    ///
+    /// Returns the records the proxy previously wrote via
+    /// [`record_pending_approvals`] for the given issuing response, including
+    /// rows whose `consumed_at` is already stamped (so callers can distinguish
+    /// "never issued" from "already used"). Ids without a matching row under
+    /// this `response_id` are simply absent from the result. Ordering is
+    /// unspecified; callers key by `approval_id`.
+    ///
+    /// Scoping by `response_id` binds each approval to the response that issued
+    /// it: an approval id is only visible to a follow-up that names the
+    /// originating `previous_response_id`, so a fresh, unrelated request cannot
+    /// see (and therefore cannot consume) a known outstanding approval, and the
+    /// same model-generated call id reused across two responses resolves to the
+    /// correct call. A client-forged `mcp_approval_request` persisted into the
+    /// conversation history has no matching pending row and is likewise
+    /// invisible, so the resume path fails closed.
+    ///
+    /// [`record_pending_approvals`]: ResponseStore::record_pending_approvals
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn get_pending_approvals(
+        &self,
+        tenant_id: &str,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<Vec<PendingApprovalRecord>, StoreError>;
+
+    /// Atomically claim single-use consumption of a batch of pending approvals
+    /// issued by `response_id`.
+    ///
+    /// Within a single database transaction, stamps `consumed_at` (epoch
+    /// milliseconds) on each server-owned pending row in `approval_ids` for
+    /// `(tenant_id, response_id)`, transitioning it from outstanding
+    /// (`consumed_at IS NULL`) to consumed. Callers first look the rows up via
+    /// [`get_pending_approvals`] under the same `response_id`, so every id
+    /// passed here is known to have a pending row; a row that fails to
+    /// transition therefore means it was **already consumed**.
+    ///
+    /// The claim is **all-or-nothing** across the whole batch:
+    /// - `Ok(None)` — *every* id transitioned outstanding→consumed; the transaction commits.
+    /// - `Ok(Some(i))` — `approval_ids[i]` could not be claimed because it was already consumed (by a prior request or
+    ///   as a duplicate appearing earlier in this same batch). The transaction rolls back, so **no** id in the batch is
+    ///   consumed and every still-outstanding approval stays replayable by a corrected follow-up request.
+    ///
+    /// Callers must treat `Some(_)` as "at least one approval was already
+    /// handled" and refuse to execute *any* tool call in the batch. Because
+    /// the transition uses a conditional `UPDATE ... WHERE consumed_at IS NULL`,
+    /// concurrent callers race for the row and exactly one observes `None`. An
+    /// empty slice is a no-op that returns `Ok(None)`.
+    ///
+    /// [`get_pending_approvals`]: ResponseStore::get_pending_approvals
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails; on error the
+    /// transaction rolls back and nothing is claimed. Callers enforcing
+    /// strict single-use must fail closed on error rather than proceed with
+    /// unclaimed approvals.
+    async fn consume_approvals(
+        &self,
+        tenant_id: &str,
+        response_id: &str,
+        approval_ids: &[&str],
+        consumed_at: i64,
+    ) -> Result<Option<usize>, StoreError>;
 }
 
 // -----------------------------------------------------------------------------

@@ -7,7 +7,9 @@ Executes pending file search calls against a vector store API compatible backend
 
 ## Configuration Notes
 
-The enclosing iterative router owns model re-entry. Streaming requests are rejected because citation markers require an incremental SSE transformer. Search queries are forwarded unchanged; model context and citation marker formatting are internal.
+The enclosing iterative router owns model re-entry. Streaming is supported via the terminal-streaming machinery: the step-local `openai_stream_events` filter (`logical_stream: true`) finalizer synthesizes citation-annotated `file_search` lifecycle frames at EOS. Search queries are forwarded unchanged; model context and citation marker formatting are internal.
+
+Cannot share an IRR step with `openai_agentic_loop` due to competing `accumulated_output` ownership.
 
 ## Configuration
 

@@ -11,7 +11,13 @@
 # be triggered at runtime.
 #
 # Pipeline ordering:
-#   tool_parse → mcp_tool_resolve → stream_events → mcp_dispatch
+#   tool_parse → mcp_tool_resolve → mcp_dispatch
+#
+# `openai_stream_events` is not part of this minimal dispatch demo: it
+# composes streamed inference rounds into one logical Responses stream and
+# is only valid inside an `iterative_request_router` step. See
+# `agentic-loop.yaml` for the end-to-end streaming loop that pairs
+# `openai_mcp_dispatch` with `openai_stream_events` inside IRR.
 #
 # Configuration:
 #   timeout_ms:      Per-call timeout for tools/call (default: 30000)
@@ -29,7 +35,6 @@ filter_chains:
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
         timeout_ms: 5000
-      - filter: openai_stream_events
       - filter: openai_mcp_dispatch
         timeout_ms: 30000
         allow_loopback: false

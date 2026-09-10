@@ -43,6 +43,7 @@ mod anthropic_messages;
 mod claude_code;
 mod codex_websocket;
 mod conversations_rehydrate;
+mod error_response_formatter;
 mod examples;
 mod failure_mode;
 mod guardrails;

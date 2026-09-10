@@ -1,18 +1,30 @@
 # Streaming Event Accumulation
 #
-# Demonstrates the `openai_stream_events` filter, which observes
-# SSE chunks from the backend without modification, accumulates
-# state (response object, output items, tool calls, usage), and
-# writes it to ResponsesState metadata. The `openai_response_store`
-# filter then persists the accumulated state at end-of-stream.
+# Demonstrates the `openai_stream_events` filter, which composes the
+# current iterative-request-router (IRR) execution into one logical
+# Responses SSE stream: it parses each backend SSE chunk, accumulates
+# state (response object, output items, tool calls, usage) into
+# ResponsesState, normalizes the per-round lifecycle, and preserves
+# parser state through stream completion. A single inference round is
+# just a one-round logical stream.
 #
-# This is a minimal pipeline focused on streaming accumulation
-# and persistence. Response body filters run in reverse config
-# order, so the store is listed before stream_events while
-# stream_events still parses final chunks before store persistence.
-# For a complete setup with multi-turn conversation support
-# (rehydrate, openai_responses_proxy), see
-# full-flow.yaml.
+# `openai_stream_events` always composes a logical stream, so it must
+# run inside an `iterative_request_router` step; placing it anywhere
+# else fails closed at request time. A `stream: true` request arms it.
+#
+# The `openai_response_store` filter runs pre-IRR (registering the
+# store backend) and persists the accumulated ResponsesState once the
+# logical stream terminates. Response body filters run in reverse
+# config order, so the store persists after the step composes the
+# terminal event.
+#
+# `openai_responses_proxy` automatically selects Praxis's
+# typed streaming transport for the effective `stream: true` request, so
+# each SSE chunk reaches `openai_stream_events` incrementally.
+#
+# For a complete multi-turn setup with rehydrate and the agentic loop,
+# see agentic-loop.yaml. For terminal streaming without persistence, see
+# irr-terminal-streaming.yaml.
 #
 # Example requests:
 #
@@ -56,21 +68,42 @@ filter_chains:
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_stream_events
-        # max_tool_call_argument_bytes: 1048576
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        # The IRR's default 30s end-to-end deadline is too short for model
+        # inference. This single step inherits a 6-minute total deadline for
+        # time-to-first-byte plus response streaming.
+        timeout_ms: 360000
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_responses_proxy
 
-      - filter: router
-        routes:
-          - path: "/v1/responses"
-            headers:
-              x-praxis-ai-format: "openai_responses"
-            cluster: "inference-backend"
+              # Composes the inference stream into one logical Responses
+              # lifecycle. Armed by a `stream: true` request; always
+              # composes, so it must run inside this IRR step.
+              - filter: openai_stream_events
+                # max_tool_call_argument_bytes: 1048576
 
-      - filter: load_balancer
-        clusters:
-          - name: "inference-backend"
-            endpoints:
-              - "127.0.0.1:8000"
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+
+              - filter: router
+                routes:
+                  - path: "/v1/responses"
+                    cluster: "inference-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:8000"
+            on_result:
+              - default: true
+                done: true
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

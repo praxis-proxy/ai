@@ -26,9 +26,10 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
+use serde::Deserialize;
 use tracing::{debug, trace, warn};
 
 use self::{
@@ -106,6 +107,24 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// from the accumulator, not a buffered body, whereas any other response-body
 /// rewriter needing the complete buffered body would instead receive fragments.
 ///
+/// # Streaming through the agentic loop
+///
+/// Because this filter runs inside the iterative router, it always declares the
+/// streaming subrequest capability and selects the transport per request from
+/// the effective `stream` bit: an effective `"stream": true` request uses
+/// Praxis's typed streaming transport, and a buffered request uses the buffered
+/// transport. Selecting streaming keeps each translated per-round stream internal
+/// to the router instead of delivering the whole upstream SSE body to
+/// `openai_agentic_loop` as one buffered blob — a blob is not a Responses
+/// resource, so the loop could not detect a returned `web_search_call` and would
+/// terminate before any search dispatches. With streaming, `openai_web_search`
+/// dispatches the search, inference resumes, and `openai_stream_events` (placed
+/// first in the step) composes one client-facing Responses SSE lifecycle across
+/// the model, search, and resumed model output.
+/// Every response filter co-located in a step with this one must therefore use
+/// `BodyMode::Stream`; a static `StreamBuffer` filter in the same step must
+/// instead buffer dynamically (see `openai_file_search_callout`).
+///
 /// # YAML
 ///
 /// ```yaml
@@ -146,8 +165,7 @@ impl ResponsesToChatCompletionsFilter {
         &self,
         ctx: &HttpFilterContext<'_>,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let streaming = request_is_streaming(ctx);
-        let translated = match translate_canonical_state(ctx, streaming) {
+        let translated = match translate_canonical_state(ctx) {
             Ok(value) => value,
             Err(action) => return Ok(Err(action)),
         };
@@ -162,7 +180,6 @@ impl ResponsesToChatCompletionsFilter {
             return Ok(Err(reject_rewritten_body_too_large(
                 serialized.len(),
                 self.config.max_rewritten_body_bytes,
-                streaming,
             )));
         }
         Ok(Ok(serialized))
@@ -232,11 +249,10 @@ impl ResponsesToChatCompletionsFilter {
                 502,
                 "server_error",
                 "upstream provider returned an unsupported response representation",
-                streaming_requested,
             )));
         }
         let Some((response_id, created_at)) = stream_identity(ctx) else {
-            return Ok(missing_pipeline_state(streaming_requested));
+            return Ok(missing_pipeline_state());
         };
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
         // Downgrade the reconciled pipeline body mode to `Stream`. A downstream
@@ -336,6 +352,18 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         BodyAccess::ReadWrite
     }
 
+    fn may_select_streaming_subrequest_response(&self) -> bool {
+        // This filter runs inside the iterative router and always advertises the
+        // streaming subrequest capability. The transport is chosen per request in
+        // `on_request_body` from the effective `stream` bit: an effective
+        // `"stream": true` request streams so each translated per-round stream
+        // stays internal to the router (letting `openai_agentic_loop` parse it and
+        // dispatch tools), and a buffered request buffers. A build-time flag would
+        // make a `stream: true` request silently buffer — and so fail to dispatch
+        // the search — by default, so the capability is declared unconditionally.
+        true
+    }
+
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
@@ -349,7 +377,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             if ctx.response_header.as_ref().map(|response| response.status) == Some(http::StatusCode::OK) {
                 return self.install_stream_converter(ctx);
             }
-            return Ok(non_ok_sse_rejection(ctx));
+            return Ok(non_ok_sse_rejection());
         }
 
         if is_non_sse_streaming_success(ctx) {
@@ -420,6 +448,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
         ctx.set_metadata(ARMED_KEY, "true");
+        select_terminal_response_mode(ctx, body);
         let now = ctx.time_source.now().as_secs();
         let created_at = ctx
             .extensions
@@ -429,6 +458,40 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
 
         Ok(FilterAction::Continue)
     }
+}
+
+/// Narrow deserialization target for the provider-visible stream bit.
+///
+/// Only `stream` participates in transport selection; every other translated
+/// request field is intentionally ignored.
+#[derive(Deserialize)]
+struct EffectiveResponseMode {
+    /// Whether the translated outbound Chat Completions request asks for SSE.
+    #[serde(default)]
+    stream: bool,
+}
+
+/// Align the typed Praxis response transport with the translated outbound body.
+///
+/// The translated Chat Completions body carries the effective `stream` bit
+/// copied from the client Responses request, so this selects the transport
+/// matching the bytes it leaves for the backend: incremental typed streaming for
+/// an SSE request, buffered otherwise. Selecting streaming is what keeps each
+/// translated per-round stream internal to the iterative router — buffering it
+/// would deliver the whole SSE body to `openai_agentic_loop` as an opaque blob
+/// it cannot parse as a Responses resource, so the loop would terminate before
+/// `openai_web_search` ever dispatches.
+fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) {
+    let mode = if body
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<EffectiveResponseMode>(bytes).ok())
+        .is_some_and(|selection| selection.stream)
+    {
+        SubRequestResponseMode::Streaming
+    } else {
+        SubRequestResponseMode::Buffered
+    };
+    ctx.set_subrequest_response_mode(mode);
 }
 
 /// Decide whether the current request should translate, release, or fail closed.
@@ -455,21 +518,21 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
                 prerequisite = "openai_responses_format",
                 "request pipeline state is unavailable"
             );
-            Some(missing_pipeline_state(false))
+            Some(missing_pipeline_state())
         },
     }
 }
 
 /// Convert the validator-owned canonical state to a Chat request value.
-fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Result<serde_json::Value, FilterAction> {
+fn translate_canonical_state(ctx: &HttpFilterContext<'_>) -> Result<serde_json::Value, FilterAction> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         warn!(
             prerequisite = "openai_responses_validate",
             "request pipeline state is unavailable"
         );
-        return Err(missing_pipeline_state(streaming));
+        return Err(missing_pipeline_state());
     };
-    ensure_previous_response_rehydrated(state, streaming)?;
+    ensure_previous_response_rehydrated(state)?;
     responses_state_to_chat_request(&state.request_body, &state.messages, &state.tools, &state.tool_choice).map_err(
         |error| {
             debug!(error = %error, "Responses request cannot be represented by Chat Completions");
@@ -477,20 +540,19 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>, streaming: bool) -> Re
                 400,
                 "invalid_request_error",
                 &error.to_string(),
-                streaming,
             ))
         },
     )
 }
 
 /// Require stored history before translating a continuation request.
-fn ensure_previous_response_rehydrated(state: &ResponsesState, streaming: bool) -> Result<(), FilterAction> {
+fn ensure_previous_response_rehydrated(state: &ResponsesState) -> Result<(), FilterAction> {
     if state.previous_response_id.is_some() && !state.history_rehydrated {
         warn!(
             prerequisite = "openai_responses_rehydrate",
             "previous_response_id was not resolved before Chat Completions translation"
         );
-        return Err(missing_pipeline_state(streaming));
+        return Err(missing_pipeline_state());
     }
     Ok(())
 }
@@ -573,7 +635,6 @@ fn finite_response_transform(ctx: &HttpFilterContext<'_>) -> Result<Option<&'sta
                 502,
                 "server_error",
                 "upstream provider returned an unsupported response representation",
-                request_is_streaming(ctx),
             )));
         }
         return Ok(Some(RESPONSE_TRANSFORM_SUCCESS));
@@ -682,7 +743,6 @@ fn sse_for_non_streaming_rejection() -> FilterAction {
         502,
         "server_error",
         "upstream provider returned a streaming response for a non-streaming request",
-        false,
     ))
 }
 
@@ -692,26 +752,23 @@ fn non_sse_success_for_streaming_rejection() -> FilterAction {
         502,
         "server_error",
         "upstream provider returned a non-streaming success response for a streaming request",
-        true,
     ))
 }
 
 /// Reject a provider error stream without leaking Chat Completions framing.
-fn non_ok_sse_rejection(ctx: &HttpFilterContext<'_>) -> FilterAction {
+fn non_ok_sse_rejection() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         502,
         "server_error",
         "upstream provider returned an error event stream",
-        request_is_streaming(ctx),
     ))
 }
 
 /// Build the fail-closed action for missing classifier or validator state.
-fn missing_pipeline_state(streaming: bool) -> FilterAction {
+fn missing_pipeline_state() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         500,
         "server_error",
         "request pipeline state is unavailable",
-        streaming,
     ))
 }

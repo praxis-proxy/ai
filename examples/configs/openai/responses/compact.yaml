@@ -63,8 +63,11 @@ filter_chains:
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_stream_events
-
+      # `openai_stream_events` is intentionally absent: it composes streamed
+      # inference rounds into one logical Responses stream and is only valid
+      # inside an `iterative_request_router` step. This compaction demo proxies
+      # finite responses, so it would be inert here. See `stream-events.yaml`
+      # and `agentic-loop.yaml` for the in-IRR streaming examples.
       - filter: openai_responses_rehydrate
 
       - filter: openai_file_resolve

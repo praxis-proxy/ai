@@ -42,6 +42,7 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     register_aws_filters(registry);
     #[cfg(feature = "azure-ad-filter")]
     register_azure_filters(registry);
+    register_azure_translation_filters(registry);
     #[cfg(feature = "gcp-adc-filter")]
     register_gcp_filters(registry);
     register_general_ai_filters(registry);
@@ -92,6 +93,14 @@ fn register_aws_filters(registry: &mut FilterRegistry) {
 #[cfg(feature = "azure-ad-filter")]
 fn register_azure_filters(registry: &mut FilterRegistry) {
     register_routing_security_filter(registry, "azure_ad", AzureAdFilter::from_config);
+}
+
+/// Register Azure OpenAI translation filters.
+fn register_azure_translation_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_azureai_chat_completions" => praxis_ai_apis::azure::ChatCompletionsToAzureaiChatCompletionsFilter::from_config
+    );
 }
 
 /// Register GCP-specific filters.
@@ -455,6 +464,7 @@ mod tests {
             "anthropic_web_search",
             "request_id",
             "aws_sigv4_sign",
+            "openai_chat_completions_to_azureai_chat_completions",
         ];
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");

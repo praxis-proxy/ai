@@ -8,14 +8,18 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::{
-    ConversationItemRecord, ConversationRecord, PostgresResponseStore, ResponseRecord, ResponseStoreRegistry,
-    SqliteResponseStore, SslMode, StoreError,
+    ConversationItemRecord, ConversationRecord, PendingApprovalRecord, PostgresResponseStore, ResponseRecord,
+    ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreError,
     trait_def::{ConversationItemStore, ResponseStore},
 };
 use crate::openai::{
     include::IncludeFields,
     responses::store::{ListParams, Order, list_input_items},
 };
+
+/// Default issuing-response scope for pending-approval tests that do not
+/// exercise response scoping explicitly.
+const RESP: &str = "resp_1";
 
 // -----------------------------------------------------------------------------
 // Schema Initialization
@@ -226,6 +230,483 @@ async fn same_response_id_can_exist_in_multiple_tenants() {
     assert_eq!(tenant_b.tenant_id, "tenant_b", "tenant_b record should be isolated");
     assert_eq!(tenant_a.created_at, 1000, "tenant_a record should not be overwritten");
     assert_eq!(tenant_b.created_at, 2000, "tenant_b record should not be overwritten");
+}
+
+// -----------------------------------------------------------------------------
+// Approval Consumption (single-use)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn consume_approval_first_call_claims() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
+
+    let conflict = store
+        .consume_approvals("tenant_a", RESP, &["call_abc"], 1000)
+        .await
+        .expect("consume should succeed");
+
+    assert!(conflict.is_none(), "first consumption of an approval should be claimed");
+}
+
+#[tokio::test]
+async fn consume_approval_without_pending_row_is_rejected() {
+    let store = make_store().await;
+
+    // No record_pending_approvals: a consume for an id the proxy never issued
+    // has no server-owned row to claim and must fail closed rather than
+    // conjuring consent from nothing.
+    let conflict = store
+        .consume_approvals("tenant_a", RESP, &["call_never_issued"], 1000)
+        .await
+        .expect("consume should succeed");
+
+    assert_eq!(
+        conflict,
+        Some(0),
+        "consuming an approval with no server-owned pending row must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn consume_approval_replay_is_rejected() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
+
+    let first = store
+        .consume_approvals("tenant_a", RESP, &["call_abc"], 1000)
+        .await
+        .expect("first consume should succeed");
+    let replay = store
+        .consume_approvals("tenant_a", RESP, &["call_abc"], 2000)
+        .await
+        .expect("replay consume should succeed");
+
+    assert!(first.is_none(), "first consumption should be claimed");
+    assert_eq!(
+        replay,
+        Some(0),
+        "replayed consumption of the same approval must be rejected (single-use)"
+    );
+}
+
+#[tokio::test]
+async fn consume_approval_distinct_ids_each_claim() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_1", "call_2"]).await;
+
+    let first = store
+        .consume_approvals("tenant_a", RESP, &["call_1"], 1000)
+        .await
+        .expect("consume should succeed");
+    let second = store
+        .consume_approvals("tenant_a", RESP, &["call_2"], 1000)
+        .await
+        .expect("consume should succeed");
+
+    assert!(first.is_none(), "first distinct approval should be claimed");
+    assert!(second.is_none(), "second distinct approval should be claimed");
+}
+
+#[tokio::test]
+async fn consume_approval_is_tenant_scoped() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_shared"]).await;
+    seed_pending(&store, "tenant_b", RESP, &["call_shared"]).await;
+
+    let tenant_a = store
+        .consume_approvals("tenant_a", RESP, &["call_shared"], 1000)
+        .await
+        .expect("tenant_a consume should succeed");
+    let tenant_b = store
+        .consume_approvals("tenant_b", RESP, &["call_shared"], 1000)
+        .await
+        .expect("tenant_b consume should succeed");
+
+    assert!(tenant_a.is_none(), "tenant_a should claim its own approval");
+    assert!(
+        tenant_b.is_none(),
+        "tenant_b sharing an approval id with tenant_a should still claim independently"
+    );
+}
+
+#[tokio::test]
+async fn consume_approvals_batch_claims_all_distinct_ids() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_1", "call_2", "call_3"]).await;
+
+    let conflict = store
+        .consume_approvals("tenant_a", RESP, &["call_1", "call_2", "call_3"], 1000)
+        .await
+        .expect("batch consume should succeed");
+
+    assert!(conflict.is_none(), "a batch of distinct ids should claim every one");
+}
+
+#[tokio::test]
+async fn consume_approvals_batch_is_all_or_nothing_on_replay() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_1", "call_2"]).await;
+
+    // Claim call_1 on its own.
+    store
+        .consume_approvals("tenant_a", RESP, &["call_1"], 1000)
+        .await
+        .expect("first claim should succeed");
+
+    // A batch that replays call_1 alongside a fresh call_2 must reject the
+    // whole batch and leave call_2 unclaimed.
+    let conflict = store
+        .consume_approvals("tenant_a", RESP, &["call_1", "call_2"], 2000)
+        .await
+        .expect("batch consume should succeed");
+    assert_eq!(conflict, Some(0), "the replayed id's index should be reported");
+
+    // Proof of rollback: call_2 was never burned, so it still claims cleanly.
+    let call_2 = store
+        .consume_approvals("tenant_a", RESP, &["call_2"], 3000)
+        .await
+        .expect("call_2 consume should succeed");
+    assert!(
+        call_2.is_none(),
+        "a rolled-back batch must not strand an otherwise-fresh sibling approval"
+    );
+}
+
+#[tokio::test]
+async fn consume_approvals_rejects_intra_batch_duplicate() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_dup"]).await;
+
+    // The same id twice in one batch is a duplicate: the first occurrence claims
+    // the row inside the transaction, so the second finds nothing outstanding.
+    let conflict = store
+        .consume_approvals("tenant_a", RESP, &["call_dup", "call_dup"], 1000)
+        .await
+        .expect("batch consume should succeed");
+    assert_eq!(conflict, Some(1), "the duplicate's index should be reported");
+
+    // Proof of rollback: the id was never burned by the rejected batch.
+    let retry = store
+        .consume_approvals("tenant_a", RESP, &["call_dup"], 2000)
+        .await
+        .expect("retry consume should succeed");
+    assert!(
+        retry.is_none(),
+        "a batch rejected for an intra-batch duplicate must not burn the id"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consume_approvals_concurrent_claims_exactly_once() {
+    // A file-backed store gives the two tasks real (>1) connections so the
+    // claim races at the database, not just in the pool. Exactly one caller
+    // must observe the fresh claim; the other must be rejected.
+    let dir = tempfile::tempdir().expect("temp dir should be created");
+    let db_path = dir.path().join("concurrent_consume.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let store = Arc::new(
+        SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None, None)
+            .await
+            .expect("store creation should succeed"),
+    );
+    seed_pending(store.as_ref(), "tenant_a", RESP, &["call_race"]).await;
+
+    let store_a = Arc::clone(&store);
+    let store_b = Arc::clone(&store);
+    let task_a = tokio::spawn(async move { store_a.consume_approvals("tenant_a", RESP, &["call_race"], 1000).await });
+    let task_b = tokio::spawn(async move { store_b.consume_approvals("tenant_a", RESP, &["call_race"], 1000).await });
+
+    let a = task_a
+        .await
+        .expect("task a should join")
+        .expect("consume a should succeed");
+    let b = task_b
+        .await
+        .expect("task b should join")
+        .expect("consume b should succeed");
+
+    let claimed = usize::from(a.is_none()) + usize::from(b.is_none());
+    let rejected = usize::from(a == Some(0)) + usize::from(b == Some(0));
+    assert_eq!(claimed, 1, "exactly one concurrent caller must claim the approval");
+    assert_eq!(rejected, 1, "exactly one concurrent caller must be rejected");
+}
+
+// -----------------------------------------------------------------------------
+// Pending Approvals (server-owned correlation records)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn record_and_get_pending_approval_round_trips_fields() {
+    let store = make_store().await;
+    let record = make_pending("call_abc");
+    store
+        .record_pending_approvals("tenant_a", RESP, std::slice::from_ref(&record), 1000)
+        .await
+        .expect("record should succeed");
+
+    let fetched = store
+        .get_pending_approvals("tenant_a", RESP, &["call_abc"])
+        .await
+        .expect("get should succeed");
+
+    assert_eq!(
+        fetched,
+        vec![record],
+        "the fetched pending record must round-trip every field"
+    );
+}
+
+#[tokio::test]
+async fn get_pending_approvals_absent_id_returns_empty() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_present"]).await;
+
+    let fetched = store
+        .get_pending_approvals("tenant_a", RESP, &["call_absent"])
+        .await
+        .expect("get should succeed");
+
+    assert!(
+        fetched.is_empty(),
+        "an id the proxy never issued must have no pending row"
+    );
+}
+
+#[tokio::test]
+async fn get_pending_approvals_is_tenant_scoped() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_shared"]).await;
+
+    let other_tenant = store
+        .get_pending_approvals("tenant_b", RESP, &["call_shared"])
+        .await
+        .expect("get should succeed");
+
+    assert!(
+        other_tenant.is_empty(),
+        "a pending row for tenant_a must be invisible to tenant_b"
+    );
+}
+
+#[tokio::test]
+async fn get_pending_approvals_returns_consumed_rows() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
+    store
+        .consume_approvals("tenant_a", RESP, &["call_abc"], 2000)
+        .await
+        .expect("consume should succeed");
+
+    // A consumed row is still returned so the resume path can distinguish
+    // "already used" (row present, consume rejects) from "never issued"
+    // (row absent).
+    let fetched = store
+        .get_pending_approvals("tenant_a", RESP, &["call_abc"])
+        .await
+        .expect("get should succeed");
+
+    assert_eq!(fetched.len(), 1, "a consumed pending row must still be retrievable");
+    assert_eq!(fetched[0].approval_id, "call_abc");
+}
+
+#[tokio::test]
+async fn record_pending_approvals_is_idempotent_and_never_resets_consumption() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
+    store
+        .consume_approvals("tenant_a", RESP, &["call_abc"], 2000)
+        .await
+        .expect("first consume should succeed");
+
+    // Re-recording the same approval (e.g. the response is persisted again on a
+    // retried turn) must not resurrect an already-consumed row, or a client
+    // could replay a used approval.
+    seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
+
+    let replay = store
+        .consume_approvals("tenant_a", RESP, &["call_abc"], 3000)
+        .await
+        .expect("replay consume should succeed");
+
+    assert_eq!(
+        replay,
+        Some(0),
+        "re-recording a consumed approval must not reset it to outstanding"
+    );
+}
+
+#[tokio::test]
+async fn get_pending_approvals_is_response_scoped() {
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", "resp_1", &["call_shared"]).await;
+
+    let other_response = store
+        .get_pending_approvals("tenant_a", "resp_2", &["call_shared"])
+        .await
+        .expect("get should succeed");
+
+    assert!(
+        other_response.is_empty(),
+        "a pending row issued by resp_1 must be invisible under a different response id"
+    );
+}
+
+#[tokio::test]
+async fn consume_approvals_is_response_scoped() {
+    // The same approval id issued by two different responses is two independent
+    // single-use tokens. A resume that names the wrong originating response must
+    // not be able to claim either, and consuming one must not consume the other.
+    let store = make_store().await;
+    seed_pending(&store, "tenant_a", "resp_1", &["call_shared"]).await;
+    seed_pending(&store, "tenant_a", "resp_2", &["call_shared"]).await;
+
+    // Claiming the token under an unrelated response id finds no row and rejects.
+    let wrong = store
+        .consume_approvals("tenant_a", "resp_other", &["call_shared"], 1000)
+        .await
+        .expect("consume should succeed");
+    assert_eq!(
+        wrong,
+        Some(0),
+        "an approval scoped to another response must not be claimable"
+    );
+
+    // Each issuing response's token is claimable exactly once, independently.
+    let first = store
+        .consume_approvals("tenant_a", "resp_1", &["call_shared"], 1000)
+        .await
+        .expect("consume should succeed");
+    let second = store
+        .consume_approvals("tenant_a", "resp_2", &["call_shared"], 1000)
+        .await
+        .expect("consume should succeed");
+    assert!(first.is_none(), "resp_1's token should claim cleanly");
+    assert!(
+        second.is_none(),
+        "resp_2's independent token should still claim cleanly"
+    );
+
+    // Replaying resp_1's now-consumed token rejects: it is single-use per response.
+    let replay = store
+        .consume_approvals("tenant_a", "resp_1", &["call_shared"], 2000)
+        .await
+        .expect("consume should succeed");
+    assert_eq!(replay, Some(0), "resp_1's token is single-use");
+}
+
+#[tokio::test]
+async fn delete_response_removes_its_pending_approvals() {
+    // Deleting the originating response must not leave its approval consumable or
+    // retain the sensitive arguments indefinitely: the pending rows scoped to that
+    // response are removed transactionally with the response itself.
+    let store = make_store().await;
+    let record = make_response_record("resp_del", "tenant_a", 1000);
+    store.upsert_response(&record).await.expect("upsert should succeed");
+    seed_pending(&store, "tenant_a", "resp_del", &["call_abc"]).await;
+
+    let deleted = store
+        .delete_response("tenant_a", "resp_del")
+        .await
+        .expect("delete should succeed");
+    assert!(deleted, "the response should be deleted");
+
+    // The approval issued by the deleted response is gone: neither retrievable...
+    let fetched = store
+        .get_pending_approvals("tenant_a", "resp_del", &["call_abc"])
+        .await
+        .expect("get should succeed");
+    assert!(
+        fetched.is_empty(),
+        "deleting the response must remove its pending approval rows"
+    );
+
+    // ...nor consumable (no server-owned row remains to claim).
+    let claim = store
+        .consume_approvals("tenant_a", "resp_del", &["call_abc"], 1000)
+        .await
+        .expect("consume should succeed");
+    assert_eq!(claim, Some(0), "a deleted response's approval must not be consumable");
+}
+
+#[tokio::test]
+async fn persist_response_with_pending_approvals_writes_both() {
+    // The atomic write path records the response and every pending approval it
+    // issued together, so the resume turn can correlate the mcp_approval_response
+    // back to a durable, server-written record.
+    let store = make_store().await;
+    let record = make_response_record("resp_persist", "tenant_a", 1000);
+    let approval = PendingApprovalRecord {
+        approval_id: "call_persist".to_owned(),
+        ..make_pending("call_persist")
+    };
+
+    store
+        .persist_response_with_pending_approvals(&record, std::slice::from_ref(&approval))
+        .await
+        .expect("atomic persist should succeed");
+
+    let fetched_response = store
+        .get_response("tenant_a", "resp_persist")
+        .await
+        .expect("get should succeed");
+    assert!(fetched_response.is_some(), "the response must be written");
+
+    let fetched_approvals = store
+        .get_pending_approvals("tenant_a", "resp_persist", &["call_persist"])
+        .await
+        .expect("get should succeed");
+    assert_eq!(
+        fetched_approvals,
+        vec![approval],
+        "the pending approval must be written and scoped to the issuing response"
+    );
+}
+
+#[tokio::test]
+async fn persist_response_with_pending_approvals_rolls_back_response_on_approval_failure() {
+    // Atomicity means the response and its pending approvals commit together or not
+    // at all. If the approval write fails, a separate-writes implementation leaves
+    // the response committed — visible to a streaming client that could then issue a
+    // DELETE while the (retried) approval insert lands, orphaning a row that holds
+    // the tool arguments. A single transaction rolls the response back with the
+    // failed approval, so no half-written state is ever observable.
+    //
+    // Force the second write to fail deterministically by dropping the derived
+    // approvals table on a side connection, then assert the response did not persist.
+    let dir = tempfile::tempdir().expect("temp dir should be created");
+    let store = make_file_store(&dir, None).await;
+
+    let db_path = dir.path().join("concurrent.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let side = sqlx::sqlite::SqlitePool::connect(&url)
+        .await
+        .expect("side connection should open");
+    sqlx::query("DROP TABLE test_responses_pending_approvals")
+        .execute(&side)
+        .await
+        .expect("dropping the approvals table should succeed");
+    side.close().await;
+
+    let record = make_response_record("resp_rollback", "tenant_a", 1000);
+    let approval = make_pending("call_rollback");
+    let result = store
+        .persist_response_with_pending_approvals(&record, std::slice::from_ref(&approval))
+        .await;
+    assert!(
+        result.is_err(),
+        "a failed pending-approval write must surface an error, not be swallowed"
+    );
+
+    let fetched = store
+        .get_response("tenant_a", "resp_rollback")
+        .await
+        .expect("get should succeed");
+    assert!(
+        fetched.is_none(),
+        "the response must be rolled back when its pending-approval write fails, \
+         leaving no half-written state"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -2424,6 +2905,108 @@ async fn pg_same_response_id_can_exist_in_multiple_tenants() {
 
 #[tokio::test]
 #[ignore]
+async fn pg_consume_approval_replay_is_rejected() {
+    let store = make_pg_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
+
+    let first = store
+        .consume_approvals("tenant_a", RESP, &["call_abc"], 1000)
+        .await
+        .expect("first consume should succeed");
+    let replay = store
+        .consume_approvals("tenant_a", RESP, &["call_abc"], 2000)
+        .await
+        .expect("replay consume should succeed");
+
+    assert!(first.is_none(), "first consumption should be claimed");
+    assert_eq!(
+        replay,
+        Some(0),
+        "replayed consumption of the same approval must be rejected (single-use)"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_persist_response_with_pending_approvals_writes_both() {
+    let store = make_pg_store().await;
+    let record = make_response_record("resp_persist", "tenant_a", 1000);
+    let approval = make_pending("call_persist");
+
+    store
+        .persist_response_with_pending_approvals(&record, std::slice::from_ref(&approval))
+        .await
+        .expect("atomic persist should succeed");
+
+    let fetched_response = store
+        .get_response("tenant_a", "resp_persist")
+        .await
+        .expect("get should succeed");
+    assert!(fetched_response.is_some(), "the response must be written");
+
+    let fetched_approvals = store
+        .get_pending_approvals("tenant_a", "resp_persist", &["call_persist"])
+        .await
+        .expect("get should succeed");
+    assert_eq!(
+        fetched_approvals,
+        vec![approval],
+        "the pending approval must be written and scoped to the issuing response"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_consume_approval_is_tenant_scoped() {
+    let store = make_pg_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_shared"]).await;
+    seed_pending(&store, "tenant_b", RESP, &["call_shared"]).await;
+
+    let tenant_a = store
+        .consume_approvals("tenant_a", RESP, &["call_shared"], 1000)
+        .await
+        .expect("tenant_a consume should succeed");
+    let tenant_b = store
+        .consume_approvals("tenant_b", RESP, &["call_shared"], 1000)
+        .await
+        .expect("tenant_b consume should succeed");
+
+    assert!(tenant_a.is_none(), "tenant_a should claim its own approval");
+    assert!(
+        tenant_b.is_none(),
+        "tenant_b sharing an approval id with tenant_a should still claim independently"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_consume_approvals_batch_is_all_or_nothing_on_replay() {
+    let store = make_pg_store().await;
+    seed_pending(&store, "tenant_a", RESP, &["call_1", "call_2"]).await;
+
+    store
+        .consume_approvals("tenant_a", RESP, &["call_1"], 1000)
+        .await
+        .expect("first claim should succeed");
+
+    let conflict = store
+        .consume_approvals("tenant_a", RESP, &["call_1", "call_2"], 2000)
+        .await
+        .expect("batch consume should succeed");
+    assert_eq!(conflict, Some(0), "the replayed id's index should be reported");
+
+    let call_2 = store
+        .consume_approvals("tenant_a", RESP, &["call_2"], 3000)
+        .await
+        .expect("call_2 consume should succeed");
+    assert!(
+        call_2.is_none(),
+        "a rolled-back batch must not strand an otherwise-fresh sibling approval"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn pg_upsert_and_get_conversation() {
     let store = make_pg_store().await;
 
@@ -3138,6 +3721,32 @@ fn make_conversation_item(
 fn assert_item_ids(items: &[ConversationItemRecord], expected: &[&str]) {
     let ids: Vec<&str> = items.iter().map(|i| i.item_id.as_str()).collect();
     assert_eq!(ids, expected, "item IDs should match expected order");
+}
+
+/// Build a pending-approval record for seeding the approvals table before a
+/// consume test. A single fixed target is fine; consumption keys on
+/// `(tenant_id, response_id, approval_id)`, and the response scope is supplied
+/// separately by [`seed_pending`].
+fn make_pending(approval_id: &str) -> PendingApprovalRecord {
+    PendingApprovalRecord {
+        approval_id: approval_id.to_owned(),
+        server_label: "weather".to_owned(),
+        tool_name: "get_weather".to_owned(),
+        arguments: r#"{"location":"SF"}"#.to_owned(),
+        target_fingerprint: "fp-test".to_owned(),
+    }
+}
+
+/// Seed `approval_ids` as outstanding (unconsumed) pending rows issued by
+/// `response_id` so a following [`ResponseStore::consume_approvals`] scoped to
+/// the same response has real rows to claim. Takes `&dyn ResponseStore` so both
+/// the SQLite and Postgres suites share it.
+async fn seed_pending(store: &dyn ResponseStore, tenant_id: &str, response_id: &str, approval_ids: &[&str]) {
+    let records: Vec<PendingApprovalRecord> = approval_ids.iter().map(|id| make_pending(id)).collect();
+    store
+        .record_pending_approvals(tenant_id, response_id, &records, 1000)
+        .await
+        .expect("seeding pending approvals should succeed");
 }
 
 fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseRecord {
