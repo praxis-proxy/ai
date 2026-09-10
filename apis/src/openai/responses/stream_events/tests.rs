@@ -3371,3 +3371,109 @@ async fn on_response_preserves_content_length_when_not_armed() {
         "Content-Length should be preserved when filter is not armed"
     );
 }
+
+#[tokio::test]
+async fn on_request_body_caps_upstream_read_timeout_at_stream_budget() {
+    use std::{sync::Arc, time::Duration};
+
+    use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
+    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = Some(Upstream {
+        address: Arc::from("127.0.0.1:9"),
+        authority: None,
+        tls: None,
+        connection: Arc::new(ConnectionOptions::default()),
+    });
+
+    filter.on_request(&mut ctx).await.unwrap();
+    filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    assert_eq!(
+        ctx.upstream.as_ref().and_then(|u| u.connection.read_timeout),
+        Some(Duration::from_secs(1)),
+        "armed stream_events must cap the selected peer read timeout so idle backends wake"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_keeps_a_tighter_cluster_read_timeout() {
+    use std::{sync::Arc, time::Duration};
+
+    use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 300").unwrap();
+    let filter = OpenaiStreamEventsFilter::from_config(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = Some(Upstream {
+        address: Arc::from("127.0.0.1:9"),
+        authority: None,
+        tls: None,
+        connection: Arc::new(ConnectionOptions {
+            read_timeout: Some(Duration::from_millis(250)),
+            ..ConnectionOptions::default()
+        }),
+    });
+
+    filter.on_request(&mut ctx).await.unwrap();
+
+    assert_eq!(
+        ctx.upstream.as_ref().and_then(|u| u.connection.read_timeout),
+        Some(Duration::from_millis(250)),
+        "a tighter cluster read timeout must not be relaxed to timeout_secs"
+    );
+}
+
+#[tokio::test]
+async fn idle_timeout_does_not_fail_a_completed_sse_stream() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let completed =
+        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
+    let mut body = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    super::record_idle_timeout_error_if_incomplete(&mut ctx);
+
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_none(),
+        "a terminal lifecycle event must not be rewritten as a transport timeout"
+    );
+    assert!(
+        ctx.get_metadata("responses.skip_persist").is_none(),
+        "a completed SSE stream must remain persistable when the HTTP body closes slowly"
+    );
+}
+
+#[tokio::test]
+async fn idle_timeout_fails_an_open_sse_stream() {
+    let (filter, mut ctx) = make_armed_context();
+    filter.on_request(&mut ctx).await.unwrap();
+
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    super::record_idle_timeout_error_if_incomplete(&mut ctx);
+
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "an idle abort before a terminal event is a stream timeout"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an incomplete idle abort must not be persisted"
+    );
+}

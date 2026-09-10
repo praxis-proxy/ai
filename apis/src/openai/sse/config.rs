@@ -27,6 +27,10 @@ pub(crate) struct SseParserConfig {
     pub max_events: usize,
 
     /// Maximum wall-clock time from first chunk to stream completion.
+    ///
+    /// Enforced when chunks or end-of-stream arrive. Idle gaps with no
+    /// body traffic are enforced by the upstream read timeout (see
+    /// `openai_stream_events.timeout_secs`).
     pub timeout: Duration,
 }
 

@@ -241,6 +241,71 @@ async fn stream_events_forwards_backend_error_transparently() {
     cleanup_sqlite_files(&db_path);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_idle_backend_is_cut_off_by_read_timeout() {
+    use std::time::{Duration, Instant};
+
+    let first_event = "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n";
+    let backend_guard = Backend::chunked(vec![
+        first_event.to_owned(),
+        "event: response.completed\ndata: {}\n\n".to_owned(),
+    ])
+    .header("content-type", "text/event-stream")
+    .stall_after_first_chunk(Duration::from_secs(10))
+    .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_idle");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    let yaml = yaml
+        .replace("sqlite://responses.db?mode=rwc", &db_url)
+        .replace("read_timeout_ms: 300000", "read_timeout_ms: 1000")
+        .replace(
+            "- filter: openai_stream_events",
+            "- filter: openai_stream_events\n        timeout_secs: 1",
+        );
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let started = Instant::now();
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
+        ),
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "an idle backend after the first SSE event must be cut off by read_timeout_ms, not held until the 10s stall; elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "headers should already be committed as SSE: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("response.in_progress"),
+        "the first SSE event should reach the client before the idle abort: {body}"
+    );
+    assert!(
+        !body.contains("response.completed"),
+        "the stalled backend must not be able to finish the stream after the idle deadline: {body}"
+    );
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

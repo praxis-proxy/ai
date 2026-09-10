@@ -156,6 +156,10 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference-backend"
+                    # Cap silent upstream reads. IRR also applies a 30s
+                    # streaming idle timeout; the effective idle deadline is
+                    # the minimum of this value and that idle budget.
+                    read_timeout_ms: 300000
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:

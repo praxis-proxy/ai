@@ -58,6 +58,9 @@ filter_chains:
 
       - filter: openai_stream_events
         # max_tool_call_argument_bytes: 1048576
+        # timeout_secs bounds elapsed time across chunks (default 300).
+        # Pair it with cluster read_timeout_ms so a silent backend is cut
+        # off without waiting for another SSE chunk.
 
       - filter: router
         routes:
@@ -69,6 +72,9 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: "inference-backend"
+            # Match openai_stream_events timeout_secs (default 300s) so an
+            # idle upstream read wakes without another body callback.
+            read_timeout_ms: 300000
             endpoints:
               - "127.0.0.1:8000"
 

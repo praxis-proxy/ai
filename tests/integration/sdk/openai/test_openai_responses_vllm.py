@@ -541,10 +541,12 @@ def _write_agentic_config(
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     vllm = _vllm_endpoint()
-    config = config.replace(
-        '- "127.0.0.1:3001"',
-        f'- "{vllm}"\n                    read_timeout_ms: 300000',
-    )
+    config = config.replace('- "127.0.0.1:3001"', f'- "{vllm}"')
+    if config.count("read_timeout_ms:") != 1:
+        raise RuntimeError(
+            "agentic-loop.yaml must declare exactly one cluster read_timeout_ms; "
+            "the vLLM harness no longer injects a second copy"
+        )
     config = _patch_store_backend(config, db_path)
     config = config.replace(
         "- filter: openai_mcp_tool_resolve\n",
