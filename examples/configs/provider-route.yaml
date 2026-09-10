@@ -31,12 +31,17 @@ filter_chains:
         header: X-Model
 
       # Exact local policy mapping. This is not another routing engine.
+      # provider_ref is the trusted Grid identity; provider_ref.site scopes
+      # the name for multi-site overlays. candidate_id: <stable_id> remains
+      # supported for legacy configurations.
       - filter: provider_route
         provider_id: site-us-west
         model_header: X-Model
         emit_demo_attribution: true
         routes:
-          - candidate_id: inference_model/mock-model/site-us-west/provider-us-west
+          - provider_ref:
+              name: mock-model-provider
+              site: site-us-west
             model: mock-model
             paths:
               - /v1/chat/completions

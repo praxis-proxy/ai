@@ -20,7 +20,10 @@
 //! group.
 //! The filter does not recompute source geography, load, or scoring.
 //!
-//! No request-time metrics or control-plane lookups are performed.
+//! No request-time metrics or control-plane lookups are performed. Overlay
+//! candidates may carry a trusted `provider_ref`; when a provider hop is
+//! configured, its name and site are forwarded alongside the stable ID using
+//! AI-owned peer headers generated after candidate selection.
 
 use std::{
     collections::BTreeSet,
@@ -39,10 +42,10 @@ use serde::Deserialize;
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     metadata::{
-        OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
-        ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_GROUP,
-        ROUTE_SELECTION_MODE, ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER,
-        set_credential_metadata,
+        OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_REF_NAME_HEADER, PROVIDER_REF_SITE_HEADER,
+        ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND, ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID,
+        ROUTE_PROVIDER_REF_NAME, ROUTE_PROVIDER_REF_SITE, ROUTE_RANK, ROUTE_SELECTION_GROUP, ROUTE_SELECTION_MODE,
+        ROUTE_SELECTION_TIER, ROUTE_SITE, ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
     overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, PickerPolicy, RouteSnapshot},
     picker,
@@ -646,6 +649,10 @@ impl HttpFilter for IntelligentRouteFilter {
             .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
         ctx.request_headers_to_remove
             .push(HeaderName::from_static(OVERLAY_REVISION_HEADER));
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static(PROVIDER_REF_NAME_HEADER));
+        ctx.request_headers_to_remove
+            .push(HeaderName::from_static(PROVIDER_REF_SITE_HEADER));
 
         if ctx.cluster.is_some() {
             tracing::debug!("intelligent_route: cluster already set; preserving");
@@ -954,6 +961,10 @@ fn record_route_decision(ctx: &mut HttpFilterContext<'_>, local_site: &Arc<str>,
     ctx.set_metadata(ROUTE_NAME, &*candidate.name);
     ctx.set_metadata(ROUTE_SITE, &*candidate.site);
     ctx.set_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
+    if let Some(provider_ref) = &candidate.provider_ref {
+        ctx.set_metadata(ROUTE_PROVIDER_REF_NAME, &*provider_ref.name);
+        ctx.set_metadata(ROUTE_PROVIDER_REF_SITE, &*provider_ref.site);
+    }
     if let Some(rank) = candidate.rank {
         ctx.set_metadata(ROUTE_RANK, rank.to_string());
     }
@@ -1005,6 +1016,18 @@ fn write_provider_context(
         HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
         request_id_value,
     ));
+    if let Some(provider_ref) = &candidate.provider_ref {
+        let provider_name = HeaderValue::from_str(&provider_ref.name).map_err(|error| {
+            FilterError::from(format!("intelligent_route: invalid provider reference name: {error}"))
+        })?;
+        let provider_site = HeaderValue::from_str(&provider_ref.site).map_err(|error| {
+            FilterError::from(format!("intelligent_route: invalid provider reference site: {error}"))
+        })?;
+        ctx.request_headers_to_set
+            .push((HeaderName::from_static(PROVIDER_REF_NAME_HEADER), provider_name));
+        ctx.request_headers_to_set
+            .push((HeaderName::from_static(PROVIDER_REF_SITE_HEADER), provider_site));
+    }
     if let Some(rev) = semantic_revision {
         let rev_value = HeaderValue::from_str(rev).map_err(|error| {
             FilterError::from(format!("intelligent_route: invalid serving overlay revision: {error}"))
@@ -2804,6 +2827,7 @@ mod tests {
                 selection_tier: None,
                 site: Arc::from("s"),
                 stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", "s", cluster),
+                provider_ref: None,
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))

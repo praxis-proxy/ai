@@ -114,6 +114,7 @@ mod tests {
             admission_state,
             cluster: Arc::from("cluster"),
             credential: None,
+            provider_ref: None,
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: Arc::from("model"),

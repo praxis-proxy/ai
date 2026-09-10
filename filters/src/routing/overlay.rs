@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
+    descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, ProviderRef, RouteCandidate},
     group_index::{self, GroupIndex},
     metadata::{CandidateCredential, CredentialRef},
 };
@@ -277,6 +277,10 @@ pub(crate) struct OverlayCandidate {
     #[serde(default)]
     credential: Option<OverlayCredential>,
 
+    /// Trusted provider identity projected by Grid.
+    #[serde(default)]
+    provider_ref: Option<OverlayProviderRef>,
+
     /// Whether this candidate is considered fresh by the configuration producer.
     #[serde(default = "default_fresh")]
     pub(crate) fresh: bool,
@@ -305,6 +309,17 @@ pub(crate) struct OverlayCandidate {
     /// Deterministic identifier assigned by the configuration producer.
     #[serde(default)]
     pub(crate) stable_id: Option<String>,
+}
+
+/// Provider identity in the Grid overlay.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverlayProviderRef {
+    /// `InferenceProvider` resource name.
+    name: String,
+
+    /// Site that owns the provider.
+    site: String,
 }
 
 /// Default freshness for overlay candidates.
@@ -800,6 +815,26 @@ pub(super) fn enrich_from_overlay(
                 );
             }
             c.stable_id = Arc::from(id.as_str());
+        }
+        c.provider_ref = oc.provider_ref.as_ref().map(|provider_ref| ProviderRef {
+            name: Arc::from(provider_ref.name.as_str()),
+            site: Arc::from(provider_ref.site.as_str()),
+        });
+        if let Some(provider_ref) = &c.provider_ref {
+            validate_overlay_provider_ref(i, provider_ref)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the trusted provider identity before it can cross the provider hop.
+fn validate_overlay_provider_ref(index: usize, provider_ref: &ProviderRef) -> Result<(), FilterError> {
+    for (field, value) in [("name", &provider_ref.name), ("site", &provider_ref.site)] {
+        if value.trim().is_empty() || value.len() > 256 || value.parse::<http::HeaderValue>().is_err() {
+            return Err(format!(
+                "routing: candidate {index}: provider_ref.{field} must be a valid 1-256 byte header value"
+            )
+            .into());
         }
     }
     Ok(())
@@ -1488,6 +1523,26 @@ mod tests {
         assert_eq!(snap.candidates.len(), 1);
         assert_eq!(&*snap.candidates[0].name, "llama-3-70b");
         assert_eq!(&*snap.local_site, "us-east-1");
+    }
+
+    #[test]
+    fn snapshot_preserves_trusted_provider_reference() {
+        let json = r#"{
+            "local_site": "site-a",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "qwen3",
+                "site": "site-b",
+                "cluster": "provider-b",
+                "fresh": true,
+                "stable_id": "stable-qwen3",
+                "provider_ref": {"name": "qwen3-ifc1", "site": "site-b"}
+            }]
+        }"#;
+        let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        let provider_ref = snap.candidates[0].provider_ref.as_ref().unwrap();
+        assert_eq!(&*provider_ref.name, "qwen3-ifc1");
+        assert_eq!(&*provider_ref.site, "site-b");
     }
 
     // -------------------------------------------------------------------------

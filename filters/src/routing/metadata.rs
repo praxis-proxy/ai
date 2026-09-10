@@ -21,6 +21,12 @@ pub(crate) const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id
 /// Serving overlay revision forwarded from the edge gateway.
 pub(crate) const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
 
+/// Trusted provider name forwarded from the selected Grid candidate.
+pub(crate) const PROVIDER_REF_NAME_HEADER: &str = "x-ai-routing-provider-name";
+
+/// Trusted provider site scope forwarded from the selected Grid candidate.
+pub(crate) const PROVIDER_REF_SITE_HEADER: &str = "x-ai-routing-provider-site";
+
 /// Provider identity header added only for backend/demo capture.
 pub(crate) const PROVIDER_ATTRIBUTION_HEADER: &str = "x-ai-provider-attribution";
 
@@ -58,11 +64,19 @@ pub(crate) const ROUTE_SELECTION_TIER: &str = "intelligent_route.selection_tier"
 pub(crate) const ROUTE_SITE: &str = "intelligent_route.site";
 /// Stable identifier for the selected candidate.
 pub(crate) const ROUTE_STABLE_ID: &str = "intelligent_route.stable_id";
+/// Trusted provider name of the selected candidate.
+pub(crate) const ROUTE_PROVIDER_REF_NAME: &str = "intelligent_route.provider_ref.name";
+/// Trusted provider site of the selected candidate.
+pub(crate) const ROUTE_PROVIDER_REF_SITE: &str = "intelligent_route.provider_ref.site";
 /// Hop request ID forwarded to the provider gateway.
 pub(crate) const ROUTE_PROVIDER_HOP_REQUEST_ID: &str = "intelligent_route.provider_hop_request_id";
 
 /// Candidate ID validated by `provider_route`.
 pub(crate) const PROVIDER_ROUTE_CANDIDATE_ID: &str = "provider_route.candidate_id";
+/// Provider reference name validated by `provider_route`.
+pub(crate) const PROVIDER_ROUTE_PROVIDER_REF_NAME: &str = "provider_route.provider_ref.name";
+/// Provider reference site validated by `provider_route`.
+pub(crate) const PROVIDER_ROUTE_PROVIDER_REF_SITE: &str = "provider_route.provider_ref.site";
 /// Provider-local backend cluster.
 pub(crate) const PROVIDER_ROUTE_CLUSTER: &str = "provider_route.cluster";
 /// Model validated by `provider_route`.

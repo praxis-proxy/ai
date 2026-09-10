@@ -34,6 +34,10 @@ struct RoutingSelection<'a> {
     site: &'a str,
     /// Stable identifier assigned to the selected provider.
     stable_id: &'a str,
+    /// Trusted provider reference name, when supplied by Grid.
+    provider_ref_name: Option<&'a str>,
+    /// Trusted provider reference site, when supplied by Grid.
+    provider_ref_site: Option<&'a str>,
     /// Producer-assigned selection tier, when available.
     tier: Option<&'a str>,
 }
@@ -56,6 +60,8 @@ impl<'a> RoutingSelection<'a> {
             revision: semantic_revision.map(AsRef::as_ref),
             site: candidate.site.as_ref(),
             stable_id: candidate.stable_id.as_ref(),
+            provider_ref_name: candidate.provider_ref.as_ref().map(|r| r.name.as_ref()),
+            provider_ref_site: candidate.provider_ref.as_ref().map(|r| r.site.as_ref()),
             tier: candidate.selection_tier.as_deref(),
         }
     }
@@ -73,6 +79,10 @@ struct ProviderRouteSelection<'a> {
     candidate_id: &'a str,
     /// Edge serving-overlay revision, when supplied and validated.
     revision: Option<&'a str>,
+    /// Trusted provider reference name, when supplied by the edge.
+    provider_ref_name: Option<&'a str>,
+    /// Trusted provider reference site, when supplied by the edge.
+    provider_ref_site: Option<&'a str>,
 }
 
 impl<'a> ProviderRouteSelection<'a> {
@@ -84,6 +94,8 @@ impl<'a> ProviderRouteSelection<'a> {
         model: &'a Arc<str>,
         candidate_id: &'a str,
         revision: Option<&'a str>,
+        provider_ref_name: Option<&'a str>,
+        provider_ref_site: Option<&'a str>,
     ) -> Self {
         Self {
             provider_id: provider_id.as_ref(),
@@ -91,6 +103,8 @@ impl<'a> ProviderRouteSelection<'a> {
             model: model.as_ref(),
             candidate_id,
             revision,
+            provider_ref_name,
+            provider_ref_site,
         }
     }
 }
@@ -112,6 +126,8 @@ pub(crate) fn record_routing_selection(
         "selected.cluster" = selection.cluster,
         "selected.site" = selection.site,
         "selected.stable_id" = selection.stable_id,
+        "selected.provider_ref.name" = Empty,
+        "selected.provider_ref.site" = Empty,
         "routing.admission_state" = selection.admission_state,
         "routing.kind" = selection.kind,
         "routing.local_site" = selection.local_site,
@@ -127,6 +143,12 @@ pub(crate) fn record_routing_selection(
     }
     if let Some(revision) = selection.revision {
         span.record("overlay.revision", revision);
+    }
+    if let Some(provider_ref_name) = selection.provider_ref_name {
+        span.record("selected.provider_ref.name", provider_ref_name);
+    }
+    if let Some(provider_ref_site) = selection.provider_ref_site {
+        span.record("selected.provider_ref.site", provider_ref_site);
     }
     let _entered = span.enter();
 }
@@ -150,18 +172,36 @@ pub(crate) fn record_provider_route_selection(
     model: &Arc<str>,
     candidate_id: &str,
     overlay_revision: Option<&str>,
+    provider_ref_name: Option<&str>,
+    provider_ref_site: Option<&str>,
 ) {
-    let selection = ProviderRouteSelection::new(provider_id, cluster, model, candidate_id, overlay_revision);
+    let selection = ProviderRouteSelection::new(
+        provider_id,
+        cluster,
+        model,
+        candidate_id,
+        overlay_revision,
+        provider_ref_name,
+        provider_ref_site,
+    );
     let span = tracing::info_span!(
         "provider.route",
         "provider.id" = selection.provider_id,
         "provider.backend.cluster" = selection.cluster,
         "provider.route.model" = selection.model,
         "provider.route.candidate_id" = selection.candidate_id,
+        "provider.route.provider_ref.name" = Empty,
+        "provider.route.provider_ref.site" = Empty,
         "overlay.revision" = Empty,
     );
     if let Some(revision) = selection.revision {
         span.record("overlay.revision", revision);
+    }
+    if let Some(provider_ref_name) = selection.provider_ref_name {
+        span.record("provider.route.provider_ref.name", provider_ref_name);
+    }
+    if let Some(provider_ref_site) = selection.provider_ref_site {
+        span.record("provider.route.provider_ref.site", provider_ref_site);
     }
     let _entered = span.enter();
 }
@@ -229,7 +269,15 @@ mod tests {
 
         // Keep a smoke assertion around the tracing macro in addition to the
         // projection contract above.
-        record_provider_route_selection(&provider_id, &cluster, &model, "candidate-a", Some("revision-a"));
+        record_provider_route_selection(
+            &provider_id,
+            &cluster,
+            &model,
+            "candidate-a",
+            Some("revision-a"),
+            Some("provider-a"),
+            Some("site-a"),
+        );
     }
 
     #[test]
@@ -252,6 +300,7 @@ mod tests {
             admission_state: AdmissionState::NewAndExisting,
             cluster: Arc::from("provider-a"),
             credential: None,
+            provider_ref: None,
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: Arc::from("model-a"),

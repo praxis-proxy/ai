@@ -162,6 +162,16 @@ pub(crate) struct CandidateConfig {
     pub site: String,
 }
 
+/// Trusted provider identity projected from the Grid routing overlay.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ProviderRef {
+    /// `InferenceProvider.metadata.name`.
+    pub name: Arc<str>,
+
+    /// Site that owns the provider candidate.
+    pub site: Arc<str>,
+}
+
 /// Default freshness state for candidates.
 fn default_fresh() -> bool {
     true
@@ -190,6 +200,9 @@ pub(crate) struct RouteCandidate {
 
     /// Optional final-hop credential reference.
     pub credential: Option<CandidateCredential>,
+
+    /// Trusted provider identity from the selected overlay candidate.
+    pub provider_ref: Option<ProviderRef>,
 
     /// Whether this candidate is fresh. Preserved from overlay/static config;
     /// the configuration producer owns freshness ordering.
@@ -298,6 +311,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             admission_state: AdmissionState::default(),
             cluster: Arc::from(c.cluster.as_str()),
             credential: c.credential,
+            provider_ref: None,
             fresh: c.fresh,
             kind: c.kind,
             name: Arc::from(c.name.as_str()),

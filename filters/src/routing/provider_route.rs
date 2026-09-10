@@ -26,9 +26,11 @@ use super::{
     metadata::{
         CandidateCredential, OVERLAY_REVISION_HEADER, PROVIDER_ATTRIBUTION_HEADER,
         PROVIDER_ATTRIBUTION_RESPONSE_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, PROVIDER_INFERENCE_RESPONSE_HEADER,
-        PROVIDER_OVERLAY_REVISION_HEADER, PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID,
-        PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL, PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID,
-        PROVIDER_ROUTE_REQUEST_ID, SELECTED_CANDIDATE_HEADER, set_credential_metadata,
+        PROVIDER_OVERLAY_REVISION_HEADER, PROVIDER_REF_NAME_HEADER, PROVIDER_REF_SITE_HEADER,
+        PROVIDER_REQUEST_ID_HEADER, PROVIDER_ROUTE_CANDIDATE_ID, PROVIDER_ROUTE_CLUSTER, PROVIDER_ROUTE_MODEL,
+        PROVIDER_ROUTE_OVERLAY_REVISION, PROVIDER_ROUTE_PROVIDER_ID, PROVIDER_ROUTE_PROVIDER_REF_NAME,
+        PROVIDER_ROUTE_PROVIDER_REF_SITE, PROVIDER_ROUTE_REQUEST_ID, SELECTED_CANDIDATE_HEADER,
+        set_credential_metadata,
     },
 };
 
@@ -67,7 +69,15 @@ struct ProviderRouteFilterConfig {
 #[serde(deny_unknown_fields)]
 struct ProviderRouteConfig {
     /// Stable candidate ID selected by the edge `intelligent_route`.
-    candidate_id: String,
+    ///
+    /// Mutually exclusive with `provider_ref`; this selector remains the
+    /// backward-compatible form for existing configurations.
+    candidate_id: Option<String>,
+
+    /// Trusted human-readable provider identity selected by Grid. The name is
+    /// scoped by site because remote Grid sites may reuse provider names.
+    /// Mutually exclusive with `candidate_id`.
+    provider_ref: Option<ProviderRefConfig>,
 
     /// Provider-local backend cluster.
     cluster: String,
@@ -82,13 +92,24 @@ struct ProviderRouteConfig {
     paths: Vec<String>,
 }
 
+/// Provider identity selector in provider-gateway configuration.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRefConfig {
+    /// `InferenceProvider.metadata.name`.
+    name: String,
+
+    /// Site that owns the provider candidate.
+    site: String,
+}
+
 /// Returns the default model header name (`X-Model`).
 fn default_model_header() -> String {
     "X-Model".to_owned()
 }
 
 /// Resolved route entry for a single candidate.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct ProviderRoute {
     /// Backend cluster name.
     cluster: Arc<str>,
@@ -98,6 +119,39 @@ struct ProviderRoute {
     model: Arc<str>,
     /// Accepted request paths.
     paths: Vec<Arc<str>>,
+}
+
+/// Reject a provider-boundary request with a diagnostic that identifies the
+/// failed trusted selector without exposing credentials.
+fn reject_provider_request(reason: &'static str) -> FilterAction {
+    tracing::warn!(reason, "provider_route: provider authorization rejected");
+    FilterAction::Reject(Rejection::status(403))
+}
+
+/// Require stable-ID and provider-reference selectors to resolve identically
+/// when both are present on a trusted provider hop.
+fn routes_equivalent(left: &ProviderRoute, right: &ProviderRoute) -> bool {
+    left == right
+}
+
+/// Explicit provider-route selectors. Keeping the maps separate prevents a
+/// candidate name from being guessed to be either a stable ID or a provider
+/// resource name.
+#[derive(Debug, Default)]
+struct ProviderRoutes {
+    /// Routes keyed by trusted provider reference.
+    provider_refs: HashMap<ProviderRefKey, ProviderRoute>,
+    /// Routes keyed by legacy stable candidate ID.
+    stable_ids: HashMap<Arc<str>, ProviderRoute>,
+}
+
+/// Namespaced provider identity used by the trusted overlay handoff.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ProviderRefKey {
+    /// Human-readable `InferenceProvider` name.
+    name: Arc<str>,
+    /// Grid site scope for the provider name.
+    site: Arc<str>,
 }
 
 /// Exact provider-local mapping from an authenticated intelligent routing
@@ -130,7 +184,7 @@ pub struct ProviderRouteFilter {
     /// Prevalidated provider attribution header.
     provider_id_header: HeaderValue,
     /// Candidate-to-route map.
-    routes: HashMap<Arc<str>, ProviderRoute>,
+    routes: ProviderRoutes,
 }
 
 impl ProviderRouteFilter {
@@ -164,25 +218,53 @@ impl ProviderRouteFilter {
 }
 
 /// Validate and resolve the configured provider-local candidate routes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps selector validation and map construction together"
+)]
 fn build_routes(
     route_configs: Vec<ProviderRouteConfig>,
     emit_demo_attribution: bool,
-) -> Result<HashMap<Arc<str>, ProviderRoute>, FilterError> {
-    let mut routes = HashMap::with_capacity(route_configs.len());
+) -> Result<ProviderRoutes, FilterError> {
+    let mut routes = ProviderRoutes {
+        provider_refs: HashMap::new(),
+        stable_ids: HashMap::with_capacity(route_configs.len()),
+    };
     for route in route_configs {
         validate_route(&route)?;
         if emit_demo_attribution {
             validate_attribution_cluster(&route.cluster)?;
         }
-        let candidate_id: Arc<str> = Arc::from(route.candidate_id.as_str());
         let provider_route = ProviderRoute {
             cluster: Arc::from(route.cluster.as_str()),
             credential: route.credential,
             model: Arc::from(route.model.as_str()),
             paths: route.paths.into_iter().map(Arc::from).collect(),
         };
-        if routes.insert(candidate_id, provider_route).is_some() {
-            return Err("provider_route: duplicate candidate_id".into());
+        match (route.candidate_id, route.provider_ref) {
+            (Some(candidate_id), None) => {
+                let candidate_id: Arc<str> = Arc::from(candidate_id.as_str());
+                if routes.stable_ids.insert(candidate_id, provider_route).is_some() {
+                    return Err("provider_route: duplicate candidate_id".into());
+                }
+            },
+            (None, Some(provider_ref)) => {
+                validate_value("provider_ref.name", &provider_ref.name)?;
+                validate_value("provider_ref.site", &provider_ref.site)?;
+                let key = ProviderRefKey {
+                    name: Arc::from(provider_ref.name.as_str()),
+                    site: Arc::from(provider_ref.site.as_str()),
+                };
+                if routes.provider_refs.insert(key, provider_route).is_some() {
+                    return Err("provider_route: duplicate provider_ref".into());
+                }
+            },
+            (Some(_), Some(_)) => {
+                return Err("provider_route: candidate_id and provider_ref are mutually exclusive".into());
+            },
+            (None, None) => {
+                return Err("provider_route: exactly one of candidate_id or provider_ref is required".into());
+            },
         }
     }
     Ok(routes)
@@ -216,20 +298,41 @@ impl HttpFilter for ProviderRouteFilter {
         strip_edge_headers(ctx);
 
         let Some(candidate_id) = request_header(ctx, SELECTED_CANDIDATE_HEADER).map(str::to_owned) else {
-            return Ok(FilterAction::Reject(Rejection::status(403)));
+            return Ok(reject_provider_request("missing trusted stable candidate ID"));
         };
         let Some(request_id) = request_header(ctx, PROVIDER_HOP_REQUEST_ID_HEADER).map(str::to_owned) else {
-            return Ok(FilterAction::Reject(Rejection::status(403)));
+            return Ok(reject_provider_request("missing trusted provider-hop request ID"));
         };
         let overlay_revision = match peer_overlay_revision(ctx) {
             Ok(revision) => revision.map(str::to_owned),
-            Err(InvalidPeerOverlayRevision) => return Ok(FilterAction::Reject(Rejection::status(403))),
+            Err(InvalidPeerOverlayRevision) => return Ok(reject_provider_request("invalid trusted overlay revision")),
         };
         let Some(model) = request_header_by_name(ctx, &self.model_header).map(str::to_owned) else {
             return Ok(FilterAction::Reject(Rejection::status(400)));
         };
-        let Some(route) = self.routes.get(candidate_id.as_str()) else {
-            return Ok(FilterAction::Reject(Rejection::status(403)));
+        let stable_route = self.routes.stable_ids.get(candidate_id.as_str());
+        let provider_name = request_header(ctx, PROVIDER_REF_NAME_HEADER).map(str::to_owned);
+        let provider_site = request_header(ctx, PROVIDER_REF_SITE_HEADER).map(str::to_owned);
+        let provider_ref_key = match (provider_name.as_deref(), provider_site.as_deref()) {
+            (Some(name), Some(site)) => Some(ProviderRefKey {
+                name: Arc::from(name),
+                site: Arc::from(site),
+            }),
+            (None, None) => None,
+            _ => return Ok(reject_provider_request("incomplete trusted provider reference")),
+        };
+        let provider_route = provider_ref_key
+            .as_ref()
+            .and_then(|provider_ref| self.routes.provider_refs.get(provider_ref));
+        let route = match (stable_route, provider_route) {
+            (Some(stable), Some(provider)) if !routes_equivalent(stable, provider) => {
+                return Ok(reject_provider_request(
+                    "stable ID and provider reference select different routes",
+                ));
+            },
+            (Some(stable), _) => stable,
+            (None, Some(provider)) => provider,
+            (None, None) => return Ok(reject_provider_request("unknown stable ID or provider reference")),
         };
         if route.model.as_ref() != model || !route.paths.iter().any(|path| path.as_ref() == ctx.request.uri.path()) {
             return Ok(FilterAction::Reject(Rejection::status(404)));
@@ -241,6 +344,13 @@ impl HttpFilter for ProviderRouteFilter {
         ctx.set_metadata(PROVIDER_ROUTE_MODEL, &model);
         ctx.set_metadata(PROVIDER_ROUTE_PROVIDER_ID, &*self.provider_id);
         ctx.set_metadata(PROVIDER_ROUTE_REQUEST_ID, &request_id);
+        let validated_provider_ref = provider_route
+            .zip(provider_ref_key.as_ref())
+            .map(|(_, provider_ref)| provider_ref);
+        if let Some(provider_ref) = validated_provider_ref {
+            ctx.set_metadata(PROVIDER_ROUTE_PROVIDER_REF_NAME, &*provider_ref.name);
+            ctx.set_metadata(PROVIDER_ROUTE_PROVIDER_REF_SITE, &*provider_ref.site);
+        }
         if let Some(revision) = &overlay_revision {
             ctx.set_metadata(PROVIDER_ROUTE_OVERLAY_REVISION, revision);
         }
@@ -254,6 +364,8 @@ impl HttpFilter for ProviderRouteFilter {
             &route.model,
             &candidate_id,
             overlay_revision.as_deref(),
+            validated_provider_ref.map(|provider_ref| provider_ref.name.as_ref()),
+            validated_provider_ref.map(|provider_ref| provider_ref.site.as_ref()),
         );
 
         Ok(FilterAction::Continue)
@@ -298,6 +410,10 @@ fn strip_edge_headers(ctx: &mut HttpFilterContext<'_>) {
         .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
     ctx.request_headers_to_remove
         .push(HeaderName::from_static(OVERLAY_REVISION_HEADER));
+    ctx.request_headers_to_remove
+        .push(HeaderName::from_static(PROVIDER_REF_NAME_HEADER));
+    ctx.request_headers_to_remove
+        .push(HeaderName::from_static(PROVIDER_REF_SITE_HEADER));
     ctx.request_headers_to_remove
         .push(HeaderName::from_static(PROVIDER_REQUEST_ID_HEADER));
     ctx.request_headers_to_remove
@@ -367,7 +483,9 @@ fn request_header_by_name<'a>(ctx: &'a HttpFilterContext<'_>, name: &HeaderName)
 
 /// Validate all fields of a single route entry.
 fn validate_route(route: &ProviderRouteConfig) -> Result<(), FilterError> {
-    validate_value("candidate_id", &route.candidate_id)?;
+    if let Some(candidate_id) = &route.candidate_id {
+        validate_value("candidate_id", candidate_id)?;
+    }
     validate_value("cluster", &route.cluster)?;
     validate_value("model", &route.model)?;
     if route.paths.is_empty() || route.paths.len() > MAX_PATHS_PER_ROUTE {
@@ -763,6 +881,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_reference_authorizes_with_trusted_overlay_identity() {
+        let config = serde_yaml::from_str(
+            "provider_id: test-provider\n\
+             routes:\n\
+             \x20 - provider_ref:\n\
+             \x20     name: qwen3-ifc1\n\
+             \x20     site: site-a\n\
+             \x20   cluster: mock-backend\n\
+             \x20   model: sim-model-v1\n\
+             \x20   paths: [/v1/chat/completions]\n",
+        )
+        .unwrap();
+        let filter = ProviderRouteFilter::from_config(&config).unwrap();
+        let mut request = request_with_peer_context("/v1/chat/completions", "stable-a", "req-1", "sim-model-v1");
+        request.headers.insert(
+            HeaderName::from_static(PROVIDER_REF_NAME_HEADER),
+            HeaderValue::from_static("qwen3-ifc1"),
+        );
+        request.headers.insert(
+            HeaderName::from_static(PROVIDER_REF_SITE_HEADER),
+            HeaderValue::from_static("site-a"),
+        );
+        let mut ctx = test_utils::make_filter_context(&request);
+
+        assert!(matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_REF_NAME), Some("qwen3-ifc1"));
+        assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_REF_SITE), Some("site-a"));
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static(PROVIDER_REF_NAME_HEADER))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_stable_id_does_not_attribute_an_unresolved_provider_reference() {
+        let filter = make_filter("abc123");
+        let mut request = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
+        request.headers.insert(
+            HeaderName::from_static(PROVIDER_REF_NAME_HEADER),
+            HeaderValue::from_static("unconfigured-provider"),
+        );
+        request.headers.insert(
+            HeaderName::from_static(PROVIDER_REF_SITE_HEADER),
+            HeaderValue::from_static("site-a"),
+        );
+        let mut ctx = test_utils::make_filter_context(&request);
+
+        assert!(matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_REF_NAME), None);
+        assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_REF_SITE), None);
+    }
+
+    #[tokio::test]
+    async fn provider_reference_wrong_site_is_denied() {
+        let config = serde_yaml::from_str(
+            "provider_id: test-provider\n\
+             routes:\n\
+             \x20 - provider_ref:\n\
+             \x20     name: qwen3-ifc1\n\
+             \x20     site: site-a\n\
+             \x20   cluster: mock-backend\n\
+             \x20   model: sim-model-v1\n\
+             \x20   paths: [/v1/chat/completions]\n",
+        )
+        .unwrap();
+        let filter = ProviderRouteFilter::from_config(&config).unwrap();
+        let mut request = request_with_peer_context("/v1/chat/completions", "unknown", "req-1", "sim-model-v1");
+        request.headers.insert(
+            HeaderName::from_static(PROVIDER_REF_NAME_HEADER),
+            HeaderValue::from_static("qwen3-ifc1"),
+        );
+        request.headers.insert(
+            HeaderName::from_static(PROVIDER_REF_SITE_HEADER),
+            HeaderValue::from_static("site-b"),
+        );
+        let mut ctx = test_utils::make_filter_context(&request);
+
+        assert!(matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 403));
+    }
+
+    #[tokio::test]
     async fn distinct_candidates_resolve_independent_cluster_metadata() {
         let f = ProviderRouteFilter::from_config(&two_route_config()).unwrap();
         let req_a = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
@@ -1007,6 +1212,20 @@ mod tests {
         let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         let result = ProviderRouteFilter::from_config(&val);
         assert!(result.is_err(), "duplicate candidate_id must be rejected");
+    }
+
+    #[test]
+    fn conflicting_selectors_rejected() {
+        let yaml = "provider_id: p\nroutes:\n  - candidate_id: a\n    provider_ref: {name: p, site: s}\n    model: m\n    paths: [/x]\n    cluster: c\n";
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(ProviderRouteFilter::from_config(&val).is_err());
+    }
+
+    #[test]
+    fn duplicate_provider_reference_rejected() {
+        let yaml = "provider_id: p\nroutes:\n  - provider_ref: {name: p, site: s}\n    model: m\n    paths: [/x]\n    cluster: c\n  - provider_ref: {name: p, site: s}\n    model: m\n    paths: [/y]\n    cluster: c2\n";
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(ProviderRouteFilter::from_config(&val).is_err());
     }
 
     #[test]

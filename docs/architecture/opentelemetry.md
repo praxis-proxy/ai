@@ -32,6 +32,8 @@ successfully served the request. It contains:
   route.
 - `provider.route.candidate_id`: the edge-selected candidate ID that was
   validated and resolved.
+- `provider.route.provider_ref.name` and `provider.route.provider_ref.site`:
+  the trusted Grid provider identity when the overlay supplied one.
 - `overlay.revision`: present only when the edge supplied a serving overlay
   revision that passed syntax and trust-boundary validation. It is
   correlation evidence only, not a provider-local config revision and not an

@@ -18,7 +18,10 @@ These names are AI-owned rather than Praxis-reserved because Praxis intentionall
 | `provider_id` | string | yes | Provider-owned identifier used for observability and demo attribution. |
 | `model_header` | string | no | Header populated by an inference parser with the requested model. |
 | `routes` | ProviderRouteConfig[] | yes | Exact provider-local candidate mappings. |
-| `routes[].candidate_id` | string | yes | Stable candidate ID selected by the edge `intelligent_route`. |
+| `routes[].candidate_id` | string | no | Stable candidate ID selected by the edge `intelligent_route`. Mutually exclusive with `provider_ref`; this selector remains the backward-compatible form for existing configurations. |
+| `routes[].provider_ref` | ProviderRefConfig | no | Trusted human-readable provider identity selected by Grid. The name is scoped by site because remote Grid sites may reuse provider names. Mutually exclusive with `candidate_id`. |
+| `routes[].provider_ref.name` | string | yes | `InferenceProvider.metadata.name`. |
+| `routes[].provider_ref.site` | string | yes | Site that owns the provider candidate. |
 | `routes[].cluster` | string | yes | Provider-local backend cluster. |
 | `routes[].credential` | CandidateCredential | no | Optional provider-local credential reference for the final API hop. |
 | `routes[].credential.strategy` | string | yes | Injection strategy. |
