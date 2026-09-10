@@ -153,8 +153,10 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
             _ => return Ok(FilterAction::Continue),
         };
 
-        extract_request_metadata(ctx, bytes);
-        Ok(transform_request_body(body))
+        let value = serde_json::from_slice::<serde_json::Value>(bytes);
+
+        extract_request_metadata(ctx, &value);
+        Ok(transform_request_body(body, value))
     }
 
     fn on_response_body(
@@ -200,9 +202,9 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
 // Request Body Helpers
 // -----------------------------------------------------------------------------
 
-/// Extract streaming and model metadata from the request body.
-fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, bytes: &[u8]) {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+/// Extract streaming and model metadata from the parsed request body.
+fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: &Result<serde_json::Value, serde_json::Error>) {
+    let Ok(value) = value else {
         ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
         return;
     };
@@ -225,12 +227,15 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, bytes: &[u8]) {
 }
 
 /// Transform the request body and return the appropriate filter action.
-fn transform_request_body(body: &mut Option<Bytes>) -> FilterAction {
+fn transform_request_body(
+    body: &mut Option<Bytes>,
+    value: Result<serde_json::Value, serde_json::Error>,
+) -> FilterAction {
     let Some(bytes) = body.as_ref() else {
         return FilterAction::Continue;
     };
 
-    match request::transform_request(bytes) {
+    match request::transform_request(value) {
         Ok(transformed) => {
             debug!(
                 original_len = bytes.len(),
@@ -536,9 +541,9 @@ mod tests {
     fn extract_request_metadata_streaming_true_with_model() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        let bytes = br#"{"stream":true,"model":"claude-opus-4-8"}"#;
+        let value = serde_json::from_slice(br#"{"stream":true,"model":"claude-opus-4-8"}"#);
 
-        extract_request_metadata(&mut ctx, bytes);
+        extract_request_metadata(&mut ctx, &value);
 
         assert_eq!(
             ctx.filter_metadata
@@ -558,9 +563,9 @@ mod tests {
     fn extract_request_metadata_streaming_false() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        let bytes = br#"{"stream":false,"model":"gpt-4"}"#;
+        let value = serde_json::from_slice(br#"{"stream":false,"model":"gpt-4"}"#);
 
-        extract_request_metadata(&mut ctx, bytes);
+        extract_request_metadata(&mut ctx, &value);
 
         assert_eq!(
             ctx.filter_metadata
@@ -581,7 +586,7 @@ mod tests {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
 
-        extract_request_metadata(&mut ctx, b"not json");
+        extract_request_metadata(&mut ctx, &serde_json::from_slice::<serde_json::Value>(b"not json"));
 
         assert_eq!(
             ctx.filter_metadata
@@ -602,7 +607,7 @@ mod tests {
     #[test]
     fn transform_request_body_none_continues() {
         let mut body: Option<Bytes> = None;
-        let action = transform_request_body(&mut body);
+        let action = transform_request_body(&mut body, serde_json::from_slice(br#"{"model":"claude-opus-4-8"}"#));
 
         assert!(matches!(action, FilterAction::Continue));
         assert!(body.is_none());
@@ -625,10 +630,9 @@ mod tests {
 
     #[test]
     fn transform_request_body_valid_transforms() {
-        let mut body = Some(Bytes::from(
-            br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#.to_vec(),
-        ));
-        let action = transform_request_body(&mut body);
+        let raw = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let mut body = Some(Bytes::from(raw.to_vec()));
+        let action = transform_request_body(&mut body, serde_json::from_slice(raw));
 
         assert!(matches!(action, FilterAction::Continue));
         assert!(body.is_some());
@@ -643,7 +647,7 @@ mod tests {
     #[test]
     fn transform_request_body_invalid_rejects() {
         let mut body = Some(Bytes::from_static(b"not json"));
-        let action = transform_request_body(&mut body);
+        let action = transform_request_body(&mut body, serde_json::from_slice(b"not json"));
 
         let FilterAction::Reject(rejection) = action else {
             panic!("invalid body should produce a rejection");
