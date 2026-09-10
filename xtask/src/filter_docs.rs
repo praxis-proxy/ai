@@ -111,23 +111,23 @@ fn collect_stale_doc_paths(root: &Path, docs_dir: &Path, all_filters: &[FilterEn
 // -----------------------------------------------------------------------------
 
 /// A filter with its location metadata for output path construction.
-struct FilterEntry {
+pub(crate) struct FilterEntry {
     /// Crate kind: `"apis"` for provider-specific, `"filters"` for
     /// cross-cutting.
     crate_kind: String,
     /// Category slug (e.g. `anthropic`, `agentic`, `guardrails`).
-    category: String,
+    pub(crate) category: String,
     /// Extracted filter information.
-    filter: FilterInfo,
+    pub(crate) filter: FilterInfo,
 }
 
 /// Information extracted for one filter.
 #[derive(Clone)]
-struct FilterInfo {
+pub(crate) struct FilterInfo {
     /// Filter name as returned by `fn name()` (e.g. `"a2a"`).
-    name: String,
+    pub(crate) name: String,
     /// First paragraph of the filter struct doc comment.
-    description: String,
+    pub(crate) description: String,
     /// First paragraphs from same-name filter variants.
     extra_descriptions: Vec<String>,
     /// Additional notes extracted from config struct docs.
@@ -135,7 +135,27 @@ struct FilterInfo {
     /// Config fields in declaration order.
     fields: Vec<FieldInfo>,
     /// YAML configuration example from doc comments.
-    yaml_examples: Vec<String>,
+    pub(crate) yaml_examples: Vec<String>,
+    /// Raw configuration fields used by the machine-readable catalog.
+    pub(crate) raw_fields: Vec<RawField>,
+    /// Configuration type passed to the filter factory, when discovered.
+    pub(crate) config_type_name: Option<String>,
+    /// Individual factory variants retained for catalog-level unions.
+    pub(crate) variants: Vec<FilterVariant>,
+    /// Parsed source items used to resolve nested configuration types.
+    pub(crate) source_items: ModuleItems,
+    pub(crate) source_path: Option<PathBuf>,
+}
+
+/// One serde shape exposed by a filter factory path.
+#[derive(Clone)]
+pub(crate) struct FilterVariant {
+    /// Rust configuration type name.
+    pub(crate) config_type_name: String,
+    /// Fields in the variant's serde object.
+    pub(crate) raw_fields: Vec<RawField>,
+    /// Source metadata needed to resolve nested types.
+    pub(crate) source_items: ModuleItems,
 }
 
 /// Information extracted for one config field.
@@ -185,32 +205,35 @@ struct FilterAnchor {
 
 /// A parsed config struct with its name and fields.
 #[derive(Clone)]
-struct ConfigStruct {
+pub(crate) struct ConfigStruct {
     /// Struct identifier (e.g. `StaticResponseConfig`).
-    name: String,
+    pub(crate) name: String,
     /// Config struct doc comment.
     doc: String,
     /// Fields in declaration order.
-    fields: Vec<RawField>,
+    pub(crate) fields: Vec<RawField>,
+    /// `#[serde(try_from = "...")]`, when present.
+    pub(crate) try_from: Option<String>,
 }
 
 /// Parsed items accumulated from source files belonging to one filter module.
-struct ModuleItems {
+#[derive(Clone)]
+pub(crate) struct ModuleItems {
     /// Module-level doc comments from files in the filter scope.
     module_docs: Vec<String>,
     /// Local config structs found (with `Deserialize` + `deny_unknown_fields`).
-    configs: Vec<ConfigStruct>,
+    pub(crate) configs: Vec<ConfigStruct>,
     /// Doc comments on public structs and filter implementation structs.
     struct_docs: Vec<String>,
     /// Struct definitions available for nested field rendering.
-    structs: BTreeMap<String, ConfigStruct>,
+    pub(crate) structs: BTreeMap<String, ConfigStruct>,
     /// Enum definitions with `Deserialize` for variant rendering.
-    enums: BTreeMap<String, EnumInfo>,
+    pub(crate) enums: BTreeMap<String, EnumInfo>,
 }
 
 impl ModuleItems {
     /// Create an empty item collection.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             module_docs: Vec::new(),
             configs: Vec::new(),
@@ -234,23 +257,27 @@ impl ModuleItems {
 
 /// Parsed enum metadata.
 #[derive(Clone)]
-struct EnumInfo {
+pub(crate) struct EnumInfo {
     /// YAML variant names.
-    variants: Vec<String>,
+    pub(crate) variants: Vec<String>,
     /// Whether serde tries variants by shape instead of by variant tag.
-    untagged: bool,
+    pub(crate) untagged: bool,
     /// `#[serde(tag = "...")]` discriminator key name, for internally
     /// tagged enums. `None` for untagged/externally tagged enums.
-    tag: Option<String>,
+    pub(crate) tag: Option<String>,
+    /// `#[serde(content = "...")]` payload key for adjacent tagging.
+    pub(crate) content: Option<String>,
     /// Source shape for each variant.
-    variant_shapes: Vec<EnumVariantShape>,
+    pub(crate) variant_shapes: Vec<EnumVariantShape>,
     /// Named fields from struct-like variants.
-    fields: Vec<RawField>,
+    pub(crate) fields: Vec<RawField>,
+    /// Fields owned by each named variant, retained for catalog rendering.
+    pub(crate) variant_fields: Vec<Vec<RawField>>,
 }
 
 /// Source shape for one enum variant.
 #[derive(Clone)]
-enum EnumVariantShape {
+pub(crate) enum EnumVariantShape {
     /// Unit variant, usually rendered as a scalar YAML value.
     Unit,
     /// Tuple variant with one wrapped type.
@@ -261,26 +288,29 @@ enum EnumVariantShape {
 
 /// A raw field before type rendering.
 #[derive(Clone)]
-struct RawField {
+pub(crate) struct RawField {
     /// Field name.
-    name: String,
+    pub(crate) name: String,
+    pub(crate) aliases: Vec<String>,
     /// Raw type from syn.
-    ty: syn::Type,
+    pub(crate) ty: syn::Type,
     /// Doc comment lines joined.
-    doc: String,
+    pub(crate) doc: String,
     /// Has `#[serde(default)]` or `#[serde(default = "...")]`.
-    has_default: bool,
+    pub(crate) has_default: bool,
+    /// Default function named by `#[serde(default = "...")]`.
+    pub(crate) default_path: Option<String>,
     /// Custom serde deserializer from `#[serde(deserialize_with = "...")]`.
-    deserialize_with: Option<String>,
+    pub(crate) deserialize_with: Option<String>,
     /// Has `#[serde(flatten)]`.
-    flatten: bool,
+    pub(crate) flatten: bool,
     /// Additional requiredness hint from surrounding syntax.
-    requirement_hint: RequirementHint,
+    pub(crate) requirement_hint: RequirementHint,
 }
 
 /// Requiredness hint from the surrounding source shape.
 #[derive(Clone, Copy)]
-enum RequirementHint {
+pub(crate) enum RequirementHint {
     /// Use the field type and serde defaults to infer requiredness.
     Normal,
     /// Field came from one of several struct-like enum variants.
@@ -302,6 +332,15 @@ impl FilterInfo {
         append_unique(&mut self.config_notes, other.config_notes);
         append_unique_fields(&mut self.fields, other.fields);
         append_unique(&mut self.yaml_examples, other.yaml_examples);
+        for variant in other.variants {
+            if !self
+                .variants
+                .iter()
+                .any(|existing| existing.config_type_name == variant.config_type_name)
+            {
+                self.variants.push(variant);
+            }
+        }
     }
 }
 
@@ -310,7 +349,7 @@ impl FilterInfo {
 // -----------------------------------------------------------------------------
 
 /// Parse shared config types that filters may reference from praxis core.
-fn parse_shared_config_items(root: &Path) -> ModuleItems {
+pub(crate) fn parse_shared_config_items(root: &Path) -> ModuleItems {
     let mut items = ModuleItems::new();
     let praxis_root = root.join("../praxis");
     let dirs = if praxis_root.is_dir() {
@@ -339,7 +378,12 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
 
 /// Local configuration files whose types are shared by filters in separate
 /// API categories. Paths are relative to the workspace root.
-const LOCAL_SHARED_CONFIG_FILES: &[&str] = &["apis/src/web_search/config.rs", "apis/src/callout_policy.rs"];
+const LOCAL_SHARED_CONFIG_FILES: &[&str] = &[
+    "apis/src/web_search/config.rs",
+    "apis/src/callout_policy.rs",
+    "apis/src/store/postgres.rs",
+    "apis/src/store/pool.rs",
+];
 
 /// Parse local configuration types shared by filters in separate API categories.
 fn parse_local_shared_config(root: &Path, items: &mut ModuleItems) {
@@ -380,7 +424,7 @@ fn resolve_praxis_source_dirs() -> Vec<PathBuf> {
 }
 
 /// Discover all filters across `apis/src/` and `filters/src/`.
-fn discover_all_filters(root: &Path, shared_items: &ModuleItems) -> Vec<FilterEntry> {
+pub(crate) fn discover_all_filters(root: &Path, shared_items: &ModuleItems) -> Vec<FilterEntry> {
     let mut entries = Vec::new();
 
     discover_crate_filters(root, &root.join("apis/src"), "apis", shared_items, &mut entries);
@@ -462,7 +506,8 @@ fn extract_standalone_filter(anchor_path: &Path, crate_kind: &str, shared_items:
     parse_file_items(&file, &mut items);
 
     let anchor = parse_anchor_file(anchor_path)?;
-    let filter = build_filter(&items, &anchor.name, anchor.config_type_name.as_deref());
+    let mut filter = build_filter(&items, &anchor.name, anchor.config_type_name.as_deref());
+    filter.source_path = Some(anchor.file.clone());
     let category = infer_standalone_category(&anchor.name);
     Some(FilterEntry {
         crate_kind: crate_kind.to_owned(),
@@ -505,7 +550,9 @@ fn extract_filters(category_dir: &Path, shared_items: &ModuleItems) -> Vec<Filte
                 };
                 parse_file_items(&file, &mut items);
             }
-            build_filter(&items, &anchor.name, anchor.config_type_name.as_deref())
+            let mut filter = build_filter(&items, &anchor.name, anchor.config_type_name.as_deref());
+            filter.source_path = Some(anchor.file.clone());
+            filter
         })
         .collect();
     merge_filter_variants(filters)
@@ -572,6 +619,53 @@ fn merge_filter_variants(filters: Vec<FilterInfo>) -> Vec<FilterInfo> {
             .or_insert(filter);
     }
     by_name.into_values().collect()
+}
+
+/// Validate factory configuration types before machine-readable generation.
+/// Human documentation intentionally retains its historical merged rendering,
+/// while the catalog must never silently union incompatible serde shapes.
+pub(crate) fn validate_factory_variants(root: &Path, allowed_unions: &[(&str, &str, &str)]) -> Result<(), String> {
+    let mut types = BTreeMap::<String, String>::new();
+    for source_dir in [root.join("apis/src"), root.join("filters/src")] {
+        let (categories, standalone) = classify_src_entries(&source_dir);
+        for directory in categories {
+            for anchor in discover_filter_anchors(&directory) {
+                record_factory_variant(&mut types, &anchor, allowed_unions)?;
+            }
+        }
+        for path in standalone {
+            if let Some(anchor) = parse_anchor_file(&path) {
+                record_factory_variant(&mut types, &anchor, allowed_unions)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_factory_variant(
+    types: &mut BTreeMap<String, String>,
+    anchor: &FilterAnchor,
+    allowed_unions: &[(&str, &str, &str)],
+) -> Result<(), String> {
+    let Some(config_type) = anchor.config_type_name.as_deref() else {
+        return Ok(());
+    };
+    if let Some(previous) = types.insert(anchor.name.clone(), config_type.to_owned())
+        && previous != config_type
+    {
+        if allowed_unions.iter().any(|(filter, first, second)| {
+            *filter == anchor.name
+                && ((*first == previous && *second == config_type) || (*first == config_type && *second == previous))
+        }) {
+            types.remove(&anchor.name);
+            return Ok(());
+        }
+        return Err(format!(
+            "catalog_error=incompatible_config_type filter={} first={} second={}",
+            anchor.name, previous, config_type
+        ));
+    }
+    Ok(())
 }
 
 /// Parse a single file to check if it is a filter anchor.
@@ -720,7 +814,7 @@ fn scope_files_recursive(dir: &Path, excluded: &HashSet<&Path>, out: &mut Vec<Pa
 }
 
 /// Recursively collect `.rs` files, skipping test files.
-fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_rs_files_recursive(dir, &mut files);
     files.sort();
@@ -775,6 +869,7 @@ fn parse_struct(s: &syn::ItemStruct, out: &mut ModuleItems) {
             name: s.ident.to_string(),
             doc: docs.clone(),
             fields,
+            try_from: serde_lit_value_from_attrs(&s.attrs, "try_from"),
         };
         if is_nested_config_struct(s) {
             out.structs.insert(config.name.clone(), config.clone());
@@ -785,6 +880,7 @@ fn parse_struct(s: &syn::ItemStruct, out: &mut ModuleItems) {
                         name: "ClusterTls".to_owned(),
                         doc: config.doc.clone(),
                         fields: config.fields.clone(),
+                        try_from: config.try_from.clone(),
                     },
                 );
             }
@@ -829,6 +925,20 @@ fn build_filter(items: &ModuleItems, name: &str, config_type: Option<&str>) -> F
         config_notes: all_notes,
         fields,
         yaml_examples,
+        raw_fields: config.map_or_else(Vec::new, |c| c.fields.clone()),
+        config_type_name: config_type.map(str::to_owned),
+        variants: config_type
+            .zip(config)
+            .map(|(config_type_name, config)| {
+                vec![FilterVariant {
+                    config_type_name: config_type_name.to_owned(),
+                    raw_fields: config.fields.clone(),
+                    source_items: items.clone(),
+                }]
+            })
+            .unwrap_or_default(),
+        source_items: items.clone(),
+        source_path: None,
     }
 }
 
@@ -1011,8 +1121,10 @@ fn parse_config_fields(s: &syn::ItemStruct) -> Option<Vec<RawField>> {
             .iter()
             .map(|f| RawField {
                 name: serde_field_name(f, rename_all),
+                aliases: serde_aliases(&f.attrs),
                 doc: extract_doc_comment(&f.attrs),
                 has_default: has_serde_default(&f.attrs),
+                default_path: serde_lit_value_from_attrs(&f.attrs, "default"),
                 deserialize_with: serde_deserialize_with(&f.attrs),
                 flatten: has_serde_attr(&f.attrs, "flatten"),
                 requirement_hint: RequirementHint::Normal,
@@ -1066,6 +1178,20 @@ fn serde_field_name(field: &syn::Field, rename_all: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+fn serde_aliases(attrs: &[syn::Attribute]) -> Vec<String> {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"))
+        .flat_map(|attr| {
+            let text = quote::quote!(#attr).to_string();
+            text.split("alias = ")
+                .skip(1)
+                .filter_map(|part| part.split('"').nth(1).map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Strip a raw identifier's `r#` prefix (e.g. `r#match` -> `match`), which
 /// `syn::Ident::to_string()` preserves but serde's own field-name
 /// resolution does not -- a raw identifier is only needed to use a
@@ -1101,6 +1227,11 @@ fn serde_deserialize_with(attrs: &[syn::Attribute]) -> Option<String> {
     attrs.iter().find_map(|attr| serde_lit_value(attr, "deserialize_with"))
 }
 
+/// Extract a serde string value from any attribute in a list.
+fn serde_lit_value_from_attrs(attrs: &[syn::Attribute], name: &str) -> Option<String> {
+    attrs.iter().find_map(|attr| serde_lit_value(attr, name))
+}
+
 /// Extract a string-literal serde attribute value.
 fn serde_lit_value(attr: &syn::Attribute, name: &str) -> Option<String> {
     if !attr.path().is_ident("serde") {
@@ -1127,6 +1258,7 @@ fn extract_enum_info(e: &syn::ItemEnum) -> EnumInfo {
     let rename_all = detect_rename_all(&e.attrs);
     let untagged = has_serde_attr(&e.attrs, "untagged");
     let tag = e.attrs.iter().find_map(|attr| serde_lit_value(attr, "tag"));
+    let content = e.attrs.iter().find_map(|attr| serde_lit_value(attr, "content"));
     let variants = e
         .variants
         .iter()
@@ -1139,14 +1271,16 @@ fn extract_enum_info(e: &syn::ItemEnum) -> EnumInfo {
         .collect();
     let variant_shapes = e.variants.iter().map(enum_variant_shape).collect();
     let variant_fields: Vec<Vec<RawField>> = e.variants.iter().map(parse_variant_fields).collect();
-    let fields = flatten_variant_fields_marking_one_of(variant_fields);
+    let fields = flatten_variant_fields_marking_one_of(variant_fields.clone());
 
     EnumInfo {
         variants,
         untagged,
         tag,
+        content,
         variant_shapes,
         fields,
+        variant_fields,
     }
 }
 
@@ -1219,8 +1353,10 @@ fn parse_variant_fields(variant: &syn::Variant) -> Vec<RawField> {
         .iter()
         .map(|f| RawField {
             name: serde_field_name(f, None),
+            aliases: serde_aliases(&f.attrs),
             doc: extract_doc_comment(&f.attrs),
             has_default: has_serde_default(&f.attrs),
+            default_path: serde_lit_value_from_attrs(&f.attrs, "default"),
             deserialize_with: serde_deserialize_with(&f.attrs),
             flatten: has_serde_attr(&f.attrs, "flatten"),
             requirement_hint: RequirementHint::Normal,
@@ -1423,7 +1559,7 @@ fn is_yaml_fence_start(line: &str) -> bool {
 // -----------------------------------------------------------------------------
 
 /// Return whether a type path is `Option<T>`.
-fn is_option_type(ty: &syn::Type) -> bool {
+pub(crate) fn is_option_type(ty: &syn::Type) -> bool {
     matches!(ty, syn::Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "Option"))
 }
 
@@ -1951,12 +2087,25 @@ fn dir_file_name(dir: &Path) -> String {
         .into_owned()
 }
 
-/// Create directories recursively, exiting on failure.
 fn create_dir_all_or_exit(dir: &Path) {
-    if let Err(e) = fs::create_dir_all(dir) {
-        eprintln!("failed to create {}: {e}", dir.display());
+    if let Err(error) = fs::create_dir_all(dir) {
+        eprintln!("failed to create {}: {error}", dir.display());
         std::process::exit(1);
     }
+}
+
+pub(crate) fn type_args(arguments: &syn::PathArguments) -> Vec<&syn::Type> {
+    let syn::PathArguments::AngleBracketed(arguments) = arguments else {
+        return Vec::new();
+    };
+    arguments
+        .args
+        .iter()
+        .filter_map(|argument| match argument {
+            syn::GenericArgument::Type(ty) => Some(ty),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Write content to a file, exiting on failure.
@@ -1978,7 +2127,7 @@ fn print_relative(root: &Path, path: &Path, action: &str) {
 }
 
 /// Get a path relative to root.
-fn relative_path(root: &Path, path: &Path) -> PathBuf {
+pub(crate) fn relative_path(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root).unwrap_or(path).to_owned()
 }
 
@@ -2311,7 +2460,7 @@ mod tests {
             #[serde(deny_unknown_fields)]
             struct ClusterConfig {
                 /// Cluster name.
-                name: String,
+    pub(crate) name: String,
             }
         ";
         let file: syn::File = syn::parse_str(source).unwrap();
@@ -2499,6 +2648,11 @@ mod tests {
                 config_notes: vec![],
                 fields: vec![],
                 yaml_examples: vec![],
+                raw_fields: vec![],
+                config_type_name: Some("TimeoutConfig".to_owned()),
+                variants: vec![],
+                source_items: ModuleItems::new(),
+                source_path: None,
             },
         }];
         let result = render_reference_index(&entries);
@@ -2733,7 +2887,33 @@ mod tests {
                     required: RequiredKind::Yes,
                 }],
                 yaml_examples: vec!["filter: timeout\ntimeout_ms: 5000".to_owned()],
+                raw_fields: vec![],
+                config_type_name: Some("TimeoutConfig".to_owned()),
+                variants: vec![],
+                source_items: ModuleItems::new(),
+                source_path: None,
             },
         }
+    }
+
+    #[test]
+    fn incompatible_same_name_factory_configs_fail_closed() {
+        let mut types = BTreeMap::new();
+        let first = FilterAnchor {
+            file: PathBuf::from("first.rs"),
+            name: "timeout".to_owned(),
+            config_type_name: Some("TimeoutConfig".to_owned()),
+        };
+        let second = FilterAnchor {
+            file: PathBuf::from("second.rs"),
+            name: "timeout".to_owned(),
+            config_type_name: Some("OtherTimeoutConfig".to_owned()),
+        };
+        record_factory_variant(&mut types, &first, &[]).expect("first variant");
+        let error = record_factory_variant(&mut types, &second, &[])
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("catalog_error=incompatible_config_type"));
+        assert!(error.contains("filter=timeout"));
     }
 }

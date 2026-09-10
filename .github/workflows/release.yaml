@@ -113,8 +113,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Generate release notes
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Generate and verify AI catalog release artifact
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          PRAXIS_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          cargo xtask generate-config-catalog
+          cargo xtask lint-config-catalog
+          cargo test -p xtask config_catalog::tests::
+          cp docs/catalog/config-catalog.json "praxis-ai-config-catalog-${VERSION}.json"
+
+      - name: Create GitHub release with catalog artifact
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --generate-notes
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: gh release create "$TAG" --generate-notes "praxis-ai-config-catalog-${VERSION}.json"

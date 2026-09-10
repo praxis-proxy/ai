@@ -10,6 +10,19 @@ repository.workspace = true
 readme = "../README.md"
 publish = false
 
+[features]
+default = []
+catalog-http-callout = ["praxis-ai-filters/http-callout-filter"]
+catalog-azure-ad = ["praxis-ai-filters/azure-ad-filter"]
+catalog-gcp-adc = ["praxis-ai-filters/gcp-adc-filter"]
+catalog-token-rate-limit = ["praxis-ai-filters/token-rate-limit-filter"]
+catalog-all = [
+    "catalog-http-callout",
+    "catalog-azure-ad",
+    "catalog-gcp-adc",
+    "catalog-token-rate-limit",
+]
+
 [lints]
 workspace = true
 
@@ -19,7 +32,10 @@ quote = { workspace = true }
 syn = { workspace = true }
 praxis-ai = { path = "../server", package = "praxis-ai-proxy" }
 praxis-ai-apis = { workspace = true }
+praxis-ai-filters = { workspace = true }
 praxis-core = { workspace = true }
+praxis-filter = { workspace = true }
+praxis-config-catalog = { workspace = true, features = ["generator"] }
 praxis-test-utils = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 serde = { workspace = true }
@@ -27,6 +43,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -1,0 +1,58 @@
+name: AI Config Catalog
+
+on:
+  pull_request:
+    paths:
+      - "xtask/**"
+      - "filters/**"
+      - "apis/**"
+      - "docs/catalog/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/config-catalog.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "xtask/**"
+      - "filters/**"
+      - "apis/**"
+      - "docs/catalog/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/config-catalog.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    name: catalog (${{ matrix.feature || 'default' }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - ""
+          - catalog-http-callout
+          - catalog-azure-ad
+          - catalog-gcp-adc
+          - catalog-token-rate-limit
+          - catalog-all
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+      - name: Test catalog profile
+        run: >-
+          cargo test -p xtask
+          ${{ matrix.feature != '' && format('--features {0}', matrix.feature) || '' }}
+          config_catalog::tests::
+      - name: Generate or lint catalog profile
+        run: |
+          if [ "${{ matrix.feature }}" = "" ]; then
+            cargo xtask lint-config-catalog
+          else
+            cargo run -p xtask --features "${{ matrix.feature }}" -- generate-config-catalog
+          fi

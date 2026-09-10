@@ -14,6 +14,7 @@
 )]
 #![allow(let_underscore_drop, reason = "development tooling")]
 
+mod config_catalog;
 mod debug;
 mod echo;
 mod filter_docs;
@@ -94,6 +95,12 @@ enum Command {
     /// Generate per-filter documentation under `docs/filters/`.
     GenerateFilterDocs(filter_docs::GenerateArgs),
 
+    /// Generate the machine-readable AI configuration catalog.
+    GenerateConfigCatalog(config_catalog::GenerateArgs),
+
+    /// Check that the machine-readable AI configuration catalog is current.
+    LintConfigCatalog(config_catalog::LintArgs),
+
     /// Check that filter doc files are up to date.
     LintFilterDocs(filter_docs::LintArgs),
 
@@ -141,6 +148,8 @@ fn main() {
         Command::MakeReplayFixture(args) => make_replay_fixture::run(args),
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
+        Command::GenerateConfigCatalog(args) => config_catalog::generate(args),
+        Command::LintConfigCatalog(args) => config_catalog::lint(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),
         Command::OpenaiConformance(args) => openai_conformance::run(&args),
         Command::OpenaiConformanceReference(args) => openai_conformance::run_reference(&args),

@@ -24,7 +24,9 @@ endif
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	test-responses-conformance \
+	test-config-catalog test-config-catalog-local \
 	lint fmt doc audit coverage-check \
+	generate-config-catalog lint-config-catalog \
 	require-container-engine \
 	container container-run \
 	setup-hooks help \
@@ -128,6 +130,26 @@ test-environment:
 # Quality
 # -------------------------------------------------------------------
 
+generate-config-catalog:
+	cargo xtask generate-config-catalog
+
+lint-config-catalog:
+	cargo xtask lint-config-catalog
+
+test-config-catalog:
+	cargo test -p xtask config_catalog::tests::
+	cargo test -p xtask --all-features config_catalog::tests::
+
+# Run catalog tests against a local Core catalog crate without patching the
+# runtime Core crates. This remains usable while the local Core checkout has
+# unrelated API changes that AI does not need for source/catalog extraction.
+test-config-catalog-local:
+	@if [ ! -d "../praxis/crates/config-catalog" ]; then \
+		echo "ERROR: ../praxis/crates/config-catalog not found"; \
+		exit 1; \
+	fi
+	cargo test --config 'patch.crates-io."praxis-proxy-config-catalog".path="../praxis/crates/config-catalog"' -p xtask config_catalog::tests::
+
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets \
@@ -138,6 +160,8 @@ lint:
 	cargo xtask lint-deps
 	cargo xtask lint-separators
 	cargo xtask lint-filter-docs
+	cargo xtask lint-config-catalog
+	$(MAKE) test-config-catalog
 	cargo xtask lint-example-tests
 	cargo xtask lint-markdown-links
 	cargo xtask sync-example-readme
@@ -182,12 +206,14 @@ patch-praxis:
 		echo "Already patched — run 'make unpatch-praxis' first"; \
 		exit 1; \
 	fi
-	@printf '\n[patch.crates-io]\n\
-	praxis-proxy-core = { path = "../praxis/core" }\n\
-	praxis-proxy-filter = { path = "../praxis/filter" }\n\
-	praxis-proxy-protocol = { path = "../praxis/protocol" }\n\
-	praxis-proxy-tls = { path = "../praxis/tls" }\n\
-	praxis-proxy = { path = "../praxis/server" }\n' >> Cargo.toml
+	@printf '%s\n' \
+		'[patch.crates-io]' \
+		'praxis-proxy-core = { path = "../praxis/crates/core" }' \
+		'praxis-proxy-config-catalog = { path = "../praxis/crates/config-catalog" }' \
+		'praxis-proxy-filter = { path = "../praxis/crates/filter" }' \
+		'praxis-proxy-protocol = { path = "../praxis/crates/protocol" }' \
+		'praxis-proxy-tls = { path = "../praxis/crates/tls" }' \
+		'praxis-proxy = { path = "../praxis/crates/server" }' >> Cargo.toml
 	@echo "Patched Cargo.toml to use ../praxis path dependencies"
 
 unpatch-praxis:

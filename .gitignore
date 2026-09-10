@@ -41,6 +41,8 @@ coverage.json
 
 # Docs are markdown only
 docs/**/
+!docs/catalog/
+!docs/catalog/config-catalog.json
 !docs/
 !docs/architecture/
 !docs/conformance/
