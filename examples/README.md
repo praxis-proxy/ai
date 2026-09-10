@@ -107,3 +107,9 @@ before sending requests.
 | File | Description |
 | ------ | ------------- |
 | [mcp-static-catalog.yaml](configs/payload-processing/mcp-static-catalog.yaml) | Provides a static MCP catalog and broker for initialize, tools/list, ping, and notifications/initialized requests |
+
+### Vertex
+
+| File | Description |
+| ------ | ------------- |
+| [chat-completions-to-gemini.yaml](configs/vertex/chat-completions-to-gemini.yaml) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini generateContent format and translates responses back |
