@@ -887,7 +887,7 @@ async fn logical_stream_flushes_index_zero_local_item_on_iteration_zero_resume()
     // output (shifted to index 1); the earlier flush gate only fired at
     // `iteration > 0`, so index 0 was never announced and a client stream
     // accumulator saw index 1 with no index 0 and panicked.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -911,7 +911,9 @@ async fn logical_stream_flushes_index_zero_local_item_on_iteration_zero_resume()
     }
 
     // arm() captures output_index_offset = 1 from the pre-seeded accumulated_output.
-    filter.on_request(&mut ctx).await.unwrap();
+    // Unit tests cannot construct the IRR-owned `IterationState`; arm directly
+    // after setting up the state that would enter the step.
+    filter.arm(&mut ctx);
 
     // The first (and only) logical response.created must be forwarded — unlike a
     // resumed round at iteration > 0, iteration 0 has no earlier lifecycle to dedup.
@@ -3530,7 +3532,7 @@ fn responses_event(event_type: &str, mut payload: serde_json::Value) -> crate::o
 }
 
 impl OpenaiStreamEventsFilter {
-    fn test_logical_stream() -> Self {
+    fn test_filter() -> Self {
         Self {
             parser_config: crate::openai::sse::SseParserConfig {
                 max_buffer_bytes: 10_485_760,
@@ -3538,7 +3540,6 @@ impl OpenaiStreamEventsFilter {
                 timeout: std::time::Duration::from_secs(300),
             },
             max_tool_call_argument_bytes: 1024 * 1024,
-            logical_stream: true,
         }
     }
 }
@@ -3550,7 +3551,7 @@ fn suppress_mode_drops_private_function_call_lifecycle() {
     // A private function_call(name=file_search) opened while a hosted file_search
     // tool is declared: its added/delta/done all suppressed (nothing emitted).
     let mut ctx = test_ctx_with_hosted_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
 
@@ -3587,7 +3588,7 @@ fn client_function_call_without_hosted_tool_passes_through() {
 
     // has_file_search_tool == false: not suppressed, reaches the wire (P1 round-11).
     let mut ctx = test_ctx_without_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let added = responses_event(
@@ -3611,7 +3612,7 @@ fn native_hybrid_drops_pending_done_and_passes_opening() {
     use super::{StreamEventsState, append_logical_event};
 
     let mut ctx = test_ctx_with_hosted_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let added = responses_event(
@@ -3642,7 +3643,7 @@ fn native_terminal_done_passes_and_cancels_synthesis() {
     use super::{StreamEventsState, append_logical_event};
 
     let mut ctx = test_ctx_with_hosted_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let added = responses_event(
@@ -3681,7 +3682,7 @@ fn native_failed_done_records_observation_for_reconcile_skip() {
     // and must be recorded — the reconcile skips by observed membership, not status, so a
     // synthesized tail cannot duplicate this live terminal done.
     let mut ctx = test_ctx_with_hosted_file_search_tool();
-    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
     let added = responses_event(
@@ -3717,7 +3718,7 @@ async fn logical_stream_finalize_clears_provider_streamed_terminal_ids() {
     // this round's observation set; finalize must clear it so it cannot accumulate across IRR
     // continuation rounds and bypass max_state_bytes. Seeding it stands in for a round in which
     // stream_events observed a provider-streamed native terminal done.
-    let filter = make_logical_filter();
+    let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -3727,7 +3728,8 @@ async fn logical_stream_finalize_clears_provider_streamed_terminal_ids() {
         "input": "hello",
         "stream": true
     })));
-    filter.on_request(&mut ctx).await.unwrap();
+    // Unit tests cannot construct the IRR-owned `IterationState`; arm directly.
+    filter.arm(&mut ctx);
 
     let mut created = Some(make_sse_chunk(
         "response.created",
@@ -3787,7 +3789,7 @@ fn logical_stream_continues_recognizes_file_search_loop() {
 fn arm_publishes_file_search_marker_on_logical_stream() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    OpenaiStreamEventsFilter::test_logical_stream().arm(&mut ctx);
+    OpenaiStreamEventsFilter::test_filter().arm(&mut ctx);
     assert_eq!(ctx.get_metadata("responses.logical_stream.file_search"), Some("true"));
 }
 
@@ -3855,7 +3857,7 @@ fn drain_invalid_index_sets_error_and_no_gap() {
 // §10 P0: native-progress-precedes-closed-error ordering (no gap, no rewind).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_progress_precedes_closed_error_ordering() {
-    let filter = OpenaiStreamEventsFilter::test_logical_stream();
+    let filter = OpenaiStreamEventsFilter::test_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -3868,7 +3870,8 @@ async fn native_progress_precedes_closed_error_ordering() {
     state.tools = vec![json!({"type": "file_search", "vector_store_ids": ["vs_1"]})];
     ctx.extensions.insert(state);
 
-    filter.on_request(&mut ctx).await.unwrap();
+    // Unit tests cannot construct the IRR-owned `IterationState`; arm directly.
+    filter.arm(&mut ctx);
 
     // Drive one native file_search progress frame through to get a sequence_number
     let mut progress = Some(make_sse_chunk(

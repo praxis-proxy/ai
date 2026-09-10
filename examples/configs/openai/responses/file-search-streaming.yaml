@@ -6,14 +6,15 @@
 # model inference before finalizing the SSE lifecycle with citation annotations.
 #
 # This config uses the streaming step order mandated by §5 of the #313 spec:
-# `openai_stream_events` (logical_stream: true) is REQUIRED ahead of
-# `openai_file_search_callout` and `openai_responses_proxy`. The proxy derives
+# `openai_stream_events` is REQUIRED ahead of `openai_file_search_callout` and
+# `openai_responses_proxy`. It always composes the current IRR execution into
+# one logical Responses stream. The proxy derives
 # the streaming transport automatically from the effective outbound `stream:
 # true`; there is no operator opt-in. Typed streaming commits response.completed
 # to the client as it arrives, so a loop-terminal error detected after that event
 # must reach the client through the logical-stream finalizer, which defers each
-# round's terminal event and can replace it with an error frame. Without
-# `logical_stream: true` that error is silently dropped after the success is
+# round's terminal event and can replace it with an error frame. Without the
+# stream-events finalizer that error is silently dropped after the success is
 # already on the wire.
 #
 # Cannot share an IRR step with openai_agentic_loop due to competing
@@ -61,7 +62,6 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_stream_events
-                logical_stream: true
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:8001
                 allow_private_url: true

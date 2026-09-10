@@ -540,11 +540,10 @@ fn append_logical_event(
     // #313 §4/§6: classify locally-executable file_search items at first sight and
     // suppress their raw wire representation. Only runs on the logical stream with a
     // hosted file_search tool declared (the load-bearing configured-tool gate, P1 round-11).
-    let file_search_active = state.logical_stream
-        && ctx
-            .extensions
-            .get::<ResponsesState>()
-            .is_some_and(crate::openai::responses::file_search_callout::has_file_search_tool);
+    let file_search_active = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(crate::openai::responses::file_search_callout::has_file_search_tool);
     if file_search_active && event.event_type() == "response.output_item.added" {
         let payload = event.payload();
         if let Some(item) = payload.get("item") {
@@ -1317,10 +1316,6 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
 }
 
 /// Emit the held terminal event only when the current IRR step is terminal.
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear sequence: drain synthesis → terminal-error arm-stop → continues gate → error/terminal emit"
-)]
 fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
