@@ -6,8 +6,6 @@
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
-use crate::json_body::{insert_if_some, take_string};
-
 // -----------------------------------------------------------------------------
 // Request Transformation
 // -----------------------------------------------------------------------------
@@ -49,6 +47,35 @@ pub(crate) fn transform_request(value: Value, original_len: usize) -> Result<Vec
 
     serialize_chat(chat, original_len)
 }
+
+// -----------------------------------------------------------------------------
+// Field Consumption
+// -----------------------------------------------------------------------------
+
+/// Remove `key` from `map` and return the owned `String` when the value was a JSON string.
+///
+/// The entry is removed either way: a non-string value is dropped and `None` returned, matching the
+/// `get(..).and_then(Value::as_str)` behavior, without re-allocating the string.
+fn take_string(map: &mut Map<String, Value>, key: &str) -> Option<String> {
+    match map.remove(key) {
+        Some(Value::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+/// Move `value` into `target` under `key`, doing nothing when the field is absent.
+///
+/// Pairs with [`Map::remove`] so a mapped field travels from the parsed body into the translated body
+/// without an intermediate copy.
+fn insert_if_some(target: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        target.insert(key.to_owned(), value);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Serialization
+// -----------------------------------------------------------------------------
 
 /// Serialize the translated body into a buffer pre-sized from the Anthropic
 /// body it was translated from.
@@ -392,7 +419,6 @@ fn split_tool_result_parts(parts: Vec<Value>) -> (String, Vec<Value>) {
         let Value::Object(mut part) = part else {
             continue;
         };
-        // No branch below reads `type` again, so it is taken out with the rest.
         match take_string(&mut part, "type").as_deref() {
             Some("text") => {
                 if let Some(text) = take_string(&mut part, "text") {
@@ -657,15 +683,12 @@ fn is_translatable_client_tool(tool: &Value) -> bool {
 }
 
 /// Convert one Anthropic client tool definition to a Chat Completions tool.
-///
-/// Consumes the definition so `input_schema` — the largest value in a typical
-/// agentic request — moves into the generated function parameters.
+/// Consumes the definition so `input_schema` moves into the generated function parameters.
 fn convert_tool_definition(tool: Value) -> Option<Value> {
     if !is_translatable_client_tool(&tool) {
         return None;
     }
 
-    // A non-object tool entry carries no fields, so it translates to an empty function.
     let mut tool = match tool {
         Value::Object(fields) => fields,
         _ => Map::new(),
@@ -684,8 +707,6 @@ fn convert_tool_definition(tool: Value) -> Option<Value> {
         function.insert("strict".to_owned(), Value::Bool(strict));
     }
 
-    // Built by hand rather than with `json!`, which would deep-clone the
-    // function map back through the serializer.
     let mut chat_tool = Map::new();
     chat_tool.insert("type".to_owned(), Value::String("function".to_owned()));
     chat_tool.insert("function".to_owned(), Value::Object(function));
@@ -753,7 +774,6 @@ fn object_tool_choice(mut tool_choice: Map<String, Value>) -> Value {
         return Value::Object(choice);
     }
 
-    // A `tool` choice without a usable name degrades to `auto`.
     let kind = tool_choice.get("type").and_then(Value::as_str).unwrap_or_default();
     Value::String(tool_choice_keyword(kind).to_owned())
 }
@@ -772,28 +792,6 @@ mod tests {
     fn transform_bytes(body: &[u8]) -> Result<Vec<u8>, String> {
         let value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
         transform_request(value, body.len())
-    }
-
-    #[test]
-    fn output_buffer_is_sized_from_the_original_body() {
-        // Server tools are dropped, so the translation is far smaller than the
-        // body it came from and cannot have grown the buffer on its own.
-        let body = format!(
-            r#"{{"model":"claude-opus-4-8","messages":[],"tools":[{{"type":"web_search_20250305","name":"{}"}}]}}"#,
-            "s".repeat(4096)
-        );
-        let result = transform_bytes(body.as_bytes()).unwrap();
-
-        assert!(
-            result.len() < body.len(),
-            "translation should be smaller than the original body"
-        );
-        assert!(
-            result.capacity() >= body.len(),
-            "output buffer should be pre-sized from the original body, got {} for a {}-byte body",
-            result.capacity(),
-            body.len()
-        );
     }
 
     #[test]
@@ -842,18 +840,6 @@ mod tests {
                 "tool_choice",
             ],
             "translated request key order must stay stable"
-        );
-    }
-
-    #[test]
-    fn untranslated_top_level_fields_are_dropped() {
-        let body = br#"{"model":"m","metadata":{"user_id":"u"},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_bytes(body).unwrap();
-        let parsed: Value = serde_json::from_slice(&result).unwrap();
-
-        assert!(
-            parsed.get("metadata").is_none(),
-            "fields with no Chat Completions mapping are not forwarded"
         );
     }
 

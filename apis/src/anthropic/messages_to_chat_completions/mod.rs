@@ -153,7 +153,6 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
             _ => return Ok(FilterAction::Continue),
         };
 
-        // Parse once: the metadata pass borrows the value, then translation consumes it.
         let transformed = match serde_json::from_slice::<serde_json::Value>(bytes) {
             Ok(value) => {
                 extract_request_metadata(ctx, Some(&value));
@@ -212,8 +211,6 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
 // -----------------------------------------------------------------------------
 
 /// Extract streaming and model metadata from the parsed request body.
-///
-/// `None` means the body did not parse, which is reported as non-streaming.
 fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serde_json::Value>) {
     let Some(value) = value else {
         ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
