@@ -83,7 +83,7 @@ pub(super) fn fs_end_stream_with_error(
 
 /// STEP 0 (§6): authoritative-success gate. Returns `true` if the gate-fail path
 /// handled the round (caller returns Continue); `false` if the gate holds and the
-/// caller proceeds to STEP 0.5/branch. Child-module free fn (no `pub(super)`).
+/// caller proceeds to STEP 0.5/branch. Child-module `pub(super)` free fn.
 #[expect(
     clippy::too_many_lines,
     reason = "linear sequence: error-terminal branch + upstream-incomplete branch, both with shared annotate + size check"
@@ -138,14 +138,20 @@ pub(super) fn step_0_gate(
         state.accumulated_output.push(item);
     }
     // Shared BRANCH B annotate + full-canonical bound; local failure → error frame.
-    if annotate_output_items(&mut state.accumulated_output, &state.citation_files).is_err()
-        || !terminal_payload_fits(state, max_json_body_bytes)
-    {
+    // Split so each check publishes its own diagnostic (matches `branch_b_terminal`).
+    if annotate_output_items(&mut state.accumulated_output, &state.citation_files).is_err() {
         fs_end_stream_with_error(
             ctx,
             state,
             "server_error",
-            "openai_file_search_callout: gate-fail terminal processing failed",
+            "openai_file_search_callout: gate-fail citation annotation failed",
+        );
+    } else if !terminal_payload_fits(state, max_json_body_bytes) {
+        fs_end_stream_with_error(
+            ctx,
+            state,
+            "server_error",
+            "openai_file_search_callout: gate-fail terminal response exceeds byte limit",
         );
     }
     true
@@ -164,6 +170,13 @@ pub(super) fn step_0_5_translate_and_mixed_tool(
     } else {
         Vec::new()
     };
+    // `reconcile_round_into_accumulated_output` uses `binary_search` on `translated`,
+    // which requires ascending order. `translate_function_calls_to_file_search` produces
+    // it via forward `iter_mut().enumerate()`; guard that invariant against a refactor.
+    debug_assert!(
+        translated.windows(2).all(|w| matches!(w, [a, b] if a < b)),
+        "translated indices must be strictly ascending for binary_search"
+    );
     let output = state.output_items();
     let mixed = output.iter().any(is_pending_file_search_call) && has_client_function_call(output);
     if mixed {
