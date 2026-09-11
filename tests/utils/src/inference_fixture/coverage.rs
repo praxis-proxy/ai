@@ -1280,16 +1280,16 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
-                CoverageStatus::LiveCovered,
-                CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
+                CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
             ]
         );
         assert_eq!(report.features_total, 26);
-        assert_eq!(report.scenarios_total, 24);
-        assert_eq!(report.recordings_total, 29);
+        assert_eq!(report.scenarios_total, 25);
+        assert_eq!(report.recordings_total, 30);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1551,7 +1551,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[13..21] {
+        for feature in &manifest.features[13..22] {
             assert_eq!(
                 feature
                     .providers
@@ -1561,7 +1561,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[21..23] {
+        for feature in &manifest.features[22..24] {
             assert_eq!(
                 feature
                     .providers
@@ -1571,7 +1571,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[23..] {
+        for feature in &manifest.features[24..] {
             assert_eq!(
                 feature
                     .providers
