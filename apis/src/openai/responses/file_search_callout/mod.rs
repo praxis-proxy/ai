@@ -461,7 +461,7 @@ impl FileSearchCalloutFilter {
             return Ok(invalid_success_response_action(continued));
         }
         let has_file_search = ctx.extensions.get::<ResponsesState>().is_some_and(has_file_search_tool);
-        if has_file_search {
+        let translated_any = if has_file_search {
             let translated = translate_function_calls_to_file_search(&mut response);
             if !translated.is_empty() {
                 debug!(
@@ -469,7 +469,10 @@ impl FileSearchCalloutFilter {
                     "translated function_call(name=file_search) to file_search_call"
                 );
             }
-        }
+            !translated.is_empty()
+        } else {
+            false
+        };
         let Some(output) = response.get("output").and_then(Value::as_array) else {
             return Ok(invalid_success_response_action(continued));
         };
@@ -502,14 +505,37 @@ impl FileSearchCalloutFilter {
             return Ok(continuation_state_rejection());
         }
 
-        if remaining_file_search_call_budget(state) == 0 {
-            terminalize_all_pending_calls(state);
-        }
+        let terminalized = if remaining_file_search_call_budget(state) == 0 {
+            terminalize_all_pending_calls(state)
+        } else {
+            false
+        };
         if state.output_items().iter().any(is_pending_file_search_call) {
             ctx.filter_results
                 .entry("openai_file_search_callout")
                 .or_default()
                 .set("pending", "true")?;
+            return Ok(FilterAction::Continue);
+        }
+
+        // Genuine passthrough: file search performed no transformation this
+        // round. That means no function_call was rewritten to a file_search_call
+        // (`!translated_any`), the budget did not force any pending call to
+        // `incomplete` (`!terminalized`), and there is no accumulated
+        // file-search state to assemble (`!continued`, snapshotted before this
+        // round's output was folded into state above). Re-serializing here would
+        // emit byte-identical JSON while `clear_rewritten_response_headers`
+        // strips the upstream representation headers (ETag, Last-Modified,
+        // Content-Encoding, ...), which openai_responses_rehydrate relies on to
+        // decline rewriting a validator-bearing response. Leave the upstream
+        // body and its headers untouched instead (see the repository rule
+        // against unnecessary re-serialization; #1046 owns the broader
+        // consolidation of file-search finalization).
+        if !continued && !translated_any && !terminalized {
+            ctx.filter_results
+                .entry("openai_file_search_callout")
+                .or_default()
+                .set("pending", "false")?;
             return Ok(FilterAction::Continue);
         }
 
@@ -1493,16 +1519,23 @@ fn terminalize_unplanned_pending_calls(state: &mut ResponsesState, plan: &Search
     }
 }
 
-/// Mark every pending call incomplete when no built-in tool budget remains.
-fn terminalize_all_pending_calls(state: &mut ResponsesState) {
+/// Mark every pending call incomplete when no built-in tool budget remains,
+/// rewriting each still-pending `file_search_call` to a terminal `incomplete`
+/// status. Returns whether any call was actually rewritten, so callers can tell
+/// a genuine passthrough (nothing mutated) from a response the budget forced to
+/// terminate.
+fn terminalize_all_pending_calls(state: &mut ResponsesState) -> bool {
+    let mut terminalized = false;
     for item in state.output_items_mut() {
         if is_pending_file_search_call(item)
             && let Some(object) = item.as_object_mut()
         {
             object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
             object.remove("results");
+            terminalized = true;
         }
     }
+    terminalized
 }
 
 /// Give every pending call its final public identity before budgeting or capping.

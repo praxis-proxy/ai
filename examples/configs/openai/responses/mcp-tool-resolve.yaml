@@ -17,7 +17,7 @@
 #
 # This is a minimal pipeline focused on MCP tool discovery. For a
 # complete setup with multi-turn conversation support (rehydrate,
-# response store), see full-flow.yaml.
+# response store), see full-flow-agentic.yaml.
 #
 # For cross-request caching via `previous_tools`, add
 # `openai_responses_rehydrate` before this filter so that

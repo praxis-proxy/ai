@@ -1,28 +1,65 @@
-# Responses API Full Flow — File Search Callout (Non-Streaming)
+# Responses API Full Flow — Unified Gateway with File Search Callout
 #
-# Extends the full-flow pipeline with an iterative_request_router (IRR)
-# around the inference step, enabling server-side file search execution.
-# The IRR sends the request to the model, executes any returned
-# file_search_call through the vector store, and feeds the search
-# context back for a second model inference before returning the
-# final Responses API object.
+# Unified Responses API gateway routing POST /v1/responses through the
+# iterative_request_router for server-side file search execution, with
+# the Responses WebSocket and non-Responses paths routed around the IRR.
 #
-# This config does NOT support streaming or WebSocket in the agentic
-# loop: openai_file_search_callout shares its IRR step with
-# openai_agentic_loop, which fully buffers each model response. For
-# streaming without hosted file_search, see full-flow.yaml. For
-# streaming hosted file_search (without the agentic loop), see
-# file-search-streaming.yaml. file_search_callout cannot share an IRR
-# step with openai_agentic_loop due to competing accumulated_output
-# ownership.
+# This config merges the standalone `full-flow.yaml` gateway into the
+# agentic (IRR) pipeline so a single deployment serves BOTH:
+#   - POST /v1/responses  → runs through the iterative_request_router
+#     (IRR), enabling server-side file_search execution across rounds for
+#     BOTH buffered and streaming (`stream: true`) clients. The in-IRR
+#     openai_stream_events filter composes each round into one logical
+#     Responses SSE stream (see issue #313 for the streaming lifecycle).
+#   - GET  /v1/responses  (WebSocket) and the non-Responses paths
+#     (/v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores)
+#     → routed AROUND the IRR. The IRR drives the Responses
+#     request/response lifecycle and cannot relay a 101 WebSocket
+#     upgrade, so WebSocket traffic bypasses it.
 #
-# Pre-IRR filters run once on the client request to set up shared
-# state (ResponsesState) which persists across all IRR iterations
-# via extension swapping.
+# Architecture (B-shaped):
 #
-# Pre-IRR pipeline (runs once):
-#   1. openai_conversations — CRUD for the Conversations API
-#   2. openai_responses_format — classifies body, promotes metadata
+#   client ─▶ [ pre-IRR prefix, runs once ]
+#              │
+#              ├─ NOT (POST /v1/responses) ─▶ bypass branch
+#              │      router + load_balancer, rejoin: terminal
+#              │      (GET /v1/responses WebSocket + non-Responses paths)
+#              │
+#              └─ POST /v1/responses ───────▶ iterative_request_router
+#                     (terminal filter; single-pass or multi-round
+#                      file_search execution, then final response)
+#
+#   The bypass gate is a `headers` no-op host carrying `conditions` +
+#   `branch_chains`. Its condition (`unless POST /v1/responses`) skips the
+#   host — and therefore its branch — for POST /v1/responses, which falls
+#   through to the terminal IRR. Every other request runs the branch,
+#   whose router+load_balancer select an upstream and `rejoin: terminal`
+#   forwards it, stopping the pipeline before the IRR.
+#
+# Why routing lives in a branch (not a top-level router before the IRR):
+#   the IRR must be the terminal filter, and a top-level router or
+#   load_balancer in the same flat chain as the IRR is rejected by the
+#   pipeline builder. Routing filters nested inside a branch (or inside
+#   the IRR step) are allowed.
+#
+# Chat-body guard:
+#   A Chat Completions or Anthropic Messages body POSTed to /v1/responses
+#   is a client error. The standalone full-flow.yaml rejected it via a
+#   top-level router that required x-praxis-ai-format=openai_responses
+#   (route-miss → 404). Here the equivalent guard is an on_result branch
+#   on openai_responses_format: when the classifier promotes a non-
+#   Responses format for the body, a static_response returns 404 before
+#   the request reaches the IRR or any backend. The IRR's own inner
+#   router matches only `path: /v1/responses` because the IRR rebuilds
+#   its sub-request from the raw client headers and does NOT carry the
+#   promoted x-praxis-ai-format header into the inner pipeline.
+#
+# Pre-IRR pipeline (runs once, before routing):
+#   1. openai_responses_format — classifies body, promotes routing
+#      metadata (format/model/stream/mode) + filter results. Hosts the
+#      chat-body guard. Placed first so its promoted `format` result is
+#      still live when its own branch is evaluated in the header phase.
+#   2. openai_conversations — CRUD for the Conversations API
 #   3. openai_responses_validate — validates parameters, generates IDs
 #   4. openai_tool_parse — parses tools array, promotes summary facts
 #   5. openai_response_store — persists responses, registers store backend
@@ -32,25 +69,23 @@
 #      that do not natively support input_file
 #   9. openai_mcp_tool_resolve — resolves MCP tool entries via tools/list
 #
-# openai_stream_events is intentionally absent: it composes streamed
-# inference rounds into one logical Responses stream and is only valid
-# inside an IRR step. This config buffers finite responses, so it would
-# be inert here. See stream-events.yaml and agentic-loop.yaml for the
-# in-IRR streaming examples.
+# openai_stream_events is not part of this pre-IRR prefix: it composes
+# streamed inference rounds into one logical Responses stream and is only
+# valid inside an IRR step. It therefore lives in the IRR inference step
+# below (as the first filter), where it serves streaming (`stream: true`)
+# clients and is inert for buffered ones. See stream-events.yaml and
+# agentic-loop.yaml for additional in-IRR streaming examples.
 #
-# IRR inference filter chain (all routing lives inside the IRR step
-# because the IRR must be the terminal filter in the chain):
+# IRR inference step (all routing lives inside the IRR step because the
+# IRR must be the terminal filter). Per §5 of the #313 spec,
+# openai_stream_events is the FIRST filter so it can compose each round
+# into one logical Responses SSE stream:
 #   Request phase (forward):
-#     openai_file_search_callout → openai_responses_proxy
-#       → headers → router → load_balancer
+#     openai_stream_events → openai_file_search_callout
+#       → openai_responses_proxy → headers → router → load_balancer
 #   Response phase (reverse):
 #     load_balancer → router → headers → openai_responses_proxy
-#       → openai_file_search_callout
-#
-# Only Responses API traffic (/v1/responses) is routed by this
-# config. Non-Responses paths (/v1/prompts, /v1/embeddings, etc.)
-# receive a route-miss error. For a full gateway that also routes
-# non-Responses traffic, see full-flow.yaml (without IRR).
+#       → openai_file_search_callout → openai_stream_events
 #
 # Transition rules (evaluated after each step's response-body):
 #   openai_file_search_callout.pending = "true" → next: inference
@@ -72,11 +107,6 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
 #
-#   # Multi-turn with previous_response_id
-#   curl -X POST http://localhost:8080/v1/responses \
-#     -H "Content-Type: application/json" \
-#     -d '{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_abc"}'
-#
 #   # File search — model issues file_search_call, executed via vector store
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
@@ -85,6 +115,15 @@
 #       "input": "What does the README say about deployment?",
 #       "tools": [{"type": "file_search", "vector_store_ids": ["vs_abc"]}]
 #     }'
+#
+#   # Responses WebSocket (routed around the IRR to a WS-capable backend)
+#   websocat -H="Authorization: Bearer $OPENAI_API_KEY" \
+#     ws://localhost:8080/v1/responses
+#
+#   # Non-Responses path (routed around the IRR to a dedicated service)
+#   curl http://localhost:8080/v1/embeddings \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"text-embedding-3-small","input":"hello"}'
 #
 # Build:
 #   cargo build -p praxis-ai-proxy
@@ -97,12 +136,10 @@ listeners:
 filter_chains:
   - name: full-flow-agentic-pipeline
     filters:
-      - filter: openai_conversations
-        backend: sqlite
-        database_url: "sqlite://responses.db?mode=rwc"
-        conversations_table: openai_conversations
-        items_table: openai_conversation_items
-
+      # Classify first so the promoted `format` result is still live when
+      # this filter's own guard branch is evaluated (branch conditions
+      # read the host's filter results, which the pipeline clears after
+      # each filter in the header phase).
       - filter: openai_responses_format
         on_invalid: continue
         headers:
@@ -110,6 +147,40 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
+        branch_chains:
+          # A Chat Completions body on /v1/responses is a client error;
+          # reject it before it reaches the IRR or any backend.
+          - name: reject-chat-completions-body
+            on_result:
+              filter: openai_responses_format
+              key: format
+              result: openai_chat_completions
+            rejoin: terminal
+            chains:
+              - name: reject-chat-completions
+                filters:
+                  - filter: static_response
+                    status: 404
+                    body: '{"error":{"message":"Chat Completions request body is not valid on the Responses endpoint","type":"invalid_request_error","code":"unsupported_body"}}'
+          # Likewise an Anthropic Messages body on /v1/responses.
+          - name: reject-anthropic-messages-body
+            on_result:
+              filter: openai_responses_format
+              key: format
+              result: anthropic_messages
+            rejoin: terminal
+            chains:
+              - name: reject-anthropic-messages
+                filters:
+                  - filter: static_response
+                    status: 404
+                    body: '{"error":{"message":"Anthropic Messages request body is not valid on the Responses endpoint","type":"invalid_request_error","code":"unsupported_body"}}'
+
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
 
       - filter: openai_responses_validate
 
@@ -139,16 +210,77 @@ filter_chains:
 
       - filter: openai_mcp_tool_resolve
 
+      # Bypass gate: route everything EXCEPT POST /v1/responses around the
+      # terminal IRR. GET /v1/responses (WebSocket) and the non-Responses
+      # paths must not enter the IRR. POST /v1/responses fails this
+      # condition, so this host (and its branch) is skipped and the
+      # request falls through to the IRR below.
+      - filter: headers
+        conditions:
+          - unless:
+              path_prefix: "/v1/responses"
+              methods: [POST]
+        branch_chains:
+          - name: non-irr-gateway
+            rejoin: terminal
+            chains:
+              - name: gateway
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/v1/prompts"
+                        cluster: "prompts-api"
+                      - path_prefix: "/v1/embeddings"
+                        cluster: "embeddings-api"
+                      - path_prefix: "/v1/files"
+                        cluster: "files-api"
+                      - path_prefix: "/v1/vector_stores"
+                        cluster: "vector-stores-backend"
+                      # GET /v1/responses WebSocket upgrade → inference
+                      # backend, gated on the classifier's promoted format
+                      # so a bare non-Responses GET does not slip through.
+                      - path: "/v1/responses"
+                        headers:
+                          x-praxis-ai-format: "openai_responses"
+                        cluster: "inference-backend"
+                  - filter: load_balancer
+                    clusters:
+                      - name: "prompts-api"
+                        endpoints:
+                          - "127.0.0.1:9998"
+                      - name: "embeddings-api"
+                        endpoints:
+                          - "127.0.0.1:9997"
+                      - name: "files-api"
+                        endpoints:
+                          - "127.0.0.1:9999"
+                      - name: "vector-stores-backend"
+                        endpoints:
+                          - "127.0.0.1:3002"
+                      - name: "inference-backend"
+                        endpoints:
+                          - "127.0.0.1:3001"
+
+      # Terminal filter: POST /v1/responses (valid Responses body) runs
+      # here. Single-pass or multi-round file_search execution, then the
+      # final Responses object is returned.
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 8
         timeout_ms: 120000
         step_timeout_ms: 60000
         max_response_bytes: 67108864
+        # Streaming (`stream: true`) responses relay through the IRR with
+        # openai_stream_events; bound the retained streamed body too.
+        max_stream_response_bytes: 67108864
         max_state_bytes: 136314880
         steps:
           - name: inference
             filters:
+              # openai_stream_events is first (per §5 of the #313 spec) so
+              # it composes each IRR round into one logical Responses SSE
+              # stream for streaming clients; it is inert for buffered ones.
+              - filter: openai_stream_events
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:3002
                 allow_private_url: true
@@ -165,6 +297,8 @@ filter_chains:
                 request_set:
                   - name: Content-Type
                     value: application/json
+              # Inner router matches path only: the IRR sub-request carries
+              # the raw client headers, not the promoted x-praxis-ai-format.
               - filter: router
                 routes:
                   - path: "/v1/responses"

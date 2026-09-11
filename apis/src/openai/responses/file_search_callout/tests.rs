@@ -1065,6 +1065,122 @@ fn final_response_rewrite_clears_representation_headers() {
     assert!(ctx.response_headers_modified);
 }
 
+#[test]
+fn final_response_passthrough_preserves_representation_headers() {
+    // A model response that performed no file-search work this round (nothing
+    // translated) with no accumulated file-search state must pass through
+    // untouched: its representation headers survive and the body is not
+    // re-serialized, so openai_responses_rehydrate can still observe the
+    // validators and decline to rewrite. Regression guard for the unified
+    // full-flow gateway, which routes every Responses call through this filter
+    // and must not strip ETag/Content-Encoding from ordinary responses.
+    let state = state_with(&["vs-a"], vec![]);
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    for name in [
+        http::header::ETAG,
+        http::header::LAST_MODIFIED,
+        http::header::CONTENT_ENCODING,
+    ] {
+        response_header
+            .headers
+            .insert(name, http::HeaderValue::from_static("upstream-v1"));
+    }
+    ctx.response_header = Some(&mut response_header);
+    let original = json!({
+        "id": "resp-passthrough",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hi", "annotations": []}]
+        }]
+    })
+    .to_string();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    assert!(matches!(
+        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
+        FilterAction::Continue
+    ));
+
+    // Body passed through byte-for-byte: no re-serialization.
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_bytes()),
+        "a passthrough response must not be re-serialized"
+    );
+    // Representation headers survive and are not marked modified.
+    let response = ctx.response_header.as_deref().unwrap();
+    assert_eq!(
+        response.headers.get(http::header::ETAG).unwrap(),
+        "upstream-v1",
+        "the upstream ETag must be preserved on a passthrough response"
+    );
+    assert_eq!(
+        response.headers.get(http::header::CONTENT_ENCODING).unwrap(),
+        "upstream-v1",
+        "the upstream Content-Encoding must be preserved on a passthrough response"
+    );
+    assert!(
+        !ctx.response_headers_modified,
+        "a passthrough must not mark response headers as modified"
+    );
+    // The round is terminal.
+    assert_eq!(
+        ctx.filter_results["openai_file_search_callout"].get("pending"),
+        Some("false")
+    );
+}
+
+#[test]
+fn exhausted_budget_terminalizes_native_call_on_first_round() {
+    // Round 0 with no accumulated file-search state (`continued` is false) and
+    // no translation this round (`translated_any` is false), but the built-in
+    // tool-call budget is exhausted, so `terminalize_all_pending_calls` rewrites
+    // the native pending call from "searching" to "incomplete". This must NOT be
+    // treated as a genuine passthrough: passing the upstream body through would
+    // leak a non-terminal file_search_call that never resolves. The response was
+    // mutated this round (`terminalized`), so the finalizer must run and emit the
+    // "incomplete" status. Regression guard for the passthrough predicate.
+    let mut state = state_with(&["vs-a"], vec![]);
+    state.max_tool_calls = Some(0);
+    let mut ctx = make_context(Some(state));
+    let mut response_header = crate::test_utils::make_response();
+    ctx.response_header = Some(&mut response_header);
+    let original = json!({
+        "id": "resp-budget-first-round",
+        "output": [{
+            "type": "file_search_call",
+            "id": "fs-native",
+            "status": "searching",
+            "queries": ["q"]
+        }]
+    })
+    .to_string();
+    let mut body = Some(Bytes::from(original.clone()));
+
+    assert!(matches!(
+        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
+        FilterAction::Continue
+    ));
+    let encoded: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        encoded["output"][0]["status"], "incomplete",
+        "a budget-exhausted native call must be terminalized, not passed through as \"searching\""
+    );
+    assert_ne!(
+        body.as_deref(),
+        Some(original.as_bytes()),
+        "the terminalized response must be re-serialized, not the upstream body"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_file_search_callout"].get("pending"),
+        Some("false"),
+        "the round is terminal once the budget is exhausted"
+    );
+}
+
 #[tokio::test]
 async fn mcp_calls_consume_the_response_wide_builtin_tool_budget() {
     let server = MockServer::json(200, &json!({"data": []}));

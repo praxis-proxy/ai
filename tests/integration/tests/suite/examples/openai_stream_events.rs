@@ -19,9 +19,8 @@ const RESPONSE_JSON: &str = r#"{"id":"resp_stream_example","created_at":1000,"mo
 
 const RESPONSES_TABLE: &str = "openai_responses";
 
-const STREAMING_EXAMPLES: [(&str, u64); 5] = [
+const STREAMING_EXAMPLES: [(&str, u64); 4] = [
     ("openai/responses/agentic-loop.yaml", 360_000),
-    ("openai/responses/full-flow.yaml", 360_000),
     ("openai/responses/irr-terminal-streaming.yaml", 360_000),
     ("openai/responses/responses-to-chat-completions.yaml", 660_000),
     ("openai/responses/stream-events.yaml", 360_000),

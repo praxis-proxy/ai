@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Functional tests for the Responses API full-flow example config.
+//! Functional tests for the unified Responses API full-flow example
+//! config (`full-flow-agentic.yaml`). POST /v1/responses runs through the
+//! iterative_request_router (IRR); WebSocket and non-Responses paths are
+//! routed around the IRR by the bypass branch.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -56,18 +59,21 @@ const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Load the full-flow config with the sqlite store redirected to an isolated
-/// temp database. Store-enabled requests now reach the backend and persist, so
-/// they must not share the on-disk `responses.db` across parallel tests.
+/// Load the unified full-flow config (`full-flow-agentic.yaml`) with the sqlite
+/// store redirected to an isolated temp database. Store-enabled requests reach
+/// the backend and persist, so they must not share the on-disk `responses.db`
+/// across parallel tests.
 fn load_full_flow_config_with_db(
     proxy_port: u16,
     db: &TempSqlite,
     port_map: &HashMap<&str, u16>,
 ) -> praxis_core::config::Config {
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        &yaml
+            .replace("sqlite://responses.db?mode=rwc", db.url())
+            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
         proxy_port,
         port_map,
     );
@@ -85,7 +91,7 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_file_resolve");
 
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml
@@ -249,7 +255,7 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
     let proxy_port = free_port();
 
     let config = load_example_config(
-        "openai/responses/full-flow.yaml",
+        "openai/responses/full-flow-agentic.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
@@ -266,7 +272,7 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
     assert_eq!(
         parse_status(&raw),
         404,
-        "non-Responses body should not match the format-constrained route"
+        "a Chat Completions body on /v1/responses should be rejected by the format guard branch"
     );
 }
 
@@ -372,7 +378,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -453,7 +459,7 @@ async fn full_flow_previous_response_id_restored_in_client_response() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev_restore");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -527,7 +533,7 @@ async fn full_flow_previous_response_id_restored_in_streaming_response() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev_restore_stream");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -614,7 +620,7 @@ async fn full_flow_encoded_response_passes_through_untouched() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_encoded_passthrough");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -694,7 +700,7 @@ async fn full_flow_response_with_validators_passes_through_unrewritten() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_validators_passthrough");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -1133,7 +1139,7 @@ fn ws_full_flow_config(
     ports: &HashMap<&str, u16>,
 ) -> (praxis_core::config::Config, TempSqlite) {
     let db = TempSqlite::new(test_name);
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())

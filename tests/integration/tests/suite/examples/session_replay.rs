@@ -465,7 +465,7 @@ async fn replay_codex_responses_session_through_full_flow_example() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("session_replay");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml

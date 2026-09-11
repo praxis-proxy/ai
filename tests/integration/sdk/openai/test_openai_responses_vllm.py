@@ -47,7 +47,7 @@ VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
+CONFIG_PATH = "examples/configs/openai/responses/full-flow-agentic.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 IRR_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/irr-terminal-streaming.yaml"
@@ -1461,9 +1461,11 @@ class TestOpenAIResponsesVLLM:
     def test_client_function_call_returns(self, openai_client):
         """Client-side function tools are returned without auto-execution.
 
-        The full-flow pipeline has no agentic loop, so function_call
-        items are passed through to the client. Validates that vLLM
-        produces a well-formed function_call through the proxy.
+        The unified full-flow pipeline's iterative_request_router only
+        loops on server-side file_search calls, so a client function_call
+        is returned to the client as the terminal response rather than
+        auto-executed. Validates that vLLM produces a well-formed
+        function_call through the proxy.
         """
         response = openai_client.responses.create(
             model=VLLM_MODEL,
