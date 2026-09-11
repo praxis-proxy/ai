@@ -1,0 +1,89 @@
+# OpenAI Operation Classifier
+#
+# Identifies supported OpenAI operations from the request head — method,
+# normalized path, and protocol headers — and publishes the result so a
+# pipeline can branch on a proxy-owned fact instead of a path prefix.
+#
+# The filter reads no request body and declares no buffering, so the
+# classification is available before any body-handling decision is made.
+#
+# Published per matched request:
+#   - a typed OpenAiOperationMatch in request extensions
+#   - metadata: openai_operation.family, openai_operation.operation_id
+#   - filter results: family, operation_id
+#   - headers: x-praxis-ai-family, x-praxis-ai-operation
+#
+# Consuming the classification:
+#   The classifier runs in the header phase. Its headers are pending
+#   mutations applied when the request is forwarded, so the `router`
+#   filter — which matches the *downstream* request headers — does not
+#   see them in the same phase. Downstream filters read the typed match
+#   from request extensions; the backend reads the forwarded headers.
+#
+# Anti-spoofing:
+#   Both headers are proxy-owned. On a match they are overwritten with the
+#   classifier's values; when nothing matches they are removed. A client
+#   cannot supply either name and have it survive to the backend.
+#
+# Unmatched requests are forwarded unchanged apart from the stripped
+# headers. Whether they are rejected, sent to a fallback backend, or
+# handled some other way is a routing policy decision this filter does
+# not make.
+#
+# Example requests:
+#
+#   # classified: family=responses operation=createResponse
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello"}'
+#
+#   # classified: operation=Getinputtokencounts — a static endpoint,
+#   # not a response whose ID is "input_tokens"
+#   curl -X POST http://localhost:8080/v1/responses/input_tokens \
+#     -H "Content-Type: application/json" -d '{"model":"gpt-4.1"}'
+#
+#   # classified: family=conversations operation=getConversation
+#   curl http://localhost:8080/v1/conversations/conv_123
+#
+#   # unsupported method: no operation matches, headers stripped
+#   curl -X PUT http://localhost:8080/v1/responses
+#
+#   # spoofing attempt: the supplied header is replaced, not honored
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "x-praxis-ai-family: files" \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello"}'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [operation-pipeline]
+
+filter_chains:
+  - name: operation-pipeline
+    filters:
+      # Classify from the request head. Header names are configurable;
+      # set either to null to publish metadata and results without a header.
+      - filter: openai_operation
+        headers:
+          family: x-praxis-ai-family
+          operation: x-praxis-ai-operation
+      # Every request is forwarded to the same backend. Classified
+      # requests arrive carrying the proxy-owned headers; unclassified
+      # ones arrive with those header names stripped.
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "backend"
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
