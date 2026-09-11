@@ -3025,3 +3025,40 @@ fn step_0_gate_fail_pending_native_incomplete_tail() {
         "three items: incomplete + completed + message"
     );
 }
+
+#[test]
+fn finalize_public_response_assigns_ids_to_id_less_items() {
+    let mut state = ResponsesState {
+        response_object: json!({
+            "id": "resp_test123",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "final answer"}]
+                }
+            ]
+        }),
+        file_search_output_items: vec![json!({
+            "type": "file_search_call",
+            "id": "fs_123",
+            "status": "completed"
+        })],
+        ..Default::default()
+    };
+
+    let bytes = finalize_public_response(&mut state).expect("finalization should succeed");
+    let response: Value = serde_json::from_slice(&bytes).expect("response should be valid JSON");
+
+    let output = response["output"].as_array().expect("output should be an array");
+    assert_eq!(output.len(), 2, "both file search call and message should be present");
+    assert_eq!(
+        output[0]["id"], "fs_123",
+        "existing file search call id should be preserved"
+    );
+    assert!(
+        output[1]["id"].as_str().is_some_and(|id| id.starts_with("msg_")),
+        "message item missing id should receive a synthetic msg_ id, got: {:?}",
+        output[1]["id"]
+    );
+}

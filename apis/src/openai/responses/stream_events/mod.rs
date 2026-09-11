@@ -791,20 +791,45 @@ fn is_premature_local_tool_done(ctx: &HttpFilterContext<'_>, event: &ResponsesEv
 }
 
 /// Whether an event type is a tool-specific progress or outcome event the model
-/// backend streams in-band for a hosted `web_search_call` or `mcp_call`
-/// (`response.web_search_call.*` / `response.mcp_call.*`). Observing one proves
-/// the progress lifecycle reached the client, so the proxy must not synthesize
-/// it again.
+/// backend streams in-band for a hosted `web_search_call`, `mcp_call`, or
+/// `mcp_list_tools` (`response.web_search_call.*` / `response.mcp_call.*` /
+/// `response.mcp_list_tools.*`). Observing one proves the progress lifecycle
+/// reached the client, so the proxy must not synthesize it again.
+///
+/// `mcp_list_tools` is included because a *deferred* MCP entry (`defer_loading:
+/// true`, or one lacking a `server_url`) is passed through unresolved by
+/// `openai_mcp_tool_resolve`, so the backend performs `tools/list` itself and
+/// natively streams the discovery lifecycle. Recording those phases keeps a
+/// backend-executed listing's real `output_item.done` from being suppressed as
+/// premature (issue #1022), exactly as native `web_search_call`/`mcp_call`
+/// passthrough is already handled. A locally seeded listing streams no such
+/// events, so this predicate is inert for it and its lifecycle is synthesized by
+/// [`flush_local_output_items`] as before.
 fn is_local_tool_progress_event(event_type: &str) -> bool {
-    event_type.starts_with("response.web_search_call.") || event_type.starts_with("response.mcp_call.")
+    event_type.starts_with("response.web_search_call.")
+        || event_type.starts_with("response.mcp_call.")
+        || event_type.starts_with("response.mcp_list_tools.")
 }
 
-/// Whether an accumulated output item was generated locally by a tool-dispatch
-/// filter rather than streamed by the model backend.
+/// Whether an output item is one of the tool types whose streaming lifecycle the
+/// proxy reconciles — whether locally synthesized (seeded by a tool-dispatch
+/// filter) or streamed natively by the model backend.
+///
+/// `mcp_list_tools` is such a type. On eager resolution `openai_mcp_tool_resolve`
+/// runs the MCP `tools/list` and seeds the discovery listing into
+/// `accumulated_output` before any inference round (issue #1022), so the backend —
+/// which then only sees the rewritten `type: "function"` tools — never streams it.
+/// But a *deferred* entry (`defer_loading: true`, or one lacking a `server_url`) is
+/// passed through unresolved, so the backend performs `tools/list` itself and
+/// natively streams the listing. Both are recognized here; whether a given
+/// lifecycle event is synthesized or forwarded is then decided by the phases
+/// actually streamed in-band ([`is_local_tool_progress_event`] →
+/// `streamed_phases`) and by provenance (`locally_executed_output_items`, which
+/// gates [`collect_pending_local_items`]), not by this type check alone.
 fn is_local_tool_item(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
-        Some("mcp_call" | "mcp_approval_request" | "web_search_call")
+        Some("mcp_call" | "mcp_approval_request" | "web_search_call" | "mcp_list_tools")
     )
 }
 
@@ -1178,11 +1203,21 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// The full ordered tool-specific lifecycle a local item owes the client between
 /// `output_item.added` and `output_item.done`, per issue #276.
 ///
-/// `mcp_call` progresses `in_progress` then `completed`/`failed`;
-/// `web_search_call` progresses `in_progress`, `searching`, then `completed` only
-/// when it actually completed (web search has no conformant `failed` event, so
-/// other outcomes surface through `output_item.done` alone). `mcp_approval_request`
-/// has no dedicated progress events; it surfaces through
+/// `mcp_call` progresses `in_progress` then `completed`/`failed`, selected by
+/// whether the item carries a non-null `error`. `web_search_call` progresses
+/// `in_progress`, `searching`, then `completed` only when it actually completed
+/// (web search has no conformant `failed` event, so other outcomes surface
+/// through `output_item.done` alone). `mcp_list_tools` progresses `in_progress`
+/// then `completed`/`failed`, selected the same way as `mcp_call`: a locally
+/// seeded listing is created only on successful discovery (issue #1022) so its
+/// terminal phase is `completed`, but a *deferred* entry the backend resolves
+/// natively can also fail its `tools/list`, streaming `mcp_list_tools.failed` on
+/// an item carrying an `error` — matching the expected terminal phase to that
+/// error keeps the backend's real `output_item.done` from being dropped as
+/// premature (issue #1022). A *local* discovery failure instead takes the
+/// separate `response.mcp_list_tools.failed` terminal-SSE path in
+/// `openai_mcp_tool_resolve` (issue #320) and never reaches this synthesis.
+/// `mcp_approval_request` has no dedicated progress events; it surfaces through
 /// `output_item.added`/`output_item.done` alone.
 ///
 /// These are distinct API lifecycle events, not one combined milestone. Callers
@@ -1190,6 +1225,14 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// lifecycle still gets exactly its missing events synthesized.
 fn expected_phase_events(item: &Value) -> Vec<&'static str> {
     match item.get("type").and_then(Value::as_str) {
+        Some("mcp_list_tools") => {
+            let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
+                "response.mcp_list_tools.failed"
+            } else {
+                "response.mcp_list_tools.completed"
+            };
+            vec!["response.mcp_list_tools.in_progress", outcome]
+        },
         Some("mcp_call") => {
             let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
                 "response.mcp_call.failed"

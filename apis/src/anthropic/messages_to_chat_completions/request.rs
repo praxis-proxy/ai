@@ -10,40 +10,103 @@ use tracing::warn;
 // Request Transformation
 // -----------------------------------------------------------------------------
 
-/// Transform an Anthropic Messages request body into Chat
+/// Transform a parsed Anthropic Messages request body into Chat
 /// Completions-compatible format.
-///
 /// Returns the transformed JSON bytes, or an error message.
-pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
-    let value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
-
-    let Some(obj) = value.as_object() else {
+pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
+    let Value::Object(mut body) = value else {
         return Err("request body is not a JSON object".to_owned());
     };
 
+    // Take every mapped field up front, in one place. Each becomes an owned
+    // local that is moved into the helper emitting it.
+    let model = body.remove("model");
+    let max_tokens = body.remove("max_tokens");
+    let system = body.remove("system");
+    let messages = body.remove("messages");
+    let stream = body.remove("stream");
+    let stream_options = body.remove("stream_options");
+    let stop_sequences = body.remove("stop_sequences");
+    let temperature = body.remove("temperature");
+    let top_p = body.remove("top_p");
+    let top_k = body.remove("top_k");
+    let tools = body.remove("tools");
+    let tool_choice = body.remove("tool_choice");
+    let had_tools = tools.is_some();
+    drop(body);
+
     let mut chat = Map::new();
-
-    if let Some(model) = obj.get("model") {
-        chat.insert("model".to_owned(), model.clone());
-    }
-
-    let mut messages = Vec::new();
-    hoist_system(&mut messages, obj);
-    convert_messages(&mut messages, obj);
-    chat.insert("messages".to_owned(), Value::Array(messages));
-
-    if let Some(max_tokens) = obj.get("max_tokens") {
-        chat.insert("max_completion_tokens".to_owned(), max_tokens.clone());
-    }
-
-    convert_stream(&mut chat, obj);
-
-    map_parameters(&mut chat, obj);
-    convert_tools(&mut chat, obj);
-    convert_parallel_tool_calls(&mut chat, obj);
-    convert_tool_choice(&mut chat, obj);
+    insert_if_some(&mut chat, "model", model);
+    chat.insert("messages".to_owned(), build_messages(system, messages));
+    insert_if_some(&mut chat, "max_completion_tokens", max_tokens);
+    convert_stream(&mut chat, stream, stream_options);
+    map_parameters(&mut chat, stop_sequences, temperature, top_p, top_k);
+    convert_tools(&mut chat, tools);
+    convert_parallel_tool_calls(&mut chat, tool_choice.as_ref());
+    convert_tool_choice(&mut chat, tool_choice, had_tools);
 
     serde_json::to_vec(&Value::Object(chat)).map_err(|e| format!("serialization failed: {e}"))
+}
+
+// -----------------------------------------------------------------------------
+// Field Consumption
+// -----------------------------------------------------------------------------
+
+/// Remove `key` from `map` and return the owned `String` when the value was a JSON string.
+///
+/// The entry is removed either way: a non-string value is dropped and `None` returned, matching the
+/// `get(..).and_then(Value::as_str)` behavior, without re-allocating the string.
+fn take_string(map: &mut Map<String, Value>, key: &str) -> Option<String> {
+    match map.remove(key) {
+        Some(Value::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+/// Move `value` into `target` under `key`, doing nothing when the field is absent.
+///
+/// Pairs with [`Map::remove`] so a mapped field travels from the parsed body into the translated body
+/// without an intermediate copy.
+fn insert_if_some(target: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        target.insert(key.to_owned(), value);
+    }
+}
+
+/// Build the Chat Completions `messages` array from the Anthropic `system` and
+/// `messages` fields.
+fn build_messages(system: Option<Value>, messages: Option<Value>) -> Value {
+    let mut converted = Vec::new();
+    hoist_system(&mut converted, system);
+    convert_messages(&mut converted, messages);
+    Value::Array(converted)
+}
+
+/// Build a Chat Completions message carrying plain string content.
+fn text_message(role: String, content: String) -> Value {
+    let mut message = Map::new();
+    message.insert("role".to_owned(), Value::String(role));
+    message.insert("content".to_owned(), Value::String(content));
+    Value::Object(message)
+}
+
+/// Build a Chat Completions `text` content part, moving `text` into it.
+fn text_content_part(text: String) -> Value {
+    let mut part = Map::new();
+    part.insert("type".to_owned(), Value::String("text".to_owned()));
+    part.insert("text".to_owned(), Value::String(text));
+    Value::Object(part)
+}
+
+/// Build a Chat Completions `image_url` content part, moving `url` into it.
+fn image_content_part(url: String) -> Value {
+    let mut image_url = Map::new();
+    image_url.insert("url".to_owned(), Value::String(url));
+
+    let mut part = Map::new();
+    part.insert("type".to_owned(), Value::String("image_url".to_owned()));
+    part.insert("image_url".to_owned(), Value::Object(image_url));
+    Value::Object(part)
 }
 
 // -----------------------------------------------------------------------------
@@ -51,18 +114,16 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<Vec<u8>, String> {
 // -----------------------------------------------------------------------------
 
 /// Hoist Anthropic top-level `system` to a Chat Completions system message.
-fn hoist_system(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
-    let Some(system) = obj.get("system") else {
-        return;
-    };
-
+fn hoist_system(messages: &mut Vec<Value>, system: Option<Value>) {
     let content = match system {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => {
+        Some(Value::String(text)) => text,
+        Some(Value::Array(blocks)) => {
             let mut parts = Vec::new();
             for block in blocks {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    parts.push(text.to_owned());
+                if let Value::Object(mut block) = block
+                    && let Some(text) = take_string(&mut block, "text")
+                {
+                    parts.push(text);
                 }
             }
             parts.join("\n")
@@ -71,7 +132,7 @@ fn hoist_system(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
     };
 
     if !content.is_empty() {
-        messages.push(json!({"role": "system", "content": content}));
+        messages.push(text_message("system".to_owned(), content));
     }
 }
 
@@ -80,50 +141,49 @@ fn hoist_system(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
 // -----------------------------------------------------------------------------
 
 /// Convert Anthropic messages array to Chat Completions messages.
-fn convert_messages(messages: &mut Vec<Value>, obj: &Map<String, Value>) {
-    let Some(Value::Array(anthropic_messages)) = obj.get("messages") else {
+fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
+    let Some(Value::Array(anthropic_messages)) = source else {
         return;
     };
 
     for msg in anthropic_messages {
-        let Some(role) = msg.get("role").and_then(Value::as_str) else {
+        let Value::Object(mut msg) = msg else {
+            continue;
+        };
+        let Some(role) = take_string(&mut msg, "role") else {
             continue;
         };
 
-        match msg.get("content") {
+        match msg.remove("content") {
             Some(Value::String(text)) => {
-                messages.push(json!({"role": role, "content": text}));
+                messages.push(text_message(role, text));
             },
             Some(Value::Array(blocks)) => {
-                convert_content_blocks(messages, role, blocks);
+                convert_content_blocks(messages, &role, blocks);
             },
             _ => {
-                messages.push(json!({"role": role, "content": ""}));
+                messages.push(text_message(role, String::new()));
             },
         }
     }
 }
 
 /// Convert typed content blocks to Chat Completions-compatible format.
-fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: &[Value]) {
-    let mut text_parts = Vec::new();
-    let mut content_parts: Vec<Value> = Vec::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
+/// Consumes the blocks to move their payloads into the translated message.
+fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
 
     for block in blocks {
-        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
-        convert_single_block(
-            block,
-            block_type,
-            messages,
-            role,
-            &mut text_parts,
-            &mut content_parts,
-            &mut tool_calls,
-        );
+        let mut block = match block {
+            Value::Object(block) => block,
+            _ => Map::new(),
+        };
+        let block_type = take_string(&mut block, "type").unwrap_or_default();
+        convert_single_block(block, &block_type, messages, role, &mut content_parts, &mut tool_calls);
     }
 
-    finalize_content_blocks(messages, role, &mut text_parts, &mut content_parts, tool_calls);
+    finalize_content_blocks(messages, role, &mut content_parts, tool_calls);
 }
 
 /// Process a single content block within a message.
@@ -132,22 +192,21 @@ fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: &[Value
     reason = "accumulator pattern requires passing all state"
 )]
 fn convert_single_block(
-    block: &Value,
+    block: Map<String, Value>,
     block_type: &str,
     messages: &mut Vec<Value>,
     role: &str,
-    text_parts: &mut Vec<String>,
     content_parts: &mut Vec<Value>,
     tool_calls: &mut Vec<Value>,
 ) {
     match block_type {
-        "text" => convert_text_block(block, text_parts, content_parts),
+        "text" => convert_text_block(block, content_parts),
         "image" => convert_image_block(block, content_parts),
-        "search_result" => convert_search_result_block(block, text_parts, content_parts),
-        "document" => convert_document_block(block, text_parts, content_parts),
+        "search_result" => convert_search_result_block(block, content_parts),
+        "document" => convert_document_block(block, content_parts),
         "tool_use" => convert_tool_use_block(block, tool_calls),
         "tool_result" => {
-            flush_text_parts(messages, text_parts, content_parts, role);
+            flush_content_parts(messages, content_parts, role);
             convert_tool_result_block(block, messages);
         },
         "thinking" | "redacted_thinking" => {
@@ -160,78 +219,102 @@ fn convert_single_block(
 }
 
 /// Convert a text content block.
-fn convert_text_block(block: &Value, text_parts: &mut Vec<String>, content_parts: &mut Vec<Value>) {
-    if let Some(text) = block.get("text").and_then(Value::as_str) {
-        append_text_content(text, text_parts, content_parts);
+fn convert_text_block(mut block: Map<String, Value>, content_parts: &mut Vec<Value>) {
+    if let Some(text) = take_string(&mut block, "text") {
+        content_parts.push(text_content_part(text));
     }
 }
 
 /// Convert an image content block.
-fn convert_image_block(block: &Value, content_parts: &mut Vec<Value>) {
-    if let Some(source) = block.get("source")
+fn convert_image_block(mut block: Map<String, Value>, content_parts: &mut Vec<Value>) {
+    if let Some(source) = block.remove("source")
         && let Some(url_val) = convert_image_source(source)
     {
-        content_parts.push(json!({"type": "image_url", "image_url": {"url": url_val}}));
+        content_parts.push(image_content_part(url_val));
     }
 }
 
 /// Convert a `search_result` block to backend-visible text context.
-fn convert_search_result_block(block: &Value, text_parts: &mut Vec<String>, content_parts: &mut Vec<Value>) {
+fn convert_search_result_block(block: Map<String, Value>, content_parts: &mut Vec<Value>) {
     if let Some(text) = flatten_search_result(block) {
-        append_text_content(&text, text_parts, content_parts);
+        content_parts.push(text_content_part(text));
     }
 }
 
 /// Convert a `document` block to backend-visible text context.
-fn convert_document_block(block: &Value, text_parts: &mut Vec<String>, content_parts: &mut Vec<Value>) {
+fn convert_document_block(block: Map<String, Value>, content_parts: &mut Vec<Value>) {
     if let Some(text) = flatten_document(block) {
-        append_text_content(&text, text_parts, content_parts);
+        content_parts.push(text_content_part(text));
     }
 }
 
-/// Append one Chat Completions text content part and its string equivalent.
-fn append_text_content(text: &str, text_parts: &mut Vec<String>, content_parts: &mut Vec<Value>) {
-    text_parts.push(text.to_owned());
-    content_parts.push(json!({"type": "text", "text": text}));
+/// Take the string out of a `text` content part, leaving other parts untouched.
+fn take_text_part(part: &mut Value) -> Option<String> {
+    let part = part.as_object_mut()?;
+    if part.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    take_string(part, "text")
+}
+
+/// Concatenate the text of every text content part, moving each string out.
+fn take_joined_text(content_parts: &mut [Value]) -> Option<String> {
+    let mut joined: Option<String> = None;
+    for part in content_parts {
+        let Some(text) = take_text_part(part) else {
+            continue;
+        };
+        match &mut joined {
+            None => joined = Some(text),
+            Some(acc) => acc.push_str(&text),
+        }
+    }
+    joined
 }
 
 /// Convert a `tool_use` content block to a Chat Completions tool call.
-fn convert_tool_use_block(block: &Value, tool_calls: &mut Vec<Value>) {
-    let id = block.get("id").and_then(Value::as_str).unwrap_or("");
-    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Value>) {
+    let id = take_string(&mut block, "id").unwrap_or_default();
+    let name = take_string(&mut block, "name").unwrap_or_default();
 
-    let empty = Value::Object(Map::new());
-    let input = block.get("input").unwrap_or(&empty);
-    let args = serde_json::to_string(input).unwrap_or_default();
+    let args = match block.remove("input") {
+        Some(input) => serde_json::to_string(&input).unwrap_or_default(),
+        None => serde_json::to_string(&Value::Object(Map::new())).unwrap_or_default(),
+    };
 
-    tool_calls.push(json!({
-        "id": id,
-        "type": "function",
-        "function": {"name": name, "arguments": args}
-    }));
+    let mut function = Map::new();
+    function.insert("name".to_owned(), Value::String(name));
+    function.insert("arguments".to_owned(), Value::String(args));
+
+    let mut tool_call = Map::new();
+    tool_call.insert("id".to_owned(), Value::String(id));
+    tool_call.insert("type".to_owned(), Value::String("function".to_owned()));
+    tool_call.insert("function".to_owned(), Value::Object(function));
+    tool_calls.push(Value::Object(tool_call));
 }
 
 /// Convert a `tool_result` content block to a Chat Completions tool message.
-fn convert_tool_result_block(block: &Value, messages: &mut Vec<Value>) {
-    let tool_call_id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-    let mut result_content = extract_tool_result_content(block);
-    let image_content = extract_tool_result_image_content(block);
+fn convert_tool_result_block(mut block: Map<String, Value>, messages: &mut Vec<Value>) {
+    let tool_call_id = take_string(&mut block, "tool_use_id").unwrap_or_default();
+    let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
 
-    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+    let (mut result_content, image_content) = split_tool_result_content(block.remove("content"));
+
+    if is_error {
         result_content = mark_tool_result_error(result_content);
     }
 
-    messages.push(json!({
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "content": result_content
-    }));
+    let mut tool_message = Map::new();
+    tool_message.insert("role".to_owned(), Value::String("tool".to_owned()));
+    tool_message.insert("tool_call_id".to_owned(), Value::String(tool_call_id));
+    tool_message.insert("content".to_owned(), Value::String(result_content));
+    messages.push(Value::Object(tool_message));
 
     if !image_content.is_empty() {
-        messages.push(json!({
-            "role": "user",
-            "content": image_content
-        }));
+        let mut image_message = Map::new();
+        image_message.insert("role".to_owned(), Value::String("user".to_owned()));
+        image_message.insert("content".to_owned(), Value::Array(image_content));
+        messages.push(Value::Object(image_message));
     }
 }
 
@@ -239,48 +322,42 @@ fn convert_tool_result_block(block: &Value, messages: &mut Vec<Value>) {
 fn finalize_content_blocks(
     messages: &mut Vec<Value>,
     role: &str,
-    text_parts: &mut Vec<String>,
     content_parts: &mut Vec<Value>,
     tool_calls: Vec<Value>,
 ) {
     if role == "assistant" && !tool_calls.is_empty() {
-        let mut msg = json!({"role": "assistant"});
-        if let Some(obj) = msg.as_object_mut() {
-            if !text_parts.is_empty() {
-                obj.insert("content".to_owned(), Value::String(text_parts.join("")));
-            }
-            obj.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+        let mut msg = Map::new();
+        msg.insert("role".to_owned(), Value::String("assistant".to_owned()));
+        if let Some(text) = take_joined_text(content_parts) {
+            msg.insert("content".to_owned(), Value::String(text));
         }
-        messages.push(msg);
+        msg.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+        messages.push(Value::Object(msg));
     } else {
-        flush_text_parts(messages, text_parts, content_parts, role);
+        flush_content_parts(messages, content_parts, role);
     }
 }
 
-/// Flush accumulated text/content parts as a message.
-fn flush_text_parts(
-    messages: &mut Vec<Value>,
-    text_parts: &mut Vec<String>,
-    content_parts: &mut Vec<Value>,
-    role: &str,
-) {
-    if content_parts.is_empty() && text_parts.is_empty() {
+/// Flush accumulated content parts as a message.
+fn flush_content_parts(messages: &mut Vec<Value>, content_parts: &mut Vec<Value>, role: &str) {
+    if content_parts.is_empty() {
         return;
     }
 
-    if content_parts.len() == 1
-        && content_parts
-            .first()
-            .and_then(|p| p.get("type"))
-            .and_then(Value::as_str)
-            == Some("text")
-    {
-        messages.push(json!({"role": role, "content": text_parts.join("")}));
-    } else if !content_parts.is_empty() {
-        messages.push(json!({"role": role, "content": std::mem::take(content_parts)}));
+    let lone_text = match content_parts.as_mut_slice() {
+        [part] => take_text_part(part),
+        _ => None,
+    };
+
+    if let Some(text) = lone_text {
+        messages.push(text_message(role.to_owned(), text));
+    } else {
+        let mut msg = Map::new();
+        msg.insert("role".to_owned(), Value::String(role.to_owned()));
+        msg.insert("content".to_owned(), Value::Array(std::mem::take(content_parts)));
+        messages.push(Value::Object(msg));
     }
 
-    text_parts.clear();
     content_parts.clear();
 }
 
@@ -288,17 +365,21 @@ fn flush_text_parts(
 // Image Source Conversion
 // -----------------------------------------------------------------------------
 
-/// Convert Anthropic image source to an `image_url` URL string.
-fn convert_image_source(source: &Value) -> Option<String> {
-    let source_type = source.get("type").and_then(Value::as_str)?;
+/// Convert Anthropic image source to an `image_url` URL string consuming the
+/// source.
+fn convert_image_source(source: Value) -> Option<String> {
+    let Value::Object(mut source) = source else {
+        return None;
+    };
+    let source_type = take_string(&mut source, "type")?;
 
-    match source_type {
+    match source_type.as_str() {
         "base64" => {
-            let media_type = source.get("media_type").and_then(Value::as_str)?;
-            let data = source.get("data").and_then(Value::as_str)?;
+            let media_type = take_string(&mut source, "media_type")?;
+            let data = take_string(&mut source, "data")?;
             Some(format!("data:{media_type};base64,{data}"))
         },
-        "url" => source.get("url").and_then(Value::as_str).map(str::to_owned),
+        "url" => take_string(&mut source, "url"),
         _ => None,
     }
 }
@@ -307,36 +388,47 @@ fn convert_image_source(source: &Value) -> Option<String> {
 // Tool Result Content Extraction
 // -----------------------------------------------------------------------------
 
-/// Extract text content from a `tool_result` block.
-fn extract_tool_result_content(block: &Value) -> String {
-    match block.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => {
-            let mut text_parts = Vec::new();
-            for part in parts {
-                match part.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(text) = part.get("text").and_then(Value::as_str) {
-                            text_parts.push(text.to_owned());
-                        }
-                    },
-                    Some("search_result") => {
-                        if let Some(text) = flatten_search_result(part) {
-                            text_parts.push(text);
-                        }
-                    },
-                    Some("document") => {
-                        if let Some(text) = flatten_document(part) {
-                            text_parts.push(text);
-                        }
-                    },
-                    _ => {},
-                }
-            }
-            text_parts.join("\n")
-        },
-        _ => String::new(),
+/// Split a `tool_result` block's `content` into its flattened text and the
+/// image parts promoted to a follow-up user message.
+fn split_tool_result_content(content: Option<Value>) -> (String, Vec<Value>) {
+    match content {
+        Some(Value::String(text)) => (text, Vec::new()),
+        Some(Value::Array(parts)) => split_tool_result_parts(parts),
+        _ => (String::new(), Vec::new()),
     }
+}
+
+/// Split the parts of an array-form `tool_result.content`.
+fn split_tool_result_parts(parts: Vec<Value>) -> (String, Vec<Value>) {
+    let mut text_parts = Vec::new();
+    let mut image_parts = Vec::new();
+
+    for part in parts {
+        let Value::Object(mut part) = part else {
+            continue;
+        };
+        match take_string(&mut part, "type").as_deref() {
+            Some("text") => {
+                if let Some(text) = take_string(&mut part, "text") {
+                    text_parts.push(text);
+                }
+            },
+            Some("search_result") => {
+                if let Some(text) = flatten_search_result(part) {
+                    text_parts.push(text);
+                }
+            },
+            Some("document") => {
+                if let Some(text) = flatten_document(part) {
+                    text_parts.push(text);
+                }
+            },
+            Some("image") => convert_image_block(part, &mut image_parts),
+            _ => {},
+        }
+    }
+
+    (text_parts.join("\n"), image_parts)
 }
 
 /// Preserve Anthropic's `tool_result.is_error` semantic in text-only tool messages.
@@ -349,120 +441,95 @@ fn mark_tool_result_error(mut content: String) -> String {
     }
 }
 
-/// Extract image content from a `tool_result` block.
-fn extract_tool_result_image_content(block: &Value) -> Vec<Value> {
-    let Some(Value::Array(parts)) = block.get("content") else {
-        return Vec::new();
-    };
-
-    let mut image_parts = Vec::new();
-    for part in parts {
-        if part.get("type").and_then(Value::as_str) == Some("image") {
-            convert_image_block(part, &mut image_parts);
-        }
-    }
-    image_parts
-}
-
 /// Flatten an Anthropic `search_result` block to plain text.
-fn flatten_search_result(block: &Value) -> Option<String> {
-    let title = block
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|title| !title.is_empty());
-    let source = block
-        .get("source")
-        .and_then(Value::as_str)
-        .filter(|source| !source.is_empty());
-    let content = extract_text_blocks(block.get("content"));
+fn flatten_search_result(mut block: Map<String, Value>) -> Option<String> {
+    let title = take_string(&mut block, "title").filter(|title| !title.is_empty());
+    let source = take_string(&mut block, "source").filter(|source| !source.is_empty());
+    let content = extract_text_blocks(block.remove("content"));
 
     if title.is_none() && source.is_none() && content.is_empty() {
         return None;
     }
 
-    let mut lines = Vec::new();
+    let mut flattened = String::new();
 
     if let Some(title) = title {
-        lines.push(format!("Search result: {}", quote_label_value(title)));
+        flattened.push_str("Search result: ");
+        flattened.push_str(&quote_label_value(&title));
     } else {
-        lines.push("Search result".to_owned());
+        flattened.push_str("Search result");
     }
 
     if let Some(source) = source {
-        lines.push(format!("Source: {}", quote_label_value(source)));
+        flattened.push_str("\nSource: ");
+        flattened.push_str(&quote_label_value(&source));
     }
 
     if !content.is_empty() {
-        lines.push("Content:".to_owned());
+        flattened.push_str("\nContent:");
+        for text in content {
+            flattened.push('\n');
+            flattened.push_str(&text);
+        }
     }
 
-    lines.extend(content);
-    non_empty_lines(&lines)
+    Some(flattened)
 }
 
 /// Flatten an Anthropic `document` block to plain text.
-fn flatten_document(block: &Value) -> Option<String> {
-    let title = block
-        .get("title")
-        .and_then(Value::as_str)
-        .filter(|title| !title.is_empty());
-    let context = block
-        .get("context")
-        .and_then(Value::as_str)
-        .filter(|context| !context.is_empty());
-    let source_text = flatten_document_source(block.get("source"));
+fn flatten_document(mut block: Map<String, Value>) -> Option<String> {
+    let title = take_string(&mut block, "title").filter(|title| !title.is_empty());
+    let context = take_string(&mut block, "context").filter(|context| !context.is_empty());
+    let source_text = flatten_document_source(block.remove("source"));
 
     if title.is_none() && context.is_none() && source_text.is_none() {
         return None;
     }
 
-    let mut lines = Vec::new();
+    let mut flattened = String::new();
 
     if let Some(title) = title {
-        lines.push(format!("Document: {}", quote_label_value(title)));
+        flattened.push_str("Document: ");
+        flattened.push_str(&quote_label_value(&title));
     } else {
-        lines.push("Document".to_owned());
+        flattened.push_str("Document");
     }
 
     if let Some(context) = context {
-        lines.push(format!("Context: {}", quote_label_value(context)));
+        flattened.push_str("\nContext: ");
+        flattened.push_str(&quote_label_value(&context));
     }
 
     if let Some(source_text) = source_text {
-        lines.push(source_text);
+        flattened.push('\n');
+        flattened.push_str(&source_text);
     }
 
-    non_empty_lines(&lines)
+    Some(flattened)
 }
 
 /// Flatten a `document.source` value to extractable text or a stable reference.
-fn flatten_document_source(source: Option<&Value>) -> Option<String> {
-    let source = source?;
-    let source_type = source.get("type").and_then(Value::as_str)?;
+fn flatten_document_source(source: Option<Value>) -> Option<String> {
+    let Value::Object(mut source) = source? else {
+        return None;
+    };
+    let source_type = take_string(&mut source, "type")?;
 
-    match source_type {
-        "text" => source
-            .get("data")
-            .and_then(Value::as_str)
+    match source_type.as_str() {
+        "text" => take_string(&mut source, "data")
             .filter(|data| !data.is_empty())
             .map(|data| format!("Content:\n{data}")),
         "content" => {
-            let lines = extract_text_blocks(source.get("content"));
+            let lines = extract_text_blocks(source.remove("content"));
             non_empty_lines(&lines).map(|content| format!("Content:\n{content}"))
         },
-        "url" => source
-            .get("url")
-            .and_then(Value::as_str)
+        "url" => take_string(&mut source, "url")
             .filter(|url| !url.is_empty())
-            .map(|url| format!("Source: {}", quote_label_value(url))),
-        "file" => source
-            .get("file_id")
-            .and_then(Value::as_str)
+            .map(|url| format!("Source: {}", quote_label_value(&url))),
+        "file" => take_string(&mut source, "file_id")
             .filter(|file_id| !file_id.is_empty())
             .map(|file_id| format!("Source: {}", quote_label_value(&format!("file:{file_id}")))),
-        "base64" => source
-            .get("media_type")
-            .and_then(Value::as_str)
+        "base64" => take_string(&mut source, "media_type")
             .filter(|media_type| !media_type.is_empty())
             .map(|media_type| format!("Source: {}", quote_label_value(&format!("base64:{media_type}")))),
         _ => None,
@@ -474,19 +541,27 @@ fn quote_label_value(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
 }
 
-/// Extract text from an array of Anthropic text blocks.
-fn extract_text_blocks(value: Option<&Value>) -> Vec<String> {
+/// Extract text from an array of Anthropic text blocks, moving each string out.
+fn extract_text_blocks(value: Option<Value>) -> Vec<String> {
     let Some(Value::Array(blocks)) = value else {
         return Vec::new();
     };
 
-    blocks
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
-        .collect()
+    let mut texts = Vec::new();
+    for block in blocks {
+        let Value::Object(mut block) = block else {
+            continue;
+        };
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        if let Some(text) = take_string(&mut block, "text")
+            && !text.is_empty()
+        {
+            texts.push(text);
+        }
+    }
+    texts
 }
 
 /// Join lines if at least one line contains content.
@@ -498,22 +573,25 @@ fn non_empty_lines(lines: &[String]) -> Option<String> {
 // Parameter Mapping
 // -----------------------------------------------------------------------------
 
-/// Copy `stream` and request streaming usage when enabled.
-fn convert_stream(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(stream) = obj.get("stream") else {
+/// Move `stream` through and request streaming usage when enabled.
+fn convert_stream(chat: &mut Map<String, Value>, stream: Option<Value>, stream_options: Option<Value>) {
+    let Some(stream) = stream else {
         return;
     };
-    chat.insert("stream".to_owned(), stream.clone());
 
-    if stream.as_bool() == Some(true) {
-        let mut opts = obj
-            .get("stream_options")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        opts.insert("include_usage".to_owned(), Value::Bool(true));
-        chat.insert("stream_options".to_owned(), Value::Object(opts));
+    let streaming = stream.as_bool() == Some(true);
+    chat.insert("stream".to_owned(), stream);
+
+    if !streaming {
+        return;
     }
+
+    let mut opts = match stream_options {
+        Some(Value::Object(opts)) => opts,
+        _ => Map::new(),
+    };
+    opts.insert("include_usage".to_owned(), Value::Bool(true));
+    chat.insert("stream_options".to_owned(), Value::Object(opts));
 }
 
 /// Map Anthropic parameters to Chat Completions-compatible equivalents.
@@ -521,22 +599,17 @@ fn convert_stream(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
 /// `top_k` has no standard Chat Completions equivalent but is preserved
 /// as an extra body parameter for backends that support it
 /// (e.g. vLLM).
-fn map_parameters(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    if let Some(stop) = obj.get("stop_sequences") {
-        chat.insert("stop".to_owned(), stop.clone());
-    }
-
-    if let Some(temp) = obj.get("temperature") {
-        chat.insert("temperature".to_owned(), temp.clone());
-    }
-
-    if let Some(top_p) = obj.get("top_p") {
-        chat.insert("top_p".to_owned(), top_p.clone());
-    }
-
-    if let Some(top_k) = obj.get("top_k") {
-        chat.insert("top_k".to_owned(), top_k.clone());
-    }
+fn map_parameters(
+    chat: &mut Map<String, Value>,
+    stop_sequences: Option<Value>,
+    temperature: Option<Value>,
+    top_p: Option<Value>,
+    top_k: Option<Value>,
+) {
+    insert_if_some(chat, "stop", stop_sequences);
+    insert_if_some(chat, "temperature", temperature);
+    insert_if_some(chat, "top_p", top_p);
+    insert_if_some(chat, "top_k", top_k);
 }
 
 // -----------------------------------------------------------------------------
@@ -544,8 +617,8 @@ fn map_parameters(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
 // -----------------------------------------------------------------------------
 
 /// Convert Anthropic tool definitions to Chat Completions function tools.
-fn convert_tools(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(Value::Array(tools)) = obj.get("tools") else {
+fn convert_tools(chat: &mut Map<String, Value>, tools: Option<Value>) {
+    let Some(Value::Array(tools)) = tools else {
         return;
     };
 
@@ -598,30 +671,34 @@ fn is_translatable_client_tool(tool: &Value) -> bool {
 }
 
 /// Convert one Anthropic client tool definition to a Chat Completions tool.
-fn convert_tool_definition(tool: &Value) -> Option<Value> {
-    if !is_translatable_client_tool(tool) {
+/// Consumes the definition so `input_schema` moves into the generated function parameters.
+fn convert_tool_definition(tool: Value) -> Option<Value> {
+    if !is_translatable_client_tool(&tool) {
         return None;
     }
 
-    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-    let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
-    let parameters = tool
-        .get("input_schema")
-        .cloned()
-        .unwrap_or_else(|| json!({"type": "object"}));
+    let mut tool = match tool {
+        Value::Object(fields) => fields,
+        _ => Map::new(),
+    };
+
+    let name = take_string(&mut tool, "name").unwrap_or_default();
+    let description = take_string(&mut tool, "description").unwrap_or_default();
+    let parameters = tool.remove("input_schema").unwrap_or_else(|| json!({"type": "object"}));
+    let strict = tool.get("strict").and_then(Value::as_bool);
 
     let mut function = Map::new();
-    function.insert("name".to_owned(), Value::String(name.to_owned()));
-    function.insert("description".to_owned(), Value::String(description.to_owned()));
+    function.insert("name".to_owned(), Value::String(name));
+    function.insert("description".to_owned(), Value::String(description));
     function.insert("parameters".to_owned(), parameters);
-    if let Some(strict) = tool.get("strict").and_then(Value::as_bool) {
+    if let Some(strict) = strict {
         function.insert("strict".to_owned(), Value::Bool(strict));
     }
 
-    Some(json!({
-        "type": "function",
-        "function": function
-    }))
+    let mut chat_tool = Map::new();
+    chat_tool.insert("type".to_owned(), Value::String("function".to_owned()));
+    chat_tool.insert("function".to_owned(), Value::Object(function));
+    Some(Value::Object(chat_tool))
 }
 
 // -----------------------------------------------------------------------------
@@ -629,8 +706,8 @@ fn convert_tool_definition(tool: &Value) -> Option<Value> {
 // -----------------------------------------------------------------------------
 
 /// Convert Anthropic `disable_parallel_tool_use` to Chat Completions format.
-fn convert_parallel_tool_calls(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(Value::Object(tool_choice)) = obj.get("tool_choice") else {
+fn convert_parallel_tool_calls(chat: &mut Map<String, Value>, tool_choice: Option<&Value>) {
+    let Some(Value::Object(tool_choice)) = tool_choice else {
         return;
     };
 
@@ -644,37 +721,49 @@ fn convert_parallel_tool_calls(chat: &mut Map<String, Value>, obj: &Map<String, 
 }
 
 /// Convert Anthropic `tool_choice` to Chat Completions format.
-fn convert_tool_choice(chat: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(tool_choice) = obj.get("tool_choice") else {
+fn convert_tool_choice(chat: &mut Map<String, Value>, tool_choice: Option<Value>, had_tools: bool) {
+    let Some(tool_choice) = tool_choice else {
         return;
     };
 
-    if obj.contains_key("tools") && !chat.contains_key("tools") {
+    if had_tools && !chat.contains_key("tools") {
         return;
     }
 
     let chat_choice = match tool_choice {
-        Value::String(s) => match s.as_str() {
-            "any" => Value::String("required".to_owned()),
-            "none" => Value::String("none".to_owned()),
-            _ => Value::String("auto".to_owned()),
-        },
-        Value::Object(tc) => match tc.get("type").and_then(Value::as_str) {
-            Some("any") => Value::String("required".to_owned()),
-            Some("none") => Value::String("none".to_owned()),
-            Some("tool") => {
-                if let Some(name) = tc.get("name").and_then(Value::as_str) {
-                    json!({"type": "function", "function": {"name": name}})
-                } else {
-                    Value::String("auto".to_owned())
-                }
-            },
-            _ => Value::String("auto".to_owned()),
-        },
+        Value::String(keyword) => Value::String(tool_choice_keyword(&keyword).to_owned()),
+        Value::Object(tool_choice) => object_tool_choice(tool_choice),
         _ => return,
     };
 
     chat.insert("tool_choice".to_owned(), chat_choice);
+}
+
+/// Map an Anthropic `tool_choice` type to its Chat Completions keyword.
+fn tool_choice_keyword(anthropic: &str) -> &'static str {
+    match anthropic {
+        "any" => "required",
+        "none" => "none",
+        _ => "auto",
+    }
+}
+
+/// Convert an object-form `tool_choice`, moving a named tool's name through.
+fn object_tool_choice(mut tool_choice: Map<String, Value>) -> Value {
+    let names_a_tool = tool_choice.get("type").and_then(Value::as_str) == Some("tool");
+
+    if names_a_tool && let Some(name) = take_string(&mut tool_choice, "name") {
+        let mut function = Map::new();
+        function.insert("name".to_owned(), Value::String(name));
+
+        let mut choice = Map::new();
+        choice.insert("type".to_owned(), Value::String("function".to_owned()));
+        choice.insert("function".to_owned(), Value::Object(function));
+        return Value::Object(choice);
+    }
+
+    let kind = tool_choice.get("type").and_then(Value::as_str).unwrap_or_default();
+    Value::String(tool_choice_keyword(kind).to_owned())
 }
 
 // -----------------------------------------------------------------------------
@@ -686,10 +775,17 @@ fn convert_tool_choice(chat: &mut Map<String, Value>, obj: &Map<String, Value>) 
 mod tests {
     use super::*;
 
+    /// Parse a raw request body and transform it, mirroring the filter's
+    /// parse-once call path including its parse-error message.
+    fn transform_bytes(body: &[u8]) -> Result<Vec<u8>, String> {
+        let value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        transform_request(value)
+    }
+
     #[test]
     fn basic_text_request() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["model"], "claude-opus-4-8", "model preserved");
@@ -706,9 +802,100 @@ mod tests {
     }
 
     #[test]
+    fn mapped_fields_keep_a_stable_serialized_key_order() {
+        // `serde_json` runs with `preserve_order`, so the order fields are
+        // emitted in `transform_request` is the order sent upstream. Pin it so
+        // reordering the emission sequence cannot silently reshape the wire body.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"stop_sequences":["x"],"temperature":0.5,"top_p":0.9,"top_k":40,"tools":[{"name":"t","input_schema":{"type":"object"}}],"tool_choice":{"type":"any","disable_parallel_tool_use":true},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let keys: Vec<&str> = parsed.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "model",
+                "messages",
+                "max_completion_tokens",
+                "stream",
+                "stream_options",
+                "stop",
+                "temperature",
+                "top_p",
+                "top_k",
+                "tools",
+                "parallel_tool_calls",
+                "tool_choice",
+            ],
+            "translated request key order must stay stable"
+        );
+    }
+
+    #[test]
+    fn tool_input_schema_is_preserved_verbatim() {
+        let body = br#"{"model":"m","tools":[{"name":"t","description":"d","input_schema":{"type":"object","properties":{"a":{"type":"array","items":{"type":"string"}},"b":{"enum":[1,2,3]}},"required":["a"],"additionalProperties":false}}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["tools"][0]["function"]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {"a": {"type": "array", "items": {"type": "string"}}, "b": {"enum": [1, 2, 3]}},
+                "required": ["a"],
+                "additionalProperties": false
+            }),
+            "moving the schema must not alter its contents"
+        );
+    }
+
+    #[test]
+    fn tool_definition_with_non_string_name_falls_back_to_empty() {
+        let body = br#"{"model":"m","tools":[{"name":42,"description":true,"input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["tools"][0]["function"]["name"], "",
+            "non-string name yields empty"
+        );
+        assert_eq!(
+            parsed["tools"][0]["function"]["description"], "",
+            "non-string description yields empty"
+        );
+    }
+
+    #[test]
+    fn stream_options_dropped_when_streaming_disabled() {
+        let body = br#"{"model":"m","stream":false,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["stream"], false);
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "stream_options is meaningless without streaming"
+        );
+    }
+
+    #[test]
+    fn caller_stream_options_are_preserved_alongside_include_usage() {
+        let body =
+            br#"{"model":"m","stream":true,"stream_options":{"custom":1},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["stream_options"]["custom"], 1,
+            "caller options are moved through"
+        );
+        assert_eq!(parsed["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
     fn system_hoisted() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":"Be helpful.","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -722,7 +909,7 @@ mod tests {
     #[test]
     fn system_text_blocks_joined() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":[{"type":"text","text":"Part 1"},{"type":"text","text":"Part 2"}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -734,7 +921,7 @@ mod tests {
     #[test]
     fn tool_use_converted() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"get_weather","input":{"city":"NYC"}}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         let msg = &parsed["messages"][0];
@@ -752,7 +939,7 @@ mod tests {
     #[test]
     fn tool_result_converted() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"72F sunny"}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
@@ -763,7 +950,7 @@ mod tests {
     #[test]
     fn tool_result_error_marked_in_tool_message_content() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"cat: missing.txt: No such file or directory","is_error":true}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -776,7 +963,7 @@ mod tests {
     #[test]
     fn tool_result_image_promoted_to_followup_user_message() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["messages"][0]["role"], "tool", "first message is tool result");
@@ -798,7 +985,7 @@ mod tests {
     #[test]
     fn top_level_search_result_preserved_as_text_context() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"search_result","source":"https://docs.example.test/product","title":"Product Guide","content":[{"type":"text","text":"The default timeout is 30 seconds."},{"type":"text","text":"The maximum timeout is 120 seconds."}]},{"type":"text","text":"What is the timeout range?"}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let content = parsed["messages"][0]["content"].as_array().unwrap();
 
@@ -817,7 +1004,7 @@ mod tests {
     #[test]
     fn tool_result_search_result_preserved_in_tool_message_content() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","source":"kb://timeouts","title":"Timeout KB","content":[{"type":"text","text":"Timeouts default to 30 seconds."}]},{"type":"text","text":"Applies to version 2."}]}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["messages"][0]["role"], "tool");
@@ -831,7 +1018,7 @@ mod tests {
     #[test]
     fn tool_result_document_preserved_in_tool_message_content() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"Before document."},{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document fact."}]},"title":"Nested Doc"},{"type":"text","text":"After document."}]}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -844,7 +1031,7 @@ mod tests {
     #[test]
     fn document_text_source_preserved_as_text_context() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"The grass is green. The sky is blue."},"title":"Color Notes","context":"trusted notes","citations":{"enabled":true}},{"type":"text","text":"What color is the grass?"}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let content = parsed["messages"][0]["content"].as_array().unwrap();
 
@@ -859,7 +1046,7 @@ mod tests {
     #[test]
     fn document_file_source_preserved_as_reference_text() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_abc123"},"title":"Uploaded Contract"},{"type":"text","text":"Summarize the uploaded contract."}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let content = parsed["messages"][0]["content"].as_array().unwrap();
 
@@ -872,7 +1059,7 @@ mod tests {
     #[test]
     fn document_source_variants_preserved_or_dropped_intentionally() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Content block fact."}]},"title":"Content Doc"},{"type":"document","source":{"type":"url","url":"https://docs.example.test/file.pdf"}},{"type":"document","source":{"type":"base64","media_type":"application/pdf"}},{"type":"document","source":{"type":"unknown","data":"ignored"}}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let content = parsed["messages"][0]["content"].as_array().unwrap();
 
@@ -911,7 +1098,7 @@ mod tests {
             }]
         })
         .to_string();
-        let result = transform_request(body.as_bytes()).unwrap();
+        let result = transform_bytes(body.as_bytes()).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -937,7 +1124,7 @@ mod tests {
             }]
         })
         .to_string();
-        let result = transform_request(body.as_bytes()).unwrap();
+        let result = transform_bytes(body.as_bytes()).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -950,7 +1137,7 @@ mod tests {
     #[test]
     fn empty_search_result_and_document_blocks_dropped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"search_result","content":[]},{"type":"document","source":{"type":"content","content":[]}},{"type":"document","source":{"type":"text","data":""}},{"type":"document","source":{"type":"url","url":""}},{"type":"document","source":{"type":"file","file_id":""}},{"type":"document","source":{"type":"base64","media_type":""}}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert!(
@@ -963,7 +1150,7 @@ mod tests {
     fn stop_sequences_mapped() {
         let body =
             br#"{"model":"claude-opus-4-8","max_tokens":1024,"stop_sequences":["END"],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["stop"][0], "END", "stop_sequences mapped to stop");
@@ -972,7 +1159,7 @@ mod tests {
     #[test]
     fn tool_choice_any_mapped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"any","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["tool_choice"], "required", "any maps to required");
@@ -981,7 +1168,7 @@ mod tests {
     #[test]
     fn tool_choice_object_any_mapped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"any"},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["tool_choice"], "required", "object-form any maps to required");
@@ -990,7 +1177,7 @@ mod tests {
     #[test]
     fn tool_choice_dropped_when_all_tools_filtered() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"web_search_20250305","name":"web_search"}],"tool_choice":"any","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert!(parsed.get("tools").is_none(), "server-side tools should be filtered");
@@ -1003,7 +1190,7 @@ mod tests {
     #[test]
     fn disable_parallel_tool_use_mapped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"auto","disable_parallel_tool_use":true},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -1015,7 +1202,7 @@ mod tests {
     #[test]
     fn tool_definitions_converted() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["tools"][0]["type"], "function", "tool type should be function");
@@ -1025,7 +1212,7 @@ mod tests {
     #[test]
     fn tool_definition_strict_mapped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true},{"name":"get_time","description":"Get time","input_schema":{"type":"object"},"strict":false},{"name":"get_news","description":"Get news","input_schema":{"type":"object"},"strict":"yes"}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -1045,7 +1232,7 @@ mod tests {
     #[test]
     fn image_base64_converted() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"abc123"}},{"type":"text","text":"What is this?"}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         let content = &parsed["messages"][0]["content"];
@@ -1061,7 +1248,7 @@ mod tests {
     fn top_k_preserved_as_extra_param() {
         let body =
             br#"{"model":"claude-opus-4-8","max_tokens":1024,"top_k":40,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["top_k"], 40, "top_k should be preserved as extra body parameter");
@@ -1070,7 +1257,7 @@ mod tests {
     #[test]
     fn transform_request_non_json_body() {
         let body = b"not json at all";
-        let result = transform_request(body);
+        let result = transform_bytes(body);
         assert!(result.is_err(), "non-JSON body should return Err");
         assert!(
             result.unwrap_err().contains("invalid JSON"),
@@ -1081,7 +1268,7 @@ mod tests {
     #[test]
     fn transform_request_json_array_body() {
         let body = b"[1,2,3]";
-        let result = transform_request(body);
+        let result = transform_bytes(body);
         assert!(result.is_err(), "JSON array body should return Err");
         assert!(
             result.unwrap_err().contains("not a JSON object"),
@@ -1093,7 +1280,7 @@ mod tests {
     fn hoist_system_non_string_non_array_skipped() {
         let body =
             br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":42,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -1107,7 +1294,7 @@ mod tests {
     #[test]
     fn hoist_system_array_empty_text_skipped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -1121,7 +1308,7 @@ mod tests {
     #[test]
     fn convert_messages_missing_role_skipped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert!(
@@ -1133,7 +1320,7 @@ mod tests {
     #[test]
     fn convert_messages_content_not_string_or_array() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":42}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["messages"][0]["role"], "user");
@@ -1146,7 +1333,7 @@ mod tests {
     #[test]
     fn thinking_block_dropped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think..."}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert!(
@@ -1158,7 +1345,7 @@ mod tests {
     #[test]
     fn unknown_block_type_dropped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"custom_xyz","data":"something"}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert!(
@@ -1170,7 +1357,7 @@ mod tests {
     #[test]
     fn tool_choice_string_none() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"none","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["tool_choice"], "none", "string none maps to none");
@@ -1179,7 +1366,7 @@ mod tests {
     #[test]
     fn tool_choice_string_unknown_maps_to_auto() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":"foo","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["tool_choice"], "auto", "unknown string tool_choice maps to auto");
@@ -1188,7 +1375,7 @@ mod tests {
     #[test]
     fn tool_choice_object_none() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"f","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"none"},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["tool_choice"], "none", "object-form none maps to none");
@@ -1197,7 +1384,7 @@ mod tests {
     #[test]
     fn tool_choice_object_tool_with_name() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"fn","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"tool","name":"fn"},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -1213,7 +1400,7 @@ mod tests {
     #[test]
     fn tool_choice_object_tool_without_name_maps_to_auto() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"name":"f","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"tool"},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(
@@ -1225,7 +1412,7 @@ mod tests {
     #[test]
     fn tool_choice_non_string_non_object_skipped() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tool_choice":true,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert!(
@@ -1237,7 +1424,7 @@ mod tests {
     #[test]
     fn multipart_image_and_text_produces_array_content() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"Describe this"},{"type":"image","source":{"type":"url","url":"https://example.com/img.png"}}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         let content = &parsed["messages"][0]["content"];
@@ -1248,9 +1435,85 @@ mod tests {
     }
 
     #[test]
+    fn two_text_blocks_stay_two_content_parts() {
+        // String content is emitted only for a *single* text part. Two text
+        // blocks keep their part boundaries rather than being joined.
+        let body = br#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let content = parsed["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "two text blocks stay two parts");
+        assert_eq!(content[0]["text"], "one");
+        assert_eq!(content[1]["text"], "two");
+    }
+
+    #[test]
+    fn assistant_tool_calls_join_all_text_blocks() {
+        // The assistant+tool_calls branch joins every text part into one string,
+        // a different rule from the single-part case above.
+        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"text","text":"two"},{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let msg = &parsed["messages"][0];
+        assert_eq!(msg["content"], "onetwo", "assistant text parts are joined");
+        assert_eq!(msg["tool_calls"][0]["id"], "c1");
+    }
+
+    #[test]
+    fn assistant_tool_calls_distinguish_empty_text_from_no_text() {
+        // An empty text block still emits `content: ""`; no text block at all
+        // emits no `content` key.
+        let empty = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":""},{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
+        let parsed: Value = serde_json::from_slice(&transform_bytes(empty).unwrap()).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"], "",
+            "an empty text block still emits content"
+        );
+
+        let none = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
+        let parsed: Value = serde_json::from_slice(&transform_bytes(none).unwrap()).unwrap();
+        assert!(
+            parsed["messages"][0].get("content").is_none(),
+            "no text block emits no content key"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_calls_drop_image_parts() {
+        // The joined-string branch cannot carry an image part, so it is dropped
+        // while the surrounding text is still joined.
+        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"one"},{"type":"image","source":{"type":"url","url":"https://example.com/i.png"}},{"type":"text","text":"two"},{"type":"tool_use","id":"c1","name":"f","input":{}}]}]}"#;
+        let parsed: Value = serde_json::from_slice(&transform_bytes(body).unwrap()).unwrap();
+
+        assert_eq!(
+            parsed["messages"][0]["content"], "onetwo",
+            "text joins across the dropped image"
+        );
+    }
+
+    #[test]
+    fn tool_use_without_input_serializes_an_empty_object() {
+        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f"},{"type":"tool_use","id":"c2","name":"g","input":null}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let calls = parsed["messages"][0]["tool_calls"].as_array().unwrap();
+        assert_eq!(
+            calls[0]["function"]["arguments"], "{}",
+            "absent input becomes an empty object"
+        );
+        assert_eq!(
+            calls[1]["function"]["arguments"], "null",
+            "an explicit null input is preserved as null"
+        );
+    }
+
+    #[test]
     fn only_tool_result_blocks_produce_tool_messages() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"result1"},{"type":"tool_result","tool_use_id":"call_2","content":"result2"}]}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         let messages = parsed["messages"].as_array().unwrap();
@@ -1265,22 +1528,39 @@ mod tests {
 
     #[test]
     fn extract_tool_result_content_null() {
-        let block = json!({"type": "tool_result", "tool_use_id": "call_1", "content": null});
-        let result = extract_tool_result_content(&block);
-        assert!(result.is_empty(), "null content should return empty string");
+        let (text, images) = split_tool_result_content(Some(Value::Null));
+        assert!(text.is_empty(), "null content should return empty string");
+        assert!(images.is_empty(), "null content carries no images");
     }
 
     #[test]
     fn extract_tool_result_content_missing() {
-        let block = json!({"type": "tool_result", "tool_use_id": "call_1"});
-        let result = extract_tool_result_content(&block);
-        assert!(result.is_empty(), "missing content should return empty string");
+        let (text, images) = split_tool_result_content(None);
+        assert!(text.is_empty(), "missing content should return empty string");
+        assert!(images.is_empty(), "missing content carries no images");
+    }
+
+    #[test]
+    fn tool_result_content_split_keeps_text_and_images_in_one_pass() {
+        let content = json!([
+            {"type": "text", "text": "before"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {"type": "text", "text": "after"},
+            {"type": "thinking", "thinking": "ignored"},
+            "not an object"
+        ]);
+
+        let (text, images) = split_tool_result_content(Some(content));
+
+        assert_eq!(text, "before\nafter", "text parts join in order, skipping non-text");
+        assert_eq!(images.len(), 1, "one image part promoted");
+        assert_eq!(images[0]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     #[test]
     fn only_client_tools_converted() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"bash_20241022","name":"bash"},{"type":"text_editor_20241022","name":"text_editor"},{"type":"code_execution_20250522","name":"code_execution"},{"type":"computer_20250124","name":"computer","display_width_px":1024,"display_height_px":768},{"type":"future_server_tool_20270101","name":"future_server_tool"},{"type":42,"name":"invalid_type","input_schema":{"type":"object"}},{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}},{"type":"custom","name":"get_time","description":"Get time","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         let tools = parsed["tools"].as_array().unwrap();
@@ -1292,7 +1572,7 @@ mod tests {
     #[test]
     fn streaming_request_includes_usage_option() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["stream"], true, "stream should be true");
@@ -1305,7 +1585,7 @@ mod tests {
     #[test]
     fn non_streaming_request_omits_stream_options() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert!(
@@ -1317,7 +1597,7 @@ mod tests {
     #[test]
     fn stream_false_omits_stream_options() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"stream":false,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
         assert_eq!(parsed["stream"], false, "stream should be false");

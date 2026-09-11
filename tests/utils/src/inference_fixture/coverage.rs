@@ -1244,6 +1244,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1283,9 +1284,10 @@ mod tests {
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 25);
+        assert_eq!(report.features_total, 26);
         assert_eq!(report.scenarios_total, 24);
         assert_eq!(report.recordings_total, 29);
         assert_eq!(
@@ -1301,6 +1303,7 @@ mod tests {
                 "messages/typed-server-tools",
                 "messages/upstream-error",
                 "responses/agentic-parallel-tool-calls",
+                "responses/agentic-status-less-function-call",
                 "responses/chat-basic-nonstream",
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
@@ -1317,7 +1320,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 25);
+        assert_eq!(manifest.features.len(), 26);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1433,6 +1436,10 @@ mod tests {
                 (
                     &"responses.agentic.parallel_tool_calls".to_owned(),
                     &vec!["responses/agentic-parallel-tool-calls".to_owned()]
+                ),
+                (
+                    &"responses.agentic.status_less_function_call".to_owned(),
+                    &vec!["responses/agentic-status-less-function-call".to_owned()]
                 ),
                 (
                     &"responses.agentic.irr_terminal_streaming".to_owned(),

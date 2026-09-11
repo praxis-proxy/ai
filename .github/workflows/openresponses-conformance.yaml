@@ -10,6 +10,7 @@ on:
       - "tests/conformance/openresponses/**"
       - "tests/integration/sdk/openai/test_responses_conformance.py"
       - ".github/actions/start-vllm/**"
+      - ".github/actions/wait-vllm/**"
       - ".github/workflows/openresponses-conformance.yaml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -24,6 +25,7 @@ on:
       - "tests/conformance/openresponses/**"
       - "tests/integration/sdk/openai/test_responses_conformance.py"
       - ".github/actions/start-vllm/**"
+      - ".github/actions/wait-vllm/**"
       - ".github/workflows/openresponses-conformance.yaml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -67,6 +69,7 @@ jobs:
             'tests/conformance/openresponses/' \
             'tests/integration/sdk/openai/test_responses_conformance.py' \
             '.github/actions/start-vllm/' \
+            '.github/actions/wait-vllm/' \
             '.github/workflows/openresponses-conformance.yaml' \
             'Cargo.toml' 'Cargo.lock' 'Makefile')
           if [ -n "$CHANGED" ]; then
@@ -104,14 +107,17 @@ jobs:
             https://bun.sh/install | bash -s "bun-v1.3.12"
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
 
-      - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
-
       - name: Start vLLM
         uses: ./.github/actions/start-vllm
         with:
           image: ${{ env.VLLM_IMAGE }}
           model: ${{ env.VLLM_MODEL }}
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Wait for vLLM readiness
+        uses: ./.github/actions/wait-vllm
 
       - name: Run OpenResponses conformance
         env:
@@ -125,7 +131,7 @@ jobs:
 
       - name: vLLM container logs
         if: failure()
-        run: docker logs vllm
+        run: docker logs vllm 2>&1 || echo "(no vllm container)"
 
       - name: Upload failure artifacts
         if: failure()

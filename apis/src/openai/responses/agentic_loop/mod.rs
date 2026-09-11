@@ -555,7 +555,11 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState) {
     for item in output {
         state.accumulated_output.push(item.clone());
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call") if item.get("status").and_then(Value::as_str) == Some("completed") => {
+            Some("function_call")
+                if item
+                    .get("status")
+                    .is_none_or(|v| v.is_null() || v.as_str() == Some("completed")) =>
+            {
                 state.tool_calls.push(item.clone());
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());

@@ -32,6 +32,11 @@ import httpx
 import pytest
 from openai import BadRequestError, NotFoundError, OpenAI
 
+# When set to a postgres:// URL (the vllm-responses-postgres CI job), the
+# conversations store runs against PostgreSQL instead of the default in-memory
+# SQLite, so this suite exercises the same store backend as the responses tests.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -57,6 +62,38 @@ def _find_binary() -> str:
     )
 
 
+def _conversations_filter() -> dict:
+    """Build the openai_conversations filter config for the configured store.
+
+    Defaults to in-memory SQLite; switches to PostgreSQL when DATABASE_URL is a
+    postgres:// URL, matching the responses tests' backend selection so both
+    suites cover the same store backend in CI.
+    """
+    cfg = {
+        "filter": "openai_conversations",
+        "conversations_table": "conversations",
+        "items_table": "conversation_items",
+    }
+    if DATABASE_URL.startswith("postgres"):
+        cfg.update(
+            {
+                "backend": "postgres",
+                "database_url": DATABASE_URL,
+                # Local CI postgres service is loopback + non-TLS.
+                "allow_private_database_url": True,
+                "ssl_mode": "disable",
+            }
+        )
+    else:
+        cfg.update(
+            {
+                "backend": "sqlite",
+                "database_url": "sqlite::memory:",
+            }
+        )
+    return cfg
+
+
 def _write_config(port: int) -> str:
     config = {
         "listeners": [
@@ -69,15 +106,7 @@ def _write_config(port: int) -> str:
         "filter_chains": [
             {
                 "name": "conversations-pipeline",
-                "filters": [
-                    {
-                        "filter": "openai_conversations",
-                        "backend": "sqlite",
-                        "database_url": "sqlite::memory:",
-                        "conversations_table": "conversations",
-                        "items_table": "conversation_items",
-                    }
-                ],
+                "filters": [_conversations_filter()],
             }
         ],
     }

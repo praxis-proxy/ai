@@ -36,6 +36,8 @@ const NATIVE_RESPONSES_STREAM_SCENARIO: &str = "responses/native-basic-stream";
 const NATIVE_RESPONSES_TOOL_SCENARIO: &str = "responses/native-tool-call";
 const AGENTIC_PARALLEL_TOOL_CALLS_SCENARIO: &str = "responses/agentic-parallel-tool-calls";
 const AGENTIC_PARALLEL_TOOL_CALLS_PROVIDER: &str = "synthetic";
+const AGENTIC_STATUS_LESS_FUNCTION_CALL_SCENARIO: &str = "responses/agentic-status-less-function-call";
+const AGENTIC_STATUS_LESS_FUNCTION_CALL_PROVIDER: &str = "synthetic";
 
 #[tokio::test]
 async fn all_inference_fixtures_replay() {
@@ -57,6 +59,7 @@ async fn all_inference_fixtures_replay() {
     let mut saw_malformed_tool_arguments = false;
     let mut saw_malformed_compaction = false;
     let mut saw_agentic_parallel_tool_calls = false;
+    let mut saw_agentic_status_less_function_call = false;
 
     for recording in recordings {
         let scenario_id = recording.scenario_id.as_str();
@@ -112,6 +115,12 @@ async fn all_inference_fixtures_replay() {
             assert_agentic_parallel_tool_calls(&report.actual, scenario_id, provider);
             saw_agentic_parallel_tool_calls = true;
         }
+        if scenario_id == AGENTIC_STATUS_LESS_FUNCTION_CALL_SCENARIO
+            && provider == AGENTIC_STATUS_LESS_FUNCTION_CALL_PROVIDER
+        {
+            assert_agentic_status_less_function_call(&report.actual, scenario_id, provider);
+            saw_agentic_status_less_function_call = true;
+        }
         if NATIVE_RESPONSES_PROVIDERS.contains(&provider) && NATIVE_RESPONSES_SCENARIOS.contains(&scenario_id) {
             native_responses_recordings.insert((scenario_id.to_owned(), provider.to_owned()));
             assert_native_responses_passthrough(&report.actual, scenario_id, provider);
@@ -154,6 +163,10 @@ async fn all_inference_fixtures_replay() {
     assert!(
         saw_agentic_parallel_tool_calls,
         "missing representative recording for scenario `{AGENTIC_PARALLEL_TOOL_CALLS_SCENARIO}` and provider `{AGENTIC_PARALLEL_TOOL_CALLS_PROVIDER}`"
+    );
+    assert!(
+        saw_agentic_status_less_function_call,
+        "missing representative recording for scenario `{AGENTIC_STATUS_LESS_FUNCTION_CALL_SCENARIO}` and provider `{AGENTIC_STATUS_LESS_FUNCTION_CALL_PROVIDER}`"
     );
     for scenario_id in NATIVE_ANTHROPIC_SCENARIOS {
         assert!(
@@ -450,5 +463,24 @@ fn assert_agentic_parallel_tool_calls(actual: &WireFixture, scenario_id: &str, p
     assert_eq!(
         client_body["parallel_tool_calls"], true,
         "client request must enable parallel_tool_calls for scenario `{scenario_id}` and provider `{provider}`"
+    );
+}
+
+fn assert_agentic_status_less_function_call(actual: &WireFixture, scenario_id: &str, provider: &str) {
+    let turn = actual.turns.first().unwrap_or_else(|| {
+        panic!("scenario `{scenario_id}` and provider `{provider}` replayed without a turn");
+    });
+    let RecordedBody::Json { value: client_body } = &turn.client.response.body else {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay a JSON client response body");
+    };
+    let function_call = client_body["output"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["type"] == "function_call"))
+        .unwrap_or_else(|| {
+            panic!("scenario `{scenario_id}` and provider `{provider}` must contain a function_call output item");
+        });
+    assert!(
+        function_call.get("status").is_none(),
+        "function_call item must be status-less for scenario `{scenario_id}` and provider `{provider}`"
     );
 }
