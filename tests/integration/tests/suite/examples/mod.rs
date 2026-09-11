@@ -26,6 +26,7 @@ mod full_flow_agentic;
 mod gcp_adc;
 mod guardrails;
 mod guardrails_response;
+mod identity_header_guard;
 mod inference_fallback;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
