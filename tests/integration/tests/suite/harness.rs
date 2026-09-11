@@ -12,6 +12,9 @@ use std::{
 
 use tempfile::TempDir;
 
+/// Pinned version of the Claude Code CLI executable used for E2E acceptance tests.
+pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.267";
+
 /// Isolated temporary workspace seeded for deterministically verifying client execution.
 pub(crate) struct TempWorkspace {
     dir: TempDir,
@@ -22,7 +25,10 @@ impl TempWorkspace {
     /// Create a new workspace seeded with `input.json`, empty `result.txt`, and executable `verify.sh`.
     pub(crate) fn new() -> std::io::Result<Self> {
         let dir = TempDir::new()?;
-        let expected_content = "SUCCESS_E2E_TEST".to_owned();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let expected_content = format!("SUCCESS_E2E_TEST_{nonce}");
 
         let input_json = serde_json::json!({
             "version": "3.6.0-mvp",
@@ -36,7 +42,7 @@ impl TempWorkspace {
         )?;
         fs::write(dir.path().join("result.txt"), "")?;
 
-        let verify_sh = "#!/bin/sh\ngrep -q \"SUCCESS_E2E_TEST\" result.txt\n";
+        let verify_sh = format!("#!/bin/sh\ngrep -q \"{expected_content}\" result.txt\n");
         let verify_path = dir.path().join("verify.sh");
         fs::write(&verify_path, verify_sh)?;
 
@@ -81,6 +87,11 @@ impl TempWorkspace {
     /// Absolute path to the workspace root.
     pub(crate) fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// Expected target content generated for this workspace run.
+    pub(crate) fn expected_content(&self) -> &str {
+        &self.expected_content
     }
 
     /// Read the current content of `result.txt`.

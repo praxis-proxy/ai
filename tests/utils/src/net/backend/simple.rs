@@ -429,6 +429,64 @@ impl StatefulCapturingBackend {
     }
 }
 
+/// Check if request is a probe.
+fn is_probe_request(method: &str, uri: &str) -> bool {
+    (method == "GET" && (uri == "/" || uri == "/api/hello")) || method == "HEAD"
+}
+
+/// Format a standard HTTP response payload.
+fn format_http_response(status: u16, resp_body: &str) -> Vec<u8> {
+    let reason = reason_phrase(status);
+    let content_type = if resp_body.starts_with("data: ") {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Length: {}\r\n\
+         Content-Type: {content_type}\r\n\
+         Connection: close\r\n\
+         Server: praxis-test-backend\r\n\
+         \r\n\
+         {resp_body}",
+        resp_body.len()
+    )
+    .into_bytes()
+}
+
+/// Write an SSE response using chunked transfer encoding incrementally.
+fn write_incremental_sse_response(stream: &mut TcpStream, status: u16, resp_body: &str) -> std::io::Result<()> {
+    let reason = reason_phrase(status);
+    let headers = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nServer: praxis-test-backend\r\n\r\n"
+    );
+    stream.write_all(headers.as_bytes())?;
+    stream.flush()?;
+
+    let frames: Vec<&str> = resp_body.split("\n\n").collect();
+    for (i, frame) in frames.iter().enumerate() {
+        if frame.trim().is_empty() {
+            continue;
+        }
+        let chunk_data = if i < frames.len() - 1 {
+            format!("{frame}\n\n")
+        } else {
+            (*frame).to_owned()
+        };
+        let chunk_header = format!("{:x}\r\n", chunk_data.len());
+        stream.write_all(chunk_header.as_bytes())?;
+        stream.write_all(chunk_data.as_bytes())?;
+        stream.write_all(b"\r\n")?;
+        stream.flush()?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    stream.write_all(b"0\r\n\r\n")?;
+    stream.flush()
+}
+
 /// Handle a single capturing-backend connection: read the full
 /// request, store it, then write the next sequential response.
 fn capture_and_respond(
@@ -443,33 +501,26 @@ fn capture_and_respond(
     let (method, uri, headers, body) = parse_raw_request(&raw);
 
     captured.lock().expect("mutex not poisoned").push(CapturedRequest {
-        method,
-        uri,
+        method: method.clone(),
+        uri: uri.clone(),
         headers,
         body,
     });
 
+    if is_probe_request(&method, &uri) {
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nOK");
+        return;
+    }
+
     let idx = counter.fetch_add(1, Ordering::SeqCst);
     let (status, resp_body) = responses.get(idx).map_or((500, "exhausted"), |(s, b)| (*s, b.as_str()));
-    let reason = reason_phrase(status);
 
-    let content_type = if resp_body.starts_with("data: ") {
-        "text/event-stream"
+    if resp_body.starts_with("data: ") {
+        let _ = write_incremental_sse_response(stream, status, resp_body);
     } else {
-        "application/json"
-    };
-
-    let resp = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Length: {}\r\n\
-         Content-Type: {content_type}\r\n\
-         Connection: close\r\n\
-         Server: praxis-test-backend\r\n\
-         \r\n\
-         {resp_body}",
-        resp_body.len()
-    );
-    let _sent = stream.write_all(resp.as_bytes());
+        let resp_bytes = format_http_response(status, resp_body);
+        let _sent = stream.write_all(&resp_bytes);
+    }
 }
 
 /// Read a full HTTP request (headers + body) from a TCP stream.

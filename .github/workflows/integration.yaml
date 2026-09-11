@@ -128,8 +128,10 @@ jobs:
         run: make test-inference-fixtures
 
       - name: Install pinned Claude Code CLI
+        env:
+          CLAUDE_CODE_PINNED_VERSION: "2.1.267"
         run: |
-          npm install -g @anthropic-ai/claude-code@2.1.267
+          npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_PINNED_VERSION}
           claude --version
 
       - name: Integration tests

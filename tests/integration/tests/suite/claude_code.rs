@@ -5,10 +5,10 @@
 //!
 //! Upstream Issue: https://github.com/praxis-proxy/ai/issues/871
 //!
-//! Validates that a pinned Claude Code executable (v2.1.267) can complete a deterministic
+//! Validates that a pinned Claude Code executable can complete a deterministic
 //! multi-turn coding task through Praxis AI using the Anthropic Messages `/v1/messages` contract.
 
-use std::{fs, process::Stdio, time::Duration};
+use std::{process::Stdio, time::Duration};
 
 #[cfg(unix)]
 use nix::{
@@ -19,9 +19,7 @@ use nix::{
 use praxis_core::config::Config;
 use praxis_test_utils::{StatefulCapturingBackend, free_port, start_proxy};
 
-use super::harness::TempWorkspace;
-
-const CLAUDE_CODE_EXPECTED_VERSION: &str = "2.1.267";
+use super::harness::{CLAUDE_CODE_PINNED_VERSION, TempWorkspace};
 
 #[test]
 fn pinned_claude_code_version_check() {
@@ -43,8 +41,8 @@ fn pinned_claude_code_version_check() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains(CLAUDE_CODE_EXPECTED_VERSION),
-        "claude --version output should contain expected version '{CLAUDE_CODE_EXPECTED_VERSION}', got: '{stdout}'"
+        stdout.contains(CLAUDE_CODE_PINNED_VERSION),
+        "claude --version output should contain expected version '{CLAUDE_CODE_PINNED_VERSION}', got: '{stdout}'"
     );
 }
 
@@ -56,13 +54,12 @@ async fn pinned_claude_code_completes_messages_coding_workflow() {
     };
 
     let workspace = TempWorkspace::new().expect("failed to create temporary workspace");
-
-    fs::write(workspace.path().join("result.txt"), "SUCCESS_E2E_TEST").expect("failed to seed workspace result.txt");
+    let expected_content = workspace.expected_content();
 
     let title_sse = "data: {\"id\":\"chatcmpl-title\",\"object\":\"chat.completion.chunk\",\"created\":1677652287,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"{\\\"title\\\": \\\"Inspect and Update Task\\\"}\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-title\",\"object\":\"chat.completion.chunk\",\"created\":1677652287,\"model\":\"claude-3-5-sonnet-20241027\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":10,\"total_tokens\":20}}\n\ndata: [DONE]\n\n".to_owned();
 
     let bash_args_json = serde_json::json!({
-        "command": "./verify.sh"
+        "command": format!("sh -c 'echo {expected_content} > result.txt && ./verify.sh'")
     });
     let bash_args_str = bash_args_json.to_string();
     let bash_args_escaped = bash_args_str.replace('\\', "\\\\").replace('"', "\\\"");
@@ -76,19 +73,16 @@ async fn pinned_claude_code_completes_messages_coding_workflow() {
     let turn1_sse = format!("{turn1_chunk1}{turn1_chunk2}{turn1_chunk3}");
 
     // Step 2: Summarize and complete
-    let turn2_chunk1 = "data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"created\":1677652289,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"I have inspected input.json, updated result.txt with SUCCESS_E2E_TEST, ran ./verify.sh, and verified the task.\"},\"finish_reason\":null}]}\n\n";
+    let turn2_chunk1 = format!(
+        "data: {{\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"created\":1677652289,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"I have inspected input.json, updated result.txt with {expected_content}, ran ./verify.sh, and verified the task.\"}},\"finish_reason\":null}}]}}\n\n"
+    );
     let turn2_chunk2 = "data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"created\":1677652289,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":60,\"completion_tokens\":20,\"total_tokens\":80}}\n\n";
     let turn2_chunk3 = "data: [DONE]\n\n";
     let turn2_sse = format!("{turn2_chunk1}{turn2_chunk2}{turn2_chunk3}");
 
     let fallback_sse = "data: {\"id\":\"chatcmpl-fallback\",\"object\":\"chat.completion.chunk\",\"created\":1677652291,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Task completed.\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
 
-    let mut responses = vec![
-        (200, title_sse.clone()),
-        (200, title_sse.clone()),
-        (200, turn1_sse),
-        (200, turn2_sse),
-    ];
+    let mut responses = vec![(200, title_sse), (200, turn1_sse), (200, turn2_sse)];
     for _ in 0..20 {
         responses.push((200, fallback_sse.to_owned()));
     }
@@ -158,12 +152,34 @@ insecure_options:
         .env("DISABLE_UPDATE_CHECK", "1")
         .env("ANTHROPIC_BASE_URL", format!("http://{}", proxy.addr()))
         .env("ANTHROPIC_API_KEY", "sk-synthetic-claude-test-key-12345")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "127.0.0.1,localhost")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_isolated_process_group(&mut command);
 
     let mut child = command.spawn().expect("failed to spawn claude code child process");
+
+    let stdout_handle = child.stdout.take().expect("child stdout should be piped");
+    let stderr_handle = child.stderr.take().expect("child stderr should be piped");
+
+    let stdout_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = Vec::new();
+        let mut reader = stdout_handle;
+        let _res = reader.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = Vec::new();
+        let mut reader = stderr_handle;
+        let _res = reader.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    });
 
     let process_group_id = child.id();
     let timeout_duration = Duration::from_secs(30);
@@ -181,9 +197,12 @@ insecure_options:
         },
     };
 
+    let stdout_str = stdout_task.await.unwrap_or_default();
+    let stderr_str = stderr_task.await.unwrap_or_default();
+
     assert!(
         status.success(),
-        "claude code child process should exit with status 0, got: {status:?}"
+        "claude code child process should exit with status 0, got: {status:?}\nSTDOUT:\n{stdout_str}\nSTDERR:\n{stderr_str}"
     );
 
     let requests = backend_guard.requests();
@@ -202,6 +221,59 @@ insecure_options:
         );
     }
 
+    let task_posts: Vec<serde_json::Value> = post_requests
+        .iter()
+        .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+        .filter(|json| {
+            let has_prompt = json["messages"].as_array().is_some_and(|msgs| {
+                msgs.iter()
+                    .any(|m| content_contains(&m["content"], "Inspect input.json"))
+            });
+            let is_main_turn = json["tools"].as_array().is_some_and(|t| !t.is_empty())
+                || json["messages"]
+                    .as_array()
+                    .is_some_and(|msgs| msgs.iter().any(|m| m["role"].as_str() == Some("tool")));
+            has_prompt && is_main_turn
+        })
+        .collect();
+
+    assert!(
+        task_posts.len() >= 2,
+        "should capture at least 2 turns for main coding task, got: {}",
+        task_posts.len()
+    );
+
+    let turn1_tools = task_posts[0]["tools"]
+        .as_array()
+        .expect("turn 1 request payload should contain 'tools' schema array");
+    let has_bash_tool = turn1_tools
+        .iter()
+        .any(|t| t["function"]["name"].as_str() == Some("Bash"));
+    assert!(has_bash_tool, "turn 1 request should present tool schema for 'Bash'");
+
+    let turn2_messages = task_posts[1]["messages"]
+        .as_array()
+        .expect("turn 2 request payload should contain 'messages' array");
+
+    let has_assistant_call = turn2_messages.iter().any(|m| {
+        m["role"].as_str() == Some("assistant")
+            && m["tool_calls"]
+                .as_array()
+                .is_some_and(|tc| tc.iter().any(|c| c["id"].as_str() == Some("call_bash_1")))
+    });
+    assert!(
+        has_assistant_call,
+        "turn 2 request should preserve assistant tool_call with stable ID 'call_bash_1'"
+    );
+
+    let has_tool_result = turn2_messages
+        .iter()
+        .any(|m| m["role"].as_str() == Some("tool") && m["tool_call_id"].as_str() == Some("call_bash_1"));
+    assert!(
+        has_tool_result,
+        "turn 2 request should submit tool_result referencing stable call ID 'call_bash_1'"
+    );
+
     workspace.assert_successful_completion();
 }
 
@@ -214,6 +286,18 @@ fn configure_isolated_process_group(command: &mut tokio::process::Command) {
 
 #[cfg(not(unix))]
 fn configure_isolated_process_group(_command: &mut tokio::process::Command) {}
+
+fn content_contains(val: &serde_json::Value, needle: &str) -> bool {
+    if let Some(s) = val.as_str() {
+        return s.contains(needle);
+    }
+    if let Some(arr) = val.as_array() {
+        return arr
+            .iter()
+            .any(|item| item["text"].as_str().is_some_and(|t| t.contains(needle)));
+    }
+    false
+}
 
 fn terminate_process_group(process_group_id: Option<u32>, child: &mut tokio::process::Child) {
     #[cfg(unix)]
