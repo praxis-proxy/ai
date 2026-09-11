@@ -131,7 +131,7 @@ jobs:
         env:
           CLAUDE_CODE_PINNED_VERSION: "2.1.267"
         run: |
-          npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_PINNED_VERSION}
+          npm install -g @anthropic-ai/claude-code@$CLAUDE_CODE_PINNED_VERSION
           claude --version
 
       - name: Integration tests
