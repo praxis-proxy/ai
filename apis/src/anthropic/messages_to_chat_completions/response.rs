@@ -687,6 +687,17 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tool_call_id_format_fails_transformation() {
+        let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call.bad","type":"function","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        let error = transform_response(body, "gpt-4").err().unwrap();
+
+        assert!(
+            error.contains("must match ^[a-zA-Z0-9_-]+$"),
+            "a syntactically invalid id should fail response transformation: {error}"
+        );
+    }
+
+    #[test]
     fn missing_tool_call_arguments_field_fails_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_time"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
         let error = transform_response(body, "gpt-4").err().unwrap();
