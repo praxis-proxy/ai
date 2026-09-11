@@ -11,6 +11,8 @@ Rejects the request with HTTP 400 before any callouts if two or more resolvable 
 
 For streaming requests, a runtime or response-processing failure from `tools/list` is returned as a successful SSE transport containing `response.mcp_list_tools.failed` and a terminal `response.failed` event. Local policy failures such as SSRF blocking remain HTTP error responses.
 
+On successful discovery, one `mcp_list_tools` output item per resolved server (in request order, including servers that resolve to zero tools) is seeded into `ResponsesState` for a downstream response-finalizing filter to surface: a buffered finalizer (`openai_agentic_loop` or `openai_mcp_dispatch`) lists it in `output`, and `openai_stream_events`, when placed inside the agentic loop on the streaming path, synthesizes its `output_item.added` → `mcp_list_tools.in_progress` → `mcp_list_tools.completed` → `output_item.done` lifecycle ahead of the model output. Unlike the failure lifecycle above — which this filter emits itself as a terminal SSE — a successful discovery must still proceed to inference, so it cannot be surfaced without one of those downstream filters; the minimal `mcp-tool-resolve.yaml` example therefore demonstrates resolution and the failure lifecycle only (see `agentic-loop.yaml` for a pipeline that surfaces successful listings). A previous-response cache hit surfaces the same item without re-calling `tools/list`, and internal retries reuse the item and its id rather than emitting a second discovery.
+
 ## Configuration
 
 | Field | Type | Required | Description |

@@ -470,6 +470,13 @@ impl FileSearchCalloutFilter {
                 );
             }
         }
+        let response_identity_hash = response
+            .get("id")
+            .and_then(Value::as_str)
+            .map_or(FNV_OFFSET_BASIS, |response_id| stable_call_hash(&[response_id]));
+        if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
+            ensure_public_output_item_ids(output, response_identity_hash);
+        }
         let Some(output) = response.get("output").and_then(Value::as_array) else {
             return Ok(invalid_success_response_action(continued));
         };
@@ -876,6 +883,13 @@ fn finalize_public_response(state: &mut ResponsesState) -> Result<Bytes, FilterA
     let mut combined_output = std::mem::take(&mut state.file_search_output_items);
     combined_output.extend(final_output);
     *state.output_items_mut() = combined_output;
+
+    let response_identity_hash = state
+        .response_object
+        .get("id")
+        .and_then(Value::as_str)
+        .map_or(FNV_OFFSET_BASIS, |response_id| stable_call_hash(&[response_id]));
+    ensure_public_output_item_ids(state.output_items_mut(), response_identity_hash);
 
     annotate_response(&mut state.response_object, &state.citation_files).map_err(|error| {
         warn!(%error, "failed to annotate final file-search response");
@@ -1439,6 +1453,7 @@ fn extract_file_search_queries(arguments: &str) -> Vec<String> {
 /// `file_search_call` items so the pending-call scan recognizes them.
 ///
 /// Returns the round-local output indices it rewrote.
+#[expect(clippy::too_many_lines, reason = "translates function calls and preserves IDs")]
 fn translate_function_calls_to_file_search(response: &mut Value) -> Vec<usize> {
     let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
         return Vec::new();
@@ -1459,12 +1474,20 @@ fn translate_function_calls_to_file_search(response: &mut Value) -> Vec<usize> {
             .map(extract_file_search_queries)
             .unwrap_or_default();
 
+        let call_id = object.get("call_id").and_then(Value::as_str).map(ToOwned::to_owned);
+
         object.insert("type".to_owned(), Value::String("file_search_call".to_owned()));
         object.insert("status".to_owned(), Value::String("searching".to_owned()));
         object.insert(
             "queries".to_owned(),
             Value::Array(queries.into_iter().map(Value::String).collect()),
         );
+
+        if object.get("id").and_then(Value::as_str).is_none_or(str::is_empty)
+            && let Some(call_id) = &call_id
+        {
+            object.insert("id".to_owned(), Value::String(format!("fs_{call_id}")));
+        }
 
         object.remove("name");
         object.remove("arguments");
@@ -1572,6 +1595,33 @@ fn response_fits(state: &ResponsesState, max_bytes: usize) -> bool {
         .ok()
         .flatten()
         .is_some()
+}
+
+/// Normalize missing or malformed provider IDs for every public output item.
+fn ensure_public_output_item_ids(items: &mut [Value], response_identity_hash: u64) {
+    for (output_index, item) in items.iter_mut().enumerate() {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        let valid_id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty());
+        if !valid_id {
+            let prefix = match object.get("type").and_then(Value::as_str) {
+                Some("file_search_call") => "fs",
+                Some("web_search_call") => "ws",
+                Some("function_call") => "fc",
+                Some("message") => "msg",
+                Some("reasoning") => "rs",
+                _ => "item",
+            };
+            object.insert(
+                "id".to_owned(),
+                Value::String(format!("{prefix}_{response_identity_hash:016x}_{output_index}")),
+            );
+        }
+    }
 }
 
 /// Normalize a malformed provider call ID without changing valid opaque IDs.

@@ -170,11 +170,11 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
         return empty_result(AiRequestFormat::NonJson);
     }
 
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return empty_result(AiRequestFormat::InvalidJson);
     };
 
-    let Some(obj) = value.as_object() else {
+    let Some(obj) = value.as_object_mut() else {
         return empty_result(AiRequestFormat::InvalidJson);
     };
 
@@ -195,7 +195,7 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
             .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())),
         max_output_tokens: obj.get("max_output_tokens").and_then(serde_json::Value::as_u64),
         max_tokens: obj.get("max_tokens").and_then(serde_json::Value::as_u64),
-        model: extract_string(obj, "model"),
+        model: take_string(obj, "model"),
         store: obj.get("store").and_then(serde_json::Value::as_bool),
         stream: obj.get("stream").and_then(serde_json::Value::as_bool),
     }
@@ -286,11 +286,15 @@ pub(crate) fn empty_result(format: AiRequestFormat) -> ClassifiedRequest {
     }
 }
 
-/// Extract a string field from a JSON object, converting numbers/booleans
+/// Take a string field out of a JSON object, converting numbers/booleans
 /// to their string representation.
-fn extract_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
-    obj.get(key).and_then(|v| match v {
-        serde_json::Value::String(s) => Some(s.clone()),
+///
+/// Moves the owned `String` out of the parsed body instead of cloning it,
+/// leaving an empty string in its place. Callers must not read `key` again
+/// afterwards.
+fn take_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj.get_mut(key).and_then(|v| match v {
+        serde_json::Value::String(s) => Some(std::mem::take(s)),
         serde_json::Value::Number(n) => Some(n.to_string()),
         serde_json::Value::Bool(b) => Some(b.to_string()),
         _ => None,

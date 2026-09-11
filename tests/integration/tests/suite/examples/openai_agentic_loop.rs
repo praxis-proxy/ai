@@ -401,6 +401,115 @@ fn round_trip_captures_tool_and_model_requests() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Issue #1022: successful mcp_list_tools discovery lifecycle (buffered)
+// -----------------------------------------------------------------------------
+
+/// A successful local MCP discovery surfaces one `mcp_list_tools` output item in
+/// the buffered response, ahead of the model output, carrying the discovered
+/// tools in `MCPListToolsTool` shape with a null `error` (issue #1022).
+#[test]
+fn buffered_discovery_emits_mcp_list_tools_output_item() {
+    let response = serde_json::json!({
+        "id": "resp_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "The weather in SF is 72F and sunny."}]
+        }]
+    });
+    let model =
+        StatefulCapturingBackend::new(vec![(200, serde_json::to_string(&response).unwrap())]).start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                    "additionalProperties": false
+                })),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config(proxy_port, model.port());
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": mcp_url,
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "discovery + single pass should return 200");
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("valid JSON response");
+    let output = response["output"].as_array().expect("output array present");
+
+    let list_idx = output
+        .iter()
+        .position(|item| item["type"] == "mcp_list_tools")
+        .expect("buffered output must include an mcp_list_tools item");
+    let msg_idx = output
+        .iter()
+        .position(|item| item["type"] == "message")
+        .expect("buffered output must include the model message");
+    assert!(
+        list_idx < msg_idx,
+        "the discovery item must precede the model output: {response}"
+    );
+
+    // Exactly one discovery item for the single resolved server.
+    assert_eq!(
+        output.iter().filter(|item| item["type"] == "mcp_list_tools").count(),
+        1,
+        "one discovery item per resolved server: {response}"
+    );
+
+    let listing = &output[list_idx];
+    assert_eq!(listing["server_label"], "weather", "server_label surfaced");
+    assert_eq!(
+        listing["error"],
+        serde_json::Value::Null,
+        "successful listing has null error"
+    );
+    assert!(
+        listing["id"].as_str().is_some_and(|id| id.starts_with("mcpl_")),
+        "discovery item carries an mcpl_ id: {listing}"
+    );
+    let tools = listing["tools"].as_array().expect("tools array present");
+    let weather = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_weather")
+        .expect("discovered tool surfaced under its real MCP name");
+    assert!(
+        weather["input_schema"]["properties"]["location"].is_object(),
+        "discovered tool carries its input_schema: {weather}"
+    );
+
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        1,
+        "discovery calls tools/list exactly once"
+    );
+}
+
 #[test]
 fn batched_mcp_calls_complete_for_parallel_and_sequential_modes() {
     for parallel in [true, false] {
@@ -917,55 +1026,124 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         0,
         "created seq: {body}"
     );
+    // #1022: the successful local MCP discovery is synthesized first, ahead of the
+    // model output, as a full mcp_list_tools lifecycle (added -> in_progress ->
+    // completed -> done). It shifts every later event's sequence number by 4.
+    assert_eq!(
+        frame_seq(item_frame(&frames, "response.output_item.added", "mcp_list_tools")),
+        1,
+        "mcp_list_tools added seq: {body}"
+    );
+    assert_eq!(
+        frame_seq(sole_event(&frames, "response.mcp_list_tools.in_progress")),
+        2,
+        "mcp_list_tools in_progress seq: {body}"
+    );
+    assert_eq!(
+        frame_seq(sole_event(&frames, "response.mcp_list_tools.completed")),
+        3,
+        "mcp_list_tools completed seq: {body}"
+    );
+    assert_eq!(
+        frame_seq(item_frame(&frames, "response.output_item.done", "mcp_list_tools")),
+        4,
+        "mcp_list_tools done seq: {body}"
+    );
     assert_eq!(
         frame_seq(item_frame(&frames, "response.output_item.added", "function_call")),
-        1,
+        5,
         "function_call added seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.function_call_arguments.delta")),
-        2,
+        6,
         "function_call arguments delta seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.function_call_arguments.done")),
-        3,
+        7,
         "function_call arguments done seq: {body}"
     );
     assert_eq!(
         frame_seq(item_frame(&frames, "response.output_item.added", "mcp_call")),
-        4,
+        8,
         "mcp_call added seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.mcp_call.in_progress")),
-        5,
+        9,
         "mcp_call in_progress seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.mcp_call.completed")),
-        6,
+        10,
         "mcp_call completed seq: {body}"
     );
     assert_eq!(
         frame_seq(item_frame(&frames, "response.output_item.done", "mcp_call")),
-        7,
+        11,
         "mcp_call done seq: {body}"
     );
     assert_eq!(
         frame_seq(item_frame(&frames, "response.output_item.added", "message")),
-        8,
+        12,
         "resumed message added seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.output_text.delta")),
-        9,
+        13,
         "resumed output_text delta seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.completed")),
-        10,
+        14,
         "terminal seq: {body}"
+    );
+
+    // #1022: the discovery item occupies output_index 0 and carries the discovered
+    // tool in MCPListToolsTool shape with a null error; every event for it shares
+    // that index and the same mcpl_ item id.
+    let list_added = item_frame(&frames, "response.output_item.added", "mcp_list_tools");
+    let list_id = list_added.data["item"]["id"]
+        .as_str()
+        .expect("mcp_list_tools must carry an id")
+        .to_owned();
+    assert!(list_id.starts_with("mcpl_"), "mcp_list_tools id prefix: {body}");
+    assert_eq!(
+        list_added.data["output_index"], 0,
+        "mcp_list_tools output_index: {body}"
+    );
+    assert_eq!(
+        list_added.data["item"]["server_label"], "weather",
+        "mcp_list_tools server_label: {body}"
+    );
+    assert_eq!(
+        list_added.data["item"]["error"],
+        serde_json::Value::Null,
+        "successful mcp_list_tools error is null: {body}"
+    );
+    assert!(
+        list_added.data["item"]["tools"].as_array().is_some_and(|tools| tools
+            .iter()
+            .any(|tool| tool["name"] == "get_weather" && tool["input_schema"].is_object())),
+        "mcp_list_tools carries the discovered tool with input_schema: {body}"
+    );
+    for event in [
+        "response.mcp_list_tools.in_progress",
+        "response.mcp_list_tools.completed",
+    ] {
+        let frame = sole_event(&frames, event);
+        assert_eq!(frame.data["output_index"], 0, "{event} output_index: {body}");
+        assert_eq!(
+            frame.data["item_id"].as_str(),
+            Some(list_id.as_str()),
+            "{event} item_id: {body}"
+        );
+    }
+    assert_eq!(
+        event_count(&frames, "response.mcp_list_tools.failed"),
+        0,
+        "a successful discovery must not fail: {body}"
     );
 
     // #276: the locally executed MCP call is synthesized as incremental events
@@ -977,10 +1155,10 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         .as_str()
         .expect("mcp_call must carry an id")
         .to_owned();
-    assert_eq!(mcp_added.data["output_index"], 1, "mcp_call added output_index: {body}");
+    assert_eq!(mcp_added.data["output_index"], 2, "mcp_call added output_index: {body}");
     for event in ["response.mcp_call.in_progress", "response.mcp_call.completed"] {
         let frame = sole_event(&frames, event);
-        assert_eq!(frame.data["output_index"], 1, "{event} output_index: {body}");
+        assert_eq!(frame.data["output_index"], 2, "{event} output_index: {body}");
         assert_eq!(
             frame.data["item_id"].as_str(),
             Some(mcp_id.as_str()),
@@ -988,7 +1166,7 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         );
     }
     let mcp_done = item_frame(&frames, "response.output_item.done", "mcp_call");
-    assert_eq!(mcp_done.data["output_index"], 1, "mcp_call done output_index: {body}");
+    assert_eq!(mcp_done.data["output_index"], 2, "mcp_call done output_index: {body}");
     assert_eq!(
         mcp_done.data["item"]["id"].as_str(),
         Some(mcp_id.as_str()),
@@ -1000,23 +1178,26 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         "a successful MCP call must not fail: {body}"
     );
 
-    // No duplicate output items: three announced (model function call,
-    // synthesized MCP call, resumed message) and exactly one MCP done.
+    // No duplicate output items: four announced (#1022 discovery listing, model
+    // function call, synthesized MCP call, resumed message) and exactly two
+    // output_item.done (discovery listing + MCP call; the message is finalized by
+    // the terminal snapshot).
     assert_eq!(
         event_count(&frames, "response.output_item.added"),
-        3,
-        "three items announced: {body}"
+        4,
+        "four items announced: {body}"
     );
     assert_eq!(
         event_count(&frames, "response.output_item.done"),
-        1,
-        "one output_item.done: {body}"
+        2,
+        "two output_item.done (discovery + mcp_call): {body}"
     );
 
-    // The resumed model output follows the two tool items at output index 2.
+    // The resumed model output follows the discovery listing and two tool items at
+    // output index 3.
     let message_added = item_frame(&frames, "response.output_item.added", "message");
     assert_eq!(
-        message_added.data["output_index"], 2,
+        message_added.data["output_index"], 3,
         "resumed message output_index: {body}"
     );
     assert_eq!(
@@ -1024,7 +1205,7 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         "resumed message id: {body}"
     );
     let text_delta = sole_event(&frames, "response.output_text.delta");
-    assert_eq!(text_delta.data["output_index"], 2, "resumed text output_index: {body}");
+    assert_eq!(text_delta.data["output_index"], 3, "resumed text output_index: {body}");
     assert_eq!(
         text_delta.data["content_index"], 0,
         "resumed text content_index: {body}"
@@ -1034,39 +1215,47 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         "resumed text item id: {body}"
     );
 
-    // The terminal snapshot agrees with the incremental history item-for-item.
+    // The terminal snapshot agrees with the incremental history item-for-item. The
+    // #1022 discovery listing leads the snapshot at index 0.
     let output = terminal_output(&frames);
-    assert_eq!(output.len(), 3, "terminal output must snapshot all three items: {body}");
-    assert_eq!(output[0]["type"], "function_call", "terminal[0] type: {body}");
-    assert_eq!(output[0]["id"], "fc_stream_1", "terminal[0] id: {body}");
-    assert_eq!(output[0]["call_id"], "call_stream_1", "terminal[0] call_id: {body}");
+    assert_eq!(output.len(), 4, "terminal output must snapshot all four items: {body}");
+    assert_eq!(output[0]["type"], "mcp_list_tools", "terminal[0] type: {body}");
     assert_eq!(
-        output[0]["arguments"], r#"{"location":"SF"}"#,
-        "terminal[0] arguments: {body}"
+        output[0]["id"].as_str(),
+        Some(list_id.as_str()),
+        "terminal[0] id must match the synthesized discovery listing: {body}"
     );
-    assert_eq!(output[1]["type"], "mcp_call", "terminal[1] type: {body}");
+    assert_eq!(output[0]["server_label"], "weather", "terminal[0] server_label: {body}");
+    assert_eq!(output[1]["type"], "function_call", "terminal[1] type: {body}");
+    assert_eq!(output[1]["id"], "fc_stream_1", "terminal[1] id: {body}");
+    assert_eq!(output[1]["call_id"], "call_stream_1", "terminal[1] call_id: {body}");
     assert_eq!(
-        output[1]["id"].as_str(),
+        output[1]["arguments"], r#"{"location":"SF"}"#,
+        "terminal[1] arguments: {body}"
+    );
+    assert_eq!(output[2]["type"], "mcp_call", "terminal[2] type: {body}");
+    assert_eq!(
+        output[2]["id"].as_str(),
         Some(mcp_id.as_str()),
-        "terminal[1] id must match synthesized mcp_call: {body}"
+        "terminal[2] id must match synthesized mcp_call: {body}"
     );
     assert!(
-        output[1]["name"]
+        output[2]["name"]
             .as_str()
             .is_some_and(|name| name.contains("get_weather")),
-        "terminal[1] name must be the MCP tool: {body}"
+        "terminal[2] name must be the MCP tool: {body}"
     );
     assert!(
-        output[1]["output"]
+        output[2]["output"]
             .as_str()
             .is_some_and(|text| text.contains("mock result for get_weather")),
-        "terminal[1] must carry the MCP result: {body}"
+        "terminal[2] must carry the MCP result: {body}"
     );
-    assert_eq!(output[2]["type"], "message", "terminal[2] type: {body}");
-    assert_eq!(output[2]["id"], "msg_stream_2", "terminal[2] id: {body}");
+    assert_eq!(output[3]["type"], "message", "terminal[3] type: {body}");
+    assert_eq!(output[3]["id"], "msg_stream_2", "terminal[3] id: {body}");
     assert_eq!(
-        output[2]["content"][0]["text"], "The weather in SF is sunny.",
-        "terminal[2] assistant text: {body}"
+        output[3]["content"][0]["text"], "The weather in SF is sunny.",
+        "terminal[3] assistant text: {body}"
     );
     let terminal = sole_event(&frames, "response.completed");
     assert_eq!(
@@ -1113,7 +1302,7 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         .expect("model function_call must carry a call_id");
     assert_eq!(model_call_id, "call_stream_1", "model function_call call_id: {body}");
     assert_eq!(
-        output[0]["call_id"].as_str(),
+        output[1]["call_id"].as_str(),
         Some(model_call_id),
         "terminal function_call call_id must match the announced call: {body}"
     );
@@ -1584,65 +1773,138 @@ fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
         0,
         "created seq: {body}"
     );
+    // #1022: the successful local MCP discovery is synthesized first, ahead of the
+    // model output, as a full mcp_list_tools lifecycle (added -> in_progress ->
+    // completed -> done). It shifts every later event's sequence number by 4. The
+    // discovery succeeds even though the subsequent tool call fails.
+    assert_eq!(
+        frame_seq(item_frame(&frames, "response.output_item.added", "mcp_list_tools")),
+        1,
+        "mcp_list_tools added seq: {body}"
+    );
+    assert_eq!(
+        frame_seq(sole_event(&frames, "response.mcp_list_tools.in_progress")),
+        2,
+        "mcp_list_tools in_progress seq: {body}"
+    );
+    assert_eq!(
+        frame_seq(sole_event(&frames, "response.mcp_list_tools.completed")),
+        3,
+        "mcp_list_tools completed seq: {body}"
+    );
+    assert_eq!(
+        frame_seq(item_frame(&frames, "response.output_item.done", "mcp_list_tools")),
+        4,
+        "mcp_list_tools done seq: {body}"
+    );
     assert_eq!(
         frame_seq(item_frame(&frames, "response.output_item.added", "function_call")),
-        1,
+        5,
         "function_call added seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.function_call_arguments.delta")),
-        2,
+        6,
         "function_call arguments delta seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.function_call_arguments.done")),
-        3,
+        7,
         "function_call arguments done seq: {body}"
     );
     assert_eq!(
         frame_seq(item_frame(&frames, "response.output_item.added", "mcp_call")),
-        4,
+        8,
         "mcp_call added seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.mcp_call.in_progress")),
-        5,
+        9,
         "mcp_call in_progress seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.mcp_call.failed")),
-        6,
+        10,
         "mcp_call failed seq: {body}"
     );
     assert_eq!(
         frame_seq(item_frame(&frames, "response.output_item.done", "mcp_call")),
-        7,
+        11,
         "mcp_call done seq: {body}"
     );
     assert_eq!(
         frame_seq(item_frame(&frames, "response.output_item.added", "message")),
-        8,
+        12,
         "resumed message added seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.output_text.delta")),
-        9,
+        13,
         "resumed output_text delta seq: {body}"
     );
     assert_eq!(
         frame_seq(sole_event(&frames, "response.completed")),
-        10,
+        14,
         "terminal seq: {body}"
     );
 
+    // #1022: the discovery item occupies output_index 0 and carries the discovered
+    // tool in MCPListToolsTool shape with a null error; every event for it shares
+    // that index and the same mcpl_ item id. A later tool-dispatch failure does not
+    // taint the successful listing.
+    let list_added = item_frame(&frames, "response.output_item.added", "mcp_list_tools");
+    let list_id = list_added.data["item"]["id"]
+        .as_str()
+        .expect("mcp_list_tools must carry an id")
+        .to_owned();
+    assert!(list_id.starts_with("mcpl_"), "mcp_list_tools id prefix: {body}");
+    assert_eq!(
+        list_added.data["output_index"], 0,
+        "mcp_list_tools output_index: {body}"
+    );
+    assert_eq!(
+        list_added.data["item"]["server_label"], "weather",
+        "mcp_list_tools server_label: {body}"
+    );
+    assert_eq!(
+        list_added.data["item"]["error"],
+        serde_json::Value::Null,
+        "successful mcp_list_tools error is null: {body}"
+    );
+    assert!(
+        list_added.data["item"]["tools"].as_array().is_some_and(|tools| tools
+            .iter()
+            .any(|tool| tool["name"] == "get_weather" && tool["input_schema"].is_object())),
+        "mcp_list_tools carries the discovered tool with input_schema: {body}"
+    );
+    for event in [
+        "response.mcp_list_tools.in_progress",
+        "response.mcp_list_tools.completed",
+    ] {
+        let frame = sole_event(&frames, event);
+        assert_eq!(frame.data["output_index"], 0, "{event} output_index: {body}");
+        assert_eq!(
+            frame.data["item_id"].as_str(),
+            Some(list_id.as_str()),
+            "{event} item_id: {body}"
+        );
+    }
+    assert_eq!(
+        event_count(&frames, "response.mcp_list_tools.failed"),
+        0,
+        "a successful discovery must not fail: {body}"
+    );
+
     // #276: the failed local mcp_call emits in_progress then failed (never
-    // completed), all sharing the reserved output index 1 and its item id.
+    // completed), all sharing its reserved output index and item id. The #1022
+    // discovery listing takes output index 0, so the mcp_call now sits at index 2
+    // (behind the discovery listing and the model function call).
     let mcp_added = item_frame(&frames, "response.output_item.added", "mcp_call");
     let mcp_id = mcp_added.data["item"]["id"]
         .as_str()
         .expect("mcp_call must carry an id")
         .to_owned();
-    assert_eq!(mcp_added.data["output_index"], 1, "mcp_call added output_index: {body}");
+    assert_eq!(mcp_added.data["output_index"], 2, "mcp_call added output_index: {body}");
     assert_eq!(
         event_count(&frames, "response.mcp_call.completed"),
         0,
@@ -1650,7 +1912,7 @@ fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
     );
     for event in ["response.mcp_call.in_progress", "response.mcp_call.failed"] {
         let frame = sole_event(&frames, event);
-        assert_eq!(frame.data["output_index"], 1, "{event} output_index: {body}");
+        assert_eq!(frame.data["output_index"], 2, "{event} output_index: {body}");
         assert_eq!(
             frame.data["item_id"].as_str(),
             Some(mcp_id.as_str()),
@@ -1658,44 +1920,56 @@ fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
         );
     }
     let mcp_done = item_frame(&frames, "response.output_item.done", "mcp_call");
-    assert_eq!(mcp_done.data["output_index"], 1, "mcp_call done output_index: {body}");
+    assert_eq!(mcp_done.data["output_index"], 2, "mcp_call done output_index: {body}");
     assert_eq!(
         mcp_done.data["item"]["id"].as_str(),
         Some(mcp_id.as_str()),
         "mcp_call done item id: {body}"
     );
 
+    // Four items announced (#1022 discovery listing, model function call, failed
+    // MCP call, resumed message) and exactly two output_item.done (discovery
+    // listing + failed MCP call; the message is finalized by the terminal snapshot).
     assert_eq!(
         event_count(&frames, "response.output_item.added"),
-        3,
-        "three items announced: {body}"
+        4,
+        "four items announced: {body}"
     );
     assert_eq!(
         event_count(&frames, "response.output_item.done"),
-        1,
-        "one output_item.done: {body}"
+        2,
+        "two output_item.done (discovery + mcp_call): {body}"
     );
 
     // The terminal snapshot carries the failed mcp_call with its non-null error
-    // and agrees item-for-item with the incremental history.
+    // and agrees item-for-item with the incremental history. The #1022 discovery
+    // listing leads the snapshot at index 0.
     let output = terminal_output(&frames);
-    assert_eq!(output.len(), 3, "terminal output must snapshot all three items: {body}");
-    assert_eq!(output[1]["type"], "mcp_call", "terminal[1] type: {body}");
+    assert_eq!(output.len(), 4, "terminal output must snapshot all four items: {body}");
+    assert_eq!(output[0]["type"], "mcp_list_tools", "terminal[0] type: {body}");
     assert_eq!(
-        output[1]["id"].as_str(),
+        output[0]["id"].as_str(),
+        Some(list_id.as_str()),
+        "terminal[0] id must match the synthesized discovery listing: {body}"
+    );
+    assert_eq!(output[0]["server_label"], "weather", "terminal[0] server_label: {body}");
+    assert_eq!(output[1]["type"], "function_call", "terminal[1] type: {body}");
+    assert_eq!(output[2]["type"], "mcp_call", "terminal[2] type: {body}");
+    assert_eq!(
+        output[2]["id"].as_str(),
         Some(mcp_id.as_str()),
-        "terminal[1] id: {body}"
+        "terminal[2] id: {body}"
     );
     assert!(
-        output[1]["error"]
+        output[2]["error"]
             .as_str()
             .is_some_and(|error| error.contains("mock failure for get_weather")),
-        "terminal[1] must carry the MCP error: {body}"
+        "terminal[2] must carry the MCP error: {body}"
     );
-    assert_eq!(output[2]["type"], "message", "terminal[2] type: {body}");
+    assert_eq!(output[3]["type"], "message", "terminal[3] type: {body}");
     assert_eq!(
-        output[2]["content"][0]["text"], "The weather service is unavailable.",
-        "terminal[2] assistant text: {body}"
+        output[3]["content"][0]["text"], "The weather service is unavailable.",
+        "terminal[3] assistant text: {body}"
     );
     assert_eq!(
         sole_event(&frames, "response.completed").data["response"]["id"],
@@ -1729,7 +2003,7 @@ fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
         .expect("model function_call must carry a call_id");
     assert_eq!(model_call_id, "call_fail_1", "model function_call call_id: {body}");
     assert_eq!(
-        output[0]["call_id"].as_str(),
+        output[1]["call_id"].as_str(),
         Some(model_call_id),
         "terminal function_call call_id must match the announced call: {body}"
     );
@@ -1780,9 +2054,18 @@ const EXPECTED_OUTPUT_TOKENS: u64 = ROUND1_USAGE.1 + ROUND2_USAGE.1 + ROUND3_USA
 const EXPECTED_TOTAL_TOKENS: u64 = ROUND1_USAGE.2 + ROUND2_USAGE.2 + ROUND3_USAGE.2;
 
 /// Output item `type` values a two-tool-round terminal response must expose, in
-/// stable chronological order: each tool round contributes a function call then
-/// its server-tool result, followed by the final assistant message.
-const EXPECTED_OUTPUT_TYPES: [&str; 5] = ["function_call", "mcp_call", "function_call", "mcp_call", "message"];
+/// stable chronological order: the successful local MCP discovery (#1022) surfaces
+/// one `mcp_list_tools` item for the single `weather` server first, then each tool
+/// round contributes a function call and its server-tool result, followed by the
+/// final assistant message.
+const EXPECTED_OUTPUT_TYPES: [&str; 6] = [
+    "mcp_list_tools",
+    "function_call",
+    "mcp_call",
+    "function_call",
+    "mcp_call",
+    "message",
+];
 
 /// Final assistant text emitted by the terminal inference round.
 const FINAL_TEXT: &str = "SF is 72F and it is 3pm PST.";
@@ -2331,8 +2614,15 @@ fn dependency_chain_feeds_first_tool_output_into_second_tool_args() {
         .collect();
     assert_eq!(
         output_types,
-        ["function_call", "mcp_call", "function_call", "mcp_call", "message"],
-        "terminal output must interleave both tool rounds then the final message: {output_types:?}"
+        [
+            "mcp_list_tools",
+            "function_call",
+            "mcp_call",
+            "function_call",
+            "mcp_call",
+            "message"
+        ],
+        "successful discovery (#1022) precedes both interleaved tool rounds and the final message: {output_types:?}"
     );
 
     // Derivation is possible: round 2's inference input carries the get_user_id

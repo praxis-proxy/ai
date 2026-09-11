@@ -201,6 +201,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.agentic.status_less_function_call
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/agentic-status-less-function-call
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.agentic.irr_terminal_streaming
     scopes:
       - responses_agentic_loop

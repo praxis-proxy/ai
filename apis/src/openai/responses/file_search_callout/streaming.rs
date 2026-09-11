@@ -8,9 +8,9 @@ use praxis_filter::{FilterAction, FilterError, HttpFilterContext};
 use serde_json::Value;
 
 use super::{
-    citations::annotate_output_items, has_client_function_call, has_file_search_tool, is_file_search_function_call,
-    is_pending_file_search_call, remaining_file_search_call_budget, terminalize_all_pending_calls,
-    translate_function_calls_to_file_search,
+    FNV_OFFSET_BASIS, citations::annotate_output_items, ensure_public_output_item_ids, has_client_function_call,
+    has_file_search_tool, is_file_search_function_call, is_pending_file_search_call, remaining_file_search_call_budget,
+    stable_call_hash, terminalize_all_pending_calls, translate_function_calls_to_file_search,
 };
 use crate::{
     callout_policy::OnFailure,
@@ -170,6 +170,14 @@ pub(super) fn step_0_5_translate_and_mixed_tool(
     } else {
         Vec::new()
     };
+    let response_identity_hash = state
+        .response_object
+        .get("id")
+        .and_then(Value::as_str)
+        .map_or(FNV_OFFSET_BASIS, |response_id| stable_call_hash(&[response_id]));
+    if let Some(output) = state.response_object.get_mut("output").and_then(Value::as_array_mut) {
+        ensure_public_output_item_ids(output, response_identity_hash);
+    }
     // `reconcile_round_into_accumulated_output` uses `binary_search` on `translated`,
     // which requires ascending order. `translate_function_calls_to_file_search` produces
     // it via forward `iter_mut().enumerate()`; guard that invariant against a refactor.
@@ -224,6 +232,13 @@ fn is_file_search_call_item(item: &Value) -> bool {
 /// suppressed); a callout-terminalized `incomplete` call is absent from the set (its
 /// live done was suppressed, never passed through) and still queues its tail.
 pub(super) fn reconcile_round_into_accumulated_output(state: &mut ResponsesState, translated: &[usize]) {
+    let response_identity_hash = state
+        .response_object
+        .get("id")
+        .and_then(Value::as_str)
+        .map_or(FNV_OFFSET_BASIS, |response_id| stable_call_hash(&[response_id]));
+    ensure_public_output_item_ids(state.output_items_mut(), response_identity_hash);
+
     let base = state.accumulated_output.len();
     let round = std::mem::take(state.output_items_mut()); // owned Vec, leaves valid []
     for (i, item) in round.into_iter().enumerate() {

@@ -1,5 +1,5 @@
 name: Start vLLM
-description: Pull the pinned vLLM CPU image, start it with the canonical serving flags, and wait for readiness.
+description: Launch the pinned vLLM CPU container in the background (pull image + start container). Pair with the wait-vllm action to block until it is serving, so the pull and model load overlap other work (e.g. cargo build).
 inputs:
   image:
     description: vLLM CPU container image (pinned by digest).
@@ -10,36 +10,33 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Pull vLLM CPU image
+    - name: Start vLLM (background)
       shell: bash
-      run: docker pull "${{ inputs.image }}"
-
-    - name: Start vLLM
-      shell: bash
+      env:
+        VLLM_IMAGE: ${{ inputs.image }}
+        VLLM_MODEL: ${{ inputs.model }}
       run: |
-        docker run -d --name vllm \
-          -p 8000:8000 \
-          --privileged=true \
-          "${{ inputs.image }}" \
-          --model /root/.cache/Qwen/Qwen3-0.6B \
-          --max-model-len 4096 \
-          --served-model-name "${{ inputs.model }}" \
-          --enable-auto-tool-choice \
-          --tool-call-parser hermes \
-          --reasoning-parser deepseek_r1 \
-          --gpu-memory-utilization 0.5
-
-    - name: Wait for vLLM readiness
-      shell: bash
-      run: |
-        echo "Waiting for vLLM health and model endpoints..."
-        timeout 900 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                   curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-          if ! docker inspect --format="{{.State.Running}}" vllm 2>/dev/null | grep -q true; then
-            echo "::error::vLLM container exited unexpectedly"
-            docker logs vllm 2>&1
-            exit 1
-          fi
-          sleep 5
-        done'
-        echo "vLLM is ready"
+        # Pull the (multi-GB, model-baked) image and start the container in the
+        # background so the pull + model load overlap the caller's next steps
+        # (cargo build, OGX startup) instead of blocking them. Join with the
+        # wait-vllm action before the first request. `nohup ... &` keeps the
+        # launcher alive across the step boundary (same technique as the OGX
+        # background start); its pid and log let wait-vllm tell "still pulling"
+        # apart from a real pull/start failure.
+        nohup bash -c '
+          set -euo pipefail
+          docker pull "$VLLM_IMAGE"
+          docker run -d --name vllm \
+            -p 8000:8000 \
+            --privileged=true \
+            "$VLLM_IMAGE" \
+            --model /root/.cache/Qwen/Qwen3-0.6B \
+            --max-model-len 4096 \
+            --served-model-name "$VLLM_MODEL" \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            --reasoning-parser deepseek_r1 \
+            --gpu-memory-utilization 0.5
+        ' > /tmp/vllm-start.log 2>&1 &
+        echo $! > /tmp/vllm-start.pid
+        echo "vLLM launch backgrounded (launcher pid $(cat /tmp/vllm-start.pid)); join with the wait-vllm action"
