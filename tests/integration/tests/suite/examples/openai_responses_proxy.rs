@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     free_port, http_send, json_post, load_example_config, parse_body, parse_status, start_backend_with_shutdown,
-    start_proxy,
+    start_capturing_backend, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -58,6 +58,29 @@ fn openai_responses_proxy_example_preserves_json_response() {
         parse_body(&raw),
         json_response,
         "JSON response body should be preserved exactly"
+    );
+}
+
+#[test]
+fn openai_responses_proxy_example_preserves_native_conversation() {
+    let backend_guard = start_capturing_backend("inference-ok");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "openai/responses/responses-proxy.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1-mini","input":"Hello","conversation":{"id":"conv_native"}}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 200, "proxied request should return 200");
+    assert_eq!(
+        backend_guard.body(),
+        body,
+        "conversation should reach the native backend unchanged"
     );
 }
 

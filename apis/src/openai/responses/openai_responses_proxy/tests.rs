@@ -535,7 +535,7 @@ async fn strips_conversation_from_outbound_body() {
 }
 
 #[tokio::test]
-async fn strips_both_previous_response_id_and_conversation() {
+async fn strips_locally_consumed_history_selectors() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -571,23 +571,22 @@ async fn strips_both_previous_response_id_and_conversation() {
 }
 
 #[tokio::test]
-async fn passthrough_strips_conversation_from_body() {
+async fn passthrough_preserves_conversation_in_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"hello","conversation":42}"#));
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"hello","conversation":{"id":"conv_native"}}"#,
+    ));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "passthrough conversation stripping should continue"
+        "passthrough conversation should continue"
     );
 
     let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert!(
-        parsed.get("conversation").is_none(),
-        "conversation should be stripped even without ResponsesState"
-    );
+    assert_eq!(parsed["conversation"]["id"], "conv_native");
     assert_eq!(parsed["model"], "gpt-4.1", "other fields should be preserved");
     assert!(
         ctx.extra_request_headers
@@ -595,6 +594,30 @@ async fn passthrough_strips_conversation_from_body() {
             .all(|(k, _)| k.as_ref() != "content-length"),
         "filter must not set content-length (core handles framing)"
     );
+}
+
+#[tokio::test]
+async fn rebuilt_body_preserves_conversation_without_local_rehydration() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "conversation": {"id": "conv_native"}
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"hello","conversation":{"id":"conv_native"}}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(rebuilt["conversation"]["id"], "conv_native");
 }
 
 #[tokio::test]
