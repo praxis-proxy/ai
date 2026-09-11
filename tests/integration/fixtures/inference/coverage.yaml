@@ -48,6 +48,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.response.invalid_tool_id
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/invalid-tool-id
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.streaming.usage
     scopes:
       - messages_to_chat_completions

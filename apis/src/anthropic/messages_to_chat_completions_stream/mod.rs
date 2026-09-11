@@ -648,7 +648,7 @@ fn transform_tool_delta(
 ) -> Result<(), FilterError> {
     let tool_call_key = tool_call_key(tc);
 
-    if tc.get("id").and_then(Value::as_str).is_some() && !is_tool_block_open(ctx, &tool_call_key) {
+    if !is_tool_block_open(ctx, &tool_call_key) {
         emit_tool_block_start(ctx, &tool_call_key, tc, output, max_tool_blocks)?;
     }
 
@@ -703,12 +703,7 @@ fn emit_tool_block_start(
     }
 
     let idx = get_block_index(ctx);
-    let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
-    let name = tc
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let (id, name) = extract_tool_id_and_name(tc)?;
     let content_block = ContentBlock::tool_use(id, serde_json::Map::new(), name);
 
     emit_event(
@@ -726,6 +721,29 @@ fn emit_tool_block_start(
     ctx.set_metadata(TOOL_BLOCK_COUNT_KEY, (opened + 1).to_string());
 
     Ok(())
+}
+
+/// Extract and validate the tool-call ID and function name from an OpenAI tool-call delta.
+fn extract_tool_id_and_name(tc: &Value) -> Result<(&str, &str), FilterError> {
+    let id = tc
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| FilterError::from("anthropic_stream_events: tool call missing required non-empty `id`"))?;
+    if !crate::anthropic::wire::is_valid_tool_use_id(id) {
+        return Err(FilterError::from(
+            "anthropic_stream_events: tool call `id` must match ^[a-zA-Z0-9_-]+$",
+        ));
+    }
+    let name = tc
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            FilterError::from("anthropic_stream_events: tool call missing required non-empty function `name`")
+        })?;
+    Ok((id, name))
 }
 
 /// Emit an `input_json_delta` if the tool call has non-empty arguments.
@@ -1464,6 +1482,50 @@ mod tests {
             "tool arguments should stream as input_json_delta"
         );
     }
+    const INVALID_TOOL_CALL_CASES: [(&str, &str, &str); 5] = [
+        (
+            "missing id",
+            r#"{"index":0,"function":{"name":"get_weather","arguments":"{}"}}"#,
+            "non-empty `id`",
+        ),
+        (
+            "empty id",
+            r#"{"index":0,"id":"","function":{"name":"get_weather","arguments":"{}"}}"#,
+            "non-empty `id`",
+        ),
+        (
+            "missing name",
+            r#"{"index":0,"id":"call_1","function":{"arguments":"{}"}}"#,
+            "non-empty function `name`",
+        ),
+        (
+            "empty name",
+            r#"{"index":0,"id":"call_1","function":{"name":"","arguments":"{}"}}"#,
+            "non-empty function `name`",
+        ),
+        (
+            "invalid id",
+            r#"{"index":0,"id":"call.bad","function":{"name":"get_weather","arguments":"{}"}}"#,
+            "must match ^[a-zA-Z0-9_-]+$",
+        ),
+    ];
+
+    #[test]
+    fn invalid_unopened_tool_call_deltas_fail_transformation() {
+        for (description, tool_call, expected_error) in INVALID_TOOL_CALL_CASES {
+            let (filter, mut ctx) = make_filter_and_context();
+            let chunk = format!(
+                "data: {{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{{\"delta\":{{\"tool_calls\":[{tool_call}]}},\"index\":0}}]}}\n\n"
+            );
+            let mut body = Some(Bytes::from(chunk));
+            let error = filter.on_response_body(&mut ctx, &mut body, false).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "{description} should fail streaming transformation: {error}"
+            );
+        }
+    }
+
 
     #[test]
     fn interleaved_tool_call_argument_delta_uses_matching_tool_block_index() {
