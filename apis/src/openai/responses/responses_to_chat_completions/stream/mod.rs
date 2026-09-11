@@ -695,7 +695,8 @@ impl StreamConverter {
         }
         self.lifecycle_started = true;
         let context = self.response_context(inputs, None);
-        let resource = in_progress_response_resource(&context);
+        let resource =
+            in_progress_response_resource(&context).map_err(|_error| ConvertError::InvalidTerminalResource)?;
         if serialized_json_len(&resource)? > self.limits.max_body_bytes {
             return Err(ConvertError::ByteLimit);
         }
@@ -1417,7 +1418,8 @@ impl StreamConverter {
         // terminal never streamed completion events for the accumulated items.
         let synthetic = self.synthetic_completion("stop");
         let mut resource = chat_response_to_response_resource(&synthetic, &context)
-            .unwrap_or_else(|_| in_progress_response_resource(&context));
+            .or_else(|_| in_progress_response_resource(&context))
+            .unwrap_or_else(|_| minimal_failed_resource(&context, message));
         mark_failed(&mut resource, message);
         // The partial snapshot can be arbitrarily large — this failure may itself
         // be the byte-limit trip, and the snapshot echoes request-controlled

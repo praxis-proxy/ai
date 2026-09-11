@@ -11,9 +11,12 @@ use serde_json::json;
 
 use super::{
     ARMED_KEY, CREATED_AT_KEY, RESPONSE_STATUS_KEY, RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM,
-    ResponsesToChatCompletionsFilter, error::normalize_provider_error,
+    ResponsesToChatCompletionsFilter, error::normalize_provider_error, reject_incompatible_reasoning,
 };
-use crate::openai::responses::state::ResponsesState;
+use crate::openai::{
+    responses::state::ResponsesState,
+    translation::reasoning::{ReasoningDialect, ReasoningOptions},
+};
 
 #[test]
 fn default_config_parses() {
@@ -127,6 +130,39 @@ fn legacy_max_body_bytes_is_rejected() {
         ResponsesToChatCompletionsFilter::from_config(&yaml).is_err(),
         "legacy max_body_bytes should be rejected as an unknown field"
     );
+}
+
+#[test]
+fn streaming_with_reasoning_dialect_is_rejected() {
+    // Streaming reasoning translation is deferred (#36).
+    let request = json!({"model": "m", "input": "hi", "stream": true});
+    let vllm = ReasoningOptions {
+        dialect: ReasoningDialect::Vllm,
+        ..ReasoningOptions::default()
+    };
+
+    let action = reject_incompatible_reasoning(&request, &vllm, true)
+        .expect_err("streaming must be rejected while a reasoning dialect is enabled");
+    assert!(matches!(action, FilterAction::Reject(_)));
+}
+
+#[test]
+fn streaming_without_reasoning_dialect_is_allowed() {
+    let request = json!({"model": "m", "input": "hi", "stream": true});
+
+    reject_incompatible_reasoning(&request, &ReasoningOptions::default(), true)
+        .expect("the default dialect performs no reasoning translation and permits streaming");
+}
+
+#[test]
+fn non_streaming_with_reasoning_dialect_is_allowed() {
+    let request = json!({"model": "m", "input": "hi"});
+    let vllm = ReasoningOptions {
+        dialect: ReasoningDialect::Vllm,
+        ..ReasoningOptions::default()
+    };
+
+    reject_incompatible_reasoning(&request, &vllm, false).expect("non-streaming reasoning translation is supported");
 }
 
 #[test]
@@ -1725,4 +1761,170 @@ fn malformed_server_error_falls_back_without_reflecting_body() {
     let normalized = normalize_provider_error(StatusCode::BAD_GATEWAY, b"private upstream details");
     assert_eq!(normalized.code, "server_error");
     assert_eq!(normalized.message, "upstream provider returned an error");
+}
+
+#[test]
+fn reasoning_dialect_config_parses() {
+    let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm\n  max_reasoning_bytes: 1024").unwrap();
+
+    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn default_reasoning_dialect_is_none() {
+    let yaml = serde_yaml::from_str("{}").unwrap();
+
+    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn zero_max_reasoning_bytes_is_rejected() {
+    let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm\n  max_reasoning_bytes: 0").unwrap();
+
+    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn max_reasoning_bytes_exceeding_body_limit_is_rejected() {
+    let yaml =
+        serde_yaml::from_str("max_body_bytes: 1024\nreasoning:\n  dialect: vllm\n  max_reasoning_bytes: 2048").unwrap();
+
+    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn unknown_reasoning_config_key_is_rejected() {
+    let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm\n  unexpected: true").unwrap();
+
+    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
+}
+
+#[tokio::test]
+async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary() {
+    let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm").unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "deepseek-r1",
+        "input": "hello",
+        "reasoning": {"summary": "auto"}
+    })));
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"deepseek-r1","input":"hello","reasoning":{"summary":"auto"}}"#,
+    ));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected rejection");
+    };
+    assert_eq!(rejection.status, 400);
+    let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(parsed["error"]["code"], "invalid_request_error");
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "summary rejection must not arm response processing"
+    );
+}
+
+#[tokio::test]
+async fn vllm_reasoning_content_is_extracted_end_to_end() {
+    let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm").unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.time_source = &fixed_time;
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_format.stream", "false");
+    context.set_metadata("responses.response_id", "resp_reasoning_1");
+    let request_value = json!({
+        "model": "deepseek-r1",
+        "input": "hello",
+        "reasoning": {"effort": "medium"},
+        "stream": false
+    });
+    context
+        .extensions
+        .insert(ResponsesState::from_request_body(request_value));
+    let mut request_body = Some(Bytes::from_static(
+        br#"{"model":"deepseek-r1","input":"hello","reasoning":{"effort":"medium"},"stream":false}"#,
+    ));
+    let request_action = filter
+        .on_request_body(&mut context, &mut request_body, true)
+        .await
+        .unwrap();
+    assert!(matches!(request_action, FilterAction::Continue));
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    // vLLM emits `reasoning` and sets the deprecated `reasoning_content` alias to null.
+    // extraction must read the current field.
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_1","object":"chat.completion","model":"deepseek-r1","choices":[{"index":0,"message":{"role":"assistant","content":"The answer is 4.","reasoning":"2 plus 2 is 4.","reasoning_content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":8,"total_tokens":18,"completion_tokens_details":{"reasoning_tokens":5}}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(translated["output"][0]["type"], "reasoning");
+    assert_eq!(translated["output"][0]["id"], "rs_resp_reasoning_1");
+    assert_eq!(translated["output"][0]["content"][0]["type"], "reasoning_text");
+    assert_eq!(translated["output"][0]["content"][0]["text"], "2 plus 2 is 4.");
+    assert_eq!(translated["output"][0]["summary"], json!([]));
+    assert_eq!(translated["output"][1]["type"], "message");
+    assert_eq!(translated["output"][1]["content"][0]["text"], "The answer is 4.");
+    assert_eq!(translated["reasoning"]["effort"], "medium");
+    assert_eq!(translated["usage"]["output_tokens_details"]["reasoning_tokens"], 5);
+}
+
+#[tokio::test]
+async fn default_dialect_leaves_reasoning_content_unextracted() {
+    let yaml = serde_yaml::from_str("{}").unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.time_source = &fixed_time;
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(CREATED_AT_KEY, "1700000000");
+    context.set_metadata("responses.response_id", "resp_plain_1");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "deepseek-r1",
+        "input": "hello"
+    })));
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_1","object":"chat.completion","model":"deepseek-r1","choices":[{"index":0,"message":{"role":"assistant","content":"answer","reasoning_content":"hidden"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    let output = translated["output"].as_array().unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0]["type"], "message");
+    assert!(output.iter().all(|item| item["type"] != "reasoning"));
 }

@@ -7,7 +7,10 @@ use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
 use super::stream::StreamLimits;
-use crate::openai::responses::body_limits::validate_size_limit;
+use crate::openai::{
+    responses::body_limits::validate_size_limit,
+    translation::reasoning::{ReasoningDialect, ReasoningOptions},
+};
 
 /// Default SSE reassembly buffer ceiling in bytes.
 const DEFAULT_MAX_SSE_BUFFER_BYTES: usize = 1 << 20;
@@ -135,6 +138,9 @@ pub(super) struct ResponsesToChatCompletionsConfig {
     /// ceiling so every emitted frame fits the buffer it is reassembled in.
     #[serde(default = "default_max_emitted_sse_frame_bytes")]
     pub max_emitted_sse_frame_bytes: usize,
+    /// Backend-specific dialect behavior.
+    #[serde(default)]
+    pub reasoning: ReasoningOptions,
 }
 
 impl Default for ResponsesToChatCompletionsConfig {
@@ -148,6 +154,7 @@ impl Default for ResponsesToChatCompletionsConfig {
             stream_timeout_secs: DEFAULT_STREAM_TIMEOUT_SECS,
             max_stream_frames: DEFAULT_MAX_STREAM_FRAMES,
             max_emitted_sse_frame_bytes: DEFAULT_MAX_EMITTED_SSE_FRAME_BYTES,
+            reasoning: ReasoningOptions::default(),
         }
     }
 }
@@ -235,6 +242,9 @@ pub(super) fn build_config(
         )
         .into());
     }
+    if config.reasoning.dialect != ReasoningDialect::None {
+        validate_max_reasoning_bytes(config.reasoning.max_reasoning_bytes, config.max_rewritten_body_bytes)?;
+    }
     Ok(config)
 }
 
@@ -244,6 +254,21 @@ fn validate_rewritten_body_limit(limit: usize) -> Result<(), FilterError> {
     if limit < MIN_MAX_REWRITTEN_BODY_BYTES {
         return Err(format!(
             "responses_to_chat_completions: max_rewritten_body_bytes ({limit}) must be at least {MIN_MAX_REWRITTEN_BODY_BYTES} bytes so the fail-closed response.failed resource always fits",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Validate reasoning byte limit for a dialect that extracts raw reasoning.
+/// It must be non-zero and within the max body bytes ceiling.
+fn validate_max_reasoning_bytes(value: usize, max_rewritten_body_bytes: usize) -> Result<(), FilterError> {
+    if value == 0 {
+        return Err("responses_to_chat_completions: reasoning.max_reasoning_bytes must be greater than 0".into());
+    }
+    if value > max_rewritten_body_bytes {
+        return Err(format!(
+            "responses_to_chat_completions: reasoning.max_reasoning_bytes ({value}) must not exceed max_rewritten_body_bytes ({max_rewritten_body_bytes})"
         )
         .into());
     }
@@ -376,5 +401,33 @@ mod tests {
             ..ResponsesToChatCompletionsConfig::default()
         };
         build_config(at_floor).expect("the minimum translated-body ceiling must be accepted");
+    }
+
+    #[test]
+    fn reasoning_bytes_zero_rejected() {
+        let err = validate_max_reasoning_bytes(0, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("must be greater than 0"),
+            "zero should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reasoning_bytes_over_body_limit_rejected() {
+        let err = validate_max_reasoning_bytes(2048, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("must not exceed max_rewritten_body_bytes"),
+            "value above the body limit should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reasoning_bytes_within_limit_accepted() {
+        validate_max_reasoning_bytes(512, 1024).expect("value below the body limit should be accepted");
+    }
+
+    #[test]
+    fn reasoning_bytes_equal_to_body_limit_accepted() {
+        validate_max_reasoning_bytes(1024, 1024).expect("value equal to the body limit should be accepted");
     }
 }

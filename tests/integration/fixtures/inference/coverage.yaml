@@ -228,6 +228,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.reasoning.request
+    scopes:
+      - responses_to_chat_completions
+    status: live_covered
+    scenarios:
+      - responses/chat-reasoning-nonstream
+    providers:
+      vllm:
+        status: live_covered
+  - id: responses.chat.reasoning.response
+    scopes:
+      - responses_to_chat_completions
+    status: live_covered
+    scenarios:
+      - responses/chat-reasoning-nonstream
+    providers:
+      vllm:
+        status: live_covered
   - id: responses.chat.malformed_compaction
     scopes:
       - responses_to_chat_completions
