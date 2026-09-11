@@ -31,7 +31,7 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import ClassVar
+from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import httpx
@@ -4601,6 +4601,589 @@ class TestFileSearchStreamingVLLM:
             "the hosted file_search must not leak as a client function_call; "
             f"leaked: {[getattr(item, 'name', '?') for item in leaked]}"
         )
+
+
+STRUCTURED_OUTPUT_SCHEMA_CASES = [
+    pytest.param(
+        "Generate a profile for Tom, a software engineer in Raleigh. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 64},
+                "occupation": {"type": "string", "maxLength": 64},
+                "city": {"type": "string", "maxLength": 64},
+            },
+            "required": ["name", "occupation", "city"],
+            "additionalProperties": False,
+        },
+        id="string-types",
+    ),
+    pytest.param(
+        "Generate a profile for Bob, who is 25 years old. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name", "age"],
+            "additionalProperties": False,
+        },
+        id="integer-types",
+    ),
+    pytest.param(
+        "Generate an active user named Alice with a verified email. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string"},
+                "is_active": {"type": "boolean"},
+                "email_verified": {"type": "boolean"},
+            },
+            "required": ["username", "is_active", "email_verified"],
+            "additionalProperties": False,
+        },
+        id="boolean-types",
+    ),
+    pytest.param(
+        "Generate product information for a laptop priced at 999.99. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "product_name": {"type": "string"},
+                "price": {"type": "number"},
+            },
+            "required": ["product_name", "price"],
+            "additionalProperties": False,
+        },
+        id="number-types",
+    ),
+    pytest.param(
+        "Generate a profile for Charlie with Python, JavaScript, and Docker skills. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "skills": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 64},
+                    "minItems": 1,
+                    "maxItems": 3,
+                },
+            },
+            "required": ["name", "skills"],
+            "additionalProperties": False,
+        },
+        id="array-of-strings",
+    ),
+    pytest.param(
+        'Return exactly this JSON object: {"student_name":"Dana","scores":[85,92,78]}. /no_think',
+        {
+            "type": "object",
+            "properties": {
+                "student_name": {"type": "string", "enum": ["Dana"]},
+                "scores": {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [78, 85, 92]},
+                    "minItems": 3,
+                    "maxItems": 3,
+                },
+            },
+            "required": ["student_name", "scores"],
+            "additionalProperties": False,
+        },
+        marks=pytest.mark.xfail(
+            strict=False,
+            raises=json.JSONDecodeError,
+            reason="CPU Qwen3-0.6B can exhaust the output limit for this schema",
+        ),
+        id="array-of-integers",
+    ),
+    pytest.param(
+        "Generate an Engineering team with Alice as lead and Bob as developer. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "team_name": {"type": "string"},
+                "members": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "role": {"type": "string"},
+                        },
+                        "required": ["name", "role"],
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                    "maxItems": 2,
+                },
+            },
+            "required": ["team_name", "members"],
+            "additionalProperties": False,
+        },
+        id="array-of-objects",
+    ),
+    pytest.param(
+        "Generate employee Susan, ID 1001, in Engineering managed by Frank. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "employee": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "employee_id": {"type": "integer"},
+                    },
+                    "required": ["name", "employee_id"],
+                    "additionalProperties": False,
+                },
+                "department": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "manager": {"type": "string"},
+                    },
+                    "required": ["name", "manager"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["employee", "department"],
+            "additionalProperties": False,
+        },
+        id="nested-objects",
+    ),
+    pytest.param(
+        "Generate an active profile for Grace, age 35, salary 120000, with Python and SQL skills, living at 123 Main St in Raleigh, zipcode 27601. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "salary": {"type": "number"},
+                "is_active": {"type": "boolean"},
+                "skills": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 64},
+                    "minItems": 1,
+                    "maxItems": 2,
+                },
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "street": {"type": "string"},
+                        "city": {"type": "string"},
+                        "zipcode": {"type": "integer"},
+                    },
+                    "required": ["street", "city", "zipcode"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["name", "age", "salary", "is_active", "skills", "address"],
+            "additionalProperties": False,
+        },
+        id="mixed-types-and-structures",
+    ),
+]
+
+
+def _assert_matches_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
+    """Assert the JSON value has the types and closed shape declared by a case."""
+    if "enum" in schema:
+        assert value in schema["enum"], f"{path} is not an allowed value: {value!r}"
+    expected_type = schema["type"]
+    if expected_type == "object":
+        assert isinstance(value, dict), f"{path} should be an object: {value!r}"
+        required = set(schema.get("required", []))
+        assert required <= value.keys(), f"{path} is missing {required - value.keys()}"
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            assert value.keys() <= properties.keys(), f"{path} has unexpected keys: {value.keys() - properties.keys()}"
+        for key, child_schema in properties.items():
+            if key in value:
+                _assert_matches_schema(value[key], child_schema, f"{path}.{key}")
+        return
+    if expected_type == "array":
+        assert isinstance(value, list), f"{path} should be an array: {value!r}"
+        assert value, f"{path} should not be empty"
+        if "minItems" in schema:
+            assert len(value) >= schema["minItems"], f"{path} has too few items"
+        if "maxItems" in schema:
+            assert len(value) <= schema["maxItems"], f"{path} has too many items"
+        for index, item in enumerate(value):
+            _assert_matches_schema(item, schema["items"], f"{path}[{index}]")
+        return
+    if expected_type == "string":
+        assert isinstance(value, str), f"{path} should be a string: {value!r}"
+        if "maxLength" in schema:
+            assert len(value) <= schema["maxLength"], f"{path} is too long"
+        return
+    if expected_type == "integer":
+        assert isinstance(value, int) and not isinstance(value, bool), f"{path} should be an integer: {value!r}"
+        return
+    if expected_type == "number":
+        assert isinstance(value, (int, float)) and not isinstance(value, bool), f"{path} should be a number: {value!r}"
+        return
+    if expected_type == "boolean":
+        assert isinstance(value, bool), f"{path} should be a boolean: {value!r}"
+        return
+    raise AssertionError(f"unsupported test schema type {expected_type!r} at {path}")
+
+
+@pytest.mark.parametrize("prompt,schema", STRUCTURED_OUTPUT_SCHEMA_CASES)
+def test_structured_output_schema_shapes(openai_client, prompt, schema):
+    """Exercise nine structured-output schema shapes."""
+    text_format = {
+        "type": "json_schema",
+        "name": "extended_response_shape",
+        "description": "A recording-free structured output compatibility case",
+        "schema": schema,
+        "strict": True,
+    }
+    response = openai_client.responses.create(
+        model=VLLM_MODEL,
+        input=prompt,
+        stream=False,
+        text={"format": text_format},
+        temperature=0,
+        store=False,
+        max_output_tokens=512,
+    )
+
+    assert response.text.format.model_dump(exclude_none=True, by_alias=True) == text_format
+    _assert_matches_schema(json.loads(response.output_text), schema)
+
+
+def test_include_logprobs_non_streaming(openai_client):
+    """Verify the finite include=message.output_text.logprobs scenario."""
+    response = openai_client.responses.create(
+        model=VLLM_MODEL,
+        input="Which planet do humans live on? /no_think",
+        stream=False,
+        include=["message.output_text.logprobs"],
+        store=False,
+        max_output_tokens=64,
+    )
+
+    messages = [item for item in response.output if item.type == "message"]
+    assert len(messages) == 1
+    assert messages[0].content[0].logprobs
+
+
+def test_include_logprobs_streaming(openai_client):
+    """Verify the streaming include=message.output_text.logprobs scenario."""
+    events = list(
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Which planet do humans live on? /no_think",
+            stream=True,
+            include=["message.output_text.logprobs"],
+            store=False,
+            max_output_tokens=64,
+        )
+    )
+
+    deltas = [event for event in events if event.type == "response.output_text.delta"]
+    assert deltas
+    assert all(event.logprobs for event in deltas)
+
+    completed = [event for event in events if event.type == "response.completed"]
+    assert len(completed) == 1
+    messages = [item for item in completed[0].response.output if item.type == "message"]
+    assert len(messages) == 1
+    assert messages[0].content[0].logprobs
+
+
+def test_response_extra_body_guided_choice(openai_client):
+    """Verify the vLLM-specific structured_outputs.choice passthrough case."""
+    response = openai_client.responses.create(
+        model=VLLM_MODEL,
+        input="Classify this sentence: I am feeling really sad today. /no_think",
+        stream=False,
+        extra_body={"structured_outputs": {"choice": ["joy", "sadness"]}},
+        store=False,
+        max_output_tokens=16,
+    )
+
+    assert response.output_text.strip() in {"joy", "sadness"}
+
+
+def _create_short_response(openai_client, **options):
+    return openai_client.responses.create(
+        model=VLLM_MODEL,
+        input="Say exactly: RESPONSES-COVERAGE-OK /no_think",
+        temperature=0,
+        max_output_tokens=64,
+        **options,
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="native Responses does not yet echo prompt_cache_key in streamed response objects",
+)
+def test_openai_response_with_prompt_cache_key_streaming(openai_client):
+    """Verify the streaming prompt_cache_key response-shape scenario."""
+    cache_key = "responses-coverage-streaming-cache"
+    events = list(
+        _create_short_response(
+            openai_client,
+            prompt_cache_key=cache_key,
+            stream=True,
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    assert events[0].response.prompt_cache_key == cache_key
+    assert terminal.prompt_cache_key == cache_key
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="native Responses does not yet echo prompt_cache_key in finite response objects",
+)
+def test_openai_response_with_prompt_cache_key_and_previous_response(openai_client):
+    """Verify the prompt_cache_key plus previous_response_id scenario."""
+    cache_key = "responses-coverage-continuation-cache"
+    first = _create_short_response(
+        openai_client,
+        prompt_cache_key=cache_key,
+        store=True,
+    )
+    second = _create_short_response(
+        openai_client,
+        prompt_cache_key=cache_key,
+        previous_response_id=first.id,
+        store=False,
+    )
+
+    assert first.prompt_cache_key == cache_key
+    assert second.prompt_cache_key == cache_key
+    assert second.previous_response_id == first.id
+
+
+def test_openai_response_with_truncation_disabled_streaming(openai_client):
+    """Verify the streaming truncation response-shape scenario."""
+    events = list(
+        _create_short_response(
+            openai_client,
+            truncation="disabled",
+            stream=True,
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    assert events[0].response.truncation == "disabled"
+    assert terminal.truncation == "disabled"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="native Responses currently reports the default top_p instead of the requested value",
+)
+def test_openai_response_with_top_p_streaming(openai_client):
+    """Verify the streaming top_p response-shape scenario."""
+    events = list(
+        _create_short_response(
+            openai_client,
+            top_p=0.8,
+            stream=True,
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    assert events[0].response.top_p == 0.8
+    assert terminal.top_p == 0.8
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="native Responses currently reports the default top_p instead of the requested value",
+)
+def test_openai_response_with_top_p_and_previous_response(openai_client):
+    """Verify the top_p plus previous_response_id scenario."""
+    first = _create_short_response(openai_client, top_p=0.7, store=True)
+    second = _create_short_response(
+        openai_client,
+        top_p=0.7,
+        previous_response_id=first.id,
+        store=False,
+    )
+
+    assert first.top_p == 0.7
+    assert second.top_p == 0.7
+    assert second.previous_response_id == first.id
+
+
+def test_openai_response_with_parallel_tool_calls_disabled_streaming(openai_client):
+    """Verify the streaming parallel_tool_calls=false shape scenario."""
+    events = list(
+        _create_short_response(
+            openai_client,
+            parallel_tool_calls=False,
+            stream=True,
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    assert events[0].response.parallel_tool_calls is False
+    assert terminal.parallel_tool_calls is False
+
+
+def test_openai_response_with_parallel_tool_calls_and_previous_response(openai_client):
+    """Verify the parallel_tool_calls plus continuation scenario."""
+    first = _create_short_response(
+        openai_client,
+        parallel_tool_calls=False,
+        store=True,
+    )
+    second = _create_short_response(
+        openai_client,
+        parallel_tool_calls=False,
+        previous_response_id=first.id,
+        store=False,
+    )
+
+    assert first.parallel_tool_calls is False
+    assert second.parallel_tool_calls is False
+    assert second.previous_response_id == first.id
+
+
+def test_openai_response_with_stream_options_includes_usage(openai_client):
+    """Verify the streaming stream_options and usage scenario."""
+    events = list(
+        _create_short_response(
+            openai_client,
+            stream=True,
+            stream_options={"include_obfuscation": True},
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    assert terminal.usage is not None
+    assert terminal.usage.total_tokens > 0
+
+
+def test_openai_response_with_stream_options_non_streaming(openai_client):
+    """Verify the finite stream_options acceptance scenario."""
+    response = _create_short_response(
+        openai_client,
+        stream_options={"include_obfuscation": True},
+        store=False,
+    )
+
+    assert "RESPONSES-COVERAGE-OK" in response.output_text
+    assert response.usage is not None
+    assert response.usage.total_tokens > 0
+
+
+def test_openai_response_with_stream_options_and_previous_response(openai_client):
+    """Verify the streaming stream_options plus continuation scenario."""
+    first = _create_short_response(openai_client, store=True)
+    events = list(
+        _create_short_response(
+            openai_client,
+            previous_response_id=first.id,
+            stream=True,
+            stream_options={"include_obfuscation": True},
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    assert terminal.previous_response_id == first.id
+    assert terminal.usage is not None
+
+
+def test_invalid_model_raises_not_found_error(openai_client):
+    """Verify the SDK exception contract for an unknown model."""
+    with pytest.raises(NotFoundError) as exc_info:
+        openai_client.responses.create(
+            model="nonexistent-model-responses-coverage",
+            input="Hello",
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="max_tool_calls=0 is not yet rejected at the Responses boundary",
+)
+def test_invalid_max_tool_calls_raises_bad_request(openai_client):
+    """Verify the max_tool_calls lower-bound error scenario."""
+    with pytest.raises(BadRequestError) as exc_info:
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Search for news",
+            tools=[{"type": "web_search"}],
+            max_tool_calls=0,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "max_tool_calls" in str(exc_info.value).lower()
+
+
+def test_invalid_temperature_raises_bad_request(openai_client):
+    """Verify propagation of the backend's sampling-temperature validation."""
+    with pytest.raises(BadRequestError) as exc_info:
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Hello",
+            temperature=-1.0,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "temperature" in str(exc_info.value).lower()
+
+
+def test_invalid_tool_choice_raises_bad_request(openai_client):
+    """Verify the invalid tool_choice error scenario."""
+    with pytest.raises(BadRequestError) as exc_info:
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Hello",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "test_tool",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_choice="invalid_choice",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "tool_choice" in str(exc_info.value).lower()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="selector conflict validation currently runs after previous-response lookup",
+)
+def test_conflicting_previous_response_and_conversation_raises_bad_request(
+    openai_client,
+):
+    """Verify the mutually exclusive conversation selectors scenario."""
+    with pytest.raises(BadRequestError) as exc_info:
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Hello",
+            previous_response_id="resp_conflict_responses_coverage",
+            conversation="conv_conflict_responses_coverage",
+        )
+
+    assert exc_info.value.status_code == 400
+    message = str(exc_info.value)
+    assert "previous_response_id" in message
+    assert "conversation" in message
+
 
 
 if __name__ == "__main__":
