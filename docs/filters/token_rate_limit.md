@@ -9,7 +9,7 @@ Token-denominated rate limiter: reserves an estimated cost at admission, reconci
 
 Experimental: requires the `token-rate-limit-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter delivers the agreed M1/M2/M6 milestone scope, but its parent proposal is not yet `accepted` and open questions remain (HA/clustered-Valkey failure modes, and the relationship to Kuadrant's `TokenRateLimitPolicy` -- see `ai#127`). The configuration surface may change between releases.
 
-Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting` proposal in `praxis-proxy/enhancements`, scoped to this milestone's static header-value matchers and per-rule algorithm choice. CEL matchers, soft-limit tiers, weighted per-type accounting, and configurable estimation strategies are still out of scope (see the module doc comment) -- upstream itself defers the first two; the latter two are deferred to a separate follow-up by design, not by upstream mandate.
+Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting` proposal in `praxis-proxy/enhancements`, scoped to this milestone's static header-value matchers and per-rule algorithm choice. CEL matchers, soft-limit tiers, and weighted per-type accounting are still out of scope (see the module doc comment) -- upstream itself defers the first two; per-type accounting is deferred to a separate follow-up by design, not by upstream mandate. Configurable estimation strategies (M3) are now supported via the `estimation:` block (see [`EstimationConfig`]).
 
 Assumes request identity has already been resolved upstream (this filter doesn't authenticate callers) -- a catch-all rule (no `match:`) reserves quota for every request that reaches it, including probes and health checks. Scope rules with explicit `match:` conditions, or place an identity/auth filter earlier in the pipeline. Tracked as follow-on integration work in `grid#101`.
 
@@ -26,7 +26,14 @@ Assumes request identity has already been resolved upstream (this filter doesn't
 | `rules[].capacity` | integer | one of | Maximum tokens admitted within `window`. |
 | `rules[].capacity` | integer | one of | Maximum tokens held at once (the bucket's ceiling). |
 | `rules[].refill_rate` | number | one of | Tokens refilled per second, up to `capacity`. |
-| `rules[].reserved_tokens` | integer | yes | Fixed token cost reserved at admission time, before actual usage is known. Placeholder pending M3 (configurable estimation strategies). Real deployments will want this derived from request metadata (e.g. `max_tokens`) rather than a single fixed constant -- that's out of scope for this milestone. |
+| `rules[].reserved_tokens` | integer | no | Fixed token cost reserved at admission time, before actual usage is known. Legacy field, retained for backward compatibility: a bare `reserved_tokens: N` is equivalent to `estimation: { strategy: fixed, fallback_estimate: N }`. Mutually exclusive with [`estimation`](Self::estimation) -- specifying both on the same rule is a config error. |
+| `rules[].estimation` | EstimationConfig | no | Configurable estimation strategy for computing the token cost reserved at admission time. Replaces the legacy `reserved_tokens` field with request-metadata-aware strategies. Mutually exclusive with [`reserved_tokens`](Self::reserved_tokens) -- specifying both on the same rule is a config error. Omitting both is also an error. |
+| `rules[].estimation.strategy` | `fixed` \| `max_tokens` \| `input_plus_max_tokens` \| `model_scaled` | yes | Which strategy to use for this rule's cost estimation. |
+| `rules[].estimation.multiplier` | number | no | Safety-margin multiplier applied to the computed estimate. Defaults to 1.0 (no margin). Must be positive and finite. |
+| `rules[].estimation.fallback_estimate` | integer | no | Token count to use when `max_tokens` is absent from the request. Required for `fixed`; optional for body-dependent strategies (if unset and the strategy can't extract a value, the request is admitted without a reservation). |
+| `rules[].estimation.model_multipliers` | object<string, number> | no | Per-model multiplier map for `model_scaled` strategy. |
+| `rules[].estimation.default_multiplier` | number | no | Default multiplier for models not listed in `model_multipliers`. |
+| `rules[].estimation.bytes_per_token` | number | no | Approximate bytes-per-token ratio for `input_plus_max_tokens`. Defaults to 4.0. |
 | `rules[].reservation_timeout` | string | no | How long an admitted-but-never-reconciled reservation (lost request: timeout, connection reset, upstream crash) is tracked as active before that already-reserved-at-admission charge against its estimate becomes irreversibly locked in (sliding-window: folded into the settled total so it survives the window's normal aging-out; token-bucket: the tokens were already decremented at reserve time regardless, this only bounds how long the reservation is tracked as pending). This does **not** defer when the charge first applies -- it applies immediately at admission, same as any other reservation. Answers the proposal's still-open "lost request handling" question for this milestone. Defaults to [`DEFAULT_RESERVATION_TIMEOUT`] when unset. |
 | `backend` | BackendConfig | no | Where every rule's admission state lives: in-process (default, one budget per gateway instance) or a shared Valkey backend (one budget shared across every gateway instance/replica). One backend for the whole filter, not per rule -- rules already share Valkey key-space isolation via `namespace`/rule-name hashing, so per-rule backend selection bought no isolation benefit, only a separate Valkey connection per rule pointed at the same URL. Revisit if a real deployment ever needs to mix in-process and Valkey rules in one filter instance. |
 | `backend.kind` | `memory` \| `valkey` | no | Which backend implementation to use. |
@@ -49,7 +56,10 @@ rules:
     algorithm: sliding_window        # sliding_window | token_bucket
     window: 1h                       # sliding_window only: window duration
     capacity: 100000                 # max tokens admitted (sliding_window) or held (token_bucket)
-    reserved_tokens: 500             # fixed cost reserved per request at admission
+    estimation:                      # M3: configurable estimation strategy
+      strategy: max_tokens           # fixed | max_tokens | input_plus_max_tokens | model_scaled
+      multiplier: 1.2                # optional safety margin (default: 1.0)
+      fallback_estimate: 500         # used when max_tokens absent from request
   - name: team-beta
     match:
       headers:
@@ -57,5 +67,5 @@ rules:
     algorithm: token_bucket
     capacity: 50000
     refill_rate: 50                  # token_bucket only: tokens refilled per second
-    reserved_tokens: 200
+    reserved_tokens: 200             # legacy: equivalent to estimation: { strategy: fixed, fallback_estimate: 200 }
 ```
