@@ -49,9 +49,8 @@
 //! - **CEL-expression matchers**: only static, exact header-value equality matching is implemented (overlapping
 //!   `praxis#189`/`#232`).
 //! - **Composite/multi-dimension keys, per-model keys**: flagged as TBD under the proposal's own M5 goal (see
-//!   `ai#123`/`ai#232`); `ai#129`'s single-header-value keying (one budget applied uniformly per key, fallback to
-//!   global) is implemented per rule, and intentionally does not resolve identity to a key itself -- it keys off
-//!   whatever header value an upstream component has already put there.
+//!   `ai#123`/`ai#232`). This filter supports either one global bucket per rule or one bucket per trusted
+//!   [`AuthenticatedIdentity`] subject. Arbitrary header-derived and compound keys remain deferred.
 //! - **Configurable estimation (M3)**: `reserved_tokens` is a fixed constant per rule, not derived from request
 //!   metadata (e.g. `max_tokens`).
 //! - **Token-type-aware accounting (M4)**: reconciles against `token.total` only; per-type (input/output/cached)
@@ -90,12 +89,15 @@ mod token_bucket_ledger;
 use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::header::HeaderName;
 use metrics::{counter, gauge};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    AuthenticatedIdentity, BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    parse_filter_config,
 };
+use sha2::{Digest as _, Sha256};
 
 use self::{
     backend::{
@@ -105,7 +107,7 @@ use self::{
         ValkeyTokenRateLimitBackend,
     },
     config::{
-        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, MatchConfig, RuleAlgorithm, RuleConfig,
+        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, KeySource, MatchConfig, RuleAlgorithm, RuleConfig,
         TokenRateLimitConfig,
     },
     ledger::{Budget, Ledger, LedgerConfig},
@@ -131,19 +133,13 @@ const META_BUCKET_KEY: &str = "token_rate_limit.bucket_key";
 /// backend/estimate even when other rules exist.
 const META_RULE_INDEX: &str = "token_rate_limit.rule_index";
 
-/// The single budget key every request resolves to in this milestone: all
-/// requests matching a rule share one budget. Kept as a named sentinel
-/// (rather than threading `Option<String>`/`&str` through the backend
-/// APIs) so a future per-request keying mechanism (M5, deliberately out
-/// of scope here -- see the proposal's open question and `ai#790`'s
-/// quota-key design) can slot in without changing the backend trait.
+/// The budget key used by the backward-compatible global key mode.
 const FALLBACK_KEY: &str = "__fallback__";
 
 /// Bound on distinct budget keys retained at once, per rule.
 ///
-/// Always `1` in this milestone (just [`FALLBACK_KEY`]); sized for future
-/// per-request keying, mirroring the soft cap `rate_limit` uses for
-/// per-IP entries.
+/// Authenticated-subject keying can create one entry per verified subject.
+/// This mirrors the soft cap `rate_limit` uses for per-IP entries.
 const MAX_KEYS: usize = 100_000;
 
 /// Bound on a single budget key's length.
@@ -505,6 +501,9 @@ pub struct TokenRateLimitFilter {
     /// Compiled rules, evaluated in configured order.
     rules: Vec<CompiledRule>,
 
+    /// Trusted request identity used to partition every rule's budget.
+    key_source: KeySource,
+
     /// Monotonic clock reference; all timestamps are offsets from this.
     epoch: Instant,
 }
@@ -538,6 +537,7 @@ impl TokenRateLimitFilter {
 
         Ok(Box::new(Self {
             rules,
+            key_source: cfg.key,
             epoch: Instant::now(),
         }))
     }
@@ -555,6 +555,18 @@ impl TokenRateLimitFilter {
     /// by `headers`, alongside its index for reconciliation.
     fn matching_rule(&self, headers: &http::HeaderMap) -> Option<(usize, &CompiledRule)> {
         self.rules.iter().enumerate().find(|(_, rule)| rule.matches(headers))
+    }
+
+    /// Resolve an opaque backend bucket key from trusted request state.
+    fn resolve_key(&self, ctx: &HttpFilterContext<'_>) -> Option<String> {
+        match self.key_source {
+            KeySource::Global => Some(FALLBACK_KEY.to_owned()),
+            KeySource::AuthenticatedSubject => ctx
+                .extensions
+                .get::<AuthenticatedIdentity>()
+                .map(AuthenticatedIdentity::subject_id)
+                .map(subject_bucket_key),
+        }
     }
 
     /// Reclaim idle/orphaned in-process state for one rule and publish
@@ -705,8 +717,8 @@ impl TokenRateLimitFilter {
 /// [`TokenRateLimitFilter::record_admission`] stays within clippy's
 /// argument-count budget.
 struct AdmittedReservation {
-    /// The budget key this reservation was admitted under (see
-    /// [`FALLBACK_KEY`] -- always that sentinel in this milestone).
+    /// The global sentinel or opaque authenticated-subject key under which
+    /// this reservation was admitted.
     key: String,
     /// The backend-issued reservation ID, stashed for later reconciliation.
     reservation_id: u64,
@@ -774,7 +786,16 @@ impl HttpFilter for TokenRateLimitFilter {
             return Ok(FilterAction::Continue);
         };
         Self::cleanup_and_record_state(rule, now_ms);
-        let key = FALLBACK_KEY.to_owned();
+        let Some(key) = self.resolve_key(ctx) else {
+            counter!(
+                "praxis_ai_token_rate_limit_requests_total",
+                "decision" => "denied",
+                "reason" => "missing_authenticated_subject",
+                "rule" => rule.name.clone(),
+            )
+            .increment(1);
+            return Ok(FilterAction::Reject(Rejection::status(401)));
+        };
         let outcome = rule
             .backend
             .reserve(ReserveRequest {
@@ -800,6 +821,12 @@ impl HttpFilter for TokenRateLimitFilter {
         }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Convert a verified subject into a fixed-size, non-identifying backend key.
+fn subject_bucket_key(subject: &str) -> String {
+    let digest = Sha256::digest(subject.as_bytes());
+    format!("subject:v1:{}", URL_SAFE_NO_PAD.encode(digest))
 }
 
 /// Expand one `${ENV_VAR}` reference in a backend URL, if present.
@@ -939,6 +966,7 @@ mod backend_injection_tests {
                 backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
                 reserved_tokens: 1,
             }],
+            key_source: super::KeySource::Global,
             epoch: std::time::Instant::now(),
         };
 
