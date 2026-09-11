@@ -48,6 +48,33 @@ impl TempWorkspace {
             fs::set_permissions(&verify_path, perms)?;
         }
 
+        drop(Command::new("git").arg("init").current_dir(dir.path()).status());
+        drop(
+            Command::new("git")
+                .arg("config")
+                .arg("user.name")
+                .arg("Test")
+                .current_dir(dir.path())
+                .status(),
+        );
+        drop(
+            Command::new("git")
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com")
+                .current_dir(dir.path())
+                .status(),
+        );
+        drop(Command::new("git").arg("add").arg(".").current_dir(dir.path()).status());
+        drop(
+            Command::new("git")
+                .arg("commit")
+                .arg("-m")
+                .arg("initial")
+                .current_dir(dir.path())
+                .status(),
+        );
+
         Ok(Self { dir, expected_content })
     }
 
@@ -67,10 +94,6 @@ impl TempWorkspace {
     }
 
     /// Assert that `result.txt` contains the target string and `./verify.sh` passes.
-    #[expect(
-        dead_code,
-        reason = "harness helper method provided for client workspace verification"
-    )]
     pub(crate) fn assert_successful_completion(&self) {
         let content = self.read_result().expect("failed to read result.txt from workspace");
         assert!(

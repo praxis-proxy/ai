@@ -453,10 +453,16 @@ fn capture_and_respond(
     let (status, resp_body) = responses.get(idx).map_or((500, "exhausted"), |(s, b)| (*s, b.as_str()));
     let reason = reason_phrase(status);
 
+    let content_type = if resp_body.starts_with("data: ") {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+
     let resp = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Length: {}\r\n\
-         Content-Type: application/json\r\n\
+         Content-Type: {content_type}\r\n\
          Connection: close\r\n\
          Server: praxis-test-backend\r\n\
          \r\n\
