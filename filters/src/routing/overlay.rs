@@ -527,9 +527,9 @@ impl RouteSnapshot {
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
         descriptor::validate_local_site(&envelope.overlay.local_site)?;
         let candidates = overlay_to_candidates(&envelope.overlay)?;
+        validate_selection_mode(&candidates, selection_mode)?;
         let group_index = group_index::build(&candidates)?;
         let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
-        validate_selection_mode(&candidates, selection_mode)?;
         warn_if_selection_policy_has_no_groups(selection_mode, &group_index);
 
         Ok(Self {
@@ -555,9 +555,9 @@ impl RouteSnapshot {
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
         let candidates = overlay_to_candidates(&doc)?;
+        validate_selection_mode(&candidates, selection_mode)?;
         let group_index = group_index::build(&candidates)?;
         let generated_at = doc.generated_at.map(|s| Arc::from(s.as_str()));
-        validate_selection_mode(&candidates, selection_mode)?;
         warn_if_selection_policy_has_no_groups(selection_mode, &group_index);
 
         Ok(Self {
@@ -815,7 +815,8 @@ fn validate_unique_stable_ids(candidates: &[RouteCandidate]) -> Result<(), Filte
 ///
 /// Zips the validated candidate list with the original overlay entries
 /// and sets `admission_state`, `rank`, `selection_group`, `selection_tier`,
-/// and `stable_id`.
+/// and `stable_id`. `traffic_weight` is already copied through the validated
+/// [`CandidateConfig`] path.
 /// Called after [`validate_candidates`] so `deny_unknown_fields` on
 /// [`CandidateConfig`] is never bypassed.
 ///
@@ -831,7 +832,6 @@ pub(super) fn enrich_from_overlay(
         }
         c.rank = oc.rank;
         c.selection_group = oc.selection_group;
-        c.traffic_weight = oc.traffic_weight;
         if let Some(t) = &oc.selection_tier {
             if t.trim().is_empty() || t.len() > 128 {
                 return Err(format!("routing: candidate {i}: selection_tier must be 1-128 non-blank bytes").into());
@@ -2927,6 +2927,16 @@ mod tests {
     fn non_weighted_overlay_rejects_weight_fields() {
         let json = br#"{"local_site":"s","selection_policy":{"mode":"random"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","traffic_weight":10}]}"#;
         assert!(RouteSnapshot::from_overlay(json).is_err());
+    }
+
+    #[test]
+    fn non_weighted_overlay_reports_mode_error_before_weight_range_error() {
+        let json = br#"{"local_site":"s","selection_policy":{"mode":"random"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","traffic_weight":1001}]}"#;
+        let error = RouteSnapshot::from_overlay(json).expect_err("non-weighted mode must reject weights");
+        assert_eq!(
+            error.to_string(),
+            "routing: traffic_weight is only valid with weightedRandom selection"
+        );
     }
 
     /// Poll `predicate` every 20ms until it returns `true` or `timeout` elapses.
