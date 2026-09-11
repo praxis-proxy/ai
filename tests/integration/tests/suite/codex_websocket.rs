@@ -20,25 +20,17 @@
 
 use std::{collections::HashMap, ffi::OsStr, process::Stdio, time::Duration};
 
-#[cfg(unix)]
-use nix::{
-    errno::Errno,
-    sys::signal::{Signal, kill},
-    unistd::Pid,
-};
 use praxis_test_utils::{
-    CapturedWsMessage, TempSqlite, WsBackendEvent, WsServerAction, example_config_path, free_port, patch_yaml,
-    start_proxy, start_scripted_websocket_backend_turns,
+    CapturedWsMessage, TempSqlite, WsBackendEvent, WsServerAction, capture_child_output,
+    configure_isolated_process_group, example_config_path, free_port, patch_yaml, start_proxy,
+    start_scripted_websocket_backend_turns,
 };
 use serde::Deserialize;
-use tokio::io::AsyncReadExt as _;
 
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Maximum time allowed for process and pipe cleanup after termination.
-const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Required output from the pinned executable.
 const CODEX_VERSION: &str = "codex-cli 0.144.1";
 /// Fixed prompt shared by the fixture and child process.
@@ -148,32 +140,6 @@ async fn pinned_codex_uses_responses_websocket_through_full_flow() {
     assert_no_unexpected_http(&mut backend).await;
 }
 
-/// A timed-out child must not leave descendants holding its captured pipes.
-#[cfg(unix)]
-#[tokio::test]
-async fn timed_out_child_kills_process_group_and_closes_inherited_pipes() {
-    let mut command = tokio::process::Command::new("/bin/sh");
-    command
-        .arg("-c")
-        .arg("sleep 30 & wait")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    configure_isolated_process_group(&mut command);
-    let child = command.spawn().expect("shell fixture should start");
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(2),
-        capture_child_output(child, Duration::from_millis(25)),
-    )
-    .await
-    .expect("process-group cleanup and pipe collection should be bounded");
-
-    assert!(output.timed_out, "shell fixture should hit the test timeout");
-    assert!(!output.status.success(), "terminated shell fixture should fail");
-}
-
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -197,18 +163,6 @@ struct CodexOutput {
     stderr: String,
     /// UTF-8-lossy standard output.
     stdout: String,
-}
-
-/// Raw child-process output plus timeout state.
-struct CapturedChildOutput {
-    /// Child exit status.
-    status: std::process::ExitStatus,
-    /// Captured standard error.
-    stderr: Vec<u8>,
-    /// Captured standard output.
-    stdout: Vec<u8>,
-    /// Whether the child exceeded its execution timeout.
-    timed_out: bool,
 }
 
 /// Expected facts in the Codex request frame.
@@ -309,96 +263,6 @@ env_key = "PRAXIS_TEST_API_KEY"
         output.stdout, output.stderr
     );
     output
-}
-
-/// Put a child in its own process group so timeout cleanup includes descendants.
-#[cfg(unix)]
-fn configure_isolated_process_group(command: &mut tokio::process::Command) {
-    use std::os::unix::process::CommandExt as _;
-
-    command.as_std_mut().process_group(0);
-}
-
-/// Preserve the cross-platform direct-child behavior where process groups are unavailable.
-#[cfg(not(unix))]
-fn configure_isolated_process_group(_command: &mut tokio::process::Command) {}
-
-/// Wait for a child, terminate its process group on timeout, and collect both pipes.
-async fn capture_child_output(mut child: tokio::process::Child, execution_timeout: Duration) -> CapturedChildOutput {
-    let process_group_id = child.id();
-    let mut stdout = child.stdout.take().expect("stdout should be piped");
-    let mut stderr = child.stderr.take().expect("stderr should be piped");
-    let mut stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.expect("stdout should be readable");
-        bytes
-    });
-    let mut stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.expect("stderr should be readable");
-        bytes
-    });
-
-    let (status, timed_out) = if let Ok(result) = tokio::time::timeout(execution_timeout, child.wait()).await {
-        (result.expect("Codex process should be waitable"), false)
-    } else {
-        terminate_process_group(process_group_id, &mut child);
-        let status = tokio::time::timeout(CHILD_CLEANUP_TIMEOUT, child.wait())
-            .await
-            .expect("killed child should be reaped within the cleanup timeout")
-            .expect("killed child should be waitable");
-        (status, true)
-    };
-
-    let stdout = collect_pipe(&mut stdout_task, process_group_id, "stdout").await;
-    let stderr = collect_pipe(&mut stderr_task, process_group_id, "stderr").await;
-    CapturedChildOutput {
-        status,
-        stderr,
-        stdout,
-        timed_out,
-    }
-}
-
-/// Terminate an isolated child process group, falling back to the direct child.
-fn terminate_process_group(process_group_id: Option<u32>, child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(id) = process_group_id {
-        let id = i32::try_from(id).expect("child PID should fit in i32");
-        match kill(Pid::from_raw(-id), Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => return,
-            Err(error) => panic!("timed-out child process group should be killable: {error}"),
-        }
-    }
-
-    child.start_kill().expect("timed-out child process should be killable");
-}
-
-/// Collect one pipe within a bound, killing inherited descendants if necessary.
-async fn collect_pipe(
-    task: &mut tokio::task::JoinHandle<Vec<u8>>,
-    process_group_id: Option<u32>,
-    name: &str,
-) -> Vec<u8> {
-    if let Ok(result) = tokio::time::timeout(CHILD_CLEANUP_TIMEOUT, &mut *task).await {
-        return result.unwrap_or_else(|error| panic!("{name} reader should finish: {error}"));
-    }
-
-    #[cfg(unix)]
-    if let Some(id) = process_group_id {
-        let id = i32::try_from(id).expect("child PID should fit in i32");
-        match kill(Pid::from_raw(-id), Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => {},
-            Err(error) => panic!("descendant process group holding {name} should be killable: {error}"),
-        }
-    }
-
-    let result = tokio::time::timeout(CHILD_CLEANUP_TIMEOUT, &mut *task).await;
-    let Ok(result) = result else {
-        task.abort();
-        panic!("{name} reader exceeded the cleanup timeout")
-    };
-    result.unwrap_or_else(|error| panic!("{name} reader should finish: {error}"))
 }
 
 /// Load and deserialize the committed deterministic fixture.

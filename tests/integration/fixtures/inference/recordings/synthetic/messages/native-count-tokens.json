@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "scenario_id": "messages/native-count-tokens",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-count-tokens-model",
+    "source_id": "controlled-anthropic-native-count-tokens-passthrough"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages/count_tokens",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "How many tokens does this sentence use?",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-count-tokens-model"
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input_tokens": 14
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages/count_tokens",
+          "headers": {
+            "anthropic-version": [
+              "2023-06-01"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "How many tokens does this sentence use?",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-count-tokens-model"
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input_tokens": 14
+            }
+          }
+        }
+      }
+    }
+  ]
+}

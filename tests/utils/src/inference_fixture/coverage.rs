@@ -1234,6 +1234,7 @@ mod tests {
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
+                vec!["messages_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
@@ -1267,6 +1268,7 @@ mod tests {
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
@@ -1283,9 +1285,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 24);
-        assert_eq!(report.scenarios_total, 24);
-        assert_eq!(report.recordings_total, 29);
+        assert_eq!(report.features_total, 25);
+        assert_eq!(report.scenarios_total, 25);
+        assert_eq!(report.recordings_total, 30);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1295,6 +1297,7 @@ mod tests {
                 "messages/malformed-tool-arguments",
                 "messages/native-basic-nonstream",
                 "messages/native-basic-stream",
+                "messages/native-count-tokens",
                 "messages/native-tool-use",
                 "messages/typed-server-tools",
                 "messages/upstream-error",
@@ -1315,7 +1318,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 24);
+        assert_eq!(manifest.features.len(), 25);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1376,6 +1379,10 @@ mod tests {
                 (
                     &"messages.native.tool_use".to_owned(),
                     &vec!["messages/native-tool-use".to_owned()]
+                ),
+                (
+                    &"messages.native.count_tokens".to_owned(),
+                    &vec!["messages/native-count-tokens".to_owned()]
                 ),
                 (
                     &"responses.native.request".to_owned(),
@@ -1525,7 +1532,15 @@ mod tests {
                 vec![("anthropic", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[10..13] {
+        assert_eq!(
+            manifest.features[10]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![("synthetic", CoverageStatus::SyntheticOnly)]
+        );
+        for feature in &manifest.features[11..14] {
             assert_eq!(
                 feature
                     .providers
@@ -1538,7 +1553,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[13..] {
+        for feature in &manifest.features[14..] {
             assert_eq!(
                 feature
                     .providers

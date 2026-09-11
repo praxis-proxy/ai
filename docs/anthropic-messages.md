@@ -64,6 +64,89 @@ curl http://localhost:8080/v1/messages \
   }'
 ```
 
+### Committed example with credential isolation
+
+[`examples/configs/anthropic/messages-native-vllm.yaml`](../examples/configs/anthropic/messages-native-vllm.yaml)
+is the hardened version of the config above and the one a real Claude Code
+client uses to reach a native vLLM backend. It deliberately omits the
+`anthropic_messages_to_chat_completions[_stream]` translation filters — vLLM
+speaks `/v1/messages` natively, so translation would be lossy — and isolates
+three distinct credentials, each at its own boundary:
+
+- `basic_auth` authenticates the *client* to the gateway. A trusted caller
+  (e.g. Claude Code via `ANTHROPIC_CUSTOM_HEADERS`) presents an
+  `Authorization: Basic ...` gateway credential; the filter verifies it and,
+  with `strip_authorization: true`, removes it so it never reaches vLLM. The
+  password resolves from `GATEWAY_AUTH_PASSWORD` at pipeline build time.
+- `headers` removes the client's native `x-api-key` so a caller's Anthropic
+  key never reaches vLLM.
+- `credential_injection` adds the backend's own `Authorization: Bearer`
+  token from the `VLLM_API_KEY` environment variable, resolved at pipeline
+  build time.
+
+Together these guarantee only authenticated callers are served, the client
+cannot smuggle either of its own credentials to the backend, and vLLM only ever
+sees the server-owned bearer token. The `router` forwards `/v1/messages`,
+`/v1/messages/count_tokens`, and `/` unchanged, so token counting and model
+discovery stay native too.
+
+### Acceptance test: real Claude Code drives native vLLM (issue #1025)
+
+[`tests/integration/tests/suite/claude_code_vllm.rs`](../tests/integration/tests/suite/claude_code_vllm.rs)
+proves the full flow end to end: a pinned real Claude Code executable completes
+a deterministic multi-step coding task while Praxis routes native Anthropic
+Messages traffic straight to a vLLM backend that serves the Anthropic Messages
+API natively.
+
+```text
+Claude Code ─► Praxis (messages-native-vllm.yaml) ─► vLLM
+```
+
+The test asserts only what a live run uniquely proves: the client completes the
+task through Praxis against a real backend — a non-timed-out, successful exit,
+the exact uppercase-derived output file, a harness-owned verification marker
+written only when the task's `verify.sh` confirms the compare, and a non-empty
+final summary in the client's stream-json output. Wire fidelity — native
+passthrough (no `chat/completions` reshaping, the exact served model on every
+inference body), credential isolation (the client's native `x-api-key` and its
+gateway `Authorization: Basic` credential are both stripped so only the injected
+backend bearer reaches vLLM, and an unauthenticated caller is rejected by
+`basic_auth`), and native token counting — is proven deterministically against
+controlled fake backends in
+[`tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs`](../tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs),
+not observed in the live run.
+
+The test is gated on live infrastructure and skips unless every required
+variable is set. Run it locally against your own pinned binary and backend:
+
+```console
+PRAXIS_TEST_CLAUDE_CODE_BIN=/absolute/path/to/claude \
+PRAXIS_TEST_VLLM_BASE_URL=http://127.0.0.1:8000 \
+PRAXIS_TEST_VLLM_MODEL=<exact-served-model-name> \
+VLLM_API_KEY=<backend-bearer-token> \
+  cargo test -p praxis-tests-integration --test suite \
+  claude_code_vllm::pinned_claude_code_drives_native_vllm_through_full_flow -- --exact
+```
+
+Set `PRAXIS_TEST_CLAUDE_CODE_NETNS` (and `PRAXIS_TEST_LISTEN_ADDRESS` to the
+host-side veth address, which Praxis then binds) to launch the client inside a
+restricted Linux network namespace that can reach only Praxis, proving it cannot
+bypass the proxy.
+
+**Pins and qualification.** The pinned Claude Code version and launch flags, the
+vLLM image digest, served model, and startup request matrix live in
+[`tests/integration/fixtures/claude-code-cli/pin.toml`](../tests/integration/fixtures/claude-code-cli/pin.toml).
+The `claude-code-native-vllm` job in
+[`.github/workflows/vllm-integration.yaml`](../.github/workflows/vllm-integration.yaml)
+runs the test exactly once (no retry) on `workflow_dispatch` only, so PR and
+merge-queue CI stay green while qualification is pending. Before it can run, a
+model must pass the consecutive qualification runs recorded in the manifest, the
+`TBD-at-qualification` pins (served model, image digest, revision, Claude Code
+archive url + sha256) must be filled in, and the manifest `status` set to
+`qualified`; the job also requires the `VLLM_API_KEY` repository secret. Until
+then it fails fast with an explanatory error rather than running against
+unqualified pins.
+
 ## Passthrough to Anthropic API
 
 Route to `api.anthropic.com` with credential

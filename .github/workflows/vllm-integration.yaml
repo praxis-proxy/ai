@@ -240,6 +240,242 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
+  # Pinned Claude Code drives NATIVE Anthropic Messages passthrough to real vLLM
+  # (issue #1025)
+  #
+  # A pinned real Claude Code executable completes a deterministic coding task
+  # while Praxis routes native Anthropic Messages traffic (/v1/messages,
+  # /v1/messages/count_tokens, /v1/models) straight to a vLLM backend that
+  # serves the Anthropic Messages API natively — with NO
+  # anthropic_messages_to_chat_completions translation.
+  #
+  # Gated to workflow_dispatch: this job is reproducibility-critical and depends
+  # on a qualified model + a pinned Claude Code archive recorded in
+  # tests/integration/fixtures/claude-code-cli/pin.toml. Until that manifest is
+  # qualified (status = "qualified" and no TBD pins remain), the job fails fast
+  # with an explanatory error rather than running against unqualified pins. It
+  # never runs on push / pull_request / merge_group, so PR and merge-queue CI
+  # stay green while qualification is pending. Requires the VLLM_API_KEY secret.
+  # ----------------------------------------------------------------------------
+
+  claude-code-native-vllm:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # Backend bearer token Praxis injects toward vLLM and vLLM requires. The
+      # acceptance test also reads this to confirm the client's gateway secret
+      # is swapped for it and never leaks upstream.
+      VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Load and qualify pins
+        run: |
+          # Single source of truth: the committed pin manifest. Export the pins
+          # this job needs and FAIL FAST if the manifest is not qualified or
+          # still carries TBD placeholders, so a premature dispatch produces a
+          # clear, actionable error instead of a confusing runtime failure.
+          python3 - "$GITHUB_ENV" <<'PY'
+          import pathlib, sys, tomllib
+
+          manifest = pathlib.Path("tests/integration/fixtures/claude-code-cli/pin.toml")
+          data = tomllib.loads(manifest.read_text())
+          claude, vllm, qual = data["claude_code"], data["vllm"], data["qualification"]
+          exported = {
+              "CLAUDE_URL": claude["url"],
+              "CLAUDE_SHA256": claude["sha256"],
+              "CLAUDE_VERSION": claude["version"],
+              "CLAUDE_PLATFORM": claude["platform"],
+              "VLLM_IMAGE_PIN": vllm["image"],
+              "VLLM_SERVED_MODEL": vllm["served_model_name"],
+              "VLLM_FLAGS": " ".join(vllm["launch"]["flags"]),
+          }
+          with open(sys.argv[1], "a", encoding="utf-8") as env_file:
+              for key, value in exported.items():
+                  env_file.write(f"{key}={value}\n")
+
+          unresolved = sorted(key for key, value in exported.items() if "TBD" in value)
+          if qual["status"] != "qualified" or unresolved:
+              print(
+                  f"::error::pin.toml is not ready (status={qual['status']!r}, "
+                  f"unresolved={unresolved}); complete the qualification described in "
+                  "tests/integration/fixtures/claude-code-cli/pin.toml "
+                  "(select a model that passes the required consecutive runs, then fill "
+                  "in the served model, image digest, revision, and the Claude Code "
+                  "archive url + sha256) before dispatching this job.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
+
+      - name: Install and checksum pinned Claude Code executable
+        run: |
+          set -euo pipefail
+          # The pinned archive is a single self-contained executable. If the
+          # qualified pin is a tarball instead, add extraction here alongside the
+          # checksum during qualification.
+          dest="$RUNNER_TEMP/claude"
+          curl -fsSL "$CLAUDE_URL" -o "$dest"
+          echo "${CLAUDE_SHA256}  ${dest}" | sha256sum -c -
+          chmod +x "$dest"
+          # Confirm the pinned version before anything else uses the binary.
+          "$dest" --version | grep -F "$CLAUDE_VERSION"
+          echo "PRAXIS_TEST_CLAUDE_CODE_BIN=$dest" >> "$GITHUB_ENV"
+
+      - name: Start native-Anthropic vLLM with backend auth
+        run: |
+          set -euo pipefail
+          if [ -z "${VLLM_API_KEY:-}" ]; then
+            echo "::error::VLLM_API_KEY secret is not set; the backend requires it"
+            exit 1
+          fi
+          docker pull "$VLLM_IMAGE_PIN"
+          # Native Anthropic Messages serving (/v1/messages,
+          # /v1/messages/count_tokens) is enabled by the pinned $VLLM_FLAGS and
+          # validated during qualification. --api-key makes vLLM require the same
+          # bearer token Praxis injects, so unauthenticated upstream calls fail.
+          # shellcheck disable=SC2086
+          docker run -d --name vllm \
+            -p 8000:8000 \
+            --privileged=true \
+            "$VLLM_IMAGE_PIN" \
+            $VLLM_FLAGS \
+            --served-model-name "$VLLM_SERVED_MODEL" \
+            --api-key "$VLLM_API_KEY"
+
+      - name: Preflight native endpoints
+        run: |
+          set -euo pipefail
+          echo "Waiting for vLLM..."
+          deadline=$((SECONDS + 900))
+          until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; do
+            if ! docker inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
+              echo "::error::vLLM container exited before readiness"
+              docker logs vllm 2>&1 || true
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::vLLM did not become ready within 900s"
+              docker logs vllm 2>&1 || true
+              exit 1
+            fi
+            sleep 5
+          done
+          # Prove the native Messages surface is up and gated by the bearer token.
+          auth="Authorization: Bearer ${VLLM_API_KEY}"
+          curl -sf -H "$auth" http://127.0.0.1:8000/v1/models > /dev/null
+          curl -sf -H "$auth" -H 'content-type: application/json' \
+            -d "{\"model\":\"${VLLM_SERVED_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+            http://127.0.0.1:8000/v1/messages/count_tokens > /dev/null
+          echo "native endpoints ready"
+
+      - name: Build Praxis and acceptance test
+        run: |
+          cargo build -p praxis-ai-proxy
+          cargo test -p praxis-tests-integration --test suite --no-run
+
+      - name: Create restricted network namespace
+        run: |
+          set -euo pipefail
+          NS=praxis-claude-ns
+          sudo ip netns add "$NS"
+          sudo ip link add veth-host type veth peer name veth-ns
+          sudo ip link set veth-ns netns "$NS"
+          # The client lives in the namespace and reaches Praxis over the veth
+          # pair, so Praxis binds the host-side veth address (10.200.0.1) rather
+          # than loopback. vLLM stays host-side on loopback (127.0.0.1:8000).
+          sudo ip addr add 10.200.0.1/24 dev veth-host
+          sudo ip link set veth-host up
+          sudo ip -n "$NS" addr add 10.200.0.2/24 dev veth-ns
+          sudo ip -n "$NS" link set veth-ns up
+          sudo ip -n "$NS" link set lo up
+          # No default route and no DNS: the client can reach ONLY 10.200.0.1,
+          # so it cannot bypass Praxis to talk to anything else. Prove it.
+          if sudo ip -n "$NS" route show default | grep -q .; then
+            echo "::error::namespace has a default route; egress is not blocked"
+            sudo ip -n "$NS" route show
+            exit 1
+          fi
+          echo "NS=$NS" >> "$GITHUB_ENV"
+          echo "restricted namespace ready"
+
+      - name: Run Claude Code native-vLLM acceptance test (once, no retry)
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+        run: |
+          set -uo pipefail
+          # Locate the already-built suite binary without recompiling.
+          TEST_BIN=$(cargo test -p praxis-tests-integration --test suite --no-run \
+              --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "suite") | .executable' \
+            | tail -n1)
+          if [ -z "$TEST_BIN" ]; then
+            echo "::error::could not locate the compiled suite test binary"
+            exit 1
+          fi
+          # The child enters the network namespace via `ip netns exec`, which
+          # needs CAP_NET_ADMIN, so the test binary runs under sudo. Only the
+          # acceptance test runs, exactly once, with no retry.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_drives_native_vllm_through_full_flow \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Acceptance log tail on failure
+        if: failure()
+        run: |
+          # Interleaved client and Praxis diagnostics for the run. The gateway
+          # and native secrets are test constants, and Praxis does not emit auth
+          # headers at the default log level, so this log is safe to surface.
+          tail -n 400 "$RUNNER_TEMP/acceptance.log" 2>/dev/null || echo "no acceptance log captured"
+
+      - name: vLLM container logs on failure
+        if: failure()
+        run: |
+          # Surface a tail inline and persist the full log for artifact upload.
+          docker logs vllm > "$RUNNER_TEMP/vllm.log" 2>&1 || true
+          tail -n 400 "$RUNNER_TEMP/vllm.log" 2>/dev/null || true
+
+      - name: Upload acceptance diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: claude-code-native-vllm-diagnostics
+          # The gateway and native secrets are test constants and Praxis does not
+          # emit auth headers at the default log level, so these logs are safe to
+          # retain.
+          path: |
+            ${{ runner.temp }}/acceptance.log
+            ${{ runner.temp }}/vllm.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Tear down network namespace
+        if: always()
+        run: |
+          sudo ip netns del praxis-claude-ns 2>/dev/null || true
+          sudo ip link del veth-host 2>/dev/null || true
+
+      - name: Stop vLLM
+        if: always()
+        run: docker rm -f vllm || true
+
+  # ----------------------------------------------------------------------------
   # Responses API integration tests with PostgreSQL store backend
   # ----------------------------------------------------------------------------
 

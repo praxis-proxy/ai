@@ -89,7 +89,7 @@ zeroize = "1.9.0"
 
 # Praxis core dependencies
 praxis-core = { version = "0.5.4", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.5.4", package = "praxis-proxy-filter" }
+praxis-filter = { version = "0.5.4", package = "praxis-proxy-filter", features = ["basic-auth-filter"] }
 praxis-protocol = { version = "0.5.4", package = "praxis-proxy-protocol" }
 praxis-tls = { version = "0.5.4", package = "praxis-proxy-tls" }
 praxis = { version = "0.5.4", package = "praxis-proxy" }

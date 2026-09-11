@@ -1,0 +1,85 @@
+# Claude Code + native-vLLM acceptance pin manifest (issue #1025)
+#
+# This is the single source of truth for the pinned `claude-code-native-vllm`
+# acceptance test (`tests/integration/tests/suite/claude_code_vllm.rs`) and its
+# CI job (`.github/workflows/vllm-integration.yaml`). Every value here is
+# reproducibility-critical: the test proves a pinned real Claude Code executable
+# completes a deterministic coding task while Praxis routes NATIVE Anthropic
+# Messages traffic to a pinned real vLLM backend, with no translation.
+#
+# Values marked `TBD-at-qualification` are determined by the qualification run
+# described under [qualification] and MUST be filled in — together with the
+# matching constants in claude_code_vllm.rs — before CI executes the test.
+
+[claude_code]
+# Version substring asserted from `claude --version`. Keep in sync with
+# CLAUDE_CODE_VERSION in claude_code_vllm.rs.
+version = "2.0.1"
+# Platform triple the pinned archive targets (e.g. "x86_64-unknown-linux-gnu").
+platform = "x86_64-unknown-linux-gnu"
+# Download URL for the pinned archive/executable.
+url = "TBD-at-qualification"
+# SHA-256 of the downloaded archive/executable; CI verifies this before running.
+sha256 = "TBD-at-qualification"
+
+# Pinned launch flags (excluding `-p`, the prompt, `--model`, `--allowedTools`,
+# and `--mcp-config`, which the test supplies from the workspace). Keep in sync
+# with LAUNCH_FLAGS in claude_code_vllm.rs. Re-validate every flag against the
+# pinned executable during qualification.
+[claude_code.launch]
+allowed_tools = ["Read", "Edit", "Bash(./verify.sh:*)"]
+flags = [
+  "--permission-mode", "acceptEdits",
+  "--strict-mcp-config",
+  "--output-format", "stream-json",
+  "--verbose",
+  "--max-turns", "8",
+]
+
+[vllm]
+# Container image pinned by digest. The existing CPU image below is a starting
+# candidate only; the served model MUST pass qualification (see below) before it
+# is trusted for this test — Qwen3-0.6B / 4096 context is not assumed capable of
+# Claude Code's prompt and reliable tool use.
+image = "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
+# Exact served model name. Set via `--served-model-name`; every model-selection
+# surface in the test (--model and the ANTHROPIC_*_MODEL env vars) pins this.
+served_model_name = "TBD-at-qualification"
+# Model weight revision / commit the image serves.
+model_revision = "TBD-at-qualification"
+# Serving parameters.
+tool_call_parser = "hermes"
+context_length = 4096
+seed = 0
+
+# vLLM launch flags recorded for reproducibility. Native Anthropic Messages
+# serving (`/v1/messages`, `/v1/messages/count_tokens`) must be enabled.
+#
+# `--model` is REQUIRED: without it vLLM has no weights to load and never becomes
+# ready. It is left `TBD-at-qualification` so the CI "unresolved TBD" fail-fast
+# gate trips until qualification pins the exact model repo/revision. Do NOT add
+# `--served-model-name` here; the CI docker run appends it separately from
+# `served_model_name` above, and duplicating it would pass the flag twice.
+[vllm.launch]
+flags = [
+  "--model", "TBD-at-qualification",
+  "--max-model-len", "4096",
+  "--enable-auto-tool-choice",
+  "--tool-call-parser", "hermes",
+  "--seed", "0",
+]
+
+# Allowed startup request matrix. The upstream wire tap forwards only these
+# native paths to vLLM; any other path is rejected as a documented nonfatal 404.
+# Unexpected INFERENCE paths (/v1/messages, /v1/messages/count_tokens) or any
+# translation-shaped /v1/chat/completions request fail the test.
+[startup_matrix]
+allowed_prefixes = ["/v1/messages", "/v1/models", "/health"]
+
+[qualification]
+# Before CI runs this test once (no retry), select a model that passes at least
+# 20 consecutive qualification runs of the full acceptance flow without retries.
+# Record the passing model's served name, image digest, and revision above.
+consecutive_passes_required = 20
+retries_allowed = 0
+status = "pending"
