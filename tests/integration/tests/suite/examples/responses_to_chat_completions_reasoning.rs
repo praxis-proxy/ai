@@ -81,6 +81,101 @@ fn reasoning_dialect_promotes_raw_reasoning_to_a_reasoning_item() {
 }
 
 #[test]
+fn reasoning_only_completion_is_returned_as_a_reasoning_item() {
+    // A completed choice whose only output is raw reasoning (content null) must
+    // translate into a reasoning output item, not be rejected as empty.
+    let chat_response = serde_json::json!({
+        "id": "chatcmpl_reasoning_only",
+        "object": "chat.completion",
+        "model": "deepseek-r1",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "reasoning": "The user only wants me to think."
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "reasoning_only_completion",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "deepseek-r1",
+        "input": "Think about 2+2 but do not answer.",
+        "reasoning": {"effort": "medium"},
+        "stream": false,
+        "store": false
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(response["status"], "completed");
+    let output = response["output"].as_array().expect("output should be an array");
+    assert_eq!(
+        output.len(),
+        1,
+        "reasoning-only completion should yield exactly one item"
+    );
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[0]["content"][0]["text"], "The user only wants me to think.");
+    assert_eq!(
+        output[0]["summary"],
+        serde_json::json!([]),
+        "raw reasoning must never leak into the summary array"
+    );
+}
+
+#[test]
+fn non_object_reasoning_block_is_rejected_before_forwarding() {
+    let backend = StatefulCapturingBackend::new(vec![(
+        200,
+        serde_json::json!({
+            "id": "chatcmpl_unused",
+            "object": "chat.completion",
+            "model": "deepseek-r1",
+            "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        })
+        .to_string(),
+    )])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "non_object_reasoning_rejected",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "deepseek-r1",
+        "input": "What is 2+2?",
+        "reasoning": true,
+        "stream": false,
+        "store": false
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("error response should be JSON");
+
+    assert_eq!(parse_status(&raw), 400);
+    assert_eq!(response["error"]["code"], "invalid_request_error");
+    assert!(
+        backend.requests().is_empty(),
+        "a malformed reasoning block must not reach the backend"
+    );
+}
+
+#[test]
 fn reasoning_summary_request_is_rejected_before_forwarding() {
     let backend = StatefulCapturingBackend::new(vec![(
         200,

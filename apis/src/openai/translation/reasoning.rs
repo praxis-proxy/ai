@@ -93,8 +93,14 @@ pub(crate) fn validate_requested_reasoning(
     request: &Map<String, Value>,
     options: &ReasoningOptions,
 ) -> Result<(), TranslationError> {
-    let Some(reasoning) = request.get("reasoning").and_then(Value::as_object) else {
-        return Ok(());
+    let reasoning = match request.get("reasoning") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Object(reasoning)) => reasoning,
+        Some(other) => {
+            return Err(TranslationError::MalformedReasoningBlock(
+                json_type_name(other).to_owned(),
+            ));
+        },
     };
 
     if requested_summary(reasoning)?.is_some() && !options.dialect.supports_safe_summary() {
@@ -129,6 +135,18 @@ pub(crate) fn extract_reasoning_item(
         });
     }
     Ok(Some(reasoning_item(reasoning_item_id, status, text)))
+}
+
+/// Report whether a Chat Completions message carries extractable raw reasoning
+/// for the configured dialect.
+pub(crate) fn message_has_reasoning(
+    message: Option<&Value>,
+    options: &ReasoningOptions,
+) -> Result<bool, TranslationError> {
+    let Some(message) = message.and_then(Value::as_object) else {
+        return Ok(false);
+    };
+    Ok(resolve_raw_reasoning(message, options.dialect)?.is_some())
 }
 
 /// Resolve raw reasoning text from a Chat Completions message for a dialect.

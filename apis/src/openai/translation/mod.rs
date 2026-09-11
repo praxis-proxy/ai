@@ -1991,6 +1991,31 @@ mod tests {
     }
 
     #[test]
+    fn non_object_reasoning_block_is_rejected() {
+        for value in [json!(true), json!(1), json!("auto"), json!([])] {
+            let error = validate_reasoning(
+                &json!({"model": "m", "input": "hi", "reasoning": value}),
+                &vllm_options(),
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains("reasoning must be an object or null"),
+                "expected malformed reasoning-block rejection, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_reasoning_block_is_accepted() {
+        validate_reasoning(
+            &json!({"model": "m", "input": "hi", "reasoning": Value::Null}),
+            &vllm_options(),
+        )
+        .expect("null reasoning block is not a request");
+    }
+
+    #[test]
     fn rehydrated_reasoning_input_item_is_dropped_not_rejected() {
         let mapped = map(&json!({
             "model": "m",
@@ -2150,6 +2175,60 @@ mod tests {
         let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
 
         assert_eq!(mapped["output"][0]["type"], "message");
+    }
+
+    /// A completed choice whose only output is raw reasoning (no content,
+    /// refusal, or tool calls).
+    fn vllm_reasoning_only_response() -> Value {
+        json!({
+            "id": "chatcmpl-r",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "reasoning": "only chain of thought"
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn reasoning_only_completion_is_accepted_as_output() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_only_response();
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["status"], "completed");
+        let output = mapped["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "only chain of thought");
+    }
+
+    #[test]
+    fn reasoning_only_completion_rejected_without_dialect() {
+        // Under the `none` dialect the reasoning is not extractable, so the
+        // completed choice truthfully carries no output and must be rejected.
+        let request = json!({"model": "m", "input": "hi"});
+        let context = super::chat_completions::ResponseContext::from_responses_request(&request, "abc".to_owned(), 0)
+            .with_completed_at(1);
+        let response = vllm_reasoning_only_response();
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("first choice message has no supported output"),
+            "expected empty-output rejection, got: {error}"
+        );
     }
 
     #[test]

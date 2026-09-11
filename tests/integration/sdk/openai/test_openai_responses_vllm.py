@@ -55,6 +55,9 @@ IRR_STREAMING_CONFIG_PATH = (
 CHAT_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/responses-to-chat-completions.yaml"
 )
+REASONING_CONFIG_PATH = (
+    "examples/configs/openai/responses/responses-to-chat-completions-reasoning.yaml"
+)
 COMPACT_CONFIG_PATH = "examples/configs/openai/responses/compact.yaml"
 WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/web-search-chat-completions.yaml"
@@ -223,6 +226,21 @@ def _write_irr_streaming_config(praxis_port: int) -> str:
 def _write_chat_streaming_config(praxis_port: int, db_path: str) -> str:
     """Patch the shipped Responses-to-Chat example for live vLLM."""
     with open(CHAT_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+def _write_reasoning_config(praxis_port: int, db_path: str) -> str:
+    """Patch the shipped reasoning-dialect example for live vLLM."""
+    with open(REASONING_CONFIG_PATH) as f:
         config = f.read()
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
@@ -730,6 +748,45 @@ def chat_streaming_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
+def reasoning_proxy(tmp_path_factory, request):
+    """Start the reasoning-dialect example against live vLLM."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-reasoning")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_reasoning_config(port, db_path)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Reasoning Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
 def compaction_server():
     """Start a deterministic summarization backend for compact callouts."""
     port = _free_port()
@@ -809,6 +866,17 @@ def chat_streaming_client(chat_streaming_proxy):
     """Return an SDK client using Responses-to-Chat stream translation."""
     return OpenAI(
         base_url=f"http://127.0.0.1:{chat_streaming_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def reasoning_client(reasoning_proxy):
+    """Return an SDK client using the reasoning-dialect example."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{reasoning_proxy}/v1",
         api_key="test",
         max_retries=0,
         timeout=300,
@@ -1623,6 +1691,66 @@ class TestOpenAIResponsesVLLM:
             expected_text="STREAM-OK",
         )
         assert terminal.status == "completed"
+
+
+class TestResponsesReasoningVLLM:
+    """Reasoning-dialect translation exercised through the OpenAI SDK."""
+
+    def test_reasoning_summary_request_is_rejected(self, reasoning_client):
+        """vLLM has no safe-summary contract, so a summary request is a 400."""
+        with pytest.raises(BadRequestError) as exc_info:
+            reasoning_client.responses.create(
+                model=VLLM_MODEL,
+                input="What is 2+2?",
+                reasoning={"summary": "auto"},
+                store=False,
+                max_output_tokens=64,
+            )
+        assert exc_info.value.status_code == 400
+
+    def test_non_object_reasoning_is_rejected(self, reasoning_client):
+        """A proxy-owned `reasoning` field that is neither object nor null is a 400."""
+        response = httpx.post(
+            f"{str(reasoning_client.base_url).rstrip('/')}/responses",
+            headers={"Authorization": "Bearer test"},
+            json={
+                "model": VLLM_MODEL,
+                "input": "What is 2+2?",
+                "reasoning": True,
+                "store": False,
+            },
+            timeout=30,
+        )
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+
+    def test_reasoning_dialect_promotes_raw_reasoning_to_an_item(
+        self, reasoning_client,
+    ):
+        """A thinking response yields a reasoning item, never a leaked summary."""
+        response = reasoning_client.responses.create(
+            model=VLLM_MODEL,
+            input="What is 2+2? Think briefly, then answer.",
+            reasoning={"effort": "low"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status in ("completed", "incomplete"), response.status
+        output_types = [item.type for item in response.output]
+        assert output_types, "response must carry at least one output item"
+
+        for item in response.output:
+            if item.type != "reasoning":
+                continue
+            # Raw chain-of-thought lives only in the reasoning item content and
+            # must never leak into the summary array.
+            assert item.summary == [], item.summary
+            assert item.content, "reasoning item must carry content"
+            assert item.content[0].type == "reasoning_text"
+            assert item.content[0].text
 
 
 class TestResponsesCompactionVLLM:

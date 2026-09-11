@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
 
-use super::reasoning::{ReasoningOptions, extract_reasoning_item, reasoning_item_id, requested_summary};
+use super::reasoning::{
+    ReasoningOptions, extract_reasoning_item, message_has_reasoning, reasoning_item_id, requested_summary,
+};
 use crate::web_search::is_web_search_tool_type;
 
 // -----------------------------------------------------------------------------
@@ -294,6 +296,9 @@ pub(crate) enum TranslationError {
         /// The observed JSON type.
         actual: String,
     },
+    /// The `reasoning` request field was present but not an object or null.
+    #[error("reasoning must be an object or null, found {0}")]
+    MalformedReasoningBlock(String),
 }
 
 /// Borrowed canonical request fields that supersede their original request values.
@@ -555,6 +560,8 @@ fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Tran
         Some("function_call_output") => append_tool_output(messages, obj)?,
         Some("message") => append_message_item(messages, obj)?,
         Some("compaction") => append_compaction_item(messages, obj)?,
+        // Cross-turn reasoning passthrough is Responses-native (encrypted
+        // reasoning items) outside the scope of Chat Completions translation.
         Some("reasoning") => {},
         None if obj.contains_key("role") || obj.contains_key("content") => append_message_item(messages, obj)?,
         None => return Err(TranslationError::UnsupportedInputItemType("unknown".to_owned())),
@@ -1206,7 +1213,7 @@ pub(crate) fn chat_response_to_response_resource(
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Chat Completions response"))?;
 
-    let finish_reason = validate_chat_response(obj)?;
+    let finish_reason = validate_chat_response(obj, &context.reasoning_options)?;
     let status = response_status(finish_reason);
     let incomplete_details = incomplete_details(finish_reason);
     let output = build_output_items(obj, context, status)?;
@@ -1224,7 +1231,10 @@ pub(crate) fn chat_response_to_response_resource(
 }
 
 /// Validate the minimum successful Chat Completions shape used by translation.
-fn validate_chat_response(obj: &Map<String, Value>) -> Result<&str, TranslationError> {
+fn validate_chat_response<'a>(
+    obj: &'a Map<String, Value>,
+    reasoning_options: &ReasoningOptions,
+) -> Result<&'a str, TranslationError> {
     let choices = obj
         .get("choices")
         .and_then(Value::as_array)
@@ -1246,12 +1256,16 @@ fn validate_chat_response(obj: &Map<String, Value>) -> Result<&str, TranslationE
         ));
     }
 
-    validate_chat_message(choice, finish_reason)?;
+    validate_chat_message(choice, finish_reason, reasoning_options)?;
     Ok(finish_reason)
 }
 
 /// Validate the assistant message fields that the translator consumes.
-fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Result<(), TranslationError> {
+fn validate_chat_message(
+    choice: &Map<String, Value>,
+    finish_reason: &str,
+    reasoning_options: &ReasoningOptions,
+) -> Result<(), TranslationError> {
     let message = choice
         .get("message")
         .and_then(Value::as_object)
@@ -1267,11 +1281,12 @@ fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Re
     let has_content = validate_chat_content(message)?;
     let has_refusal = validate_chat_refusal(message)?;
     let has_tool_calls = validate_chat_tool_calls(message, finish_reason)?;
+    let has_reasoning = message_has_reasoning(choice.get("message"), reasoning_options)?;
     // A completed terminal must carry at least one translatable output; without
     // one the translator would synthesize a counterfeit `completed` response with
     // an empty output array. Incomplete terminals (length, content_filter)
     // truthfully carry empty output, so they are exempt.
-    let has_output = has_content || has_refusal || has_tool_calls;
+    let has_output = has_content || has_refusal || has_tool_calls || has_reasoning;
     if response_status(finish_reason) == "completed" && !has_output {
         return Err(TranslationError::InvalidChatResponse(
             "first choice message has no supported output",
