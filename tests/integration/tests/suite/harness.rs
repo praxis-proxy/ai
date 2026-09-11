@@ -67,19 +67,23 @@ impl TempWorkspace {
     }
 
     /// Assert that `result.txt` contains the target string and `./verify.sh` passes.
+    #[expect(
+        dead_code,
+        reason = "harness helper method provided for client workspace verification"
+    )]
     pub(crate) fn assert_successful_completion(&self) {
-        let content = self.read_result().unwrap_or_default();
+        let content = self.read_result().expect("failed to read result.txt from workspace");
         assert!(
             content.contains(&self.expected_content),
-            "result.txt should contain expected content '{}', got: '{}'",
+            "workspace result.txt should contain expected string '{}', got: '{}'",
             self.expected_content,
             content
         );
 
-        let status = self.run_verification().expect("verify.sh execution failed");
+        let status = self.run_verification().expect("execution of verify.sh script failed");
         assert!(
             status.success(),
-            "verify.sh should exit with status 0, got: {:?}",
+            "workspace verify.sh script should exit with status 0, got exit code: {:?}",
             status.code()
         );
     }
