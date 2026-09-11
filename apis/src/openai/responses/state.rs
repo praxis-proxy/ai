@@ -324,6 +324,10 @@ pub(crate) struct ResponsesState {
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
 
+    /// Number of leading messages already persisted by a provider-owned
+    /// conversation. Internal continuations send only the remaining delta.
+    pub provider_history_len: usize,
+
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
     pub parallel_tool_calls: bool,
@@ -615,6 +619,7 @@ impl Default for ResponsesState {
             deferred_stream_done: false,
             mcp_tool_map: HashMap::new(),
             messages: Vec::new(),
+            provider_history_len: 0,
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
             pending_approvals: Vec::new(),
@@ -665,6 +670,7 @@ impl ResponsesState {
             input: messages.clone(),
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
+            provider_history_len: 0,
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
