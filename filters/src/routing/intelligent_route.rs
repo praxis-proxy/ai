@@ -2729,6 +2729,7 @@ mod tests {
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
                     site: site1.to_owned(),
+                    traffic_weight: None,
                 },
                 CandidateConfig {
                     cluster: cluster2.to_owned(),
@@ -2737,6 +2738,7 @@ mod tests {
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
                     site: site2.to_owned(),
+                    traffic_weight: None,
                 },
             ])
             .unwrap(),
@@ -2753,6 +2755,7 @@ mod tests {
                 kind: CapabilityKind::InferenceModel,
                 name: "llama".to_owned(),
                 site: "site-a".to_owned(),
+                traffic_weight: None,
             }])
             .unwrap(),
             Arc::from("site-a"),
@@ -2801,6 +2804,7 @@ mod tests {
                 name: Arc::from("llama"),
                 rank: None,
                 selection_group: None,
+                traffic_weight: None,
                 selection_tier: None,
                 site: Arc::from("s"),
                 stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", "s", cluster),
