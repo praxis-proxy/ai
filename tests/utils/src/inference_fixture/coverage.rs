@@ -1214,7 +1214,7 @@ mod tests {
                 "messages_native_passthrough",
                 "responses_agentic_loop",
                 "responses_native_passthrough",
-                "responses_to_chat_completions",
+                "openai_responses_to_chat_completions",
             ]
         );
         assert_eq!(
@@ -1238,16 +1238,16 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
-                vec!["responses_to_chat_completions"],
-                vec!["responses_to_chat_completions"],
-                vec!["responses_to_chat_completions"],
-                vec!["responses_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
-                vec!["responses_to_chat_completions"],
-                vec!["responses_to_chat_completions"],
-                vec!["responses_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
             ]
         );
         assert_eq!(

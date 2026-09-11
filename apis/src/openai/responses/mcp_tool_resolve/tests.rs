@@ -1,0 +1,4276 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
+//! Unit tests for the `openai_mcp_tool_resolve` filter.
+
+use super::*;
+
+// =========================================================================
+// Config Parsing
+// =========================================================================
+
+#[test]
+fn default_config_parses() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_tool_resolve", "filter name");
+}
+
+#[test]
+fn config_with_custom_timeout() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 10000").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_tool_resolve", "filter name");
+}
+
+#[test]
+fn config_rejects_unknown_fields() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("unknown_field: true").unwrap();
+    assert!(
+        McpToolResolveFilter::from_config(&yaml).is_err(),
+        "unknown fields should be rejected"
+    );
+}
+
+#[test]
+fn body_mode_is_stream_buffer() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    match filter.request_body_mode() {
+        BodyMode::StreamBuffer { max_bytes } => {
+            assert_eq!(
+                max_bytes,
+                Some(67_108_864),
+                "StreamBuffer should default to the 64 MiB ceiling; the raw cap is governed by body_limits"
+            );
+        },
+        other => panic!("expected StreamBuffer, got {other:?}"),
+    }
+}
+
+#[test]
+fn config_rejects_zero_timeout() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 0").unwrap();
+    assert!(
+        McpToolResolveFilter::from_config(&yaml).is_err(),
+        "timeout_ms: 0 should be rejected"
+    );
+}
+
+#[test]
+fn config_rejects_zero_max_servers() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_servers: 0").unwrap();
+    assert!(
+        McpToolResolveFilter::from_config(&yaml).is_err(),
+        "max_servers: 0 should be rejected"
+    );
+}
+
+#[test]
+fn config_with_custom_max_servers() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_servers: 5").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_tool_resolve", "filter name");
+}
+
+#[test]
+fn config_rejects_zero_max_tools() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_tools: 0").unwrap();
+    assert!(
+        McpToolResolveFilter::from_config(&yaml).is_err(),
+        "max_tools: 0 should be rejected"
+    );
+}
+
+#[test]
+fn config_with_custom_max_tools() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_tools: 50").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_tool_resolve", "filter name");
+}
+
+// =========================================================================
+// MCP Entry Extraction
+// =========================================================================
+
+#[test]
+fn extract_mcp_entries_from_mixed_tools() {
+    let body = serde_json::json!({
+        "input": "test",
+        "tools": [
+            {"type": "function", "name": "calc"},
+            {"type": "mcp", "server_label": "weather", "server_url": "http://localhost:8001/mcp"},
+            {"type": "web_search"},
+            {"type": "mcp", "server_label": "calendar", "server_url": "http://localhost:8002/mcp"}
+        ]
+    });
+    let entries = extract_mcp_entries(body.to_string().as_bytes());
+
+    assert_eq!(entries.len(), 2, "should extract 2 MCP entries");
+    assert_eq!(
+        entries[0]["server_label"].as_str(),
+        Some("weather"),
+        "first entry server_label"
+    );
+    assert_eq!(
+        entries[1]["server_label"].as_str(),
+        Some("calendar"),
+        "second entry server_label"
+    );
+}
+
+#[test]
+fn extract_mcp_entries_empty_when_no_mcp() {
+    let body = serde_json::json!({
+        "input": "test",
+        "tools": [{"type": "function", "name": "calc"}]
+    });
+    let entries = extract_mcp_entries(body.to_string().as_bytes());
+    assert!(entries.is_empty(), "should find no MCP entries");
+}
+
+#[test]
+fn extract_mcp_entries_handles_no_tools() {
+    let body = serde_json::json!({"input": "test"});
+    let entries = extract_mcp_entries(body.to_string().as_bytes());
+    assert!(entries.is_empty(), "should handle missing tools array");
+}
+
+#[test]
+fn extract_mcp_entries_handles_invalid_json() {
+    let entries = extract_mcp_entries(b"not json");
+    assert!(entries.is_empty(), "should handle invalid JSON");
+}
+
+// =========================================================================
+// Cache Matching
+// =========================================================================
+
+#[test]
+fn cache_hit_when_all_allowed_tools_present() {
+    let url = "http://10.0.0.5/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": url,
+        "tools": [
+            {"name": "get_weather"},
+            {"name": "get_forecast"}
+        ]
+    })];
+    let allowed = vec!["get_weather".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "weather", url, Some(&allowed), false);
+    assert!(result.is_some(), "should hit cache");
+    assert_eq!(result.unwrap().len(), 2, "should return full cached listing");
+}
+
+#[test]
+fn cache_miss_when_allowed_tool_not_in_cache() {
+    let url = "http://10.0.0.5/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": url,
+        "tools": [{"name": "get_weather"}]
+    })];
+    let allowed = vec!["unknown_tool".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "weather", url, Some(&allowed), false);
+    assert!(result.is_none(), "should miss cache for unknown tool");
+}
+
+#[test]
+fn cache_miss_when_unrestricted_allowed_tools() {
+    let url = "http://10.0.0.5/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": url,
+        "tools": [{"name": "get_weather"}, {"name": "get_forecast"}]
+    })];
+
+    let result = find_cached_listing(Some(&previous), "weather", url, None, false);
+    assert!(
+        result.is_none(),
+        "unrestricted entries must miss to avoid reusing partial listings"
+    );
+}
+
+#[test]
+fn cache_miss_when_unrestricted_widens_narrow_cached_listing() {
+    let url = "http://10.0.0.5/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": url,
+        "tools": [{"name": "get_weather"}]
+    })];
+
+    let result = find_cached_listing(Some(&previous), "weather", url, None, false);
+    assert!(
+        result.is_none(),
+        "unrestricted must miss when cached listing is a narrow subset"
+    );
+}
+
+#[test]
+fn cache_miss_when_wrong_server_label() {
+    let url = "http://10.0.0.5/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": url,
+        "tools": [{"name": "get_weather"}]
+    })];
+    let allowed = vec!["get_weather".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "calendar", url, Some(&allowed), false);
+    assert!(result.is_none(), "should miss cache for different server");
+}
+
+#[test]
+fn cache_miss_when_no_previous_tools() {
+    let allowed = vec!["get_weather".to_owned()];
+    let result = find_cached_listing(None, "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    assert!(result.is_none(), "should miss when no previous_tools");
+}
+
+#[test]
+fn cache_miss_when_server_url_changed() {
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": "http://10.0.0.5/mcp",
+        "tools": [{"name": "get_weather"}]
+    })];
+    let allowed = vec!["get_weather".to_owned()];
+
+    let result = find_cached_listing(
+        Some(&previous),
+        "weather",
+        "http://10.0.0.99/mcp",
+        Some(&allowed),
+        false,
+    );
+    assert!(
+        result.is_none(),
+        "should miss cache when server_url differs from cached entry"
+    );
+}
+
+#[test]
+fn cache_miss_when_continuation_changes_allowed_tools() {
+    let url = "http://10.0.0.5/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": url,
+        "tools": [{"name": "get_weather"}]
+    })];
+    let new_allowed = vec!["get_forecast".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "weather", url, Some(&new_allowed), false);
+    assert!(
+        result.is_none(),
+        "cache should miss when continuation requests a tool not in the cached listing"
+    );
+}
+
+// =========================================================================
+// Cache: connector entries require URL match
+// =========================================================================
+
+#[test]
+fn cache_miss_for_connector_when_cached_entry_lacks_server_url() {
+    let previous = vec![serde_json::json!({
+        "server_label": "drive",
+        "tools": [{"name": "search"}]
+    })];
+    let allowed = vec!["search".to_owned()];
+
+    let result = find_cached_listing(
+        Some(&previous),
+        "drive",
+        "https://drive.example.com/mcp",
+        Some(&allowed),
+        true,
+    );
+    assert!(
+        result.is_none(),
+        "connector entries must not match label-only cached listings"
+    );
+}
+
+#[test]
+fn cache_hit_for_connector_when_cached_entry_has_matching_url() {
+    let url = "https://drive.example.com/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "drive",
+        "server_url": url,
+        "tools": [{"name": "search"}]
+    })];
+    let allowed = vec!["search".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "drive", url, Some(&allowed), true);
+    assert!(result.is_some(), "exact URL match should hit cache");
+}
+
+#[test]
+fn cache_hit_for_direct_url_label_only_still_works() {
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "tools": [{"name": "get_weather"}]
+    })];
+    let allowed = vec!["get_weather".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    assert!(
+        result.is_some(),
+        "direct URL entries should still use label-only matching"
+    );
+}
+
+// =========================================================================
+// Dispatch Metadata: connector_id preserved
+// =========================================================================
+
+#[test]
+fn insert_tools_preserves_connector_id() {
+    let tools = vec![serde_json::json!({"name": "search"})];
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "drive",
+        "connector_id": "corp_drive",
+        "server_url": "https://drive.example.com/mcp"
+    });
+    let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
+    insert_tools(tools, &entry, &mut tool_map);
+
+    let val = &tool_map[&("drive".to_owned(), "search".to_owned())];
+    assert_eq!(
+        val.get("connector_id").and_then(serde_json::Value::as_str),
+        Some("corp_drive"),
+        "connector_id must be preserved in dispatch metadata"
+    );
+}
+
+#[test]
+fn insert_tools_without_connector_id_has_null() {
+    let tools = vec![serde_json::json!({"name": "tool_a"})];
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "s",
+        "server_url": "http://10.0.0.5/mcp"
+    });
+    let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
+    insert_tools(tools, &entry, &mut tool_map);
+
+    let val = &tool_map[&("s".to_owned(), "tool_a".to_owned())];
+    assert!(
+        val.get("connector_id").is_none() || val["connector_id"].is_null(),
+        "no connector_id should produce null or absent field"
+    );
+}
+
+// =========================================================================
+// Allowed Tools Filter
+// =========================================================================
+
+#[test]
+fn filter_keeps_only_allowed_tools() {
+    let tools = vec![
+        serde_json::json!({"name": "get_weather"}),
+        serde_json::json!({"name": "get_forecast"}),
+        serde_json::json!({"name": "get_alerts"}),
+    ];
+    let allowed = AllowedTools {
+        names: Some(vec!["get_weather".to_owned(), "get_alerts".to_owned()]),
+        read_only: None,
+    };
+
+    let filtered = apply_allowed_tools_filter(tools, &allowed);
+    assert_eq!(filtered.len(), 2, "should keep only allowed tools");
+    assert_eq!(filtered[0]["name"], "get_weather", "first kept tool");
+    assert_eq!(filtered[1]["name"], "get_alerts", "second kept tool");
+}
+
+#[test]
+fn filter_returns_all_when_unrestricted() {
+    let tools = vec![serde_json::json!({"name": "a"}), serde_json::json!({"name": "b"})];
+    let filtered = apply_allowed_tools_filter(tools, &AllowedTools::unrestricted());
+    assert_eq!(filtered.len(), 2, "should return all tools when no filter");
+}
+
+#[test]
+fn filter_returns_empty_when_no_match() {
+    let tools = vec![serde_json::json!({"name": "a"})];
+    let allowed = AllowedTools {
+        names: Some(vec!["nonexistent".to_owned()]),
+        read_only: None,
+    };
+    let filtered = apply_allowed_tools_filter(tools, &allowed);
+    assert!(filtered.is_empty(), "should return empty when no match");
+}
+
+#[test]
+fn filter_read_only_keeps_annotated_tools() {
+    let tools = vec![
+        serde_json::json!({"name": "read_data", "annotations": {"readOnlyHint": true}}),
+        serde_json::json!({"name": "write_data", "annotations": {"readOnlyHint": false}}),
+        serde_json::json!({"name": "no_annotation"}),
+    ];
+    let allowed = AllowedTools {
+        names: None,
+        read_only: Some(true),
+    };
+    let filtered = apply_allowed_tools_filter(tools, &allowed);
+    assert_eq!(filtered.len(), 1, "should keep only read-only tools");
+    assert_eq!(filtered[0]["name"], "read_data", "kept tool");
+}
+
+#[test]
+fn filter_read_only_list_applies_both() {
+    let tools = vec![
+        serde_json::json!({"name": "read_data", "annotations": {"readOnlyHint": true}}),
+        serde_json::json!({"name": "write_data", "annotations": {"readOnlyHint": false}}),
+        serde_json::json!({"name": "other_read", "annotations": {"readOnlyHint": true}}),
+    ];
+    let allowed = AllowedTools {
+        names: Some(vec!["read_data".to_owned(), "write_data".to_owned()]),
+        read_only: Some(true),
+    };
+    let filtered = apply_allowed_tools_filter(tools, &allowed);
+    assert_eq!(filtered.len(), 1, "name + read_only intersection");
+    assert_eq!(filtered[0]["name"], "read_data", "only read_data passes both filters");
+}
+
+#[test]
+fn filter_writable_only_excludes_read_only_tools() {
+    let tools = vec![
+        serde_json::json!({"name": "read_data", "annotations": {"readOnlyHint": true}}),
+        serde_json::json!({"name": "write_data", "annotations": {"readOnlyHint": false}}),
+        serde_json::json!({"name": "no_annotation"}),
+    ];
+    let allowed = AllowedTools {
+        names: None,
+        read_only: Some(false),
+    };
+    let filtered = apply_allowed_tools_filter(tools, &allowed);
+    assert_eq!(filtered.len(), 2, "should keep writable + unannotated tools");
+    assert_eq!(filtered[0]["name"], "write_data");
+    assert_eq!(filtered[1]["name"], "no_annotation");
+}
+
+// =========================================================================
+// Pipeline Regression: no spurious ResponsesState creation
+// =========================================================================
+
+/// Build a minimal MCP request body targeting `server_url`.
+fn mcp_body(server_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "weather",
+                    "server_url": server_url, "allowed_tools": ["get_weather"]}]
+    })
+}
+
+/// Cache-hit path populates `mcp_tool_map` on an existing state
+/// without corrupting `request_body`.
+#[tokio::test]
+async fn cache_hit_populates_mcp_tool_map_on_existing_state() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": server_url,
+        "tools": [{"name": "get_weather", "description": "Get weather"}]
+    })];
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "cache hit should continue");
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
+    assert!(
+        state
+            .mcp_tool_map
+            .contains_key(&("weather".to_owned(), "get_weather".to_owned())),
+        "tool should be in map"
+    );
+    assert!(!state.request_body.is_null(), "request_body must not be null");
+}
+
+/// The rewritten body (after `mcp`→`function` expansion) is bounded
+/// by `max_rewritten_body_bytes`: a tiny limit rejects with 413.
+///
+/// Uses the cache-hit path so resolution needs no live MCP server.
+#[tokio::test]
+async fn rewritten_body_over_limit_rejected_with_413() {
+    let filter =
+        McpToolResolveFilter::from_config(&serde_yaml::from_str("max_rewritten_body_bytes: 10").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": server_url,
+        "tools": [{"name": "get_weather", "description": "Get weather"}]
+    })];
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(r) if r.status == 413),
+        "rewritten body over max_rewritten_body_bytes should be rejected with 413"
+    );
+}
+
+/// The same cache-hit resolution under a generous limit is committed,
+/// rewriting the `mcp` entry into a `function` tool.
+#[tokio::test]
+async fn rewritten_body_under_limit_committed() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": server_url,
+        "tools": [{"name": "get_weather", "description": "Get weather"}]
+    })];
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "rewritten body under the limit should continue"
+    );
+
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    let tools = rewritten["tools"].as_array().expect("tools array present");
+    assert!(
+        tools
+            .iter()
+            .any(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("function")),
+        "mcp tool should be rewritten to a function tool"
+    );
+}
+
+/// A cache hit must still reject a blocked `server_url` — a
+/// continuation cannot smuggle an SSRF URL through cached tools.
+#[tokio::test]
+async fn cache_hit_with_blocked_url_still_rejected() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = mcp_body("http://127.0.0.1/mcp");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather",
+        "tools": [{"name": "get_weather", "description": "Get weather"}]
+    })];
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "cache hit with blocked URL must still be rejected"
+    );
+}
+
+/// Without a pre-existing `ResponsesState`, the filter must NOT
+/// insert a default one (whose `request_body` is `Null`).
+#[tokio::test]
+async fn no_spurious_state_creation_without_existing_state() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = mcp_body("http://127.0.0.1:1/mcp");
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "should reject (SSRF-blocked loopback)"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "no state should be inserted"
+    );
+}
+
+#[tokio::test]
+async fn connector_id_entry_without_configured_connectors_rejected() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "remote",
+                    "connector_id": "mcp_conn_abc123"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "unknown connector_id should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn missing_server_label_skips_resolution() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_url": "http://10.0.0.5/mcp"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "MCP entry without server_label should be skipped"
+    );
+}
+
+#[tokio::test]
+async fn defer_loading_true_skips_eager_resolution() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "deferred",
+                    "server_url": "http://10.0.0.5/mcp",
+                    "defer_loading": true}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "defer_loading: true should skip eager tools/list"
+    );
+}
+
+/// `write_state` creates `ResponsesState` from body when none
+/// exists, preserving `request_body` and populating `mcp_tool_map`.
+#[test]
+fn write_state_creates_state_when_missing() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_json = mcp_body("http://10.0.0.5/mcp");
+    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+
+    let mut map = HashMap::new();
+    map.insert(
+        ("weather".to_owned(), "get_weather".to_owned()),
+        serde_json::json!({"tool": true}),
+    );
+    write_state(&mut ctx, &body_bytes, map);
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state should be created");
+    assert!(
+        state
+            .mcp_tool_map
+            .contains_key(&("weather".to_owned(), "get_weather".to_owned())),
+        "tool should be in map"
+    );
+    assert_eq!(
+        state.request_body["model"], "gpt-4o",
+        "request_body should be parsed from body"
+    );
+    assert!(!state.request_body.is_null(), "request_body must not be null");
+}
+
+/// `write_state` updates existing state without replacing it.
+#[test]
+fn write_state_updates_existing_state() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_json = mcp_body("http://10.0.0.5/mcp");
+    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+
+    let mut state = ResponsesState::from_request_body(body_json);
+    state.previous_response_id = Some("resp_existing".to_owned());
+    ctx.extensions.insert(state);
+
+    let mut map = HashMap::new();
+    map.insert(
+        ("weather".to_owned(), "get_weather".to_owned()),
+        serde_json::json!({"tool": true}),
+    );
+    write_state(&mut ctx, &body_bytes, map);
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
+    assert!(
+        state
+            .mcp_tool_map
+            .contains_key(&("weather".to_owned(), "get_weather".to_owned())),
+        "tool should be in map"
+    );
+    assert_eq!(
+        state.previous_response_id.as_deref(),
+        Some("resp_existing"),
+        "existing fields should be preserved"
+    );
+}
+
+// =========================================================================
+// Allowed Tools Extraction
+// =========================================================================
+
+#[test]
+fn extract_allowed_tools_string_array() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": ["get_weather", "get_forecast"]
+    });
+    let allowed = extract_allowed_tools(&entry);
+    assert_eq!(
+        allowed.as_names().unwrap(),
+        &["get_weather", "get_forecast"],
+        "should extract allowed_tools"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_filter_object() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"tool_names": ["get_weather"]}
+    });
+    let allowed = extract_allowed_tools(&entry);
+    assert_eq!(
+        allowed.as_names().unwrap(),
+        &["get_weather"],
+        "should extract tool_names from filter object"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_read_only() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"read_only": true}
+    });
+    let allowed = extract_allowed_tools(&entry);
+    assert_eq!(allowed.read_only, Some(true), "should be read_only");
+    assert!(allowed.as_names().is_none(), "should have no name list");
+}
+
+#[test]
+fn extract_allowed_tools_read_only_with_names() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"read_only": true, "tool_names": ["get_weather"]}
+    });
+    let allowed = extract_allowed_tools(&entry);
+    assert_eq!(allowed.read_only, Some(true), "should be read_only");
+    assert_eq!(
+        allowed.as_names().unwrap(),
+        &["get_weather"],
+        "should also have name list"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_read_only_false_filters_writable() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"read_only": false}
+    });
+    let allowed = extract_allowed_tools(&entry);
+    assert_eq!(
+        allowed.read_only,
+        Some(false),
+        "read_only: false should filter for writable tools"
+    );
+    assert!(allowed.as_names().is_none(), "should have no name list");
+}
+
+#[test]
+fn extract_allowed_tools_read_only_false_with_names() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"read_only": false, "tool_names": ["a"]}
+    });
+    let allowed = extract_allowed_tools(&entry);
+    assert_eq!(
+        allowed.read_only,
+        Some(false),
+        "read_only: false should filter for writable tools"
+    );
+    assert_eq!(allowed.as_names().unwrap(), &["a"], "should have name list");
+}
+
+#[test]
+fn extract_allowed_tools_unrestricted_when_absent() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv"
+    });
+    assert!(
+        extract_allowed_tools(&entry).as_names().is_none(),
+        "should be unrestricted when absent"
+    );
+}
+
+// =========================================================================
+// Cache Matching: real mcp_list_tools shape
+// =========================================================================
+
+#[test]
+fn cache_hit_when_cached_entry_has_no_server_url() {
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "tools": [{"name": "get_weather"}]
+    })];
+    let allowed = vec!["get_weather".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    assert!(
+        result.is_some(),
+        "real mcp_list_tools items lack server_url; label-only match"
+    );
+}
+
+#[test]
+fn cache_miss_when_same_label_different_server_url() {
+    let previous = vec![serde_json::json!({
+        "server_label": "weather",
+        "server_url": "http://10.0.0.1/mcp",
+        "tools": [{"name": "get_weather"}]
+    })];
+    let allowed = vec!["get_weather".to_owned()];
+
+    let result = find_cached_listing(
+        Some(&previous),
+        "weather",
+        "http://10.0.0.99/mcp",
+        Some(&allowed),
+        false,
+    );
+    assert!(
+        result.is_none(),
+        "different server_url with same label should not match"
+    );
+}
+
+// =========================================================================
+// Duplicate Tool Names Across Servers
+// =========================================================================
+
+#[test]
+fn duplicate_tool_name_across_servers_accepted() {
+    let tools = vec![serde_json::json!({"name": "shared_tool"})];
+    let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
+
+    let entry_a = serde_json::json!({"server_label": "server_a", "server_url": "http://10.0.0.1/mcp"});
+    insert_tools(tools.clone(), &entry_a, &mut tool_map);
+
+    let entry_b = serde_json::json!({"server_label": "server_b", "server_url": "http://10.0.0.2/mcp"});
+    insert_tools(tools, &entry_b, &mut tool_map);
+
+    assert_eq!(
+        tool_map.len(),
+        2,
+        "same tool name from different servers should coexist"
+    );
+    assert!(tool_map.contains_key(&("server_a".to_owned(), "shared_tool".to_owned())));
+    assert!(tool_map.contains_key(&("server_b".to_owned(), "shared_tool".to_owned())));
+}
+
+// =========================================================================
+// has_entry_credentials
+// =========================================================================
+
+#[test]
+fn has_credentials_with_authorization() {
+    let entry = serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "authorization": "tok"});
+    assert!(has_entry_credentials(&entry));
+}
+
+#[test]
+fn has_credentials_with_headers() {
+    let entry =
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "headers": {"x-key": "val"}});
+    assert!(has_entry_credentials(&entry));
+}
+
+#[test]
+fn no_credentials_without_auth_or_headers() {
+    let entry = serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"});
+    assert!(!has_entry_credentials(&entry));
+}
+
+#[test]
+fn no_credentials_with_empty_headers() {
+    let entry = serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "headers": {}});
+    assert!(!has_entry_credentials(&entry));
+}
+
+#[test]
+fn same_server_different_auth_both_detected() {
+    let url = "http://10.0.0.1/mcp";
+    let entry_a = serde_json::json!({"server_label": "s", "server_url": url, "authorization": "tok_a"});
+    let entry_b = serde_json::json!({"server_label": "s", "server_url": url, "authorization": "tok_b"});
+    assert!(has_entry_credentials(&entry_a), "entry A has credentials");
+    assert!(has_entry_credentials(&entry_b), "entry B has credentials");
+}
+
+// =========================================================================
+// insert_tools preserves dispatch config
+// =========================================================================
+
+#[test]
+fn insert_tools_preserves_authorization_and_require_approval() {
+    let tools = vec![serde_json::json!({"name": "run_query"})];
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "db",
+        "server_url": "http://10.0.0.5/mcp",
+        "authorization": "tok_secret",
+        "require_approval": "always",
+        "headers": {"x-custom": "val"}
+    });
+    let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
+    insert_tools(tools, &entry, &mut tool_map);
+
+    let val = &tool_map[&("db".to_owned(), "run_query".to_owned())];
+    assert_eq!(
+        val.get("authorization").and_then(serde_json::Value::as_str),
+        Some("tok_secret"),
+        "authorization must be preserved for dispatch"
+    );
+    assert_eq!(
+        val.get("require_approval").and_then(serde_json::Value::as_str),
+        Some("always"),
+        "require_approval must be preserved for dispatch"
+    );
+}
+
+#[tokio::test]
+async fn connector_id_entry_without_configured_connectors_rejects_with_400() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "previous_response_id": "resp_abc",
+        "tools": [{"type": "mcp", "server_label": "remote",
+                    "connector_id": "mcp_conn_abc123"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 400, "unknown connector_id should be 400");
+}
+
+// =========================================================================
+// Entry Deduplication
+// =========================================================================
+
+#[test]
+fn dedup_entries_groups_same_label_url() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["x"]}),
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["y"]}),
+        serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    let (mapping, tasks, _) = dedup_entries(&entries);
+
+    assert_eq!(tasks.len(), 2, "two unique servers → two tasks");
+    assert_eq!(
+        mapping[0], mapping[1],
+        "entries sharing (label, url) should map to the same task"
+    );
+    assert_ne!(
+        mapping[0], mapping[2],
+        "different servers should map to different tasks"
+    );
+}
+
+#[test]
+fn dedup_entries_keeps_credentialed_independent() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_a"}),
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_b"}),
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp"}),
+    ];
+    let (mapping, tasks, _) = dedup_entries(&entries);
+
+    assert_eq!(
+        tasks.len(),
+        3,
+        "each credentialed entry + one non-credentialed = three tasks"
+    );
+    assert_ne!(mapping[0], mapping[1], "different credentials → different tasks");
+    assert_ne!(
+        mapping[0], mapping[2],
+        "credentialed vs non-credentialed → different tasks"
+    );
+}
+
+#[test]
+fn dedup_entries_includes_resolved_connector() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "connector_id": "c1", "server_url": "https://a.example.com/mcp"}),
+        serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.1/mcp", "defer_loading": true}),
+        serde_json::json!({"server_label": "c", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    let (mapping, tasks, _) = dedup_entries(&entries);
+
+    assert_eq!(tasks.len(), 2, "resolved connector + direct URL = two tasks");
+    assert!(mapping[0].is_some(), "resolved connector entry IS resolvable");
+    assert!(mapping[1].is_none(), "deferred entry not resolvable");
+    assert!(mapping[2].is_some(), "direct URL entry resolvable");
+}
+
+// =========================================================================
+// Allowed Names Merging
+// =========================================================================
+
+#[test]
+fn dedup_entries_merges_allowed_names_union() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["a"]}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["b"]}),
+    ];
+    let (_, _, allowed) = dedup_entries(&entries);
+
+    assert_eq!(allowed.len(), 1, "one task");
+    let names = allowed[0].as_ref().expect("should have merged names");
+    assert!(names.contains(&"a".to_owned()), "union should contain a");
+    assert!(names.contains(&"b".to_owned()), "union should contain b");
+}
+
+#[test]
+fn dedup_entries_unrestricted_entry_forces_unrestricted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["a"]}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+    ];
+    let (_, _, allowed) = dedup_entries(&entries);
+
+    assert_eq!(allowed.len(), 1, "one task");
+    assert!(
+        allowed[0].is_none(),
+        "unrestricted entry should force the union to unrestricted"
+    );
+}
+
+#[test]
+fn merge_allowed_names_both_some() {
+    let mut existing = Some(vec!["a".to_owned()]);
+    merge_allowed_names(&mut existing, &Some(vec!["b".to_owned(), "a".to_owned()]));
+    let names = existing.expect("should remain Some");
+    assert_eq!(names.len(), 2, "union without duplicates");
+    assert!(names.contains(&"a".to_owned()));
+    assert!(names.contains(&"b".to_owned()));
+}
+
+#[test]
+fn merge_allowed_names_new_unrestricted() {
+    let mut existing = Some(vec!["a".to_owned()]);
+    merge_allowed_names(&mut existing, &None);
+    assert!(existing.is_none(), "unrestricted new → unrestricted result");
+}
+
+#[test]
+fn merge_allowed_names_existing_unrestricted() {
+    let mut existing: Option<Vec<String>> = None;
+    merge_allowed_names(&mut existing, &Some(vec!["a".to_owned()]));
+    assert!(existing.is_none(), "unrestricted existing stays unrestricted");
+}
+
+// =========================================================================
+// Dedup Cache Interaction
+// =========================================================================
+
+/// When dedup'd entries have different `allowed_tools` and the
+/// `previous_tools` cache only covers one entry's tools, the
+/// merged union must force a cache miss so that `fetch_tools`
+/// retrieves the full listing for all entries in the group.
+#[tokio::test]
+async fn dedup_cache_miss_when_partial_cache_covers_only_representative() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [
+            {"type": "mcp", "server_label": "srv", "server_url": server_url, "allowed_tools": ["tool_a"]},
+            {"type": "mcp", "server_label": "srv", "server_url": server_url, "allowed_tools": ["tool_b"]}
+        ]
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "srv",
+        "server_url": server_url,
+        "tools": [{"name": "tool_a", "description": "A"}]
+    })];
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "should reject (tools/list call fails against non-listening address)"
+    );
+}
+
+// =========================================================================
+// Distinct Server Counting
+// =========================================================================
+
+#[test]
+fn count_distinct_servers_dedupes_same_label_url() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["x"]}),
+        serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    assert_eq!(
+        count_distinct_servers(&entries),
+        2,
+        "same (label, url) should count once"
+    );
+}
+
+#[test]
+fn count_distinct_servers_includes_resolved_connectors() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "connector_id": "c1", "server_url": "https://a.example.com/mcp"}),
+        serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.1/mcp", "defer_loading": true}),
+        serde_json::json!({"server_label": "c", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    assert_eq!(
+        count_distinct_servers(&entries),
+        2,
+        "resolved connector + direct URL, deferred excluded"
+    );
+}
+
+/// Apply `allowed_tools` filtering and insert results into the
+/// tool map — mirrors the per-entry flow in `resolve_all_entries`.
+fn filter_and_insert(
+    tools: Vec<serde_json::Value>,
+    entry: &serde_json::Value,
+    tool_map: &mut HashMap<(String, String), serde_json::Value>,
+) {
+    let allowed = extract_allowed_tools(entry);
+    insert_tools(apply_allowed_tools_filter(tools, &allowed), entry, tool_map);
+}
+
+#[test]
+fn same_server_different_allowed_tools_both_inserted() {
+    let tools = vec![
+        serde_json::json!({"name": "tool_a"}),
+        serde_json::json!({"name": "tool_b"}),
+    ];
+    let mut tool_map: HashMap<(String, String), serde_json::Value> = HashMap::new();
+
+    let entry_a = serde_json::json!({
+        "server_label": "s", "server_url": "http://10.0.0.1/mcp",
+        "allowed_tools": ["tool_a"], "require_approval": "always"
+    });
+    let entry_b = serde_json::json!({
+        "server_label": "s", "server_url": "http://10.0.0.1/mcp",
+        "allowed_tools": ["tool_b"], "require_approval": "never"
+    });
+
+    filter_and_insert(tools.clone(), &entry_a, &mut tool_map);
+    filter_and_insert(tools, &entry_b, &mut tool_map);
+
+    let key_a = ("s".to_owned(), "tool_a".to_owned());
+    let key_b = ("s".to_owned(), "tool_b".to_owned());
+    assert!(tool_map.contains_key(&key_a), "tool_a from entry A should be present");
+    assert!(tool_map.contains_key(&key_b), "tool_b from entry B should be present");
+    assert_eq!(
+        tool_map[&key_b]
+            .get("require_approval")
+            .and_then(serde_json::Value::as_str),
+        Some("never"),
+        "entry B's config should be on tool_b"
+    );
+}
+
+// =========================================================================
+// Max Servers Cap
+// =========================================================================
+
+#[tokio::test]
+async fn max_servers_exceeded_returns_rejection() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_servers: 1").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [
+            {"type": "mcp", "server_label": "a", "server_url": "http://10.0.0.1/mcp"},
+            {"type": "mcp", "server_label": "b", "server_url": "http://10.0.0.2/mcp"}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "exceeding max_servers should produce a rejection"
+    );
+}
+
+#[tokio::test]
+async fn connector_entries_counted_against_max_servers_when_configured() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+max_servers: 1
+connectors:
+  - id: conn_1
+    server_url: https://a.example.com/mcp
+  - id: conn_2
+    server_url: https://b.example.com/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [
+            {"type": "mcp", "server_label": "a", "connector_id": "conn_1"},
+            {"type": "mcp", "server_label": "b", "connector_id": "conn_2"}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "resolved connectors should count against max_servers"
+    );
+}
+
+#[tokio::test]
+async fn deferred_entries_not_counted_against_max_servers() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_servers: 1").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [
+            {"type": "mcp", "server_label": "a", "server_url": "http://10.0.0.1/mcp", "defer_loading": true},
+            {"type": "mcp", "server_label": "b", "server_url": "http://10.0.0.2/mcp", "defer_loading": true}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "deferred entries should not count against max_servers"
+    );
+}
+
+// =========================================================================
+// previous_response_id preservation
+// =========================================================================
+
+#[test]
+fn write_state_skips_state_creation_with_previous_response_id() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "previous_response_id": "resp_abc",
+        "tools": [{"type": "mcp", "server_label": "w", "server_url": "http://10.0.0.5/mcp"}]
+    });
+    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+
+    let mut map = HashMap::new();
+    map.insert(
+        ("w".to_owned(), "get_weather".to_owned()),
+        serde_json::json!({"tool": true}),
+    );
+    write_state(&mut ctx, &body_bytes, map);
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("state should be created even with previous_response_id");
+    assert!(!state.mcp_tool_map.is_empty(), "tool map should be populated");
+}
+
+// =========================================================================
+// EntryResolution: zero-tool and passthrough behavior
+// =========================================================================
+
+#[test]
+fn rewrite_tools_array_drops_resolved_empty_entry() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "calc"}),
+        serde_json::json!({"type": "mcp", "server_label": "empty_srv", "server_url": "http://10.0.0.5/mcp"}),
+    ];
+    let per_entry = vec![EntryResolution::Resolved(Vec::new())];
+
+    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+
+    assert_eq!(rewritten.len(), 1, "resolved-empty MCP entry should be dropped");
+    assert_eq!(rewritten[0]["name"], "calc", "function tool preserved");
+    assert!(generated.is_empty(), "no generated names");
+}
+
+#[test]
+fn rewrite_tools_array_preserves_passthrough_entry() {
+    let tools = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "deferred",
+        "server_url": "http://10.0.0.5/mcp",
+        "defer_loading": true
+    })];
+    let per_entry = vec![EntryResolution::PassThrough];
+
+    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+
+    assert_eq!(rewritten.len(), 1, "passthrough entry should be preserved");
+    assert_eq!(rewritten[0]["type"], "mcp", "passthrough keeps original type");
+}
+
+#[test]
+fn rewrite_tools_array_expands_resolved_nonempty() {
+    let tools = vec![serde_json::json!({"type": "mcp", "server_label": "srv"})];
+    let per_entry = vec![EntryResolution::Resolved(vec![mcp_tool_to_function_tool(
+        "srv",
+        &serde_json::json!({"name": "tool_a", "description": "A"}),
+    )])];
+
+    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+
+    assert_eq!(rewritten.len(), 1, "one MCP entry → one function tool");
+    assert_eq!(rewritten[0]["type"], "function");
+    assert_eq!(rewritten[0]["name"], "srv__tool_a");
+    assert!(generated.contains("srv__tool_a"));
+}
+
+// =========================================================================
+// Credential isolation: entries resolving to zero permitted tools
+// =========================================================================
+
+/// A request whose only MCP entry resolves to zero permitted tools
+/// must still be rewritten: the original `type: "mcp"` entry — and
+/// its `authorization`/`headers` credentials — must never survive
+/// into the body handed to the inference backend.
+///
+/// Regression test for the credential-isolation leak where
+/// `rewrite_request_body` returned `None` for an empty rewritten
+/// tools array, causing the caller to forward the original body
+/// (credentials included) verbatim.
+#[test]
+#[expect(clippy::too_many_lines, reason = "comprehensive credential-isolation assertions")]
+fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": "https://mcp.example.test/mcp",
+            "authorization": "Bearer super-secret-token",
+            "headers": {"x-api-key": "another-secret"}
+        }]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let per_entry = vec![EntryResolution::Resolved(Vec::new())];
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["weather".to_owned()]);
+
+    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+        .expect("rewrite must not error")
+        .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
+
+    let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
+    assert_eq!(
+        rewritten["tools"],
+        serde_json::json!([]),
+        "the resolved-empty MCP entry must be dropped, leaving an empty tools array"
+    );
+
+    let raw = String::from_utf8(serialized.as_bytes().to_vec()).unwrap();
+    assert!(
+        !raw.contains("super-secret-token"),
+        "authorization credential must not survive into the backend request: {raw}"
+    );
+    assert!(
+        !raw.contains("another-secret"),
+        "custom header credential must not survive into the backend request: {raw}"
+    );
+    assert!(
+        !raw.contains("\"mcp\""),
+        "no type:mcp entry may survive into the backend request: {raw}"
+    );
+}
+
+/// A mixed request where one MCP entry resolves to concrete tools and
+/// a second resolves to zero must drop only the empty entry's
+/// credentials while keeping the resolved function tools.
+#[test]
+#[expect(clippy::too_many_lines, reason = "comprehensive credential-isolation assertions")]
+fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": "https://weather.example.test/mcp"
+            },
+            {
+                "type": "mcp",
+                "server_label": "empty",
+                "server_url": "https://empty.example.test/mcp",
+                "authorization": "Bearer empty-secret-token"
+            }
+        ]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let per_entry = vec![
+        EntryResolution::Resolved(vec![mcp_tool_to_function_tool(
+            "weather",
+            &serde_json::json!({"name": "get_weather", "description": "A"}),
+        )]),
+        EntryResolution::Resolved(Vec::new()),
+    ];
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
+
+    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+        .expect("rewrite must not error")
+        .expect("mixed request must be rewritten");
+
+    let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
+    let tools = rewritten["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 1, "only the resolved-nonempty entry survives: {tools:?}");
+    assert_eq!(tools[0]["name"], "weather__get_weather", "resolved tool preserved");
+
+    let raw = String::from_utf8(serialized.as_bytes().to_vec()).unwrap();
+    assert!(
+        !raw.contains("empty-secret-token"),
+        "empty entry credential must not leak: {raw}"
+    );
+}
+
+/// Regression: an `allowed_tools` choice restricting the model to an MCP
+/// server that resolves to zero tools, while an unrelated top-level
+/// function tool survives. The emptied choice must normalize to `"none"`,
+/// never be removed — removing it would let the model call the unrelated
+/// function that the original choice deliberately excluded.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "request fixture plus tool_choice normalization and survival assertions"
+)]
+fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_tools_empties() {
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": "https://weather.example.test/mcp",
+                "authorization": "Bearer super-secret-token"
+            },
+            {"type": "function", "name": "unrelated_local_tool"}
+        ],
+        "tool_choice": {
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "mcp", "server_label": "weather"}]
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    // The single MCP entry resolves to zero permitted tools.
+    let per_entry = vec![EntryResolution::Resolved(Vec::new())];
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["weather".to_owned()]);
+
+    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+        .expect("rewrite must not error")
+        .expect("resolved-empty entry must trigger a rewrite");
+
+    let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
+    assert_eq!(
+        rewritten["tool_choice"], "none",
+        "emptied auto allowed_tools must normalize to \"none\", not be removed: {rewritten}"
+    );
+    let tools = rewritten["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 1, "the unrelated function tool must survive: {tools:?}");
+    assert_eq!(
+        tools[0]["name"], "unrelated_local_tool",
+        "unrelated top-level tool preserved"
+    );
+
+    let raw = String::from_utf8(serialized.as_bytes().to_vec()).unwrap();
+    assert!(
+        !raw.contains("super-secret-token"),
+        "empty entry credential must not leak: {raw}"
+    );
+}
+
+// =========================================================================
+// Body Rewrite: MCP to Function
+// =========================================================================
+
+/// Build a tool map with a single `(weather, get_weather)` entry.
+fn weather_tool_map() -> HashMap<(String, String), serde_json::Value> {
+    let mut map = HashMap::new();
+    map.insert(
+        ("weather".to_owned(), "get_weather".to_owned()),
+        serde_json::json!({
+            "server_label": "weather",
+            "tool_definition": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }),
+    );
+    map
+}
+
+/// Build a [`Resolution`] from raw MCP definitions, pre-building
+/// function tools for `per_entry` and dispatch entries for
+/// `tool_map`, using `"weather"` as the server label.
+fn make_resolution(raw_per_entry: &[Vec<serde_json::Value>]) -> Resolution {
+    let label = "weather";
+    let mut tool_map = HashMap::new();
+    let mut per_entry = Vec::new();
+    for raw_tools in raw_per_entry {
+        let function_tools: Vec<serde_json::Value> = raw_tools
+            .iter()
+            .map(|def| mcp_tool_to_function_tool(label, def))
+            .collect();
+        tool_map.extend(raw_tools.iter().map(|tool| {
+            let name = tool["name"].as_str().unwrap_or("unknown");
+            (
+                (label.to_owned(), name.to_owned()),
+                serde_json::json!({"server_label": label, "tool_definition": tool}),
+            )
+        }));
+        per_entry.push(EntryResolution::Resolved(function_tools));
+    }
+    let has_resolved = !raw_per_entry.is_empty();
+    let resolved_labels = if has_resolved {
+        HashSet::from([label.to_owned()])
+    } else {
+        HashSet::new()
+    };
+    Resolution {
+        per_entry,
+        tool_map,
+        has_resolved,
+        resolved_labels,
+    }
+}
+
+/// Pre-built function tools in `per_entry` are moved into the
+/// rewritten array; non-MCP tools pass through unchanged.
+#[test]
+fn rewrite_tools_array_converts_mcp_to_function() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "calc"}),
+        serde_json::json!({"type": "mcp", "server_label": "weather"}),
+    ];
+    let raw = vec![vec![serde_json::json!({
+        "name": "get_weather",
+        "description": "Get current weather",
+        "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
+    })]];
+    let resolution = make_resolution(&raw);
+    let (rewritten, generated) = rewrite_tools_array(tools, resolution.per_entry);
+
+    assert_eq!(rewritten.len(), 2, "should have 2 tools");
+    assert_eq!(rewritten[0]["name"], "calc", "first tool unchanged");
+    assert_eq!(rewritten[1]["type"], "function", "MCP converted to function");
+    assert_eq!(rewritten[1]["name"], "weather__get_weather", "prefixed name");
+    assert_eq!(
+        rewritten[1]["description"], "Get current weather",
+        "description preserved from MCP definition"
+    );
+    assert!(
+        rewritten[1]["parameters"]["properties"]["city"].is_object(),
+        "inputSchema mapped to parameters"
+    );
+    assert!(
+        generated.contains("weather__get_weather"),
+        "generated names should track rewritten tools"
+    );
+}
+
+/// Unresolved MCP entries (empty `per_entry`) are left unchanged.
+#[test]
+fn rewrite_tools_array_preserves_unresolved_mcp() {
+    let tools = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "unknown",
+        "server_url": "http://10.0.0.99/mcp"
+    })];
+
+    let (rewritten, generated) = rewrite_tools_array(tools, vec![EntryResolution::PassThrough]);
+
+    assert_eq!(rewritten.len(), 1, "should preserve unresolved entry");
+    assert_eq!(rewritten[0]["type"], "mcp", "unresolved MCP left unchanged");
+    assert!(generated.is_empty(), "no generated names for unresolved");
+}
+
+/// Missing `inputSchema` defaults to `{"type":"object"}`.
+#[test]
+fn mcp_tool_to_function_tool_adds_default_parameters() {
+    let definition = serde_json::json!({"name": "simple_tool", "description": "Does something"});
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert_eq!(function_tool["type"], "function", "type set to function");
+    assert_eq!(
+        function_tool["name"], "srv__simple_tool",
+        "name encoded with label prefix"
+    );
+    assert_eq!(function_tool["description"], "Does something", "description preserved");
+    assert_eq!(
+        function_tool["parameters"]["type"], "object",
+        "default parameters when inputSchema absent"
+    );
+}
+
+/// A single MCP entry resolving to multiple tools expands into
+/// multiple function tools in the output.
+#[test]
+fn rewrite_tools_array_expands_multiple_tools() {
+    let tools = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "math",
+        "server_url": "http://10.0.0.5/mcp"
+    })];
+
+    let per_entry = vec![EntryResolution::Resolved(vec![
+        mcp_tool_to_function_tool(
+            "math",
+            &serde_json::json!({"name": "add", "description": "Add numbers"}),
+        ),
+        mcp_tool_to_function_tool(
+            "math",
+            &serde_json::json!({"name": "subtract", "description": "Subtract numbers"}),
+        ),
+    ])];
+
+    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+
+    assert_eq!(rewritten.len(), 2, "one MCP entry expands to multiple function tools");
+    let names: Vec<&str> = rewritten.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"math__add"), "should have add tool");
+    assert!(names.contains(&"math__subtract"), "should have subtract tool");
+    assert_eq!(generated.len(), 2, "both names tracked as generated");
+}
+
+// =========================================================================
+// Body Rewrite: input_schema fallback (cached tool format)
+// =========================================================================
+
+/// Falls back to `input_schema` when `inputSchema` is absent
+/// (cached API listing format).
+#[test]
+fn mcp_tool_to_function_tool_reads_input_schema_snake_case() {
+    let definition = serde_json::json!({
+        "name": "cached_tool",
+        "description": "Cached from API",
+        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert_eq!(function_tool["type"], "function", "type set to function");
+    assert_eq!(function_tool["name"], "srv__cached_tool", "name encoded");
+    assert_eq!(
+        function_tool["parameters"]["properties"]["q"]["type"], "string",
+        "should read input_schema when inputSchema is absent"
+    );
+}
+
+/// `inputSchema` takes precedence over `input_schema` when both
+/// fields are present.
+#[test]
+fn mcp_tool_to_function_tool_prefers_input_schema_camel_case() {
+    let definition = serde_json::json!({
+        "name": "both_schemas",
+        "inputSchema": {"type": "object", "properties": {"a": {"type": "string"}}},
+        "input_schema": {"type": "object", "properties": {"b": {"type": "string"}}}
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert!(
+        function_tool["parameters"]["properties"]["a"].is_object(),
+        "inputSchema (camelCase) should take precedence"
+    );
+}
+
+/// A complex `inputSchema` (`$ref`, `$defs`, `anyOf`, nested objects) is
+/// carried into `parameters` verbatim, not sanitized or flattened. The
+/// rewrite is a blind whole-value clone, and this pins that contract so a
+/// future schema-walking regression cannot silently drop JSON Schema
+/// constructs the backend needs to constrain tool arguments.
+#[test]
+fn mcp_tool_to_function_tool_preserves_nested_schema_verbatim() {
+    let input_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "shape": {"$ref": "#/$defs/shape"},
+            "mode": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "nested": {"type": "object", "additionalProperties": false,
+                       "properties": {"deep": {"type": "array", "items": {"type": "integer"}}}}
+        },
+        "required": ["shape"],
+        "additionalProperties": false,
+        "$defs": {
+            "shape": {"type": "object", "required": ["kind"],
+                      "properties": {"kind": {"type": "string"}}}
+        }
+    });
+    let definition = serde_json::json!({
+        "name": "complex_tool",
+        "description": "Uses a nested schema",
+        "inputSchema": input_schema,
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert_eq!(
+        function_tool["parameters"], input_schema,
+        "nested $ref/$defs/anyOf inputSchema must survive the rewrite bit-for-bit"
+    );
+}
+
+/// `outputSchema` has no slot in the Responses function-tool format and is
+/// intentionally dropped by the rewrite. This pins the drop so it stays a
+/// deliberate decision rather than an accident: the emitted tool carries
+/// only `type`/`name`/`description`/`parameters`.
+#[test]
+fn mcp_tool_to_function_tool_drops_output_schema() {
+    let definition = serde_json::json!({
+        "name": "structured_tool",
+        "description": "Returns structured output",
+        "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}},
+        "outputSchema": {"type": "object", "required": ["answer"],
+                         "properties": {"answer": {"type": "string"}}}
+    });
+
+    let function_tool = mcp_tool_to_function_tool("srv", &definition);
+
+    assert!(
+        function_tool.get("outputSchema").is_none(),
+        "outputSchema has no function-tool slot and must be dropped"
+    );
+    assert!(
+        function_tool.get("output_schema").is_none(),
+        "snake_case output_schema must also be absent"
+    );
+    let obj = function_tool.as_object().expect("function tool is an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["description", "name", "parameters", "type"],
+        "function tool carries only the Responses-supported fields"
+    );
+}
+
+/// Fresh discovery and cached continuation must rewrite the same logical tool
+/// to the identical function tool.
+///
+/// A fresh `tools/list` callout serializes schemas with the `camelCase`
+/// `inputSchema` spelling, while a cached `mcp_list_tools` listing carries the
+/// `snake_case` `input_schema` spelling. Both provenances funnel through
+/// [`mcp_tool_to_function_tool`] in `build_entry_resolution`, so the same tool
+/// must produce byte-equivalent parameters regardless of which path resolved
+/// it — otherwise a cache hit could hand the model a different tool contract
+/// than a fresh discovery of the same server.
+#[test]
+fn mcp_tool_to_function_tool_fresh_and_cached_schemas_are_equivalent() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "shape": {"$ref": "#/$defs/shape"},
+            "mode": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "tags": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["shape"],
+        "additionalProperties": false,
+        "$defs": {"shape": {"type": "object", "properties": {"kind": {"type": "string"}}}}
+    });
+
+    // Fresh discovery: rmcp serializes `tools/list` with camelCase `inputSchema`.
+    let fresh = serde_json::json!({
+        "name": "lookup", "description": "Look something up", "inputSchema": schema,
+    });
+    // Cached continuation: stored `mcp_list_tools` items carry snake_case.
+    let cached = serde_json::json!({
+        "name": "lookup", "description": "Look something up", "input_schema": schema,
+    });
+
+    let fresh_tool = mcp_tool_to_function_tool("srv", &fresh);
+    let cached_tool = mcp_tool_to_function_tool("srv", &cached);
+
+    assert_eq!(
+        fresh_tool, cached_tool,
+        "fresh discovery and cached continuation must rewrite to the identical function tool"
+    );
+    assert_eq!(
+        fresh_tool["parameters"], schema,
+        "the shared rewrite must preserve the complex schema verbatim on both paths"
+    );
+}
+
+// =========================================================================
+// Function Name Encoding
+// =========================================================================
+
+/// Invalid characters (dots, slashes) are replaced with
+/// underscores to satisfy the `^[a-zA-Z0-9_-]+$` schema.
+#[test]
+fn encode_function_name_sanitizes_invalid_chars() {
+    let name = encode_function_name("my.server", "get/weather");
+    assert_eq!(name, "my_server__get_weather", "dots and slashes replaced with _");
+}
+
+/// Combined label + tool name exceeding 64 characters is truncated
+/// to the `MAX_FUNCTION_NAME_LEN` limit.
+#[test]
+fn encode_function_name_truncates_long_names() {
+    let long_label = "a".repeat(40);
+    let long_tool = "b".repeat(40);
+    let name = encode_function_name(&long_label, &long_tool);
+    assert!(
+        name.len() <= MAX_FUNCTION_NAME_LEN,
+        "name should be truncated to {} chars, got {}",
+        MAX_FUNCTION_NAME_LEN,
+        name.len()
+    );
+}
+
+/// Alphanumeric characters, hyphens, and underscores pass through
+/// without sanitization.
+#[test]
+fn encode_function_name_preserves_valid_chars() {
+    let name = encode_function_name("label-1", "tool_2");
+    assert_eq!(name, "label-1__tool_2", "valid chars preserved");
+}
+
+// =========================================================================
+// tool_choice Rewrite
+// =========================================================================
+
+/// Named MCP `tool_choice` is translated to a function-typed
+/// choice with the encoded name.
+#[test]
+fn rewrite_tool_choice_translates_mcp_to_function() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "weather", "name": "get_weather"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    let choice = &obj["tool_choice"];
+    assert_eq!(choice["type"], "function", "type rewritten to function");
+    assert_eq!(choice["name"], "weather__get_weather", "name encoded");
+}
+
+/// Non-object `tool_choice` values (like `"auto"`) are left
+/// unchanged.
+#[test]
+fn rewrite_tool_choice_ignores_non_mcp() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert("tool_choice".to_owned(), serde_json::json!("auto"));
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    assert_eq!(obj["tool_choice"], "auto", "non-MCP tool_choice unchanged");
+}
+
+/// Missing `tool_choice` field is a no-op.
+#[test]
+fn rewrite_tool_choice_ignores_missing() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    assert!(obj.get("tool_choice").is_none(), "no tool_choice inserted");
+}
+
+/// Named MCP `tool_choice` referencing a tool not in `tool_map`
+/// is left unchanged.
+#[test]
+fn rewrite_tool_choice_skips_unknown_mcp_tool() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "weather", "name": "nonexistent"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    assert_eq!(
+        obj["tool_choice"]["type"], "mcp",
+        "unknown MCP tool_choice left unchanged"
+    );
+}
+
+// =========================================================================
+// State Sync: write_state synchronizes request_body and tools
+// =========================================================================
+
+/// Build a rewritten body with function tools and `tool_choice`
+/// already translated from MCP form.
+fn rewritten_body_json() -> serde_json::Value {
+    serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "function", "name": "weather__get_weather", "parameters": {"type": "object"}}],
+        "tool_choice": {"type": "function", "name": "weather__get_weather"}
+    })
+}
+
+/// `write_state` synchronizes `request_body`, `tools`, and
+/// `tool_choice` on an existing `ResponsesState`.
+#[test]
+fn write_state_syncs_request_body_and_tools_on_existing_state() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let original_body = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "weather"}],
+        "tool_choice": {"type": "mcp", "server_label": "weather", "name": "get_weather"}
+    });
+    ctx.extensions.insert(ResponsesState::from_request_body(original_body));
+
+    let body_bytes = serde_json::to_vec(&rewritten_body_json()).unwrap();
+    write_state(&mut ctx, &body_bytes, weather_tool_map());
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
+    assert_eq!(state.tools.len(), 1, "tools synced from rewritten body");
+    assert_eq!(state.tools[0]["type"], "function", "synced tool is function type");
+    assert_eq!(state.tool_choice["type"], "function", "tool_choice synced");
+    assert_eq!(
+        state.request_body["tools"][0]["type"], "function",
+        "request_body rewritten"
+    );
+}
+
+// =========================================================================
+// Per-entry expansion respects allowed_tools
+// =========================================================================
+
+/// Per-entry `per_entry` lists are consumed independently,
+/// respecting per-entry `allowed_tools` filtering.
+#[test]
+fn rewrite_per_entry_respects_allowed_tools_filter() {
+    let tools = vec![
+        serde_json::json!({"type": "mcp", "server_label": "s", "allowed_tools": ["tool_a"]}),
+        serde_json::json!({"type": "mcp", "server_label": "s", "allowed_tools": ["tool_b"]}),
+    ];
+
+    let per_entry = vec![
+        EntryResolution::Resolved(vec![mcp_tool_to_function_tool(
+            "s",
+            &serde_json::json!({"name": "tool_a", "description": "A"}),
+        )]),
+        EntryResolution::Resolved(vec![mcp_tool_to_function_tool(
+            "s",
+            &serde_json::json!({"name": "tool_b", "description": "B"}),
+        )]),
+    ];
+
+    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+
+    assert_eq!(rewritten.len(), 2, "each entry expands independently");
+    assert_eq!(rewritten[0]["name"], "s__tool_a", "first entry only has tool_a");
+    assert_eq!(rewritten[1]["name"], "s__tool_b", "second entry only has tool_b");
+}
+
+// =========================================================================
+// Server-level MCP tool_choice → allowed_tools
+// =========================================================================
+
+/// Server-level MCP `tool_choice` `{"type":"mcp","server_label":"X"}`
+/// (without `name`) rewrites to an `allowed_tools` form scoped to
+/// that server's generated functions.
+#[test]
+fn rewrite_tool_choice_server_level_becomes_allowed_tools() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "weather"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    let choice = &obj["tool_choice"];
+    assert_eq!(
+        choice["type"], "allowed_tools",
+        "server-level MCP tool_choice should become allowed_tools"
+    );
+    assert_eq!(choice["mode"], "required", "mode should be required");
+    let tool_refs = choice["tools"].as_array().expect("tools should be array");
+    assert!(
+        tool_refs.iter().all(|t| t["type"] == "function"),
+        "all entries should be function type"
+    );
+    assert!(
+        tool_refs.iter().any(|t| t["name"] == "weather__get_weather"),
+        "should include weather server's function"
+    );
+}
+
+/// Server-level MCP `tool_choice` for an unknown server is left
+/// unchanged when no tools from that server exist.
+#[test]
+fn rewrite_tool_choice_server_level_unknown_label_unchanged() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "nonexistent"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    assert_eq!(
+        obj["tool_choice"]["type"], "mcp",
+        "unknown server-level MCP tool_choice left unchanged"
+    );
+}
+
+// =========================================================================
+// MCP selectors inside allowed_tools tool_choice
+// =========================================================================
+
+/// MCP selectors inside an `allowed_tools` `tool_choice` are
+/// expanded to their generated function equivalents.
+#[test]
+fn rewrite_tool_choice_expands_mcp_selectors_in_allowed_tools() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "weather"},
+                {"type": "function", "name": "calc"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    let choice = &obj["tool_choice"];
+    assert_eq!(choice["type"], "allowed_tools", "type preserved");
+    assert_eq!(choice["mode"], "auto", "mode preserved");
+    let tool_refs = choice["tools"].as_array().expect("tools should be array");
+    let names: Vec<&str> = tool_refs.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"calc"), "non-MCP selector preserved");
+    assert!(
+        names.contains(&"weather__get_weather"),
+        "MCP selector expanded to function"
+    );
+}
+
+/// Named MCP selectors inside `allowed_tools` are translated to
+/// their specific function equivalent.
+#[test]
+fn rewrite_tool_choice_translates_named_mcp_selector_in_allowed_tools() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [
+                {"type": "mcp", "server_label": "weather", "name": "get_weather"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert_eq!(tool_refs.len(), 1, "one selector → one function ref");
+    assert_eq!(tool_refs[0]["type"], "function", "translated to function");
+    assert_eq!(tool_refs[0]["name"], "weather__get_weather", "name encoded");
+}
+
+/// `allowed_tools` `tool_choice` without MCP selectors is left
+/// unchanged.
+#[test]
+fn rewrite_tool_choice_allowed_tools_without_mcp_unchanged() {
+    let tool_map = weather_tool_map();
+    let original = serde_json::json!({
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "function", "name": "calc"}]
+    });
+    let mut obj = serde_json::Map::new();
+    obj.insert("tool_choice".to_owned(), original.clone());
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    assert_eq!(obj["tool_choice"], original, "no MCP selectors → unchanged");
+}
+
+/// An unresolved named MCP selector inside `allowed_tools` is
+/// preserved when no matching entry exists in `tool_map`.
+#[test]
+fn rewrite_tool_choice_preserves_unresolved_named_mcp_selector() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "weather", "name": "nonexistent"},
+                {"type": "function", "name": "calc"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert_eq!(tool_refs.len(), 2, "unresolved selector preserved alongside function");
+    let mcp_ref = tool_refs.iter().find(|t| t["type"] == "mcp");
+    assert!(mcp_ref.is_some(), "unresolved MCP selector should be preserved");
+    assert_eq!(
+        mcp_ref.unwrap()["name"],
+        "nonexistent",
+        "original selector fields preserved"
+    );
+}
+
+/// An unresolved server-level MCP selector inside `allowed_tools`
+/// is preserved when no tools from that server exist in `tool_map`.
+#[test]
+fn rewrite_tool_choice_preserves_unresolved_server_mcp_selector() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [
+                {"type": "mcp", "server_label": "unknown_server"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert_eq!(tool_refs.len(), 1, "unresolved server selector preserved");
+    assert_eq!(tool_refs[0]["type"], "mcp", "original MCP type preserved");
+    assert_eq!(
+        tool_refs[0]["server_label"], "unknown_server",
+        "original server_label preserved"
+    );
+}
+
+/// Mixed resolved and unresolved MCP selectors: resolved ones
+/// expand, unresolved ones are preserved.
+#[test]
+fn rewrite_tool_choice_mixed_resolved_and_unresolved_selectors() {
+    let tool_map = weather_tool_map();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "weather"},
+                {"type": "mcp", "server_label": "deferred_server"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &HashSet::new()).unwrap();
+
+    let choice = &obj["tool_choice"];
+    let tool_refs = choice["tools"].as_array().expect("tools array");
+    let has_expanded = tool_refs
+        .iter()
+        .any(|t| t["type"] == "function" && t["name"].as_str().is_some_and(|n| n.starts_with("weather__")));
+    assert!(has_expanded, "resolved MCP selector should expand");
+    let has_preserved = tool_refs
+        .iter()
+        .any(|t| t["type"] == "mcp" && t["server_label"] == "deferred_server");
+    assert!(has_preserved, "unresolved MCP selector should be preserved");
+}
+
+/// A server-level MCP selector for a label that resolved to zero
+/// tools must be dropped from an `allowed_tools` `tool_choice`,
+/// mirroring the top-level MCP `tool_choice` handling. The native
+/// selector must not reach the backend.
+#[test]
+fn rewrite_tool_choice_drops_resolved_empty_server_selector_in_allowed_tools() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "empty_server"},
+                {"type": "function", "name": "calc"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert!(
+        tool_refs.iter().all(|t| t["type"] != "mcp"),
+        "resolved-empty MCP selector must be dropped, not preserved: {tool_refs:?}"
+    );
+    assert!(
+        tool_refs.iter().any(|t| t["name"] == "calc"),
+        "unrelated function selector must be preserved"
+    );
+}
+
+/// A named MCP selector whose server resolved but whose tool is not
+/// in the resolved set is dropped, while a genuinely unresolved
+/// (deferred) selector on another label is preserved.
+#[test]
+fn rewrite_tool_choice_drops_resolved_empty_named_selector_keeps_unresolved() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "mcp", "server_label": "empty_server", "name": "gone"},
+                {"type": "mcp", "server_label": "deferred_server"}
+            ]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+
+    let tool_refs = obj["tool_choice"]["tools"].as_array().expect("tools array");
+    assert_eq!(
+        tool_refs.len(),
+        1,
+        "only the unresolved selector should remain: {tool_refs:?}"
+    );
+    assert_eq!(tool_refs[0]["type"], "mcp", "deferred selector preserved");
+    assert_eq!(
+        tool_refs[0]["server_label"], "deferred_server",
+        "the preserved selector must be the unresolved one"
+    );
+}
+
+/// When every selector in an `allowed_tools` choice targets a locally
+/// resolved server that produced zero eligible tools, a
+/// `mode: "required"` choice is unsatisfiable. It must be rejected
+/// rather than rewritten to an empty (schema-invalid) `allowed_tools`.
+#[test]
+fn rewrite_tool_choice_rejects_allowed_tools_when_all_selectors_resolved_empty_required() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [{"type": "mcp", "server_label": "empty_server"}]
+        }),
+    );
+
+    let err = rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap_err();
+    assert!(
+        matches!(err, ResolveError::EmptyResolvedToolChoice(_)),
+        "an all-empty required allowed_tools choice must be rejected, not emitted as empty: {err}"
+    );
+}
+
+/// When every selector in a non-required `allowed_tools` choice
+/// resolves to zero eligible tools, the restricted set is empty. It must
+/// normalize to `"none"` — never to an empty (schema-invalid)
+/// `allowed_tools`, and never removed (which would broaden access to any
+/// other tool still supplied in the request).
+#[test]
+fn rewrite_tool_choice_normalizes_empty_auto_allowed_tools_to_none() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "mcp", "server_label": "empty_server"}]
+        }),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+    assert_eq!(
+        obj["tool_choice"], "none",
+        "a vacuous auto allowed_tools choice must normalize to \"none\", not be emptied or removed: {obj:?}"
+    );
+}
+
+// =========================================================================
+// Name Collision Detection
+// =========================================================================
+
+/// Duplicate generated function names are detected and rejected.
+#[test]
+fn detect_name_collisions_rejects_generated_duplicates() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "my_server__get"}),
+        serde_json::json!({"type": "function", "name": "my_server__get"}),
+    ];
+    let generated = HashSet::from(["my_server__get".to_owned()]);
+
+    let result = detect_name_collisions(&tools, &generated);
+    assert!(result.is_err(), "duplicate generated names should be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("my_server__get"),
+        "error should identify the colliding name"
+    );
+}
+
+/// Distinct function names pass collision detection.
+#[test]
+fn detect_name_collisions_accepts_distinct_names() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "server_a__tool"}),
+        serde_json::json!({"type": "function", "name": "server_b__tool"}),
+    ];
+    let generated = HashSet::from(["server_a__tool".to_owned(), "server_b__tool".to_owned()]);
+
+    assert!(
+        detect_name_collisions(&tools, &generated).is_ok(),
+        "distinct names should pass collision check"
+    );
+}
+
+/// Non-function tools are skipped during collision detection.
+#[test]
+fn detect_name_collisions_ignores_non_function_tools() {
+    let tools = vec![
+        serde_json::json!({"type": "mcp", "server_label": "x"}),
+        serde_json::json!({"type": "function", "name": "only_one"}),
+    ];
+    let generated = HashSet::from(["only_one".to_owned()]);
+
+    assert!(
+        detect_name_collisions(&tools, &generated).is_ok(),
+        "non-function tools should be skipped"
+    );
+}
+
+/// Client-supplied duplicate function names are not rejected when
+/// no generated name is involved.
+#[test]
+fn detect_name_collisions_ignores_client_duplicates() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "client_func"}),
+        serde_json::json!({"type": "function", "name": "client_func"}),
+    ];
+    let generated = HashSet::new();
+
+    assert!(
+        detect_name_collisions(&tools, &generated).is_ok(),
+        "client-only duplicates should pass — backend validates these"
+    );
+}
+
+/// A generated name colliding with a client-supplied name is
+/// rejected.
+#[test]
+fn detect_name_collisions_rejects_generated_vs_client_collision() {
+    let tools = vec![
+        serde_json::json!({"type": "function", "name": "my_func"}),
+        serde_json::json!({"type": "function", "name": "my_func"}),
+    ];
+    let generated = HashSet::from(["my_func".to_owned()]);
+
+    assert!(
+        detect_name_collisions(&tools, &generated).is_err(),
+        "generated name colliding with client name should be rejected"
+    );
+}
+
+/// Lossy sanitization can cause collisions when special characters
+/// in labels map to the same encoded name.
+#[test]
+fn encode_function_name_lossy_collision_example() {
+    let name_a = encode_function_name("my.server", "get");
+    let name_b = encode_function_name("my_server", "get");
+    assert_eq!(name_a, name_b, "dots sanitized to underscores create identical names");
+}
+
+// =========================================================================
+// Duplicate server_label Rejection
+// =========================================================================
+
+#[test]
+fn duplicate_label_rejected() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+    ];
+    let err = check_duplicate_labels(&entries).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate server_label"),
+        "should report duplicate label: {err}"
+    );
+}
+
+#[test]
+fn duplicate_label_with_credentials_rejected() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_a"}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_b"}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_err(),
+        "credentialed duplicates must be rejected"
+    );
+}
+
+#[test]
+fn duplicate_label_different_urls_rejected() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_err(),
+        "same label with different URLs must be rejected"
+    );
+}
+
+#[test]
+fn distinct_labels_accepted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.2/mcp"}),
+    ];
+    assert!(check_duplicate_labels(&entries).is_ok(), "distinct labels should pass");
+}
+
+#[test]
+fn duplicate_label_connector_resolved_entry_counted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "s", "connector_id": "c1", "server_url": "https://a.example.com/mcp"}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_err(),
+        "resolved connector entries should be counted in duplicate check"
+    );
+}
+
+#[test]
+fn duplicate_label_deferred_not_counted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.2/mcp", "defer_loading": true}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_ok(),
+        "deferred entries are not resolvable and should not trigger duplicate check"
+    );
+}
+
+#[test]
+fn duplicate_label_empty_entries_accepted() {
+    let entries: Vec<serde_json::Value> = Vec::new();
+    assert!(check_duplicate_labels(&entries).is_ok(), "empty entries should pass");
+}
+
+#[test]
+fn duplicate_label_single_entry_accepted() {
+    let entries = vec![serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"})];
+    assert!(check_duplicate_labels(&entries).is_ok(), "single entry should pass");
+}
+
+#[test]
+fn duplicate_label_all_non_resolvable_accepted() {
+    let entries = vec![
+        serde_json::json!({"server_label": "s", "connector_id": "conn_1"}),
+        serde_json::json!({"server_label": "s", "connector_id": "conn_2"}),
+    ];
+    assert!(
+        check_duplicate_labels(&entries).is_ok(),
+        "all non-resolvable entries should pass"
+    );
+}
+
+#[test]
+fn duplicate_label_reports_offending_label() {
+    let entries = vec![
+        serde_json::json!({"server_label": "my_srv", "server_url": "http://10.0.0.1/mcp"}),
+        serde_json::json!({"server_label": "my_srv", "server_url": "http://10.0.0.1/mcp"}),
+    ];
+    let err = check_duplicate_labels(&entries).unwrap_err();
+    assert!(
+        err.to_string().contains("my_srv"),
+        "error should name the duplicate label: {err}"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_label_entries_rejected_at_filter_level() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [
+            {"type": "mcp", "server_label": "s", "server_url": "http://10.0.0.5/mcp", "authorization": "tok_a"},
+            {"type": "mcp", "server_label": "s", "server_url": "http://10.0.0.5/mcp", "authorization": "tok_b"}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(
+        rejection.status, 400,
+        "duplicate labels must be a 400 client error, not 502"
+    );
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(
+        body_str.contains("duplicate server_label"),
+        "response body should mention the duplicate: {body_str}"
+    );
+}
+
+// =========================================================================
+// Body Size Limit After MCP Tool Expansion
+// =========================================================================
+
+/// Build a filter with a specific `max_rewritten_body_bytes` limit.
+fn filter_with_max_rewritten_body_bytes(limit: usize) -> Box<dyn HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_rewritten_body_bytes: {limit}")).unwrap();
+    McpToolResolveFilter::from_config(&yaml).unwrap()
+}
+
+/// Build a cached tool listing with a schema large enough to
+/// expand a small request body past a given byte threshold.
+fn large_cached_tools(desc_len: usize) -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "name": "get_weather",
+        "description": "x".repeat(desc_len),
+        "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
+    })]
+}
+
+/// Expansion past `max_rewritten_body_bytes` produces a 413 rejection with
+/// `invalid_request_error`. Body and `ResponsesState` are unchanged.
+#[tokio::test]
+async fn expanded_body_exceeding_limit_returns_413() {
+    let filter = filter_with_max_rewritten_body_bytes(256);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url,
+        "tools": large_cached_tools(4096),
+    })];
+    ctx.extensions.insert(state);
+
+    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(body_bytes.clone()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 413, "should be HTTP 413");
+    let resp = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(resp.contains("invalid_request_error"), "error type: {resp}");
+    assert_eq!(body.as_deref(), Some(body_bytes.as_slice()), "body must be unchanged");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.mcp_tool_map.is_empty(),
+        "tool map must not be populated on rejection"
+    );
+}
+
+/// Expansion within `max_rewritten_body_bytes` continues and commits the
+/// rewritten body to `ResponsesState`.
+#[tokio::test]
+async fn expanded_body_within_limit_continues() {
+    let filter = filter_with_max_rewritten_body_bytes(1_048_576);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = mcp_body(server_url);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url,
+        "tools": [{"name": "get_weather", "description": "Get weather"}],
+    })];
+    ctx.extensions.insert(state);
+
+    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(body_bytes.clone()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "should continue");
+    assert_ne!(body.as_deref(), Some(body_bytes.as_slice()), "body should be rewritten");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(!state.mcp_tool_map.is_empty(), "tool map should be populated");
+}
+
+/// Run MCP tool expansion through the filter and return the
+/// expanded body length.
+async fn measure_expanded_body_len(server_url: &str, cached: &[serde_json::Value]) -> usize {
+    let filter = filter_with_max_rewritten_body_bytes(1_048_576);
+    let body_json = mcp_body(server_url);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url, "tools": cached,
+    })];
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    body.as_ref().unwrap().len()
+}
+
+/// Expanded body whose length equals `max_rewritten_body_bytes` exactly is
+/// accepted (the guard rejects strictly *over* the limit).
+#[tokio::test]
+async fn expanded_body_at_exact_limit_continues() {
+    let server_url = "http://10.0.0.5/mcp";
+    let cached = vec![serde_json::json!({
+        "name": "get_weather", "description": "Get weather",
+        "inputSchema": {"type": "object"},
+    })];
+    let expanded_len = measure_expanded_body_len(server_url, &cached).await;
+
+    let filter_exact = filter_with_max_rewritten_body_bytes(expanded_len);
+    let body_json = mcp_body(server_url);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url, "tools": cached,
+    })];
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter_exact.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "body at exact limit ({expanded_len} bytes) should be accepted"
+    );
+}
+
+/// `BodyTooLarge` maps to HTTP 413 with `invalid_request_error`.
+#[test]
+fn body_too_large_maps_to_413() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let err = ResolveError::BodyTooLarge {
+        actual: 1_000_000,
+        limit: 65_536,
+    };
+    let action = resolve_error_action(&mut ctx, &err, false, b"{}");
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 413, "should be HTTP 413");
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(
+        body_str.contains("invalid_request_error"),
+        "error type should be invalid_request_error: {body_str}"
+    );
+    assert!(body_str.contains("1000000"), "should include actual size: {body_str}");
+}
+
+// =========================================================================
+// Connector Resolution
+// =========================================================================
+
+#[test]
+fn resolve_connector_ids_injects_server_url() {
+    let connectors = HashMap::from([(
+        "corp_drive".to_owned(),
+        url::Url::parse("https://drive.example.com/mcp").unwrap(),
+    )]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "drive",
+        "connector_id": "corp_drive"
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_ok(), "valid connector should resolve");
+    assert_eq!(
+        entries[0]["server_url"].as_str(),
+        Some("https://drive.example.com/mcp"),
+        "server_url should be injected"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_rejects_unknown_id() {
+    let connectors = HashMap::from([(
+        "known".to_owned(),
+        url::Url::parse("https://a.example.com/mcp").unwrap(),
+    )]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "drive",
+        "connector_id": "nonexistent"
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("unknown connector_id"), "error: {err}");
+    assert!(err.to_string().contains("nonexistent"), "should name the ID: {err}");
+}
+
+#[test]
+fn resolve_connector_ids_rejects_mutual_exclusivity() {
+    let connectors = HashMap::from([("c1".to_owned(), url::Url::parse("https://a.example.com/mcp").unwrap())]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "s",
+        "connector_id": "c1",
+        "server_url": "https://other.example.com/mcp"
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("mutually exclusive"),
+        "should mention mutual exclusivity"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_rejects_null_server_url_as_mutual_exclusivity() {
+    let connectors = HashMap::from([("c1".to_owned(), url::Url::parse("https://a.example.com/mcp").unwrap())]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "s",
+        "connector_id": "c1",
+        "server_url": null
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("mutually exclusive"),
+        "null server_url key presence should trigger mutual exclusivity"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_rejects_deferred_connector() {
+    let connectors = HashMap::from([("c1".to_owned(), url::Url::parse("https://a.example.com/mcp").unwrap())]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "s",
+        "connector_id": "c1",
+        "defer_loading": true
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("defer_loading"),
+        "should reject deferred connector"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_rejects_non_string_connector_id() {
+    let connectors = HashMap::from([(
+        "valid".to_owned(),
+        url::Url::parse("https://a.example.com/mcp").unwrap(),
+    )]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "s",
+        "connector_id": 42
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("must be a non-empty string"),
+        "should reject non-string connector_id"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_rejects_empty_connector_id() {
+    let connectors = HashMap::from([(
+        "valid".to_owned(),
+        url::Url::parse("https://a.example.com/mcp").unwrap(),
+    )]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "s",
+        "connector_id": ""
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("must be a non-empty string"),
+        "should reject empty connector_id"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_rejects_missing_server_label() {
+    let connectors = HashMap::from([("c1".to_owned(), url::Url::parse("https://a.example.com/mcp").unwrap())]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "connector_id": "c1"
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_err());
+    assert!(
+        result.unwrap_err().to_string().contains("server_label"),
+        "should require server_label with connector_id"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_skips_entries_without_connector_id() {
+    let connectors = HashMap::new();
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "s",
+        "server_url": "http://10.0.0.5/mcp"
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_ok(), "entries without connector_id should be skipped");
+    assert_eq!(
+        entries[0]["server_url"].as_str(),
+        Some("http://10.0.0.5/mcp"),
+        "original server_url should be unchanged"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_preserves_request_fields() {
+    let connectors = HashMap::from([("c1".to_owned(), url::Url::parse("https://a.example.com/mcp").unwrap())]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "s",
+        "connector_id": "c1",
+        "authorization": "Bearer tok",
+        "require_approval": "always",
+        "allowed_tools": ["tool_a"]
+    })];
+
+    let result = resolve_connector_ids(&connectors, &mut entries);
+    assert!(result.is_ok());
+    assert_eq!(
+        entries[0]["authorization"].as_str(),
+        Some("Bearer tok"),
+        "authorization preserved"
+    );
+    assert_eq!(
+        entries[0]["require_approval"].as_str(),
+        Some("always"),
+        "require_approval preserved"
+    );
+    assert!(entries[0]["allowed_tools"].is_array(), "allowed_tools preserved");
+}
+
+// =========================================================================
+// Connector Config
+// =========================================================================
+
+#[test]
+fn config_with_connectors_parses() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: corp_drive
+    server_url: https://drive-mcp.example.com/mcp
+  - id: internal_search
+    server_url: https://search-mcp.example.com/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_tool_resolve");
+}
+
+#[test]
+fn config_with_empty_connectors_parses() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("connectors: []").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "openai_mcp_tool_resolve");
+}
+
+#[test]
+fn config_rejects_duplicate_connector_ids() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: dup
+    server_url: https://a.example.com/mcp
+  - id: dup
+    server_url: https://b.example.com/mcp
+",
+    )
+    .unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_empty_connector_id() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+connectors:
+  - id: ""
+    server_url: https://a.example.com/mcp
+"#,
+    )
+    .unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_empty_connector_url() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+connectors:
+  - id: valid
+    server_url: ""
+"#,
+    )
+    .unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_connector_id_too_long() {
+    let long_id = "a".repeat(129);
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "connectors:\n  - id: {long_id}\n    server_url: https://a.example.com/mcp"
+    ))
+    .unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_connector_url_too_long() {
+    let long_url = format!("https://a.example.com/{}", "x".repeat(2049));
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&format!("connectors:\n  - id: valid\n    server_url: {long_url}")).unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_too_many_connectors() {
+    let entries: String = (0..65)
+        .map(|i| format!("  - id: conn_{i}\n    server_url: https://{i}.example.com/mcp"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("connectors:\n{entries}")).unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_connector_with_non_http_scheme() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: bad
+    server_url: ftp://a.example.com/mcp
+",
+    )
+    .unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_connector_url_with_credentials() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: bad
+    server_url: https://user:pass@a.example.com/mcp
+",
+    )
+    .unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_connector_url_without_host() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: bad
+    server_url: https:///
+",
+    )
+    .unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+}
+
+#[test]
+fn config_rejects_unknown_connector_fields() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: c1
+    server_url: https://a.example.com/mcp
+    extra: true
+",
+    )
+    .unwrap();
+    assert!(
+        McpToolResolveFilter::from_config(&yaml).is_err(),
+        "unknown fields in connector entries should be rejected"
+    );
+}
+
+// =========================================================================
+// Connector Filter-Level Tests
+// =========================================================================
+
+#[tokio::test]
+async fn connector_entry_rejected_when_no_connectors_configured() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "drive", "connector_id": "corp_drive"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 400, "unknown connector should be 400");
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(body_str.contains("unknown connector_id"), "body: {body_str}");
+}
+
+#[tokio::test]
+async fn connector_mutual_exclusivity_rejected_at_filter_level() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: c1
+    server_url: https://a.example.com/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{
+            "type": "mcp", "server_label": "s",
+            "connector_id": "c1",
+            "server_url": "https://other.example.com/mcp"
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 400);
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(body_str.contains("mutually exclusive"), "body: {body_str}");
+}
+
+#[tokio::test]
+async fn connector_deferred_rejected_at_filter_level() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: c1
+    server_url: https://a.example.com/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{
+            "type": "mcp", "server_label": "s",
+            "connector_id": "c1",
+            "defer_loading": true
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 400);
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(body_str.contains("defer_loading"), "body: {body_str}");
+}
+
+#[tokio::test]
+async fn connector_missing_label_rejected_at_filter_level() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+connectors:
+  - id: c1
+    server_url: https://a.example.com/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "connector_id": "c1"}]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 400);
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(body_str.contains("server_label"), "body: {body_str}");
+}
+
+#[tokio::test]
+async fn direct_url_alongside_connector_both_counted() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+max_servers: 1
+connectors:
+  - id: c1
+    server_url: https://a.example.com/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [
+            {"type": "mcp", "server_label": "a", "connector_id": "c1"},
+            {"type": "mcp", "server_label": "b", "server_url": "http://10.0.0.5/mcp"}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "two distinct servers with max_servers=1 should be rejected"
+    );
+}
+
+// =========================================================================
+// Request connector_id length cap
+// =========================================================================
+
+#[test]
+fn resolve_connector_ids_rejects_oversized_id() {
+    let connectors = HashMap::new();
+    let long_id = "a".repeat(129);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "test",
+        "connector_id": long_id,
+    })];
+    let err = resolve_connector_ids(&connectors, &mut entries).unwrap_err();
+    assert!(
+        matches!(err, ResolveError::InvalidConnectorId),
+        "oversized connector_id should be rejected: {err}"
+    );
+}
+
+#[test]
+fn resolve_connector_ids_accepts_max_length_id() {
+    let id = "a".repeat(128);
+    let url: url::Url = "https://example.com/mcp".parse().unwrap();
+    let connectors = HashMap::from([(id.clone(), url)]);
+    let mut entries = vec![serde_json::json!({
+        "type": "mcp",
+        "server_label": "test",
+        "connector_id": id,
+    })];
+    assert!(
+        resolve_connector_ids(&connectors, &mut entries).is_ok(),
+        "128-byte connector_id should be accepted"
+    );
+}
+
+// =========================================================================
+// Connector URL redaction in errors
+// =========================================================================
+
+#[test]
+fn redact_connector_client_error_replaces_url() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "drive",
+        "connector_id": "corp_drive",
+        "server_url": "https://internal.corp.example.com/mcp",
+    });
+    let uri: http::Uri = "https://internal.corp.example.com/mcp".parse().unwrap();
+    let client_err = mcp_client::McpClientError::Connection {
+        url: mcp_client::McpDisplayUrl::from_uri(&uri),
+    };
+    let result: Result<Option<Vec<serde_json::Value>>, ResolveError> = Err(ResolveError::Client {
+        server_label: "drive".to_owned(),
+        source: client_err,
+    });
+
+    let redacted = redact_connector_client_error(result, &entry);
+    let err = redacted.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("internal.corp.example.com"),
+        "internal URL should not appear in error: {msg}"
+    );
+    assert!(msg.contains("corp_drive"), "connector_id should appear in error: {msg}");
+    assert!(msg.contains("drive"), "server_label should appear in error: {msg}");
+}
+
+#[test]
+fn redact_connector_client_error_passes_through_direct_url() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "drive",
+        "server_url": "https://external.example.com/mcp",
+    });
+    let uri: http::Uri = "https://external.example.com/mcp".parse().unwrap();
+    let client_err = mcp_client::McpClientError::Connection {
+        url: mcp_client::McpDisplayUrl::from_uri(&uri),
+    };
+    let result: Result<Option<Vec<serde_json::Value>>, ResolveError> = Err(ResolveError::Client {
+        server_label: "drive".to_owned(),
+        source: client_err,
+    });
+
+    let redacted = redact_connector_client_error(result, &entry);
+    let err = redacted.unwrap_err();
+    assert!(
+        matches!(err, ResolveError::Client { .. }),
+        "direct URL errors should not be redacted"
+    );
+}
+
+// =========================================================================
+// tool_choice rejects resolved server with zero tools
+// =========================================================================
+
+#[test]
+fn rewrite_tool_choice_rejects_resolved_label_zero_tools_named() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "empty_server", "name": "some_tool"}),
+    );
+
+    let err = rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap_err();
+    assert!(
+        matches!(err, ResolveError::EmptyResolvedToolChoice(_)),
+        "should reject named tool_choice for resolved server with zero tools: {err}"
+    );
+}
+
+#[test]
+fn rewrite_tool_choice_rejects_resolved_label_zero_tools_server_level() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::from(["empty_server".to_owned()]);
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "empty_server"}),
+    );
+
+    let err = rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap_err();
+    assert!(
+        matches!(err, ResolveError::EmptyResolvedToolChoice(_)),
+        "should reject server-level tool_choice for resolved server with zero tools: {err}"
+    );
+}
+
+#[test]
+fn rewrite_tool_choice_passes_unresolved_label_zero_tools() {
+    let tool_map = HashMap::new();
+    let resolved_labels = HashSet::new();
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "tool_choice".to_owned(),
+        serde_json::json!({"type": "mcp", "server_label": "passthrough_server"}),
+    );
+
+    rewrite_tool_choice(&mut obj, &tool_map, &resolved_labels).unwrap();
+    assert_eq!(
+        obj["tool_choice"]["type"], "mcp",
+        "unresolved label should be left unchanged"
+    );
+}
+
+// =========================================================================
+// Credential isolation end-to-end (real rmcp MCP server)
+// =========================================================================
+
+use rmcp::{
+    ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
+};
+
+/// Request payload for the single-tool server's `get_weather` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WeatherRequest {
+    /// City to look up the weather for.
+    #[schemars(description = "City to look up")]
+    city: String,
+}
+
+/// Minimal MCP server exposing a single, non-read-only tool.
+#[derive(Debug, Clone)]
+struct SingleToolMcpServer {
+    /// Router holding the server's generated tool handlers.
+    tool_router: ToolRouter<Self>,
+}
+
+#[expect(clippy::unused_self, reason = "rmcp macro-generated code")]
+#[tool_router]
+impl SingleToolMcpServer {
+    /// Construct the server with its generated tool router.
+    fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// The single non-read-only tool the server advertises.
+    #[tool(description = "Get current weather for a city")]
+    fn get_weather(&self, Parameters(req): Parameters<WeatherRequest>) -> String {
+        format!("weather in {}", req.city)
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for SingleToolMcpServer {
+    /// Advertise tool support so `tools/list` returns `get_weather`.
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Single-tool MCP server for credential-isolation tests")
+    }
+}
+
+/// Start the single-tool MCP server on an ephemeral loopback port.
+///
+/// Returns the server URL and a `CancellationToken` that shuts the
+/// server down when cancelled or dropped.
+async fn start_single_tool_mcp_server() -> (String, tokio_util::sync::CancellationToken) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<SingleToolMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(SingleToolMcpServer::new()), std::sync::Arc::default(), config);
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct)
+}
+
+/// End-to-end regression: a credentialed MCP entry whose permitted
+/// tool set filters down to zero must not forward its credentials to
+/// the inference backend. `tools/list` succeeds (returning one
+/// non-read-only tool), but `allowed_tools.read_only = true` removes
+/// it, so the entry resolves to zero permitted tools. The resolved
+/// MCP entry — and its `authorization` — must be stripped from the
+/// body handed downstream.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "e2e setup plus credential-isolation assertions")]
+async fn zero_permitted_tools_does_not_leak_credentials_to_backend() {
+    let (server_url, ct) = start_single_tool_mcp_server().await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("allow_loopback: true").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": server_url,
+            "authorization": "Bearer super-secret-token",
+            "allowed_tools": {"tool_names": ["get_weather"], "read_only": true}
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    ct.cancel();
+
+    assert!(matches!(action, FilterAction::Continue), "should continue");
+
+    let committed = body.as_ref().expect("body present");
+    let raw = String::from_utf8(committed.to_vec()).unwrap();
+    assert!(
+        !raw.contains("super-secret-token"),
+        "credential leaked to backend request body: {raw}"
+    );
+    assert!(
+        !raw.contains("\"mcp\""),
+        "resolved MCP entry leaked to backend request body: {raw}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_slice(committed).unwrap();
+    assert_eq!(
+        parsed["tools"],
+        serde_json::json!([]),
+        "all tools filtered out → empty tools array"
+    );
+}
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "full Responses lifecycle assertions")]
+async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    drop(listener);
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("allow_loopback: true\ntimeout_ms: 1000").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    // Per-filter state (the deferred-failure stash) is keyed by the filter's
+    // pipeline index, which the real pre-read machinery sets. Emulate it so the
+    // body-phase stash survives into the header phase.
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.set_metadata("openai_format.stream", "true");
+    ctx.set_metadata("responses.response_id", "resp_listing_failure");
+
+    let body_json = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": server_url,
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.response_id = Some("resp_listing_failure".to_owned());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    // The body phase defers: a `TerminalResponse` returned here would be swallowed
+    // as `Continue`, so the runtime failure is stashed and `Continue` returned.
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a streaming runtime discovery failure defers to the header phase"
+    );
+
+    // The header phase consumes the stash and emits the terminal SSE response.
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::TerminalResponse(terminal) = action else {
+        panic!("failed MCP discovery should terminate locally with a terminal response");
+    };
+
+    assert_eq!(terminal.status, 200, "SSE lifecycle must be visible to SDK clients");
+    assert_eq!(
+        terminal
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "failure lifecycle must use SSE content type"
+    );
+    let raw = std::str::from_utf8(terminal.body.as_deref().expect("SSE body")).unwrap();
+    let events = parse_named_sse_events(raw);
+    let event_types: Vec<_> = events.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        event_types,
+        [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.mcp_list_tools.in_progress",
+            "response.mcp_list_tools.failed",
+            "response.output_item.done",
+            "response.failed",
+        ],
+        "failure stream should form a complete Responses lifecycle"
+    );
+
+    for (expected, (_, payload)) in events.iter().enumerate() {
+        assert_eq!(
+            payload["sequence_number"].as_u64(),
+            Some(expected as u64),
+            "sequence numbers should be monotonic"
+        );
+    }
+    let failed = &events[4].1;
+    assert_eq!(failed["output_index"], 0);
+    assert!(
+        failed["item_id"].as_str().is_some_and(|id| id.starts_with("mcpl_")),
+        "failure event should identify the MCP list item"
+    );
+    assert_eq!(
+        failed.as_object().map(serde_json::Map::len),
+        Some(4),
+        "the standard failure event must not grow non-schema server or error fields"
+    );
+
+    let done_item = &events[5].1["item"];
+    assert_eq!(done_item["server_label"], "weather");
+    assert_eq!(done_item["id"], failed["item_id"]);
+    assert!(
+        done_item["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("server_label \"weather\"") && error.contains(&server_url)),
+        "the output item should carry the server identity and diagnostic"
+    );
+    let failed_response = &events[6].1["response"];
+    assert_eq!(failed_response["id"], "resp_listing_failure");
+    assert_eq!(failed_response["status"], "failed");
+    assert_eq!(failed_response["output"][0], *done_item);
+    assert_eq!(failed_response["error"]["code"], "server_error");
+
+    // The requested model must be echoed in every snapshot. No
+    // `openai_format.model` metadata is set here, so this exercises
+    // the `ResponsesState.request_body` fallback branch.
+    let created_response = &events[0].1["response"];
+    assert_eq!(
+        created_response["model"], "gpt-4o-mini",
+        "created snapshot echoes model"
+    );
+    assert_eq!(failed_response["model"], "gpt-4o-mini", "failed snapshot echoes model");
+
+    // No `openai_format.store` metadata is set, so the effective store
+    // is the OpenAI default (true). The snapshot must advertise that so a caller
+    // who later retrieves the persisted failure sees a consistent resource.
+    assert_eq!(
+        created_response["store"], true,
+        "store defaults to true when omitted, matching the store filter's own gate"
+    );
+    assert_eq!(
+        failed_response["store"], true,
+        "failed snapshot mirrors effective store"
+    );
+
+    // Pin the exact top-level key set of the synthesized response resource so a
+    // future refactor cannot silently drop a required field or add a non-schema
+    // one. The in-progress snapshot shares this shape with the failed one.
+    let mut created_keys: Vec<&str> = created_response
+        .as_object()
+        .expect("response object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    created_keys.sort_unstable();
+    assert_eq!(
+        created_keys,
+        [
+            "completed_at",
+            "created_at",
+            "error",
+            "id",
+            "incomplete_details",
+            "instructions",
+            "max_output_tokens",
+            "metadata",
+            "model",
+            "object",
+            "output",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "reasoning",
+            "status",
+            "store",
+            "temperature",
+            "text",
+            "tool_choice",
+            "tools",
+            "top_p",
+            "truncation",
+            "usage",
+        ],
+        "response snapshot must carry exactly the schema fields"
+    );
+}
+
+#[test]
+fn streaming_failure_classification_includes_runtime_tools_list_failures() {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    let url = || mcp_client::McpDisplayUrl::from_uri(&uri);
+    let client = |source: mcp_client::McpClientError| ResolveError::Client {
+        server_label: "drive".to_owned(),
+        source,
+    };
+
+    // Every runtime/transport failure of `tools/list` discovery must defer to the
+    // 200 SSE lifecycle. Pinning each arm guards the core feature: a refactor that
+    // drops one would silently return a hard HTTP error for that failure mode.
+    for source in [
+        mcp_client::McpClientError::Connection { url: url() },
+        mcp_client::McpClientError::ListTools { url: url() },
+        mcp_client::McpClientError::Timeout {
+            url: url(),
+            timeout: Duration::from_secs(1),
+        },
+        mcp_client::McpClientError::TooManyTools {
+            url: url(),
+            count: 11,
+            max: 10,
+        },
+        mcp_client::McpClientError::Serialization(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+    ] {
+        assert!(
+            is_mcp_listing_runtime_failure(&client(source)),
+            "runtime tools/list failure must defer to the SSE lifecycle"
+        );
+    }
+}
+
+#[test]
+fn streaming_failure_classification_excludes_local_request_policy() {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    let url = || mcp_client::McpDisplayUrl::from_uri(&uri);
+    let client = |source: mcp_client::McpClientError| ResolveError::Client {
+        server_label: "drive".to_owned(),
+        source,
+    };
+
+    // Local request-policy failures retain their HTTP error. SSRF blocking is the
+    // headline exclusion documented on the filter: it must never be downgraded to
+    // the 200 SSE lifecycle. `CallTool` is a non-listing operation and cannot
+    // arise from the tools/list path.
+    for source in [
+        mcp_client::McpClientError::InvalidAuthorization,
+        mcp_client::McpClientError::SsrfBlocked {
+            url: url(),
+            reason: "resolves to a private address",
+        },
+        mcp_client::McpClientError::CallTool {
+            url: url(),
+            tool_name: "x".to_owned(),
+        },
+    ] {
+        assert!(
+            !is_mcp_listing_runtime_failure(&client(source)),
+            "local policy / non-listing failure must retain its HTTP error"
+        );
+    }
+}
+
+/// A streaming SSRF failure is a pre-commitment rejection: it fires during
+/// request-body resolution, before any `text/event-stream` is established, so
+/// it returns the ordinary JSON `{"error":{...}}` envelope at the mapped status
+/// (issue #1001) -- never the 200 discovery lifecycle reserved for runtime
+/// `tools/list` failures, and never a committed-stream SSE `error` event.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "comprehensive pre-commitment JSON rejection assertions"
+)]
+fn streaming_ssrf_failure_retains_http_error() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let uri: http::Uri = "https://mcp.internal/tools".parse().unwrap();
+    let err = ResolveError::Client {
+        server_label: "internal".to_owned(),
+        source: mcp_client::McpClientError::SsrfBlocked {
+            url: mcp_client::McpDisplayUrl::from_uri(&uri),
+            reason: "resolves to a private address",
+        },
+    };
+
+    let FilterAction::Reject(rejection) = resolve_error_action(&mut ctx, &err, true, b"{}") else {
+        panic!("expected Reject");
+    };
+
+    assert_eq!(rejection.status, 502, "SSRF keeps its upstream error status");
+    assert!(
+        !rejection.preserve_keepalive,
+        "a genuine HTTP error closes the connection, unlike the 200 discovery-failure transport"
+    );
+    let ct = rejection.headers.iter().find(|(k, _)| k == "content-type");
+    assert_eq!(
+        ct.map(|(_, v)| v.as_str()),
+        Some("application/json"),
+        "a pre-commitment SSRF rejection uses the JSON error envelope, not an SSE event (issue #1001)"
+    );
+    let raw = std::str::from_utf8(rejection.body.as_deref().expect("error body")).unwrap();
+    assert!(
+        !raw.starts_with("event: "),
+        "SSRF must not emit a committed-stream SSE error event: {raw}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(
+        parsed["error"]["type"], "server_error",
+        "SSRF maps to a server_error envelope: {raw}"
+    );
+    assert_eq!(
+        parsed["error"]["code"], "server_error",
+        "SSRF maps to a server_error envelope: {raw}"
+    );
+    assert!(
+        parsed["error"]["message"].as_str().is_some_and(|m| m.contains("SSRF")),
+        "the SSRF reason is preserved in the message: {raw}"
+    );
+    assert!(
+        !raw.contains("response.mcp_list_tools.failed") && !raw.contains("response.failed"),
+        "SSRF must not emit the discovery lifecycle: {raw}"
+    );
+}
+
+/// Drive the deferred-failure path end to end and return the parsed lifecycle
+/// events, so tests can inspect the response snapshots embedded in each frame.
+///
+/// A streaming runtime failure stashes a descriptor and returns `Continue`, and
+/// the header phase consumes it to build the terminal SSE. `body` is the raw
+/// request body the resolver captured its size-bounded echo options from.
+fn failure_lifecycle_events(
+    ctx: &mut HttpFilterContext<'_>,
+    err: &ResolveError,
+    body: &[u8],
+) -> Vec<(String, serde_json::Value)> {
+    ctx.current_filter_id = Some(0);
+    assert!(
+        matches!(resolve_error_action(ctx, err, true, body), FilterAction::Continue),
+        "a streaming runtime discovery failure should defer"
+    );
+    let pending = ctx
+        .remove_filter_state::<PendingListToolsFailure>()
+        .expect("deferred failure descriptor stashed");
+    let terminal = build_list_tools_failure_response(ctx, &pending);
+    let raw = std::str::from_utf8(terminal.body.as_deref().expect("SSE body")).unwrap();
+    parse_named_sse_events(raw)
+}
+
+/// The id from the terminal `response.failed` event of the deferred-failure path.
+fn failed_response_id(ctx: &mut HttpFilterContext<'_>, err: &ResolveError, body: &[u8]) -> String {
+    let events = failure_lifecycle_events(ctx, err, body);
+    events[6].1["response"]["id"].as_str().expect("response id").to_owned()
+}
+
+/// A connection failure descriptor, the canonical runtime `tools/list` failure.
+fn connection_failure() -> ResolveError {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    ResolveError::Client {
+        server_label: "weather".to_owned(),
+        source: mcp_client::McpClientError::Connection {
+            url: mcp_client::McpDisplayUrl::from_uri(&uri),
+        },
+    }
+}
+
+/// The synthesized failure resource must echo the caller's request parameters in
+/// every snapshot, so a persisted or streamed failure reports the same
+/// configuration a real Responses object would rather than silently substituting
+/// API defaults. `input` and `tools` are intentionally omitted -- the latter so
+/// per-entry MCP credentials are never persisted.
+#[test]
+#[expect(clippy::too_many_lines, reason = "one assertion per echoed request field")]
+fn streaming_failure_snapshot_echoes_request_parameters() {
+    let body_json = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+        "temperature": 0.2,
+        "top_p": 0.5,
+        "parallel_tool_calls": false,
+        "max_output_tokens": 256,
+        "instructions": "be terse",
+        "truncation": "auto",
+        "tool_choice": "required",
+        "previous_response_id": "resp_prev",
+        "text": {"format": {"type": "json_object"}},
+        "reasoning": {"effort": "high"},
+        "metadata": {"trace": "abc123"},
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": "https://mcp.example/tools",
+            "authorization": "secret-token",
+        }],
+    });
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    // Deliberately insert NO `ResponsesState`: the echoed parameters must come
+    // from the size-bounded capture taken from the request body during the
+    // pre-read, so a pipeline without validate/rehydrate still reports the
+    // caller's real configuration.
+    let body = serde_json::to_vec(&body_json).unwrap();
+
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), &body);
+    // Every snapshot shares the echoed parameters; assert on the created and
+    // failed frames that bracket the stream.
+    for response in [&events[0].1["response"], &events[6].1["response"]] {
+        assert_eq!(response["temperature"], 0.2, "temperature echoes the request");
+        assert_eq!(response["top_p"], 0.5, "top_p echoes the request");
+        assert_eq!(response["parallel_tool_calls"], false, "parallel_tool_calls echoes");
+        assert_eq!(response["max_output_tokens"], 256, "max_output_tokens echoes");
+        assert_eq!(response["instructions"], "be terse", "instructions echoes");
+        assert_eq!(response["truncation"], "auto", "truncation echoes");
+        assert_eq!(response["tool_choice"], "required", "tool_choice echoes");
+        assert_eq!(
+            response["previous_response_id"], "resp_prev",
+            "previous_response_id echoes"
+        );
+        assert_eq!(
+            response["text"],
+            serde_json::json!({"format": {"type": "json_object"}}),
+            "text echoes"
+        );
+        assert_eq!(
+            response["reasoning"],
+            serde_json::json!({"effort": "high"}),
+            "reasoning echoes"
+        );
+        assert_eq!(
+            response["metadata"],
+            serde_json::json!({"trace": "abc123"}),
+            "metadata echoes"
+        );
+        // Never persist tools (credential leak) or input.
+        assert_eq!(
+            response["tools"],
+            serde_json::json!([]),
+            "tools must not leak credentials"
+        );
+        assert!(response.get("input").is_none(), "request input must not be persisted");
+    }
+}
+
+/// When no request option is captured (a body carrying no echoable field), every
+/// echoed field falls back to its OpenAI API default. Persistence is unaffected:
+/// it depends only on `response_object`, not on the echoed options.
+#[test]
+fn streaming_failure_snapshot_uses_api_defaults_without_captured_options() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), b"{}");
+    let response = &events[6].1["response"];
+    for (field, default) in [
+        ("temperature", serde_json::json!(1.0)),
+        ("top_p", serde_json::json!(1.0)),
+        ("parallel_tool_calls", serde_json::json!(true)),
+        ("tool_choice", serde_json::json!("auto")),
+        ("truncation", serde_json::json!("disabled")),
+        ("previous_response_id", serde_json::Value::Null),
+        ("max_output_tokens", serde_json::Value::Null),
+        ("instructions", serde_json::Value::Null),
+        ("reasoning", serde_json::Value::Null),
+        ("text", serde_json::json!({"format": {"type": "text"}})),
+        ("metadata", serde_json::json!({})),
+    ] {
+        assert_eq!(response[field], default, "{field} falls back to its API default");
+    }
+}
+
+/// `capture_echoed_options` copies only the whitelisted request options -- never
+/// `input` or the credentialed `tools` array -- so nothing that could leak a
+/// secret or bloat the snapshot survives the capture.
+#[test]
+fn capture_echoed_options_whitelists_safe_fields_only() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "gpt-4o-mini",
+        "temperature": 0.2,
+        "metadata": {"trace": "abc123"},
+        "input": "secret prompt",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "authorization": "secret-token",
+        }],
+    }))
+    .unwrap();
+
+    let captured = capture_echoed_options(&body).expect("whitelisted fields are captured");
+    assert_eq!(captured["temperature"], 0.2, "temperature is whitelisted");
+    assert_eq!(
+        captured["metadata"],
+        serde_json::json!({"trace": "abc123"}),
+        "metadata is whitelisted"
+    );
+    assert_eq!(captured["model"], "gpt-4o-mini", "model is whitelisted");
+    assert!(captured.get("input").is_none(), "input must never be captured");
+    assert!(
+        captured.get("tools").is_none(),
+        "tools must never be captured (credential leak)"
+    );
+}
+
+/// `capture_echoed_options` returns `None` when nothing echoable survives -- an
+/// empty object, a body with only non-echoed fields, or an unparseable body --
+/// so the snapshot falls back to API defaults for every field.
+#[test]
+fn capture_echoed_options_none_without_whitelisted_fields() {
+    assert!(
+        capture_echoed_options(br#"{"input":"hi","tools":[]}"#).is_none(),
+        "a body with only non-echoed fields captures nothing"
+    );
+    assert!(
+        capture_echoed_options(b"{}").is_none(),
+        "an empty object captures nothing"
+    );
+    assert!(
+        capture_echoed_options(b"not json").is_none(),
+        "an unparseable body captures nothing"
+    );
+}
+
+/// A single oversized field (`instructions`) is dropped from the capture so it
+/// cannot be amplified across the SSE snapshots, while the smaller fields
+/// captured before it are retained. This bounds a valid-but-large request rather
+/// than rejecting it or losing all fidelity.
+#[test]
+fn capture_echoed_options_drops_oversized_field_keeps_small_ones() {
+    let huge = "x".repeat(MAX_ECHOED_OPTIONS_BYTES + 1);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "temperature": 0.2,
+        "metadata": {"trace": "abc123"},
+        "instructions": huge,
+    }))
+    .unwrap();
+
+    let captured = capture_echoed_options(&body).expect("small fields are still captured");
+    assert_eq!(captured["temperature"], 0.2, "a small field is retained");
+    assert_eq!(
+        captured["metadata"],
+        serde_json::json!({"trace": "abc123"}),
+        "a small field is retained"
+    );
+    assert!(
+        captured.get("instructions").is_none(),
+        "an oversized field is dropped from the capture"
+    );
+}
+
+/// End to end, an oversized `instructions` must not be amplified across the three
+/// SSE snapshots: the terminal failure echoes the default `instructions` (null)
+/// while still echoing the small fields, and the whole SSE body stays far below
+/// the size of the request that produced it.
+#[test]
+fn streaming_failure_snapshot_drops_oversized_options() {
+    let huge = "x".repeat(MAX_ECHOED_OPTIONS_BYTES + 1);
+    let body_json = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+        "temperature": 0.2,
+        "instructions": huge,
+    });
+    let body = serde_json::to_vec(&body_json).unwrap();
+    let request_len = body.len();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), &body);
+
+    let response = &events[6].1["response"];
+    assert_eq!(response["temperature"], 0.2, "the small option still echoes");
+    assert_eq!(
+        response["instructions"],
+        serde_json::Value::Null,
+        "the oversized instructions is dropped to its API default, not amplified"
+    );
+
+    // The SSE body embeds a snapshot in three frames; if the oversized field had
+    // been echoed it would appear ~3x. Assert the whole stream stays a small
+    // fraction of the single request that carried it.
+    let sse_len: usize = events
+        .iter()
+        .map(|(name, payload)| name.len() + payload.to_string().len())
+        .sum();
+    assert!(
+        sse_len < MAX_ECHOED_OPTIONS_BYTES,
+        "oversized options must not amplify the {request_len}-byte request into the SSE body \
+         (got {sse_len} bytes)"
+    );
+}
+
+/// Building the terminal failure must publish the failed snapshot directly into
+/// `ResponsesState.response_object`, the field `openai_store` reads to
+/// persist streaming responses. In `agentic-loop.yaml` `openai_stream_events`
+/// runs *after* this filter (nested in the `iterative_request_router`), so the
+/// short-circuiting `TerminalResponse` means `stream_events` never accumulates the
+/// failure -- persistence depends on this direct write. The written snapshot must
+/// be exactly the terminal `response.failed` resource so the store persists the
+/// same object the client received.
+#[test]
+fn build_failure_populates_response_object_state() {
+    let body_json = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "input": "hello",
+        "stream": true,
+    });
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(body_json.clone()));
+
+    let body = serde_json::to_vec(&body_json).unwrap();
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), &body);
+    let terminal_response = events[6].1["response"].clone();
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
+    assert_eq!(
+        state.response_object, terminal_response,
+        "response_object must hold the terminal response.failed snapshot for the store to persist"
+    );
+    assert_eq!(
+        state.response_object["status"], "failed",
+        "persisted snapshot records the failure"
+    );
+}
+
+/// When no `ResponsesState` exists yet -- a valid pipeline of
+/// `openai_store` + this filter *without*
+/// `openai_validate`/`openai_rehydrate` to build state up
+/// front -- the terminal-failure build must still CREATE the state and populate
+/// `response_object`, or the store would have nothing to persist and the failure
+/// would be lost. `get_or_insert_with` (not `get_mut`) is what makes this work.
+#[test]
+fn build_failure_creates_response_object_state_when_absent() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    // Deliberately insert NO ResponsesState before building the failure.
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "precondition: no state exists yet"
+    );
+
+    let events = failure_lifecycle_events(&mut ctx, &connection_failure(), b"{}");
+    let terminal_response = events[6].1["response"].clone();
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("building the failure must create the state so the store can persist");
+    assert_eq!(
+        state.response_object, terminal_response,
+        "created state must hold the terminal response.failed snapshot"
+    );
+    assert_eq!(
+        state.response_object["status"], "failed",
+        "persisted snapshot records the failure"
+    );
+}
+
+/// `response_id` resolves from metadata first, then `ResponsesState`, then a
+/// generated `resp_` id. The lifecycle test covers the metadata branch; this
+/// covers the state fallback and the generated fallback.
+#[test]
+fn failure_lifecycle_response_id_falls_back_to_state_then_generated() {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    let make_err = || ResolveError::Client {
+        server_label: "weather".to_owned(),
+        source: mcp_client::McpClientError::Connection {
+            url: mcp_client::McpDisplayUrl::from_uri(&uri),
+        },
+    };
+
+    // No metadata, but ResponsesState carries a response_id → use it.
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o-mini"}));
+    state.response_id = Some("resp_from_state".to_owned());
+    ctx.extensions.insert(state);
+    assert_eq!(
+        failed_response_id(&mut ctx, &make_err(), b"{}"),
+        "resp_from_state",
+        "state fallback used"
+    );
+
+    // No metadata and no ResponsesState → generated resp_ id.
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        failed_response_id(&mut ctx, &make_err(), b"{}").starts_with("resp_"),
+        "generated fallback should produce a resp_ id"
+    );
+}
+
+fn parse_named_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .map(|frame| {
+            let mut lines = frame.lines();
+            let name = lines
+                .next()
+                .and_then(|line| line.strip_prefix("event: "))
+                .expect("named SSE event")
+                .to_owned();
+            let payload = lines
+                .next()
+                .and_then(|line| line.strip_prefix("data: "))
+                .expect("SSE data line");
+            (name, serde_json::from_str(payload).expect("valid SSE JSON payload"))
+        })
+        .collect()
+}

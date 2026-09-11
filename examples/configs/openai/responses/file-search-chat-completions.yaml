@@ -7,16 +7,16 @@
 # function call and drives one more finite inference round.
 #
 # Request order:
-#   1. openai_responses_format classifies the client request.
-#   2. openai_responses_validate creates canonical ResponsesState.
+#   1. openai_format classifies the client request.
+#   2. openai_validate creates canonical ResponsesState.
 #   3. iterative_request_router owns the finite model-search-model loop.
-#   4. openai_file_search_callout executes pending hosted search calls.
-#   5. responses_to_chat_completions synthesizes the private function tool.
+#   4. openai_file_search_dispatch executes pending hosted search calls.
+#   5. openai_responses_to_chat_completions synthesizes the private function tool.
 #   6. path_rewrite selects /v1/chat/completions explicitly.
 #
 # Response filters run in reverse order. Each Chat Completions response is
 # therefore converted into a Responses resource before
-# openai_file_search_callout inspects it. A returned
+# openai_file_search_dispatch inspects it. A returned
 # function_call(name="file_search") is normalized to file_search_call,
 # executed through the vector store, and retained in the client-visible final
 # Responses output.
@@ -32,14 +32,14 @@ listeners:
 filter_chains:
   - name: responses-file-search-chat
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: iterative_request_router
         initial_step: inference
@@ -51,7 +51,7 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:8001
                 allow_private_url: true
                 timeout_ms: 5000
@@ -62,7 +62,7 @@ filter_chains:
                 forward_headers:
                   - authorization
 
-              - filter: responses_to_chat_completions
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 67108864
 
               - filter: path_rewrite
@@ -90,7 +90,7 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 key: pending
                 value: "true"
                 next: inference

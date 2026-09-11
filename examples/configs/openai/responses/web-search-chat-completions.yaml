@@ -4,10 +4,10 @@
 # backend that only implements /v1/chat/completions. Serves both finite
 # (`"stream": false`) and streaming (`"stream": true`) requests from one
 # pipeline. The compatibility filter privately exposes web_search to that
-# backend as a strict function tool. The existing openai_web_search executor
+# backend as a strict function tool. The existing openai_web_search_dispatch executor
 # handles the returned call and IRR drives the second inference round.
 #
-# responses_to_chat_completions runs inside the iterative router and selects its
+# openai_responses_to_chat_completions runs inside the iterative router and selects its
 # transport from the effective request: a `"stream": true` request streams, so
 # each translated per-round stream stays internal to the router; a finite request
 # buffers. openai_stream_events accumulates each translated
@@ -18,15 +18,15 @@
 # so it is a no-op and the finite round-trip is unaffected.
 #
 # Request order inside IRR:
-#   openai_stream_events -> openai_web_search -> openai_agentic_loop
-#     -> responses_to_chat_completions -> path_rewrite -> router
+#   openai_stream_events -> openai_web_search_dispatch -> openai_agentic_loop
+#     -> openai_responses_to_chat_completions -> path_rewrite -> router
 #
 # Response filters run in reverse. Each Chat Completions response (finite JSON or
 # streamed SSE) is therefore converted into a Responses resource before
-# openai_agentic_loop and openai_web_search see it, and openai_stream_events
+# openai_agentic_loop and openai_web_search_dispatch see it, and openai_stream_events
 # (client-facing) composes the logical stream last. A private
 # function_call(name="web_search") becomes a canonical web_search_call, which
-# openai_web_search executes on the next iteration.
+# openai_web_search_dispatch executes on the next iteration.
 #
 #   curl -N http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
@@ -45,14 +45,14 @@ listeners:
 filter_chains:
   - name: responses-web-search-chat
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: openai_tool_parse
 
@@ -76,14 +76,14 @@ filter_chains:
               # no-op on finite (non-SSE) responses.
               - filter: openai_stream_events
 
-              - filter: openai_web_search
+              - filter: openai_web_search_dispatch
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
 
               - filter: openai_agentic_loop
                 max_infer_iters: 10
 
-              - filter: responses_to_chat_completions
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 67108864
 
               - filter: path_rewrite
@@ -111,7 +111,7 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_web_search
+              - filter: openai_web_search_dispatch
                 key: action
                 value: loop
                 next: inference

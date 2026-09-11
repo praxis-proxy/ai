@@ -125,14 +125,14 @@ pub(super) struct StreamEventsState {
 /// # timeout_secs: 300
 /// # max_tool_call_argument_bytes: 1048576
 /// ```
-pub struct OpenaiStreamEventsFilter {
+pub struct StreamEventsFilter {
     /// Configuration for the SSE frame parser.
     parser_config: SseParserConfig,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
 }
 
-impl OpenaiStreamEventsFilter {
+impl StreamEventsFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
@@ -244,7 +244,7 @@ impl OpenaiStreamEventsFilter {
 
 /// Outcome of the request-phase IRR-placement guard.
 ///
-/// Factored out of [`OpenaiStreamEventsFilter`]'s `on_request` so the guard's
+/// Factored out of [`StreamEventsFilter`]'s `on_request` so the guard's
 /// fail-closed decision table — the invariant that logical composition only
 /// arms inside an `iterative_request_router` step — is exhaustively unit
 /// testable. The runtime signal it depends on, an [`IterationState`] in request
@@ -275,7 +275,7 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
 }
 
 #[async_trait]
-impl HttpFilter for OpenaiStreamEventsFilter {
+impl HttpFilter for StreamEventsFilter {
     fn name(&self) -> &'static str {
         "openai_stream_events"
     }
@@ -302,10 +302,10 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         let typed_streaming = ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming;
         // The `iterative_request_router` runner moves request extensions into
         // each step but builds a fresh `filter_metadata` map, so metadata set by
-        // pre-IRR filters (e.g. `openai_responses_format`) is not visible here.
+        // pre-IRR filters (e.g. `openai_format`) is not visible here.
         // `ResponsesState` is created pre-IRR and travels through extensions, so
         // fall back to it for format and stream detection — mirroring how
-        // `responses_to_chat_completions` resolves `request_is_streaming`.
+        // `openai_responses_to_chat_completions` resolves `request_is_streaming`.
         let responses_state = ctx.extensions.get::<ResponsesState>();
         let has_responses_state = responses_state.is_some();
         let body_stream = responses_state
@@ -314,10 +314,9 @@ impl HttpFilter for OpenaiStreamEventsFilter {
             .unwrap_or(false);
         let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
             && (typed_streaming
-                || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+                || ctx.get_metadata("openai_format.format") == Some("openai_responses")
                 || has_responses_state);
-        let is_streaming =
-            typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
+        let is_streaming = typed_streaming || ctx.get_metadata("openai_format.stream") == Some("true") || body_stream;
         // `IterationState` is inserted by the IRR runner before the request phase
         // of every iteration (including iteration 0), so its presence is the
         // runtime signal that the filter is placed inside an IRR step.
@@ -543,11 +542,11 @@ fn append_logical_event(
     let file_search_active = ctx
         .extensions
         .get::<ResponsesState>()
-        .is_some_and(crate::openai::responses::file_search_callout::has_file_search_tool);
+        .is_some_and(crate::openai::responses::file_search_dispatch::has_file_search_tool);
     if file_search_active && event.event_type() == "response.output_item.added" {
         let payload = event.payload();
         if let Some(item) = payload.get("item") {
-            use crate::openai::responses::file_search_callout::{
+            use crate::openai::responses::file_search_dispatch::{
                 is_file_search_function_call, is_pending_file_search_call,
             };
             if is_file_search_function_call(item) {
@@ -813,7 +812,7 @@ fn is_local_tool_item(item: &Value) -> bool {
 /// envelope.
 ///
 /// The whole item is hashed rather than keyed on `type|status` alone so a payload
-/// the model never streamed — e.g. the `action.sources` list `openai_web_search`
+/// the model never streamed — e.g. the `action.sources` list `openai_web_search_dispatch`
 /// adds to a `web_search_call` after local execution — is detected as a change even
 /// when the item's type and status are unchanged.
 ///
@@ -1324,7 +1323,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // Preserve any non-terminal logical events `process_chunk` already emitted
     // for this final chunk, then append synthesized local-tool events and the
     // deferred terminal. A transport that reassembles the whole stream before
-    // releasing it (e.g. `responses_to_chat_completions`) delivers the
+    // releasing it (e.g. `openai_responses_to_chat_completions`) delivers the
     // created/delta events and deferred terminal together in the end-of-stream
     // chunk; starting from an empty buffer here would drop those earlier events.
     let mut output = body.take().map_or_else(Vec::new, |bytes| bytes.to_vec());
@@ -1351,7 +1350,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // web_search/mcp own their own stop signalling and are left untouched.
     let file_search_looping = ctx
         .filter_results
-        .get("openai_file_search_callout")
+        .get("openai_file_search_dispatch")
         .and_then(|results| results.get("action"))
         == Some("loop");
     let terminal_error = ctx.get_metadata("responses.stream_error_code").is_some()
@@ -1404,9 +1403,13 @@ fn emit_deferred_terminal(
 
 /// Whether a dispatch filter requested another inference step.
 fn logical_stream_continues(ctx: &HttpFilterContext<'_>) -> bool {
-    ["openai_mcp_dispatch", "openai_web_search", "openai_file_search_callout"]
-        .iter()
-        .any(|filter| ctx.filter_results.get(filter).and_then(|results| results.get("action")) == Some("loop"))
+    [
+        "openai_mcp_dispatch",
+        "openai_web_search_dispatch",
+        "openai_file_search_dispatch",
+    ]
+    .iter()
+    .any(|filter| ctx.filter_results.get(filter).and_then(|results| results.get("action")) == Some("loop"))
 }
 
 /// Return a locally generated terminal error for an already-committed stream.

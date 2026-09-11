@@ -3177,7 +3177,7 @@ async fn patch_on_conversation_path_continues() {
 // -----------------------------------------------------------------------------
 
 fn set_append_back_metadata(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
-    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_format.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", "conv_test_123");
 }
 
@@ -3199,7 +3199,7 @@ async fn on_response_not_armed_when_streaming() {
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_format.stream", "true");
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
@@ -3212,7 +3212,7 @@ async fn on_response_not_armed_when_background() {
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
-    ctx.set_metadata("openai_responses_format.background", "true");
+    ctx.set_metadata("openai_format.background", "true");
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
@@ -3418,7 +3418,7 @@ async fn on_response_body_appends_completed_response() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("openai_format.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", &conv_id);
 
     let input_items = vec![serde_json::json!({

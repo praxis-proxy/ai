@@ -19,11 +19,11 @@ origin.
 
 | Callout | Target source | Private opt-in | Redirect policy | Authentication mode |
 | --- | --- | --- | --- | --- |
-| `openai_web_search`, `anthropic_web_search` | Provider default or configured `base_url` | `allow_private_base_url` | No-follow | Configured provider API key; validated origin only |
+| `openai_web_search_dispatch`, `anthropic_web_search` | Provider default or configured `base_url` | `allow_private_base_url` | No-follow | Configured provider API key; validated origin only |
 | `openai_file_resolve` Files API | Configured `files_api_url` | `allow_private_files_api_url` | No-follow | Only headers named by `forward_headers` |
 | `openai_file_resolve` `file_url` fetch | Request-derived URL | Exact `allowed_file_url_origins` | No-follow | Anonymous; no downstream headers |
-| `openai_file_search_callout` | Configured `vector_store_url` | `allow_private_url` | No-follow | Only headers named by `forward_headers` |
-| `openai_responses_compact` | Configured `inference_url` | `allow_private_inference_url` | No-follow | Anonymous; no downstream or cluster headers |
+| `openai_file_search_dispatch` | Configured `vector_store_url` | `allow_private_url` | No-follow | Only headers named by `forward_headers` |
+| `openai_compact` | Configured `inference_url` | `allow_private_inference_url` | No-follow | Anonymous; no downstream or cluster headers |
 | `ai_guardrails` with NeMo | Configured `endpoint` | `allow_private_endpoint` | No-follow | Anonymous; no downstream headers |
 | `http_callout` | Configured `target.url` | `allow_private_addresses` | No-follow | Configured static headers plus allowed `forward_headers` |
 | MCP client | Request-derived server URL or configured connector | `allow_loopback` for loopback only | No-follow | Sanitized request-provided MCP authorization/headers |

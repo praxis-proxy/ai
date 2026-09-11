@@ -21,7 +21,7 @@ use std::{
 
 use sha2::{Digest as _, Sha256};
 
-use crate::{openai::responses::openai_mcp_tool_resolve::encode_function_name, store::PendingApprovalRecord};
+use crate::{openai::responses::mcp_tool_resolve::encode_function_name, store::PendingApprovalRecord};
 
 /// Approval policy for MCP tool execution.
 #[derive(Debug, Clone, PartialEq)]

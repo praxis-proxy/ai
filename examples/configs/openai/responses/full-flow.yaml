@@ -12,13 +12,13 @@
 #      response path it appends input+output items back to the
 #      conversation after a successful non-streaming response.
 #
-#   2. openai_responses_format classifies the request and promotes
+#   2. openai_format classifies the request and promotes
 #      format, model, stream, and mode to internal routing headers.
 #      on_invalid is left at the default (passthrough) so that
 #      Conversations API traffic is not rejected before the
 #      conversations filter can handle it in the body phase.
 #
-#   3. openai_responses_validate checks JSON syntax, generates response
+#   3. openai_validate checks JSON syntax, generates response
 #      and conversation IDs, and writes responses.* metadata for downstream
 #      filters. Provider-owned parameter combinations pass through.
 #
@@ -27,7 +27,7 @@
 #      has_web_search, tool_choice, function_count, etc.) to
 #      metadata and filter results. Does not mutate the request body.
 #
-#   5. openai_response_store persists responses to SQLite and registers
+#   5. openai_store persists responses to SQLite and registers
 #      the store backend so downstream filters (rehydrate, compact) can
 #      read from it. It runs PRE-IRR (before the iterative_request_router
 #      below), so on the response path — which runs in reverse config
@@ -36,7 +36,7 @@
 #      reads the accumulated response object that openai_stream_events
 #      builds inside the IRR (see step 11).
 #
-#   6. openai_responses_rehydrate loads conversation context from
+#   6. openai_rehydrate loads conversation context from
 #      previous_response_id or conversation field by fetching
 #      stored responses/conversations and prepending their message
 #      history to the current request. previous_response_id takes
@@ -84,7 +84,7 @@
 #      branch rejoins at `terminal` so its selected cluster is forwarded
 #      upstream directly.
 #
-#   11. openai_responses_proxy reads the assembled ResponsesState and
+#   11. openai_proxy reads the assembled ResponsesState and
 #      rebuilds the outbound request body with the full conversation
 #      history, then automatically selects the typed
 #      streaming transport so each backend SSE chunk reaches
@@ -100,13 +100,13 @@
 #      request reaches this step.
 #
 # Streaming persistence:
-#   Removing openai_stream_events (or moving openai_response_store after
+#   Removing openai_stream_events (or moving openai_store after
 #   the IRR) silently breaks streaming persistence: the store persists
 #   ResponsesState.response_object, and only openai_stream_events
 #   populates it for `stream: true` responses. Keep the store PRE-IRR and
 #   openai_stream_events INSIDE the IRR step so both buffered and
 #   streaming responses are persisted and retrievable via
-#   GET /v1/responses/{id} (served pre-IRR by openai_response_store).
+#   GET /v1/responses/{id} (served pre-IRR by openai_store).
 #
 # Agentic loop:
 #   This config runs the IRR with max_iterations: 1 — a single inference
@@ -221,7 +221,7 @@ filter_chains:
         conversations_table: openai_conversations
         items_table: openai_conversation_items
 
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -229,11 +229,11 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: openai_tool_parse
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"
@@ -242,7 +242,7 @@ filter_chains:
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
@@ -329,11 +329,11 @@ filter_chains:
                           - "127.0.0.1:3002"
 
       # Classified openai_responses POST /v1/responses create requests flow
-      # here. The IRR runs a single inference round; openai_responses_proxy
+      # here. The IRR runs a single inference round; openai_proxy
       # automatically selects the typed streaming transport, and
       # openai_stream_events composes the round into one logical Responses
       # stream while accumulating the response object into ResponsesState.
-      # The pre-IRR openai_response_store then persists that object on the
+      # The pre-IRR openai_store then persists that object on the
       # response path (reverse order). The step router is path-only because
       # the IRR strips x-praxis-* headers from its sub-request; the bypass
       # carrier above has already excluded non-Responses traffic.
@@ -347,7 +347,7 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
 
               # Composes the inference stream into one logical Responses
               # lifecycle and accumulates the response object for

@@ -27,7 +27,7 @@ use crate::{
             },
             config::{McpDispatchConfig, build_config},
         },
-        openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
+        mcp_tool_resolve::{McpToolIndex, encode_function_name},
         state::{McpApprovalState, ResponsesState},
     },
     store::{PendingApprovalRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore},

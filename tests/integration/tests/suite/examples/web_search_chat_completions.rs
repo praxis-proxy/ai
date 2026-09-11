@@ -382,7 +382,7 @@ fn web_search_chat_completions_streams_dispatch_once_as_one_logical_response() {
 
 #[test]
 fn web_search_chat_completions_streaming_fails_closed_without_stream_events() {
-    // responses_to_chat_completions always advertises the streaming subrequest
+    // openai_responses_to_chat_completions always advertises the streaming subrequest
     // capability and selects the streaming transport for an effective
     // `"stream": true` request. Without `openai_stream_events` in the inference
     // step nothing publishes the `responses.logical_stream` marker, so typed

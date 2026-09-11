@@ -9,29 +9,29 @@
 # Step boundary: the IRR resets per-step metadata for credential
 # isolation but preserves extensions across steps. This means:
 #
-#   - ResponsesState (extension, set by openai_responses_validate)
+#   - ResponsesState (extension, set by openai_validate)
 #     survives step transitions.
-#   - openai_responses_format.format (metadata) does not.
+#   - openai_format.format (metadata) does not.
 #
-# Because responses_to_chat_completions reads both metadata and
-# extensions, each step must re-run openai_responses_format and
-# openai_responses_validate to repopulate its metadata. Without
+# Because openai_responses_to_chat_completions reads both metadata and
+# extensions, each step must re-run openai_format and
+# openai_validate to repopulate its metadata. Without
 # them the translation filter returns 500: "request pipeline state
 # is unavailable".
 #
 # Filter ordering within each step:
 #
-#   1. openai_responses_format         classify, set metadata
-#   2. openai_responses_model_rewrite  rewrite model (optional)
-#   3. openai_responses_validate       parse body, set metadata + extension
-#   4. responses_to_chat_completions   translate body using both
+#   1. openai_format         classify, set metadata
+#   2. openai_model_rewrite  rewrite model (optional)
+#   3. openai_validate       parse body, set metadata + extension
+#   4. openai_responses_to_chat_completions   translate body using both
 #   5. path_rewrite                    /v1/responses -> /v1/chat/completions
 #   6. router                          select cluster
 #   7. credential_injection            inject per-cluster credentials
 #   8. load_balancer                   select endpoint
 #
 # Key ordering constraints:
-#   - 1 before 2: model rewrite reads openai_responses_format.stream
+#   - 1 before 2: model rewrite reads openai_format.stream
 #   - 2 before 3: validate parses after rewrite, so ResponsesState
 #     carries the effective model
 #   - 3 before 4: translation reads responses.response_id metadata
@@ -40,12 +40,12 @@
 #     which the router sets
 #
 # Pre-IRR filters:
-#   openai_responses_format rejects non-Responses requests early.
-#   openai_responses_validate rejects malformed bodies before the
+#   openai_format rejects non-Responses requests early.
+#   openai_validate rejects malformed bodies before the
 #   IRR allocates sub-request resources.
 #
 # Adapting for real providers:
-#   - Add openai_responses_model_rewrite between format and validate
+#   - Add openai_model_rewrite between format and validate
 #     in the fallback step to map model names across providers.
 #   - Use env_var instead of value in credential_injection to read
 #     API keys from the environment at startup.
@@ -66,23 +66,23 @@ listeners:
 filter_chains:
   - name: inference-failover
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: iterative_request_router
         initial_step: primary
         steps:
           - name: primary
             filters:
-              - filter: openai_responses_format
-              - filter: openai_responses_validate
-              - filter: responses_to_chat_completions
+              - filter: openai_format
+              - filter: openai_validate
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 67108864
               - filter: path_rewrite
                 replace:
@@ -116,9 +116,9 @@ filter_chains:
 
           - name: fallback
             filters:
-              - filter: openai_responses_format
-              - filter: openai_responses_validate
-              - filter: responses_to_chat_completions
+              - filter: openai_format
+              - filter: openai_validate
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 67108864
               - filter: path_rewrite
                 replace:

@@ -143,10 +143,10 @@ fn validate_responses_format_headers(headers: &ResponsesFormatHeaders) -> Result
         ("stream", headers.stream.as_deref(), "x-praxis-ai-stream"),
         ("mode", headers.mode.as_deref(), "x-praxis-responses-mode"),
     ] {
-        crate::promotion::validate_dedicated_promotion_header("openai_responses_format", field, name, &[dedicated])?;
+        crate::promotion::validate_dedicated_promotion_header("openai_format", field, name, &[dedicated])?;
     }
     crate::promotion::reject_duplicate_promotion_fields(
-        "openai_responses_format",
+        "openai_format",
         &[
             ("format", headers.format.as_deref()),
             ("model", headers.model.as_deref()),

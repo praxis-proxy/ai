@@ -15,22 +15,22 @@ listeners:
 filter_chains:
   - name: agentic-fixture
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: iterative_request_router
         initial_step: inference
@@ -40,7 +40,7 @@ filter_chains:
             filters:
               - filter: openai_agentic_loop
                 max_infer_iters: 1
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
               - filter: router
                 routes:
                   - path_prefix: "/"

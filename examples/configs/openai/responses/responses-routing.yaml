@@ -1,6 +1,6 @@
 # Responses API Mode Routing
 #
-# Routes Responses API traffic by detected mode. The `openai_responses_format`
+# Routes Responses API traffic by detected mode. The `openai_format`
 # filter classifies requests as `stateless` (simple inference, no
 # state management) or `stateful` (needs conversation history, tools,
 # or persistence).
@@ -27,12 +27,12 @@ listeners:
 filter_chains:
   - name: responses-routing
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         branch_chains:
           - name: stateful
             on_result:
-              filter: openai_responses_format
+              filter: openai_format
               key: mode
               result: stateful
             chains:
@@ -40,7 +40,7 @@ filter_chains:
                 filters:
                   # Placeholder: the full stateful chain would include
                   # request_validate, response_store, rehydrate,
-                  # openai_tool_parse, openai_responses_proxy, stream_events,
+                  # openai_tool_parse, openai_proxy, stream_events,
                   # tool_dispatch, reasoning, etc.
                   #
                   # For now, proxy to the same backend. Future

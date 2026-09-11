@@ -4,7 +4,7 @@
      by hand — edit tests/conformance/openresponses/manifest.yaml and regenerate. -->
 
 This suite runs the external [OpenResponses][openresponses] conformance oracle
-against the `responses_to_chat_completions` translation filter — never against
+against the `openai_responses_to_chat_completions` translation filter — never against
 native Responses passthrough.
 
 ## Coverage

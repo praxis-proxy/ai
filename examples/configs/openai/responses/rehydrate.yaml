@@ -4,15 +4,15 @@
 # response, confirming its status is completed, and
 # promoting the ID to filter metadata. Body construction
 # from the resolved conversation is handled downstream by
-# the `openai_responses_proxy` filter.
+# the `openai_proxy` filter.
 #
 # Pipeline ordering:
-#   1. openai_responses_format — classifies body, promotes metadata
-#   2. openai_responses_validate — parses JSON, enriches metadata, generates IDs
-#   3. openai_response_store — initializes store, registers in ctx
-#   4. openai_responses_rehydrate — validates previous response, sets metadata
+#   1. openai_format — classifies body, promotes metadata
+#   2. openai_validate — parses JSON, enriches metadata, generates IDs
+#   3. openai_store — initializes store, registers in ctx
+#   4. openai_rehydrate — validates previous response, sets metadata
 #
-# The response_store filter must appear before openai_responses_rehydrate so its
+# The response_store filter must appear before openai_rehydrate so its
 # store backend is registered in `ctx.response_stores` during
 # `on_request`.
 #
@@ -39,17 +39,17 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: router
         routes:

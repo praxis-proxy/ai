@@ -553,7 +553,7 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -647,7 +647,7 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -773,7 +773,7 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

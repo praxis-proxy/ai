@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Integration tests for the `openai_responses_format` mode routing.
+//! Integration tests for the `openai_format` mode routing.
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
@@ -157,12 +157,12 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         branch_chains:
           - name: stateful_branch
             on_result:
-              filter: openai_responses_format
+              filter: openai_format
               key: mode
               result: stateful
             rejoin: shared_load_balancer

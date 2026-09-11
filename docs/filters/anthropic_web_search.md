@@ -16,7 +16,7 @@ Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 | `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
 | `base_url` | string | no | Override the provider's default API base URL. |
 | `allow_private_base_url` | bool | no | Allow a `base_url` that targets local-sensitive addresses. DNS names are resolved once per request and every result is checked immediately before the transport connects. By default, any private, loopback, link-local, or otherwise non-public result rejects the callout. Enable this only for a trusted private provider endpoint. |
-| `terminal_streaming` | bool | no | Select Praxis streaming transport for effective `stream: true` Messages requests. When enabled, the terminal inference response is streamed incrementally as one coherent client-visible SSE lifecycle while intermediate tool/search transitions stay internal. This knob is anthropic-only; `openai_web_search` does not accept it. |
+| `terminal_streaming` | bool | no | Select Praxis streaming transport for effective `stream: true` Messages requests. When enabled, the terminal inference response is streamed incrementally as one coherent client-visible SSE lifecycle while intermediate tool/search transitions stay internal. This knob is anthropic-only; `openai_web_search_dispatch` does not accept it. |
 
 ## Examples
 

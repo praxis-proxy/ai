@@ -5,7 +5,7 @@
 #
 # The iterative_request_router (IRR) repeatedly runs one inference step.
 # `openai_mcp_dispatch` dynamically executes MCP calls against the server URL
-# supplied in the request, and `openai_web_search` executes web searches
+# supplied in the request, and `openai_web_search_dispatch` executes web searches
 # against an external search provider. Both dispatch results back to the
 # model via the loop. Client-side function calls do not match any
 # dispatch filter and are returned to the client without looping.
@@ -19,18 +19,18 @@
 #   Filters listed first in the YAML run last in the response phase.
 #
 # Pipeline ordering (pre-IRR, runs once):
-#   1. openai_responses_format — classifies body, promotes metadata
-#   2. openai_responses_validate — validates parameters, generates IDs
-#   3. openai_response_store — registers the store backend
-#   4. openai_responses_rehydrate — loads previous_response_id context
+#   1. openai_format — classifies body, promotes metadata
+#   2. openai_validate — validates parameters, generates IDs
+#   3. openai_store — registers the store backend
+#   4. openai_rehydrate — loads previous_response_id context
 #
 # IRR inference filter chain:
 #   Request phase (forward):
-#     openai_web_search → openai_mcp_dispatch → openai_agentic_loop
-#       → openai_responses_proxy → router → load_balancer
+#     openai_web_search_dispatch → openai_mcp_dispatch → openai_agentic_loop
+#       → openai_proxy → router → load_balancer
 #   Response phase (reverse):
-#     load_balancer → router → openai_responses_proxy → openai_agentic_loop
-#       → openai_mcp_dispatch → openai_web_search
+#     load_balancer → router → openai_proxy → openai_agentic_loop
+#       → openai_mcp_dispatch → openai_web_search_dispatch
 #   openai_agentic_loop extracts completed function calls and web_search_call
 #   items. Dispatch filters then identify their respective calls, write
 #   the IRR transition, and execute them at the start of the next
@@ -38,7 +38,7 @@
 #
 # Transition rules (evaluated after each step's response-body):
 #   openai_mcp_dispatch.action = "loop"  → next: inference
-#   openai_web_search.action   = "loop"  → next: inference
+#   openai_web_search_dispatch.action   = "loop"  → next: inference
 #   default                              → done (exit to client)
 #
 # Config knobs:
@@ -119,24 +119,24 @@ listeners:
 filter_chains:
   - name: agentic-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: openai_tool_parse
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: openai_mcp_tool_resolve
 
@@ -158,7 +158,7 @@ filter_chains:
               # stream, so this filter always composes and must run inside this
               # IRR step.
               #
-              # REQUIRED because `openai_responses_proxy` below selects typed
+              # REQUIRED because `openai_proxy` below selects typed
               # streaming automatically for an effective `"stream": true`
               # request. Typed streaming commits `response.completed` to the
               # client as it arrives, so a loop-terminal error detected by
@@ -176,7 +176,7 @@ filter_chains:
               # Runs first on request re-entry to execute pending web
               # searches, and last on the model response to detect
               # web_search_call items.
-              - filter: openai_web_search
+              - filter: openai_web_search_dispatch
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
                 max_calls_per_round: 32
@@ -192,7 +192,7 @@ filter_chains:
                 max_infer_iters: 10
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
               - filter: router
                 routes:
                   - path_prefix: "/"
@@ -207,7 +207,7 @@ filter_chains:
                 key: action
                 value: loop
                 next: inference
-              - filter: openai_web_search
+              - filter: openai_web_search_dispatch
                 key: action
                 value: loop
                 next: inference

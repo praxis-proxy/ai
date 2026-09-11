@@ -29,14 +29,14 @@ pub use conversations::{
 };
 pub use operation::{OpenAiHandlingMode, OpenAiOperationSpec, OpenAiRequestBody};
 pub use responses::{
-    AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, FileSearchCalloutFilter, McpDispatchFilter,
-    McpToolResolveFilter, ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter,
-    ResponsesFormatFilter, ToolParseFilter, WebSearchFilter,
-    openai_responses_proxy::ResponsesProxyFilter,
+    AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, FileSearchDispatchFilter, McpDispatchFilter,
+    McpToolResolveFilter, ModelRewriteFilter, RehydrateFilter, ResponseStoreFilter, ResponsesFormatFilter,
+    ResponsesValidateFilter, ToolParseFilter, WebSearchDispatchFilter,
+    responses_proxy::ResponsesProxyFilter,
     responses_to_chat_completions::ResponsesToChatCompletionsFilter,
     routes::{
         PROTOCOL_EXTENSION_OPERATION_IDS as RESPONSES_PROTOCOL_EXTENSION_OPERATION_IDS, ResponsesOperation,
         ResponsesOperationSpec, operation_specs as responses_operation_specs,
     },
-    stream_events::OpenaiStreamEventsFilter,
+    stream_events::StreamEventsFilter,
 };

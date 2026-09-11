@@ -133,19 +133,19 @@ pub(crate) mod test_utils {
         let mut registry = praxis_filter::FilterRegistry::with_builtins();
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_responses_format" => crate::openai::ResponsesFormatFilter::from_config
+            http "openai_format" => crate::openai::ResponsesFormatFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_response_store" => crate::openai::ResponseStoreFilter::from_config
+            http "openai_store" => crate::openai::ResponseStoreFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_responses_rehydrate" => crate::openai::RehydrateFilter::from_config
+            http "openai_rehydrate" => crate::openai::RehydrateFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_stream_events" => crate::openai::OpenaiStreamEventsFilter::from_config
+            http "openai_stream_events" => crate::openai::StreamEventsFilter::from_config
         );
         registry
     }

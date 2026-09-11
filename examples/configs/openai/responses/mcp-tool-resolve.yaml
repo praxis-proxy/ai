@@ -6,7 +6,7 @@
 # server.
 #
 # The filter runs after `openai_tool_parse` (gated on `openai_tool_parse.has_mcp`)
-# and before `openai_responses_proxy`. It reads MCP entries from the
+# and before `openai_proxy`. It reads MCP entries from the
 # buffered request body, checks `previous_tools` for cached
 # listings, calls `tools/list` via the `mcp_client` module, and
 # writes `mcp_tool_map` to `ResponsesState`.
@@ -20,7 +20,7 @@
 # response store), see full-flow.yaml.
 #
 # For cross-request caching via `previous_tools`, add
-# `openai_responses_rehydrate` before this filter so that
+# `openai_rehydrate` before this filter so that
 # `ResponsesState.previous_tools` is populated from the stored
 # previous response.
 #
@@ -70,7 +70,7 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -88,7 +88,7 @@ filter_chains:
           - id: internal_search
             server_url: https://search-mcp.internal:8443/mcp
 
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
         name: inference
 
       - filter: router

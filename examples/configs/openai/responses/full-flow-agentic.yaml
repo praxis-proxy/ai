@@ -8,11 +8,11 @@
 # final Responses API object.
 #
 # This config does NOT support streaming or WebSocket in the agentic
-# loop: openai_file_search_callout shares its IRR step with
+# loop: openai_file_search_dispatch shares its IRR step with
 # openai_agentic_loop, which fully buffers each model response. For
 # streaming without hosted file_search, see full-flow.yaml. For
 # streaming hosted file_search (without the agentic loop), see
-# file-search-streaming.yaml. file_search_callout cannot share an IRR
+# file-search-streaming.yaml. file_search_dispatch cannot share an IRR
 # step with openai_agentic_loop due to competing accumulated_output
 # ownership.
 #
@@ -22,11 +22,11 @@
 #
 # Pre-IRR pipeline (runs once):
 #   1. openai_conversations — CRUD for the Conversations API
-#   2. openai_responses_format — classifies body, promotes metadata
-#   3. openai_responses_validate — validates parameters, generates IDs
+#   2. openai_format — classifies body, promotes metadata
+#   3. openai_validate — validates parameters, generates IDs
 #   4. openai_tool_parse — parses tools array, promotes summary facts
-#   5. openai_response_store — persists responses, registers store backend
-#   6. openai_responses_rehydrate — loads previous_response_id / conversation
+#   5. openai_store — persists responses, registers store backend
+#   6. openai_rehydrate — loads previous_response_id / conversation
 #   7. openai_file_resolve — resolves file_id references via Files API
 #   8. openai_doc_extract — converts input_file to input_text for backends
 #      that do not natively support input_file
@@ -41,11 +41,11 @@
 # IRR inference filter chain (all routing lives inside the IRR step
 # because the IRR must be the terminal filter in the chain):
 #   Request phase (forward):
-#     openai_file_search_callout → openai_responses_proxy
+#     openai_file_search_dispatch → openai_proxy
 #       → headers → router → load_balancer
 #   Response phase (reverse):
-#     load_balancer → router → headers → openai_responses_proxy
-#       → openai_file_search_callout
+#     load_balancer → router → headers → openai_proxy
+#       → openai_file_search_dispatch
 #
 # Only Responses API traffic (/v1/responses) is routed by this
 # config. Non-Responses paths (/v1/prompts, /v1/embeddings, etc.)
@@ -53,7 +53,7 @@
 # non-Responses traffic, see full-flow.yaml (without IRR).
 #
 # Transition rules (evaluated after each step's response-body):
-#   openai_file_search_callout.pending = "true" → next: inference
+#   openai_file_search_dispatch.pending = "true" → next: inference
 #   default                                     → done (exit to client)
 #
 # Model responses that combine file_search_call with a client-executed
@@ -103,7 +103,7 @@ filter_chains:
         conversations_table: openai_conversations
         items_table: openai_conversation_items
 
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -111,17 +111,17 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: openai_tool_parse
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
@@ -149,7 +149,7 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:3002
                 allow_private_url: true
                 timeout_ms: 5000
@@ -159,7 +159,7 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
                 name: inference
               - filter: headers
                 request_set:
@@ -175,7 +175,7 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 key: pending
                 value: "true"
                 next: inference

@@ -83,14 +83,14 @@ before sending requests.
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates compaction after rehydrate, file resolve, and document extract so rewritten current-turn content survives history replacement |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |
-| [file-search-callout.yaml](configs/openai/responses/file-search-callout.yaml) | Demonstrates the `openai_file_search_callout` filter configuration |
 | [file-search-chat-completions-fixture.yaml](configs/openai/responses/file-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses file_search tool |
 | [file-search-chat-completions.yaml](configs/openai/responses/file-search-chat-completions.yaml) | Accepts finite OpenAI Responses requests with hosted file search while targeting a backend that only implements /v1/chat/completions |
+| [file-search-dispatch.yaml](configs/openai/responses/file-search-dispatch.yaml) | Demonstrates the `openai_file_search_dispatch` filter configuration |
 | [file-search-streaming.yaml](configs/openai/responses/file-search-streaming.yaml) | Demonstrates streaming hosted file_search through the iterative_request_router |
 | [format-routing.yaml](configs/openai/responses/format-routing.yaml) | Routes AI API traffic by detected body format |
 | [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Extends the full-flow pipeline with an iterative_request_router (IRR) around the inference step, enabling server-side file search execution |
 | [full-flow.yaml](configs/openai/responses/full-flow.yaml) | Combines conversations, format classification, request validation, file resolution, streaming accumulation, and backend routing into a single pipeline |
-| [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_responses_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
+| [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
 | [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
 | [mcp-tool-resolve.yaml](configs/openai/responses/mcp-tool-resolve.yaml) | Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP tool entries in the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server |
 | [model-rewrite.yaml](configs/openai/responses/model-rewrite.yaml) | Rewrites or injects the top-level `model` field in Responses API request bodies before forwarding to the inference backend |
@@ -107,7 +107,7 @@ before sending requests.
 | [vllm-agentic-api.yaml](configs/openai/responses/vllm-agentic-api.yaml) | vLLM Agentic API: https://github.com/vllm-project/agentic-api |
 | [web-search-chat-completions-fixture.yaml](configs/openai/responses/web-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses web_search tool |
 | [web-search-chat-completions.yaml](configs/openai/responses/web-search-chat-completions.yaml) | Accepts OpenAI Responses requests with hosted web search while targeting a backend that only implements /v1/chat/completions |
-| [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search` filter configuration |
+| [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search_dispatch` filter configuration |
 
 ### Payload Processing
 

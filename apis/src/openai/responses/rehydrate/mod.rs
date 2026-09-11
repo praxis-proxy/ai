@@ -79,7 +79,7 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_responses_rehydrate
+/// filter: openai_rehydrate
 /// ```
 pub struct RehydrateFilter;
 
@@ -94,7 +94,7 @@ impl RehydrateFilter {
         // The filter has no tunable options. Parsing still runs so that
         // `deny_unknown_fields` rejects any config keys, including the removed
         // `max_history_bytes` / `max_history_items` limits.
-        let _: EmptyFilterConfig = parse_filter_config("openai_responses_rehydrate", config)?;
+        let _: EmptyFilterConfig = parse_filter_config("openai_rehydrate", config)?;
         Ok(Box::new(Self))
     }
 
@@ -174,7 +174,7 @@ impl RehydrateFilter {
 #[async_trait]
 impl HttpFilter for RehydrateFilter {
     fn name(&self) -> &'static str {
-        "openai_responses_rehydrate"
+        "openai_rehydrate"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -224,7 +224,7 @@ impl HttpFilter for RehydrateFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_format.format") != Some("openai_responses") {
             return Ok(FilterAction::Release);
         }
 
@@ -1346,7 +1346,7 @@ fn mcp_tool_names(tools: &[Value]) -> Vec<String> {
 /// [`build_state`] reconstructs [`ResponsesState`] from the request body, so
 /// markers not derivable from the body alone must be carried across the
 /// replacement. Currently that is the store filter's
-/// [`ResponsesState::store_persist_armed`] flag, which `openai_response_store`
+/// [`ResponsesState::store_persist_armed`] flag, which `openai_store`
 /// sets before rehydrate runs. Dropping it here would make `mcp_dispatch`
 /// falsely reject a continuation-turn `mcp_approval_request` as unresumable,
 /// even though the store is configured and will persist the response.

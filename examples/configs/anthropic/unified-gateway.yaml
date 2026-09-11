@@ -6,7 +6,7 @@
 #
 # `anthropic_messages_format` classifies every request body and
 # promotes `x-praxis-ai-format` for router-based cluster selection.
-# `openai_responses_format` runs second for its own filter results
+# `openai_format` runs second for its own filter results
 # but does not promote a format header (avoids overwriting).
 
 listeners:
@@ -24,7 +24,7 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: ~

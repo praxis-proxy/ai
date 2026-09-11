@@ -5,7 +5,7 @@
 //!
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
 //! across filter phases. It holds the heavy data needed by the
-//! validate → rehydrate → `openai_tool_parse` → `openai_responses_proxy` →
+//! validate → rehydrate → `openai_tool_parse` → `openai_proxy` →
 //! `stream_events` → `openai_agentic_loop` pipeline.
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
@@ -186,9 +186,9 @@ pub(crate) enum McpApprovalState {
 
 /// Request-scoped state shared across Responses API filters.
 ///
-/// Created by `openai_responses_validate` for every Responses API
+/// Created by `openai_validate` for every Responses API
 /// create request. When `previous_response_id` is present,
-/// `openai_responses_rehydrate` replaces it with an enriched
+/// `openai_rehydrate` replaces it with an enriched
 /// version that includes conversation history. Uses
 /// [`serde_json::Value`] for flexibility while the Responses API
 /// types stabilize; can be refactored to typed structs later
@@ -297,7 +297,7 @@ pub(crate) struct ResponsesState {
     /// Initialized from the current request's input. When
     /// `previous_response_id` is set, `rehydrate` prepends stored
     /// history. `openai_agentic_loop` appends tool results during agentic
-    /// loops. `openai_responses_proxy` reads this as the authoritative
+    /// loops. `openai_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
@@ -324,7 +324,7 @@ pub(crate) struct ResponsesState {
 
     /// Whether the store filter armed persistence for this exchange.
     ///
-    /// Set by `openai_response_store` during the request phase only after it
+    /// Set by `openai_store` during the request phase only after it
     /// initializes and registers a backend AND classifies this request as one
     /// whose response will be persisted. `mcp_dispatch` reads this
     /// exchange-scoped marker before emitting an `mcp_approval_request`: unlike
@@ -443,7 +443,7 @@ pub(crate) struct ResponsesState {
     pub locally_executed_output_items: HashSet<String>,
 
     /// Absolute `output_index` values into `accumulated_output` (+ origin) for the
-    /// items `openai_file_search_callout` reconciled this round on the streaming
+    /// items `openai_file_search_dispatch` reconciled this round on the streaming
     /// path. Drained exactly once by `stream_events` at finalize (§4.2). Index + a
     /// 1-byte tag (no owned `Value`) so it needs no separate `continuation_state_fits` charge.
     pub pending_local_tool_synthesis: Vec<(usize, SynthesisKind)>,

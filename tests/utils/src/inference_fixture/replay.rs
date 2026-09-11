@@ -416,14 +416,14 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "anthropic_messages_to_chat_completions"
             | "anthropic_messages_to_chat_completions_stream"
             | "iterative_request_router"
-            | "openai_responses_proxy"
+            | "openai_proxy"
             | "path_rewrite"
-            | "openai_responses_format"
-            | "openai_responses_validate"
-            | "openai_response_store"
-            | "openai_responses_rehydrate"
+            | "openai_format"
+            | "openai_validate"
+            | "openai_store"
+            | "openai_rehydrate"
             | "openai_stream_events"
-            | "responses_to_chat_completions"
+            | "openai_responses_to_chat_completions"
             | "router"
             | "load_balancer"
     )
@@ -2605,7 +2605,7 @@ mod tests {
             .expect("test filter config should parse")
         };
         let safe_config: Config = parse_config(
-            "      - filter: openai_responses_format\n      - filter: openai_responses_validate\n      - filter: openai_response_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
+            "      - filter: openai_format\n      - filter: openai_validate\n      - filter: openai_store\n      - filter: openai_rehydrate\n      - filter: openai_stream_events\n      - filter: openai_responses_to_chat_completions\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
         );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
 

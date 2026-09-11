@@ -36,7 +36,7 @@ const FILE_SEARCH_QUERY_MAX_LENGTH: usize = 65_536;
 
 /// Maximum number of vector stores a single hosted file-search tool may target.
 ///
-/// `openai_file_search_callout` issues an upstream vector-store query per id on
+/// `openai_file_search_dispatch` issues an upstream vector-store query per id on
 /// every inference round, so an unbounded array would amplify one inbound
 /// request into many outbound searches. The OpenAI API currently caps this at
 /// 1; a small generous bound keeps proxy fan-out finite without enforcing the
@@ -912,7 +912,7 @@ fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), Translation
     for field in tool.keys() {
         if !matches!(field.as_str(), "type" | "search_context_size" | "user_location") {
             return Err(TranslationError::InvalidWebSearchTool(format!(
-                "field `{field}` is not supported by openai_web_search"
+                "field `{field}` is not supported by openai_web_search_dispatch"
             )));
         }
     }
@@ -936,7 +936,7 @@ fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), Translation
     Ok(())
 }
 
-/// Validate fields required later by `openai_file_search_callout`.
+/// Validate fields required later by `openai_file_search_dispatch`.
 fn validate_file_search_tool(tool: &Map<String, Value>) -> Result<(), TranslationError> {
     validate_vector_store_ids(tool)?;
 

@@ -16,8 +16,8 @@
 //!
 //! Compaction applies in two scenarios:
 //!
-//! - **Reactive** — multi-turn requests where `openai_responses_rehydrate` has loaded stored conversation history, i.e.
-//!   requests that include `previous_response_id` or `conversation`. Single-turn requests (no stored history, even with
+//! - **Reactive** — multi-turn requests where `openai_rehydrate` has loaded stored conversation history, i.e. requests
+//!   that include `previous_response_id` or `conversation`. Single-turn requests (no stored history, even with
 //!   `context_management` set) are released without compaction because there is no prior history to summarize.
 //! - **Explicit** — `POST /v1/responses/compact`, which summarizes any previously stored response (plus optional inline
 //!   `input`) regardless of rehydration, returning a `response.compaction` object.
@@ -138,7 +138,7 @@ struct Summarization {
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_responses_compact
+/// filter: openai_compact
 /// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// allow_private_inference_url: true
@@ -148,7 +148,7 @@ struct Summarization {
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: openai_responses_compact
+/// filter: openai_compact
 /// allow_pre_security_callout: true
 /// inference_url: "http://localhost:11434/v1/chat/completions"
 /// allow_private_inference_url: true
@@ -191,7 +191,7 @@ impl CompactFilter {
 
     /// Shared constructor: parse config, validate, eager-init tiktoken, and box.
     fn build(config: &serde_yaml::Value, client: SubRequestClient) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: CompactFilterConfig = parse_filter_config("openai_responses_compact", config)?;
+        let cfg: CompactFilterConfig = parse_filter_config("openai_compact", config)?;
         let validated = build_config(&cfg)?;
         eager_init_tiktoken(&validated.tiktoken_encoding);
         Ok(Box::new(Self {
@@ -357,7 +357,7 @@ impl CompactFilter {
 #[async_trait]
 impl HttpFilter for CompactFilter {
     fn name(&self) -> &'static str {
-        "openai_responses_compact"
+        "openai_compact"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -543,7 +543,7 @@ pub(super) fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+    ctx.get_metadata("openai_format.format") == Some("openai_responses")
 }
 
 // -----------------------------------------------------------------------------

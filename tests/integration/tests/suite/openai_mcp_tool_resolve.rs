@@ -169,7 +169,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
         "failed MCP output item should identify the server: {response_body}"
     );
     // The lifecycle snapshots echo the requested model. In the shipped pipeline
-    // the format filter promotes it to `openai_responses_format.model` metadata,
+    // the format filter promotes it to `openai_format.model` metadata,
     // so this exercises the metadata branch (not the ResponsesState fallback the
     // unit tests cover).
     assert!(
@@ -186,7 +186,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
 // mcp_tool_resolve). A streaming `tools/list` runtime failure is emitted as a
 // 200 SSE lifecycle; because it is a `TerminalResponse` (not a `Reject`), the
 // response phase runs `openai_stream_events` (which accumulates the terminal
-// `response.failed`) and `openai_response_store` (which persists it) so a caller
+// `response.failed`) and `openai_store` (which persists it) so a caller
 // can later retrieve the failed response -- all without contacting the backend.
 // =============================================================================
 
@@ -469,7 +469,7 @@ async fn streaming_list_failure_persists_when_stream_events_after_resolve() {
 /// Regression for a persistence gap in the store-without-validate/rehydrate
 /// configuration: when no filter builds a `ResponsesState` before the resolver,
 /// the terminal-failure build must CREATE the state (not just mutate an existing
-/// one) so `openai_response_store` has a `response_object` to persist. With a
+/// one) so `openai_store` has a `response_object` to persist. With a
 /// `get_mut`-only write this GET would 404 despite `store` defaulting to enabled;
 /// `get_or_insert_with` makes the failed response retrievable regardless of which
 /// upstream filters ran.
@@ -652,15 +652,15 @@ fn non_responses_path_passes_through() {
 }
 
 // =============================================================================
-// Body Preservation with openai_responses_proxy (get_or_insert_with regression)
+// Body Preservation with openai_proxy (get_or_insert_with regression)
 // =============================================================================
 
 #[test]
-fn body_preserved_through_openai_responses_proxy_with_function_tools() {
+fn body_preserved_through_openai_proxy_with_function_tools() {
     let backend_guard = start_echo_backend();
     let proxy_port = free_port();
 
-    let yaml = resolve_with_openai_responses_proxy_yaml(proxy_port, backend_guard.port());
+    let yaml = resolve_with_openai_proxy_yaml(proxy_port, backend_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -676,11 +676,11 @@ fn body_preserved_through_openai_responses_proxy_with_function_tools() {
 }
 
 #[test]
-fn body_preserved_through_openai_responses_proxy_without_tools() {
+fn body_preserved_through_openai_proxy_without_tools() {
     let backend_guard = start_echo_backend();
     let proxy_port = free_port();
 
-    let yaml = resolve_with_openai_responses_proxy_yaml(proxy_port, backend_guard.port());
+    let yaml = resolve_with_openai_proxy_yaml(proxy_port, backend_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
@@ -1159,13 +1159,13 @@ fn resolve_yaml(proxy_port: u16, backend_port: u16) -> String {
 }
 
 /// Pipeline mirroring the relevant shipped `full-flow.yaml` ordering for store
-/// retrieval: `openai_response_store` runs pre-IRR, before
+/// retrieval: `openai_store` runs pre-IRR, before
 /// `openai_mcp_tool_resolve`. `openai_stream_events` is intentionally absent
 /// here -- it is IRR-only (it fails closed outside an `iterative_request_router`),
 /// and in the shipped `full-flow.yaml` it lives inside the IRR that follows the
 /// resolver, so the resolver's pre-IRR short-circuit never reaches it. The
 /// resolver self-delivers the 200 SSE failure lifecycle and writes
-/// `ResponsesState.response_object` directly, so `openai_response_store` persists
+/// `ResponsesState.response_object` directly, so `openai_store` persists
 /// the synthesized failure without any stream_events involvement.
 fn resolve_yaml_full_flow_store(proxy_port: u16, backend_port: u16, db_url: &str, timeout_ms: u64) -> String {
     format!(
@@ -1177,11 +1177,11 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_validate
       - filter: openai_tool_parse
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1226,16 +1226,16 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_validate
       - filter: openai_tool_parse
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
         conversations_table: openai_conversations
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
       - filter: openai_mcp_tool_resolve
         timeout_ms: {timeout_ms}
       - filter: openai_stream_events
@@ -1254,13 +1254,13 @@ insecure_options:
     )
 }
 
-/// Minimal store pipeline with `openai_response_store` + `openai_mcp_tool_resolve`
-/// but WITHOUT `openai_responses_validate`/`openai_responses_rehydrate` (and no
+/// Minimal store pipeline with `openai_store` + `openai_mcp_tool_resolve`
+/// but WITHOUT `openai_validate`/`openai_rehydrate` (and no
 /// `openai_stream_events`). Nothing builds a `ResponsesState` before the resolver,
 /// so persistence depends entirely on the resolver *creating* the state when it
 /// writes the terminal snapshot (`get_or_insert_with`, not `get_mut`). The store
 /// still triggers streaming persistence -- its gating reads only
-/// `openai_responses_format.*` metadata, which `openai_responses_format`
+/// `openai_format.*` metadata, which `openai_format`
 /// (always first) supplies -- and `build_record_from_state` reads only
 /// `response_object`, so a default state carrying just that field suffices.
 fn resolve_yaml_store_no_validate_rehydrate(
@@ -1278,10 +1278,10 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
       - filter: openai_tool_parse
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1313,7 +1313,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1333,7 +1333,7 @@ insecure_options:
     )
 }
 
-fn resolve_with_openai_responses_proxy_yaml(proxy_port: u16, backend_port: u16) -> String {
+fn resolve_with_openai_proxy_yaml(proxy_port: u16, backend_port: u16) -> String {
     format!(
         r#"
 listeners:
@@ -1343,11 +1343,11 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
         name: inference
       - filter: router
         routes:
@@ -1374,7 +1374,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1404,7 +1404,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1435,12 +1435,12 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
         allow_loopback: true
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
         name: inference
       - filter: router
         routes:
@@ -1471,13 +1471,13 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
         allow_loopback: true
 {connectors_yaml}
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
         name: inference
       - filter: router
         routes:

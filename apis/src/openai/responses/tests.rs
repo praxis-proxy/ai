@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Unit tests for the `openai_responses_format` filter.
+//! Unit tests for the `openai_format` filter.
 
 use bytes::Bytes;
 
@@ -15,11 +15,7 @@ use super::*;
 fn default_config_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(
-        filter.name(),
-        "openai_responses_format",
-        "filter name should be openai_responses_format"
-    );
+    assert_eq!(filter.name(), "openai_format", "filter name should be openai_format");
 }
 
 #[test]
@@ -36,25 +32,21 @@ headers:
     .unwrap();
 
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(
-        filter.name(),
-        "openai_responses_format",
-        "filter name should be openai_responses_format"
-    );
+    assert_eq!(filter.name(), "openai_format", "filter name should be openai_format");
 }
 
 #[test]
 fn on_invalid_continue_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("on_invalid: continue").unwrap();
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_responses_format", "continue mode should parse");
+    assert_eq!(filter.name(), "openai_format", "continue mode should parse");
 }
 
 #[test]
 fn on_invalid_reject_parses() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("on_invalid: reject").unwrap();
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_responses_format", "reject mode should parse");
+    assert_eq!(filter.name(), "openai_format", "reject mode should parse");
 }
 
 #[test]
@@ -112,11 +104,7 @@ headers:
     )
     .unwrap();
     let filter = ResponsesFormatFilter::from_config(&yaml).unwrap();
-    assert_eq!(
-        filter.name(),
-        "openai_responses_format",
-        "null headers should disable promotion"
-    );
+    assert_eq!(filter.name(), "openai_format", "null headers should disable promotion");
 }
 
 // -----------------------------------------------------------------------------
@@ -183,7 +171,7 @@ fn non_json_reject_returns_reject() {
 }
 
 #[test]
-fn openai_responses_format_not_rejected() {
+fn openai_format_not_rejected() {
     let cfg: ResponsesFormatConfig = serde_yaml::from_str("on_invalid: reject").unwrap();
     let result = handle_invalid_format(AiRequestFormat::Responses, &cfg);
     assert!(result.is_none(), "responses format should not be rejected");
@@ -313,63 +301,49 @@ async fn promotes_metadata_for_full_responses_request() {
     let ctx = run_filter("{}", FULL_RESPONSES_BODY).await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.model").map(String::as_str),
         Some("gpt-4.1")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.stream")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.stream").map(String::as_str),
         Some("true")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.store")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.store").map(String::as_str),
         Some("false")
     );
     assert_eq!(
+        ctx.filter_metadata.get("openai_format.background").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.background")
+            .get("openai_format.has_previous_response_id")
             .map(String::as_str),
         Some("true")
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.has_previous_response_id")
+            .get("openai_format.has_conversation")
             .map(String::as_str),
         Some("true")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.has_conversation")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.has_tools").map(String::as_str),
         Some("true")
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.has_tools")
+            .get("openai_format.has_prompt_id")
             .map(String::as_str),
         Some("true")
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.has_prompt_id")
-            .map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.mode").map(String::as_str),
         Some("stateful")
     );
 }
@@ -377,7 +351,7 @@ async fn promotes_metadata_for_full_responses_request() {
 #[tokio::test]
 async fn promotes_filter_results_for_full_responses_request() {
     let ctx = run_filter("{}", FULL_RESPONSES_BODY).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("format"), Some("openai_responses"));
     assert_eq!(results.get("model"), Some("gpt-4.1"));
@@ -404,44 +378,40 @@ async fn missing_optional_facts_not_promoted() {
     assert!(!headers.contains_key("x-praxis-ai-model"), "model header absent");
     assert!(!headers.contains_key("x-praxis-ai-stream"), "stream header absent");
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.model"),
+        !ctx.filter_metadata.contains_key("openai_format.model"),
         "model metadata absent"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.stream"),
+        !ctx.filter_metadata.contains_key("openai_format.stream"),
         "stream metadata absent"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.store"),
+        !ctx.filter_metadata.contains_key("openai_format.store"),
         "store metadata absent"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.background"),
+        !ctx.filter_metadata.contains_key("openai_format.background"),
         "background metadata absent"
     );
     assert!(
         !ctx.filter_metadata
-            .contains_key("openai_responses_format.has_previous_response_id"),
+            .contains_key("openai_format.has_previous_response_id"),
         "prev_id metadata absent"
     );
     assert!(
-        !ctx.filter_metadata
-            .contains_key("openai_responses_format.has_conversation"),
+        !ctx.filter_metadata.contains_key("openai_format.has_conversation"),
         "conversation metadata absent"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.has_tools"),
+        !ctx.filter_metadata.contains_key("openai_format.has_tools"),
         "tools metadata absent"
     );
     assert!(
-        !ctx.filter_metadata
-            .contains_key("openai_responses_format.has_prompt_id"),
+        !ctx.filter_metadata.contains_key("openai_format.has_prompt_id"),
         "prompt_id metadata absent"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.mode").map(String::as_str),
         Some("stateful"),
         "mode should be stateful when store is omitted (defaults to true)"
     );
@@ -458,10 +428,10 @@ async fn oversized_model_not_promoted_to_header_or_results_or_metadata() {
         !headers.contains_key("x-praxis-ai-model"),
         "oversized model not in header"
     );
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
     assert!(results.get("model").is_none(), "oversized model not in results");
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.model"),
+        !ctx.filter_metadata.contains_key("openai_format.model"),
         "oversized model not in metadata"
     );
 }
@@ -502,9 +472,7 @@ async fn null_headers_suppress_emission() {
         "null headers suppress all emission"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "metadata still written with null headers"
     );
@@ -519,9 +487,7 @@ async fn get_v1_responses_with_id_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses/resp_abc123").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "GET /v1/responses/{{id}} should classify as responses"
     );
@@ -537,9 +503,7 @@ async fn get_v1_responses_input_items_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses/resp_abc123/input_items").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "GET /v1/responses/{{id}}/input_items should classify as responses"
     );
@@ -550,9 +514,7 @@ async fn delete_v1_responses_with_id_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::DELETE, "/v1/responses/resp_abc123").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "DELETE /v1/responses/{{id}} should classify as responses"
     );
@@ -563,13 +525,11 @@ async fn post_v1_responses_cancel_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::POST, "/v1/responses/resp_abc123/cancel").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "POST /v1/responses/{{id}}/cancel should classify as responses"
     );
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
     assert_eq!(results.get("format"), Some("openai_responses"), "filter result format");
 }
 
@@ -578,9 +538,7 @@ async fn post_v1_responses_input_tokens_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::POST, "/v1/responses/input_tokens").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "POST /v1/responses/input_tokens should classify as responses"
     );
@@ -591,9 +549,7 @@ async fn post_v1_responses_compact_classifies_as_responses() {
     let ctx = run_filter_with_method("{}", "", http::Method::POST, "/v1/responses/compact").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "POST /v1/responses/compact should classify as responses"
     );
@@ -602,7 +558,7 @@ async fn post_v1_responses_compact_classifies_as_responses() {
 #[tokio::test]
 async fn get_path_match_promotes_filter_results() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses/resp_abc123").await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("format"), Some("openai_responses"), "filter result format");
     assert_eq!(results.get("model"), None, "no model from path-only classification");
@@ -612,7 +568,7 @@ async fn get_path_match_promotes_filter_results() {
 #[tokio::test]
 async fn delete_path_match_promotes_filter_results() {
     let ctx = run_filter_with_method("{}", "", http::Method::DELETE, "/v1/responses/resp_abc123").await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("format"), Some("openai_responses"), "filter result format");
 }
@@ -642,19 +598,19 @@ async fn get_path_match_no_body_facts() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses/resp_abc").await;
 
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.model"),
+        !ctx.filter_metadata.contains_key("openai_format.model"),
         "no model from path-only classification"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.stream"),
+        !ctx.filter_metadata.contains_key("openai_format.stream"),
         "no stream from path-only classification"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.store"),
+        !ctx.filter_metadata.contains_key("openai_format.store"),
         "no store from path-only classification"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.background"),
+        !ctx.filter_metadata.contains_key("openai_format.background"),
         "no background from path-only classification"
     );
 }
@@ -670,9 +626,7 @@ async fn put_unrelated_path_classifies_body_normally() {
     .await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_chat_completions"),
         "non-path method should classify using request body"
     );
@@ -689,16 +643,12 @@ async fn post_v1_responses_classifies_body_normally() {
     .await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "POST should classify via body, not path"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.model").map(String::as_str),
         Some("gpt-4.1"),
         "POST should extract model from body"
     );
@@ -713,16 +663,12 @@ async fn post_v1_responses_create_without_discriminator_classifies_as_responses(
     let ctx = run_filter_with_method("{}", r#"{"model":"gpt-5"}"#, http::Method::POST, "/v1/responses").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "create body without discriminator fields should classify as responses"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.model").map(String::as_str),
         Some("gpt-5"),
         "model should still be extracted from the create body"
     );
@@ -741,23 +687,17 @@ async fn post_v1_responses_create_preserves_body_facts() {
     .await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "create endpoint should classify as responses"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.stream")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.stream").map(String::as_str),
         Some("true"),
         "stream fact should be preserved"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.store")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.store").map(String::as_str),
         Some("false"),
         "store fact should be preserved"
     );
@@ -810,7 +750,7 @@ async fn responses_websocket_handshake_promotes_only_format() {
     )
     .await;
     let headers = collect_headers(&ctx);
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(
         headers.get("x-praxis-ai-format"),
@@ -818,9 +758,7 @@ async fn responses_websocket_handshake_promotes_only_format() {
         "the handshake should promote the Responses format header"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("openai_responses"),
         "the handshake should write the Responses format metadata"
     );
@@ -846,8 +784,7 @@ async fn responses_websocket_handshake_promotes_only_format() {
         "mode",
     ] {
         assert!(
-            !ctx.filter_metadata
-                .contains_key(&format!("openai_responses_format.{fact}")),
+            !ctx.filter_metadata.contains_key(&format!("openai_format.{fact}")),
             "handshake should not write {fact} metadata"
         );
         assert!(
@@ -863,9 +800,7 @@ async fn get_responses_without_websocket_headers_classifies_body_normally() {
     let ctx = run_filter_with_method("{}", "", http::Method::GET, "/v1/responses").await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.format").map(String::as_str),
         Some("non_json"),
         "an ordinary GET list request must not be promoted as a WebSocket handshake"
     );
@@ -883,13 +818,11 @@ async fn get_responses_without_websocket_headers_classifies_body_normally() {
 #[tokio::test]
 async fn mode_stateless_when_store_false_no_stateful_markers() {
     let ctx = run_filter("{}", r#"{"input":"test","store":false}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("mode"), Some("stateless"));
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.mode").map(String::as_str),
         Some("stateless")
     );
     let headers = collect_headers(&ctx);
@@ -899,7 +832,7 @@ async fn mode_stateless_when_store_false_no_stateful_markers() {
 #[tokio::test]
 async fn mode_stateful_when_store_omitted() {
     let ctx = run_filter("{}", r#"{"input":"test"}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(
         results.get("mode"),
@@ -911,7 +844,7 @@ async fn mode_stateful_when_store_omitted() {
 #[tokio::test]
 async fn mode_stateful_when_store_true() {
     let ctx = run_filter("{}", r#"{"input":"test","store":true}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("mode"), Some("stateful"));
 }
@@ -923,7 +856,7 @@ async fn mode_stateful_when_previous_response_id() {
         r#"{"input":"test","store":false,"previous_response_id":"resp_1"}"#,
     )
     .await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("mode"), Some("stateful"));
 }
@@ -931,7 +864,7 @@ async fn mode_stateful_when_previous_response_id() {
 #[tokio::test]
 async fn mode_stateful_when_tools_present() {
     let ctx = run_filter("{}", r#"{"input":"test","store":false,"tools":[{"type":"function"}]}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("mode"), Some("stateful"));
 }
@@ -939,7 +872,7 @@ async fn mode_stateful_when_tools_present() {
 #[tokio::test]
 async fn mode_stateful_when_background_true() {
     let ctx = run_filter("{}", r#"{"input":"test","store":false,"background":true}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("mode"), Some("stateful"));
 }
@@ -947,7 +880,7 @@ async fn mode_stateful_when_background_true() {
 #[tokio::test]
 async fn mode_stateful_when_conversation_present() {
     let ctx = run_filter("{}", r#"{"input":"test","store":false,"conversation":{"id":"conv_1"}}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("mode"), Some("stateful"));
 }
@@ -955,7 +888,7 @@ async fn mode_stateful_when_conversation_present() {
 #[tokio::test]
 async fn mode_stateful_when_prompt_id_present() {
     let ctx = run_filter("{}", r#"{"input":"test","store":false,"prompt":{"id":"pmpt_123"}}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(results.get("mode"), Some("stateful"));
 }
@@ -963,14 +896,14 @@ async fn mode_stateful_when_prompt_id_present() {
 #[tokio::test]
 async fn mode_not_set_for_chat_completions() {
     let ctx = run_filter("{}", r#"{"messages":[{"role":"user","content":"Hi"}]}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert!(
         results.get("mode").is_none(),
         "mode should not be set for chat_completions"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.mode"),
+        !ctx.filter_metadata.contains_key("openai_format.mode"),
         "mode metadata absent for chat_completions"
     );
     let headers = collect_headers(&ctx);
@@ -988,7 +921,7 @@ async fn mode_not_set_for_chat_completions() {
 #[tokio::test]
 async fn mode_stateless_with_store_false_and_empty_tools() {
     let ctx = run_filter("{}", r#"{"input":"test","store":false,"tools":[]}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
+    let results = ctx.filter_results.get("openai_format").unwrap();
 
     assert_eq!(
         results.get("mode"),
@@ -1021,9 +954,7 @@ async fn mode_header_suppressed_when_null() {
         "null mode header should suppress emission"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_format.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_format.mode").map(String::as_str),
         Some("stateless"),
         "metadata still written with null mode header"
     );
@@ -1170,7 +1101,7 @@ fn fs_end_stream_writes_five_keys_and_is_idempotent() {
     assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
     assert_eq!(ctx.get_metadata("responses.stream_error_message"), Some("boom"));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
-    let r = ctx.filter_results.get("openai_file_search_callout").unwrap();
+    let r = ctx.filter_results.get("openai_file_search_dispatch").unwrap();
     assert_eq!(r.get("action"), Some("done"));
     assert_eq!(r.get("pending"), Some("false"));
     // Idempotent: a second call with a different code does not clobber.

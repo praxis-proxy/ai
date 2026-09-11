@@ -1,4 +1,4 @@
-# OpenResponses conformance triage for the responses_to_chat_completions filter.
+# OpenResponses conformance triage for the openai_responses_to_chat_completions filter.
 #
 # Source suite: https://github.com/openresponses/openresponses
 # Pinned commit: 92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c
@@ -57,12 +57,12 @@ inapplicable:
     reason: >-
       Separate /responses/compact operation outside the Responses-create
       translation surface. Belongs to a whole-Responses-API metric, not this
-      responses_to_chat_completions (POST /v1/responses) coverage.
+      openai_responses_to_chat_completions (POST /v1/responses) coverage.
   - id: compact-missing-model
     reason: >-
       Separate /responses/compact operation (negative case) outside the
       Responses-create translation surface. Belongs to a whole-Responses-API
-      metric, not this responses_to_chat_completions (POST /v1/responses)
+      metric, not this openai_responses_to_chat_completions (POST /v1/responses)
       coverage.
   - id: websocket-response
     reason: >-

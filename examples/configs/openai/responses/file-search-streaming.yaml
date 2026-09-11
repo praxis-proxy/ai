@@ -6,8 +6,8 @@
 # model inference before finalizing the SSE lifecycle with citation annotations.
 #
 # This config uses the streaming step order mandated by §5 of the #313 spec:
-# `openai_stream_events` is REQUIRED ahead of `openai_file_search_callout` and
-# `openai_responses_proxy`. It always composes the current IRR execution into
+# `openai_stream_events` is REQUIRED ahead of `openai_file_search_dispatch` and
+# `openai_proxy`. It always composes the current IRR execution into
 # one logical Responses stream. The proxy derives
 # the streaming transport automatically from the effective outbound `stream:
 # true`; there is no operator opt-in. Typed streaming commits response.completed
@@ -47,8 +47,8 @@ listeners:
 filter_chains:
   - name: file-search-streaming-pipeline
     filters:
-      - filter: openai_responses_format
-      - filter: openai_responses_validate
+      - filter: openai_format
+      - filter: openai_validate
       - filter: openai_tool_parse
       - filter: iterative_request_router
         initial_step: inference
@@ -62,7 +62,7 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_stream_events
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:8001
                 allow_private_url: true
                 timeout_ms: 5000
@@ -74,7 +74,7 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
               - filter: headers
                 request_set:
                   - name: Content-Type
@@ -89,7 +89,7 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 key: pending
                 value: "true"
                 next: inference

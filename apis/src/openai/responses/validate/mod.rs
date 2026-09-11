@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! `openai_responses_validate` filter: validate and enrich incoming Responses
+//! `openai_validate` filter: validate and enrich incoming Responses
 //! API requests.
 //!
-//! Expects the upstream `openai_responses_format` classifier to have already
+//! Expects the upstream `openai_format` classifier to have already
 //! identified this request as a Responses API request and promoted
 //! routing facts (`model`, `stream`, `store`, `background`) to
-//! `openai_responses_format.*` metadata.
+//! `openai_format.*` metadata.
 //!
 //! This filter validates that the body is JSON, then does targeted field
 //! extraction for `conversation.id`. It does **not** deserialize the full
@@ -17,7 +17,7 @@
 //! # YAML
 //!
 //! ```yaml
-//! filter: openai_responses_validate
+//! filter: openai_validate
 //! ```
 
 use async_trait::async_trait;
@@ -32,7 +32,7 @@ use tracing::{debug, trace};
 use super::{error::responses_error_rejection, extract_conversation_id, state::ResponsesState};
 
 // -----------------------------------------------------------------------------
-// OpenaiResponsesValidateFilter
+// ResponsesValidateFilter
 // -----------------------------------------------------------------------------
 
 /// Validates and enriches Responses API requests.
@@ -41,7 +41,7 @@ use super::{error::responses_error_rejection, extract_conversation_id, state::Re
 /// Does not deserialize the full body into a typed struct or reject
 /// provider-supported combinations such as background streaming.
 ///
-/// Must be placed after `openai_responses_format` in the filter chain.
+/// Must be placed after `openai_format` in the filter chain.
 /// Skips non-Responses API requests (those not classified as
 /// `openai_responses`).
 ///
@@ -50,11 +50,11 @@ use super::{error::responses_error_rejection, extract_conversation_id, state::Re
 /// `responses.background`, `responses.stream`.
 ///
 /// This filter has no configuration, body buffering is handled by
-/// the upstream `openai_responses_format` classifier.
+/// the upstream `openai_format` classifier.
 #[derive(Default)]
-pub struct OpenaiResponsesValidateFilter;
+pub struct ResponsesValidateFilter;
 
-impl OpenaiResponsesValidateFilter {
+impl ResponsesValidateFilter {
     /// Create a filter from YAML config.
     ///
     /// # Errors
@@ -63,15 +63,15 @@ impl OpenaiResponsesValidateFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let _: EmptyFilterConfig = parse_filter_config("openai_responses_validate", config)?;
+        let _: EmptyFilterConfig = parse_filter_config("openai_validate", config)?;
         Ok(Box::new(Self))
     }
 }
 
 #[async_trait]
-impl HttpFilter for OpenaiResponsesValidateFilter {
+impl HttpFilter for ResponsesValidateFilter {
     fn name(&self) -> &'static str {
-        "openai_responses_validate"
+        "openai_validate"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -98,7 +98,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_format.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }
@@ -196,25 +196,21 @@ fn resolve_conversation_id(ctx: &HttpFilterContext<'_>, body: &serde_json::Value
 
 /// Enrich filter context with validated metadata for downstream filters.
 ///
-/// Reads `stream`, `store`, `background` from `openai_responses_format.*`
+/// Reads `stream`, `store`, `background` from `openai_format.*`
 /// classifier metadata and applies spec defaults.
 fn enrich_context(ctx: &mut HttpFilterContext<'_>, response_id: &str, conversation_id: &str) {
     ctx.set_metadata("responses.response_id", response_id);
     ctx.set_metadata("responses.conversation_id", conversation_id);
 
-    let store = ctx
-        .get_metadata("openai_responses_format.store")
-        .is_none_or(|v| v != "false");
+    let store = ctx.get_metadata("openai_format.store").is_none_or(|v| v != "false");
     ctx.set_metadata("responses.store", if store { "true" } else { "false" });
 
     let background = ctx
-        .get_metadata("openai_responses_format.background")
+        .get_metadata("openai_format.background")
         .is_some_and(|v| v == "true");
     ctx.set_metadata("responses.background", if background { "true" } else { "false" });
 
-    let stream = ctx
-        .get_metadata("openai_responses_format.stream")
-        .is_some_and(|v| v == "true");
+    let stream = ctx.get_metadata("openai_format.stream").is_some_and(|v| v == "true");
     ctx.set_metadata("responses.stream", if stream { "true" } else { "false" });
 
     trace!(store, background, stream, "classifier metadata applied");
@@ -242,24 +238,24 @@ mod tests {
 
     #[test]
     fn from_config_succeeds() {
-        let filter = OpenaiResponsesValidateFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let filter = ResponsesValidateFilter::from_config(&serde_yaml::Value::Null).unwrap();
         assert_eq!(
             filter.name(),
-            "openai_responses_validate",
-            "filter name should be openai_responses_validate"
+            "openai_validate",
+            "filter name should be openai_validate"
         );
     }
 
     #[test]
     fn from_config_rejects_unknown_fields() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("bogus: true").unwrap();
-        let result = OpenaiResponsesValidateFilter::from_config(&yaml);
+        let result = ResponsesValidateFilter::from_config(&yaml);
         assert!(result.is_err(), "unknown fields should be rejected");
     }
 
     #[test]
     fn body_access_is_read_only() {
-        let filter = OpenaiResponsesValidateFilter;
+        let filter = ResponsesValidateFilter;
         assert_eq!(
             filter.request_body_access(),
             BodyAccess::ReadOnly,
@@ -325,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_stream_from_classifier_metadata() {
-        let ctx = run_filter(r#"{"input": "Hi"}"#, &[("openai_responses_format.stream", "true")]).await;
+        let ctx = run_filter(r#"{"input": "Hi"}"#, &[("openai_format.stream", "true")]).await;
 
         assert_eq!(
             ctx.filter_metadata.get("responses.stream").map(String::as_str),
@@ -336,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_store_from_classifier_metadata() {
-        let ctx = run_filter(r#"{"input": "Hi"}"#, &[("openai_responses_format.store", "false")]).await;
+        let ctx = run_filter(r#"{"input": "Hi"}"#, &[("openai_format.store", "false")]).await;
 
         assert_eq!(
             ctx.filter_metadata.get("responses.store").map(String::as_str),
@@ -347,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_background_from_classifier_metadata() {
-        let ctx = run_filter(r#"{"input": "Hi"}"#, &[("openai_responses_format.background", "true")]).await;
+        let ctx = run_filter(r#"{"input": "Hi"}"#, &[("openai_format.background", "true")]).await;
 
         assert_eq!(
             ctx.filter_metadata.get("responses.background").map(String::as_str),
@@ -394,10 +390,7 @@ mod tests {
     async fn stream_and_background_accepted() {
         let ctx = run_filter(
             r#"{"input": "test"}"#,
-            &[
-                ("openai_responses_format.stream", "true"),
-                ("openai_responses_format.background", "true"),
-            ],
+            &[("openai_format.stream", "true"), ("openai_format.background", "true")],
         )
         .await;
         assert_eq!(
@@ -416,10 +409,7 @@ mod tests {
     async fn background_without_store_accepted() {
         let ctx = run_filter(
             r#"{"input": "test"}"#,
-            &[
-                ("openai_responses_format.background", "true"),
-                ("openai_responses_format.store", "false"),
-            ],
+            &[("openai_format.background", "true"), ("openai_format.store", "false")],
         )
         .await;
         assert_eq!(
@@ -436,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_request_rejection_uses_json_content_type() {
-        let action = run_filter_raw("not valid json", &[("openai_responses_format.stream", "true")]).await;
+        let action = run_filter_raw("not valid json", &[("openai_format.stream", "true")]).await;
         if let FilterAction::Reject(rejection) = action {
             let has_content_type = rejection
                 .headers
@@ -522,7 +512,7 @@ mod tests {
             "/v1/chat/completions",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_chat_completions");
+        ctx.set_metadata("openai_format.format", "openai_chat_completions");
         let mut body = Some(Bytes::from(r#"{"messages":[]}"#));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -555,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn not_end_of_stream_continues() {
-        let filter = OpenaiResponsesValidateFilter;
+        let filter = ResponsesValidateFilter;
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let mut body = Some(Bytes::from(r#"{"input": "partial"}"#));
@@ -585,7 +575,7 @@ mod tests {
             "/v1/responses/resp_abc123",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -607,7 +597,7 @@ mod tests {
             "/v1/responses/resp_abc123",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -625,7 +615,7 @@ mod tests {
             "/v1/responses/resp_abc123/input_items",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -643,7 +633,7 @@ mod tests {
             "/v1/responses/resp_abc123/cancel",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -665,7 +655,7 @@ mod tests {
             "/v1/responses/resp_abc123/cancel/",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -683,7 +673,7 @@ mod tests {
             "/v1/responses/input_tokens",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -698,7 +688,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn make_filter() -> Box<dyn HttpFilter> {
-        OpenaiResponsesValidateFilter::from_config(&serde_yaml::Value::Null).unwrap()
+        ResponsesValidateFilter::from_config(&serde_yaml::Value::Null).unwrap()
     }
 
     async fn run_filter(body_str: &str, classifier_metadata: &[(&str, &str)]) -> HttpFilterContext<'static> {
@@ -708,7 +698,7 @@ mod tests {
             "/v1/responses",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         for (k, v) in classifier_metadata {
             ctx.set_metadata(*k, *v);
         }
@@ -730,7 +720,7 @@ mod tests {
             "/v1/responses",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         for (k, v) in classifier_metadata {
             ctx.set_metadata(*k, *v);
         }

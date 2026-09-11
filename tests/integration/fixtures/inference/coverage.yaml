@@ -4,7 +4,7 @@ scope:
   - messages_native_passthrough
   - responses_agentic_loop
   - responses_native_passthrough
-  - responses_to_chat_completions
+  - openai_responses_to_chat_completions
 features:
   - id: messages.request.minimal
     scopes:
@@ -155,7 +155,7 @@ features:
         status: synthetic_only
   - id: responses.chat.request
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
@@ -165,7 +165,7 @@ features:
         status: synthetic_only
   - id: responses.chat.response.text
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
@@ -175,7 +175,7 @@ features:
         status: synthetic_only
   - id: responses.chat.web_search
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-web-search
@@ -185,7 +185,7 @@ features:
         status: synthetic_only
   - id: responses.chat.file_search
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-file-search
@@ -221,7 +221,7 @@ features:
         status: synthetic_only
   - id: responses.chat.continuation
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-basic-nonstream
@@ -230,7 +230,7 @@ features:
         status: synthetic_only
   - id: responses.chat.malformed_compaction
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-malformed-compaction
@@ -239,7 +239,7 @@ features:
         status: synthetic_only
   - id: responses.chat.tools.function_echo
     scopes:
-      - responses_to_chat_completions
+      - openai_responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-tool-echo

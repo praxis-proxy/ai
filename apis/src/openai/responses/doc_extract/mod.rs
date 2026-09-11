@@ -17,7 +17,7 @@
 //! pipeline.
 //!
 //! Runs after `openai_file_resolve` (which resolves `file_id` to
-//! inline `file_data`) and before `openai_responses_proxy` (which
+//! inline `file_data`) and before `openai_proxy` (which
 //! rebuilds the body from state). Parts without inline `file_data`
 //! (unresolved `file_id` or `file_url`) are skipped — this filter
 //! does not perform network I/O.
@@ -64,7 +64,7 @@ use self::{
 };
 use super::{
     body_limits::reject_rewritten_body_too_large, file_resolve::resolve::content_parts_mut,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};
 
@@ -146,7 +146,7 @@ impl HttpFilter for DocExtractFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_format.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }
@@ -385,7 +385,7 @@ fn extract_history(
 }
 
 /// Enforce the body limit against the exact request shape that
-/// `openai_responses_proxy` will later serialize from state.
+/// `openai_proxy` will later serialize from state.
 fn reject_oversized_state_body(
     ctx: &HttpFilterContext<'_>,
     max_rewritten_body_bytes: usize,

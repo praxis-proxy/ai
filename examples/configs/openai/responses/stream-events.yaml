@@ -12,13 +12,13 @@
 # run inside an `iterative_request_router` step; placing it anywhere
 # else fails closed at request time. A `stream: true` request arms it.
 #
-# The `openai_response_store` filter runs pre-IRR (registering the
+# The `openai_store` filter runs pre-IRR (registering the
 # store backend) and persists the accumulated ResponsesState once the
 # logical stream terminates. Response body filters run in reverse
 # config order, so the store persists after the step composes the
 # terminal event.
 #
-# `openai_responses_proxy` automatically selects Praxis's
+# `openai_proxy` automatically selects Praxis's
 # typed streaming transport for the effective `stream: true` request, so
 # each SSE chunk reaches `openai_stream_events` incrementally.
 #
@@ -52,7 +52,7 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
@@ -60,9 +60,9 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
@@ -78,7 +78,7 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
 
               # Composes the inference stream into one logical Responses
               # lifecycle. Armed by a `stream: true` request; always

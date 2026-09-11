@@ -11,7 +11,7 @@
 //!    `openai_mcp_dispatch.action = "loop"` to filter results.
 //! 2. **Request-body path** (`on_request_body`, next IRR iteration): executes pending MCP calls via
 //!    [`mcp_client::call_tool`] and appends results to `messages`, `persisted_messages`, and `output_items` before
-//!    `openai_responses_proxy` serializes the next inference request.
+//!    `openai_proxy` serializes the next inference request.
 //!
 //! # Pipeline dependencies
 //!
@@ -70,7 +70,7 @@ use self::{
 use super::{
     DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
     error::responses_error_rejection,
-    openai_mcp_tool_resolve::{McpToolIndex, McpToolMatch},
+    mcp_tool_resolve::{McpToolIndex, McpToolMatch},
     state::{McpApprovalState, ResponsesState, current_round_borrowed_tool_call_admissions},
 };
 use crate::{

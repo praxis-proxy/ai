@@ -1,14 +1,14 @@
 # Terminal Responses Streaming through IRR
 #
 # Demonstrates a single-step iterative_request_router pipeline that exposes a
-# native OpenAI Responses SSE body incrementally. `openai_responses_proxy`
+# native OpenAI Responses SSE body incrementally. `openai_proxy`
 # always advertises the streaming capability and selects Praxis's typed
 # streaming transport automatically for an effective `"stream": true` request;
 # there is no operator opt-in. Streaming is not a Praxis IRR YAML transport
 # mode.
 #
-# `openai_responses_format` publishes descriptive client intent. The final
-# outbound serializer, `openai_responses_proxy`, independently keeps the
+# `openai_format` publishes descriptive client intent. The final
+# outbound serializer, `openai_proxy`, independently keeps the
 # provider-visible `"stream": true` field aligned with Praxis's typed
 # `SubRequestResponseMode::Streaming` selection.
 #
@@ -16,7 +16,7 @@
 # IRR may also resume the same downstream stream after response-dependent
 # transitions; the agentic-loop example demonstrates that multi-round form.
 #
-# The typed response mode selected by `openai_responses_proxy` arms the
+# The typed response mode selected by `openai_proxy` arms the
 # step-local `openai_stream_events` filter. It receives each SSE chunk before it
 # is sent to the client and preserves parser state through stream completion.
 #
@@ -34,10 +34,10 @@ listeners:
 filter_chains:
   - name: responses-terminal-stream
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: iterative_request_router
         initial_step: inference
@@ -48,7 +48,7 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
 
               - filter: openai_stream_events
 

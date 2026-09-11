@@ -3,8 +3,8 @@
 # Rewrites or injects the top-level `model` field in Responses API
 # request bodies before forwarding to the inference backend.
 #
-# This pipeline uses `openai_responses_format` to classify the
-# request, then `openai_responses_model_rewrite` to apply alias
+# This pipeline uses `openai_format` to classify the
+# request, then `openai_model_rewrite` to apply alias
 # mapping. The router uses the effective model header to select
 # the backend cluster, so routing reflects the rewritten model,
 # not the original client-facing name.
@@ -24,13 +24,13 @@ listeners:
 filter_chains:
   - name: model-rewrite-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
 
-      - filter: openai_responses_model_rewrite
+      - filter: openai_model_rewrite
         default_model: "llama-3.3-70b"
         model_aliases:
           "codex-*": "llama-3.3-70b"

@@ -99,7 +99,7 @@ test-postgres-unit:
 	cargo test -p praxis-ai-apis store::tests::pg_ -- --ignored $(_NOCAPTURE)
 
 test-postgres-integration:
-	cargo test -p praxis-tests-integration --test suite openai_response_store_postgres -- --ignored $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --test suite openai_store_postgres -- --ignored $(_NOCAPTURE)
 
 test-token-rate-limit-valkey-unit:
 	cargo test -p praxis-ai-filters --features token-rate-limit-filter valkey $(_NOCAPTURE)

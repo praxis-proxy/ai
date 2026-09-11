@@ -18,7 +18,7 @@ use crate::store::{
 };
 
 /// Filter name used in SSRF validation error messages.
-const FILTER_NAME: &str = "openai_response_store";
+const FILTER_NAME: &str = "openai_store";
 
 // -----------------------------------------------------------------------------
 // StorageBackend

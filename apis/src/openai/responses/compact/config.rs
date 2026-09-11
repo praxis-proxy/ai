@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Configuration for the `openai_responses_compact` filter.
+//! Configuration for the `openai_compact` filter.
 
 use praxis_filter::FilterError;
 use serde::Deserialize;
@@ -125,27 +125,23 @@ const SUPPORTED_ENCODINGS: &[&str] = &["cl100k_base", "o200k_base"];
 pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig, FilterError> {
     validate_pre_security_callout(raw)?;
     if raw.inference_url.is_empty() {
-        return Err(FilterError::from("openai_responses_compact: inference_url is empty"));
+        return Err(FilterError::from("openai_compact: inference_url is empty"));
     }
     let address_policy = AddressPolicy::from_allow_private(raw.allow_private_inference_url);
-    validate_configured_http_target("openai_responses_compact", &raw.inference_url, address_policy)?;
+    validate_configured_http_target("openai_compact", &raw.inference_url, address_policy)?;
 
     if !SUPPORTED_ENCODINGS.contains(&raw.tiktoken_encoding.as_str()) {
         return Err(FilterError::from(format!(
-            "openai_responses_compact: unsupported tiktoken_encoding {:?}; supported: {}",
+            "openai_compact: unsupported tiktoken_encoding {:?}; supported: {}",
             raw.tiktoken_encoding,
             SUPPORTED_ENCODINGS.join(", ")
         )));
     }
 
-    let timeout_ms =
-        callout_policy::validate_timeout_ms("openai_responses_compact", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
+    let timeout_ms = callout_policy::validate_timeout_ms("openai_compact", raw.timeout_ms, DEFAULT_TIMEOUT_MS)?;
 
-    let status_on_error = callout_policy::validate_status_on_error(
-        "openai_responses_compact",
-        raw.status_on_error,
-        DEFAULT_STATUS_ON_ERROR,
-    )?;
+    let status_on_error =
+        callout_policy::validate_status_on_error("openai_compact", raw.status_on_error, DEFAULT_STATUS_ON_ERROR)?;
 
     Ok(ValidatedConfig {
         inference_url: raw.inference_url.clone(),
@@ -168,7 +164,7 @@ pub(super) fn build_config(raw: &CompactFilterConfig) -> Result<ValidatedConfig,
 fn validate_pre_security_callout(cfg: &CompactFilterConfig) -> Result<(), FilterError> {
     if !cfg.allow_pre_security_callout {
         return Err(
-            "openai_responses_compact: 'allow_pre_security_callout' must be true because StreamBuffer body callouts run before header-phase security filters; place authentication and authorization in an outer trust boundary"
+            "openai_compact: 'allow_pre_security_callout' must be true because StreamBuffer body callouts run before header-phase security filters; place authentication and authorization in an outer trust boundary"
                 .into(),
         );
     }

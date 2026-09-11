@@ -551,7 +551,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: postgres
         database_url: "postgres://user:super-secret-db-pass@localhost:5432/praxis"
         responses_table: openai_responses
@@ -590,7 +590,7 @@ filter_chains:
             chains:
               - name: inline_store
                 filters:
-                  - filter: openai_response_store
+                  - filter: openai_store
                     backend: postgres
                     database_url: "postgres://user:super-secret-db-pass@localhost:5432/praxis"
                     responses_table: openai_responses
@@ -672,12 +672,13 @@ filter_chains:
     #[test]
     fn redact_sensitive_keys_api_key() {
         let mut value: serde_yaml::Value =
-            serde_yaml::from_str("openai_web_search:\n  api_key: brave-secret-key-123").expect("test YAML must parse");
+            serde_yaml::from_str("openai_web_search_dispatch:\n  api_key: brave-secret-key-123")
+                .expect("test YAML must parse");
         redact_sensitive_keys(&mut value);
         let redacted = value
             .as_mapping()
             .unwrap()
-            .get(serde_yaml::Value::String("openai_web_search".to_owned()))
+            .get(serde_yaml::Value::String("openai_web_search_dispatch".to_owned()))
             .unwrap()
             .as_mapping()
             .unwrap()

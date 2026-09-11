@@ -169,7 +169,7 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
 #[test]
 fn full_flow_stateful_valid_request_reaches_backend() {
     // A classified Responses create request now flows through the IRR
-    // (openai_responses_proxy + openai_stream_events), so the backend must
+    // (openai_proxy + openai_stream_events), so the backend must
     // return a native Responses resource rather than an opaque marker string.
     let backend_guard = start_backend_with_shutdown(
         r#"{"id":"resp_stateful","created_at":1000,"model":"gpt-4.1","object":"response","status":"completed","output":[]}"#,
@@ -273,7 +273,7 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
 /// Streaming persistence and retrieval, end to end. A `stream: true` create
 /// request routes through the IRR, where openai_stream_events accumulates the
 /// native Responses SSE lifecycle into `ResponsesState.response_object`. The
-/// pre-IRR openai_response_store then persists that accumulated object on the
+/// pre-IRR openai_store then persists that accumulated object on the
 /// response path, so the streamed resource is retrievable via
 /// `GET /v1/responses/{id}`. Without the in-IRR accumulator the object stays
 /// null and persistence is silently skipped (the store logs "response_object is

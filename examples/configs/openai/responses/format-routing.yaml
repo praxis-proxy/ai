@@ -1,6 +1,6 @@
 # Responses Format Routing
 #
-# Routes AI API traffic by detected body format. The `openai_responses_format`
+# Routes AI API traffic by detected body format. The `openai_format`
 # filter parses JSON request bodies and classifies them as `openai_responses`
 # (Responses API), `openai_chat_completions` (Chat Completions API), or
 # `unknown` (valid JSON but unrecognized format).
@@ -30,7 +30,7 @@ listeners:
 filter_chains:
   - name: ai-routing
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

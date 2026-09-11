@@ -214,23 +214,25 @@ pub(super) fn build_config(
 ) -> Result<ResponsesToChatCompletionsConfig, FilterError> {
     validate_rewritten_body_limit(config.max_rewritten_body_bytes)?;
     if config.max_sse_buffer_bytes == 0 {
-        return Err("responses_to_chat_completions: max_sse_buffer_bytes must be greater than zero".into());
+        return Err("openai_responses_to_chat_completions: max_sse_buffer_bytes must be greater than zero".into());
     }
     if config.max_stream_events == 0 {
-        return Err("responses_to_chat_completions: max_stream_events must be greater than zero".into());
+        return Err("openai_responses_to_chat_completions: max_stream_events must be greater than zero".into());
     }
     if config.max_tool_call_argument_bytes == 0 {
-        return Err("responses_to_chat_completions: max_tool_call_argument_bytes must be greater than zero".into());
+        return Err(
+            "openai_responses_to_chat_completions: max_tool_call_argument_bytes must be greater than zero".into(),
+        );
     }
     if config.max_tool_calls == 0 {
-        return Err("responses_to_chat_completions: max_tool_calls must be greater than zero".into());
+        return Err("openai_responses_to_chat_completions: max_tool_calls must be greater than zero".into());
     }
     if config.max_stream_frames == 0 {
-        return Err("responses_to_chat_completions: max_stream_frames must be greater than zero".into());
+        return Err("openai_responses_to_chat_completions: max_stream_frames must be greater than zero".into());
     }
     if config.max_emitted_sse_frame_bytes < MIN_MAX_EMITTED_SSE_FRAME_BYTES {
         return Err(format!(
-            "responses_to_chat_completions: max_emitted_sse_frame_bytes ({}) must be at least {MIN_MAX_EMITTED_SSE_FRAME_BYTES} bytes so the fail-closed response.failed terminal always fits",
+            "openai_responses_to_chat_completions: max_emitted_sse_frame_bytes ({}) must be at least {MIN_MAX_EMITTED_SSE_FRAME_BYTES} bytes so the fail-closed response.failed terminal always fits",
             config.max_emitted_sse_frame_bytes,
         )
         .into());
@@ -240,10 +242,14 @@ pub(super) fn build_config(
 
 /// Validate the translated-body ceiling, including the streaming failure floor.
 fn validate_rewritten_body_limit(limit: usize) -> Result<(), FilterError> {
-    validate_size_limit("responses_to_chat_completions", "max_rewritten_body_bytes", limit)?;
+    validate_size_limit(
+        "openai_responses_to_chat_completions",
+        "max_rewritten_body_bytes",
+        limit,
+    )?;
     if limit < MIN_MAX_REWRITTEN_BODY_BYTES {
         return Err(format!(
-            "responses_to_chat_completions: max_rewritten_body_bytes ({limit}) must be at least {MIN_MAX_REWRITTEN_BODY_BYTES} bytes so the fail-closed response.failed resource always fits",
+            "openai_responses_to_chat_completions: max_rewritten_body_bytes ({limit}) must be at least {MIN_MAX_REWRITTEN_BODY_BYTES} bytes so the fail-closed response.failed resource always fits",
         )
         .into());
     }

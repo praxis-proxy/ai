@@ -136,7 +136,7 @@ async fn first_non_empty_chunk_records_with_model_label() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.set_metadata("openai_responses_format.model", "gpt-4o");
+    ctx.set_metadata("openai_format.model", "gpt-4o");
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -226,7 +226,7 @@ fn resolve_model_openai() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.set_metadata("openai_responses_format.model", "gpt-4o");
+    ctx.set_metadata("openai_format.model", "gpt-4o");
     assert_eq!(resolve_model(&ctx), "gpt-4o");
 }
 
@@ -253,7 +253,7 @@ fn resolve_model_prefers_openai_over_anthropic() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.set_metadata("openai_responses_format.model", "gpt-4o");
+    ctx.set_metadata("openai_format.model", "gpt-4o");
     ctx.set_metadata("anthropic_messages_format.model", "claude-sonnet-5");
     assert_eq!(resolve_model(&ctx), "gpt-4o");
 }
@@ -281,7 +281,7 @@ fn resolve_model_rejects_oversized_value() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     let long_model = "a".repeat(MAX_PROMOTED_VALUE_LEN + 1);
-    ctx.set_metadata("openai_responses_format.model", &long_model);
+    ctx.set_metadata("openai_format.model", &long_model);
     assert_eq!(resolve_model(&ctx), "unknown");
 }
 
@@ -291,7 +291,7 @@ fn resolve_model_accepts_max_length_value() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     let model = "a".repeat(MAX_PROMOTED_VALUE_LEN);
-    ctx.set_metadata("openai_responses_format.model", &model);
+    ctx.set_metadata("openai_format.model", &model);
     assert_eq!(resolve_model(&ctx), model);
 }
 

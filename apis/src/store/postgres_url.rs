@@ -3,7 +3,7 @@
 
 //! Shared `PostgreSQL` URL parsing and SSRF validation.
 //!
-//! Both `openai_response_store` and `openai_conversations` validate
+//! Both `openai_store` and `openai_conversations` validate
 //! `PostgreSQL` connection URLs against the same SSRF policy. This
 //! module centralizes the target parser, host/IP classification,
 //! Unix socket checks, and legacy IPv4 handling so the two filters
@@ -722,10 +722,9 @@ mod tests {
 
     #[test]
     fn error_messages_include_filter_name() {
-        let err =
-            validate_postgres_database_url("openai_response_store", "postgres://127.0.0.1/db", false).unwrap_err();
+        let err = validate_postgres_database_url("openai_store", "postgres://127.0.0.1/db", false).unwrap_err();
         assert!(
-            err.to_string().starts_with("openai_response_store:"),
+            err.to_string().starts_with("openai_store:"),
             "error should carry the filter name prefix"
         );
 

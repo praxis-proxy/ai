@@ -281,10 +281,10 @@ def _write_web_search_chat_streaming_config(
         "                    read_timeout_ms: 300000",
     )
     config = config.replace(
-        "- filter: openai_web_search\n"
+        "- filter: openai_web_search_dispatch\n"
         "                provider: brave\n"
         "                api_key: ${WEB_SEARCH_API_KEY}",
-        "- filter: openai_web_search\n"
+        "- filter: openai_web_search_dispatch\n"
         "                provider: brave\n"
         "                api_key: test-key\n"
         f"                base_url: http://127.0.0.1:{search_port}\n"
@@ -657,10 +657,10 @@ def _write_agentic_config(
         "        step_timeout_ms: 300000\n",
     )
     config = config.replace(
-        "- filter: openai_web_search\n"
+        "- filter: openai_web_search_dispatch\n"
         "                provider: brave\n"
         "                api_key: ${WEB_SEARCH_API_KEY}",
-        "- filter: openai_web_search\n"
+        "- filter: openai_web_search_dispatch\n"
         "                provider: brave\n"
         "                api_key: test-key\n"
         f"                base_url: http://127.0.0.1:{search_port}\n"
@@ -668,9 +668,9 @@ def _write_agentic_config(
     )
     if translate_to_chat:
         config = config.replace(
-            "              - filter: openai_responses_proxy\n"
+            "              - filter: openai_proxy\n"
             "              - filter: router",
-            "              - filter: responses_to_chat_completions\n"
+            "              - filter: openai_responses_to_chat_completions\n"
             "              - filter: path_rewrite\n"
             "                replace:\n"
             '                  pattern: "^/v1/responses/?$"\n'
@@ -2173,7 +2173,7 @@ class TestResponsesToChatCompletionsVLLM:
 
         A streaming Responses request is translated to Chat Completions,
         the returned private ``web_search`` tool call is restored to a
-        canonical ``web_search_call``, ``openai_web_search`` dispatches the
+        canonical ``web_search_call``, ``openai_web_search_dispatch`` dispatches the
         query, and inference resumes — all exposed to the client as ONE
         logical Responses SSE lifecycle. The terminal event carries the
         completed web-search item and the final assistant message.
@@ -3724,8 +3724,8 @@ listeners:
 filter_chains:
   - name: file-search-pipeline
     filters:
-      - filter: openai_responses_format
-      - filter: openai_responses_validate
+      - filter: openai_format
+      - filter: openai_validate
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 8
@@ -3740,7 +3740,7 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_tool_parse
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://{ogx_endpoint}
                 allow_private_url: true
                 timeout_ms: 30000
@@ -3750,7 +3750,7 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
                 name: inference
               - filter: headers
                 request_set:
@@ -3767,7 +3767,7 @@ filter_chains:
                     endpoints:
                       - "{vllm_endpoint}"
             on_result:
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 key: pending
                 value: "true"
                 next: inference
@@ -3868,7 +3868,7 @@ def vector_store():
 
 @pytest.fixture(scope="session")
 def file_search_proxy(tmp_path_factory, request):
-    """Start a Praxis proxy with the file-search-callout pipeline."""
+    """Start a Praxis proxy with the file-search-dispatch pipeline."""
     port = _free_port()
     config_path = _write_file_search_config(port)
     binary = _find_binary()
@@ -4065,7 +4065,7 @@ class TestFileSearchChatCompletionsVLLM:
     """Issue #296: hosted file_search against a Chat Completions backend.
 
     Unlike TestFileSearchVLLM (which proxies vLLM's native /v1/responses),
-    this drives responses_to_chat_completions: the native file_search tool
+    this drives openai_responses_to_chat_completions: the native file_search tool
     is synthesized into a private chat `function`, vLLM's
     /v1/chat/completions emits the call, the proxy runs the OGX vector-store
     search, and drives one more finite inference round -- without ever
@@ -4173,7 +4173,7 @@ def _write_file_search_streaming_config(praxis_port: int) -> str:
 
 @pytest.fixture(scope="session")
 def file_search_streaming_proxy(tmp_path_factory, request):
-    """Start a Praxis proxy with the streaming file-search-callout pipeline."""
+    """Start a Praxis proxy with the streaming file-search-dispatch pipeline."""
     port = _free_port()
     config_path = _write_file_search_streaming_config(port)
     binary = _find_binary()
@@ -4245,8 +4245,8 @@ class TestFileSearchStreamingVLLM:
     """Issue #313: streaming hosted file_search (stream=True).
 
     Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
-    example config: openai_stream_events(logical_stream) + file_search_callout
-    + openai_responses_proxy (streaming transport auto-derived from
+    example config: openai_stream_events(logical_stream) + file_search_dispatch
+    + openai_proxy (streaming transport auto-derived from
     stream=True). vLLM emits a private
     function_call(name=file_search), which the callout suppresses and replaces
     with a synthesized file_search_call lifecycle, runs the OGX search, and

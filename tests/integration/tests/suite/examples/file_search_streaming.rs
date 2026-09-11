@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Functional integration tests for the streaming file-search-callout example config.
+//! Functional integration tests for the streaming file-search-dispatch example config.
 
 use std::{
     collections::HashMap,
